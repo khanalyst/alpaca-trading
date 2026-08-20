@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from . import state
 from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
+from .contracts.rule import RULE_SCHEMA_V3
 from .execution_lifecycle import _plain, _value
 from .instruments import validate_equity_symbol
 
@@ -469,6 +470,22 @@ class MarketEntryRiskMixin:
                       strategy.get("execution_profile",
                                    strategy.get("execution_mode", "shares"))).lower()
         decision["execution_profile"] = "options" if profile in {"options", "option"} else "shares"
+        if (decision["execution_profile"] == "options" and
+                str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3):
+            self._event("risk_reject", {
+                "symbol": symbol,
+                "reason": "rule-strategy.v3 is not executable for options",
+            })
+            return None
+        if (decision["execution_profile"] == "shares" and
+                str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3 and
+                decision.get("breakeven_r") is not None and
+                not callable(getattr(self.provider, "replace_stop_order", None))):
+            self._event("execution_reject", {
+                "symbol": symbol,
+                "reason": "rule-strategy.v3 requires broker stop replacement capability",
+            })
+            return None
         if decision["execution_profile"] == "shares":
             try:
                 entry_reference = _equity_entry_reference(decision, row)
@@ -552,7 +569,8 @@ class MarketEntryRiskMixin:
             return None
         plan.update({key: signal.get(key) for key in (
             "setup_id", "setup_type", "strategy_id", "strategy_version",
-            "variant_id", "signal_ts", "force_flat_at") if signal.get(key) is not None})
+            "variant_id", "signal_ts", "force_flat_at", "rule_schema",
+            "breakeven_r") if signal.get(key) is not None})
         plan["underlying_symbol"] = symbol
         if decision["execution_profile"] == "options":
             option = plan.get("option", {})

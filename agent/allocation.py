@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from research.edge_lab import DEFAULT_DB_PATH, EdgeLedger
+from research.factory_ledger import FactoryLedger
 
 # Correlation is estimated on held-out per-session R, matched by session date.
 # Fewer than this many shared sessions is not an estimate, so the pair is
@@ -31,6 +32,28 @@ CORRELATION_THRESHOLD = 0.5
 # How many already-admitted candidates a further candidate may be correlated
 # with at or above the threshold.  One means one expression per cluster.
 MAX_CORRELATED_ADMISSIONS = 1
+
+
+def _record_family(record: Mapping) -> str:
+    """Extract an executable family without changing candidate identity."""
+    if record.get("family"):
+        return str(record["family"])
+    axes = record.get("axes") if isinstance(record.get("axes"), Mapping) else {}
+    config = record.get("config") if isinstance(record.get("config"), Mapping) else {}
+    strategy = config.get("strategy") if isinstance(config.get("strategy"), Mapping) else {}
+    spec = strategy.get("rule_spec") if isinstance(strategy.get("rule_spec"), Mapping) else {}
+    return str(spec.get("family") or axes.get("family") or "")
+
+
+def _frozen_cluster(record: Mapping, policy: Mapping | None) -> str | None:
+    """Return a verified persisted cluster assignment, if one exists."""
+    if not isinstance(policy, Mapping) or policy.get("verified_persisted") is not True:
+        return None
+    mapping = policy.get("cluster_map")
+    if not isinstance(mapping, Mapping):
+        return None
+    value = mapping.get(_record_family(record))
+    return str(value) if value else None
 
 
 def _finite(value) -> float | None:
@@ -152,7 +175,8 @@ def correlation(left: Mapping[str, float], right: Mapping[str, float]) -> float:
 
 def allocate(records: Sequence[Mapping], *, free_slots: int,
              db_path: str | Path | None = None,
-             ledger: EdgeLedger | None = None) -> dict:
+             ledger: EdgeLedger | None = None,
+             dependence_policy: Mapping | None = None) -> dict:
     """Choose the best feasible candidate set for one cycle.
 
     Greedy over the evidence ranking: the strongest candidate is admitted
@@ -168,6 +192,14 @@ def allocate(records: Sequence[Mapping], *, free_slots: int,
             ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
         except Exception:  # noqa: BLE001
             ledger = None
+    policy = dependence_policy
+    if policy is None and db_path is not None:
+        try:
+            vehicles = {str(record.get("vehicle") or "equity") for record in ranked}
+            vehicle = next(iter(vehicles)) if len(vehicles) == 1 else "equity"
+            policy = FactoryLedger(db_path).latest_dependence_policy(vehicle=vehicle)
+        except Exception:  # noqa: BLE001 - unreadable policy is safe fallback
+            policy = None
     sessions: list[dict[str, float]] = []
     for record in ranked:
         try:
@@ -176,6 +208,7 @@ def allocate(records: Sequence[Mapping], *, free_slots: int,
             sessions.append({})
     admitted: list[Mapping] = []
     admitted_index: list[int] = []
+    admitted_clusters: dict[str, int] = {}
     rejected: list[dict] = []
     slots = max(0, int(free_slots))
     for index, record in enumerate(ranked):
@@ -184,6 +217,15 @@ def allocate(records: Sequence[Mapping], *, free_slots: int,
         if len(admitted) >= slots:
             rejected.append({**identity, "reason": "no free concurrent position slot",
                              "free_slots": slots})
+            continue
+        cluster = _frozen_cluster(record, policy)
+        if cluster is not None and cluster in admitted_clusters:
+            peer_index = admitted_clusters[cluster]
+            rejected.append({**identity,
+                             "reason": "frozen dependence cluster",
+                             "dependence_cluster": cluster,
+                             "cluster_source": policy.get("policy_hash"),
+                             "correlated_with": ranked[peer_index].get("variant_id")})
             continue
         peers = []
         for other in admitted_index:
@@ -199,9 +241,15 @@ def allocate(records: Sequence[Mapping], *, free_slots: int,
             continue
         admitted.append(record)
         admitted_index.append(index)
-    return {"admitted": admitted, "rejected": rejected}
+        if cluster is not None:
+            admitted_clusters[cluster] = index
+    return {"admitted": admitted, "rejected": rejected,
+            "dependence_policy": (dict(policy) if isinstance(policy, Mapping) else None),
+            "dependence_policy_hash": (policy.get("policy_hash")
+                                        if isinstance(policy, Mapping) else None)}
 
 
 __all__ = ["CORRELATION_THRESHOLD", "MAX_CORRELATED_ADMISSIONS",
            "MIN_OVERLAP_SESSIONS", "UNKNOWN_CORRELATION", "allocate",
-           "correlation", "evidence_rank", "heldout_sessions"]
+           "correlation", "evidence_rank", "heldout_sessions",
+           "_frozen_cluster"]

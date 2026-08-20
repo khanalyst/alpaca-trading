@@ -24,10 +24,12 @@ from typing import Any, Mapping, Sequence
 
 from agent.contracts.rule import RULE_FAMILIES
 from .gates import gate_dependence_report
-from .edge_ledger_store import DEFAULT_DB_PATH, VEHICLES
+from .edge_ledger_store import DEFAULT_DB_PATH, VEHICLES, content_hash
+from .factory_ledger import dependence_policy_digest
 from .stats import cross_family_dependence_report
 
 REPORT_SCHEMA = "factory-report.v1"
+DEPENDENCE_POLICY_REPORT_SCHEMA = "dependence-policy.v1"
 
 # Origins where the model actually authored the hypothesis.  Everything else
 # is deterministic, even when a provider was asked first and refused.
@@ -54,6 +56,7 @@ _CHECK_LABELS = {
     "qualification_delta_positive": "beat the baseline in the sealed window",
     "family_fdr_significant": "survives multiple-testing within its family",
     "global_fdr_significant": "survives multiple-testing across the cycle",
+    "cluster_fdr_significant": "survives frozen dependence-cluster multiplicity",
 }
 
 
@@ -79,6 +82,26 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number == number and abs(number) != float("inf") else None
+
+
+def _dependence_policy_row(row: Mapping[str, Any]) -> dict:
+    """Decode and hash-check one frozen policy without opening a writable ledger."""
+    try:
+        source_cycles = json.loads(row.get("source_cycles_json") or "[]")
+        cluster_map = json.loads(row.get("cluster_map_json") or "{}")
+        evidence = json.loads(row.get("evidence_json") or "{}")
+        cutoff = float(row.get("cutoff"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"verified_persisted": False, "reason": "malformed_policy"}
+    body = {"schema": str(row.get("schema") or DEPENDENCE_POLICY_REPORT_SCHEMA),
+            "version": 1, "target_cycle_id": str(row.get("target_cycle_id") or ""),
+            "vehicle": str(row.get("vehicle") or ""), "cutoff": cutoff,
+            "source_cycles": source_cycles, "cluster_map": cluster_map,
+            "evidence": evidence}
+    return {**body, "policy_id": row.get("policy_id"),
+            "policy_hash": row.get("policy_hash"),
+            "policy_digest": dependence_policy_digest(body),
+            "verified_persisted": content_hash(body) == str(row.get("policy_hash") or "")}
 
 
 def _failed_checks(gate: Mapping[str, Any]) -> list[str]:
@@ -124,6 +147,12 @@ def _variant_row(record: Mapping[str, Any]) -> dict:
         "heldout_delta_lcb": _number(gate.get("heldout_delta_lcb")),
         "p_raw": _number(gate.get("p_raw")),
         "q_value": q_value,
+        "cluster_q_value": _number((gate.get("cluster_multiple_tests") or {}).get(
+            "p_adjusted") if isinstance(gate.get("cluster_multiple_tests"), Mapping)
+            else None),
+        "cluster_multiple_tests": (dict(gate.get("cluster_multiple_tests") or {})
+                                    if isinstance(gate.get("cluster_multiple_tests"), Mapping)
+                                    else {}),
         "confidence": _number(gate.get("confidence")),
         "is_root": bool(gate.get("is_root")),
         "null_control": gate.get("null_control"),
@@ -357,6 +386,13 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             return {"schema": REPORT_SCHEMA, "available": False,
                     "reason": "no factory lineage recorded", "db_path": str(path),
                     "vehicles": []}
+        frozen_policies: dict[str, list[dict]] = {name: [] for name in VEHICLES}
+        if "factory_dependence_policies" in tables:
+            for row in db.execute(
+                    "SELECT * FROM factory_dependence_policies "
+                    "ORDER BY created_at,policy_id"):
+                policy = _dependence_policy_row(dict(row))
+                frozen_policies.setdefault(str(row["vehicle"]), []).append(policy)
         hypotheses = [dict(row) for row in db.execute(
             """SELECT h.*, (SELECT status FROM factory_events e
                             WHERE e.hypothesis_id=h.hypothesis_id
@@ -558,6 +594,9 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
         }
         report_vehicles.append({
             "vehicle": name,
+            "dependence_policies": frozen_policies.get(name, []),
+            "dependence_policy": (frozen_policies.get(name) or [])[-1]
+            if frozen_policies.get(name) else None,
             "cross_family_dependence": cross_family,
             "search_state": vehicle_search_state,
             "search_exhausted": bool(vehicle_search_state) and all(
@@ -616,6 +655,8 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 "reasons_built_on_a_prior_lesson": sum(
                     1 for item in local_lessons if item.get("parent_lesson_id")),
                 "cross_family_dependence": cross_family,
+                "dependence_policy_hash": ((frozen_policies.get(name) or [])[-1].get(
+                    "policy_hash") if frozen_policies.get(name) else None),
             },
             "lessons": local_lessons,
             "slots": [{"slot": key, "generations": slots[key]}
@@ -679,6 +720,18 @@ def render_text(report: Mapping[str, Any]) -> str:
         else:
             add("  cross-family dependence: unavailable "
                 f"({dependence.get('reason', 'not enough complete sessions')})")
+        policy = vehicle.get("dependence_policy") or {}
+        if policy:
+            evidence = policy.get("evidence") or {}
+            add("  frozen dependence policy: "
+                f"{'verified' if policy.get('verified_persisted') else 'unverified'}, "
+                f"hash {policy.get('policy_hash') or '—'}, "
+                f"source cycles {len(policy.get('source_cycles') or ())}, "
+                f"clusters {len(set((policy.get('cluster_map') or {}).values()))}, "
+                f"floor {evidence.get('minimum_complete_sessions', '—')} sessions / "
+                f"{evidence.get('minimum_prior_cycles', '—')} cycles")
+        else:
+            add("  frozen dependence policy: unavailable (no persisted policy)")
         add("  verdict classes: " +
             json.dumps(summary.get("classifications", {}), sort_keys=True))
         add(f"  hypotheses proposed by the LLM: {summary['llm_seeded_hypotheses']}"
@@ -836,6 +889,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 f"{', '.join(summary.get('families_untested', ())) or 'none'}",
                 f"- Cross-family dependence: "
                 f"{('available' if (vehicle.get('cross_family_dependence') or {}).get('available') else 'unavailable')}",
+                f"- Frozen dependence policy: "
+                f"{('verified' if (vehicle.get('dependence_policy') or {}).get('verified_persisted') else 'unavailable')}",
                 f"- Verdict classes: {json.dumps(summary.get('classifications', {}), sort_keys=True)}",
                 f"- Proposed by the LLM: {summary['llm_seeded_hypotheses']}"
                 f" ({summary['llm_proposals_rejected']} refused)",

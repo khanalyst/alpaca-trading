@@ -17,7 +17,9 @@ from pathlib import Path
 import random
 from typing import Any, Mapping, Sequence
 
-from agent.contracts.rule import hold_deadline
+from agent.contracts.rule import (completed_bar_exit_transition, hold_deadline,
+                                  initialize_exit_state,
+                                  rule_vehicle_executable, validate_rule_spec)
 from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     CostError, CostModel, ReplayPolicy, SQLiteQuoteIndex,
                     SQLiteQuoteIndexDescriptor, check_stressed_cost_plan,
@@ -656,6 +658,8 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
     whose own replay trades a fixed size.  A delta between books sized
     differently would measure position size, not timing.
     """
+    spec = validate_rule_spec(spec)
+    unsupported_vehicle = not rule_vehicle_executable(spec, vehicle)
     model = costs or CostModel()
     # Omitted policy is the checked runtime policy.  Historical bar fallback
     # is available only through an explicit ReplayPolicy(strict_market_data=False).
@@ -679,6 +683,11 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         opportunity = f"null:{account_id}:{symbol}:{day}"
         reference = references[key]
         session_bars = grouped.get(key, [])
+        if unsupported_vehicle:
+            rows.append(_null_row(
+                symbol, day, opportunity, vehicle,
+                "rule-strategy.v3 is not executable for options"))
+            continue
         if reference.get("no_trade") is True or len(session_bars) < 3:
             rows.append(_null_row(symbol, day, opportunity, vehicle))
             continue
@@ -813,6 +822,9 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         exit_ref = float(exit_bar.close)
         exit_at = exit_bar.end
         boundary_exit = True
+        exit_state = initialize_exit_state(
+            direction, entry_underlying, stop, target,
+            breakeven_r=spec.get("breakeven_r"))
         for bar in session_bars[entry_index:last_index + 1]:
             if replay_available_at(
                     bar,
@@ -822,22 +834,16 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 # its full record is observed; only bars before entry are
                 # excluded by the availability-time entry resolver.
                 continue
-            if direction == "long":
-                gap_stop, gap_target = bar.open <= stop, bar.open >= target
-                hit_stop, hit_target = bar.low <= stop, bar.high >= target
-            else:
-                gap_stop, gap_target = bar.open >= stop, bar.open <= target
-                hit_stop, hit_target = bar.high >= stop, bar.low <= target
-            # The null shares the candidate's exit rules, gap-through included.
-            # Giving chance entries an exit realism the candidate does not have
-            # would bias every delta measured against them.
-            if gap_stop or gap_target:
-                exit_ref, exit_bar, exit_at = float(bar.open), bar, bar.timestamp
-                break
-            if hit_stop or hit_target:
-                exit_ref = stop if hit_stop else target
-                exit_bar, exit_at, boundary_exit = bar, bar.end, False
-                break
+            transition = completed_bar_exit_transition(exit_state, bar)
+            exit_state = transition["state"]
+            resolved = transition["exit"]
+            if resolved is None:
+                continue
+            exit_ref = float(resolved["price"])
+            exit_bar = bar
+            boundary_exit = bool(resolved.get("gapped"))
+            exit_at = bar.timestamp if boundary_exit else bar.end
+            break
         exit_source = BAR
         exit_feed = exit_provider = None
         exit_age = 0.0
@@ -1001,6 +1007,14 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                         "nominal_risk_usd": nominal_risk_usd,
                         "entry_notional": entry_notional})
             row.update(stress_telemetry)
+        if spec.get("breakeven_r") is not None:
+            row.update({
+                "breakeven_r": spec["breakeven_r"],
+                "initial_stop_price": exit_state["initial_stop_price"],
+                "active_stop_price": exit_state["active_stop_price"],
+                "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
+                "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
+            })
         rows.append(row)
     executed = [row for row in rows if row.get("no_trade") is not True]
     return {"account_id": account_id, "starting_cash": float(starting_cash),

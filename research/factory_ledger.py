@@ -13,6 +13,11 @@ import uuid
 
 from .edge_lab import DEFAULT_DB_PATH, EdgeLedger, canonical_json, content_hash
 from .gates import verify_gate_envelope
+from .stats import (DEPENDENCE_CORRELATION_THRESHOLD,
+                     DEPENDENCE_MIN_COMPLETE_SESSIONS,
+                     DEPENDENCE_MIN_PRIOR_CYCLES,
+                     DEPENDENCE_POLICY_SCHEMA,
+                     deterministic_dependence_map)
 from agent.contracts.rule import rule_variant_id
 
 
@@ -42,6 +47,87 @@ LESSON_SOURCES = {"llm", "deterministic", "live_paper"}
 # are intentionally isolated by the live-shadow v3 scope.
 FDR_METHOD = "lord_balanced_raw_p_v3"
 LEGACY_FDR_METHOD = "lord_balanced_v2"
+
+
+def _paired_session_deltas(result: Mapping[str, Any], *, vehicle: str) -> list[dict[str, Any]]:
+    """Return candidate-minus-baseline deltas keyed by tested session.
+
+    This intentionally mirrors the gate match key (comparison id, then
+    symbol/session, then opportunity/timestamp) without using aggregate P&L.
+    Ambiguous duplicate keys are dropped.  The caller can therefore average
+    repeated variants deterministically while preserving the exact paired
+    opportunities that the gate tested.
+    """
+    gate = result.get("gate") if isinstance(result, Mapping) else None
+    envelope = gate.get("verified_gate") if isinstance(gate, Mapping) else None
+    if not isinstance(envelope, Mapping):
+        return []
+    candidate = envelope.get("heldout_source")
+    baseline = envelope.get("heldout_baseline_source")
+    if not isinstance(candidate, (list, tuple)) or not isinstance(baseline, (list, tuple)):
+        return []
+
+    def key(row: Mapping) -> str:
+        if row.get("comparison_id"):
+            return str(row["comparison_id"])
+        symbol, session = row.get("symbol"), row.get("session_date")
+        if symbol and session:
+            return f"{row.get('vehicle', vehicle)}:{symbol}:{session}"
+        return str(row.get("opportunity_id") or row.get("entry_timestamp") or "")
+
+    def indexed(rows: list | tuple) -> dict[str, Mapping]:
+        values: dict[str, Mapping] = {}
+        duplicates: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping) or row.get("no_trade") is True:
+                continue
+            if row.get("vehicle", vehicle) != vehicle:
+                continue
+            match = key(row)
+            if not match or match in values:
+                duplicates.add(match)
+            else:
+                values[match] = row
+        for match in duplicates:
+            values.pop(match, None)
+        return values
+
+    left, right = indexed(candidate), indexed(baseline)
+    paired: list[dict[str, Any]] = []
+    for match in sorted(set(left) & set(right)):
+        try:
+            delta = float(left[match].get("net_pnl", 0.0)) - float(
+                right[match].get("net_pnl", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(delta):
+            continue
+        session = str(left[match].get("session_date") or "").strip()
+        if session:
+            paired.append({"session": session, "delta": delta})
+    return paired
+
+
+def dependence_policy_digest(policy: Mapping[str, Any]) -> str:
+    """Hash semantic dependence policy inputs, excluding audit timestamps/ids.
+
+    ``policy_hash`` authenticates the exact persisted freeze (including target
+    cycle and cutoff).  Authorizing gate/provenance hashes must instead be
+    stable across equivalent memory/process/path replays, so they use this
+    digest over version, thresholds, source cycles, cluster assignments, and
+    deterministic evidence only.
+    """
+    evidence = policy.get("evidence") if isinstance(policy.get("evidence"), Mapping) else {}
+    semantic = {
+        "schema": str(policy.get("schema") or DEPENDENCE_POLICY_SCHEMA),
+        "version": int(policy.get("version", 1)),
+        "vehicle": str(policy.get("vehicle") or ""),
+        "source_cycles": sorted(str(item) for item in (policy.get("source_cycles") or ())),
+        "cluster_map": {str(key): str(value) for key, value in sorted(
+            (policy.get("cluster_map") or {}).items(), key=lambda item: str(item[0]))},
+        "evidence": evidence,
+    }
+    return content_hash(semantic)
 
 
 def _fdr_semantics(scope: str) -> tuple[str, str]:
@@ -272,6 +358,24 @@ class FactoryLedger:
                     result_json TEXT NOT NULL,
                     created_at REAL NOT NULL
                 );
+                -- A policy is frozen before a cycle evaluates any current
+                -- data.  It is immutable and becomes runtime-visible only
+                -- once its target cycle has completed in factory_cycles.
+                CREATE TABLE IF NOT EXISTS factory_dependence_policies (
+                    policy_id TEXT PRIMARY KEY,
+                    target_cycle_id TEXT NOT NULL,
+                    vehicle TEXT NOT NULL CHECK(vehicle IN ('equity','option')),
+                    schema TEXT NOT NULL,
+                    cutoff REAL NOT NULL,
+                    source_cycles_json TEXT NOT NULL,
+                    cluster_map_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    policy_hash TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(target_cycle_id, vehicle)
+                );
+                CREATE INDEX IF NOT EXISTS factory_dependence_policies_latest
+                    ON factory_dependence_policies(vehicle, created_at);
                 -- Why something was tried, and what happened when it was.
                 -- Split in two because the two facts are learned at different
                 -- times: the reason exists when the variant is proposed, the
@@ -371,6 +475,14 @@ class FactoryLedger:
                 CREATE TRIGGER IF NOT EXISTS factory_cycles_no_delete
                     BEFORE DELETE ON factory_cycles BEGIN
                     SELECT RAISE(ABORT, 'factory cycles are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_dependence_policies_no_update
+                    BEFORE UPDATE ON factory_dependence_policies BEGIN
+                    SELECT RAISE(ABORT, 'dependence policies are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_dependence_policies_no_delete
+                    BEFORE DELETE ON factory_dependence_policies BEGIN
+                    SELECT RAISE(ABORT, 'dependence policies are immutable');
                 END;
             """)
             # ``CREATE TABLE IF NOT EXISTS`` leaves an already-created table
@@ -1242,6 +1354,131 @@ class FactoryLedger:
                 canonical_json(identity), workers, strategies, variants,
                 canonical_json(recorded), datetime.now().timestamp(),
             ))
+
+    def freeze_dependence_policy(self, cycle_id: str, *, vehicle: str,
+                                 cutoff: float | None = None) -> dict[str, Any]:
+        """Freeze prior-cycle dependence before the current cycle is tested.
+
+        Only account rows belonging to completed ``factory_cycles`` whose
+        completion timestamp is strictly before ``cutoff`` are considered.
+        The append-only policy row records the exact source cycle ids,
+        thresholds, cluster map, and content hash used by runtime allocation.
+        """
+        if vehicle not in {"equity", "option"}:
+            raise FactoryError("vehicle must be equity or option")
+        resolved_cutoff = (datetime.now().timestamp() if cutoff is None else float(cutoff))
+        if not math.isfinite(resolved_cutoff):
+            raise FactoryError("dependence policy cutoff must be finite")
+        with closing(_connect(self.path)) as db:
+            existing = db.execute(
+                "SELECT * FROM factory_dependence_policies WHERE target_cycle_id=? AND vehicle=?",
+                (str(cycle_id), str(vehicle))).fetchone()
+            if existing is not None:
+                return self._decode_dependence_policy(existing)
+            rows = db.execute(
+                """SELECT a.cycle_id,a.result_json,c.created_at
+                   FROM factory_accounts a JOIN factory_cycles c
+                     ON c.cycle_id=a.cycle_id
+                   WHERE a.vehicle=? AND c.created_at < ?
+                   ORDER BY c.created_at,c.cycle_id,a.account_id""",
+                (str(vehicle), resolved_cutoff)).fetchall()
+        observations: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                result = json.loads(row["result_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(result, Mapping):
+                continue
+            spec = result.get("rule_spec")
+            gate = result.get("gate")
+            family = (spec.get("family") if isinstance(spec, Mapping) else
+                      result.get("family"))
+            if not family or not isinstance(gate, Mapping):
+                continue
+            for paired in _paired_session_deltas(result, vehicle=vehicle):
+                observations.append({"cycle_id": str(row["cycle_id"]),
+                                     "family": str(family), **paired})
+        policy = deterministic_dependence_map(
+            observations, cutoff=resolved_cutoff,
+            min_sessions=DEPENDENCE_MIN_COMPLETE_SESSIONS,
+            min_cycles=DEPENDENCE_MIN_PRIOR_CYCLES,
+            threshold=DEPENDENCE_CORRELATION_THRESHOLD)
+        source_cycles = list(policy.get("source_cycles") or ())
+        cluster_map = dict(policy.get("cluster_map") or {})
+        evidence = {key: value for key, value in policy.items()
+                    if key not in {"schema", "cutoff", "cluster_map"}}
+        body = {"schema": DEPENDENCE_POLICY_SCHEMA, "version": 1,
+                "target_cycle_id": str(cycle_id), "vehicle": str(vehicle),
+                "cutoff": resolved_cutoff, "source_cycles": source_cycles,
+                "cluster_map": cluster_map, "evidence": evidence}
+        policy_hash = content_hash(body)
+        policy_id = uuid.uuid4().hex
+        with closing(_connect(self.path)) as db, db:
+            db.execute(
+                """INSERT INTO factory_dependence_policies
+                   (policy_id,target_cycle_id,vehicle,schema,cutoff,
+                    source_cycles_json,cluster_map_json,evidence_json,
+                    policy_hash,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (policy_id, str(cycle_id), str(vehicle), DEPENDENCE_POLICY_SCHEMA,
+                 resolved_cutoff, canonical_json(source_cycles),
+                 canonical_json(cluster_map), canonical_json(evidence),
+                 policy_hash, datetime.now().timestamp()))
+        return {**body, "policy_id": policy_id, "policy_hash": policy_hash,
+                "policy_digest": dependence_policy_digest(body),
+                "verified_persisted": True}
+
+    @staticmethod
+    def _decode_dependence_policy(row: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            source_cycles = json.loads(row["source_cycles_json"] or "[]")
+            cluster_map = json.loads(row["cluster_map_json"] or "{}")
+            evidence = json.loads(row["evidence_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return {"verified_persisted": False, "reason": "malformed_policy"}
+        body = {"schema": str(row["schema"]), "version": 1,
+                "target_cycle_id": str(row["target_cycle_id"]),
+                "vehicle": str(row["vehicle"]), "cutoff": float(row["cutoff"]),
+                "source_cycles": source_cycles, "cluster_map": cluster_map,
+                "evidence": evidence}
+        expected = content_hash(body)
+        verified = expected == str(row["policy_hash"] or "")
+        return {**body, "policy_id": str(row["policy_id"]),
+                "policy_hash": str(row["policy_hash"]),
+                "policy_digest": dependence_policy_digest(body),
+                "verified_persisted": bool(verified)}
+
+    def latest_dependence_policy(self, *, vehicle: str) -> dict[str, Any] | None:
+        """Return the newest hash-verified policy for a completed target cycle."""
+        if vehicle not in {"equity", "option"}:
+            return None
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT * FROM factory_dependence_policies WHERE vehicle=? "
+                "ORDER BY created_at DESC,policy_id DESC", (str(vehicle),)).fetchall()
+            for row in rows:
+                policy = self._decode_dependence_policy(row)
+                if not policy.get("verified_persisted"):
+                    continue
+                completed = db.execute(
+                    "SELECT 1 FROM factory_cycles WHERE cycle_id=?",
+                    (policy.get("target_cycle_id"),)).fetchone()
+                if completed is None:
+                    # A crashed/in-progress cycle's freeze is audit evidence,
+                    # not a runtime authorization.
+                    continue
+                return policy
+        return None
+
+    def dependence_policies(self, *, vehicle: str | None = None) -> list[dict[str, Any]]:
+        """Read all persisted policies for report/audit consumers."""
+        clause = " WHERE vehicle=?" if vehicle else ""
+        args = (str(vehicle),) if vehicle else ()
+        with closing(_connect(self.path)) as db:
+            rows = db.execute("SELECT * FROM factory_dependence_policies" + clause +
+                              " ORDER BY created_at,policy_id", args).fetchall()
+        return [self._decode_dependence_policy(row) for row in rows]
 
     def next_fdr_allocation(self, scope: str, *, alpha: float = .05) -> dict[str, Any]:
         """Preview the next durable allocation without spending it."""

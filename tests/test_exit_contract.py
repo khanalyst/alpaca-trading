@@ -19,12 +19,16 @@ from agent.alpaca_domain import Account, Order, OrderRequest, Position, Quote
 from agent.config import validate_config
 from agent.contracts.rule import (BAR_SECONDS, RuleSpecError,
                                   MIN_STOP_DISTANCE_FRACTION,
+                                  RULE_SCHEMA_V3,
+                                  completed_bar_exit_transition,
                                   generate_rule_signal, hold_deadline,
+                                  initialize_exit_state,
                                   rule_variant_id, validate_rule_spec)
 from agent.engine import Engine
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
 from research.costs import ReplayPolicy
+from research.edge_discovery_core import null_control_account
 from research.factory_core import _simulate_trade, simulate_account
 from research.market_data import normalize_underlying_bar
 
@@ -33,6 +37,9 @@ SPEC = validate_rule_spec({
     "family": "momentum_continuation", "lookback": 3, "slow_lookback": 8,
     "atr_period": 3, "threshold_bps": 1.0, "stop_atr": 1.0, "target_r": 2.0,
     "max_hold_bars": 3, "confirmation": "none",
+})
+V3_SPEC = validate_rule_spec({
+    **SPEC, "schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
 })
 # Four rising bars produce the signal at index 3, so the simulated entry bar
 # is index 4 and the bounded hold expires at the end of index 7.
@@ -177,6 +184,104 @@ class HoldDeadlineTests(unittest.TestCase):
             hold_deadline(entry, {"max_hold_bars": 3}, force_flat_ts="soon")
 
 
+class CompletedBarExitTransitionTests(unittest.TestCase):
+    def test_completed_close_arms_breakeven_for_the_next_bar_only(self):
+        state_row = initialize_exit_state(
+            "long", 100.0, 99.0, 103.0, breakeven_r=1.0)
+        arm_bar = {"timestamp": BASE, "open": 100.0, "high": 101.2,
+                   "low": 99.5, "close": 101.1}
+        armed = completed_bar_exit_transition(state_row, arm_bar)
+        self.assertIsNone(armed["exit"])
+        self.assertTrue(armed["stop_changed"])
+        self.assertEqual(armed["state"]["initial_stop_price"], 99.0)
+        self.assertEqual(armed["state"]["active_stop_price"], 100.0)
+        self.assertEqual(armed["state"]["breakeven_armed_epoch"],
+                         (BASE + timedelta(minutes=1)).timestamp())
+
+        next_bar = {"timestamp": BASE + timedelta(minutes=1),
+                    "open": 100.5, "high": 102.0,
+                    "low": 99.8, "close": 101.5}
+        stopped = completed_bar_exit_transition(armed["state"], next_bar)
+        self.assertEqual(stopped["exit"]["reason"], "stop")
+        self.assertEqual(stopped["exit"]["price"], 100.0)
+
+    def test_gap_precedes_intrabar_and_stop_wins_a_tie(self):
+        state_row = initialize_exit_state("long", 100, 99, 103)
+        gap = completed_bar_exit_transition(state_row, {
+            "timestamp": BASE, "open": 98.5, "high": 104,
+            "low": 98, "close": 102})
+        self.assertEqual(gap["exit"]["reason"], "stop")
+        self.assertEqual(gap["exit"]["price"], 98.5)
+        self.assertTrue(gap["exit"]["gapped"])
+
+        tie = completed_bar_exit_transition(
+            initialize_exit_state("long", 100, 99, 103), {
+                "timestamp": BASE, "open": 100, "high": 104,
+                "low": 98, "close": 101})
+        self.assertEqual(tie["exit"]["reason"], "stop")
+        self.assertTrue(tie["exit"]["tie_broken"])
+
+    def test_entry_exactly_at_the_stop_resolves_at_the_fill_anchor(self):
+        transition = completed_bar_exit_transition(
+            initialize_exit_state("long", 99.0, 99.0, 103.0), {
+                "timestamp": BASE, "open": 99.0, "high": 100.0,
+                "low": 98.5, "close": 99.5})
+        self.assertEqual(transition["exit"]["reason"], "stop")
+        self.assertEqual(transition["exit"]["price"], 99.0)
+        self.assertTrue(transition["exit"]["entry_gap"])
+
+    def test_short_positions_use_the_same_next_bar_arm_contract(self):
+        state_row = initialize_exit_state(
+            "short", 100.0, 101.0, 97.0, breakeven_r=1.0)
+        armed = completed_bar_exit_transition(state_row, {
+            "timestamp": BASE, "open": 100.0, "high": 100.5,
+            "low": 98.8, "close": 98.9})
+        self.assertIsNone(armed["exit"])
+        self.assertEqual(armed["state"]["active_stop_price"], 100.0)
+        stopped = completed_bar_exit_transition(armed["state"], {
+            "timestamp": BASE + timedelta(minutes=1), "open": 99.5,
+            "high": 100.2, "low": 98.0, "close": 99.0})
+        self.assertEqual(stopped["exit"]["reason"], "stop")
+        self.assertEqual(stopped["exit"]["price"], 100.0)
+
+
+class V3OptionRejectionTests(unittest.TestCase):
+    def test_runtime_risk_rejects_v3_options_before_contract_selection(self):
+        risk = RiskEngine({"strategy": {"execution_profile": "options"}})
+        decision = {
+            "symbol": "SPY", "direction": "long", "confidence": 1.0,
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "execution_profile": "options", "rule_schema": RULE_SCHEMA_V3,
+            "breakeven_r": 0.5,
+        }
+        plan, reason = risk.vet_open(
+            decision, 100_000, [], {"SPY": {"price": 100.0}}, {}, 0,
+            now=BASE.timestamp())
+        self.assertIsNone(plan)
+        self.assertEqual(reason,
+                         "rule-strategy.v3 is not executable for options")
+
+    def test_research_marks_v3_options_unexecutable_not_unobserved(self):
+        bars = _bars(RISING + FLAT)
+        result = _simulate_trade(
+            bars, V3_SPEC, [], "option",
+            policy=BAR_ONLY_POLICY)
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["unpriced_reason"],
+            "rule-strategy.v3 is not executable for options")
+        null = null_control_account(
+            bars, [], V3_SPEC, vehicle="option", account_id="unsupported-v3",
+            reference_rows=[{
+                "symbol": "SPY",
+                "session_date": bars[0].session_date.isoformat(),
+            }], policy=BAR_ONLY_POLICY)
+        self.assertEqual(null["trades"], 0)
+        self.assertEqual(
+            null["rows"][0]["reject_reason"],
+            "rule-strategy.v3 is not executable for options")
+
+
 class PlanCarriesTheHoldTests(unittest.TestCase):
     def setUp(self):
         self.variant_id = rule_variant_id(SPEC)
@@ -283,16 +388,19 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.engine.market.should_force_flat = lambda now=None: False
         return self.engine
 
-    def _open_runtime_trade(self, bars, name):
+    def _open_runtime_trade(self, bars, name, *, spec=SPEC):
         """Persist the same signal through plan, risk, and fill activation."""
         engine = self._engine(name)
+        cfg = validate_config({"strategy": {
+            "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+            "rule_spec": spec}})
         signal = generate_rule_signal(
-            "SPY", _payloads([bar.close for bar in bars[:4]]), config=self.cfg,
+            "SPY", _payloads([bar.close for bar in bars[:4]]), config=cfg,
             now=datetime.now(timezone.utc))
         snapshot = {"price": signal["entry_price"], "signal_ts": signal["signal_ts"],
                     "session": signal["session"], "spread_bps": 1.0,
                     "stale": False, "quote_stale": False}
-        plan, why = build_setup_plan(signal, snapshot, self.cfg)
+        plan, why = build_setup_plan(signal, snapshot, cfg)
         self.assertIsNone(why)
         risk_plan, why = engine.risk.vet_open(
             dict(plan), 100_000, [], {"SPY": {"price": plan["entry_price"]}},
@@ -319,18 +427,20 @@ class ExitContractDifferentialTests(unittest.TestCase):
     def _drive(self, engine, bars, *, start_index):
         """Return the first (reason, exit timestamp) the monitor produces."""
         for bar in bars[start_index:]:
-            result = engine._monitor_positions(bar.end, [self._position(bar.close)])
+            result = engine._monitor_positions(
+                bar.end, [self._position(bar.close)],
+                market_rows={"SPY": {"bars": [bar]}})
             if result["closed"]:
                 return result["closed"][0]["reason"], bar.end
         return None, None
 
     def _differential(self, closes, name, *, force_flat_from=None, opens=None,
-                      ranges=None, start_index=5):
+                      ranges=None, start_index=5, spec=SPEC):
         bars = _bars(closes, opens, ranges)
         simulated = _simulate_trade(
-            bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
+            bars, spec, [], "equity", policy=BAR_ONLY_POLICY)
         self.assertIsNotNone(simulated)
-        engine, plan = self._open_runtime_trade(bars, name)
+        engine, plan = self._open_runtime_trade(bars, name, spec=spec)
         if force_flat_from is not None:
             engine.market.should_force_flat = (
                 lambda now=None: now is not None and
@@ -518,6 +628,47 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.assertEqual(simulated["exit_reference"], 100.3)
         self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
         self.assertAlmostEqual(simulated["realized_risk_per_unit"], 0.0, places=9)
+
+    def test_v3_replay_and_runtime_arm_then_stop_on_the_same_completed_bars(self):
+        closes = RISING + [101.0, 100.9] + FLAT[:5]
+        bars = _bars(closes, ranges={5: (101.05, 100.7)})
+        simulated, plan, reason, exit_at = self._differential(
+            closes, "runtime-v3-breakeven", ranges={5: (101.05, 100.7)},
+            start_index=4, spec=V3_SPEC)
+        self.assertEqual(simulated["exit_reason"], "stop")
+        self.assertEqual(reason, "stop")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+        self.assertEqual(exit_at, bars[5].end)
+        self.assertAlmostEqual(simulated["initial_stop_price"],
+                               plan["stop_price"], places=9)
+        self.assertAlmostEqual(simulated["active_stop_price"],
+                               plan["entry_price"], places=9)
+        self.assertEqual(simulated["breakeven_armed_epoch"],
+                         bars[4].end.timestamp())
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertAlmostEqual(trade["initial_stop_price"],
+                               plan["stop_price"], places=9)
+        self.assertAlmostEqual(trade["active_stop_price"],
+                               plan["entry_price"], places=9)
+        self.assertEqual(trade["breakeven_armed_epoch"],
+                         bars[4].end.timestamp())
+
+    def test_v3_runtime_filters_the_signal_bar_before_the_expected_entry_bar(self):
+        bars = _bars(RISING + [101.0] + FLAT[:6])
+        engine, _plan = self._open_runtime_trade(
+            bars, "runtime-v3-entry-filter", spec=V3_SPEC)
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["exit_entry_bar_epoch"],
+                         bars[4].timestamp.timestamp())
+
+        result = engine._monitor_positions(
+            bars[3].end, [self._position(bars[3].close)],
+            market_rows={"SPY": {"bars": [bars[3]]}})
+
+        self.assertEqual(result["closed"], [])
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertIsNone(trade["last_completed_bar_epoch"])
+        self.assertIs(trade["entry_bar_pending"], True)
 
     def test_a_legacy_trade_without_the_field_keeps_its_behaviour(self):
         bars = _bars(RISING + FLAT)

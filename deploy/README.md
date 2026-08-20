@@ -239,13 +239,27 @@ The shipped `max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade
 is about `0.833` cost-to-risk at the 25-bps stress and is vetoed before option
 fees.
 
-On a genuinely empty journal only, an operator may explicitly set
-`ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1` for the first research cycle.
-That cycle persists `calibration_state=bootstrap_unknown` and keeps
-`authorization_exit_code=2`; it permits shadow evidence collection but is not
-measured execution calibration and cannot authorize production. Any existing,
-thin, mixed-vehicle, stale, or optimistic history remains blocked until the
-normal measured calibration is authorized.
+Compose ships `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1` so a fresh
+installation with no paper journal can collect broker-free shadow evidence.
+This is a narrow empty-journal bootstrap only: the persisted
+`calibration_state=bootstrap_unknown` and `authorization_exit_code=2` remain
+non-authorizing and cannot claim measured calibration or promote a candidate.
+Set the variable to `0` in the deployment environment when measured
+calibration must exist before shadow ingestion. Thin, existing, mixed-vehicle,
+stale, or optimistic history remains blocked until normal measured
+calibration is authorized.
+
+ShadowRunner records a durable `replay_quarantine` entry for every incomplete
+or mismatched candidate/session replay. Its health result reports
+`stale_tail.status=blocked`, the session, and the exact source/shadow/replay
+digests. Correct the recorder source, then run one bounded replay cycle (for
+example `docker compose run --rm --no-deps shadow --once`); only when all
+required arms produce a complete parity match is the entry changed to
+`status=repaired`. The read-only `edge ingest-shadow` consumer refuses to
+advance its boundary or spend FDR while a quarantine entry or an
+authoritative-calendar gap remains, and its retry records the repaired
+session explicitly. A missing or stale recorder calendar is reported as
+`catalog_unavailable`/unknown rather than inferred from weekdays.
 
 The executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
 configured R target, and bar-cap time exit. Fit-only factory diagnostics expose

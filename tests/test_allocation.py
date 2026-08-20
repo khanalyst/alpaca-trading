@@ -129,6 +129,32 @@ class AllocationTests(unittest.TestCase):
         with self._verified():
             return resolve_validated_variants(_RUNTIME_CONFIG, db_path=self.db)
 
+    def test_verified_frozen_dependence_cluster_keeps_one_strongest_edge(self):
+        left = {"candidate_id": "a", "variant_id": "a", "family": "alpha",
+                "latest_proof": {"verified_gate": _gate(lcb=.20)}}
+        right = {"candidate_id": "b", "variant_id": "b", "family": "beta",
+                 "latest_proof": {"verified_gate": _gate(lcb=.10)}}
+        policy = {"verified_persisted": True, "policy_hash": "p" * 64,
+                  "cluster_map": {"alpha": "dependence-0001",
+                                  "beta": "dependence-0001"}}
+        result = allocate([right, left], free_slots=2,
+                          ledger=None, dependence_policy=policy)
+        self.assertEqual([item["variant_id"] for item in result["admitted"]], ["a"])
+        self.assertEqual(result["rejected"][0]["reason"], "frozen dependence cluster")
+
+    def test_unassigned_legacy_family_keeps_safe_existing_behavior(self):
+        left = {"candidate_id": "a", "variant_id": "a", "family": "legacy-a",
+                "latest_proof": {"verified_gate": _gate(lcb=.20)}}
+        right = {"candidate_id": "b", "variant_id": "b", "family": "legacy-b",
+                 "latest_proof": {"verified_gate": _gate(lcb=.10)}}
+        policy = {"verified_persisted": True, "policy_hash": "p" * 64,
+                  "cluster_map": {"known": "dependence-0001"}}
+        result = allocate([left, right], free_slots=2,
+                          ledger=None, dependence_policy=policy)
+        self.assertEqual(len(result["admitted"]), 1)
+        self.assertEqual(result["rejected"][0]["reason"],
+                         "correlated with an admitted candidate")
+
     # --- ranking -----------------------------------------------------------
 
     def test_stronger_later_sorting_family_ranks_ahead_of_weaker_earlier_name(self):

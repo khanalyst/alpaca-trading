@@ -1787,6 +1787,8 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                            checks: Mapping[str, bool], passes: bool,
                            performance: Mapping | None = None,
                            family_q_value: float | None = None,
+                           cluster_q_value: float | None = None,
+                           cluster_multiple_tests: Mapping | None = None,
                            walk_forward: Mapping | None = None,
                            retirement: Mapping | None = None,
                            qualification: Mapping | None = None,
@@ -1893,7 +1895,10 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         (heldout_floor or {}).get("adequate") and
         _floor_minimums_meet(heldout_floor, lane=lane))
     stats = {"q_value": q_value, "family_q_value":
-             q_value if family_q_value is None else family_q_value, "alpha": alpha}
+             q_value if family_q_value is None else family_q_value,
+             "alpha": alpha}
+    if cluster_q_value is not None:
+        stats["cluster_q_value"] = float(cluster_q_value)
     derived["family_fdr_significant"] = float(stats["family_q_value"]) <= float(alpha)
     derived["global_fdr_significant"] = float(q_value) <= float(alpha)
     online = dict(online_fdr or {})
@@ -2050,7 +2055,12 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "statistics": {"p_value": float(p_value), "q_value": float(q_value),
                        "family_q_value": float(q_value if family_q_value is None
                                                 else family_q_value),
+                       **({"cluster_q_value": float(cluster_q_value)}
+                          if cluster_q_value is not None else {}),
                        "alpha": float(alpha)},
+        "cluster_multiple_tests": (dict(cluster_multiple_tests)
+                                    if isinstance(cluster_multiple_tests, Mapping)
+                                    else {}),
         "performance": reported,
         "falsification": dict(falsification),
         "separation": dict(separation),
@@ -2428,6 +2438,18 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     math.isfinite(global_q) and 0.0 <= global_q <= 1.0 and
                     math.isfinite(family_q) and 0.0 <= family_q <= 1.0):
                 return False
+            cluster_tests = envelope.get("cluster_multiple_tests")
+            if cluster_tests:
+                if not isinstance(cluster_tests, Mapping):
+                    return False
+                cluster_q = statistics.get("cluster_q_value")
+                if (not isinstance(cluster_q, (int, float)) or
+                        isinstance(cluster_q, bool) or
+                        not math.isfinite(float(cluster_q)) or
+                        not 0.0 <= float(cluster_q) <= 1.0 or
+                        bool(checks.get("cluster_fdr_significant")) !=
+                        (float(cluster_q) <= alpha)):
+                    return False
             if ("family_fdr_significant" in checks and
                     bool(checks["family_fdr_significant"]) != (family_q <= alpha)):
                 return False
@@ -2480,6 +2502,14 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 control=envelope.get("control") or {},
                 p_value=float(statistics.get("p_value")), q_value=global_q,
                 family_q_value=family_q, alpha=alpha,
+                cluster_q_value=(statistics.get("cluster_q_value")
+                                 if isinstance(statistics.get("cluster_q_value"),
+                                                (int, float)) and
+                                 not isinstance(statistics.get("cluster_q_value"), bool)
+                                 else None),
+                cluster_multiple_tests=(cluster_tests
+                                        if isinstance(cluster_tests, Mapping)
+                                        else None),
                 falsification=envelope.get("falsification") or {},
                 separation=envelope.get("separation") or {},
                 checks=checks, passes=bool(envelope.get("passes")),

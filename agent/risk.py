@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 from collections.abc import Mapping
 
 from .instruments import validate_equity_symbol, validate_option_symbol
+from .contracts.rule import RULE_SCHEMA_V3
 from research.costs import (CostError, STRESSED_COST_BASIS,
                             STRESSED_COST_SCHEMA, stressed_cost_usd)
 
@@ -569,6 +570,15 @@ class RiskEngine:
         strategy_cfg = self.cfg.get("strategy", {}) if isinstance(self.cfg, Mapping) else {}
         profile = str(decision.get("execution_profile", decision.get(
             "profile", strategy_cfg.get("execution_profile", "shares")))).lower()
+        if (profile in {"options", "option", "defined_risk_options",
+                        "options_defined_risk"} and
+                str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3):
+            return None, "rule-strategy.v3 is not executable for options"
+        v3_signal_ts = None
+        if str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3:
+            v3_signal_ts = _num(decision.get("signal_ts"))
+            if v3_signal_ts is None or v3_signal_ts < 0:
+                return None, "rule-strategy.v3 signal timestamp is unavailable"
         try:
             budget = self._risk_usd(equity, decision)
         except ValueError as exc:
@@ -628,6 +638,14 @@ class RiskEngine:
                      "max_hold_bars": decision.get("max_hold_bars"),
                      "hold_deadline_ts": decision.get("hold_deadline_ts"),
                      "underlying_stop_price": stop, "underlying_target_price": target})
+        if str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3:
+            plan.update({
+                "rule_schema": RULE_SCHEMA_V3,
+                "breakeven_r": decision.get("breakeven_r"),
+                # The completed-bar runtime must exclude the signal bar and
+                # start from the same next bar used by research replay.
+                "signal_ts": v3_signal_ts,
+            })
         plan, cost_reason = self.check_stressed_cost(plan, cfg=cost_cfg)
         if plan is None:
             return None, cost_reason

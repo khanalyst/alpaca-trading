@@ -520,6 +520,11 @@ class Order:
     # Bracket child legs, provider-neutral and already normalized.
     legs: tuple[Mapping[str, Any], ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    # Alpaca replacement-chain ids.  They are durable reconciliation evidence:
+    # a process can recover the new live stop even if it died after the broker
+    # accepted a replacement but before local state stored the response.
+    replaces: str | None = None
+    replaced_by: str | None = None
 
 
 @dataclass(frozen=True)

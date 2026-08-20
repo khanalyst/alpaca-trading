@@ -292,12 +292,13 @@ explicit `ALPACA_RESEARCH_VEHICLES=all` override runs both lanes. Missing,
 stale, or insufficient calibration blocks shadow authorization while leaving
 offline discovery/factory diagnostics available.
 
-For a genuinely empty journal, an operator may explicitly set
-`ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1` for the first cycle. This
-persists `calibration_state=bootstrap_unknown` with
-`authorization_exit_code=2`, allowing shadow evidence collection without
-claiming measured execution calibration. Existing, thin, or mixed-vehicle
-history remains blocked.
+Compose defaults the genuinely empty-journal path to
+`ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1`. It persists
+`calibration_state=bootstrap_unknown` with `authorization_exit_code=2`,
+allowing shadow evidence collection without claiming measured execution
+calibration or authorizing production. Set it to `0` to require measured
+calibration before shadow ingestion. Existing, thin, or mixed-vehicle history
+remains blocked.
 
 ## 8. Export deployment paths and validate Compose
 

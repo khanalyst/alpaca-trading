@@ -551,11 +551,22 @@ requires reviewed OPRA evidence and controls. The dashboard reports proved
 option edges that the default `shares` runtime cannot execute, so that evidence
 is visible rather than silently discarded.
 
-When the journal is truly empty, the first cycle can be explicitly bootstrapped
-with `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1`. The persisted
+Compose defaults a truly empty journal to
+`ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1`. The persisted
 `bootstrap_unknown` state keeps `authorization_exit_code=2`: it only permits
-shadow evidence collection and never claims measured execution calibration.
+shadow evidence collection and never claims measured execution calibration or
+authorizes production. Set the variable to `0` to require measured calibration.
 Existing, thin, mixed-vehicle, stale, or optimistic history remains blocked.
+
+ShadowRunner writes `replay_quarantine` metadata for each incomplete or
+mismatched candidate/session replay. A blocked `stale_tail` includes the
+session and source/shadow/replay digests. Repair the recorder input and run a
+bounded replay (`docker compose run --rm --no-deps shadow --once`); all paired
+arms must replay the exact session before the entry is durably marked
+`repaired`. Until then `edge ingest-shadow` leaves its boundary and FDR state
+unchanged. An authoritative recorder-calendar gap is reported as
+`missing_sessions`; a missing/stale calendar is `catalog_unavailable`/unknown.
+Both are likewise non-authorizing and never inferred from weekdays.
 
 A slot whose hypothesis proves an edge is reseeded with a new hypothesis in the
 same cycle, so logical research capacity stays constant instead of shrinking

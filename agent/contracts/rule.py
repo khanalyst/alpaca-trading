@@ -8,6 +8,7 @@ every signal is evaluated from completed bars only.
 from __future__ import annotations
 
 from datetime import datetime, time, timezone
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import hashlib
 import json
 import math
@@ -20,7 +21,8 @@ from . import register
 
 RULE_SCHEMA_V1 = "rule-strategy.v1"
 RULE_SCHEMA_V2 = "rule-strategy.v2"
-RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2)
+RULE_SCHEMA_V3 = "rule-strategy.v3"
+RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3)
 # ``RULE_SCHEMA`` remains the v1 name so existing callers, stored specs, and
 # content hashes are untouched.  v2 is a strict superset reached only by
 # writing its schema string explicitly.
@@ -108,6 +110,16 @@ _V2_BOUNDS = {
     "entry_before_minutes": (1, SESSION_MINUTES, int),
     "min_atr_bps": (0.0, 2_000.0, float),
     "max_atr_bps": (1.0, 5_000.0, float),
+}
+# v3 is the first exit-side grammar extension.  ``None`` is deliberately the
+# neutral default: merely upgrading a stored rule to v3 does not move a stop,
+# while a finite value arms a move to the actual fill price after a completed
+# close reaches that many units of the position's initial fill-to-stop risk.
+V3_DEFAULT_EXTENSIONS: dict[str, Any] = {
+    "breakeven_r": None,
+}
+_V3_BOUNDS = {
+    "breakeven_r": (0.0, 10.0, float),
 }
 _EXTRA_CONFIRMATIONS = tuple(name for name in CONFIRMATIONS if name != "none")
 MAX_CONFIRMATIONS = len(_EXTRA_CONFIRMATIONS)
@@ -201,6 +213,8 @@ def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
         fields.add("volume_multiplier")
     if "volatility" in confirmations:
         fields.update(("atr_period", "compression_bps"))
+    if spec.get("breakeven_r") is not None:
+        fields.add("breakeven_r")
     return fields
 
 
@@ -216,8 +230,13 @@ def rule_semantic_signature(value: Mapping[str, Any]) -> str:
     spec = validate_rule_spec(value)
     effective = {name: spec[name] for name in _semantic_fields(spec)
                  if name in spec}
-    if spec.get("schema") == RULE_SCHEMA_V2:
+    if spec.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
         for name, default in V2_DEFAULT_EXTENSIONS.items():
+            current = spec.get(name, default)
+            if current != default:
+                effective[name] = current
+    if spec.get("schema") == RULE_SCHEMA_V3:
+        for name, default in V3_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
                 effective[name] = current
@@ -238,9 +257,12 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
         return 1.0
     distance = 0.0
     dimensions = 0
-    bounds = {**_BOUNDS, **_V2_BOUNDS}
+    bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS}
     fields = _semantic_fields(a) | _semantic_fields(b)
     for name, default in V2_DEFAULT_EXTENSIONS.items():
+        if a.get(name, default) != default or b.get(name, default) != default:
+            fields.add(name)
+    for name, default in V3_DEFAULT_EXTENSIONS.items():
         if a.get(name, default) != default or b.get(name, default) != default:
             fields.add(name)
     for name in sorted(fields):
@@ -282,7 +304,7 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             "confirmation": {"type": "string", "enum": list(CONFIRMATIONS)},
         }
         required = list(DEFAULT_RULE_SPEC)
-        if name == RULE_SCHEMA_V2:
+        if name in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
             properties.update({
                 "confirmations": {"type": "array", "maxItems": MAX_CONFIRMATIONS,
                                   "uniqueItems": True,
@@ -295,6 +317,11 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
                 "max_atr_bps": {"type": "number", "minimum": 1.0, "maximum": 5000.0},
             })
             required += list(V2_DEFAULT_EXTENSIONS)
+        if name == RULE_SCHEMA_V3:
+            properties["breakeven_r"] = {
+                "type": ["number", "null"], "minimum": 0.0, "maximum": 10.0,
+            }
+            required += list(V3_DEFAULT_EXTENSIONS)
         return {"type": "object", "additionalProperties": False,
                 "required": required, "properties": properties}
 
@@ -336,20 +363,29 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         raise RuleSpecError(
             f"rule_spec.schema must be one of {', '.join(map(repr, RULE_SCHEMAS))}")
     permitted = set(DEFAULT_RULE_SPEC)
-    if schema == RULE_SCHEMA_V2:
+    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
         permitted |= set(V2_DEFAULT_EXTENSIONS)
+    if schema == RULE_SCHEMA_V3:
+        permitted |= set(V3_DEFAULT_EXTENSIONS)
     unknown = sorted(set(value) - permitted)
     if unknown:
         # A v1 spec naming a v2 field is a version error, not a typo: say so.
-        extensions = [name for name in unknown if name in V2_DEFAULT_EXTENSIONS]
-        if extensions:
+        v3_extensions = [name for name in unknown if name in V3_DEFAULT_EXTENSIONS]
+        if v3_extensions:
             raise RuleSpecError(
-                f"rule_spec field(s) {', '.join(extensions)} require "
+                f"rule_spec field(s) {', '.join(v3_extensions)} require "
+                f"schema {RULE_SCHEMA_V3!r}")
+        v2_extensions = [name for name in unknown if name in V2_DEFAULT_EXTENSIONS]
+        if v2_extensions:
+            raise RuleSpecError(
+                f"rule_spec field(s) {', '.join(v2_extensions)} require "
                 f"schema {RULE_SCHEMA_V2!r}")
         raise RuleSpecError(f"rule_spec has unknown field(s): {', '.join(unknown)}")
     spec = dict(DEFAULT_RULE_SPEC)
-    if schema == RULE_SCHEMA_V2:
+    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
         spec.update(V2_DEFAULT_EXTENSIONS)
+    if schema == RULE_SCHEMA_V3:
+        spec.update(V3_DEFAULT_EXTENSIONS)
     spec.update(value)
     spec["schema"] = schema
     if spec.get("family") not in RULE_FAMILIES:
@@ -375,7 +411,7 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         spec[name] = number
     if spec["slow_lookback"] <= spec["lookback"]:
         raise RuleSpecError("rule_spec.slow_lookback must exceed lookback")
-    if schema != RULE_SCHEMA_V2:
+    if schema == RULE_SCHEMA_V1:
         return spec
     spec["confirmations"] = _validate_confirmations(spec["confirmations"])
     for name, (lower, upper, cast) in _V2_BOUNDS.items():
@@ -397,6 +433,24 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
             "rule_spec.entry_before_minutes must exceed entry_after_minutes")
     if spec["max_atr_bps"] <= spec["min_atr_bps"]:
         raise RuleSpecError("rule_spec.max_atr_bps must exceed min_atr_bps")
+    if schema == RULE_SCHEMA_V2:
+        return spec
+    breakeven = spec.get("breakeven_r")
+    if breakeven is None:
+        return spec
+    if isinstance(breakeven, bool):
+        raise RuleSpecError("rule_spec.breakeven_r has an invalid type")
+    lower, upper, cast = _V3_BOUNDS["breakeven_r"]
+    try:
+        breakeven = cast(breakeven)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuleSpecError("rule_spec.breakeven_r must be numeric or null") from exc
+    if not math.isfinite(breakeven) or not lower <= breakeven <= upper:
+        raise RuleSpecError(
+            f"rule_spec.breakeven_r must be between {lower:g} and {upper:g}, or null")
+    if breakeven >= float(spec["target_r"]):
+        raise RuleSpecError("rule_spec.breakeven_r must be below target_r")
+    spec["breakeven_r"] = breakeven
     return spec
 
 
@@ -439,6 +493,229 @@ def _epoch(value: Any, field: str) -> float:
     if not math.isfinite(number):
         raise RuleSpecError(f"{field} must be finite")
     return number
+
+
+def _exit_number(value: Any, field: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool):
+        raise RuleSpecError(f"{field} must be numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuleSpecError(f"{field} must be numeric") from exc
+    if not math.isfinite(number) or (positive and number <= 0):
+        qualifier = "finite and positive" if positive else "finite"
+        raise RuleSpecError(f"{field} must be {qualifier}")
+    return number
+
+
+def initialize_exit_state(direction: str, entry_price: Any, stop_price: Any,
+                          target_price: Any, *, breakeven_r: Any = None) -> dict[str, Any]:
+    """Return the canonical durable state for one bounded rule exit.
+
+    The entry is the actual fill anchor.  The authored/resting initial stop is
+    retained separately from the active stop so a later breakeven amendment
+    never rewrites the risk unit that armed it.
+    """
+    direction = str(direction or "").lower()
+    if direction not in {"long", "short"}:
+        raise RuleSpecError("exit direction must be long or short")
+    entry = _exit_number(entry_price, "exit entry_price", positive=True)
+    stop = _exit_number(stop_price, "exit stop_price", positive=True)
+    target = _exit_number(target_price, "exit target_price", positive=True)
+    if ((direction == "long" and not stop < target) or
+            (direction == "short" and not target < stop)):
+        raise RuleSpecError("exit stop/entry/target geometry is invalid")
+    if breakeven_r is not None:
+        breakeven = _exit_number(breakeven_r, "exit breakeven_r")
+        lower, upper, _cast = _V3_BOUNDS["breakeven_r"]
+        if not lower <= breakeven <= upper:
+            raise RuleSpecError(
+                f"exit breakeven_r must be between {lower:g} and {upper:g}, or null")
+    else:
+        breakeven = None
+    return {
+        "direction": direction,
+        "entry_price": entry,
+        "initial_stop_price": stop,
+        "active_stop_price": stop,
+        "target_price": target,
+        "initial_risk": abs(entry - stop),
+        "breakeven_r": breakeven,
+        "breakeven_armed_at": None,
+        "breakeven_armed_epoch": None,
+        "entry_bar_pending": True,
+        "last_completed_bar_at": None,
+        "last_completed_bar_epoch": None,
+    }
+
+
+def breakeven_stop_price(entry_price: Any, direction: str) -> float:
+    """Return the broker-valid equity tick nearest entry without crossing it."""
+    direction = str(direction or "").lower()
+    if direction not in {"long", "short"}:
+        raise RuleSpecError("breakeven direction must be long or short")
+    entry = Decimal(str(_exit_number(
+        entry_price, "breakeven entry_price", positive=True)))
+    increment = Decimal("0.01") if entry >= Decimal("1") else Decimal("0.0001")
+    rounding = ROUND_FLOOR if direction == "long" else ROUND_CEILING
+    price = entry.quantize(increment, rounding=rounding)
+    if entry < Decimal("1") <= price:
+        price = price.quantize(Decimal("0.01"), rounding=rounding)
+    if price <= 0:
+        raise RuleSpecError("breakeven stop price must be positive")
+    return float(price)
+
+
+def _exit_bar_time(row: Any) -> tuple[float, float]:
+    opened = _timestamp(row)
+    if opened is None:
+        raise RuleSpecError("completed exit bar timestamp is unavailable")
+    opened_epoch = opened.timestamp()
+    raw_end = _value(row, "end", None)
+    if raw_end is None:
+        end_epoch = opened_epoch + BAR_SECONDS
+    else:
+        if isinstance(raw_end, datetime):
+            ended = raw_end if raw_end.tzinfo else raw_end.replace(tzinfo=timezone.utc)
+        else:
+            try:
+                text = str(raw_end)
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                ended = datetime.fromisoformat(text)
+                if ended.tzinfo is None:
+                    ended = ended.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError) as exc:
+                raise RuleSpecError("completed exit bar end is invalid") from exc
+        end_epoch = ended.timestamp()
+    if not math.isfinite(end_epoch) or end_epoch <= opened_epoch:
+        raise RuleSpecError("completed exit bar end must follow its open")
+    return opened_epoch, end_epoch
+
+
+def completed_bar_exit_transition(state: Mapping[str, Any], bar: Any) -> dict[str, Any]:
+    """Advance one exit from one completed OHLC bar without side effects.
+
+    Ordering is the executable contract: gap checks first, then the intrabar
+    range with stop winning an unknowable two-sided path, then (only if still
+    open) a completed-close breakeven arm whose new stop applies next bar.
+    """
+    if not isinstance(state, Mapping):
+        raise RuleSpecError("exit state must be a mapping")
+    direction = str(state.get("direction") or "").lower()
+    entry = _exit_number(state.get("entry_price"), "exit entry_price", positive=True)
+    initial_stop = _exit_number(
+        state.get("initial_stop_price", state.get("stop_price")),
+        "exit initial_stop_price", positive=True)
+    active_stop = _exit_number(
+        state.get("active_stop_price", initial_stop),
+        "exit active_stop_price", positive=True)
+    target = _exit_number(state.get("target_price"), "exit target_price", positive=True)
+    entry_pending = bool(state.get("entry_bar_pending", False))
+    if direction == "long":
+        valid = (initial_stop < target and active_stop < target and
+                 (entry_pending or active_stop <= entry < target))
+    elif direction == "short":
+        valid = (target < initial_stop and target < active_stop and
+                 (entry_pending or target < entry <= active_stop))
+    else:
+        valid = False
+    if not valid:
+        raise RuleSpecError("exit state geometry is invalid")
+    initial_risk = abs(entry - initial_stop)
+    breakeven = state.get("breakeven_r")
+    if breakeven is not None:
+        breakeven = _exit_number(breakeven, "exit breakeven_r")
+        lower, upper, _cast = _V3_BOUNDS["breakeven_r"]
+        if not lower <= breakeven <= upper:
+            raise RuleSpecError(
+                f"exit breakeven_r must be between {lower:g} and {upper:g}, or null")
+    opened_epoch, end_epoch = _exit_bar_time(bar)
+    previous_epoch = state.get("last_completed_bar_epoch")
+    if previous_epoch is not None:
+        previous_epoch = _exit_number(previous_epoch, "last completed bar epoch")
+        if end_epoch < previous_epoch - 1e-9:
+            raise RuleSpecError("completed exit bars are out of order")
+        if abs(end_epoch - previous_epoch) <= 1e-9:
+            return {"state": dict(state), "exit": None,
+                    "stop_changed": False, "duplicate": True}
+    opened = _exit_number(_value(bar, "open"), "completed exit bar open", positive=True)
+    high = _exit_number(_value(bar, "high"), "completed exit bar high", positive=True)
+    low = _exit_number(_value(bar, "low"), "completed exit bar low", positive=True)
+    close = _exit_number(_value(bar, "close"), "completed exit bar close", positive=True)
+    if low > min(opened, close) or high < max(opened, close) or high < low:
+        raise RuleSpecError("completed exit bar OHLC is invalid")
+
+    updated = dict(state)
+    updated.update({
+        "direction": direction, "entry_price": entry,
+        "initial_stop_price": initial_stop, "active_stop_price": active_stop,
+        "target_price": target, "initial_risk": initial_risk,
+        "breakeven_r": breakeven,
+        "entry_bar_pending": False,
+        "last_completed_bar_at": datetime.fromtimestamp(
+            end_epoch, timezone.utc).isoformat(),
+        "last_completed_bar_epoch": end_epoch,
+    })
+    if direction == "long":
+        gap_stop, gap_target = opened <= active_stop, opened >= target
+        hit_stop, hit_target = low <= active_stop, high >= target
+    else:
+        gap_stop, gap_target = opened >= active_stop, opened <= target
+        hit_stop, hit_target = high >= active_stop, low <= target
+    exit_row = None
+    if state.get("entry_bar_pending", False):
+        if direction == "long":
+            fill_stop, fill_target = entry <= active_stop, entry >= target
+        else:
+            fill_stop, fill_target = entry >= active_stop, entry <= target
+        if fill_stop or fill_target:
+            exit_row = {
+                "reason": "stop" if fill_stop else "target",
+                "price": entry, "gapped": True, "entry_gap": True,
+                "tie_broken": bool(fill_stop and fill_target),
+                "bar_start_epoch": opened_epoch, "bar_end_epoch": end_epoch,
+            }
+    if exit_row is None and initial_risk <= 0:
+        raise RuleSpecError("exit initial risk must be positive")
+    if exit_row is None and (gap_stop or gap_target):
+        reason = "stop" if gap_stop else "target"
+        exit_row = {
+            "reason": reason, "price": opened, "gapped": True,
+            "entry_gap": False,
+            "tie_broken": bool(gap_stop and gap_target),
+            "bar_start_epoch": opened_epoch, "bar_end_epoch": end_epoch,
+        }
+    elif exit_row is None and (hit_stop or hit_target):
+        reason = "stop" if hit_stop else "target"
+        exit_row = {
+            "reason": reason,
+            "price": active_stop if hit_stop else target,
+            "gapped": False, "entry_gap": False,
+            "tie_broken": bool(hit_stop and hit_target),
+            "bar_start_epoch": opened_epoch, "bar_end_epoch": end_epoch,
+        }
+    stop_changed = False
+    if exit_row is None and breakeven is not None and not state.get(
+            "breakeven_armed_epoch"):
+        trigger = (entry + initial_risk * breakeven if direction == "long" else
+                   entry - initial_risk * breakeven)
+        reached = close >= trigger if direction == "long" else close <= trigger
+        if reached:
+            updated["active_stop_price"] = breakeven_stop_price(entry, direction)
+            updated["breakeven_armed_at"] = datetime.fromtimestamp(
+                end_epoch, timezone.utc).isoformat()
+            updated["breakeven_armed_epoch"] = end_epoch
+            stop_changed = active_stop != updated["active_stop_price"]
+    return {"state": updated, "exit": exit_row,
+            "stop_changed": stop_changed, "duplicate": False}
+
+
+def rule_vehicle_executable(spec: Mapping[str, Any], vehicle: str) -> bool:
+    """Whether research/runtime possess a parity-safe execution path."""
+    normalized = validate_rule_spec(spec)
+    return not (normalized["schema"] == RULE_SCHEMA_V3 and
+                str(vehicle or "").lower() in {"option", "options"})
 
 
 def rule_spec_hash(value: Mapping[str, Any]) -> str:
@@ -511,7 +788,7 @@ def _session_minutes(stamp: datetime) -> float:
 
 
 def _within_entry_window(spec: Mapping[str, Any], stamp: datetime) -> bool:
-    if spec.get("schema") != RULE_SCHEMA_V2:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
         return True
     elapsed = _session_minutes(stamp)
     return (float(spec["entry_after_minutes"]) <= elapsed <
@@ -520,7 +797,7 @@ def _within_entry_window(spec: Mapping[str, Any], stamp: datetime) -> bool:
 
 def _within_volatility_band(spec: Mapping[str, Any], atr: float,
                             close: float) -> bool:
-    if spec.get("schema") != RULE_SCHEMA_V2:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
         return True
     if close <= 0:
         return False
@@ -784,7 +1061,7 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
         return None
     if not _within_entry_window(spec, stamp):
         return None
-    return {
+    result = {
         "direction": direction,
         "setup_type": f"rule_{family}",
         "family": family,
@@ -799,6 +1076,12 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
         "rule_spec_hash": rule_spec_hash(spec),
         "confidence": 1.0,
     }
+    if spec["schema"] == RULE_SCHEMA_V3:
+        result.update({
+            "rule_schema": RULE_SCHEMA_V3,
+            "breakeven_r": spec.get("breakeven_r"),
+        })
+    return result
 
 
 def evaluate_rule_signal_metadata(rows: Sequence[Any],
@@ -882,14 +1165,18 @@ __all__ = [
     "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
     "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
-           "RULE_SCHEMA_V2", "SESSION_MINUTES", "V2_DEFAULT_EXTENSIONS",
+           "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "SESSION_MINUTES",
+           "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS",
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "feature_window_bars", "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",
-    "RuleSpecError", "evaluate_rule_signal", "evaluate_rule_signal_metadata",
+    "RuleSpecError", "breakeven_stop_price", "completed_bar_exit_transition",
+    "evaluate_rule_signal",
+    "evaluate_rule_signal_metadata", "initialize_exit_state",
     "rule_signal_metadata",
     "generate_rule_signal", "hold_deadline", "rule_spec_hash",
-    "rule_variant_id", "setup_evidence", "validate_rule_spec",
+    "rule_variant_id", "rule_vehicle_executable", "setup_evidence",
+    "validate_rule_spec",
 ]
 
 

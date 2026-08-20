@@ -26,7 +26,10 @@ from .edge_lab import _strengthen_gate
 from .edge_ledger import EdgeLedger, VEHICLES, provenance_hash
 from .edge_ledger_store import REPLAY_ENGINE_EPOCH, content_hash
 from .gates import sample_counts, verify_gate_envelope, validate_protocol_floor
-from .live_shadow import ShadowError, ShadowStore, _opportunity_capacity
+from .live_shadow import (
+    REPLAY_QUARANTINE_OVERFLOW_KEY, ShadowError, ShadowStore,
+    _opportunity_capacity,
+)
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from .factory_ledger import FDR_METHOD, FactoryLedger
 from .stats import benjamini_hochberg
@@ -274,6 +277,37 @@ def _rows_for(store: ShadowStore, candidate_id: str, sessions: Sequence[str],
                 return [], f"session {day} contains a cross-vehicle row"
             rows.append(dict(row))
     return rows, None
+
+
+def _session_continuity(store: ShadowStore, boundary: str,
+                        available: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Return (missing, unknown) sessions from exact recorder provenance.
+
+    The shadow WAL carries a monotonic catalog populated from the recorder's
+    Alpaca calendar sidecar.  It is intentionally not synthesized from
+    weekdays or timestamps.  Once a newer catalog-backed session is present,
+    an available session absent from that catalog is also unknown and blocks
+    authorization until the operator repairs/replays the source.
+    """
+    catalog = store.session_catalog()
+    authoritative = sorted(
+        str(session) for session, detail in catalog.items()
+        if str(session) > str(boundary)
+        and isinstance(detail, Mapping)
+        and str(detail.get("source") or "") == "recorder_alpaca_calendar")
+    if not authoritative:
+        observed = {str(session) for session in available if str(session) > str(boundary)}
+        return [], sorted(observed)
+    observed = {str(session) for session in available if str(session) > str(boundary)}
+    authoritative_set = set(authoritative)
+    observed_catalog = observed & authoritative_set
+    if not observed_catalog:
+        return [], sorted(observed)
+    newest = max(observed_catalog)
+    missing = [session for session in authoritative
+               if session <= newest and session not in observed]
+    unknown = sorted(session for session in observed if session not in authoritative_set)
+    return missing, unknown
 
 
 def _preflight_ready(gate: Mapping[str, Any]) -> tuple[bool, dict[str, bool]]:
@@ -639,6 +673,102 @@ class ShadowIngestor:
                     "stale_tail": {"status": "stale" if stale_sessions else "clear",
                                    "sessions": stale_sessions,
                                    "unknown_sessions": []}}
+        catalog = self.store.session_catalog()
+        replay_quarantine = self.store.replay_quarantine()
+        overflow = replay_quarantine.get(REPLAY_QUARANTINE_OVERFLOW_KEY)
+        if isinstance(overflow, Mapping) and str(overflow.get("status") or "") == "overflow":
+            return {
+                "candidate_id": candidate_id,
+                "status": "repair_required",
+                "reason": "replay quarantine overflow requires operator rebuild",
+                "quarantine_overflow": True,
+                "repair_required": [dict(overflow)],
+                "ingested": False,
+                "boundary": boundary,
+                "sessions": available,
+                "stale_tail": {
+                    "status": "blocked",
+                    "reason": "replay_quarantine_overflow",
+                    "quarantine_overflow": True,
+                    "active_count": overflow.get("active_count"),
+                    "active_digest": overflow.get("active_digest"),
+                },
+            }
+        if not catalog:
+            return {
+                "candidate_id": candidate_id,
+                "status": "incomplete",
+                "reason": "authoritative recorder session catalog unavailable",
+                "catalog_unavailable": True,
+                "ingested": False,
+                "boundary": boundary,
+                "sessions": available,
+                "stale_tail": {
+                    "status": "blocked",
+                    "reason": "catalog_unavailable",
+                    "catalog_unavailable": True,
+                },
+            }
+        missing_sessions, unknown_catalog_sessions = _session_continuity(
+            self.store, boundary, available)
+        if missing_sessions or unknown_catalog_sessions:
+            return {
+                "candidate_id": candidate_id,
+                "status": "incomplete",
+                "reason": ("authoritative recorder calendar has an unobserved "
+                           "mid-tail session" if missing_sessions else
+                           "available replay session lacks authoritative calendar "
+                           "provenance: " + ", ".join(
+                               f"session {session}" for session in unknown_catalog_sessions)),
+                "ingested": False,
+                "boundary": boundary,
+                "sessions": available,
+                "missing_sessions": missing_sessions,
+                "unknown_sessions": unknown_catalog_sessions,
+                "stale_tail": {
+                    "status": "blocked",
+                    "missing_sessions": missing_sessions,
+                    "unknown_sessions": unknown_catalog_sessions,
+                    "reason": "authoritative_session_continuity_gap",
+                },
+            }
+        # A prior incomplete/mismatched replay is a durable repair boundary,
+        # not a reason to discard that session and continue with a newer tail.
+        # ShadowRunner changes the entry to ``repaired`` only after a complete
+        # parity replay; until then no gate/FDR/boundary mutation is allowed.
+        required_arm_ids = {
+            "candidate": candidate_id,
+            "baseline": baseline_id,
+            "null": null_id,
+        }
+        repair_required: list[dict[str, Any]] = []
+        for day in available:
+            for arm, arm_id in required_arm_ids.items():
+                for detail in replay_quarantine.values():
+                    if not isinstance(detail, Mapping):
+                        continue
+                    if (str(detail.get("candidate_id") or "") == str(arm_id) and
+                            str(detail.get("session_date") or "") == day and
+                            str(detail.get("status") or "") != "repaired"):
+                        repair_required.append({**dict(detail), "arm": arm})
+        if repair_required:
+            repair_required.sort(key=lambda item: str(item.get("session_date") or ""))
+            return {
+                "candidate_id": candidate_id,
+                "status": "repair_required",
+                "reason": ("mid-tail replay session is quarantined; repair and "
+                           "replay it before authorization can advance"),
+                "ingested": False,
+                "boundary": boundary,
+                "sessions": available,
+                "repair_required": repair_required,
+                "stale_tail": {
+                    "status": "blocked",
+                    "sessions": [str(item.get("session_date") or "")
+                                 for item in repair_required],
+                    "reason": "replay_repair_required",
+                },
+            }
         selection_sessions, confirmatory_sessions = _split_sessions(
             available, self.config.min_sessions)
         if not selection_sessions or not confirmatory_sessions:

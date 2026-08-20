@@ -63,6 +63,18 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.ledger.transition(self.candidate["candidate_id"], "backtest_passed",
                                reason="backtest proof")
         self.store = ShadowStore(self.shadow_path)
+        # Ingestion requires recorder-owned calendar provenance; these compact
+        # fixtures model sixteen completed exchange sessions explicitly rather
+        # than inferring weekdays.
+        self.store.save_session_catalog({
+            session: {
+                "session_date": session,
+                "open": f"{session}T14:30:00+00:00",
+                "close": f"{session}T21:00:00+00:00",
+                "source": "recorder_alpaca_calendar",
+            }
+            for session in (f"2024-04-{day:02d}" for day in range(1, 17))
+        })
 
     def tearDown(self):
         self.tmp.cleanup()

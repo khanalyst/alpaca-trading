@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import random
 import sqlite3
+import time
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -38,7 +39,8 @@ from .edge_discovery_core import (corpus_slice, null_control_account,
                                   validate_worker_projection)
 from .factory_ledger import (
     ACTIVE_HYPOTHESIS_STATES, FACTORY_SCHEMA, FACTORY_STATUSES, FactoryError,
-    FactoryLedger, deferred_fdr, experiment_identity, experiment_provenance,
+    FactoryLedger, deferred_fdr, dependence_policy_digest, experiment_identity,
+    experiment_provenance,
 )
 from .gates import (chronological_split, heldout_separation,
                     expectancy_rejection_report,
@@ -458,8 +460,33 @@ def _failed_variants(factory: FactoryLedger, *, vehicle: str,
 def _variant_keys(spec: Mapping[str, Any]) -> set[str]:
     """Exact and semantic ids used by all discovery lanes."""
     normalized = validate_rule_spec(spec)
+    # Content-addressed variant ids remain immutable.  The additional
+    # behaviour key is only a comparison aid: v1's single legacy
+    # ``confirmation`` and v2's ``confirmations`` list can encode the same
+    # executable predicate and must not buy a second experiment.
     return {rule_variant_id(normalized),
-            f"semantic:{rule_semantic_signature(normalized)}"}
+            f"semantic:{rule_semantic_signature(normalized)}",
+            f"behavior:{_behavior_signature(normalized)}"}
+
+
+def _behavior_signature(spec: Mapping[str, Any]) -> str:
+    """Canonical executable signature across legacy/v2 grammar aliases."""
+    normalized = validate_rule_spec(spec)
+    confirmations = {str(normalized.get("confirmation") or "none")}
+    confirmations.update(str(item) for item in normalized.get("confirmations") or ())
+    confirmations.discard("none")
+    try:
+        effective = json.loads(rule_semantic_signature(normalized))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        effective = {}
+    # ``confirmation`` and ``confirmations`` are two spellings of one
+    # predicate set; remove both before inserting the canonical set.  Schema
+    # and explicit v2 defaults are intentionally absent from this identity.
+    effective.pop("confirmation", None)
+    effective.pop("confirmations", None)
+    effective["confirmations"] = sorted(confirmations)
+    return json.dumps(effective, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
 
 
 def _variant_seen(spec: Mapping[str, Any], seen: set[str]) -> bool:
@@ -497,12 +524,59 @@ def _semantic_duplicate(spec: Mapping[str, Any],
             continue
         if normalized.get("family") != other.get("family"):
             continue
-        if rule_semantic_distance(normalized, other) <= threshold:
+        if _behavior_signature(normalized) == _behavior_signature(other):
+            return True
+        if _behavior_distance(normalized, other) <= threshold:
             return True
     return False
 
 
-def structure_signature(spec: Mapping[str, Any]) -> dict[str, Any]:
+def _behavior_distance(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
+    """Distance with one canonical confirmation/topology representation."""
+    a, b = validate_rule_spec(left), validate_rule_spec(right)
+    if a.get("family") != b.get("family"):
+        return 1.0
+    # The contract's distance is correct for ordinary numeric axes, but it
+    # treats the legacy confirmation field and v2 list as separate dimensions.
+    # Replace that pair with one categorical axis while retaining the audited
+    # normalization for every other executable field.
+    try:
+        fields = set(json.loads(rule_semantic_signature(a))) | set(
+            json.loads(rule_semantic_signature(b)))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return rule_semantic_distance(a, b)
+    fields.discard("confirmation")
+    fields.discard("confirmations")
+    dimensions = len(fields) + 1
+    distance = 0.0
+    bounds = {"lookback": (3.0, 120.0), "slow_lookback": (5.0, 240.0),
+              "range_minutes": (3.0, 120.0), "threshold_bps": (0.0, 500.0),
+              "compression_bps": (1.0, 2000.0), "zscore": (.25, 5.0),
+              "volume_multiplier": (.25, 10.0), "atr_period": (3.0, 100.0),
+              "stop_atr": (.2, 10.0), "target_r": (.25, 10.0),
+              "max_hold_bars": (1.0, 390.0),
+              "entry_after_minutes": (0.0, 389.0),
+              "entry_before_minutes": (1.0, 390.0),
+              "min_atr_bps": (0.0, 2000.0), "max_atr_bps": (1.0, 5000.0)}
+    for name in sorted(fields):
+        av, bv = a.get(name), b.get(name)
+        if name in bounds and isinstance(av, (int, float)) and isinstance(bv, (int, float)):
+            low, high = bounds[name]
+            distance += min(1.0, abs(float(av) - float(bv)) / max(high - low, 1.0))
+        else:
+            distance += 0.0 if av == bv else 1.0
+    left_confirmations = set(str(a.get("confirmation") or "none") for _ in (0,))
+    left_confirmations.update(str(item) for item in a.get("confirmations") or ())
+    right_confirmations = set(str(b.get("confirmation") or "none") for _ in (0,))
+    right_confirmations.update(str(item) for item in b.get("confirmations") or ())
+    left_confirmations.discard("none")
+    right_confirmations.discard("none")
+    distance += 0.0 if left_confirmations == right_confirmations else 1.0
+    return distance / max(dimensions, 1)
+
+
+def structure_signature(spec: Mapping[str, Any],
+                        comparison: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return a policy-neutral executable structure summary.
 
     The signature intentionally excludes values of ordinary numeric tuning
@@ -511,21 +585,42 @@ def structure_signature(spec: Mapping[str, Any]) -> dict[str, Any]:
     without baking a policy verdict into the identity hash.
     """
     normalized = validate_rule_spec(spec)
-    conditional = {
-        "confirmations": tuple(normalized.get("confirmations") or ()),
-        "entry_window": (normalized.get("entry_after_minutes"),
-                          normalized.get("entry_before_minutes")),
-        "atr_band": (normalized.get("min_atr_bps"), normalized.get("max_atr_bps")),
-    }
     defaults = V2_DEFAULT_EXTENSIONS
+    conditional = {
+        "confirmations": tuple(sorted(set(
+            [str(normalized.get("confirmation") or "none"),
+             *(str(item) for item in normalized.get("confirmations") or ())]) - {"none"})),
+        "entry_window": (normalized.get("entry_after_minutes",
+                                        defaults["entry_after_minutes"]),
+                          normalized.get("entry_before_minutes",
+                                        defaults["entry_before_minutes"])),
+        "atr_band": (normalized.get("min_atr_bps", defaults["min_atr_bps"]),
+                      normalized.get("max_atr_bps", defaults["max_atr_bps"])),
+    }
     active_axes = []
-    if conditional["confirmations"]:
+    prior = validate_rule_spec(comparison) if isinstance(comparison, Mapping) else None
+    prior_confirmations = None
+    if prior is not None:
+        prior_confirmations = tuple(sorted(set(
+            [str(prior.get("confirmation") or "none"),
+             *(str(item) for item in prior.get("confirmations") or ())]) - {"none"}))
+    if ((prior_confirmations is None and conditional["confirmations"]) or
+            (prior_confirmations is not None and
+             conditional["confirmations"] != prior_confirmations)):
         active_axes.append("confirmations")
-    if normalized.get("schema") == RULE_SCHEMA_V2 and (
+    extension_active = normalized.get("schema") == RULE_SCHEMA_V2 and (
             conditional["entry_window"] != (defaults["entry_after_minutes"],
                                                defaults["entry_before_minutes"]) or
             conditional["atr_band"] != (defaults["min_atr_bps"],
-                                          defaults["max_atr_bps"])):
+                                          defaults["max_atr_bps"]))
+    extension_values = (conditional["entry_window"] + conditional["atr_band"])
+    prior_extension_values = (None if prior is None else (
+        prior.get("entry_after_minutes", defaults["entry_after_minutes"]),
+        prior.get("entry_before_minutes", defaults["entry_before_minutes"]),
+        prior.get("min_atr_bps", defaults["min_atr_bps"]),
+        prior.get("max_atr_bps", defaults["max_atr_bps"])))
+    if ((prior is None and extension_active) or
+            (prior is not None and extension_values != prior_extension_values)):
         active_axes.append("conditional_window_or_atr")
     semantic_fields = set(EXECUTABLE_RULE_FIELDS)
     # ``rule_semantic_signature`` uses family-relevant fields; expose that
@@ -546,23 +641,34 @@ def _structurally_distinct(spec: Mapping[str, Any],
                            candidates: Sequence[Mapping[str, Any]]) -> bool:
     """Whether a model discovery/replacement has genuine new structure."""
     current = validate_rule_spec(spec)
-    signature = structure_signature(current)
+    same_family: list[dict[str, Any]] = []
+    saw_other_family = False
     for candidate in candidates:
         try:
             prior = validate_rule_spec(candidate)
         except (TypeError, ValueError, KeyError):
             continue
         if str(prior.get("family")) != str(current.get("family")):
-            return True
-        if signature["active_axes"]:
-            return True
+            saw_other_family = True
+            continue
+        same_family.append(prior)
+    # A different family is structurally new only when no same-family prior
+    # exists to which it could be an alias.  ``existing_specs`` normally spans
+    # many families, so returning True for the first other-family row would
+    # incorrectly allow a one-axis near-duplicate of the relevant lineage.
+    if not same_family:
+        return saw_other_family
+    for prior in same_family:
+        compared = structure_signature(current, prior)
+        if compared["active_axes"]:
+            continue
         changed = [name for name in EXECUTABLE_RULE_FIELDS
                    if prior.get(name) != current.get(name)]
         # Same-family one-axis numeric motion is tuning, not discovery.  Two
         # executable changes form a distinct interaction topology.
-        if len(changed) >= 2:
-            return True
-    return False
+        if len(changed) < 2:
+            return False
+    return True
 
 
 def _mark_variant(spec: Mapping[str, Any], seen: set[str]) -> None:
@@ -1093,10 +1199,16 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
             break
         if _failed_variant(spec, failed) or _variant_seen(spec, seen):
             continue
+        # Deterministic tuning is also subject to the same bounded semantic
+        # neighborhood when a prior cycle (or an earlier accepted member in
+        # this cycle) already tested the point.  IDs are never rewritten: the
+        # exact member is simply skipped and the ladder supplies its next
+        # deterministic fallback.
+        prior_specs = list(existing_specs)
+        if _semantic_duplicate(spec, prior_specs, near_distance=near_distance):
+            continue
         # The deterministic ladder is an explicit bounded search space; keep
-        # its neighboring points as coverage. Near-duplicate suppression is
-        # applied to model aliases above, where it prevents paying for
-        # semantically redundant provider output.
+        # its non-redundant neighboring points as coverage.
         _mark_variant(spec, seen)
         chosen.append(TunedVariant(spec, reason, "deterministic", None))
     _record_llm_observation(
@@ -2179,6 +2291,15 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     duplicate = factory.existing_cycle(dataset_hash, vehicle, identity)
     if duplicate is not None:
         return {**duplicate, "duplicate": True}
+    # Freeze the dependence map before any current-cycle diagnosis, tuning, or
+    # replay.  The ledger method reads only completed cycles before this
+    # cutoff; the current cycle id is not inserted until the entire cycle
+    # finishes, so held-out outcomes cannot define their own cluster.
+    cycle_id = uuid.uuid4().hex
+    dependence_policy = factory.freeze_dependence_policy(
+        cycle_id, vehicle=vehicle, cutoff=time.time())
+    dependence_digest = str(dependence_policy.get("policy_digest") or
+                            dependence_policy_digest(dependence_policy))
     edge = EdgeLedger(db_path)
     # Seeding a fresh ledger and reviving an idle slot are the same operation:
     # give every configured slot an active hypothesis. Keeping one path means
@@ -2215,7 +2336,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     if not active:
         return {"schema": FACTORY_SCHEMA, "status": "exhausted", "dataset_hash": dataset_hash,
                 "vehicle": vehicle, "strategies": 0, "variants": 0, "accounts": 0,
-                "seeded": seeded, "revived": revived}
+                "seeded": seeded, "revived": revived,
+                "cycle_id": cycle_id, "dependence_policy": dependence_policy}
     tasks = []
     sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
@@ -2318,7 +2440,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     if not tasks:
         return {"schema": FACTORY_SCHEMA, "status": "waiting_for_new_data",
                 "dataset_hash": dataset_hash, "vehicle": vehicle,
-                "strategies": len(active), "variants": 0, "accounts": 0}
+                "strategies": len(active), "variants": 0, "accounts": 0,
+                "cycle_id": cycle_id, "dependence_policy": dependence_policy}
 
     max_workers = min(int(workers), len(tasks))
     worker_results = []
@@ -2589,7 +2712,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             (variant, gate))
     family_corrections: dict[str, dict] = {}
     for family_name in family_rows:
-        family_corrections[family_name] = benjamini_hochberg(
+            family_corrections[family_name] = benjamini_hochberg(
             {
                 f"{family_name}|{owner['hypothesis']['hypothesis_id']}|"
                 f"{variant['variant_id']}": gate["p_raw"]
@@ -2597,6 +2720,34 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 if str((variant.get("rule_spec") or {}).get("family") or
                        owner["hypothesis"]["family"]) == family_name
             }, alpha=alpha)
+    # A second, conservative multiplicity layer groups current-cycle tests by
+    # the frozen *prior-cycle* dependence map.  The existing global BH remains
+    # mandatory; this correction can only veto a candidate that global/family
+    # BH would otherwise admit. Unknown/legacy families get singleton groups,
+    # preserving their safe fallback without claiming unmeasured dependence.
+    frozen_clusters = dict(dependence_policy.get("cluster_map") or {})
+    cluster_rows: dict[str, dict[str, float]] = {}
+    cluster_for_key: dict[str, str] = {}
+    for owner, variant, gate in variant_rows:
+        family_name = str((variant.get("rule_spec") or {}).get(
+            "family") or owner["hypothesis"]["family"])
+        candidate_key = f"{owner['hypothesis']['hypothesis_id']}:{variant['variant_id']}"
+        cluster_name = str(frozen_clusters.get(family_name) or
+                           f"legacy-singleton:{candidate_key}")
+        cluster_for_key[candidate_key] = cluster_name
+        cluster_rows.setdefault(cluster_name, {})[candidate_key] = gate["p_raw"]
+    cluster_corrections: dict[str, dict] = {}
+    for cluster_name in sorted(cluster_rows):
+        correction = benjamini_hochberg(cluster_rows[cluster_name], alpha=alpha)
+        for candidate_key, item in correction.items():
+            cluster_corrections[candidate_key] = {
+                **item, "cluster": cluster_name,
+                "scope": "frozen_dependence_cluster",
+                "method": "benjamini_hochberg",
+                "policy_hash": dependence_digest,
+                "verified_persisted": dependence_policy.get(
+                    "verified_persisted") is True,
+            }
     for worker, variant, gate in variant_rows:
         family_name = str((variant.get("rule_spec") or {}).get(
             "family") or worker["hypothesis"]["family"])
@@ -2618,7 +2769,28 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                                   "family": family_name}
         gate["global_multiple_tests"] = {**overall,
                                          "method": "benjamini_hochberg",
-                                         "scope": "cycle_global"}
+                                  "scope": "cycle_global"}
+        candidate_key = f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}"
+        cluster = cluster_corrections.get(candidate_key, {
+            "p": gate["p_raw"], "p_adjusted": gate["p_raw"],
+            "significant": float(gate["p_raw"]) <= float(alpha),
+            "cluster": cluster_for_key.get(candidate_key),
+            "scope": "frozen_dependence_cluster",
+            "method": "benjamini_hochberg",
+            "policy_hash": dependence_digest,
+            "verified_persisted": dependence_policy.get(
+                "verified_persisted") is True,
+        })
+        gate["cluster_multiple_tests"] = cluster
+        gate["checks_without_family"]["cluster_fdr_significant"] = bool(
+            cluster.get("significant"))
+        # Recompute the development screen after adding the conservative
+        # cluster veto; qualification remains a later sealed-window check.
+        gate["development_passes_without_family"] = bool(all(
+            value for name, value in gate["checks_without_family"].items()
+            if name not in {"qualification_net_positive",
+                            "qualification_delta_positive",
+                            "qualification_cluster_floor"}))
         gate["confidence"] = 1.0 - float(overall["p_adjusted"])
 
     # Rank only development-eligible candidates, then open one sealed window.
@@ -2657,7 +2829,6 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     # Allocate the cycle identity before reserving a qualification window. The
     # ledger claim commits before ``sealed.release`` so a crash cannot make
     # that same window look unused on a later invocation.
-    cycle_id = uuid.uuid4().hex
     qualification_key = None
     qualification_report: dict[str, Any] | None = None
     qualification_claim_error: str | None = None
@@ -2777,6 +2948,15 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         run_provenance = {
             "factory": FACTORY_SCHEMA,
             "experiment_identity": identity["identity_hash"],
+            "dependence_policy": {
+                "schema": dependence_policy.get("schema"),
+                # ``policy_hash`` is the stable semantic digest in the
+                # authorizing projection; the exact freeze hash remains
+                # available as audit metadata outside this projection.
+                "policy_hash": dependence_digest,
+                "source_cycles": list(dependence_policy.get("source_cycles") or ()),
+                "cluster_map": dict(dependence_policy.get("cluster_map") or {}),
+            },
             "hypothesis_id": worker["hypothesis"]["hypothesis_id"],
             "variant_id": variant["variant_id"],
             "costs": model.as_dict(),
@@ -2802,6 +2982,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             p_value=gate["p_raw"],
             q_value=overall["p_adjusted"],
             family_q_value=family["p_adjusted"], alpha=alpha,
+            cluster_q_value=gate["cluster_multiple_tests"].get("p_adjusted"),
+            cluster_multiple_tests=gate["cluster_multiple_tests"],
             falsification=gate["falsification"],
             separation=gate["heldout_separation"], checks=checks,
             passes=gate["passes"], walk_forward=gate["walk_forward"],
@@ -3412,6 +3594,24 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     search_exhausted = bool(search_state) and all(
         str(item.get("state")) == "bounded_space_exhausted"
         for item in search_state.values())
+    policy_clusters = dict(dependence_policy.get("cluster_map") or {})
+    dependence_constraint = {
+        "schema": "dependence-cluster-constraint.v1",
+        "policy_hash": dependence_digest,
+        "audit_policy_hash": dependence_policy.get("policy_hash"),
+        "verified_persisted": dependence_policy.get("verified_persisted") is True,
+        "max_admissions_per_cluster": 1,
+        "assignments": {
+            str(item.get("variant_id")): policy_clusters.get(
+                str(item.get("family") or ""))
+            for item in summaries
+            if policy_clusters.get(str(item.get("family") or ""))
+        },
+        "unknown_family_behavior": "existing_safe_family_correlation",
+        "authorizing": True,
+        "gate_scope": "cluster_level_bh_veto_in_addition_to_family_and_global_bh",
+        "runtime_scope": "one_strongest_edge_per_verified_frozen_cluster",
+    }
     result = {
         "schema": FACTORY_SCHEMA,
         "status": ("partial_worker_failure" if worker_failures else
@@ -3419,6 +3619,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                    "bounded_space_exhausted" if search_exhausted else
                    "pending_replacement_capacity" if pending else "complete"),
         "cycle_id": cycle_id,
+        "dependence_policy": dependence_policy,
+        "dependence_constraint": dependence_constraint,
         "dataset_hash": dataset_hash, "vehicle": vehicle,
         "experiment_identity": identity,
         "experiment_provenance": experiment_provenance_body,

@@ -452,7 +452,11 @@ class AlpacaProvider(AlpacaMarketDataMixin):
                      submitted_at=_dt(_value(row, "submitted_at")),
                      updated_at=_dt(_value(row, "updated_at")),
                      legs=tuple(self._order_leg(leg) for leg in raw_legs),
-                     raw=_mapping(row))
+                     raw=_mapping(row),
+                     replaces=(str(_value(row, "replaces", "") or "").strip()
+                               or None),
+                     replaced_by=(str(_value(row, "replaced_by", "") or "").strip()
+                                  or None))
 
     def _order_leg(self, row: Any) -> dict[str, Any]:
         """Normalize one bracket child leg; no SDK object crosses upward."""
@@ -586,6 +590,48 @@ class AlpacaProvider(AlpacaMarketDataMixin):
             raise
         except Exception as exc:  # noqa: BLE001
             raise AlpacaError(f"cancel order failed: {exc}") from exc
+
+    def replace_stop_order(self, order_id: str,
+                           stop_price: Decimal | float | str) -> Order:
+        """Atomically replace one broker stop and return its new order row."""
+        wanted = str(order_id or "").strip()
+        if not wanted:
+            raise AlpacaError("replace stop order id is required")
+        try:
+            price = _finite_decimal(stop_price, "replacement stop_price", positive=True)
+        except ValueError as exc:
+            raise AlpacaError(str(exc)) from exc
+        replace_call = getattr(self.session.trading, "replace_order_by_id", None)
+        if not callable(replace_call):
+            raise AlpacaError("trading client cannot replace an order")
+        try:
+            from alpaca.trading.requests import ReplaceOrderRequest
+            request: Any = ReplaceOrderRequest(stop_price=float(price))
+        except ImportError:
+            # Injectable fakes accept the provider-neutral price directly.
+            request = {"stop_price": price}
+        try:
+            try:
+                row = replace_call(wanted, request)
+            except TypeError:
+                row = replace_call(order_id=wanted, order_data=request)
+            result = self._order(row)
+            if result.type not in {"stop", "stop_limit"}:
+                raise AlpacaError("replacement response is not a stop order")
+            response_price = _optional_decimal(
+                _value(result.raw, "stop_price"),
+                "replacement response stop_price")
+            if response_price is None or response_price != price:
+                raise AlpacaError(
+                    "replacement response stop_price does not match request")
+            if result.replaces is not None and result.replaces != wanted:
+                raise AlpacaError(
+                    "replacement response belongs to a different order")
+        except AlpacaError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AlpacaError(f"replace stop order failed: {exc}") from exc
+        return result
 
     def cancel_all_orders(self) -> None:
         try:

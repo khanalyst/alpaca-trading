@@ -15,10 +15,12 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    RULE_FAMILIES, RULE_SCHEMA_V2, SESSION_MINUTES, V2_DEFAULT_EXTENSIONS,
-    evaluate_rule_signal,
+    RULE_FAMILIES, RULE_SCHEMA_V2, RULE_SCHEMA_V3, SESSION_MINUTES,
+    V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS,
+    completed_bar_exit_transition, evaluate_rule_signal,
     feature_window_bars, hold_deadline, rule_semantic_signature,
-    rule_variant_id, validate_rule_spec,
+    initialize_exit_state, rule_variant_id, rule_vehicle_executable,
+    validate_rule_spec,
 )
 from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     CostError, CostModel, ReplayPolicy,
@@ -136,9 +138,17 @@ def template_hypothesis(slot: int, *, vehicle: str = "equity",
     """Return the generation-zero hypothesis a slot starts from."""
     if not 0 <= int(slot) < MAX_STRATEGIES:
         raise FactoryError(f"slot must be between 0 and {MAX_STRATEGIES - 1}")
-    # Factory roots use the promoted v2 no-op form; the raw catalog remains
-    # available above for legacy v1 content-addressed IDs.
-    spec = validate_rule_spec(family_template(FAMILY_TEMPLATES[int(slot)]["family"]))
+    # The raw catalog remains available above for legacy v1/v2
+    # content-addressed IDs.  New equity roots use v3's no-op form so the
+    # deterministic coordinate neighborhood can reach bounded exits without
+    # depending on an LLM proposal; option roots stay on executable v2.
+    authored = family_template(FAMILY_TEMPLATES[int(slot)]["family"])
+    if str(vehicle) == "equity":
+        # Equity is the only vehicle with a parity-safe runtime amendment path.
+        # Promote new roots to v3 at its neutral default so the ordinary
+        # coordinate neighborhood can deterministically activate breakeven.
+        authored.update({"schema": RULE_SCHEMA_V3, **V3_DEFAULT_EXTENSIONS})
+    spec = validate_rule_spec(authored)
     return StrategyHypothesis(
         _hypothesis_id(vehicle, int(slot), int(generation), spec), int(slot),
         int(generation), vehicle, spec["family"], _thesis(spec),
@@ -316,6 +326,11 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     resolved_policy = _coerce_policy(policy)
     if not _session_bars_valid(session_bars):
         return None
+    spec = validate_rule_spec(spec)
+    if not rule_vehicle_executable(spec, vehicle):
+        return _unpriced(
+            session_bars[0], session_bars[0], session_bars[0].session_date,
+            "unknown", "rule-strategy.v3 is not executable for options")
     try:
         resolved_policy = replay_policy_for_bars(
             resolved_policy, session_bars,
@@ -479,70 +494,29 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         tie = False
         gapped = False
         exit_gapped = False
-        if direction == "long":
-            through_stop = entry_underlying <= stop
-            through_target = entry_underlying >= target
-        else:
-            through_stop = entry_underlying >= stop
-            through_target = entry_underlying <= target
-        if through_stop or through_target:
-            # The entry gapped past one of its own levels.  The runtime cannot
-            # see that gap when it sizes or prices the bracket, so it takes the
-            # trade anyway and the resting leg triggers on arrival: a real fill
-            # at the entry, never at the impossible better level.
-            gapped = True
-            reason = "stop" if through_stop else "target"
-            exit_ref = entry_underlying
-            exit_bar = entry_bar
-            # The resting leg can execute at the entry boundary, but the
-            # completed-bar replay only observes and records that outcome at
-            # the bar close.  Pricing stays pinned to the earlier executable
-            # instant so no later quote leaks into the fill.
-            exit_at = entry_bar.end
-            pricing_cutoff = entry_bar.timestamp
-        else:
-            # The scan starts at the entry bar, not the one after it.  Since
-            # commit 11e87c8 the broker's bracket legs are live the moment the
-            # entry fills, so a level touched later inside the entry bar does
-            # execute.  Entry is the bar's open — its first instant — so the
-            # whole of that bar's remaining range is after the entry and none
-            # of it is lookahead; nothing before index+1 is ever examined, and
-            # the signal itself still only saw bars[:index+1].  The intrabar
-            # path is unknowable either way, so the established stop-wins-ties
-            # rule resolves it against the strategy here too.
-            for bar in session_bars[entry_index:last_index + 1]:
-                if _available(bar, resolved_policy) is None:
-                    # Resting exits consume completed OHLC once the record is
-                    # observed, even when observation trails market end.
-                    continue
-                if direction == "long":
-                    gap_stop, gap_target = bar.open <= stop, bar.open >= target
-                    hit_stop, hit_target = bar.low <= stop, bar.high >= target
-                else:
-                    gap_stop, gap_target = bar.open >= stop, bar.open <= target
-                    hit_stop, hit_target = bar.high >= stop, bar.low <= target
-                if gap_stop or gap_target:
-                    # A bar that opens beyond a resting leg fills at that open,
-                    # not at the level the market never traded again.  Stop
-                    # still wins the tie; the stop side makes results worse and
-                    # that is exactly the point of modelling it.
-                    reason = "stop" if gap_stop else "target"
-                    exit_ref, exit_bar = float(bar.open), bar
-                    exit_at, pricing_cutoff, exit_gapped = (
-                        bar.end, bar.timestamp, True)
-                    break
-                if hit_stop or hit_target:
-                    tie = hit_stop and hit_target
-                    reason = "stop" if hit_stop else "target"
-                    exit_ref = stop if hit_stop else target
-                    exit_bar = bar
-                    # Minute bars do not reveal the intrabar trigger instant.
-                    # Price option exits only from information available at
-                    # the bar open; a later quote from the same bar would be
-                    # lookahead relative to an unknown trigger.
-                    exit_at = bar.end
-                    pricing_cutoff = bar.timestamp
-                    break
+        exit_state = initialize_exit_state(
+            direction, entry_underlying, stop, target,
+            breakeven_r=spec.get("breakeven_r"))
+        # The scan starts at the entry bar: the broker bracket is live from the
+        # fill.  The shared transition owns entry-gap, later-gap, stop-wins tie,
+        # and completed-close breakeven ordering for replay, null, and runtime.
+        for bar in session_bars[entry_index:last_index + 1]:
+            if _available(bar, resolved_policy) is None:
+                continue
+            transition = completed_bar_exit_transition(exit_state, bar)
+            exit_state = transition["state"]
+            resolved = transition["exit"]
+            if resolved is None:
+                continue
+            reason = str(resolved["reason"])
+            tie = bool(resolved.get("tie_broken"))
+            gapped = bool(resolved.get("entry_gap"))
+            exit_gapped = bool(resolved.get("gapped")) and not gapped
+            exit_ref = float(resolved["price"])
+            exit_bar = bar
+            exit_at = bar.end
+            pricing_cutoff = bar.timestamp
+            break
         day = signal_bar.session_date
         multiplier = 1
         contract = None
@@ -596,7 +570,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # is not stale, it is simply the bar's quote; only genuinely older
             # quotes carry an age.
             exit_age = max(0.0, (pricing_cutoff - exit_snap.timestamp).total_seconds())
-        return {
+        trade_row = {
             "vehicle": vehicle, "symbol": signal_bar.symbol,
             "session_date": day.isoformat(), "direction": direction,
             "signal_timestamp": signal_bar.end.isoformat(),
@@ -647,6 +621,15 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 else "forward_observed"
             ),
         }
+        if spec.get("breakeven_r") is not None:
+            trade_row.update({
+                "breakeven_r": spec["breakeven_r"],
+                "initial_stop_price": exit_state["initial_stop_price"],
+                "active_stop_price": exit_state["active_stop_price"],
+                "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
+                "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
+            })
+        return trade_row
     return None
 
 
@@ -1039,7 +1022,7 @@ def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
 
 
 _COORDINATE_FIELDS = (
-    "threshold_bps", "target_r", "stop_atr", "max_hold_bars",
+    "threshold_bps", "target_r", "breakeven_r", "stop_atr", "max_hold_bars",
     "lookback", "slow_lookback", "range_minutes", "zscore",
     "volume_multiplier", "compression_bps", "atr_period", "side",
     "confirmation", "entry_after_minutes", "entry_before_minutes",
@@ -1050,12 +1033,12 @@ _FAILURE_FIELD_PRIORITY = {
         "threshold_bps", "confirmation", "lookback", "range_minutes",
         "zscore", "volume_multiplier", "entry_before_minutes"),
     "negative_expectancy": (
-        "threshold_bps", "target_r", "stop_atr", "max_hold_bars",
+        "threshold_bps", "target_r", "breakeven_r", "stop_atr", "max_hold_bars",
         "confirmation", "side"),
     "poor_payoff": (
-        "target_r", "stop_atr", "max_hold_bars", "threshold_bps"),
+        "target_r", "breakeven_r", "stop_atr", "max_hold_bars", "threshold_bps"),
     "low_win_rate": (
-        "target_r", "threshold_bps", "max_hold_bars", "confirmation"),
+        "target_r", "breakeven_r", "threshold_bps", "max_hold_bars", "confirmation"),
     "excess_drawdown": (
         "stop_atr", "max_hold_bars", "side", "threshold_bps",
         "confirmation"),
@@ -1096,6 +1079,14 @@ def _coordinate_values(root: Mapping[str, Any], field: str) -> list[Any]:
             if item not in current:
                 values.append([*current, item])
         return values
+    if field == "breakeven_r":
+        target = float(root["target_r"])
+        candidates: list[float | None] = [None, 0.0]
+        candidates.extend(round(target * fraction, 8)
+                          for fraction in (.25, .5, .75))
+        return [candidate for candidate in candidates
+                if candidate != value and
+                (candidate is None or candidate < target)]
     if field == "stop_atr":
         return [value for value in _STOP_ATR_LADDER
                 if float(value) != float(root.get(field))]
@@ -1228,15 +1219,17 @@ def mutate_with_reasons(spec: Mapping[str, Any], diagnostic: Mapping[str, Any],
 
 
 # Deterministic discovery ladders.  These are the offline fallback for seeding
-# a free slot, and they deliberately reach into the v2 grammar: without them
-# the only structure a slot could ever explore is "another family at template
-# defaults", which is what made the search terminate in the first place.
+# a free slot, and they deliberately reach into the conditional grammar:
+# equity traverses v3 breakeven coordinates while options stay on executable
+# v2.  Without these axes the only structure a slot could ever explore is
+# "another family at template defaults", which made the search terminate.
 _DISCOVERY_WINDOWS: tuple[tuple[int, int], ...] = (
     (0, SESSION_MINUTES), (0, 120), (30, 210), (120, 330), (240, SESSION_MINUTES))
 _DISCOVERY_CONFIRMATIONS: tuple[tuple[str, ...], ...] = (
     (), ("trend",), ("volume",), ("volatility",), ("trend", "volume"))
 _DISCOVERY_BANDS: tuple[tuple[float, float], ...] = (
     (0.0, 5_000.0), (0.0, 60.0), (25.0, 120.0), (60.0, 5_000.0))
+_DISCOVERY_BREAKEVEN_FRACTIONS: tuple[float, ...] = (0.0, .25, .5, .75)
 # (side, target_r, stop_atr, max_hold_bars) — the payoff shape the conditional
 # entry is expressed with.
 _DISCOVERY_SHAPES: tuple[tuple[str, float, float, int], ...] = (
@@ -1255,10 +1248,12 @@ _DISCOVERY_SHAPES: tuple[tuple[str, float, float, int], ...] = (
 # tail unreachable.
 MAX_DISCOVERY_ATTEMPTS = (
     len(_DISCOVERY_WINDOWS) * len(_DISCOVERY_CONFIRMATIONS) *
-    len(_DISCOVERY_BANDS) * len(_DISCOVERY_SHAPES))
+    len(_DISCOVERY_BANDS) * len(_DISCOVERY_SHAPES) *
+    len(_DISCOVERY_BREAKEVEN_FRACTIONS))
 
 
-def discovery_spec(index: int, *, family: str) -> dict[str, Any]:
+def discovery_spec(index: int, *, family: str,
+                   vehicle: str = "equity") -> dict[str, Any]:
     """Return the deterministic *index*-th conditional variant of a family.
 
     The ladder dimensions have mixed lengths (5, 5, 4, 7 against an 11-family
@@ -1267,6 +1262,8 @@ def discovery_spec(index: int, *, family: str) -> dict[str, Any]:
     """
 
     spec = family_template(family)
+    if str(vehicle) == "equity":
+        spec.update({"schema": RULE_SCHEMA_V3, **V3_DEFAULT_EXTENSIONS})
     if index <= 0:
         return validate_rule_spec(spec)
     windows, confirms = len(_DISCOVERY_WINDOWS), len(_DISCOVERY_CONFIRMATIONS)
@@ -1276,12 +1273,20 @@ def discovery_spec(index: int, *, family: str) -> dict[str, Any]:
     low, high = _DISCOVERY_BANDS[(index // (windows * confirms)) % bands]
     side, target_r, stop_atr, max_hold = _DISCOVERY_SHAPES[
         (index // (windows * confirms * bands)) % shapes]
+    breakeven_fraction = _DISCOVERY_BREAKEVEN_FRACTIONS[
+        (index // (windows * confirms * bands * shapes)) %
+        len(_DISCOVERY_BREAKEVEN_FRACTIONS)]
     spec.update({"schema": RULE_SCHEMA_V2, "entry_after_minutes": after,
                  "entry_before_minutes": before,
                  "confirmations": list(confirmations),
                  "min_atr_bps": low, "max_atr_bps": high,
                  "side": side, "target_r": target_r, "stop_atr": stop_atr,
                  "max_hold_bars": max_hold})
+    if str(vehicle) == "equity":
+        spec.update({
+            "schema": RULE_SCHEMA_V3,
+            "breakeven_r": round(target_r * breakeven_fraction, 8),
+        })
     return validate_rule_spec(spec)
 
 
@@ -1293,8 +1298,8 @@ def discovery_hypothesis(previous: Mapping[str, Any], *, generation: int,
 
     An untried family at its own template comes first, because that is the
     cheapest genuinely new shape.  Once a slot has seen every family, discovery
-    continues into the conditional v2 grammar instead of stopping: a slot that
-    has run out of families has not run out of hypotheses.
+    continues into its executable conditional grammar instead of stopping: a
+    slot that has run out of families has not run out of hypotheses.
     """
 
     vehicle = str(previous["vehicle"])
@@ -1314,12 +1319,12 @@ def discovery_hypothesis(previous: Mapping[str, Any], *, generation: int,
         family = RULE_FAMILIES[(start + offset) % len(RULE_FAMILIES)]
         if family in tried_families:
             continue
-        seeded = build(validate_rule_spec(family_template(family)))
+        seeded = build(discovery_spec(0, family=family, vehicle=vehicle))
         if seeded is not None:
             return seeded
     for index in range(1, MAX_DISCOVERY_ATTEMPTS + 1):
         family = RULE_FAMILIES[(start + index) % len(RULE_FAMILIES)]
-        seeded = build(discovery_spec(index, family=family))
+        seeded = build(discovery_spec(index, family=family, vehicle=vehicle))
         if seeded is not None:
             return seeded
     return None

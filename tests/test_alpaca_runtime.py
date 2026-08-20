@@ -180,6 +180,52 @@ class AlpacaRuntimeTests(unittest.TestCase):
             OptionContract.from_sdk({
                 "symbol": "SPY260821C00600000", "option_type": "put"})
 
+    def test_stop_replacement_normalizes_the_broker_successor_chain(self):
+        class ReplacingTrading(TradingFake):
+            def __init__(self):
+                self.calls = []
+
+            def replace_order_by_id(self, order_id, request):
+                price = (request.get("stop_price") if isinstance(request, dict)
+                         else request.stop_price)
+                self.calls.append((order_id, Decimal(str(price))))
+                return {
+                    "id": "stop-new", "symbol": "SPY",
+                    "asset_class": "us_equity", "qty": "2", "side": "sell",
+                    "status": "accepted", "type": "stop",
+                    "time_in_force": "day", "stop_price": str(price),
+                    "replaces": order_id,
+                }
+
+        trading = ReplacingTrading()
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(paper=True, trading_client=trading))
+        replacement = provider.replace_stop_order("stop-old", Decimal("101.50"))
+        self.assertEqual(trading.calls, [("stop-old", Decimal("101.50"))])
+        self.assertEqual(replacement.id, "stop-new")
+        self.assertEqual(replacement.replaces, "stop-old")
+        self.assertEqual(replacement.raw["stop_price"], "101.50")
+
+    def test_stop_replacement_wraps_a_non_finite_response_price(self):
+        class MalformedReplacementTrading(TradingFake):
+            def replace_order_by_id(self, order_id, request):
+                return {
+                    "id": "stop-new", "symbol": "SPY",
+                    "asset_class": "us_equity", "qty": "2", "side": "sell",
+                    "status": "accepted", "type": "stop",
+                    "time_in_force": "day", "stop_price": "NaN",
+                    "replaces": order_id,
+                }
+
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(
+                paper=True, trading_client=MalformedReplacementTrading()))
+        with self.assertRaisesRegex(
+                AlpacaError, "replacement response stop_price must be finite"):
+            provider.replace_stop_order("stop-old", Decimal("101.50"))
+
     def test_order_request_rejects_non_boolean_or_enabled_extended_hours(self):
         for value in ("false", 1, None):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "extended_hours"):

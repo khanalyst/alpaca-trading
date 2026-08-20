@@ -22,7 +22,9 @@ from unittest import mock
 
 from agent import state
 from agent.config import ConfigError, validate_config
+from agent.contracts.rule import RULE_SCHEMA_V3
 from agent.alpaca_domain import Account, Order, OrderRequest, Position, Quote
+from agent.alpaca_provider import AlpacaError
 from agent.engine import Engine
 from agent.execution_lifecycle import (_broker_protected, _leg_live, _leg_rows,
                                         _protective_legs)
@@ -71,6 +73,9 @@ class ProtectionProvider:
         self.submitted = []
         self.close_requests = []
         self.cancelled = []
+        self.replacements = []
+        self.replace_error_after_fill = False
+        self.replacement_returns_filled = False
         self.cancel_all_calls = 0
         self.cancel_error = None
         self._next_id = 1
@@ -115,6 +120,29 @@ class ProtectionProvider:
 
     def cancel_all_orders(self):
         self.cancel_all_calls += 1
+
+    def replace_stop_order(self, order_id, stop_price):
+        old_id = str(order_id)
+        old = self.orders_by_id[old_id]
+        if self.replace_error_after_fill:
+            self.set_order(old_id, status="filled", filled_qty=old.qty,
+                           filled_avg_price=99)
+            raise RuntimeError("stop filled during replacement")
+        new_id = f"{old_id}-replacement-{len(self.replacements) + 1}"
+        self.orders_by_id[old_id] = replace(
+            old, status="replaced", replaced_by=new_id)
+        replacement = Order(
+            new_id, old.symbol, old.qty, old.side,
+            "filled" if self.replacement_returns_filled else "accepted",
+            old.type, old.time_in_force,
+            filled_qty=(old.qty if self.replacement_returns_filled
+                        else Decimal("0")),
+            filled_avg_price=(Decimal(str(stop_price))
+                              if self.replacement_returns_filled else None),
+            raw={"stop_price": Decimal(str(stop_price))}, replaces=old_id)
+        self.orders_by_id[new_id] = replacement
+        self.replacements.append((old_id, Decimal(str(stop_price)), new_id))
+        return replacement
 
     def set_order(self, order_id, *, status, filled_qty=0, filled_avg_price=None):
         self.orders_by_id[order_id] = replace(
@@ -209,7 +237,8 @@ class ProtectionHarness(unittest.TestCase):
             "SPY", self._signal(), self._row(), self.provider.account(), [],
             self.NOW)
 
-    def _open_bracketed_position(self, quantity=Decimal("10")):
+    def _open_bracketed_position(self, quantity=Decimal("10"), *,
+                                 plan_updates=None, filled_quantity=None):
         request = OrderRequest("SPY", quantity, "buy",
                                client_order_id="entry-protected",
                                order_class="bracket",
@@ -222,11 +251,15 @@ class ProtectionHarness(unittest.TestCase):
                 "underlying_symbol": "SPY", "contract_multiplier": Decimal("1"),
                 "setup_id": "entry-protected", "setup_type": "ibr",
                 "risk_usd": 25, "notional": 1015}
+        plan.update(dict(plan_updates or {}))
         self.engine._record_open_order(request, order, plan)
-        self.provider.set_order(order.id, status="filled", filled_qty=quantity,
+        filled = quantity if filled_quantity is None else Decimal(str(filled_quantity))
+        self.provider.set_order(order.id,
+                                status=("filled" if filled == quantity
+                                        else "partially_filled"), filled_qty=filled,
                                 filled_avg_price=101.5)
         self.provider.positions_live = [Position(
-            "SPY", quantity, "long", avg_entry_price=Decimal("101.5"),
+            "SPY", filled, "long", avg_entry_price=Decimal("101.5"),
             current_price=Decimal("98.5"))]
         self.engine.reconcile()
         return order
@@ -393,6 +426,23 @@ class BrokerProtectionTests(ProtectionHarness):
         self.assertIsNone(request.take_profit)
         self.assertIsNone(request.stop_loss)
 
+    def test_v3_option_entry_is_rejected_before_option_chain_selection(self):
+        self._bind_engine(profile="options", runtime_name="runtime-v3-options")
+        signal = self._signal()
+        signal.update({
+            "execution_profile": "options", "rule_schema": RULE_SCHEMA_V3,
+            "breakeven_r": 0.5,
+        })
+        events = []
+        self.engine._event = lambda kind, payload: events.append((kind, payload))
+        self.assertIsNone(self.engine._risk_order(
+            "SPY", signal, self._row(), self.provider.account(), [], self.NOW))
+        self.assertEqual(events[-1], ("risk_reject", {
+            "symbol": "SPY",
+            "reason": "rule-strategy.v3 is not executable for options",
+        }))
+        self.assertEqual(self.provider.submitted, [])
+
     # 2. child legs
 
     def test_child_leg_ids_are_persisted_on_trade_and_protection(self):
@@ -407,6 +457,159 @@ class BrokerProtectionTests(ProtectionHarness):
                           runtime["protection"]["SPY"]["protective_legs"]],
                          [f"{order.id}-stop", f"{order.id}-target"])
         self.assertTrue(_broker_protected(trade_legs))
+
+    def test_v3_completed_close_replaces_the_broker_stop_for_the_next_bar(self):
+        self._bind_engine(runtime_name="runtime-v3-stop-replace")
+        order = self._open_bracketed_position(plan_updates={
+            "rule_schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
+            "signal_ts": (self.NOW - timedelta(minutes=2)).timestamp(),
+        })
+        bar = {
+            "symbol": "SPY", "timestamp": self.NOW - timedelta(minutes=1),
+            "open": 101.5, "high": 103.1, "low": 101.3, "close": 103.0,
+            "volume": 1000,
+        }
+        monitored = self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live),
+            market_rows={"SPY": {"bars": [bar]}})
+        self.assertEqual(monitored["closed"], [])
+        self.assertEqual(monitored["failed"], [])
+        old_stop = f"{order.id}-stop"
+        self.assertEqual(self.provider.orders_by_id[old_stop].status, "replaced")
+        self.assertEqual(self.provider.replacements[0][:2],
+                         (old_stop, Decimal("101.5")))
+        runtime = state.load_state()
+        trade = runtime["active_trades"]["SPY"]
+        self.assertEqual(trade["initial_stop_price"], 99.0)
+        self.assertEqual(trade["active_stop_price"], 101.5)
+        self.assertEqual(trade["breakeven_armed_epoch"], self.NOW.timestamp())
+        self.assertEqual(trade["stop_replacement"]["status"], "confirmed")
+        self.assertTrue(_broker_protected(_leg_rows(trade)))
+        self.assertEqual(
+            runtime["protection"]["SPY"]["active_stop_price"], 101.5)
+
+    def test_v3_waits_for_the_entry_fill_before_amending_protection(self):
+        self._bind_engine(runtime_name="runtime-v3-partial-entry")
+        self._open_bracketed_position(
+            quantity=Decimal("10"), filled_quantity=Decimal("5"),
+            plan_updates={
+                "rule_schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
+                "signal_ts": (self.NOW - timedelta(minutes=2)).timestamp(),
+            })
+        bar = {
+            "symbol": "SPY", "timestamp": self.NOW - timedelta(minutes=1),
+            "open": 101.5, "high": 103.1, "low": 101.3, "close": 103.0,
+            "volume": 1000,
+        }
+        monitored = self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live),
+            market_rows={"SPY": {"bars": [bar]}})
+        self.assertEqual(monitored["closed"], [])
+        self.assertEqual(monitored["failed"], [])
+        self.assertEqual(self.provider.replacements, [])
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["filled_fraction"], 0.5)
+        self.assertIsNone(trade["breakeven_armed_epoch"])
+        self.assertIsNone(trade["last_completed_bar_epoch"])
+
+    def test_reconcile_recovers_a_replacement_accepted_before_local_attach(self):
+        self._bind_engine(runtime_name="runtime-v3-stop-recover")
+        order = self._open_bracketed_position(plan_updates={
+            "rule_schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
+            "signal_ts": (self.NOW - timedelta(minutes=2)).timestamp(),
+        })
+        old_stop = f"{order.id}-stop"
+        replacement = self.provider.replace_stop_order(old_stop, 101.5)
+
+        def leave_pending(current):
+            trade = current["active_trades"]["SPY"]
+            trade.update({
+                "breakeven_armed_at": self.NOW.isoformat(),
+                "breakeven_armed_epoch": self.NOW.timestamp(),
+                "desired_stop_price": 101.5,
+                "stop_replacement": {
+                    "status": "pending", "old_order_id": old_stop,
+                    "requested_stop_price": 101.5,
+                },
+            })
+            return current
+
+        state.update_state(leave_pending)
+        self.engine.reconcile()
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["active_stop_price"], 101.5)
+        self.assertEqual(trade["stop_replacement"]["status"], "confirmed")
+        self.assertTrue(trade["stop_replacement"]["recovered"])
+        self.assertEqual(trade["stop_replacement"]["new_order_id"],
+                         replacement.id)
+        self.assertTrue(_broker_protected(_leg_rows(trade)))
+
+    def test_reconcile_refuses_an_unobservable_pending_replacement(self):
+        self._bind_engine(runtime_name="runtime-v3-stop-missing-chain")
+        order = self._open_bracketed_position(plan_updates={
+            "rule_schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
+            "signal_ts": (self.NOW - timedelta(minutes=2)).timestamp(),
+        })
+        old_stop = f"{order.id}-stop"
+
+        def leave_pending(current):
+            current["active_trades"]["SPY"]["stop_replacement"] = {
+                "status": "pending", "old_order_id": old_stop,
+                "requested_stop_price": 101.5,
+            }
+            return current
+
+        state.update_state(leave_pending)
+        self.provider.orders_by_id.pop(old_stop)
+        with self.assertRaisesRegex(
+                AlpacaError, "pending replacement stop .* is unavailable"):
+            self.engine.reconcile()
+
+    def test_stop_fill_race_never_sends_a_duplicate_local_close(self):
+        self._bind_engine(runtime_name="runtime-v3-stop-fill-race")
+        order = self._open_bracketed_position(plan_updates={
+            "rule_schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
+            "signal_ts": (self.NOW - timedelta(minutes=2)).timestamp(),
+        })
+        self.provider.replace_error_after_fill = True
+        bar = {
+            "symbol": "SPY", "timestamp": self.NOW - timedelta(minutes=1),
+            "open": 101.5, "high": 103.1, "low": 101.3, "close": 103.0,
+            "volume": 1000,
+        }
+        monitored = self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live),
+            market_rows={"SPY": {"bars": [bar]}})
+        self.assertEqual(monitored["closed"], [])
+        self.assertEqual(monitored["failed"][0]["reason"],
+                         "breakeven_stop_replace_failed")
+        self.assertEqual(self.provider.close_requests, [])
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["closing_order_id"], f"{order.id}-stop")
+        self.assertEqual(trade["closing_reason"], "stop")
+
+    def test_filled_replacement_response_never_falls_through_to_local_close(self):
+        self._bind_engine(runtime_name="runtime-v3-stop-filled-response")
+        self._open_bracketed_position(plan_updates={
+            "rule_schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
+            "signal_ts": (self.NOW - timedelta(minutes=2)).timestamp(),
+        })
+        self.provider.replacement_returns_filled = True
+        bar = {
+            "symbol": "SPY", "timestamp": self.NOW - timedelta(minutes=1),
+            "open": 101.5, "high": 103.1, "low": 101.3, "close": 103.0,
+            "volume": 1000,
+        }
+        monitored = self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live),
+            market_rows={"SPY": {"bars": [bar]}})
+        self.assertEqual(monitored["closed"], [])
+        self.assertEqual(monitored["failed"], [])
+        self.assertEqual(self.provider.close_requests, [])
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["closing_reason"], "stop")
+        self.assertEqual(trade["closing_order_id"],
+                         self.provider.replacements[0][2])
 
     def test_normalized_legs_drop_sdk_shape_and_keep_role_and_price(self):
         rows = _protective_legs([_leg("leg-1", "stop", price=99),

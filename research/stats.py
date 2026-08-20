@@ -23,6 +23,20 @@ DEFAULT_BREADTH_MIN_CLUSTERS = 2
 DEFAULT_BREADTH_MIN_SESSIONS = 3
 DEFAULT_CLUSTER_BLOCK_LENGTH = 5
 
+# Dependence policies are deliberately stricter than the existing diagnostic
+# cross-family report below.  They are built only from completed prior cycles,
+# use paired candidate-minus-baseline session deltas, and are unavailable
+# unless both breadth and temporal replication are present.
+DEPENDENCE_POLICY_SCHEMA = "dependence-policy.v1"
+DEPENDENCE_MIN_COMPLETE_SESSIONS = 20
+DEPENDENCE_MIN_PRIOR_CYCLES = 2
+DEPENDENCE_CORRELATION_THRESHOLD = .8
+# Short names retained for callers that describe the floor as shared-session
+# evidence rather than complete cells.
+DEPENDENCE_MIN_SESSIONS = DEPENDENCE_MIN_COMPLETE_SESSIONS
+DEPENDENCE_MIN_CYCLES = DEPENDENCE_MIN_PRIOR_CYCLES
+DEPENDENCE_ABS_CORRELATION = DEPENDENCE_CORRELATION_THRESHOLD
+
 
 def stable_seed(value) -> int:
     """Derive a reproducible 63-bit seed from arbitrary JSON-able content."""
@@ -30,6 +44,163 @@ def stable_seed(value) -> int:
                          ensure_ascii=False, allow_nan=False, default=str)
     digest = hashlib.sha256(encoded.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+
+def deterministic_dependence_map(rows, *, cutoff: float | None = None,
+                                 min_sessions: int = DEPENDENCE_MIN_COMPLETE_SESSIONS,
+                                 min_cycles: int = DEPENDENCE_MIN_PRIOR_CYCLES,
+                                 threshold: float = DEPENDENCE_CORRELATION_THRESHOLD) -> dict:
+    """Build a frozen family dependence map from prior paired observations.
+
+    ``rows`` must contain ``cycle_id``, ``family``, ``session`` and ``delta``.
+    Repeated observations in one cycle/family/session are averaged so a
+    variant sweep cannot overweight a family.  Correlations are then computed
+    on the sorted union of complete cycle/session cells.  Strong edges are
+    traversed in lexical order by a deterministic union-find, making cluster
+    identifiers reproducible and independent of input order.
+
+    This helper is policy-only: it does not alter BH or any gate.  An
+    unavailable map is returned with its evidence and explicit reason so the
+    caller can persist that conservative decision before a new cycle starts.
+    """
+    try:
+        minimum_sessions = max(1, int(min_sessions))
+        minimum_cycles = max(1, int(min_cycles))
+        correlation_threshold = float(threshold)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("dependence policy thresholds must be numeric") from exc
+    if not math.isfinite(correlation_threshold) or not 0.0 <= correlation_threshold <= 1.0:
+        raise ValueError("dependence correlation threshold must be between zero and one")
+
+    cells: dict[tuple[str, str, str], list[float]] = {}
+    invalid = 0
+    source_cycles: set[str] = set()
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            invalid += 1
+            continue
+        cycle = str(row.get("cycle_id") or row.get("cycle") or "").strip()
+        family = str(row.get("family") or "").strip()
+        session = str(row.get("session") or row.get("session_date") or "").strip()
+        try:
+            value = float(row.get("delta"))
+        except (TypeError, ValueError, OverflowError):
+            invalid += 1
+            continue
+        if not cycle or not family or not session or not math.isfinite(value):
+            invalid += 1
+            continue
+        cells.setdefault((cycle, family, session), []).append(value)
+        source_cycles.add(cycle)
+    reduced = {key: sum(values) / len(values)
+               for key, values in cells.items() if values}
+    cycles = sorted({key[0] for key in reduced})
+    families = sorted({key[1] for key in reduced})
+    parent = {family: family for family in families}
+
+    def find(value: str) -> str:
+        root = value
+        while parent[root] != root:
+            root = parent[root]
+        while parent[value] != value:
+            next_value = parent[value]
+            parent[value] = root
+            value = next_value
+        return root
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        if left_root < right_root:
+            parent[right_root] = left_root
+        else:
+            parent[left_root] = right_root
+
+    pairwise: list[dict] = []
+    strong_pairs: list[list[str]] = []
+    for index, left in enumerate(families):
+        for right in families[index + 1:]:
+            shared_keys = sorted({(cycle, session) for cycle, family, session in reduced
+                                  if family == left} &
+                                 {(cycle, session) for cycle, family, session in reduced
+                                  if family == right})
+            left_values = [reduced[(cycle, left, session)] for cycle, session in shared_keys]
+            right_values = [reduced[(cycle, right, session)] for cycle, session in shared_keys]
+            pair_cycles = sorted({cycle for cycle, _session in shared_keys})
+            correlation = None
+            if len(shared_keys) >= minimum_sessions and len(pair_cycles) >= minimum_cycles:
+                left_mean = sum(left_values) / len(left_values)
+                right_mean = sum(right_values) / len(right_values)
+                left_centered = [value - left_mean for value in left_values]
+                right_centered = [value - right_mean for value in right_values]
+                left_var = sum(value * value for value in left_centered)
+                right_var = sum(value * value for value in right_centered)
+                if left_var > 1e-18 and right_var > 1e-18:
+                    correlation = sum(a * b for a, b in zip(left_centered, right_centered)) / math.sqrt(left_var * right_var)
+                    correlation = max(-1.0, min(1.0, correlation))
+            absolute = abs(correlation) if correlation is not None else None
+            item = {
+                "families": [left, right], "left": left, "right": right,
+                "complete_sessions": len(shared_keys), "prior_cycles": pair_cycles,
+                "correlation": correlation, "absolute_correlation": absolute,
+                "eligible": bool(correlation is not None),
+                "strong": bool(absolute is not None and absolute >= correlation_threshold),
+                "reason": (None if correlation is not None else
+                           "insufficient_complete_sessions_or_cycles"),
+            }
+            pairwise.append(item)
+            if item["strong"]:
+                strong_pairs.append([left, right])
+                union(left, right)
+
+    groups: dict[str, list[str]] = {}
+    for family in families:
+        groups.setdefault(find(family), []).append(family)
+    ordered_groups = sorted((sorted(values) for values in groups.values()),
+                            key=lambda values: tuple(values))
+    cluster_map = {
+        family: f"dependence-{index:04d}"
+        for index, members in enumerate(ordered_groups, start=1)
+        for family in members
+    }
+    complete_session_count = len({(cycle, session) for cycle, _family, session in reduced})
+    available = bool(len(cycles) >= minimum_cycles and
+                     complete_session_count >= minimum_sessions and
+                     any(item["strong"] for item in pairwise))
+    reason = None if available else (
+        "insufficient_prior_cycles" if len(cycles) < minimum_cycles else
+        "insufficient_complete_sessions" if complete_session_count < minimum_sessions else
+        "no_strong_dependence_pairs")
+    body = {
+        "schema": DEPENDENCE_POLICY_SCHEMA,
+        "version": 1,
+        "cutoff": cutoff,
+        "available": available,
+        "reason": reason,
+        "minimum_complete_sessions": minimum_sessions,
+        "minimum_prior_cycles": minimum_cycles,
+        "correlation_threshold": correlation_threshold,
+        "source_cycles": cycles,
+        "families": families,
+        "complete_session_count": complete_session_count,
+        "invalid_observations": invalid,
+        "pairwise": pairwise,
+        "strong_pairs": sorted(strong_pairs),
+        "cluster_map": cluster_map if available else {},
+        "cluster_members": {cluster: sorted(family for family, value in cluster_map.items()
+                                             if value == cluster)
+                            for cluster in sorted(set(cluster_map.values()))}
+        if available else {},
+    }
+    return body
+
+
+# Readable aliases for policy callers and compatibility with external research
+# tooling that uses "dependence policy" terminology.
+build_dependence_map = deterministic_dependence_map
+dependence_policy_map = deterministic_dependence_map
+build_dependence_policy = deterministic_dependence_map
 
 
 def cluster_contributions(deltas, clusters) -> list[float]:
@@ -1059,7 +1230,13 @@ def benjamini_hochberg(pvalues: dict, alpha: float = 0.05) -> dict:
     }
 
 
-__all__ = ["DEFAULT_BREADTH_MIN_CLUSTERS", "DEFAULT_BREADTH_MIN_SESSIONS",
+__all__ = ["DEPENDENCE_POLICY_SCHEMA", "DEPENDENCE_MIN_COMPLETE_SESSIONS",
+           "DEPENDENCE_MIN_PRIOR_CYCLES", "DEPENDENCE_CORRELATION_THRESHOLD",
+           "DEPENDENCE_MIN_SESSIONS", "DEPENDENCE_MIN_CYCLES",
+           "DEPENDENCE_ABS_CORRELATION",
+           "deterministic_dependence_map", "build_dependence_map",
+           "dependence_policy_map", "build_dependence_policy",
+           "DEFAULT_BREADTH_MIN_CLUSTERS", "DEFAULT_BREADTH_MIN_SESSIONS",
            "DEFAULT_BOOTSTRAP_DRAWS", "DEFAULT_NULL_DRAWS",
            "DEFAULT_CLUSTER_BLOCK_LENGTH",
            "benjamini_hochberg",

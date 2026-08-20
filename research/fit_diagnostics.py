@@ -196,6 +196,8 @@ def _planned_vector(metadata: Mapping[str, Any], *, full: bool) -> dict[str, Any
             "max_hold_bars": metadata.get("planned_hold_bars",
                                            metadata.get("max_hold_bars")),
         })
+        if metadata.get("breakeven_r") is not None:
+            vector["breakeven_r"] = rounded(metadata.get("breakeven_r"))
     return vector
 
 
@@ -542,6 +544,8 @@ def measure_fit_diagnostics(
         "target_r": _quantiles([item.get("target_r") for item in signals]),
         "hold_bars": _quantiles([item.get("planned_hold_bars") for item in signals]),
     }
+    if normalized.get("breakeven_r") is not None:
+        planned["breakeven_r"] = normalized["breakeven_r"]
     rows = [dict(row) for row in account_rows if isinstance(row, Mapping)]
     controls_input = risk_config if risk_config is not None else config
     stress_scenario, stress_limit = _stress_controls(controls_input)
@@ -615,20 +619,7 @@ def measure_fit_diagnostics(
         "cost_to_risk": {"configured": configured, "stressed": stressed},
         "risk": _risk_summary(rows),
         "exits": _exit_summary(rows),
-        "exit_grammar": {
-            "schema": "fixed-atr-floor-bracket-r-target-bar-cap.v1",
-            "supported_exit_modes": [
-                "atr_floor_bracket", "r_target", "bar_cap"],
-            "bracket": "ATR stop with 30 bps floor",
-            "target": "configured R multiple",
-            "hold_cap": "configured max_hold_bars",
-            "executable_exit_templates_added": False,
-            "requires_operator_review": True,
-            "authorizing": False,
-            "unsupported_requested_exit_fields": [],
-            "unsupported_exit_requested": False,
-            "status": "supported_fixed_grammar",
-        },
+        "exit_grammar": audit_exit_grammar(normalized),
         "mde_power": _mde(rows),
         "behavior_fingerprint": {
             "entry": _digest(entry_vectors),
@@ -753,6 +744,12 @@ def fit_behavior_fingerprint(bars: Sequence[Any],
 def audit_exit_grammar(spec: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Describe the currently executable exit grammar for operator review."""
     candidate = spec if isinstance(spec, Mapping) else {}
+    try:
+        normalized = validate_rule_spec(candidate) if candidate else None
+    except (TypeError, ValueError):
+        normalized = None
+    breakeven = (normalized.get("breakeven_r")
+                 if isinstance(normalized, Mapping) else None)
     unsupported = sorted(
         str(key) for key in candidate
         if any(marker in str(key).lower() for marker in (
@@ -760,20 +757,29 @@ def audit_exit_grammar(spec: Mapping[str, Any] | None = None) -> dict[str, Any]:
             "take_profit", "stop_loss")) and str(key) not in {
                 "max_hold_bars"})
     result = {
-        "schema": "fixed-atr-floor-bracket-r-target-bar-cap.v1",
+        "schema": ("completed-close-breakeven-bracket.v1" if breakeven is not None
+                   else "fixed-atr-floor-bracket-r-target-bar-cap.v1"),
         "supported_exit_modes": [
             "atr_floor_bracket", "r_target", "bar_cap"],
         "bracket": "ATR stop with 30 bps floor",
         "target": "configured R multiple",
         "hold_cap": "configured max_hold_bars",
-        "executable_exit_templates_added": False,
-        "requires_operator_review": True,
+        "executable_exit_templates_added": breakeven is not None,
+        "requires_operator_review": breakeven is None,
         "authorizing": False,
     }
+    if breakeven is not None:
+        result["supported_exit_modes"].append("completed_close_breakeven")
+        result.update({
+            "breakeven_r": breakeven,
+            "breakeven_trigger": "completed close; amended stop is active next bar",
+            "vehicle_support": {"equity": True, "option": False},
+        })
     result["unsupported_requested_exit_fields"] = unsupported
     result["unsupported_exit_requested"] = bool(unsupported)
-    result["status"] = ("rejected_unsupported_exit_grammar"
-                         if unsupported else "supported_fixed_grammar")
+    result["status"] = ("rejected_unsupported_exit_grammar" if unsupported else
+                         "supported_breakeven_grammar" if breakeven is not None else
+                         "supported_fixed_grammar")
     return result
 
 

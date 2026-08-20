@@ -177,6 +177,11 @@ services:
       # Set ALPACA_RESEARCH_VEHICLES=all (or option) to opt into other lanes.
       ALPACA_RESEARCH_VEHICLES: ${ALPACA_RESEARCH_VEHICLES:-equity}
       ALPACA_RESEARCH_DATASET: ${ALPACA_RESEARCH_DATASET:-}
+      # A fresh Compose deployment has no paper execution journal yet.  The
+      # explicit bootstrap state permits broker-free shadow evidence collection
+      # only; its persisted calibration authorization_exit_code remains 2.
+      # Set to 0 when measured calibration must exist before shadow ingestion.
+      ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN: ${ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN:-1}
       ALPACA_RESEARCH_BACKTEST: ${ALPACA_RESEARCH_BACKTEST:-1}
       ALPACA_FACTORY_ENABLED: ${ALPACA_FACTORY_ENABLED:-1}
       ALPACA_FACTORY_STRATEGIES: ${ALPACA_FACTORY_STRATEGIES:-11}

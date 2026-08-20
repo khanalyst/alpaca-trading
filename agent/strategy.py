@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .contracts import finite as _finite
 from .contracts.ibr import build_ibr_range
-from .contracts.rule import (BAR_SECONDS, RuleSpecError, hold_deadline,
+from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RuleSpecError, hold_deadline,
                              MIN_STOP_DISTANCE_FRACTION, rule_variant_id,
                              validate_rule_spec)
 
@@ -149,13 +149,21 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
         "stop_distance": distance, "target_r": float(spec["target_r"]),
         "stop_loss_pct": round(distance / entry * 100.0, 8),
         "take_profit_pct": round(abs(target - entry) / entry * 100.0, 8),
-        "invalidation_anchor": "structure", "exit_policy": "fixed_target_r",
+        "invalidation_anchor": "structure",
+        "exit_policy": ("breakeven_then_target_r"
+                        if spec.get("breakeven_r") is not None
+                        else "fixed_target_r"),
         "execution_choice": str(decision.get("execution_choice") or "normal"),
         "force_flat": True, "force_flat_at": force_flat_at,
         "force_flat_ts": force_flat_ts,
         "force_flat_reason": "regular_session_close", "size_pct_equity": 0.0,
         "rule_spec_hash": decision.get("rule_spec_hash"),
     })
+    if spec["schema"] == RULE_SCHEMA_V3:
+        plan.update({
+            "rule_schema": RULE_SCHEMA_V3,
+            "breakeven_r": spec.get("breakeven_r"),
+        })
     return plan, None
 
 def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,

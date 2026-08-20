@@ -12,6 +12,9 @@ from typing import Any, Mapping
 from . import state
 from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
+from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RuleSpecError,
+                             completed_bar_exit_transition,
+                             initialize_exit_state)
 from .instruments import validate_instrument
 
 _FILLED_ORDER_STATUSES = {"filled", "partially_filled"}
@@ -324,6 +327,10 @@ class ExecutionLifecycleMixin:
                 isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
         existing = current.get("active_trades", {}).get(symbol, {})
         existing = existing if isinstance(existing, Mapping) else {}
+        v3_progressed = (
+            str(existing.get("rule_schema") or "") == RULE_SCHEMA_V3 and
+            (existing.get("last_completed_bar_epoch") is not None or
+             isinstance(existing.get("stop_replacement"), Mapping)))
         # The broker's ``filled_avg_price`` is cumulative.  Keep the last
         # journaled average so an incremental row can be priced at the
         # implied fill rather than at the new cumulative average.  This is
@@ -340,6 +347,15 @@ class ExecutionLifecycleMixin:
                 plan.get("option", {}).get("debit") if _option_profile(profile) and
                 isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
         instrument_entry = fill_price
+        if v3_progressed:
+            prior_qty = self._number(existing.get("cumulative_filled_qty"))
+            prior_entry = self._number(existing.get("entry_price"))
+            if (prior_qty is None or prior_entry is None or
+                    abs(prior_qty - filled_qty) > 1e-9 or
+                    instrument_entry is None or
+                    abs(prior_entry - instrument_entry) > 1e-9):
+                raise AlpacaError(
+                    "v3 entry fill changed after completed-bar exit processing")
 
         if order_state.get("fill_logged") and "logged_filled_qty" not in order_state:
             # Older state files used a boolean only; avoid duplicating their
@@ -467,10 +483,38 @@ class ExecutionLifecycleMixin:
             "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
             "contract_multiplier": multiplier,
         }
+        if str(plan.get("rule_schema") or "") == RULE_SCHEMA_V3:
+            if v3_progressed:
+                bounded_exit = {
+                    key: deepcopy(existing[key]) for key in (
+                        "direction", "entry_price", "initial_stop_price",
+                        "active_stop_price", "target_price", "initial_risk",
+                        "breakeven_r", "breakeven_armed_at",
+                        "breakeven_armed_epoch", "entry_bar_pending",
+                        "last_completed_bar_at", "last_completed_bar_epoch")
+                    if key in existing
+                }
+            else:
+                try:
+                    bounded_exit = initialize_exit_state(
+                        direction, instrument_entry,
+                        plan.get("underlying_stop_price", plan.get("stop_price")),
+                        plan.get("underlying_target_price", plan.get("target_price")),
+                        breakeven_r=plan.get("breakeven_r"))
+                except RuleSpecError as exc:
+                    raise AlpacaError(f"filled v3 exit state is invalid: {exc}") from exc
+            signal_ts = self._number(plan.get("signal_ts"))
+            trade.update(bounded_exit)
+            trade.update({
+                "rule_schema": RULE_SCHEMA_V3,
+                "exit_entry_bar_epoch": (
+                    signal_ts + BAR_SECONDS if signal_ts is not None else None),
+            })
         # The broker-resident bracket legs are the position's real protection.
         # Keep the ids observed at submission; a later reconciliation refreshes
         # their status but must not lose the association.
-        legs = _leg_rows(order_state) or _leg_rows(existing)
+        legs = (_leg_rows(existing) if v3_progressed else
+                (_leg_rows(order_state) or _leg_rows(existing)))
         if legs:
             trade["protective_legs"] = [dict(leg) for leg in legs]
         # A newly observed fill may precede the broker position endpoint.  An
@@ -486,7 +530,10 @@ class ExecutionLifecycleMixin:
         current.setdefault("protection", {})[symbol] = {
             key: trade.get(key) for key in (
                 "underlying_symbol", "stop_price", "target_price", "force_flat_at",
-                "max_hold_bars", "hold_deadline_ts", "protective_legs")
+                "max_hold_bars", "hold_deadline_ts", "protective_legs",
+                "rule_schema", "initial_stop_price", "active_stop_price",
+                "breakeven_r", "breakeven_armed_at", "breakeven_armed_epoch",
+                "last_completed_bar_at", "last_completed_bar_epoch")
         }
         if incremental_qty > 0:
             incremental_notional, incremental_risk = economics(
@@ -873,7 +920,220 @@ class ExecutionLifecycleMixin:
             return None
         return (bid + ask) / 2.0
 
-    def _monitor_positions(self, now: datetime, positions: list[Any]) -> dict[str, Any]:
+    def _completed_exit_bars(self, trade: Mapping, now: datetime,
+                             market_rows: Mapping[str, Any] | None) -> list[Any]:
+        """Return ordered unseen completed bars for one durable v3 exit."""
+        underlying = str(trade.get("underlying_symbol") or
+                         trade.get("symbol") or "").upper()
+        row = market_rows.get(underlying, {}) if isinstance(market_rows, Mapping) else {}
+        bars = row.get("bars", []) if isinstance(row, Mapping) else []
+        if not bars:
+            start_epoch = (self._number(trade.get("last_completed_bar_epoch")) or
+                           self._number(trade.get("exit_entry_bar_epoch")) or
+                           self._number(trade.get("opened_at")))
+            start = (datetime.fromtimestamp(max(0.0, start_epoch - BAR_SECONDS),
+                                            timezone.utc)
+                     if start_epoch is not None else now - timedelta(minutes=5))
+            try:
+                fetched = self.market.stock_bars(
+                    [underlying], timeframe="1m", start=start, end=now)
+                bars = fetched.get(underlying, []) if isinstance(fetched, Mapping) else []
+            except Exception:  # noqa: BLE001
+                return []
+        prepared: list[tuple[datetime, Any]] = []
+        entry_epoch = self._number(trade.get("exit_entry_bar_epoch"))
+        last_epoch = self._number(trade.get("last_completed_bar_epoch"))
+        for raw in bars or ():
+            try:
+                bar = self._bar_mapping(raw, underlying)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            stamp = self._timestamp(bar.get("timestamp"))
+            if stamp is None:
+                continue
+            end = stamp + timedelta(seconds=BAR_SECONDS)
+            if end > now or (entry_epoch is not None and
+                             stamp.timestamp() < entry_epoch - 1e-9):
+                continue
+            if last_epoch is not None and end.timestamp() <= last_epoch + 1e-9:
+                continue
+            prepared.append((stamp, bar))
+        prepared.sort(key=lambda item: item[0])
+        if any(right[0] - left[0] != timedelta(seconds=BAR_SECONDS)
+               for left, right in zip(prepared, prepared[1:])):
+            return []
+        return [bar for _stamp, bar in prepared]
+
+    @staticmethod
+    def _replacement_leg(order: Any, stop_price: float) -> dict[str, Any]:
+        return {
+            "order_id": str(_value(order, "id", "")), "role": "stop",
+            "status": str(_value(order, "status", "accepted") or
+                          "accepted").lower(),
+            "price": float(stop_price),
+            "qty": float(_value(order, "qty", 0) or 0),
+            "filled_qty": float(_value(order, "filled_qty", 0) or 0),
+            "filled_avg_price": (
+                float(_value(order, "filled_avg_price"))
+                if _value(order, "filled_avg_price", None) is not None else None),
+        }
+
+    def _replace_breakeven_stop(self, symbol: str, trade: dict,
+                                desired_stop: float) -> tuple[bool, dict]:
+        """Persist intent, amend one stop, then durably attach its successor."""
+        live_stops = [leg for leg in _leg_rows(trade)
+                      if str(leg.get("role")) == "stop" and _leg_live(leg)]
+        if len(live_stops) != 1 or not _broker_protected(_leg_rows(trade)):
+            self._event("breakeven_stop_replace_failed", {
+                "symbol": symbol, "reason": "one complete live bracket is required"})
+            return False, trade
+        replace_stop = getattr(self.provider, "replace_stop_order", None)
+        if not callable(replace_stop):
+            self._event("breakeven_stop_replace_failed", {
+                "symbol": symbol, "reason": "provider cannot replace a stop order"})
+            return False, trade
+        old_leg = live_stops[0]
+        old_id = str(old_leg.get("order_id"))
+        pending = {
+            "status": "pending", "old_order_id": old_id,
+            "requested_stop_price": float(desired_stop),
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "requested_epoch": time.time(),
+        }
+        trade["desired_stop_price"] = float(desired_stop)
+        trade["stop_replacement"] = dict(pending)
+
+        def mark_pending(current: dict) -> dict:
+            for bucket in ("active_trades", "protection"):
+                row = current.get(bucket, {}).get(symbol)
+                if not isinstance(row, dict):
+                    continue
+                for key in ("breakeven_armed_at", "breakeven_armed_epoch",
+                            "last_completed_bar_at", "last_completed_bar_epoch"):
+                    row[key] = trade.get(key)
+                row["desired_stop_price"] = float(desired_stop)
+                row["stop_replacement"] = dict(pending)
+            return current
+
+        state.update_state(mark_pending)
+        try:
+            replacement = replace_stop(old_id, desired_stop)
+        except Exception as exc:  # noqa: BLE001
+            self._event("breakeven_stop_replace_failed", {
+                "symbol": symbol, "order_id": old_id, "error": str(exc)})
+            # A replace can race a stop/target fill.  Reconcile authoritative
+            # broker state before any retry or local close is considered.
+            try:
+                self.reconcile()
+            except Exception:  # noqa: BLE001
+                pass
+            refreshed = state.load_state().get("active_trades", {}).get(symbol, trade)
+            return False, dict(refreshed) if isinstance(refreshed, Mapping) else trade
+        new_leg = self._replacement_leg(replacement, desired_stop)
+        if not new_leg["order_id"]:
+            raise AlpacaError("replacement stop has no broker order id")
+        confirmed = {
+            **pending, "status": "confirmed",
+            "new_order_id": new_leg["order_id"],
+            "confirmed_at": datetime.now(timezone.utc).isoformat(),
+            "confirmed_epoch": time.time(),
+        }
+
+        def attach(current: dict) -> dict:
+            for bucket in ("active_trades", "protection"):
+                row = current.get(bucket, {}).get(symbol)
+                if not isinstance(row, dict):
+                    continue
+                legs = [dict(item) for item in _leg_rows(row)
+                        if str(item.get("order_id")) != old_id]
+                legs.append(dict(new_leg))
+                row.update({
+                    "protective_legs": legs,
+                    "active_stop_price": float(desired_stop),
+                    "desired_stop_price": float(desired_stop),
+                    "stop_replacement": dict(confirmed),
+                })
+                if new_leg["status"] in _FILLED_ORDER_STATUSES:
+                    row.update({"status": "closing", "closing_reason": "stop",
+                                "closing_order_id": new_leg["order_id"],
+                                "closing_price": new_leg.get("filled_avg_price")})
+            return current
+
+        current = state.update_state(attach)
+        refreshed = current.get("active_trades", {}).get(symbol, trade)
+        self._event("breakeven_stop_replaced", {
+            "symbol": symbol, "old_order_id": old_id,
+            "new_order_id": new_leg["order_id"], "stop_price": desired_stop})
+        return True, dict(refreshed) if isinstance(refreshed, Mapping) else trade
+
+    def _recover_stop_replacement(self, symbol: str, trade: dict,
+                                  by_id: Mapping[str, Any]) -> None:
+        """Recover a replacement chain after a crash between broker/local writes."""
+        pending = trade.get("stop_replacement")
+        if not isinstance(pending, Mapping) or str(pending.get("status")) != "pending":
+            return
+        pending = dict(pending)
+        old_id = str(pending.get("old_order_id") or "")
+        desired = self._number(pending.get("requested_stop_price"))
+        if not old_id or desired is None:
+            raise AlpacaError(f"pending stop replacement for {symbol} is malformed")
+        old_order = by_id.get(old_id)
+        new_id = str(pending.get("new_order_id") or "")
+        if not new_id and old_order is not None:
+            new_id = str(_value(old_order, "replaced_by", "") or "")
+        successor = by_id.get(new_id) if new_id else None
+        if successor is None:
+            successor = next((order for order in by_id.values()
+                              if str(_value(order, "replaces", "") or "") == old_id),
+                             None)
+            if successor is not None:
+                new_id = str(_value(successor, "id", "") or "")
+        old_status = str(_value(old_order, "status", "") or "").lower()
+        if successor is None:
+            if old_order is None:
+                raise AlpacaError(
+                    f"pending replacement stop {old_id} is unavailable")
+            if old_status == "replaced" or new_id:
+                raise AlpacaError(
+                    f"replacement successor for stop {old_id} is unavailable")
+            # A visible predecessor with no replacement chain can be refreshed
+            # by the leg lifecycle below.  A still-live predecessor may be
+            # retried by the next monitor; a terminal one fails protection
+            # closed instead.
+            pending["reconcile_misses"] = int(
+                pending.get("reconcile_misses", 0) or 0) + 1
+            trade["stop_replacement"] = pending
+            return
+        if str(_value(successor, "type", "") or "").lower() not in {
+                "stop", "stop_limit"}:
+            raise AlpacaError("replacement successor is not a stop order")
+        raw = _value(successor, "raw", {})
+        broker_stop = self._number(_value(raw, "stop_price", None))
+        if broker_stop is None or abs(broker_stop - desired) > 1e-9:
+            raise AlpacaError("replacement successor stop price is contradictory")
+        new_leg = self._replacement_leg(successor, desired)
+        legs = [dict(item) for item in _leg_rows(trade)
+                if str(item.get("order_id")) != old_id]
+        legs.append(new_leg)
+        pending.update({
+            "status": "confirmed", "new_order_id": new_id,
+            "confirmed_at": datetime.now(timezone.utc).isoformat(),
+            "confirmed_epoch": time.time(), "recovered": True,
+        })
+        trade.update({
+            "protective_legs": legs, "active_stop_price": desired,
+            "desired_stop_price": desired, "stop_replacement": pending,
+        })
+        if new_leg["status"] in _FILLED_ORDER_STATUSES:
+            trade.update({"status": "closing", "closing_reason": "stop",
+                          "closing_order_id": new_id,
+                          "closing_price": new_leg.get("filled_avg_price")})
+        self._event("breakeven_stop_recovered", {
+            "symbol": symbol, "old_order_id": old_id,
+            "new_order_id": new_id, "stop_price": desired})
+
+    def _monitor_positions(self, now: datetime, positions: list[Any], *,
+                           market_rows: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Evaluate persisted protection on every cycle and close safely."""
         runtime = state.load_state()
         active = runtime.get("active_trades", {}) if isinstance(runtime, Mapping) else {}
@@ -900,9 +1160,88 @@ class ExecutionLifecycleMixin:
                 # it.  Sending anything here would double-close.
                 continue
             protected = _broker_protected(legs)
+            transition_reason = None
+            filled_fraction = (self._number(trade.get("filled_fraction"))
+                               if isinstance(trade, Mapping) else None)
+            if (isinstance(trade, Mapping) and
+                    str(trade.get("rule_schema") or "") == RULE_SCHEMA_V3 and
+                    filled_fraction is not None and filled_fraction >= 1.0 - 1e-9):
+                trade = dict(trade)
+                pending = trade.get("stop_replacement")
+                if (isinstance(pending, Mapping) and
+                        str(pending.get("status")) == "pending" and protected):
+                    desired_stop = self._number(
+                        pending.get("requested_stop_price",
+                                    trade.get("desired_stop_price")))
+                    if desired_stop is None:
+                        failed.append({"symbol": symbol,
+                                       "reason": "breakeven_stop_invalid"})
+                        continue
+                    replaced, trade = self._replace_breakeven_stop(
+                        symbol, trade, desired_stop)
+                    if not replaced:
+                        active[symbol] = trade
+                        failed.append({
+                            "symbol": symbol,
+                            "reason": "breakeven_stop_replace_failed"})
+                        continue
+                    legs = _leg_rows(trade)
+                    protected = _broker_protected(legs)
+                bars = self._completed_exit_bars(trade, now, market_rows)
+                if bars:
+                    old_active_stop = self._number(trade.get("active_stop_price"))
+                    stop_changed = False
+                    try:
+                        for bar in bars:
+                            transition = completed_bar_exit_transition(trade, bar)
+                            trade.update(transition["state"])
+                            stop_changed = stop_changed or bool(
+                                transition.get("stop_changed"))
+                            if transition.get("exit") is not None:
+                                transition_reason = str(
+                                    transition["exit"].get("reason") or "") or None
+                                trade["completed_bar_exit"] = dict(transition["exit"])
+                                break
+                    except RuleSpecError as exc:
+                        failed.append({"symbol": symbol,
+                                       "reason": "v3_exit_state_invalid",
+                                       "error": str(exc)})
+                        self._event("v3_exit_state_invalid", {
+                            "symbol": symbol, "error": str(exc)})
+                        continue
+                    if stop_changed and transition_reason is None and protected:
+                        desired_stop = self._number(trade.get("active_stop_price"))
+                        if desired_stop is None:
+                            failed.append({"symbol": symbol,
+                                           "reason": "breakeven_stop_invalid"})
+                            continue
+                        # The pure state has armed the desired next-bar stop;
+                        # broker protection remains at the old stop until the
+                        # replacement response or reconciliation proves success.
+                        trade["active_stop_price"] = old_active_stop
+                        replaced, trade = self._replace_breakeven_stop(
+                            symbol, trade, desired_stop)
+                        if not replaced:
+                            active[symbol] = trade
+                            failed.append({
+                                "symbol": symbol,
+                                "reason": "breakeven_stop_replace_failed"})
+                            continue
+                        legs = _leg_rows(trade)
+                        protected = _broker_protected(legs)
+                    active[symbol] = trade
+                    changed = True
+                    if (trade.get("closing_order_id") or any(
+                            str(leg.get("status", "")).lower() == "filled"
+                            for leg in legs)):
+                        # A replacement response may already be filled.  That
+                        # broker leg is the exit; never fall through to the
+                        # local protection poller and submit a second close.
+                        continue
             price = self._protection_price(trade, position, now) if isinstance(trade, Mapping) else None
             direction = str(trade.get("direction", _value(position, "side", "long"))).lower()
-            stop = self._number(trade.get("stop_price"))
+            stop = self._number(trade.get("active_stop_price",
+                                          trade.get("stop_price")))
             target = self._number(trade.get("target_price"))
             reason = None
             if force_flat:
@@ -915,6 +1254,8 @@ class ExecutionLifecycleMixin:
                 self._event("unprotected_position", {"symbol": symbol,
                                                       "reason": "protective_legs_terminal"})
                 reason = "protection_missing"
+            elif transition_reason is not None and not protected:
+                reason = transition_reason
             elif protected:
                 # The broker owns the stop and target exits.  A local price
                 # crossing must not race its own resting legs.
@@ -981,9 +1322,25 @@ class ExecutionLifecycleMixin:
                                                   "error": str(exc)})
         if changed:
             try:
+                protection = dict(runtime.get("protection", {}))
+                for symbol, trade in active.items():
+                    if (not isinstance(trade, Mapping) or
+                            str(trade.get("rule_schema") or "") != RULE_SCHEMA_V3):
+                        continue
+                    row = dict(protection.get(symbol, {}))
+                    for key in ("rule_schema", "initial_stop_price",
+                                "active_stop_price", "breakeven_r",
+                                "breakeven_armed_at", "breakeven_armed_epoch",
+                                "last_completed_bar_at", "last_completed_bar_epoch",
+                                "desired_stop_price", "stop_replacement",
+                                "protective_legs"):
+                        if key in trade:
+                            row[key] = deepcopy(trade[key])
+                    protection[symbol] = row
                 runtime = state.update_state(lambda current: {
                     **current,
                     "active_trades": dict(active),
+                    "protection": protection,
                     "orders": {**current.get("orders", {}),
                                **runtime.get("orders", {})},
                 })
@@ -1039,6 +1396,9 @@ class ExecutionLifecycleMixin:
         # the broker creates them on the same equity symbol with the parent's
         # day time-in-force.
         for symbol, trade in previous.items():
+            if (isinstance(trade, dict) and
+                    str(trade.get("rule_schema") or "") == RULE_SCHEMA_V3):
+                self._recover_stop_replacement(symbol, trade, by_id)
             legs = _leg_rows(trade)
             if not legs:
                 continue
@@ -1203,7 +1563,12 @@ class ExecutionLifecycleMixin:
             # win for protection and any close it just observed.
             if isinstance(refreshed_item, Mapping):
                 for key in ("protective_legs", "closing_order_id",
-                            "closing_reason", "closing_price"):
+                            "closing_reason", "closing_price", "rule_schema",
+                            "initial_stop_price", "active_stop_price",
+                            "breakeven_r", "breakeven_armed_at",
+                            "breakeven_armed_epoch", "last_completed_bar_at",
+                            "last_completed_bar_epoch", "desired_stop_price",
+                            "stop_replacement"):
                     if key in refreshed_item:
                         item[key] = deepcopy(refreshed_item[key])
             pending = next((row for row in pending_by_symbol.get(symbol, [])
@@ -1390,7 +1755,20 @@ class ExecutionLifecycleMixin:
                     entry_order["closing_attempt"] = int(max(attempts))
             current.setdefault("protection", {}).pop(symbol, None)
         reconciled_at = time.time()
-        protection = current.get("protection", {})
+        protection = dict(current.get("protection", {}))
+        for symbol, trade in active.items():
+            if (not isinstance(trade, Mapping) or
+                    str(trade.get("rule_schema") or "") != RULE_SCHEMA_V3):
+                continue
+            row = dict(protection.get(symbol, {}))
+            for key in ("rule_schema", "initial_stop_price", "active_stop_price",
+                        "breakeven_r", "breakeven_armed_at",
+                        "breakeven_armed_epoch", "last_completed_bar_at",
+                        "last_completed_bar_epoch", "desired_stop_price",
+                        "stop_replacement", "protective_legs"):
+                if key in trade:
+                    row[key] = deepcopy(trade[key])
+            protection[symbol] = row
         # The learning events for the closes booked above are written in this
         # same atomic replacement.  Either the trade is still active and its
         # close is re-derived next cycle, or the close and its outcome are both

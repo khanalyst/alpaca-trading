@@ -61,6 +61,14 @@ DEFAULT_RETENTION_DAYS = 180
 MAX_PENDING_CORPUS_BYTES = 64 * 1024 * 1024
 MAX_QUARANTINE_EVENTS = 1024
 QUARANTINE_OVERFLOW_KEY = "__quarantine_overflow__"
+# Replay metadata is immutable evidence; these bounded meta projections make
+# an incomplete/mismatched middle session visible to operators and require an
+# explicit repaired replay before ingestion may advance its boundary.
+REPLAY_QUARANTINE_META_KEY = "replay_quarantine"
+SESSION_CATALOG_META_KEY = "session_catalog"
+MAX_REPLAY_REPAIR_HISTORY = 32
+MAX_ACTIVE_REPLAY_QUARANTINE = 1024
+REPLAY_QUARANTINE_OVERFLOW_KEY = "__replay_quarantine_overflow__"
 
 
 class ShadowError(RuntimeError):
@@ -152,6 +160,26 @@ def _recorded_session_bounds(corpus_path: Path, session: str) -> tuple[datetime,
             closed.astimezone(NEW_YORK).date().isoformat() != session):
         return None
     return opened, closed
+
+
+def _recorded_session_calendar(corpus_path: Path) -> dict[str, tuple[datetime, datetime]]:
+    """Return validated, already-closed sessions from the recorder sidecar."""
+    index_path = corpus_path.parent / RECORDER_INDEX_NAME
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    calendar = payload.get("session_calendar") if isinstance(payload, Mapping) else None
+    if not isinstance(calendar, Mapping):
+        return {}
+    now = datetime.now(UTC)
+    result: dict[str, tuple[datetime, datetime]] = {}
+    for session in calendar:
+        day = str(session)
+        bounds = _recorded_session_bounds(corpus_path, day)
+        if bounds is not None and bounds[1] <= now:
+            result[day] = bounds
+    return result
 
 
 def _recorded_session_close(corpus_path: Path, session: str) -> datetime | None:
@@ -820,14 +848,16 @@ class ShadowStore:
             result[key] = dict(detail)
         return result
 
-    def save_quarantine_events(self, value: Mapping[str, Mapping[str, Any]]) -> None:
+    def save_quarantine_events(self, value: Mapping[str, Mapping[str, Any]], *,
+                               replace: bool = False) -> None:
         """Persist bounded malformed-event diagnostics as mutable metadata.
 
         This metadata is not authorizing evidence.  It records why a source
         offset remains uncommitted and is removed only when the exact event
         key successfully normalizes on a later corrected replay.
         """
-        encoded = {str(key): dict(detail) for key, detail in value.items()}
+        prior = {} if replace else self.quarantine_events()
+        encoded = {**prior, **{str(key): dict(detail) for key, detail in value.items()}}
         if len(encoded) > MAX_QUARANTINE_EVENTS:
             # Do not silently discard malformed evidence when the diagnostic
             # bound is reached. Retain a deterministic prefix plus an
@@ -852,6 +882,211 @@ class ShadowStore:
             db.execute("""INSERT INTO meta(key,value) VALUES('quarantine_events',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                        (_json(encoded),))
+
+    def session_catalog(self) -> dict[str, dict[str, Any]]:
+        """Return recorder-calendar session provenance seen by ShadowRunner."""
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?",
+                             (SESSION_CATALOG_META_KEY,)).fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("shadow session catalog metadata is invalid") from exc
+        if not isinstance(value, Mapping):
+            raise ShadowError("shadow session catalog metadata is invalid")
+        result: dict[str, dict[str, Any]] = {}
+        for session, detail in value.items():
+            if not isinstance(session, str) or not isinstance(detail, Mapping):
+                raise ShadowError("shadow session catalog metadata is invalid")
+            result[session] = dict(detail)
+        return result
+
+    def save_session_catalog(self, value: Mapping[str, Mapping[str, Any]]) -> None:
+        """Persist bounded exact-calendar session provenance.
+
+        Only entries sourced from the recorder's Alpaca calendar may be used
+        to detect an all-arm gap.  Timestamp-derived weekdays are deliberately
+        not promoted to this catalog because holidays and early closes must
+        remain an external authority.
+        """
+        if self.readonly:
+            raise ShadowError("cannot update session catalog on a read-only WAL")
+        incoming = {str(key): dict(detail) for key, detail in value.items()}
+        existing = self.session_catalog()
+        for key, detail in incoming.items():
+            prior = existing.get(key)
+            if prior is not None and _digest(prior) != _digest(detail):
+                raise ShadowError(f"session catalog provenance conflicts for {key}")
+        # The catalog is monotonic: a correction can add a session, but cannot
+        # erase or replace exchange-calendar authority already observed.
+        encoded = {**existing, **incoming}
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value) VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                       (SESSION_CATALOG_META_KEY, _json(encoded)))
+
+    def record_session_calendar(self, session_date: str, *, opened: str,
+                                closed: str, source: str) -> None:
+        if self.readonly:
+            raise ShadowError("cannot update session catalog on a read-only WAL")
+        catalog = self.session_catalog()
+        existing = catalog.get(str(session_date))
+        if existing is not None:
+            expected = {"session_date": str(session_date), "open": str(opened),
+                        "close": str(closed), "source": str(source)}
+            if any(str(existing.get(key)) != value for key, value in expected.items()):
+                raise ShadowError(f"session catalog provenance conflicts for {session_date}")
+            return
+        catalog[str(session_date)] = {
+            "session_date": str(session_date), "open": str(opened),
+            "close": str(closed), "source": str(source),
+            "recorded_ts": time.time(),
+        }
+        self.save_session_catalog(catalog)
+
+    def replay_quarantine(self) -> dict[str, dict[str, Any]]:
+        """Return durable replay repair/quarantine state.
+
+        A replay that is incomplete or semantically mismatched is never
+        silently treated as a missing row.  The shadow worker records a
+        bounded diagnostic entry keyed by candidate/session; a later complete
+        parity replay changes that same entry to ``repaired`` and retains the
+        prior digests for audit.  This projection is also readable from the
+        ingest-only process (which opens the WAL read-only).
+        """
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (REPLAY_QUARANTINE_META_KEY,)).fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("shadow replay quarantine metadata is invalid") from exc
+        if not isinstance(value, Mapping):
+            raise ShadowError("shadow replay quarantine metadata is invalid")
+        result: dict[str, dict[str, Any]] = {}
+        for key, detail in value.items():
+            if not isinstance(key, str) or not isinstance(detail, Mapping):
+                raise ShadowError("shadow replay quarantine metadata is invalid")
+            result[key] = dict(detail)
+        return result
+
+    def _save_replay_quarantine(self, value: Mapping[str, Mapping[str, Any]]) -> None:
+        # Keep every unresolved entry (they are the repair boundary), while
+        # bounding retained repaired history.  If the active set exceeds the
+        # explicit safety limit, persist a visible overflow sentinel with a
+        # deterministic digest/count; ingestion treats it as a global block.
+        active = {
+            str(key): dict(detail) for key, detail in value.items()
+            if str(key) != REPLAY_QUARANTINE_OVERFLOW_KEY
+            and str((detail or {}).get("status") or "") != "repaired"
+        }
+        repaired = [
+            (str(key), dict(detail)) for key, detail in value.items()
+            if str(key) != REPLAY_QUARANTINE_OVERFLOW_KEY
+            and str((detail or {}).get("status") or "") == "repaired"
+        ]
+        repaired.sort(key=lambda item: (
+            float(item[1].get("repaired_ts", 0.0) or 0.0), item[0]))
+        encoded: dict[str, dict[str, Any]] = dict(active)
+        encoded.update(dict(repaired[-MAX_REPLAY_REPAIR_HISTORY:]))
+        if len(active) > MAX_ACTIVE_REPLAY_QUARANTINE:
+            active_keys = sorted(active)
+            encoded[REPLAY_QUARANTINE_OVERFLOW_KEY] = {
+                "schema": "shadow-replay-repair.v1",
+                "candidate_id": None,
+                "session_date": None,
+                "status": "overflow",
+                "reason": "active replay quarantine exceeds safety bound",
+                "max_active": MAX_ACTIVE_REPLAY_QUARANTINE,
+                "active_count": len(active),
+                "active_digest": _digest(active_keys),
+                "unknown_tail": True,
+                "updated_ts": time.time(),
+            }
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value) VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                       (REPLAY_QUARANTINE_META_KEY, _json(encoded)))
+
+    @staticmethod
+    def _replay_quarantine_key(candidate_id: str, session_date: str) -> str:
+        return f"{candidate_id}:{session_date}"
+
+    def quarantine_replay_session(self, *, candidate_id: str,
+                                  session_date: str, reason: str,
+                                  status: str, source_digest: str | None = None,
+                                  shadow_digest: str | None = None,
+                                  replay_digest: str | None = None) -> dict[str, Any]:
+        """Record a blocked replay session without deleting any evidence."""
+        if self.readonly:
+            raise ShadowError("cannot update replay quarantine on a read-only WAL")
+        if status not in {"incomplete", "mismatch"}:
+            raise ValueError("replay quarantine status must be incomplete or mismatch")
+        key = self._replay_quarantine_key(str(candidate_id), str(session_date))
+        quarantine = self.replay_quarantine()
+        now = time.time()
+        previous = quarantine.get(key, {})
+        history = list(previous.get("history") or []) if isinstance(previous, Mapping) else []
+        history.append({
+            "status": status, "reason": str(reason),
+            "source_digest": source_digest, "shadow_digest": shadow_digest,
+            "replay_digest": replay_digest, "observed_ts": now,
+        })
+        history = history[-MAX_REPLAY_REPAIR_HISTORY:]
+        entry = {
+            "schema": "shadow-replay-repair.v1",
+            "candidate_id": str(candidate_id),
+            "session_date": str(session_date),
+            "status": "quarantined",
+            "reason": str(reason),
+            "source_digest": source_digest,
+            "shadow_digest": shadow_digest,
+            "replay_digest": replay_digest,
+            "first_seen_ts": previous.get("first_seen_ts", now),
+            "last_seen_ts": now,
+            "repair_count": int(previous.get("repair_count", 0) or 0),
+            "history": history,
+        }
+        quarantine[key] = entry
+        self._save_replay_quarantine(quarantine)
+        return entry
+
+    def repair_replay_session(self, *, candidate_id: str,
+                              session_date: str, source_digest: str,
+                              shadow_digest: str, replay_digest: str,
+                              reason: str = "complete parity replay") -> dict[str, Any] | None:
+        """Persist an explicit repaired/replayed transition for a session."""
+        if self.readonly:
+            raise ShadowError("cannot update replay quarantine on a read-only WAL")
+        key = self._replay_quarantine_key(str(candidate_id), str(session_date))
+        quarantine = self.replay_quarantine()
+        previous = quarantine.get(key)
+        if not isinstance(previous, Mapping):
+            return None
+        now = time.time()
+        history = list(previous.get("history") or [])
+        history.append({
+            "status": "repaired", "reason": str(reason),
+            "source_digest": source_digest, "shadow_digest": shadow_digest,
+            "replay_digest": replay_digest, "repaired_ts": now,
+        })
+        entry = dict(previous)
+        entry.update({
+            "status": "repaired", "reason": str(reason),
+            "source_digest": source_digest, "shadow_digest": shadow_digest,
+            "replay_digest": replay_digest,
+            "repaired_ts": now,
+            "repair_count": int(previous.get("repair_count", 0) or 0) + 1,
+            "history": history[-MAX_REPLAY_REPAIR_HISTORY:],
+        })
+        quarantine[key] = entry
+        self._save_replay_quarantine(quarantine)
+        return entry
 
     def upsert_candidate(self, candidate: Mapping[str, Any]) -> None:
         config = candidate.get("config")
@@ -1715,6 +1950,29 @@ class ShadowRunner:
         self.store.replay_diff(candidate_id=candidate_id, session_date=session,
                                source_digest=source_digest, shadow_digest=shadow_digest,
                                replay_digest=replay_digest, status=status, details=details)
+        # Keep a durable repair trail for any session that was incomplete or
+        # semantically mismatched.  Ingestion treats a quarantined session as
+        # blocked even when later sessions are healthy; only a subsequent
+        # complete, parity-matched replay records the explicit ``repaired``
+        # transition that permits the chronological tail to advance.
+        # A normal forward poll may observe a session before its closing bar;
+        # that expected open tail is diagnostic but is not itself a repair
+        # incident.  Quarantine only an attempted closed-session replay (or a
+        # replay exception), while ingestion still refuses incomplete metadata.
+        if status == "mismatch" or (
+                status == "incomplete" and (complete or not replay_ok)):
+            self.store.quarantine_replay_session(
+                candidate_id=candidate_id, session_date=session,
+                reason=("replay incomplete" if status == "incomplete"
+                        else "shadow/replay semantic mismatch"),
+                status=status, source_digest=source_digest,
+                shadow_digest=shadow_digest, replay_digest=replay_digest)
+        else:
+            self.store.repair_replay_session(
+                candidate_id=candidate_id, session_date=session,
+                source_digest=source_digest, shadow_digest=shadow_digest,
+                replay_digest=str(replay_digest),
+                reason="complete parity replay after quarantine")
         if complete and replay_ok and replay_digest is not None:
             # Persist fills/exits/P&L in the isolated shadow database.  The
             # rows are diagnostic while parity is mismatched; ``gate_rows``
@@ -1872,7 +2130,10 @@ class ShadowRunner:
                 next_offsets[key] = consumed
         for event_key in resolved_quarantine:
             quarantine.pop(event_key, None)
-        self.store.save_quarantine_events(quarantine)
+        # ``replace=True`` lets this poll remove an event after the exact
+        # corrected bytes normalize; direct operator writes default to a
+        # monotonic merge so unrelated quarantine evidence is preserved.
+        self.store.save_quarantine_events(quarantine, replace=True)
         self.store.save_source_offsets(next_offsets)
         # Recompute the durable block after resolving corrected rows.  A
         # corrected replay can therefore become eligible in this same poll;
@@ -1887,6 +2148,43 @@ class ShadowRunner:
             for detail in quarantine.values())
         quarantine_overflow = QUARANTINE_OVERFLOW_KEY in quarantine
         events, bars, quotes, options = self._load_events()
+        # Persist only exact recorder/Alpaca calendar sessions.  This catalog
+        # is the continuity authority used by ingestion; event timestamps or
+        # weekday heuristics are intentionally insufficient (holidays and
+        # early closes must remain represented by the recorder provenance).
+        catalog = self.store.session_catalog()
+        # Import completed calendar sessions even when a particular session
+        # has no normalized events.  This is what makes an all-arm missing
+        # middle session visible instead of letting the union of replay rows
+        # silently skip it.
+        for session, bounds in _recorded_session_calendar(self.config.corpus_path).items():
+            catalog.setdefault(session, {
+                "session_date": session,
+                "open": bounds[0].isoformat(),
+                "close": bounds[1].isoformat(),
+                "source": "recorder_alpaca_calendar",
+                "recorded_ts": time.time(),
+            })
+        for event in events:
+            if event.get("event_type") not in {"bar", "bar_1m"}:
+                continue
+            stamp = _timestamp(event.get("as_of") or event.get("timestamp"))
+            if stamp is None:
+                continue
+            session = stamp.astimezone(NEW_YORK).date().isoformat()
+            bounds = _recorded_session_bounds(self.config.corpus_path, session)
+            event_end = _event_end(event)
+            if bounds is None or event_end is None or event_end < bounds[1]:
+                continue
+            catalog.setdefault(session, {
+                "session_date": session,
+                "open": bounds[0].isoformat(),
+                "close": bounds[1].isoformat(),
+                "source": "recorder_alpaca_calendar",
+                "recorded_ts": time.time(),
+            })
+        if catalog != self.store.session_catalog():
+            self.store.save_session_catalog(catalog)
         # Process one local session at a time.  A completed replay closes that
         # session's virtual books before the next session is evaluated, which
         # is essential when the recorder is catching up multiple sessions in
@@ -1975,12 +2273,32 @@ class ShadowRunner:
                     self._replay(paired, session, session_bars, session_quotes,
                                  rows, session_options)
         prune = self.store.prune()
+        replay_quarantine = self.store.replay_quarantine()
+        pending_repairs = [
+            dict(detail) for detail in replay_quarantine.values()
+            if isinstance(detail, Mapping) and detail.get("status") in {
+                "quarantined", "overflow"}
+        ]
+        pending_repairs.sort(key=lambda item: (
+            str(item.get("session_date") or ""),
+            str(item.get("candidate_id") or "")))
+        catalog = self.store.session_catalog()
         stale_tail = {
-            "status": "blocked" if (invalid_sessions or unknown_quarantine) else "clear",
+            "status": "blocked" if (
+                invalid_sessions or unknown_quarantine or pending_repairs) else "clear",
             "sessions": sorted(invalid_sessions),
             "unknown_events": bool(unknown_quarantine),
             "quarantine_overflow": bool(quarantine_overflow),
             "invalid_events": int(invalid_events),
+            "replay_repairs_required": len(pending_repairs),
+            "replay_quarantine_sessions": sorted({
+                str(item.get("session_date")) for item in pending_repairs
+                if item.get("session_date")}),
+            "replay_quarantine": pending_repairs[-64:],
+            "authoritative_catalog_sessions": sorted(
+                str(session) for session, detail in catalog.items()
+                if isinstance(detail, Mapping)
+                and str(detail.get("source") or "") == "recorder_alpaca_calendar")[-64:],
         }
         # Surface the latest per-candidate capacity summaries without copying
         # raw account rows into the heartbeat.  Replay details are already
@@ -2006,6 +2324,7 @@ class ShadowRunner:
                 "skipped_recovery_bytes": skipped_recovery_bytes,
                 "quarantine_through_session": quarantine_through,
                 "stale_tail": stale_tail,
+                "replay_quarantine": pending_repairs[-64:],
                 "opportunity_capacity": capacity,
                 **prune}
 
@@ -2043,7 +2362,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "DEFAULT_EQUITY", "DEFAULT_RETENTION_DAYS", "InputConflict",
-    "_opportunity_capacity",
+    "_opportunity_capacity", "REPLAY_QUARANTINE_META_KEY",
+    "SESSION_CATALOG_META_KEY", "REPLAY_QUARANTINE_OVERFLOW_KEY",
     "ShadowConfig", "ShadowError",
     "ShadowRunner", "ShadowStore", "run_shadow_once", "main",
 ]

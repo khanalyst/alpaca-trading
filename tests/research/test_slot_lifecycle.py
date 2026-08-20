@@ -12,7 +12,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V2,
+from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
                                   rule_variant_id)
 from research.edge_lab import EdgeLedger
 from research.factory_core import (
@@ -183,7 +183,7 @@ class DeterministicDiscoveryTests(unittest.TestCase):
             self.assertEqual(seeded.rule_spec,
                              template_hypothesis(1).rule_spec)
 
-    def test_discovery_continues_into_v2_once_every_family_is_tried(self):
+    def test_equity_discovery_continues_into_v3_once_every_family_is_tried(self):
         with tempfile.TemporaryDirectory() as directory:
             factory, _edge = _ledgers(directory)
             _seed(factory)
@@ -193,7 +193,21 @@ class DeterministicDiscoveryTests(unittest.TestCase):
                 existing_variant_ids=_variant_ids(factory),
                 tried_families=set(RULE_FAMILIES))
             self.assertIsNotNone(seeded)
+            self.assertEqual(seeded.rule_spec["schema"], RULE_SCHEMA_V3)
+            self.assertIsNotNone(seeded.rule_spec["breakeven_r"])
+
+    def test_option_discovery_stays_on_executable_v2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            _seed(factory, vehicle="option")
+            previous = factory.active("option")[0]
+            seeded = discovery_hypothesis(
+                previous, generation=1, not_before=None,
+                existing_variant_ids=_variant_ids(factory, "option"),
+                tried_families=set(RULE_FAMILIES))
+            self.assertIsNotNone(seeded)
             self.assertEqual(seeded.rule_spec["schema"], RULE_SCHEMA_V2)
+            self.assertNotIn("breakeven_r", seeded.rule_spec)
 
     def test_the_deterministic_ladder_is_wide_and_collision_free(self):
         """A slot that runs out of families has not run out of hypotheses."""

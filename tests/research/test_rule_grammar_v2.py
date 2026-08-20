@@ -19,8 +19,9 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     DEFAULT_RULE_SPEC, MAX_CONFIRMATIONS, RULE_FAMILIES, RULE_SCHEMA_V1,
-    RULE_SCHEMA_V2, SIDES, CONFIRMATIONS, RuleSpecError, evaluate_rule_signal,
-    rule_variant_id, setup_evidence, validate_rule_spec,
+    RULE_SCHEMA_V2, RULE_SCHEMA_V3, SIDES, CONFIRMATIONS, RuleSpecError,
+    evaluate_rule_signal, rule_spec_hash, rule_variant_id, setup_evidence,
+    validate_rule_spec,
 )
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -121,8 +122,57 @@ class V1IdentityTests(unittest.TestCase):
 
     def test_unknown_schema_is_refused(self):
         with self.assertRaises(RuleSpecError):
-            validate_rule_spec({"schema": "rule-strategy.v3",
+            validate_rule_spec({"schema": "rule-strategy.v4",
                                 "family": "mean_reversion"})
+
+    def test_v2_content_hash_is_frozen_when_v3_is_added(self):
+        expected = {
+            RULE_SCHEMA_V1:
+                "825f856a71714f2fc2e1f3efd955e3088a90c8a27da0f4211b8d3b1f97b49008",
+            RULE_SCHEMA_V2:
+                "f7091bc68676e2e603e1a3796f83c593e36b3593cf8fa12cb1cc1d36665c23c3",
+        }
+        for schema, digest in expected.items():
+            with self.subTest(schema=schema):
+                spec = validate_rule_spec({**BASE, "schema": schema})
+                self.assertEqual(rule_spec_hash(spec), digest)
+
+    def test_v1_and_v2_signal_contracts_do_not_gain_v3_fields(self):
+        bars = rising_bars(25, 0)
+        for schema in (RULE_SCHEMA_V1, RULE_SCHEMA_V2):
+            with self.subTest(schema=schema):
+                signal = evaluate_rule_signal(
+                    bars, validate_rule_spec({**BASE, "schema": schema}))
+                self.assertIsNotNone(signal)
+                self.assertNotIn("breakeven_r", signal)
+                self.assertNotIn("rule_schema", signal)
+
+
+class V3ValidationTests(unittest.TestCase):
+    def test_v3_default_is_nullable_and_inherits_v2_entry_filters(self):
+        spec = validate_rule_spec({"schema": RULE_SCHEMA_V3,
+                                   "family": "mean_reversion"})
+        self.assertIsNone(spec["breakeven_r"])
+        self.assertEqual(spec["confirmations"], [])
+        self.assertEqual(spec["entry_before_minutes"], 390)
+
+    def test_breakeven_is_v3_only_bounded_and_below_target(self):
+        for schema in (RULE_SCHEMA_V1, RULE_SCHEMA_V2):
+            with self.subTest(schema=schema), self.assertRaisesRegex(
+                    RuleSpecError, RULE_SCHEMA_V3):
+                validate_rule_spec({"schema": schema,
+                                    "family": "mean_reversion",
+                                    "breakeven_r": 1.0})
+        for value, target in ((True, 2.0), (-0.01, 2.0),
+                              (10.1, 11.0), (1.0, 1.0), (2.0, 1.0)):
+            with self.subTest(value=value, target=target), self.assertRaises(RuleSpecError):
+                validate_rule_spec({"schema": RULE_SCHEMA_V3,
+                                    "family": "mean_reversion",
+                                    "target_r": min(target, 10.0),
+                                    "breakeven_r": value})
+        self.assertEqual(validate_rule_spec({
+            "schema": RULE_SCHEMA_V3, "family": "mean_reversion",
+            "target_r": 2.0, "breakeven_r": 1.0})["breakeven_r"], 1.0)
 
 
 class V2ValidationTests(unittest.TestCase):

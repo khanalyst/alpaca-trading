@@ -9,7 +9,9 @@ from research.factory_core import family_template, template_hypothesis, mutate_w
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
                                     TUNING_SCHEMA, ProposalResult)
 from research.strategy_factory import (
-    NEAR_DUPLICATE_DISTANCE, _llm_replacement, _seed_slot, _tuned_variants,
+    NEAR_DUPLICATE_DISTANCE, _behavior_signature, _llm_replacement,
+    _seed_slot, _semantic_duplicate, _structurally_distinct,
+    _tuned_variants, structure_signature,
 )
 
 
@@ -48,6 +50,47 @@ class _ReplacementAdapter:
 
 
 class SemanticNearDuplicateTests(unittest.TestCase):
+    def test_legacy_confirmation_and_v2_confirmation_list_share_behavior_key(self):
+        legacy = validate_rule_spec({"family": "momentum_continuation",
+                                     "confirmation": "volume"})
+        modern = validate_rule_spec({"schema": "rule-strategy.v2",
+                                     "family": "momentum_continuation",
+                                     "confirmation": "none",
+                                     "confirmations": ["volume"]})
+        self.assertEqual(_behavior_signature(legacy), _behavior_signature(modern))
+        self.assertTrue(_semantic_duplicate(modern, [legacy], near_distance=0.0))
+
+    def test_topology_alias_does_not_count_an_active_axis_against_same_prior(self):
+        prior = validate_rule_spec({"family": "momentum_continuation",
+                                    "threshold_bps": 23.5})
+        alias = validate_rule_spec({"family": "momentum_continuation",
+                                    "threshold_bps": 23.50001})
+        self.assertEqual(structure_signature(alias, prior)["active_axes"], [])
+        self.assertFalse(_structurally_distinct(alias, [prior]))
+
+    def test_mixed_family_history_cannot_hide_same_family_alias(self):
+        prior = validate_rule_spec({"family": "momentum_continuation",
+                                    "threshold_bps": 23.5})
+        alias = validate_rule_spec({"family": "momentum_continuation",
+                                    "threshold_bps": 23.50001})
+        other = validate_rule_spec({"family": "vwap_reversion"})
+        self.assertFalse(_structurally_distinct(alias, [other, prior]))
+
+    def test_deterministic_pool_near_duplicate_falls_back_without_rewriting_ids(self):
+        root = validate_rule_spec({"family": "momentum_continuation",
+                                   "max_hold_bars": 120})
+        prior = validate_rule_spec({**root, "max_hold_bars": 121})
+        chosen, _proposal = _tuned_variants(
+            {"rule_spec": root, "slot": 0},
+            {"primary_failure": "negative_expectancy"}, count=2,
+            vehicle="equity", llm_enabled=False,
+            config={"near_duplicate_distance": 0.01},
+            adapter=None,
+            existing_specs=[prior])
+        self.assertTrue(chosen)
+        self.assertNotEqual(chosen[0].rule_spec, prior)
+        self.assertEqual(chosen[0].source, "deterministic")
+
     def test_config_exposes_bounded_default(self):
         cfg = validate_config({})
         self.assertEqual(NEAR_DUPLICATE_DISTANCE, 0.001)

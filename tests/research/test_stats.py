@@ -1,12 +1,57 @@
 import unittest
 
 from research.stats import (
+    deterministic_dependence_map,
     effective_breadth_report,
     moving_block_cluster_bootstrap_lower_bound,
 )
+from research.factory_ledger import dependence_policy_digest
 
 
 class ResearchStatisticsTests(unittest.TestCase):
+    def test_semantic_policy_digest_excludes_freeze_audit_identity(self):
+        base = {"schema": "dependence-policy.v1", "version": 1,
+                "vehicle": "equity", "target_cycle_id": "random-a",
+                "cutoff": 10.0, "source_cycles": ["prior-a", "prior-b"],
+                "cluster_map": {"a": "dependence-0001"},
+                "evidence": {"minimum_prior_cycles": 2,
+                             "minimum_complete_sessions": 20,
+                             "correlation_threshold": .8}}
+        changed_audit = {**base, "target_cycle_id": "random-b", "cutoff": 99.0}
+        self.assertEqual(dependence_policy_digest(base),
+                         dependence_policy_digest(changed_audit))
+        changed_semantics = {**base, "evidence": {
+            **base["evidence"], "correlation_threshold": .9}}
+        self.assertNotEqual(dependence_policy_digest(base),
+                            dependence_policy_digest(changed_semantics))
+
+    def test_dependence_map_requires_prior_cycles_and_uses_sorted_union_find(self):
+        rows = []
+        for cycle in ("cycle-b", "cycle-a"):
+            for session in range(20):
+                value = float(session + 1)
+                rows.extend([
+                    {"cycle_id": cycle, "family": "zeta", "session": str(session),
+                     "delta": value},
+                    {"cycle_id": cycle, "family": "alpha", "session": str(session),
+                     "delta": 2 * value},
+                ])
+        report = deterministic_dependence_map(rows)
+        self.assertTrue(report["available"])
+        self.assertEqual(report["source_cycles"], ["cycle-a", "cycle-b"])
+        self.assertEqual(report["cluster_map"], {
+            "alpha": "dependence-0001", "zeta": "dependence-0001"})
+        self.assertEqual(report["pairwise"][0]["complete_sessions"], 40)
+
+    def test_dependence_map_does_not_use_a_single_current_cycle(self):
+        rows = [{"cycle_id": "only", "family": family, "session": str(index),
+                 "delta": float(index + 1)}
+                for family in ("a", "b") for index in range(100)]
+        report = deterministic_dependence_map(rows)
+        self.assertFalse(report["available"])
+        self.assertEqual(report["reason"], "insufficient_prior_cycles")
+        self.assertEqual(report["cluster_map"], {})
+
     def test_moving_block_bootstrap_is_reproducible_and_records_design(self):
         deltas = [0.2, 0.4, 0.1, 0.7, 0.5, 0.3]
         clusters = ["s1", "s2", "s3", "s4", "s5", "s6"]

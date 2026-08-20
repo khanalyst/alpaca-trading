@@ -696,14 +696,20 @@ if [[ "$shadow_db" != /* ]]; then
   shadow_db="$repo_root/$shadow_db"
 fi
 # Calibration is read-only and applies only at the promotion boundary. Keep
-# discovery/factory diagnostic even when paper evidence is absent or thin, but
-# never let a vehicle's shadow lane proceed without a fresh, explicitly
-# authorized calibration report for that same vehicle.
+# discovery/factory diagnostic even when paper evidence is absent or thin. A
+# vehicle's shadow lane requires a fresh, explicitly authorized calibration
+# report, except for the narrowly empty-journal bootstrap below; that path
+# remains non-authorizing and persists authorization_exit_code=2.
+# ``calibration_authorized`` means measured execution calibration only.  A
+# genuinely empty-journal bootstrap is tracked separately so it can collect
+# broker-free shadow evidence without being mistaken for a promotion pass.
 calibration_authorized=0
+shadow_ingest_allowed=0
 calibration_reason="not_checked"
 run_calibration() {
   local vehicle="$1"
   calibration_authorized=0
+  shadow_ingest_allowed=0
   calibration_reason="disabled"
   if [ "${ALPACA_RESEARCH_CALIBRATION_ENABLED:-1}" != "1" ]; then
     echo '{"schema":"research-calibration.v1","status":"blocked","reason":"calibration_disabled","authorization_exit_code":2}' >&2
@@ -882,6 +888,7 @@ PY
   fi
   if [ "$report_status" -eq 0 ] && [ "$report_persisted" -eq 1 ]; then
     calibration_authorized=1
+    shadow_ingest_allowed=1
     calibration_reason="authorized"
     echo '{"schema":"research-calibration.v1","status":"authorized","authorization_exit_code":0}' >&2
   elif [ "$report_status" -eq 2 ] && [ "$report_persisted" -eq 1 ] &&
@@ -891,7 +898,7 @@ PY
     # journal state can pass this shadow-ingestion gate.  The persisted report
     # still carries authorization_exit_code=2, so downstream calibration
     # consumers cannot mistake it for measured execution authorization.
-    calibration_authorized=1
+    shadow_ingest_allowed=1
     calibration_reason="bootstrap_unknown"
     echo '{"schema":"research-calibration.v1","status":"bootstrap_unknown","authorization_exit_code":2}' >&2
   else
@@ -989,7 +996,7 @@ run_shadow_ingest() {
   [ "${ALPACA_SHADOW_INGEST_ENABLED:-1}" = "1" ] || return 0
   emit_progress "shadow_ingest" 0 1 "steps" "$vehicle"
   run_calibration "$vehicle"
-  if [ "$calibration_authorized" -ne 1 ]; then
+  if [ "$shadow_ingest_allowed" -ne 1 ]; then
     cycle_outcomes+=("$vehicle:shadow-ingest:blocked:$calibration_reason")
     echo "{\"schema\":\"research-shadow-authorization.v1\",\"status\":\"blocked\",\"vehicle\":\"$vehicle\",\"reason\":\"$calibration_reason\"}" >&2
     emit_progress "shadow_ingest" 1 1 "steps" "$vehicle"
