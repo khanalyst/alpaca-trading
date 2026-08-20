@@ -373,10 +373,12 @@ class LiveShadowTests(unittest.TestCase):
             plan={"symbol": symbol, "entry_price": 100, "shares": 1,
                   "risk_usd": risk_usd, "notional": notional})
 
-    def _evaluate_with_context(self, runner, candidate, symbol="QQQ"):
+    def _evaluate_with_context(self, runner, candidate, symbol="QQQ", *,
+                               equity_feed="iex"):
         event = self._replay_row(
             timestamp="2026-01-02T16:00:00+00:00",
             as_of="2026-01-02T16:01:00+00:00")
+        event["feed"] = equity_feed
         event["observed_at"] = "2026-01-02T16:01:00+00:00"
         event["symbol"] = symbol
         event["event_key"] = _event_key("bar_1m", symbol, event["timestamp"])
@@ -388,7 +390,7 @@ class LiveShadowTests(unittest.TestCase):
         quote = {"symbol": symbol, "timestamp": event["observed_at"],
                  "as_of": event["observed_at"],
                  "observed_at": event["observed_at"],
-                 "provider": "recorded", "feed": "sip",
+                 "provider": "recorded", "feed": equity_feed,
                  "bid": "99.9", "ask": "100.1"}
         signal_ts = datetime.fromisoformat(event["timestamp"]).timestamp()
         signal = {"symbol": symbol, "direction": "long",
@@ -403,6 +405,41 @@ class LiveShadowTests(unittest.TestCase):
                        return_value=(plan, None)):
             return runner._evaluate(candidate, event, {symbol: [previous, event]},
                                     {symbol: [quote]}, {})
+
+    def test_iex_shadow_rejects_sip_decisions_and_replay_evidence(self):
+        candidate = self._candidate()
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+
+        kind, reason, payload, plan = self._evaluate_with_context(
+            runner, candidate, equity_feed="sip")
+        self.assertEqual((kind, reason, plan),
+                         ("no_data", "equity feed mismatch", None))
+        self.assertEqual(payload["equity_feed"], "iex")
+        self.assertEqual(payload["observed_equity_feed"], "sip")
+
+        sip_row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
+        sip_row["feed"] = "sip"
+        with patch("research.live_shadow.replay_ibr",
+                   return_value=SimpleNamespace(trades=[], refusals=[])) as replay:
+            runner._replay(candidate, "2026-01-02", [sip_row], [], [])
+            replay.assert_not_called()
+        rejected = runner.store.replay_metadata(candidate["candidate_id"])[0]
+        self.assertEqual(rejected["status"], "incomplete")
+        self.assertEqual(rejected["details"]["equity_feed"], "iex")
+        self.assertEqual(rejected["details"]["feed_mismatches"][0]["observed_feed"],
+                         "sip")
+        self.assertEqual(runner.store.gate_rows(candidate["candidate_id"]), [])
+        self.assertEqual(runner.store.replay_accounts(candidate["candidate_id"]), [])
+
+        iex_row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
+        with patch("research.live_shadow.replay_ibr",
+                   return_value=SimpleNamespace(trades=[], refusals=[])):
+            runner._replay(candidate, "2026-01-02", [iex_row], [], [])
+        accepted = runner.store.replay_metadata(candidate["candidate_id"])[0]
+        self.assertEqual(accepted["status"], "match")
+        self.assertEqual(accepted["details"]["equity_feed"], "iex")
+        self.assertEqual(len(runner.store.replay_accounts(
+            candidate["candidate_id"])), 1)
 
     def test_open_books_enforce_candidate_local_portfolio_caps(self):
         cases = (
@@ -607,7 +644,8 @@ class LiveShadowTests(unittest.TestCase):
         self.assertTrue(json.loads(rows[0][1])["complete"])
 
     def test_semantic_signature_can_match_and_reports_field_mismatch(self):
-        payload = {"signal": {"direction": "long", "setup_type": "rule_opening_range_breakout",
+        payload = {"equity_feed": "iex",
+                   "signal": {"direction": "long", "setup_type": "rule_opening_range_breakout",
                                "signal_ts": 1767369600.0,
                                "decision_timestamp": "2026-01-02T16:00:00+00:00",
                                "entry_timestamp": "2026-01-02T16:01:00+00:00"},
@@ -625,11 +663,15 @@ class LiveShadowTests(unittest.TestCase):
                                     "entry_timestamp": "2026-01-02T16:01:00+00:00",
                                     "stop_price": 99, "target_price": 102,
                                     "stop_distance": 1}, vehicle="equity", strategy_id="rule",
-                                   target_r=2, setup_type="rule_opening_range_breakout")
+                                   target_r=2, setup_type="rule_opening_range_breakout",
+                                   equity_feed="iex")
         self.assertEqual(_signature_diffs([runtime], [replay]), [])
         mismatch = {**replay, "target_price": 103}
         differences = _signature_diffs([runtime], [mismatch])
         self.assertEqual([item["field"] for item in differences], ["target_price"])
+        feed_mismatch = {**replay, "equity_feed": "sip"}
+        differences = _signature_diffs([runtime], [feed_mismatch])
+        self.assertEqual([item["field"] for item in differences], ["equity_feed"])
 
     def test_completed_replay_closes_virtual_book_for_the_next_session(self):
         store = ShadowStore(self.shadow)
@@ -657,7 +699,8 @@ class LiveShadowTests(unittest.TestCase):
         signal_ts = datetime(2026, 1, 2, 16, 0, tzinfo=timezone.utc).timestamp()
 
         def payload():
-            return {"signal": {"direction": "long", "setup_type": "ibr_breakout",
+            return {"equity_feed": "iex",
+                    "signal": {"direction": "long", "setup_type": "ibr_breakout",
                                 "signal_ts": signal_ts},
                     "setup_plan": {"direction": "long", "setup_type": "ibr_breakout",
                                    "signal_ts": signal_ts, "stop_price": 99,

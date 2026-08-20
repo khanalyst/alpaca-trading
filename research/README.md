@@ -12,15 +12,17 @@ latest of event timestamp, `as_of`, and `observed_at`; `as_of > observed_at`,
 naive timestamps, future values, invalid quotes, and malformed OHLC values fail
 closed.
 
-The shipped paper deployment defaults to SIP equity data and OPRA option data;
-both entitlements are required for autonomous research and executable option
-evidence. The trader's runtime execution profile remains `shares`, with live
+The shipped paper deployment defaults to the free Basic IEX equity feed and an
+equity-only universe; it does not acquire options. `indicative` is the safe
+options-feed default and is non-executable. IEX is required for the autonomous
+equity lane. The trader's runtime execution profile remains `shares`, with live
 trading disabled. Scheduled research follows the deployed equity/shares lane by
 default (`ALPACA_RESEARCH_VEHICLES=equity`). Set the variable to `option` or
-`all` for an explicit opt-in; option research is evidence generation, not
-permission to execute options. Compose starts the recorder, scheduled research,
-broker-free shadow, watchdog, trader, and dashboard with one plain
-`docker compose up -d` command; systemd uses the same defaults.
+`all` only after explicitly adding an option universe and configuring OPRA;
+option research is evidence generation, not permission to execute options.
+Compose starts the recorder, scheduled research, broker-free shadow, watchdog,
+trader, and dashboard with one plain `docker compose up -d` command; systemd
+uses the same defaults.
 
 ## Normalized data
 
@@ -94,7 +96,7 @@ timestamp.
 3. Make the signal actionable at the maximum availability time of the required
    records (`timestamp`, `as_of`, and `observed_at`). A delayed recorder bar
    may signal when observed; enter at that decision/observation time using a
-   fresh SIP/OPRA quote. Delayed full OHLC never backfills an earlier entry, and
+   fresh IEX/OPRA quote. Delayed full OHLC never backfills an earlier entry, and
    partial pre-entry ranges are excluded.
 4. Apply gap-aware fills and stop-first ties when a candle touches both stop
    and target. A bar that opens beyond the stop or target fills at that open,
@@ -125,7 +127,7 @@ live-shadow, and paper remain strict and require fresh executable quotes.
 Backtest evidence never authorizes paper.
 
 Authorizing fill-quality evidence is stricter than a diagnostic backtest:
-equity entry and exit legs must carry Alpaca SIP quote provenance, and option
+equity entry and exit legs must carry Alpaca IEX quote provenance, and option
 entry and exit legs must carry OPRA quote provenance. Every leg records provider,
 feed, quote timestamp/age, and fill source; both legs must be executable and no
 older than 30 seconds. Bar-only, missing, partial-feed, or stale legs remain
@@ -136,7 +138,7 @@ executable pricing is absent.
 The command-line surface is intentionally small:
 
 ```bash
-python research.py validate-data bars.jsonl --provider alpaca --feed sip
+python research.py validate-data bars.jsonl --provider alpaca --feed iex
 python research.py backtest-ibr bars.jsonl --vehicle equity
 python research.py backtest-ibr bars.jsonl --vehicle equity --strict-market-data
 ```
@@ -214,7 +216,7 @@ never adjusts the model automatically.
 ## Evidence and provenance
 
 Research artifacts require row-level provider/feed identity; command-line flags
-cannot manufacture missing SIP/OPRA provenance. They retain the normalized input
+cannot manufacture missing IEX/OPRA provenance. They retain the normalized input
 digest, configuration, code version, cost model, risk/`ReplayPolicy`, and
 gate assumptions alongside results. The experiment identity binds dataset,
 configuration, code, cost, risk, gates, and provenance hashes. Any feature or
@@ -638,9 +640,9 @@ python research.py factory report [--slot N] [--format text|markdown|json] [--wr
 ```
 
 The standalone factory preflight requires readable normalized JSONL with
-explicit provider/feed provenance; the default equity lane requires SIP.
+explicit provider/feed provenance; the default equity lane requires IEX.
 `--diagnostic-only` is an explicit non-authorizing mode for partial or
-non-SIP input, marks the result diagnostic, and emits no proofs.
+non-IEX input, marks the result diagnostic, and emits no proofs.
 
 `factory run` archives the Markdown narrative under `research/results/factory/`
 on every cycle, including a cycle that proved nothing, so the read-only

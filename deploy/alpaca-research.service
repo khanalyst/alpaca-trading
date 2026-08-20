@@ -10,9 +10,9 @@ WorkingDirectory=/opt/alpaca-agent-trading
 EnvironmentFile=-/etc/alpaca-agent-trading/research.env
 Environment=ALPACA_PAPER=true
 Environment=ALPACA_LIVE_ENABLE=false
-Environment=ALPACA_DATA_FEED=sip
-Environment=ALPACA_STOCK_FEED=sip
-Environment=ALPACA_OPTIONS_FEED=opra
+Environment=ALPACA_DATA_FEED=iex
+Environment=ALPACA_STOCK_FEED=iex
+Environment=ALPACA_OPTIONS_FEED=indicative
 Environment=ALPACA_RESEARCH_VEHICLES=equity
 Environment=ALPACA_RESEARCH_LLM_SECRETS_FILE=/etc/alpaca-agent-trading/research-llm.env
 Environment=PYTHON=/opt/alpaca-agent-trading/.venv/bin/python

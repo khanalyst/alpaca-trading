@@ -59,10 +59,10 @@ def _int(block: Mapping[str, Any], key: str, path: str, lo: int, hi: int, defaul
 
 
 def _feed(value: Any, *, options: bool = False) -> str:
-    # SIP/OPRA are the only feeds with the complete executable market view.
-    # Keep the parser's fallback fail-closed as well as the shipped config:
-    # an omitted feed must never silently select a partial/indicative stream.
-    raw = str(value or ("opra" if options else "sip")).strip().lower().replace("-", "_")
+    # The shipped equity protocol is bound to Alpaca IEX.  Other recognized
+    # streams remain valid diagnostic identities, but omission must resolve to
+    # the exact authorizing feed rather than silently changing proof semantics.
+    raw = str(value or ("opra" if options else "iex")).strip().lower().replace("-", "_")
     if raw == "delayed":
         raw = "delayed_sip"
     allowed = {"indicative", "opra"} if options else {"iex", "sip", "delayed_sip"}
@@ -73,9 +73,9 @@ def _feed(value: Any, *, options: bool = False) -> str:
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "mode": "paper",
-    "broker": {"paper": True, "allow_live": False, "data_feed": "sip", "options_feed": "opra"},
+    "broker": {"paper": True, "allow_live": False, "data_feed": "iex", "options_feed": "indicative"},
     "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "require_exact_calendar": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
-    "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"], "asset_classes": ["us_equity", "us_option"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
+    "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"], "asset_classes": ["us_equity"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
     "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
     "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0, "stressed_cost_scenario_bps": 25.0, "max_stressed_cost_to_risk_ratio": 0.30},
     "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100, "strict_market_data": True},
@@ -212,19 +212,18 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         raise ConfigError(f"universe.denylist: {exc}") from exc
     out["universe"] = universe
 
-    # Autonomous research and execution require the complete entitled feeds.
-    # IEX/indicative remain valid only for explicitly non-research, equity-only
-    # diagnostics; they are never allowed to become runtime evidence for a
-    # configured research or option lane.
+    # Autonomous equity research is intentionally bound to the shipped IEX
+    # protocol.  SIP/delayed streams remain recognizable diagnostics, but are
+    # not alternate authorization identities.
     research_requested = bool(
         isinstance(out.get("research"), Mapping)
         and out.get("research", {}).get("enabled", True))
     option_lane = any(str(item).lower() in {"us_option", "option", "options"}
                       for item in universe["asset_classes"])
-    if research_requested and broker["data_feed"] != "sip":
+    if research_requested and broker["data_feed"] != "iex":
         raise ConfigError(
-            "research.enabled requires the SIP equity feed entitlement; "
-            "set broker.data_feed=\"sip\" or ALPACA_DATA_FEED=sip")
+            "research.enabled requires the IEX equity feed; "
+            "set broker.data_feed=\"iex\" or ALPACA_DATA_FEED=iex")
     if (option_lane and research_requested and
             broker["options_feed"] != "opra"):
         raise ConfigError(

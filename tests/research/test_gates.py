@@ -28,7 +28,7 @@ class EvidenceGateTests(unittest.TestCase):
             "vehicle": "equity", "symbol": "SPY", "session_date": "2026-01-02",
             "opportunity_id": "equity-1", "net_pnl": 20.0,
             "entry_fill_source": "quote", "exit_fill_source": "quote",
-            "entry_feed": "sip", "exit_feed": "sip",
+            "entry_feed": "iex", "exit_feed": "iex",
             "entry_provider": "alpaca", "exit_provider": "alpaca",
             "entry_quote_age_seconds": 0.0,
             "exit_quote_age_seconds": 0.0,
@@ -36,12 +36,13 @@ class EvidenceGateTests(unittest.TestCase):
         row.update(changes)
         return row
 
-    def test_equity_fill_quality_requires_sip_quote_provenance_on_both_legs(self):
+    def test_equity_fill_quality_requires_iex_quote_provenance_on_both_legs(self):
         from research.gates import fill_source_summary
         self.assertTrue(fill_source_summary(
             [self._equity_quote_row()], vehicle="equity")["adequate"])
         for changes in (
-                {"entry_feed": "iex"}, {"exit_feed": "iex"},
+                {"entry_feed": "sip"}, {"exit_feed": "sip"},
+                {"entry_feed": "delayed_sip"}, {"exit_feed": "delayed_sip"},
                 {"entry_feed": None}, {"exit_feed": None},
                 {"entry_feed": "unknown"}, {"exit_feed": "unknown"},
                 {"entry_fill_source": "bar"}, {"exit_fill_source": "bar"},
@@ -158,7 +159,7 @@ class EvidenceGateTests(unittest.TestCase):
             "vehicle": "equity", "opportunity_id": "fresh-equity-1",
             "entry_quote_age_seconds": 30.0,
             "exit_quote_age_seconds": 30.0,
-            "entry_feed": "sip", "exit_feed": "sip",
+            "entry_feed": "iex", "exit_feed": "iex",
             "entry_provider": "alpaca", "exit_provider": "alpaca",
             "entry_fill_source": "quote", "exit_fill_source": "quote",
         }
@@ -434,6 +435,41 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertFalse(verify_gate_envelope(derived_tamper))
         envelope["passes"] = True
         self.assertFalse(verify_gate_envelope(envelope))
+
+    def test_legacy_envelope_without_feed_rebuilds_under_historical_sip(self):
+        from research.gates import _content_hash
+
+        sip = self._equity_quote_row(
+            entry_feed="sip", exit_feed="sip", entry_price=100.0,
+            exit_price=101.0, quantity=1.0, risk_usd=10.0)
+        fit_floor = structural_floor(
+            [], vehicle="equity", min_trades=0, min_sessions=0,
+            required=False, equity_feed="sip")
+        heldout_floor = structural_floor(
+            [sip], vehicle="equity", min_trades=1, min_sessions=1,
+            equity_feed="sip")
+        envelope = verified_gate_envelope(
+            lane="shadow", vehicle="equity", fit=[], heldout=[sip],
+            fit_floor=fit_floor, heldout_floor=heldout_floor,
+            control={}, p_value=1.0, q_value=1.0, alpha=.05,
+            falsification={}, separation={}, checks={}, passes=False,
+            equity_feed="sip")
+        self.assertEqual(envelope["equity_feed"], "sip")
+        self.assertEqual(
+            envelope["authorization_projection"]["heldout"]["counts"]
+            ["eligible"], 1)
+        self.assertTrue(verify_gate_envelope(envelope))
+
+        legacy = copy.deepcopy(envelope)
+        legacy.pop("equity_feed")
+        legacy["risk_unit_report"].pop("equity_feed", None)
+        for projection in legacy["authorization_projection"].values():
+            projection.pop("equity_feed", None)
+        legacy["content_hash"] = _content_hash({
+            key: value for key, value in legacy.items()
+            if key != "content_hash"
+        })
+        self.assertTrue(verify_gate_envelope(legacy))
 
     def test_qualification_source_digests_are_recomputed_and_tampering_fails(self):
         candidate = _rows(3, net=2.0)

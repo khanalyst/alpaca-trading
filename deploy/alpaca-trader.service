@@ -12,9 +12,9 @@ EnvironmentFile=-/etc/alpaca-agent-trading/agent.env
 Environment=ALPACA_PAPER=true
 Environment=ALPACA_LIVE_ENABLE=false
 Environment=ALPACA_AGENT_SECRETS_FILE=/etc/alpaca-agent-trading/agent.env
-Environment=ALPACA_DATA_FEED=sip
-Environment=ALPACA_STOCK_FEED=sip
-Environment=ALPACA_OPTIONS_FEED=opra
+Environment=ALPACA_DATA_FEED=iex
+Environment=ALPACA_STOCK_FEED=iex
+Environment=ALPACA_OPTIONS_FEED=indicative
 ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/main.py run
 Restart=on-failure
 RestartSec=30

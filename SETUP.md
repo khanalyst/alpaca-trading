@@ -74,10 +74,10 @@ guarded step at the very end.
    is the most common place to go wrong.
 3. Generate a paper API key and secret.
 4. Save both immediately in a password manager. **The secret is shown once.**
-5. Confirm that the paper account has SIP equity and OPRA option entitlements.
-   These are the supported defaults and required feeds for autonomous research
-   and executable option evidence; requesting an unentitled feed fails at the
-   first authenticated call.
+5. Confirm that the paper account can read the free Basic IEX equity feed. The
+   shipped universe is equity-only, so no option entitlement is needed. OPRA
+   is required only for an explicitly enabled option universe/research lane;
+   indicative options remain non-executable.
 6. Do not configure crypto. This repository accepts US equity/ETF underlyings
    and listed OCC option contracts only, and rejects everything else.
 
@@ -87,7 +87,7 @@ Official references:
 - [Alpaca authentication and API domains](https://docs.alpaca.markets/us/docs/authentication)
 - [Alpaca option-chain feeds](https://docs.alpaca.markets/us/reference/optionchain)
 
-**Checkpoint:** you have a paper key and secret plus SIP and OPRA entitlements.
+**Checkpoint:** you have a paper key and secret plus IEX equity access.
 
 ## 2. Create the VM
 
@@ -167,10 +167,15 @@ ALPACA_API_KEY=<paper-api-key>
 ALPACA_SECRET_KEY=<paper-api-secret>
 ALPACA_PAPER=true
 ALPACA_LIVE_ENABLE=false
-ALPACA_DATA_FEED=sip
-ALPACA_STOCK_FEED=sip
-ALPACA_OPTIONS_FEED=opra
+ALPACA_DATA_FEED=iex
+ALPACA_STOCK_FEED=iex
+ALPACA_OPTIONS_FEED=indicative
 ```
+
+Free Basic IEX is a limited venue view, not the consolidated SIP tape. Sparse
+bars/quotes are retained as coverage evidence, and paid-feed history cannot be
+relabeled or reused as IEX proof; a feed change always requires fresh research
+and shadow re-proof.
 
 Never put live credentials in this file. Never commit it. In your Alpaca
 account, use trading permissions only and keep withdrawals disabled.
@@ -436,8 +441,9 @@ docker compose ps
 docker compose logs --tail=100 recorder
 ```
 
-**Expected:** the probe returns `status: probe_ok` for the configured SIP feed
-(and OPRA when options are enabled), followed by `recorded N Alpaca rows to ...`
+**Expected:** the probe returns `status: probe_ok` for the configured IEX feed
+(and OPRA only when options are explicitly enabled), followed by `recorded N
+Alpaca rows to ...`
 roughly once a minute during market hours and healthy recorder status. A
 container can remain `Up` while every acquisition attempt fails; health exposes
 the durable `failure_kind` and `last_error`. Do not interpret process uptime as
@@ -599,7 +605,7 @@ durable FDR allocation rather than trusting caller-supplied fields.
 Authorizing fill quality is point-in-time and provenance-bound: required records
 become actionable at the maximum of event timestamp, `as_of`, and `observed_at`.
 A delayed recorder bar may signal when observed; execution enters at that
-decision/observation time using fresh SIP (equity) or OPRA (option) evidence.
+decision/observation time using fresh IEX (equity) or OPRA (option) evidence.
 Delayed full OHLC never backfills an earlier entry, and partial pre-entry bar
 ranges are excluded. Historical bar-fallback rows, partial-feed, missing, or
 stale legs remain diagnostic and cannot authorize a proof. Fit diagnostics may
@@ -869,6 +875,11 @@ over.
 
 See [OPERATIONS.md](OPERATIONS.md) for reconciliation, backup, recovery, and
 incident procedures.
+
+For an existing VM moving from a legacy SIP corpus to the shipped Free Basic
+IEX profile, follow the concise [VM feed migration handoff](VM_MIGRATION.md)
+before restarting services. It preserves broker reconciliation state, archives
+the old proof state, and requires a fresh IEX research/shadow re-proof.
 
 ## 18. Optional guarded live mode
 

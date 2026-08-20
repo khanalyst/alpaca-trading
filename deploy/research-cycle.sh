@@ -119,9 +119,9 @@ load_llm_secrets() {
 
 load_llm_secrets
 
-# Feed entitlements are part of the autonomous-research contract. Do this
-# preflight before dataset work so an IEX/indicative override fails with a
-# useful reason rather than silently producing evidence from a partial feed.
+# Feed selection is part of the autonomous-research contract. Do this
+# preflight before dataset work so a non-IEX equity override fails with a
+# useful reason rather than silently producing evidence from another feed.
 set +e
 feed_guard="$($python_bin - "$agent_config" <<'PY'
 import sys
@@ -136,8 +136,8 @@ except Exception as exc:
 broker = config.get("broker") or {}
 research = config.get("research") or {}
 classes = (config.get("universe") or {}).get("asset_classes") or []
-if research.get("enabled", True) and broker.get("data_feed") != "sip":
-    print("autonomous research requires SIP equity entitlement")
+if research.get("enabled", True) and broker.get("data_feed") != "iex":
+    print("autonomous research requires the exact IEX equity feed")
     raise SystemExit(1)
 option_lane = any(str(item).lower() in {"us_option", "option", "options"}
                   for item in classes)
@@ -534,7 +534,7 @@ fi
 # The validated agent configuration is the feed contract.  Environment feed
 # hints have already been folded into (and checked by) ``load_config``; using
 # them again here could stamp a different CLI identity onto external rows.
-feed="${configured_feed:-sip}"
+feed="${configured_feed:-iex}"
 emit_progress "validation" 0 1 "steps" "both"
 set +e
 "$python_bin" "$repo_root/research.py" validate-data "$validated_input" \

@@ -23,10 +23,17 @@ OPTION_FEEDS = {"indicative", "opra"}
 def _canonical_feed(value: Any, *, options: bool = False) -> str:
     """Normalize configured feed names before SDK enum conversion."""
     raw_value = getattr(value, "value", value)
-    # A missing feed is a configuration error in spirit; using the complete
-    # entitled feed as the parser fallback prevents a partial/indicative
-    # stream from being selected implicitly by a caller that omitted it.
-    raw = str(raw_value or ("opra" if options else "sip")).strip().lower().replace("-", "_")
+    # Missing equity metadata is intentionally the zero-cost IEX lane.  The
+    # caller may still request SIP explicitly; this fallback is only for
+    # genuinely absent defaults and must not be used to relabel a response.
+    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+        raw_value = "opra" if options else "iex"
+    raw = str(raw_value).strip().lower().replace("-", "_")
+    # Enum reprs from older alpaca-py releases can arrive as
+    # ``DataFeed.SIP``/``OptionsFeed.OPRA`` rather than their value.  Treat the
+    # final enum component as the wire name while retaining strict validation.
+    if "." in raw:
+        raw = raw.rsplit(".", 1)[-1]
     aliases = {"delayed": "delayed_sip", "delayed_sip": "delayed_sip",
                "opra": "opra", "indicative": "indicative"}
     canonical = aliases.get(raw, raw)
@@ -90,6 +97,7 @@ def _mapping(value: Any) -> dict[str, Any]:
             "quote", "latest_trade", "last_trade", "daily_bar",
             "prev_daily_bar", "minute_bar", "timestamp", "bid_price",
             "ask_price", "bid_size", "ask_size", "last_price", "greeks",
+            "feed", "underlying_price", "underlying_last",
             "id", "qty", "side", "status", "time_in_force", "client_order_id",
             "filled_qty", "filled_avg_price", "submitted_at", "updated_at",
             "limit_price", "stop_price", "position_intent")
@@ -121,6 +129,11 @@ def normalize_quote(value: Any, symbol: str | None = None, feed: str | None = No
     bid_raw = _value(value, "bid_price", _value(value, "bid"))
     ask_raw = _value(value, "ask_price", _value(value, "ask"))
     last_raw = _value(value, "last_price", _value(value, "last"))
+    # A requested feed is an annotation only when the provider omitted feed
+    # metadata.  Explicit response metadata always wins so SIP can never be
+    # relabelled as IEX (or vice versa) at this boundary.
+    response_feed = _value(value, "feed")
+    effective_feed = response_feed if response_feed not in (None, "") else feed
     return Quote(
         symbol=str(_value(value, "symbol", symbol) or symbol or "").upper(),
         timestamp=_dt(_value(value, "timestamp")),
@@ -129,7 +142,7 @@ def normalize_quote(value: Any, symbol: str | None = None, feed: str | None = No
         bid_size=_decimal_or_none(_value(value, "bid_size")),
         ask_size=_decimal_or_none(_value(value, "ask_size")),
         last=_decimal_or_none(last_raw),
-        feed=_canonical_feed(feed or _value(value, "feed"), options=False),
+        feed=_canonical_feed(effective_feed, options=False),
     )
 
 
@@ -140,6 +153,8 @@ def normalize_bar(value: Any, symbol: str | None = None, feed: str | None = None
     close_price = _decimal_or_none(_value(value, "close"))
     if any(price is None for price in (open_price, high_price, low_price, close_price)):
         raise ValueError("bar OHLC values are required")
+    response_feed = _value(value, "feed")
+    effective_feed = response_feed if response_feed not in (None, "") else feed
     return Bar(
         symbol=str(_value(value, "symbol", symbol) or symbol or "").upper(),
         timestamp=_dt(_value(value, "timestamp")) or datetime.min,
@@ -150,6 +165,6 @@ def normalize_bar(value: Any, symbol: str | None = None, feed: str | None = None
         volume=_decimal_or_none(_value(value, "volume", 0)),
         trade_count=_value(value, "trade_count"),
         vwap=_decimal_or_none(_value(value, "vwap")),
-        feed=_canonical_feed(feed or _value(value, "feed"), options=False),
+        feed=_canonical_feed(effective_feed, options=False),
         atr=_decimal_or_none(_value(value, "atr")),
     )

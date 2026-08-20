@@ -215,6 +215,55 @@ class EntryBarVisibilityTests(unittest.TestCase):
         self.assertEqual(null_row["underlying_entry"],
                          trade.underlying_entry)
 
+    def test_strict_option_underlying_quote_requires_policy_equity_feed(self):
+        bars = bars_for_day()
+        signal = bars[30]
+        decision = signal.end + timedelta(seconds=5)
+        bars[30] = replace(
+            signal,
+            identity=replace(signal.identity, as_of=signal.end,
+                             observed_at=decision),
+        )
+        entry_bar = bars[32]
+        bars[32] = replace(
+            entry_bar,
+            identity=replace(
+                entry_bar.identity,
+                as_of=entry_bar.timestamp + timedelta(seconds=1),
+                observed_at=entry_bar.timestamp + timedelta(seconds=1),
+            ),
+        )
+        snapshots = {}
+        for index, bar in enumerate(bars[31:], 31):
+            quote_at = decision if index == 31 else bar.timestamp
+            snapshots[quote_at] = replace(
+                option_quote(quote_at, bid=2.0, ask=2.1),
+                underlying_price=None,
+            )
+
+        def underlying_quote(feed):
+            quote = equity_quote(31, 100.9, 101.1)
+            return replace(
+                quote, timestamp=decision,
+                identity=replace(quote.identity, feed=feed, as_of=decision,
+                                 observed_at=decision),
+            )
+
+        mismatched = replay_ibr(
+            bars, config=IBRConfig(policy=ReplayPolicy()), vehicle="option",
+            option_snapshots=snapshots, quotes=[underlying_quote("sip")])
+        self.assertEqual(mismatched.trades, [])
+        self.assertEqual(mismatched.refusals[0].reason,
+                         "underlying_quote_feed_mismatch")
+        self.assertEqual(mismatched.refusals[0].detail,
+                         {"expected": "iex", "observed": "sip"})
+
+        matched = replay_ibr(
+            bars, config=IBRConfig(policy=ReplayPolicy()), vehicle="option",
+            option_snapshots=snapshots, quotes=[underlying_quote("iex")])
+        self.assertEqual(len(matched.trades), 1)
+        self.assertEqual(matched.trades[0].underlying_quote_feed, "iex")
+
     def test_factory_and_fit_diagnostic_share_the_entry_boundary(self):
         baseline = [
             _available_at(bar, bar.timestamp) for bar in _bars()

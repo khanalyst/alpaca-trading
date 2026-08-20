@@ -82,9 +82,12 @@ def _quote(minute, bid, ask, *, as_of_minute=None):
 class CostModelTests(unittest.TestCase):
     def test_replay_policy_stress_controls_are_runtime_only_and_identity_bound(self):
         direct = ReplayPolicy()
+        self.assertEqual(direct.equity_feed, "iex")
         self.assertIsNone(direct.stressed_cost_scenario_bps)
         self.assertIsNone(direct.max_stressed_cost_to_risk_ratio)
         runtime = ReplayPolicy.from_config(validate_config({}))
+        self.assertEqual(runtime.equity_feed, "iex")
+        self.assertEqual(runtime.as_dict()["equity_feed"], "iex")
         self.assertEqual(runtime.stressed_cost_scenario_bps, 25.0)
         self.assertEqual(runtime.max_stressed_cost_to_risk_ratio, .30)
         self.assertEqual(runtime.as_dict()["stressed_cost_scenario_bps"], 25.0)
@@ -260,7 +263,7 @@ class OptionProvenanceTests(unittest.TestCase):
 
 
 class EquityProvenanceTests(unittest.TestCase):
-    """Only SIP quote legs can authorize equity economics evidence."""
+    """Only IEX quote legs can authorize current equity economics evidence."""
 
     @staticmethod
     def _row(**changes):
@@ -269,8 +272,8 @@ class EquityProvenanceTests(unittest.TestCase):
             "no_trade": False, "entry_price": 100.0, "exit_price": 101.0,
             "quantity": 1.0, "contract_multiplier": 1.0,
             "risk_usd": 10.0, "entry_fill_source": QUOTE,
-            "exit_fill_source": QUOTE, "entry_feed": "sip",
-            "exit_feed": "sip", "entry_provider": "alpaca",
+            "exit_fill_source": QUOTE, "entry_feed": "iex",
+            "exit_feed": "iex", "entry_provider": "alpaca",
             "exit_provider": "alpaca", "entry_quote_age_seconds": 0.0,
             "exit_quote_age_seconds": 0.0,
         }
@@ -283,11 +286,11 @@ class EquityProvenanceTests(unittest.TestCase):
             [row], vehicle="equity",
             costs=CostModel(spread_bps=0, slippage_bps=0, fee_bps=0))
 
-    def test_sip_quote_sources_and_providers_are_adequate(self):
+    def test_iex_quote_sources_and_providers_are_adequate(self):
         self.assertTrue(self._report(self._row())["adequate"])
 
-    def test_iex_quote_source_is_diagnostic_only(self):
-        report = self._report(self._row(entry_feed="iex", exit_feed="iex"))
+    def test_sip_quote_source_is_diagnostic_only(self):
+        report = self._report(self._row(entry_feed="sip", exit_feed="sip"))
         self.assertFalse(report["adequate"])
 
     def test_missing_or_unknown_equity_feed_is_diagnostic_only(self):

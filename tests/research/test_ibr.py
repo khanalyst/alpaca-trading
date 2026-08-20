@@ -203,12 +203,12 @@ class IBRReplayTests(unittest.TestCase):
         self.assertEqual(local.minute, 55)
 
 
-def equity_quote(minute, bid, ask):
+def equity_quote(minute, bid, ask, *, feed="sip"):
     """A quote at the given offset from the 09:30 session open."""
     ts = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc) + timedelta(minutes=minute)
     return normalize_quote({
         "symbol": "SPY", "timestamp": ts.isoformat(), "bid": bid, "ask": ask,
-        "provider": "alpaca", "feed": "sip",
+        "provider": "alpaca", "feed": feed,
     })
 
 
@@ -317,16 +317,16 @@ class IBRQuoteFillTests(unittest.TestCase):
         result = replay_ibr(
             bars,
             config=IBRConfig(stop_pct=.01, target_pct=.02, quantity=3.0,
-                             costs=FREE),
+            costs=FREE),
             quotes=[
-                equity_quote(31, 100.98, 101.06),
-                equity_quote(385, 100.90, 101.00),
+                equity_quote(31, 100.98, 101.06, feed="iex"),
+                equity_quote(385, 100.90, 101.00, feed="iex"),
             ])
         self.assertEqual(len(result.trades), 1)
         trade = result.trades[0]
         self.assertEqual((trade.entry_fill_source, trade.exit_fill_source),
                          (QUOTE, QUOTE))
-        self.assertEqual((trade.entry_feed, trade.exit_feed), ("sip", "sip"))
+        self.assertEqual((trade.entry_feed, trade.exit_feed), ("iex", "iex"))
         self.assertEqual((trade.entry_provider, trade.exit_provider),
                          ("alpaca", "alpaca"))
         self.assertEqual((trade.entry_quote_age_seconds,

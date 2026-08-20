@@ -120,7 +120,8 @@ def arm_evidence_report(*args, **kwargs):
 
 def _projection_summary(projection: Mapping[str, Any]) -> dict:
     return {key: projection.get(key) for key in (
-        "schema", "vehicle", "strict", "counts", "reasons", "excluded")}
+        "schema", "vehicle", "equity_feed", "strict", "counts", "reasons",
+        "excluded")}
 
 
 def verified_gate_envelope(*args, **kwargs):
@@ -208,7 +209,7 @@ def _stream_rows(source: Path):
 
 def _row_provenance(row: Mapping[str, Any], *, kind: str,
                     require: bool = False,
-                    expected_equity_feed: str = "sip",
+                    expected_equity_feed: str = "iex",
                     expected_provider: str | None = None) -> tuple[str | None, str | None]:
     """Read a row's provenance without manufacturing research metadata.
 
@@ -232,10 +233,10 @@ def _row_provenance(row: Mapping[str, Any], *, kind: str,
         if not feed:
             raise DiscoveryError(
                 f"{kind} research requires explicit feed provenance")
-        expected = str(expected_equity_feed or "sip").strip().lower()
-        if expected != "sip":
+        expected = str(expected_equity_feed or "iex").strip().lower()
+        if expected != "iex":
             raise DiscoveryError(
-                f"equity research requires configured SIP feed, got {expected or '[missing]'}")
+                f"equity research requires configured IEX feed, got {expected or '[missing]'}")
         if feed != expected:
             raise DiscoveryError(
                 f"{kind} row feed {feed!r} is not executable; expected {expected!r}")
@@ -247,7 +248,7 @@ def _row_provenance(row: Mapping[str, Any], *, kind: str,
 
 def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None = None,
                       require_provenance: bool = False,
-                      expected_equity_feed: str = "sip",
+                      expected_equity_feed: str = "iex",
                       expected_provider: str | None = None) -> tuple[
         list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
     """Normalize one row stream into the three replay books.
@@ -274,7 +275,7 @@ def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None =
                 # for old in-memory fixtures.  Authorizing callers always set
                 # ``require_provenance`` and therefore never reach defaults.
                 bar = normalize_underlying_bar(
-                    row, provider=provider or "alpaca", feed=feed or "sip")
+                    row, provider=provider or "alpaca", feed=feed or "iex")
                 if keep is None or keep(_bar_session(bar)):
                     bars.append(bar)
             elif kind in {"option", "option_snapshot", "option_quote"}:
@@ -302,7 +303,7 @@ def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None =
                 # is used only where a fill lands on that instant; everything
                 # else still falls back to the bar and says so.
                 quote = normalize_quote(
-                    row, provider=provider or "alpaca", feed=feed or "sip")
+                    row, provider=provider or "alpaca", feed=feed or "iex")
                 if keep is None or keep(quote.session_date.isoformat()):
                     if quote_index is None:
                         quotes.append(quote)
@@ -327,7 +328,7 @@ def _bar_session(bar: UnderlyingBar) -> str:
 def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
                          force_quote_index: bool = False,
                          require_provenance: bool = False,
-                         expected_equity_feed: str = "sip",
+                         expected_equity_feed: str = "iex",
                          expected_provider: str | None = None) -> tuple[
         list[dict], list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
     """Load one normalized JSONL corpus: bars, option quotes, equity quotes.
@@ -415,7 +416,8 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
 
 def validate_worker_projection(source: str | Path, *,
                                bars: Sequence[UnderlyingBar],
-                               snapshots: Mapping[str, OptionSnapshot]) -> str:
+                               snapshots: Mapping[str, OptionSnapshot],
+                               expected_equity_feed: str = "iex") -> str:
     """Verify that a compact worker view is exactly the full replay projection.
 
     The view is an optimization, not a second research dataset.  Validate it
@@ -448,7 +450,7 @@ def validate_worker_projection(source: str | Path, *,
 
     projected_bars, projected_snapshots, projected_quotes = _normalize_corpus(
         projection_rows(), require_provenance=True,
-        expected_equity_feed="sip")
+        expected_equity_feed=expected_equity_feed)
     if projected_quotes:
         raise DiscoveryError("worker_data must not contain equity quotes")
     if (projected_bars != list(bars) or
@@ -463,7 +465,8 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
                  until: str | None = None,
                  exclude: Sequence[str] = (),
                  quote_descriptor: SQLiteQuoteIndexDescriptor | None = None,
-                 expected_digest: str | None = None) -> tuple[
+                 expected_digest: str | None = None,
+                 expected_equity_feed: str = "iex") -> tuple[
                      list[UnderlyingBar], list[OptionSnapshot], list[QuoteSnapshot]]:
     """Re-read one recorded corpus and keep only a session window of it.
 
@@ -510,7 +513,8 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
     try:
         bars, snapshots, quotes = _normalize_corpus(
             rows(), keep=keep, quote_index=quote_index,
-            require_provenance=True, expected_equity_feed="sip")
+            require_provenance=True,
+            expected_equity_feed=expected_equity_feed)
         if (digest is not None and
                 digest.hexdigest() != str(expected_digest)):
             raise DiscoveryError("worker_data changed after parent validation")
@@ -1107,7 +1111,8 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
                    control_kind: str = "matched_actual_baseline",
                    null_rows: Sequence[Mapping] = (),
                    qualification: Mapping | None = None,
-                   test_iterations: int = 20_000) -> dict:
+                   test_iterations: int = 20_000,
+                   equity_feed: str = "iex") -> dict:
     """Evaluate one chronological backtest or a genuinely new shadow sample.
 
     A backtest is split into fit/held-out partitions.  A shadow evaluation is
@@ -1122,11 +1127,14 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     baseline_raw = [dict(row) for row in baseline]
     null_raw = [dict(row) for row in null_rows]
     candidate_projection = authorization_projection(candidate_raw, vehicle=vehicle,
-                                                    strict=True)
+                                                    strict=True,
+                                                    equity_feed=equity_feed)
     baseline_projection = authorization_projection(baseline_raw, vehicle=vehicle,
-                                                   strict=True)
+                                                   strict=True,
+                                                   equity_feed=equity_feed)
     null_projection = authorization_projection(null_raw, vehicle=vehicle,
-                                                strict=True)
+                                                strict=True,
+                                                equity_feed=equity_feed)
     candidate = candidate_projection["eligible"]
     baseline = baseline_projection["eligible"]
     null_rows = null_projection["eligible"]
@@ -1165,26 +1173,31 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     held_sessions = {str(row.get("session_date") or "") for row in raw_heldout}
     fit_floor = structural_floor(
         fit, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
-        min_clusters=MIN_PROMOTION_CLUSTERS, required=not shadow)
+        min_clusters=MIN_PROMOTION_CLUSTERS, required=not shadow,
+        equity_feed=equity_feed)
     held_floor = structural_floor(
         heldout, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
-        min_clusters=MIN_PROMOTION_CLUSTERS)
+        min_clusters=MIN_PROMOTION_CLUSTERS, equity_feed=equity_feed)
     overall_floor = structural_floor(
         ordered, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
-        min_clusters=MIN_PROMOTION_CLUSTERS)
+        min_clusters=MIN_PROMOTION_CLUSTERS, equity_feed=equity_feed)
     separation = (heldout_separation(fit, heldout) if not shadow else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": bool(heldout), "mode": "new_data"})
-    delta_all = paired_delta(ordered, baseline, vehicle=vehicle)
-    delta_fit = (matched_cluster_test(fit, base_fit, vehicle=vehicle) if not shadow else
+    delta_all = paired_delta(
+        ordered, baseline, vehicle=vehicle, equity_feed=equity_feed)
+    delta_fit = (matched_cluster_test(
+        fit, base_fit, vehicle=vehicle, equity_feed=equity_feed) if not shadow else
                  {"available": True, "actual_control": True, "matched": 0,
                   "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest"})
     delta_held = matched_cluster_test(
-        heldout, base_heldout, vehicle=vehicle, iterations=test_iterations)
+        heldout, base_heldout, vehicle=vehicle, iterations=test_iterations,
+        equity_feed=equity_feed)
     delta_fit["actual_control"] = bool(actual_control)
     delta_held["actual_control"] = bool(actual_control)
     placebo = deterministic_placebo_deltas(
-        heldout, base_heldout, vehicle=vehicle)
+        heldout, base_heldout, vehicle=vehicle,
+        equity_feed=equity_feed)
     falsification = {
         **falsification_gate(placebo["observed"], placebo["placebo"], alpha=alpha),
         "method": placebo["method"],
@@ -1204,7 +1217,8 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     null_heldout = [row for row in null_rows
                     if str(row.get("session_date") or "") in heldout_sessions]
     null_test = matched_cluster_test(
-        heldout, null_heldout, vehicle=vehicle, iterations=test_iterations)
+        heldout, null_heldout, vehicle=vehicle, iterations=test_iterations,
+        equity_feed=equity_feed)
     null_control = {**null_test, "kind": "randomized_entry_null",
                     "available": bool(null_test["available"]),
                     "p_value": float(null_test["p_value"])}
@@ -1252,35 +1266,43 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     heldout_null_raw = [row for row in null_raw
                         if str(row.get("session_date") or "") in heldout_sessions]
     fit_null_projection = (authorization_projection(
-        fit_null_raw, vehicle=vehicle, strict=True)
+        fit_null_raw, vehicle=vehicle, strict=True, equity_feed=equity_feed)
         if fit_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
     heldout_null_projection = (authorization_projection(
-        heldout_null_raw, vehicle=vehicle, strict=True)
+        heldout_null_raw, vehicle=vehicle, strict=True,
+        equity_feed=equity_feed)
         if heldout_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
     arm_diagnostics = {
         "fit": arm_evidence_report(
             candidate=raw_fit, baseline=raw_base_fit, null=fit_null_raw,
-            vehicle=vehicle,
+            vehicle=vehicle, equity_feed=equity_feed,
             projections={"candidate": authorization_projection(
-                             raw_fit, vehicle=vehicle, strict=True),
+                             raw_fit, vehicle=vehicle, strict=True,
+                             equity_feed=equity_feed),
                          "baseline": authorization_projection(
-                             raw_base_fit, vehicle=vehicle, strict=True),
+                             raw_base_fit, vehicle=vehicle, strict=True,
+                             equity_feed=equity_feed),
                          "null": fit_null_projection}),
         "heldout": arm_evidence_report(
             candidate=raw_heldout, baseline=raw_base_heldout,
             null=heldout_null_raw, vehicle=vehicle,
+            equity_feed=equity_feed,
             projections={"candidate": authorization_projection(
-                             raw_heldout, vehicle=vehicle, strict=True),
+                             raw_heldout, vehicle=vehicle, strict=True,
+                             equity_feed=equity_feed),
                          "baseline": authorization_projection(
-                             raw_base_heldout, vehicle=vehicle, strict=True),
+                             raw_base_heldout, vehicle=vehicle, strict=True,
+                             equity_feed=equity_feed),
                          "null": heldout_null_projection}),
         "all": arm_evidence_report(
             candidate=ordered_raw, baseline=base_ordered_raw,
-            null=null_raw, vehicle=vehicle,
+            null=null_raw, vehicle=vehicle, equity_feed=equity_feed,
             projections={"candidate": authorization_projection(
-                             ordered_raw, vehicle=vehicle, strict=True),
+                             ordered_raw, vehicle=vehicle, strict=True,
+                             equity_feed=equity_feed),
                          "baseline": authorization_projection(
-                             base_ordered_raw, vehicle=vehicle, strict=True),
+                             base_ordered_raw, vehicle=vehicle, strict=True,
+                             equity_feed=equity_feed),
                          "null": null_projection}),
     }
     return {"vehicle": vehicle, "shadow": shadow,
@@ -1297,8 +1319,10 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
             "falsification": falsification,
             "checks_without_family": checks,
             "max_drawdown": max_drawdown_of(ordered),
-            "fit_trades": sample_counts(fit, vehicle=vehicle)["trades"],
-            "heldout_trades": sample_counts(heldout, vehicle=vehicle)["trades"],
+            "fit_trades": sample_counts(
+                fit, vehicle=vehicle, equity_feed=equity_feed)["trades"],
+            "heldout_trades": sample_counts(
+                heldout, vehicle=vehicle, equity_feed=equity_feed)["trades"],
             "fit_sessions": len({row.get("session_date") for row in fit}),
             "heldout_sessions": len({row.get("session_date") for row in heldout}),
             "_fit_rows": fit, "_heldout_rows": heldout,
@@ -1327,7 +1351,8 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
                    global_fdr: Mapping | None = None,
                    provenance: Mapping | None = None,
                    candidate_id: str | None = None,
-                   costs: CostModel | None = None) -> dict:
+                   costs: CostModel | None = None,
+                   equity_feed: str = "iex") -> dict:
     online = dict(online_fdr or {})
     global_data = dict(global_fdr or family)
     cumulative_passes = bool(
@@ -1388,7 +1413,8 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
         qualification=gate.get("qualification"),
         null_control=gate.get("null_control"),
         online_fdr=online, provenance=provenance,
-        candidate_id=candidate_id, performance=performance, costs=costs)
+        candidate_id=candidate_id, performance=performance, costs=costs,
+        equity_feed=equity_feed)
     gate["passes"] = bool(envelope["passes"])
     gate["verified_gate"] = envelope
     gate["gate_hash"] = envelope["content_hash"]

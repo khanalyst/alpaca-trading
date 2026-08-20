@@ -123,11 +123,13 @@ class LiveShadowControlTests(unittest.TestCase):
                     "signal_ts": signal["signal_ts"], "stop_price": 99.0,
                     "target_price": 99.0 + (1.0 + target_r), "stop_distance": 1.0,
                     "target_r": target_r, "execution_profile": "shares",
+                    "equity_feed": "iex",
                     "decision_timestamp": event_at, "entry_timestamp": event_at,
                 }
                 return ("open_incomplete", "paired test open", {
                     "session_date": "2026-01-02", "strategy_id": "rule",
-                    "variant_id": paired["variant_id"], "signal": signal,
+                    "variant_id": paired["variant_id"], "equity_feed": "iex",
+                    "signal": signal,
                     "setup_plan": plan, "risk_plan": plan,
                 }, {**plan, "entry_price": 100.0, "shares": 1.0,
                     "risk_usd": 100.0, "notional": 100.0})

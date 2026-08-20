@@ -31,7 +31,7 @@ class ScheduledResearchTests(unittest.TestCase):
     @staticmethod
     def _factory_config() -> dict:
         return {
-            "broker": {"data_feed": "sip"},
+            "broker": {"data_feed": "iex"},
             "costs": {"spread_bps": 7.0, "slippage_bps": 4.0,
                       "fee_bps": 0.8},
             "execution": {"max_spread_bps": 20.0,
@@ -74,7 +74,7 @@ class ScheduledResearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "market.jsonl"
             source.write_text(json.dumps({
-                "kind": "bar", "provider": "alpaca", "feed": "sip",
+                "kind": "bar", "provider": "alpaca", "feed": "iex",
             }) + "\n", encoding="utf-8")
             base = self._factory_args(source)
             for status, expected in (
@@ -129,10 +129,10 @@ class ScheduledResearchTests(unittest.TestCase):
                 self.assertEqual(
                     parser.parse_args(argv).max_confirmatory_attempts, 9)
 
-    def test_factory_default_rejects_non_sip_or_missing_provenance_before_runner(self):
+    def test_factory_default_rejects_non_iex_or_missing_provenance_before_runner(self):
         for row in (
-                {"kind": "bar", "provider": "alpaca", "feed": "iex"},
-                {"kind": "bar", "feed": "sip"}):
+                {"kind": "bar", "provider": "alpaca", "feed": "sip"},
+                {"kind": "bar", "feed": "iex"}):
             with self.subTest(row=row), tempfile.TemporaryDirectory() as directory:
                 source = Path(directory) / "market.jsonl"
                 source.write_text(json.dumps(row) + "\n", encoding="utf-8")
@@ -147,7 +147,7 @@ class ScheduledResearchTests(unittest.TestCase):
                 factory.assert_not_called()
 
     def test_factory_diagnostic_only_marks_result_and_emits_no_proof(self):
-        row = {"kind": "bar", "provider": "alpaca", "feed": "iex"}
+        row = {"kind": "bar", "provider": "alpaca", "feed": "sip"}
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "market.jsonl"
             source.write_text(json.dumps(row) + "\n", encoding="utf-8")
@@ -173,17 +173,17 @@ class ScheduledResearchTests(unittest.TestCase):
             self.assertTrue(result["diagnostic_only"])
             self.assertFalse(result["authorizing"])
             self.assertEqual(result["source"]["provider"], "alpaca")
-            self.assertEqual(result["source"]["feed"], "iex")
+            self.assertEqual(result["source"]["feed"], "sip")
             self.assertEqual(result["source_provider"], "alpaca")
-            self.assertEqual(result["source_feed"], "iex")
+            self.assertEqual(result["source_feed"], "sip")
             self.assertEqual(result["source_provenance"],
-                             {"provider": "alpaca", "feed": "iex"})
+                             {"provider": "alpaca", "feed": "sip"})
             self.assertEqual(result["provenance"],
-                             {"provider": "alpaca", "feed": "iex"})
+                             {"provider": "alpaca", "feed": "sip"})
             self.assertEqual(result["proofs"], [])
 
-    def test_factory_sip_default_keeps_proof_emission_path(self):
-        row = {"kind": "bar", "provider": "alpaca", "feed": "sip"}
+    def test_factory_iex_default_keeps_proof_emission_path(self):
+        row = {"kind": "bar", "provider": "alpaca", "feed": "iex"}
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "market.jsonl"
             source.write_text(json.dumps(row) + "\n", encoding="utf-8")

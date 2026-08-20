@@ -77,7 +77,7 @@ def _session_closes(symbol: str, day: int) -> tuple[list[float], list[int]]:
     # Keep the pre-gap close below both the root's 2R target and the winning
     # arm's 2.5R target.  ``_session_rows`` then opens the next bar materially
     # above both levels: the replay records an arrival/gap fill at that
-    # boundary and can price the exit from the explicit SIP quote there.
+    # boundary and can price the exit from the explicit IEX quote there.
     # This is deliberately a market gap, not a production fallback around the
     # strict fill-quality gate; the authored 30 bps stop economics are unchanged.
     for step in (.23,):
@@ -105,7 +105,7 @@ def _session_rows(symbol: str, day: int, opening: datetime) -> list[dict]:
             opened = round(101.70 + _wobble(symbol, day), 4)
         stamp = opening + timedelta(minutes=index)
         rows.append({
-            "kind": "bar", "provider": "test", "feed": "sip", "symbol": symbol,
+            "kind": "bar", "provider": "test", "feed": "iex", "symbol": symbol,
             "timestamp": stamp.isoformat(),
             "as_of": (stamp + timedelta(minutes=1)).isoformat(),
             "observed_at": (stamp + timedelta(minutes=1)).isoformat(),
@@ -118,7 +118,7 @@ def _session_rows(symbol: str, day: int, opening: datetime) -> list[dict]:
         # same fresh two-sided quote the live entry path requires instead of
         # silently falling back to a bar price.
         rows.append({
-            "kind": "quote", "provider": "test", "feed": "sip",
+            "kind": "quote", "provider": "test", "feed": "iex",
             "symbol": symbol, "timestamp": stamp.isoformat(),
             "as_of": stamp.isoformat(), "observed_at": stamp.isoformat(),
             "bid": round(opened - .01, 4), "ask": round(opened + .01, 4),

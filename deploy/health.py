@@ -96,7 +96,9 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
     }
 
 
-def recorder(path: Path, max_age: float, *, now: float | None = None) -> dict:
+def recorder(path: Path, max_age: float, *, now: float | None = None,
+             configured_data_feed: str | None = None,
+             configured_options_feed: str | None = None) -> dict:
     files = [item for item in path.rglob("*.csv") if item.is_file()]
     latest_csv = max((item.stat().st_mtime for item in files), default=None)
     # A deduplicated recorder cycle may append no corpus rows while still
@@ -146,8 +148,10 @@ def recorder(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "latest_csv_write_ts": latest_csv,
         "index_write_ts": index_write,
         "data_feed": index.get("data_feed"),
-        "configured_data_feed": attempt.get("data_feed"),
-        "configured_options_feed": attempt.get("options_feed"),
+        "configured_data_feed": (attempt.get("data_feed") or
+                                  configured_data_feed),
+        "configured_options_feed": (attempt.get("options_feed") or
+                                     configured_options_feed),
         "last_attempt_ts": attempt.get("updated_ts"),
         "last_error": attempt.get("error"),
         "failure_kind": attempt.get("failure_kind"),

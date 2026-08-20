@@ -76,7 +76,7 @@ def _validated_row_provenance(row: Mapping[str, Any], *, kind: str,
 
     CLI provider/feed values describe the configured adapter; they are not
     permission to rewrite an external row's identity.  Equity evidence is
-    authorizable only from the complete SIP feed, while option evidence keeps
+    authorizable only from the shipped IEX feed, while option evidence keeps
     its independent OPRA requirement.
     """
     provider_value = row.get("provider")
@@ -98,14 +98,14 @@ def _validated_row_provenance(row: Mapping[str, Any], *, kind: str,
     expected_feed = (None if configured_feed in (None, "")
                      else str(configured_feed).strip().lower())
     # ``validate-data`` is the research authorization preflight.  Keep the
-    # complete equity requirement explicit even when a caller supplies an
-    # IEX/indicative CLI hint for diagnostics.
-    if expected_feed != "sip":
+    # exact equity requirement explicit even when a caller supplies a
+    # SIP/delayed CLI hint for diagnostics.
+    if expected_feed != "iex":
         raise NormalizationError(
-            f"equity research requires configured SIP feed, got {expected_feed or '[missing]'}")
+            f"equity research requires configured IEX feed, got {expected_feed or '[missing]'}")
     if feed != expected_feed:
         raise NormalizationError(
-            f"{kind} row feed {feed or '[missing]'!r} is not executable; expected 'sip'")
+            f"{kind} row feed {feed or '[missing]'!r} is not executable; expected 'iex'")
     return provider, feed
 
 
@@ -173,7 +173,7 @@ def cmd_validate_data(args: argparse.Namespace) -> int:
             provider, feed = _validated_row_provenance(
                 row, kind=kind,
                 configured_provider=getattr(args, "provider", None),
-                configured_feed=getattr(args, "feed", None) or "sip")
+                configured_feed=getattr(args, "feed", None) or "iex")
         except (NormalizationError, ValueError) as exc:
             provenance_error = exc
             errors.append(f"row {number}: {exc}")
@@ -196,7 +196,7 @@ def _bars(args: argparse.Namespace):
             provider, feed = _validated_row_provenance(
                 row, kind=str(row.get("kind", "bar")).lower(),
                 configured_provider=getattr(args, "provider", None),
-                configured_feed=getattr(args, "feed", None) or "sip")
+                configured_feed=getattr(args, "feed", None) or "iex")
             bars.append(normalize_underlying_bar(
                 row, provider=provider, feed=feed))
         except (NormalizationError, ValueError) as exc:
@@ -236,7 +236,7 @@ def _quotes(args: argparse.Namespace):
                     provider, feed = _validated_row_provenance(
                         row, kind=str(row.get("kind", "quote")).lower(),
                         configured_provider=getattr(args, "provider", None),
-                        configured_feed=getattr(args, "feed", None) or "sip")
+                        configured_feed=getattr(args, "feed", None) or "iex")
                     index.add(normalize_quote(
                         row, provider=provider, feed=feed))
                 except (json.JSONDecodeError, NormalizationError, ValueError) as exc:
@@ -372,7 +372,7 @@ def _factory_feed_contract(config: Mapping[str, Any]) -> tuple[str, str | None]:
     broker = broker if isinstance(broker, Mapping) else {}
     data = config.get("data")
     data = data if isinstance(data, Mapping) else {}
-    feed = (broker.get("data_feed") or data.get("feed") or "sip")
+    feed = (broker.get("data_feed") or data.get("feed") or "iex")
     provider = (broker.get("provider") or data.get("provider") or
                 config.get("provider") or os.getenv("ALPACA_DATA_PROVIDER"))
     return str(feed).strip().lower(), (
@@ -383,10 +383,9 @@ def _factory_dataset_preflight(
         args: argparse.Namespace, config: Mapping[str, Any]) -> dict[str, Any]:
     """Check CLI factory input provenance before invoking ``run_factory``.
 
-    The public factory API intentionally retains its historical permissive
-    in-memory behavior.  This stricter check belongs to the standalone CLI,
-    where a file is an authorizing research artifact and command-line metadata
-    must never relabel an IEX or unlabelled row as SIP evidence.
+    Both the public factory API and this CLI require row-owned provenance for
+    authorizing corpora.  Command-line metadata must never relabel a SIP or
+    unlabelled row as IEX evidence.
 
     The returned context is suitable for a diagnostic result.  File-backed
     factory runs fail closed when the source cannot be inspected; callers that
@@ -441,18 +440,18 @@ def _factory_dataset_preflight(
                         errors.append(
                             f"row {number}: {kind} provider {provider!r} does not match "
                             f"configured provider {expected_provider!r}")
-                    if expected_feed != "sip":
+                    if expected_feed != "iex":
                         errors.append(
-                            "configured equity research feed must be SIP; "
+                            "configured equity research feed must be IEX; "
                             f"got {expected_feed or '[missing]'}")
-                    elif feed != "sip":
+                    elif feed != "iex":
                         errors.append(
                             f"row {number}: {kind} feed {feed or '[missing]'!r} "
-                            "is not executable; expected 'sip'")
+                            "is not executable; expected 'iex'")
                 elif kind in _OPTION_FACTORY_KINDS:
                     # A mixed corpus may carry option evidence while an equity
                     # factory lane is running.  Keep that evidence explicit as
-                    # well, without allowing OPRA rows to satisfy the SIP gate.
+                    # well, without allowing OPRA rows to satisfy the IEX gate.
                     provider = str(row.get("provider") or "").strip()
                     feed = str(row.get("feed", row.get("feed_id")) or "").strip().lower()
                     if not provider:
@@ -914,7 +913,7 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
                             help="optional bar+option JSONL replay view for workers")
         parser.add_argument(
             "--diagnostic-only", action="store_true",
-            help=("run despite IEX or missing source provenance; the result is "
+            help=("run despite SIP/delayed source provenance; the result is "
                   "non-authorizing and no edge proofs are emitted"))
         parser.add_argument("--agent-config", default=None,
                             help="validated agent config (default: config.yaml)")

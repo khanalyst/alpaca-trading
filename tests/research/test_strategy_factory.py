@@ -14,6 +14,7 @@ from agent.contracts.rule import (
 )
 from agent.edge import apply_variant, resolve_validated_variant
 from research.edge_lab import EdgeLedger
+from research.edge_discovery_core import DiscoveryError
 from research.edge_identity import candidate_assumptions
 from research.edge_ledger_store import content_hash, provenance_hash
 from research import gates
@@ -48,7 +49,7 @@ def losing_breakouts(sessions=12):
             timestamp = start + timedelta(minutes=minute)
             observed = timestamp + timedelta(minutes=1)
             rows.append({
-                "kind": "bar", "provider": "test", "feed": "sip",
+                "kind": "bar", "provider": "test", "feed": "iex",
                 "symbol": "SPY", "timestamp": timestamp.isoformat(),
                 "as_of": observed.isoformat(), "observed_at": observed.isoformat(),
                 "open": open_, "high": high, "low": low, "close": close,
@@ -128,7 +129,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
             "net_pnl": net_pnl, "entry_price": 100.0,
             "exit_price": 101.0, "quantity": 1.0, "risk_usd": 1.0,
             "entry_fill_source": "quote", "exit_fill_source": "quote",
-            "entry_feed": "sip", "exit_feed": "sip",
+            "entry_feed": "iex", "exit_feed": "iex",
             "entry_provider": "alpaca", "exit_provider": "alpaca",
             "entry_quote_age_seconds": 0.0,
             "exit_quote_age_seconds": 0.0,
@@ -364,6 +365,22 @@ def persist_rule_gate(ledger, candidate_id, lane):
 
 
 class StrategyFactoryTests(unittest.TestCase):
+    def test_authorizing_factory_requires_explicit_iex_corpus_provenance(self):
+        source = losing_breakouts(1)[0]
+        invalid = [
+            {key: value for key, value in source.items() if key != "feed"},
+            {**source, "feed": "sip"},
+        ]
+        for index, row in enumerate(invalid):
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(
+                        DiscoveryError,
+                        "explicit feed provenance|expected 'iex'"):
+                    run_factory(
+                        [row], db_path=Path(directory) / f"edge-{index}.sqlite3",
+                        strategies=1, variants_per_strategy=2, workers=1,
+                        min_trades=1, min_sessions=1)
+
     def setUp(self):
         # These tests exercise bounded mutation/lifecycle mechanics with
         # compact synthetic corpora.  Explicitly lower protocol constants in

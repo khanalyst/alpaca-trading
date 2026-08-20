@@ -102,7 +102,8 @@ def _classification(gate: Mapping) -> str:
     return "adequate_inconclusive"
 
 
-def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -> dict:
+def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str,
+                     equity_feed: str = "iex") -> dict:
     """Add absolute profitability, lower-bound and walk-forward requirements.
 
     Beating a control is necessary but not sufficient: an accepted variant
@@ -113,14 +114,17 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
     sessions = {str(row.get("session_date") or "") for row in heldout}
     base_heldout = [row for row in baseline
                     if str(row.get("session_date") or "") in sessions]
-    absolute = performance_floor(heldout, vehicle=vehicle)
+    absolute = performance_floor(
+        heldout, vehicle=vehicle, equity_feed=equity_feed)
     minimums = (gate.get("heldout_floor") or {}).get("minimums") or {}
     folds = 3
     walk = walk_forward_report(
         heldout, base_heldout, vehicle=vehicle, folds=folds,
         min_test_sessions=max(1, int(minimums.get("sessions", 1)) // folds),
-        min_test_trades=max(1, int(minimums.get("trades", 1)) // (folds * 2)))
-    rejection = expectancy_rejection_report(heldout, vehicle=vehicle)
+        min_test_trades=max(1, int(minimums.get("trades", 1)) // (folds * 2)),
+        equity_feed=equity_feed)
+    rejection = expectancy_rejection_report(
+        heldout, vehicle=vehicle, equity_feed=equity_feed)
     negative_folds = [item for item in walk.get("results", ())
                       if item.get("adequate") and
                       float(item.get("net_pnl", 0.0)) <= 0.0]
@@ -194,13 +198,13 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             not math.isfinite(float(alpha)) or not 0.0 < float(alpha) <= 1.0):
         raise DiscoveryError("alpha must be finite and in (0,1]")
     # Discovery is an authorizing boundary: preserve each equity row's own
-    # provider/feed identity and require the configured complete SIP feed.
+    # provider/feed identity and require the configured IEX feed.
     broker = (config or {}).get("broker") if isinstance(config, Mapping) else {}
-    configured_feed = ((broker or {}).get("data_feed", "sip")
-                       if isinstance(broker, Mapping) else "sip")
+    configured_feed = ((broker or {}).get("data_feed", "iex")
+                       if isinstance(broker, Mapping) else "iex")
     raw_rows, bars, snapshots, quotes = _read_discovery_rows(
         data, require_provenance=True,
-        expected_equity_feed=str(configured_feed or "sip"))
+        expected_equity_feed=str(configured_feed or "iex"))
     from agent.variants import load_registry
     registry_path = variants_path or Path(__file__).with_name("variants.yaml")
     variants = load_registry(registry_path)
@@ -332,7 +336,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         return qualification_report(
             rows, control, vehicle=vehicle,
             sessions=sorted({str(row.get("session_date") or "") for row in rows}),
-            candidate_id=candidate_id, preselected=preselected)
+            candidate_id=candidate_id, preselected=preselected,
+            equity_feed=runtime_policy.equity_feed)
 
     modes: dict[str, str] = {}
     eval_rows: dict[str, list[dict]] = {}
@@ -470,8 +475,10 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 min_sessions=effective_minimums[mode][1], alpha=alpha,
                 shadow=(mode == "shadow"),
                 null_rows=null_results[variant.variant_id],
-                qualification=window_reports[variant.variant_id]),
-            candidate_baseline, vehicle=vehicle)
+                qualification=window_reports[variant.variant_id],
+                equity_feed=runtime_policy.equity_feed),
+            candidate_baseline, vehicle=vehicle,
+            equity_feed=runtime_policy.equity_feed)
     corrected = benjamini_hochberg(
         {variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()}, alpha=alpha)
 
@@ -568,7 +575,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 dataset=raw_rows, config=run_configs[variant.variant_id],
                 code=code_path, provenance=run_provenance),
             candidate_id=variant.variant_id,
-            costs=configs[variant.variant_id].costs)
+            costs=configs[variant.variant_id].costs,
+            equity_feed=mode_policies[variant.variant_id].equity_feed)
     forward_success = any(
         modes[variant.variant_id] == "shadow" and
         gates.get(variant.variant_id, {}).get("passes", False)
@@ -596,8 +604,10 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             shadow=(baseline_mode == "shadow"), actual_control=False,
             control_kind="synthetic_zero_reference",
             null_rows=null_results[baseline_variant.variant_id],
-            qualification=baseline_window),
-        baseline_zero, vehicle=vehicle)
+            qualification=baseline_window,
+            equity_feed=runtime_policy.equity_feed),
+        baseline_zero, vehicle=vehicle,
+        equity_feed=runtime_policy.equity_feed)
     _finalize_gate(
         baseline_gate, lane=baseline_mode,
         family={"p": baseline_gate["candidate_p_raw"],
@@ -615,7 +625,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                         "backtest_bar_fallback": backtest_bar_fallback,
                         "selected_test_id": selected_test_id}),
         candidate_id=baseline_variant.variant_id,
-        costs=configs[baseline_variant.variant_id].costs)
+        costs=configs[baseline_variant.variant_id].costs,
+        equity_feed=mode_policies[baseline_variant.variant_id].equity_feed)
     baseline_run = None
     # A control arm is never post-selection qualified, so its reusable
     # development run must not be labelled underpowered merely because the

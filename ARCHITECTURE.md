@@ -325,7 +325,7 @@ provider/feed identity, and out-of-scope instruments. Session grouping uses
 `execution.strict_market_data` default is `true`. Required records become
 actionable at the maximum of event timestamp, `as_of`, and `observed_at`;
 delayed bars can signal when observed, and execution enters at that
-decision/observation time using fresh SIP/OPRA evidence. Delayed full OHLC
+decision/observation time using fresh IEX/OPRA evidence. Delayed full OHLC
 never backfills an earlier entry, partial pre-entry ranges are excluded, and
 historical bar fallback remains diagnostic and is excluded from authorizing
 statistics.

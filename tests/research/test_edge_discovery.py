@@ -31,7 +31,7 @@ from research.factory_ledger import FactoryLedger
 from tests.research.test_factory_end_to_end import edge_corpus
 
 
-def _gate_evidence(heldout, *, alpha=.05):
+def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex"):
     """Build the statistical evidence a persisted proof must now reproduce.
 
     The zero baseline makes the matched deltas equal to the held-out P&L, so
@@ -39,16 +39,20 @@ def _gate_evidence(heldout, *, alpha=.05):
     """
     baseline = [{**row, "net_pnl": 0.0, "opportunity_id": f"base-{index}"}
                 for index, row in enumerate(heldout)]
-    control = matched_cluster_test(heldout, baseline, vehicle="equity")
-    placebo = placebo_null_distribution(heldout, baseline, vehicle="equity")
+    control = matched_cluster_test(
+        heldout, baseline, vehicle="equity", equity_feed=equity_feed)
+    placebo = placebo_null_distribution(
+        heldout, baseline, vehicle="equity", equity_feed=equity_feed)
     falsification = {
         **falsification_gate(placebo["observed"], placebo["placebo"], alpha=alpha),
         "method": placebo["method"], "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),
         "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
     }
-    absolute = performance_floor(heldout, vehicle="equity")
-    walk = walk_forward_report(heldout, baseline, vehicle="equity")
+    absolute = performance_floor(
+        heldout, vehicle="equity", equity_feed=equity_feed)
+    walk = walk_forward_report(
+        heldout, baseline, vehicle="equity", equity_feed=equity_feed)
     return control, falsification, absolute, walk
 
 
@@ -69,7 +73,7 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
             (100, 102, 99.5, 102),      # confirmed breakout
             (102, 103, 101.5, 103),     # next-bar entry at 102
             # Gap through the 1.5R target at the next-bar boundary.  The
-            # candidate's exit is therefore priced by the executable SIP
+            # candidate's exit is therefore priced by the executable IEX
             # quote at that boundary; the 2R baseline still holds to the
             # force-flat boundary because this bar's high remains below 2R.
             (106.5, 107, 102.5, 106.8),
@@ -91,7 +95,7 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                     "observed_at": (timestamp + timedelta(minutes=1)).isoformat(),
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
-                    "volume": 1, "provider": "alpaca", "feed": "sip",
+                    "volume": 1, "provider": "alpaca", "feed": "iex",
                 })
                 rows.append({
                     "kind": "quote", "symbol": symbol,
@@ -100,16 +104,16 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                     # record itself arrives at its completed-bar timestamp.
                     "as_of": timestamp.isoformat(),
                     "observed_at": timestamp.isoformat(),
-                    # The target bar needs an executable SIP bid for the
+                    # The target bar needs an executable IEX bid for the
                     # long exit; opening-price quotes would force a bar
                     # fallback and make this lifecycle fixture fail the
                     # production fill-quality gate.
                     "bid": (high if minute == 3 else open_) + shift - .01,
                     "ask": (high if minute == 3 else open_) + shift + .01,
-                    "provider": "alpaca", "feed": "sip",
+                    "provider": "alpaca", "feed": "iex",
                 })
             # The 2R baseline can remain open after this compact four-minute
-            # fixture.  Supply its exact force-flat SIP quote so the baseline
+            # fixture.  Supply its exact force-flat IEX quote so the baseline
             # and randomized null stay in the authorizing-quality sample.
             final_quote = session + timedelta(minutes=len(values))
             rows.append({
@@ -119,12 +123,12 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                 "observed_at": final_quote.isoformat(),
                 "bid": values[-1][3] + shift - .01,
                 "ask": values[-1][3] + shift + .01,
-                "provider": "alpaca", "feed": "sip",
+                "provider": "alpaca", "feed": "iex",
             })
             # The baseline (2R) remains open through this compact session and
             # is force-flat on the final completed bar.  Supply a distinct
             # quote at that exact bar-end boundary so strict replay records a
-            # genuine SIP exit rather than silently falling back to OHLC.
+            # genuine IEX exit rather than silently falling back to OHLC.
             final_timestamp = session + timedelta(minutes=len(values))
             final_close = values[-1][3] + shift
             rows.append({
@@ -133,7 +137,7 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                 "as_of": final_timestamp.isoformat(),
                 "observed_at": final_timestamp.isoformat(),
                 "bid": final_close - .01, "ask": final_close + .01,
-                "provider": "alpaca", "feed": "sip",
+                "provider": "alpaca", "feed": "iex",
             })
     return rows
 
@@ -141,8 +145,10 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
 def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   passes: bool = True, record: bool = True,
                   score: float = 1.0,
-                   scores: list[float] | None = None,
-                   r_multiples: list[float] | None = None) -> tuple[dict, dict]:
+                  scores: list[float] | None = None,
+                  r_multiples: list[float] | None = None,
+                  equity_feed: str = "iex",
+                  legacy_feedless: bool = False) -> tuple[dict, dict]:
     def priced(row: dict) -> dict:
         return {
             **row,
@@ -155,7 +161,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
             "risk_usd": 10.0,
             "entry_fill_source": "quote",
             "exit_fill_source": "quote",
-            "entry_feed": "sip", "exit_feed": "sip",
+            "entry_feed": equity_feed, "exit_feed": equity_feed,
             "entry_provider": "alpaca", "exit_provider": "alpaca",
             "entry_quote_age_seconds": 0.0,
             "exit_quote_age_seconds": 0.0,
@@ -219,7 +225,8 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     selection_p_value = None
     if lane == "shadow":
         selection_control = matched_cluster_test(
-            selection_rows, selection_baseline_rows, vehicle="equity")
+            selection_rows, selection_baseline_rows, vehicle="equity",
+            equity_feed=equity_feed)
         selection_p_value = float(selection_control["p_value"])
     baseline = [{**row, "net_pnl": 0.0,
                  "opportunity_id": f"baseline-{index}"}
@@ -231,15 +238,18 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     fit_floor = structural_floor(
         fit, vehicle="equity", min_trades=floor_trades, min_sessions=30,
         min_clusters=30,
-        required=lane != "shadow")
+        required=lane != "shadow", equity_feed=equity_feed)
     held_floor = structural_floor(
         heldout, vehicle="equity", min_trades=floor_trades, min_sessions=30,
-        min_clusters=30)
+        min_clusters=30, equity_feed=equity_feed)
     separation = (heldout_separation(fit, heldout) if lane == "backtest" else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": True, "mode": "new_data"})
-    control, falsification, absolute, walk = _gate_evidence(heldout)
-    fit_control = (matched_cluster_test(fit, fit_baseline, vehicle="equity")
+    control, falsification, absolute, walk = _gate_evidence(
+        heldout, equity_feed=equity_feed)
+    fit_control = (matched_cluster_test(
+                       fit, fit_baseline, vehicle="equity",
+                       equity_feed=equity_feed)
                    if fit else {"available": True, "actual_control": True,
                                 "matched": 0, "mean_delta": None,
                                 "p_value": 1.0, "mode": "prior_backtest"})
@@ -258,7 +268,8 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     qualification = qualification_report(
         qualification_rows, qualification_baseline, vehicle="equity",
         sessions=sorted({row["session_date"] for row in qualification_rows}),
-        candidate_id=candidate_id, preselected=True)
+        candidate_id=candidate_id, preselected=True,
+        equity_feed=equity_feed)
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
     hashes = edge_ledger.provenance_hash(config=candidate_config)
@@ -356,7 +367,24 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                      "heldout_delta_lcb": control["mean_delta_lcb"],
                      "heldout_net_pnl": absolute["net_pnl"],
                      "heldout_expectancy": absolute["expectancy"],
-                     "max_drawdown": max_drawdown_of(heldout)})
+                     "max_drawdown": max_drawdown_of(heldout)},
+        equity_feed=equity_feed)
+    if legacy_feedless:
+        def strip_feed(value):
+            if isinstance(value, dict):
+                value.pop("equity_feed", None)
+                for item in value.values():
+                    strip_feed(item)
+            elif isinstance(value, list):
+                for item in value:
+                    strip_feed(item)
+
+        strip_feed(envelope)
+        envelope["passes"] = bool(passes and all(envelope["checks"].values()))
+        envelope["content_hash"] = gates._content_hash({
+            key: value for key, value in envelope.items()
+            if key != "content_hash"
+        })
     live_source = None
     if lane == "shadow":
         session_rows = {
@@ -473,6 +501,37 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
 
 
 class EdgeLedgerStoreExtractionTests(unittest.TestCase):
+    def test_ledger_accepts_legacy_sip_but_explicit_sip_cannot_authorize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity",
+                hypothesis="pre-feed-binding SIP proof", config={})
+            run, legacy = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest",
+                record=False, equity_feed="sip", legacy_feedless=True)
+            self.assertTrue(legacy["passes"])
+            self.assertNotIn("equity_feed", legacy)
+            ledger.record_verified_gate(run["run_id"], legacy)
+            proof = ledger.latest_verified_run(
+                candidate["candidate_id"], lane="backtest")
+            self.assertIsNotNone(proof)
+            self.assertTrue(proof["verified_gate"]["passes"])
+
+            explicit_run, explicit = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest",
+                record=False, equity_feed="sip")
+            self.assertEqual(explicit["equity_feed"], "sip")
+            self.assertFalse(explicit["passes"])
+            forged = copy.deepcopy(explicit)
+            forged["passes"] = True
+            forged["content_hash"] = gates._content_hash({
+                key: value for key, value in forged.items()
+                if key != "content_hash"
+            })
+            with self.assertRaisesRegex(ValueError, "envelope/hash"):
+                ledger.record_verified_gate(explicit_run["run_id"], forged)
+
     def test_store_symbols_are_identical_through_edge_facades(self):
         names = (
             "VEHICLES", "LANES", "LIFECYCLE", "CANDIDATE", "BACKTEST_PASSED",
@@ -629,7 +688,7 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
         self.assertEqual(bars, [bar])
         self.assertEqual(snapshots, {})
         self.assertEqual(quotes, [])
-        normalizer.assert_called_once_with(row, provider="alpaca", feed="sip")
+        normalizer.assert_called_once_with(row, provider="alpaca", feed="iex")
 
     def test_option_corpus_requires_explicit_opra_provenance(self):
         row = {
@@ -689,7 +748,7 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
                 "opportunity_id": f"{prefix}:{index}", "no_trade": False,
                 "net_pnl": net, "gross_pnl": net + .1, "costs": .1,
                 "entry_fill_source": "quote", "exit_fill_source": "quote",
-                "entry_feed": "sip", "exit_feed": "sip",
+                "entry_feed": "iex", "exit_feed": "iex",
                 "entry_provider": "fixture", "exit_provider": "fixture",
                 "entry_quote_age_seconds": 0.0, "exit_quote_age_seconds": 0.0,
             }
@@ -1704,10 +1763,10 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
     winner = [(100, 101, 99, 100), (100, 102, 99, 102),
               (102, 103, 101, 102),     # next-bar entry
               # Gap through the 1.5R target at the executable bar boundary;
-              # the 2R baseline remains open and uses the final SIP quote.
+              # the 2R baseline remains open and uses the final IEX quote.
               (107, 107.5, 101, 107)]
     # Keep the winner's decline above the 3-dollar stop so the 2R baseline
-    # reaches its force-flat boundary and can be priced by the final SIP
+    # reaches its force-flat boundary and can be priced by the final IEX
     # quote.  The target variant has already exited at the opening gap.
     price = 106.0
     for _ in range(20):
@@ -1715,7 +1774,7 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
         price -= .25
     loser = [(100, 101, 99, 100), (100, 102, 99, 102),
              (102, 103, 101, 102),
-             # Gap through the stop so both arms use the opening SIP quote;
+             # Gap through the stop so both arms use the opening IEX quote;
              # the candidate still loses, while qualification remains
              # authorizable and therefore explicitly fails on performance.
              (98, 102, 94, 95)]
@@ -1735,7 +1794,7 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
                     "observed_at": (timestamp + timedelta(minutes=1)).isoformat(),
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
-                    "volume": 1, "provider": "alpaca", "feed": "sip",
+                    "volume": 1, "provider": "alpaca", "feed": "iex",
                 })
                 rows.append({
                     "kind": "quote", "symbol": symbol,
@@ -1743,7 +1802,7 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
                     "as_of": timestamp.isoformat(),
                     "observed_at": timestamp.isoformat(),
                     "bid": open_ + shift - .01, "ask": open_ + shift + .01,
-                    "provider": "alpaca", "feed": "sip",
+                    "provider": "alpaca", "feed": "iex",
                 })
             final_quote = session + timedelta(minutes=len(values))
             rows.append({
@@ -1753,7 +1812,7 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
                 "observed_at": final_quote.isoformat(),
                 "bid": values[-1][3] + shift - .01,
                 "ask": values[-1][3] + shift + .01,
-                "provider": "alpaca", "feed": "sip",
+                "provider": "alpaca", "feed": "iex",
             })
     return rows
 
@@ -1795,7 +1854,7 @@ def _drift_sessions(start: datetime, count: int,
                     "observed_at": timestamp.isoformat(),
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
-                    "volume": 1, "provider": "alpaca", "feed": "sip",
+                    "volume": 1, "provider": "alpaca", "feed": "iex",
                 })
                 rows.append({
                     "kind": "quote", "symbol": symbol,
@@ -1803,7 +1862,7 @@ def _drift_sessions(start: datetime, count: int,
                     "as_of": timestamp.isoformat(),
                     "observed_at": timestamp.isoformat(),
                     "bid": open_ + shift - .01, "ask": open_ + shift + .01,
-                    "provider": "alpaca", "feed": "sip",
+                    "provider": "alpaca", "feed": "iex",
                 })
             final_quote = session + timedelta(minutes=len(values))
             rows.append({
@@ -1813,7 +1872,7 @@ def _drift_sessions(start: datetime, count: int,
                 "observed_at": final_quote.isoformat(),
                 "bid": values[-1][3] + shift - .01,
                 "ask": values[-1][3] + shift + .01,
-                "provider": "alpaca", "feed": "sip",
+                "provider": "alpaca", "feed": "iex",
             })
     return rows
 

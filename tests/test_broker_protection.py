@@ -35,7 +35,7 @@ from deploy import watchdog
 
 _LIVE_CONFIG = {
     "mode": "live",
-    "broker": {"paper": False, "allow_live": True},
+    "broker": {"paper": False, "allow_live": True, "options_feed": "opra"},
     "strategy": {"id": "ibr", "version": "v1", "variant_id": "ibr.baseline",
                  "selection_mode": "specific", "execution_mode": "shares"},
     "llm": {"enabled": False},
@@ -1060,7 +1060,8 @@ class LiveOptionsGateTests(unittest.TestCase):
     def test_paper_still_accepts_the_options_execution_mode(self):
         cfg = deepcopy(_LIVE_CONFIG)
         cfg.update({"mode": "paper",
-                    "broker": {"paper": True, "allow_live": False}})
+                    "broker": {"paper": True, "allow_live": False,
+                               "options_feed": "opra"}})
         cfg["strategy"]["execution_mode"] = "options"
         result = validate_config(cfg)
         self.assertEqual(result["strategy"]["execution_mode"], "options")

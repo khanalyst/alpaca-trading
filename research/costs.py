@@ -107,6 +107,10 @@ class ReplayPolicy:
     # are appended to preserve the positional constructor contract above.
     stressed_cost_scenario_bps: float | None = None
     max_stressed_cost_to_risk_ratio: float | None = None
+    # Appended to preserve the positional constructor contract.  IEX is the
+    # shipped equity authorization identity; legacy SIP envelopes select their
+    # historical semantics explicitly during verification.
+    equity_feed: str = "iex"
 
     def __post_init__(self) -> None:
         age = float(self.max_market_data_age_seconds)
@@ -144,6 +148,13 @@ class ReplayPolicy:
             raise CostError(
                 "max_stressed_cost_to_risk_ratio must be finite and non-negative "
                 "when supplied")
+        feed = str(self.equity_feed or "").strip().lower().replace("-", "_")
+        if feed == "delayed":
+            feed = "delayed_sip"
+        if feed not in {"iex", "sip", "delayed_sip"}:
+            raise CostError(
+                "equity_feed must be iex, sip, or delayed_sip")
+        object.__setattr__(self, "equity_feed", feed)
         if not isinstance(self.strict_market_data, bool):
             raise CostError("strict_market_data must be true or false")
         if not isinstance(self.require_exact_calendar, bool):
@@ -160,6 +171,7 @@ class ReplayPolicy:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "equity_feed": self.equity_feed,
             "max_market_data_age_seconds": float(self.max_market_data_age_seconds),
             "options_min_dte": int(self.options_min_dte),
             "options_max_dte": int(self.options_max_dte),
@@ -196,8 +208,13 @@ class ReplayPolicy:
         risk = source.get("risk") or {}
         strategy = source.get("strategy") or {}
         session = source.get("session") or {}
-        if not all(isinstance(block, Mapping) for block in (execution, risk, strategy, session)):
+        broker = source.get("broker") or {}
+        data = source.get("data") or {}
+        if not all(isinstance(block, Mapping) for block in (
+                execution, risk, strategy, session, broker, data)):
             raise CostError("runtime policy blocks must be mappings")
+        equity_feed = (broker.get("data_feed") if "data_feed" in broker else
+                       data.get("feed") if "feed" in data else "iex")
         latest = strategy.get("latest_entry_time")
         if latest is not None and not isinstance(latest, time):
             try:
@@ -231,6 +248,7 @@ class ReplayPolicy:
                                       not isinstance(value, int) or value < 0):
                 raise CostError(f"{name} must be a non-negative integer")
         return cls(
+            equity_feed=str(equity_feed),
             max_market_data_age_seconds=float(execution.get("max_market_data_age_seconds", 30.0)),
             options_min_dte=int(risk.get("options_min_dte", 7)),
             options_max_dte=int(risk.get("options_max_dte", 60)),
@@ -785,7 +803,8 @@ _cost_model_for_vehicle = cost_model_for_vehicle
 
 def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
                      costs: Any = None, config: Mapping | None = None,
-                     min_cost_coverage: float = 1.0) -> dict[str, Any]:
+                     min_cost_coverage: float = 1.0,
+                     equity_feed: str = "iex") -> dict[str, Any]:
     """Recompute whether each executed row has a cost-covered risk unit.
 
     A risk unit is the monetary loss to the authored stop (``risk_usd`` when
@@ -797,6 +816,11 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
     """
     if not isinstance(vehicle, str) or vehicle not in {"equity", "option"}:
         raise CostError("vehicle must be equity or option")
+    equity_feed = str(equity_feed or "").strip().lower().replace("-", "_")
+    if equity_feed == "delayed":
+        equity_feed = "delayed_sip"
+    if equity_feed not in {"iex", "sip", "delayed_sip"}:
+        raise CostError("equity_feed must be iex, sip, or delayed_sip")
     if config is not None and costs is None:
         costs = CostModel.from_config(config, vehicle=vehicle)
     model = cost_model_for_vehicle(costs, vehicle)
@@ -842,22 +866,21 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
                                        row.get("exit_fill_source") == QUOTE))
             except CostError:
                 cost = None
-        # Equity proof is executable only when both legs were priced from
-        # recorded quotes carrying explicit SIP provenance.  Backtests may
-        # retain bar/IEX/unknown rows for diagnostics, but those rows can
-        # never satisfy an authorizing risk-unit report.  Options deliberately
-        # follow their existing OPRA gate and are not subject to this SIP rule.
+        # Equity proof is bound to the report's explicit feed identity.  New
+        # authorizing research passes IEX; SIP remains available only for
+        # faithful verification of pre-binding historical envelopes.
         equity_provenance = True
         provenance_reason: str | None = None
         if vehicle == "equity":
-            def _sip_leg(leg: str) -> bool:
+            def _equity_leg(leg: str) -> bool:
                 source = str(row.get(f"{leg}_fill_source") or "").strip().lower()
                 feed = str(row.get(f"{leg}_feed") or "").strip().lower()
                 provider = str(row.get(f"{leg}_provider") or "").strip()
-                return source == QUOTE and feed == "sip" and bool(provider)
-            equity_provenance = _sip_leg("entry") and _sip_leg("exit")
+                return source == QUOTE and feed == equity_feed and bool(provider)
+            equity_provenance = _equity_leg("entry") and _equity_leg("exit")
             if not equity_provenance:
-                provenance_reason = "equity legs require SIP quote provenance"
+                provenance_reason = (
+                    f"equity legs require {equity_feed.upper()} quote provenance")
         elif vehicle == "option":
             # Option evidence authorizes only an executable OPRA quote on both
             # legs, observed no more than one recorder cycle (30 seconds) ago.
@@ -925,6 +948,7 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
     adequate = bool(executed and observations and not failures)
     return {
         "schema": "risk-unit-report.v1",
+        "equity_feed": equity_feed,
         "vehicle": vehicle,
         "minimum_cost_coverage": coverage,
         "cost_model": model.as_dict(),

@@ -167,11 +167,11 @@ class AlpacaProvider(AlpacaMarketDataMixin):
             raise PaperModeError("broker endpoint overrides are disabled")
         import_env_feed = os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED")
         import_env_option_feed = os.getenv("ALPACA_OPTIONS_FEED")
-        # Keep minimal/injected configs fail-closed too.  A caller that has
-        # not passed the validated shipped config must not silently fall back
-        # to the partial IEX or indicative option stream.
-        configured_data_feed = broker.get("data_feed") if "data_feed" in broker else data_cfg.get("feed", "sip")
-        configured_options_feed = broker.get("options_feed") if "options_feed" in broker else data_cfg.get("options_feed", "opra")
+        # Keep minimal/injected configs on the shipped protocol too.  A caller
+        # that has not passed validated config still receives the exact IEX
+        # identity rather than an unrelated historical feed assumption.
+        configured_data_feed = broker.get("data_feed") if "data_feed" in broker else data_cfg.get("feed", "iex")
+        configured_options_feed = broker.get("options_feed") if "options_feed" in broker else data_cfg.get("options_feed", "indicative")
         self.data_feed = _canonical_feed(import_env_feed or configured_data_feed)
         self.options_feed = _canonical_feed(import_env_option_feed or configured_options_feed, options=True)
         strategy = cfg.get("strategy") if isinstance(cfg.get("strategy"), Mapping) else {}
@@ -183,9 +183,9 @@ class AlpacaProvider(AlpacaMarketDataMixin):
         # The checked configuration defaults research on; an unvalidated
         # mapping must not opt out merely by omitting the field.
         research_enabled = bool(research.get("enabled", True))
-        if research_enabled and self.data_feed != "sip":
+        if research_enabled and self.data_feed != "iex":
             raise PaperModeError(
-                "autonomous research requires the SIP equity feed entitlement")
+                "autonomous research requires the IEX equity feed")
         if ((str(strategy.get("execution_mode", "shares")).lower()
              in {"options", "option"}) or
                 (research_enabled and option_lane)) and \

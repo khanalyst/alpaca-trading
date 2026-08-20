@@ -100,7 +100,7 @@ class LiveShadowIngestTests(unittest.TestCase):
                    "risk_usd": 10.0,
                    "entry_fill_source": "quote",
                    "exit_fill_source": "quote",
-                   "entry_feed": "sip", "exit_feed": "sip",
+                   "entry_feed": "iex", "exit_feed": "iex",
                    "entry_provider": "alpaca", "exit_provider": "alpaca",
                    "entry_quote_age_seconds": 0.0,
                    "exit_quote_age_seconds": 0.0}
@@ -128,7 +128,7 @@ class LiveShadowIngestTests(unittest.TestCase):
                "quantity": 1.0, "multiplier": 1.0,
                "stop_distance": 1.0, "risk_usd": 10.0,
                "entry_fill_source": "quote", "exit_fill_source": "quote",
-               "entry_feed": "sip", "exit_feed": "sip",
+               "entry_feed": "iex", "exit_feed": "iex",
                "entry_provider": "alpaca", "exit_provider": "alpaca",
                "entry_quote_age_seconds": 0.0,
                "exit_quote_age_seconds": 0.0}

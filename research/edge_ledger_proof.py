@@ -236,6 +236,13 @@ class EdgeLedgerProofMixin:
     def _gate_envelope_error(self, run: Mapping, envelope: Mapping) -> str | None:
         if envelope.get("lane") != run.get("lane") or envelope.get("vehicle") != run.get("vehicle"):
             return "verified gate lane/vehicle does not match the persisted run"
+        equity_feed = str(
+            envelope.get("equity_feed", "sip")
+        ).strip().lower().replace("-", "_")
+        if equity_feed == "delayed":
+            equity_feed = "delayed_sip"
+        if equity_feed not in {"iex", "sip", "delayed_sip"}:
+            return "verified gate equity feed is invalid"
         # V2 source-backed proofs must identify the immutable run candidate.
         # During the historical transition producers used the candidate's
         # stable variant id before the UUID-backed ledger record existed, so
@@ -320,9 +327,13 @@ class EdgeLedgerProofMixin:
                 return "persisted trades do not fit the recorded chronological boundary"
         expected = envelope.get("counts") or {}
         actual = {
-            "fit": sample_counts(fit_rows, vehicle=run["vehicle"]),
-            "heldout": sample_counts(heldout_rows, vehicle=run["vehicle"]),
-            "total": sample_counts(rows, vehicle=run["vehicle"]),
+            "fit": sample_counts(
+                fit_rows, vehicle=run["vehicle"], equity_feed=equity_feed),
+            "heldout": sample_counts(
+                heldout_rows, vehicle=run["vehicle"],
+                equity_feed=equity_feed),
+            "total": sample_counts(
+                rows, vehicle=run["vehicle"], equity_feed=equity_feed),
         }
         if expected != actual:
             return "verified gate counts do not match persisted trades"
@@ -330,8 +341,12 @@ class EdgeLedgerProofMixin:
         source_fit = envelope.get("fit_source")
         source_held = envelope.get("heldout_source")
         if (not isinstance(source_fit, list) or not isinstance(source_held, list) or
-                sample_counts(source_fit, vehicle=run["vehicle"]) != actual["fit"] or
-                sample_counts(source_held, vehicle=run["vehicle"]) != actual["heldout"]):
+                sample_counts(
+                    source_fit, vehicle=run["vehicle"],
+                    equity_feed=equity_feed) != actual["fit"] or
+                sample_counts(
+                    source_held, vehicle=run["vehicle"],
+                    equity_feed=equity_feed) != actual["heldout"]):
             return "verified gate source evidence is missing or does not match persisted trades"
         if (not _trade_rows_match(source_fit, fit_rows) or
                 not _trade_rows_match(source_held, heldout_rows)):
@@ -402,7 +417,8 @@ class EdgeLedgerProofMixin:
                 vehicle=run["vehicle"],
                 min_trades=normalized_minimums["trades"],
                 min_sessions=normalized_minimums["sessions"],
-                min_clusters=normalized_minimums["clusters"])
+                min_clusters=normalized_minimums["clusters"],
+                equity_feed=equity_feed)
             if (feasibility.get("status") != recomputed_feasibility.get("status") or
                     bool(feasibility.get("adequate")) != bool(recomputed_feasibility.get("adequate"))):
                 return "verified gate floor feasibility evidence is inconsistent"
@@ -533,7 +549,9 @@ class EdgeLedgerProofMixin:
         # and matched deltas.  A recorded decision the evidence no longer
         # reproduces is not a proof, however well formed its hashes are.
         from .gates import performance_floor
-        absolute = performance_floor(heldout_rows, vehicle=run["vehicle"])
+        absolute = performance_floor(
+            heldout_rows, vehicle=run["vehicle"],
+            equity_feed=equity_feed)
         if "heldout_net_pnl" in performance and not _close(
                 _finite_number(performance.get("heldout_net_pnl")), absolute["net_pnl"]):
             return "verified gate held-out net P&L does not match persisted trades"

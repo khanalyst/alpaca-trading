@@ -1136,7 +1136,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--once", action="store_true")
     p.add_argument(
         "--probe", action="store_true",
-        help="verify recent SIP/OPRA entitlement without writing corpus rows")
+        help=("verify recent configured market-data access (IEX equities; "
+              "OPRA only for an explicitly enabled option lane) without "
+              "writing corpus rows"))
     p.add_argument("--audit", action="store_true",
                    help="validate the full corpus and detect duplicate keys")
     p.add_argument("--config", default="config.yaml")

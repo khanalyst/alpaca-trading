@@ -369,7 +369,7 @@ class BoundaryTests(unittest.TestCase):
                          now=FRIDAY_EVENING)
 
     def test_the_requested_feed_reaches_every_request(self):
-        for requested, expected in (("sip", "sip"),
+        for requested, expected in (("iex", "iex"), ("sip", "sip"),
                                     ("delayed", "delayed_sip")):
             provider = FakeProvider(bars_per_session=1)
             with self.subTest(feed=requested), \
@@ -384,6 +384,17 @@ class BoundaryTests(unittest.TestCase):
                     {row["feed"] for row in iter_corpus_rows(output)},
                     {expected})
                 self.assertEqual(_load_index(output)["data_feed"], expected)
+
+    def test_backfill_defaults_to_iex(self):
+        provider = FakeProvider(bars_per_session=1)
+        with tempfile.TemporaryDirectory() as directory:
+            output = _corpus(directory)
+            backfill(provider, ["SPY"], output, days=3,
+                     now=FRIDAY_EVENING)
+            self.assertTrue(provider.bar_windows)
+            self.assertEqual(
+                {window[2] for window in provider.bar_windows}, {"iex"})
+            self.assertEqual(_load_index(output)["data_feed"], "iex")
 
     def test_backfill_refuses_a_feed_change_before_mutating_the_corpus(self):
         with tempfile.TemporaryDirectory() as directory:

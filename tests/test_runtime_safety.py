@@ -572,24 +572,24 @@ class RuntimeSafetyTests(unittest.TestCase):
             default.quotes(["SPY"])
             default.option_snapshots("SPY")
             provider = AlpacaProvider({"mode": "paper", "broker": {
-                "paper": True, "data_feed": "sip", "options_feed": "opra"}},
+                "paper": True, "data_feed": "iex", "options_feed": "opra"}},
                 session=session)
             bars = provider.bars(["SPY"], "1m")
             quotes = provider.quotes(["SPY"])
             options = provider.option_snapshots("SPY")
-        self.assertEqual(provider.data_feed, "sip")
+        self.assertEqual(provider.data_feed, "iex")
         self.assertEqual(provider.options_feed, "opra")
-        self.assertEqual(bars["SPY"][0].feed, "sip")
-        self.assertEqual(quotes["SPY"][0].feed, "sip")
+        self.assertEqual(bars["SPY"][0].feed, "iex")
+        self.assertEqual(quotes["SPY"][0].feed, "iex")
         self.assertEqual(options[0].feed, "opra")
         request_feeds = [(name, kwargs.get("feed")) for name, kwargs in seen]
         self.assertEqual(request_feeds[:3], [
-            ("StockBarsRequest", "SIP"),
-            ("StockQuotesRequest", "SIP"),
-            ("OptionChainRequest", "OPRA")])
+            ("StockBarsRequest", "IEX"),
+            ("StockQuotesRequest", "IEX"),
+            ("OptionChainRequest", "INDICATIVE")])
         request_feeds = dict(request_feeds)
-        self.assertEqual(request_feeds["StockBarsRequest"], "SIP")
-        self.assertEqual(request_feeds["StockQuotesRequest"], "SIP")
+        self.assertEqual(request_feeds["StockBarsRequest"], "IEX")
+        self.assertEqual(request_feeds["StockQuotesRequest"], "IEX")
         self.assertEqual(request_feeds["OptionChainRequest"], "OPRA")
 
     def test_order_reconciliation_uses_bounded_filter_without_page_token(self):
@@ -731,16 +731,31 @@ class RuntimeSafetyTests(unittest.TestCase):
 
     def test_preflight_rejects_injected_provider_feed_bypass_for_research(self):
         class ResearchProvider(FakeProvider):
-            data_feed = "iex"
+            data_feed = "sip"
             options_feed = "indicative"
 
         cfg = _cfg()
-        cfg["broker"].update(data_feed="sip", options_feed="opra")
+        cfg["broker"].update(data_feed="iex", options_feed="opra")
         cfg["research"] = {"enabled": True, "require_validated_variant": False,
                             "db_path": str(Path(self.runtime_tmp.name) / "edge.sqlite3")}
         engine = Engine(cfg, light=True, provider=ResearchProvider())
         self.addCleanup(engine.close)
         with self.assertRaisesRegex(AlpacaError, "provider equity feed"):
+            engine.preflight()
+
+    def test_preflight_requires_iex_for_loaded_validated_equity_edge(self):
+        class SipProvider(FakeProvider):
+            data_feed = "sip"
+
+        cfg = _cfg()
+        cfg["broker"]["data_feed"] = "sip"
+        cfg["research"] = {"enabled": False}
+        engine = Engine(cfg, light=True, provider=SipProvider())
+        self.addCleanup(engine.close)
+        engine._edge_records = [{"vehicle": "equity", "status": "validated"}]
+        engine._edge_record = engine._edge_records[0]
+        with self.assertRaisesRegex(
+                AlpacaError, "validated-equity runtime requires the IEX"):
             engine.preflight()
 
     def test_preflight_rejects_option_execution_without_opra_provider(self):
@@ -758,11 +773,11 @@ class RuntimeSafetyTests(unittest.TestCase):
 
     def test_preflight_rejects_option_research_without_opra_provider(self):
         class IndicativeProvider(FakeProvider):
-            data_feed = "sip"
+            data_feed = "iex"
             options_feed = "indicative"
 
         cfg = _cfg()
-        cfg["broker"].update(data_feed="sip", options_feed="opra")
+        cfg["broker"].update(data_feed="iex", options_feed="opra")
         cfg["universe"]["asset_classes"] = ["us_equity", "us_option"]
         cfg["research"] = {"enabled": True, "require_validated_variant": False,
                             "db_path": str(Path(self.runtime_tmp.name) / "edge.sqlite3")}
@@ -1011,7 +1026,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         provider = FakeProvider()
         # Research-enabled runtimes must advertise their entitled feeds even
         # when this test is focused on the missing validated edge.
-        provider.data_feed = "sip"
+        provider.data_feed = "iex"
         provider.options_feed = "opra"
         cfg = _cfg()
         cfg["research"] = {
@@ -1465,7 +1480,7 @@ class RuntimeSafetyTests(unittest.TestCase):
 
     def test_premarket_required_edge_refreshes_paused_heartbeat_after_cleanup(self):
         class PreopenProvider(FakeProvider):
-            data_feed = "sip"
+            data_feed = "iex"
             options_feed = "opra"
 
             def clock(self):

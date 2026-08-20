@@ -3,8 +3,8 @@
   "broker": {
     "paper": true,
     "allow_live": false,
-    "data_feed": "sip",
-    "options_feed": "opra"
+    "data_feed": "iex",
+    "options_feed": "indicative"
   },
   "session": {
     "timezone": "America/New_York",
@@ -16,7 +16,7 @@
   },
   "universe": {
     "symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"],
-    "asset_classes": ["us_equity", "us_option"],
+    "asset_classes": ["us_equity"],
     "min_price": 1.0,
     "max_symbols": 50,
     "denylist": []

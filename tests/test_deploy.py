@@ -61,7 +61,7 @@ def tearDownModule() -> None:                                  # noqa: N802
 class _MarketFake:
     def __init__(self, feed=None):
         self.seen = []
-        self.data_feed = feed
+        self.data_feed = "iex" if feed is None else feed
 
     def bars(self, symbols, *, start, end, feed, **kwargs):
         self.seen.append(("bars", feed))
@@ -198,7 +198,8 @@ class _CalendarFake:
                 {"date": "2026-08-07", "open": "09:30", "close": "13:00"}]
 
 
-def _corpus_rows(*, sessions: int, per_session: int, minute: int = 0) -> list[dict]:
+def _corpus_rows(*, sessions: int, per_session: int, minute: int = 0,
+                 feed: str = "iex") -> list[dict]:
     """Synthesize a durable corpus ending the session before the fakes' rows."""
     from deploy.recorder_market import _event_key
     rows = []
@@ -208,7 +209,7 @@ def _corpus_rows(*, sessions: int, per_session: int, minute: int = 0) -> list[di
         for step in range(per_session):
             stamp = (day + timedelta(minutes=minute + step)).isoformat()
             rows.append({"event_key": _event_key("bar_1m", "SPY", stamp),
-                         "observed_at": stamp, "provider": "alpaca", "feed": "sip",
+                         "observed_at": stamp, "provider": "alpaca", "feed": feed,
                          "event_type": "bar_1m", "symbol": "SPY",
                          "timestamp": stamp, "as_of": stamp, "open": 100,
                          "high": 101, "low": 99, "close": 100.5, "volume": 10})
@@ -245,14 +246,14 @@ def _replay_corpus_csv(*, quotes: bool = True, sessions: int = 1) -> str:
                 values = (base, base + 0.3, base - 0.1, base + 0.2)
             writer.writerow({
                 "event_key": _event_key("bar_1m", "SPY", stamp), "observed_at": stamp,
-                "provider": "alpaca", "feed": "sip", "event_type": "bar_1m",
+                "provider": "alpaca", "feed": "iex", "event_type": "bar_1m",
                 "symbol": "SPY", "timestamp": stamp, "as_of": stamp,
                 "open": values[0], "high": values[1], "low": values[2],
                 "close": values[3], "volume": 1000})
             if quotes:
                 writer.writerow({
                     "event_key": _event_key("quote", "SPY", stamp), "observed_at": stamp,
-                    "provider": "alpaca", "feed": "sip", "event_type": "quote",
+                    "provider": "alpaca", "feed": "iex", "event_type": "quote",
                     "symbol": "SPY", "timestamp": stamp, "as_of": stamp,
                     "bid": values[0] - 0.5, "ask": values[0] + 0.5,
                     "bid_size": 10, "ask_size": 10})
@@ -267,7 +268,7 @@ def _run_research_cycle(dataset: Path | str, root: Path, **env):
         config.write_text(json.dumps({
             "mode": "paper",
             "broker": {"paper": True, "allow_live": False,
-                       "data_feed": "sip", "options_feed": "opra"},
+                       "data_feed": "iex", "options_feed": "opra"},
             "universe": {"asset_classes": ["us_equity", "us_option"]},
             # These are explicit synthetic/external fixtures without a
             # recorder sidecar. Exercise the diagnostic fallback while the
@@ -284,7 +285,7 @@ def _run_research_cycle(dataset: Path | str, root: Path, **env):
                     ALPACA_FACTORY_ENABLED="0",
                     ALPACA_EDGE_DB=str(root / "edge.sqlite3"),
                     ALPACA_AGENT_CONFIG=str(config),
-                    ALPACA_DATA_FEED="sip", ALPACA_STOCK_FEED="sip",
+                    ALPACA_DATA_FEED="iex", ALPACA_STOCK_FEED="iex",
                     ALPACA_OPTIONS_FEED="opra",
                     ALPACA_RESEARCH_LLM_SECRETS_FILE="/dev/null")
     test_env.update(env)
@@ -634,7 +635,7 @@ class DeployTests(unittest.TestCase):
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,"
             "open,high,low,close,volume,bid,ask,last\n"
-            "k,2026-08-08T13:31:00+00:00,alpaca,sip,bar_1m,SPY,"
+            "k,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY,"
             "2026-08-08T13:30:00+00:00,100,101,99,100.5,10,,,,\n")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -653,10 +654,10 @@ class DeployTests(unittest.TestCase):
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
             "open,high,low,close,volume,bid,ask,bid_size,ask_size\n"
-            "bar,2026-08-08T13:31:00+00:00,alpaca,sip,bar_1m,SPY,"
+            "bar,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY,"
             "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
             "100,101,99,100.5,10,,,,\n"
-            "quote,2026-08-08T13:31:00+00:00,alpaca,sip,quote,SPY,"
+            "quote,2026-08-08T13:31:00+00:00,alpaca,iex,quote,SPY,"
             "2026-08-08T13:31:00+00:00,2026-08-08T13:32:00+00:00,"
             ",,,,,100,101,10,10\n")
         with tempfile.TemporaryDirectory() as directory:
@@ -706,12 +707,12 @@ class DeployTests(unittest.TestCase):
             self.assertFalse(validation["valid"])
             self.assertIn("slash pair", validation["errors"][0])
 
-    def test_research_cycle_rejects_external_iex_equity_provenance(self):
-        """An external IEX row cannot be promoted by SIP CLI metadata."""
+    def test_research_cycle_rejects_external_sip_equity_provenance(self):
+        """A legacy SIP row cannot be promoted by IEX CLI metadata."""
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
             "open,high,low,close,volume\n"
-            "iex,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY,"
+            "sip,2026-08-08T13:31:00+00:00,alpaca,sip,bar_1m,SPY,"
             "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
             "100,101,99,100.5,10\n")
         with tempfile.TemporaryDirectory() as directory:
@@ -722,7 +723,7 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
             validation = [item for item in _cycle_payloads(result.stdout, "valid")][0]
             self.assertFalse(validation["valid"])
-            self.assertTrue(any("expected 'sip'" in error
+            self.assertTrue(any("expected 'iex'" in error
                                 for error in validation["errors"]))
 
     def test_research_cycle_routes_recorded_quotes_into_the_replay(self):
@@ -961,7 +962,7 @@ class DeployTests(unittest.TestCase):
         writer.writeheader()
         writer.writerow({
             "event_key": "bar", "observed_at": "2026-08-08T13:31:00+00:00",
-            "provider": "alpaca", "feed": "sip", "event_type": "bar_1m",
+            "provider": "alpaca", "feed": "iex", "event_type": "bar_1m",
             "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
             "as_of": "2026-08-08T13:30:00+00:00", "open": 100, "high": 101,
             "low": 99, "close": 100.5, "volume": 10,
@@ -1005,7 +1006,7 @@ class DeployTests(unittest.TestCase):
             dataset = root / "market.jsonl"
             edge_db = root / "edge.sqlite3"
             dataset.write_text("\n".join(json.dumps(row) for row in (
-                {"kind": "bar", "provider": "alpaca", "feed": "sip",
+                {"kind": "bar", "provider": "alpaca", "feed": "iex",
                  "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
                  "as_of": "2026-08-08T13:30:00+00:00",
                  "observed_at": "2026-08-08T13:31:00+00:00",
@@ -1349,7 +1350,7 @@ class DeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "market.csv"
-            rows = _corpus_rows(sessions=1, per_session=2)
+            rows = _corpus_rows(sessions=1, per_session=2, feed="sip")
             recorder._append_partitions(path, rows)
             index = recorder._scan_corpus(path)
             index.pop("bar_coverage")
@@ -1380,7 +1381,7 @@ class DeployTests(unittest.TestCase):
             mixed.update({
                 "event_key": recorder._event_key(
                     "bar_1m", "SPY", mixed_stamp.isoformat()),
-                "feed": "iex", "timestamp": mixed_stamp.isoformat(),
+                "feed": "sip", "timestamp": mixed_stamp.isoformat(),
                 "as_of": mixed_stamp.isoformat(),
             })
             recorder._append_partitions(path, [*rows, mixed])
@@ -1633,21 +1634,21 @@ class DeployTests(unittest.TestCase):
     def test_provider_env_feed_wins_over_iex_config_and_is_recorded(self):
         sdk = _StockDataFake()
         with tempfile.TemporaryDirectory() as directory, patch.dict(
-                "os.environ", {"ALPACA_DATA_FEED": "sip"}, clear=False):
+                "os.environ", {"ALPACA_DATA_FEED": "iex"}, clear=False):
             provider = AlpacaProvider(
                 {"mode": "paper", "broker": {"paper": True,
-                                               "data_feed": "iex"}},
+                                               "data_feed": "sip"}},
                 session=AlpacaSession(api_key="key", secret_key="secret",
                                       paper=True, stock_data_client=sdk))
             path = Path(directory) / "market.csv"
             self.assertEqual(recorder.record_once(provider, ["SPY"], path), 2)
-            self.assertEqual(provider.data_feed, "sip")
+            self.assertEqual(provider.data_feed, "iex")
             for request in (sdk.bar_request, sdk.quote_request):
                 value = getattr(request, "feed", None)
                 if value is None and isinstance(request, dict):
                     value = request.get("feed")
-                self.assertIn("sip", str(value).lower())
-            self.assertTrue(all(row["feed"] == "sip"
+                self.assertIn("iex", str(value).lower())
+            self.assertTrue(all(row["feed"] == "iex"
                                 for row in recorder.iter_corpus_rows(path)))
 
     def test_health_uses_running_paper_heartbeat_contract(self):
@@ -1731,23 +1732,23 @@ class DeployTests(unittest.TestCase):
             self.assertTrue(result["fresh"])
             self.assertEqual(result["series_files"], 0)
 
-    def test_recorder_health_surfaces_a_permanent_sip_entitlement_failure(self):
+    def test_recorder_health_surfaces_a_permanent_iex_entitlement_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             csv_path = root / "market.csv"
             csv_path.write_text("event_key\n", encoding="utf-8")
             index_path = root / ".recorder-index.json"
-            index_path.write_text(json.dumps({"data_feed": "sip"}),
+            index_path.write_text(json.dumps({"data_feed": "iex"}),
                                   encoding="utf-8")
             status_path = root / ".recorder-status.json"
             status_path.write_text(json.dumps({
                 "schema": "recorder-status.v1",
                 "status": "failed",
                 "updated_ts": 995,
-                "data_feed": "sip",
-                "failure_kind": "sip_entitlement_required",
+                "data_feed": "iex",
+                "failure_kind": "iex_entitlement_required",
                 "retryable": False,
-                "error": "subscription does not permit querying recent SIP data",
+                "error": "subscription does not permit querying recent IEX data",
             }), encoding="utf-8")
             os.utime(csv_path, (995, 995))
             os.utime(index_path, (995, 995))
@@ -1756,11 +1757,11 @@ class DeployTests(unittest.TestCase):
 
             self.assertFalse(result["ok"])
             self.assertTrue(result["fresh"])
-            self.assertEqual(result["status"], "sip_entitlement_required")
+            self.assertEqual(result["status"], "iex_entitlement_required")
             self.assertEqual(result["failure_kind"],
-                             "sip_entitlement_required")
+                             "iex_entitlement_required")
             self.assertFalse(result["retryable"])
-            self.assertIn("recent SIP", result["last_error"])
+            self.assertIn("recent IEX", result["last_error"])
 
     def test_market_data_probe_does_not_mutate_the_corpus(self):
         fake = _MarketFake()
@@ -1772,7 +1773,7 @@ class DeployTests(unittest.TestCase):
                 fake, ["SPY"], config={"universe": {"asset_classes": []}})
 
             self.assertEqual(result["status"], "probe_ok")
-            self.assertEqual(result["data_feed"], "sip")
+            self.assertEqual(result["data_feed"], "iex")
             self.assertEqual(result["event_counts"],
                              {"bar_1m": 1, "quote": 1})
             self.assertFalse(output.exists())
@@ -1781,10 +1782,33 @@ class DeployTests(unittest.TestCase):
     def test_subscription_error_is_classified_as_non_retryable(self):
         kind, retryable = recorder._market_data_failure(
             RuntimeError(
-                "subscription does not permit querying recent SIP data"),
-            data_feed="sip", options_feed="opra")
-        self.assertEqual(kind, "sip_entitlement_required")
+                "subscription does not permit querying recent IEX data"),
+            data_feed="iex", options_feed="opra")
+        self.assertEqual(kind, "iex_entitlement_required")
         self.assertFalse(retryable)
+
+    def test_shipped_defaults_use_free_basic_iex_equity_lane(self):
+        config = json.loads((Path(__file__).resolve().parents[1] /
+                             "config.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(config["broker"]["data_feed"], "iex")
+        self.assertEqual(config["broker"]["options_feed"], "indicative")
+        self.assertEqual(config["universe"]["asset_classes"], ["us_equity"])
+        self.assertEqual(config["strategy"]["execution_mode"], "shares")
+        self.assertEqual(
+            Path(__file__).resolve().parents[1].joinpath(
+                ".env.example").read_text(encoding="utf-8").split(
+                    "ALPACA_RESEARCH_VEHICLES=", 1)[1].splitlines()[0],
+            "equity")
+
+    def test_research_cycle_option_lane_still_requires_opra(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "market.csv"
+            dataset.write_text(_replay_corpus_csv(), encoding="utf-8")
+            result = _run_research_cycle(
+                dataset, root, ALPACA_OPTIONS_FEED="indicative")
+            self.assertEqual(result.returncode, 3, result.stderr + result.stdout)
+            self.assertIn("OPRA", result.stdout)
 
     def test_scheduler_accepts_paper_config_without_secret_loader(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1804,10 +1828,14 @@ class DeployTests(unittest.TestCase):
             snapshot = dashboard.snapshot(root)
             self.assertTrue(snapshot["research"]["service_optional"])
             self.assertTrue(snapshot["research"]["entry_gate_required"])
+            self.assertEqual(snapshot["recorder"]["configured_data_feed"], "iex")
+            self.assertEqual(snapshot["recorder"]["configured_options_feed"],
+                             "indicative")
             self.assertNotIn("gates", snapshot)
 
     def test_dashboard_html_renders_the_current_snapshot_contract(self):
         self.assertIn("d.strategy.execution_mode", dashboard.HTML)
+        self.assertIn("d.recorder.configured_data_feed", dashboard.HTML)
         self.assertIn("d.research.entry_gate_required", dashboard.HTML)
         self.assertIn("d.research.service_optional", dashboard.HTML)
         self.assertIn("d.edge.proved_edges", dashboard.HTML)

@@ -6,21 +6,25 @@ payloads are converted to `research.market_data` records before feature
 calculation or replay. Required records become actionable only at the maximum
 of their market event timestamp, `as_of`, and `observed_at` timestamps. A
 delayed recorder bar can therefore signal when observed; execution enters at
-that decision/observation time using fresh SIP (equity) or OPRA (option)
+that decision/observation time using fresh IEX (equity) or OPRA (option)
 evidence. Delayed full OHLC never backfills an earlier entry, and partial
 pre-entry bar ranges are excluded. `as_of` may never be later than
 `observed_at`. Records retain provider/feed identity and the New York session
 date used for grouping.
 
-The shipped paper deployment requires SIP for equities and OPRA for options.
-Those are the defaults and the minimum entitlements for autonomous research
-and executable option evidence; a partial or non-executable feed cannot satisfy a
-research proof. The trader remains paper-only with live trading disabled and
-uses the `shares` runtime execution profile. Scheduled research follows the
-equity lane by default (`ALPACA_RESEARCH_VEHICLES=equity`); `option` or `all` is
-an explicit operator selection, with calibration and authorization evidence
-kept per vehicle. Option research is evidence generation only and does not
-authorize options live execution.
+The shipped paper deployment uses the free Basic IEX equity feed and does not
+acquire options (`universe.asset_classes=["us_equity"]`). `indicative` is the
+safe options-feed default and is non-executable. IEX is the exact feed required
+for the shipped equity research/authorization lane; a partial or mixed feed
+cannot satisfy a research proof. IEX is a limited venue view rather than the
+consolidated SIP tape, so coverage can be sparse and its evidence is not
+interchangeable with a paid-feed corpus. A feed change requires collecting the
+new corpus and re-deriving research/shadow proofs. The trader remains paper-only with live
+trading disabled and uses the `shares` runtime execution profile. Scheduled
+research follows the equity lane by default (`ALPACA_RESEARCH_VEHICLES=equity`);
+`option` or `all` is an explicit operator selection that requires changing the
+universe and configuring OPRA. Option research is evidence generation only and
+does not authorize options live execution.
 Selecting the separate `options` execution profile is an explicit paper
 runtime decision after OPRA evidence and controls are reviewed.
 
@@ -74,7 +78,7 @@ Every replay must establish the following invariants:
   freshness bound at the instant being priced; a signal whose contract has no such quote
   is recorded as an explicit unpriced row, never dropped and never filled from
   the contract's last quote of the morning;
-- authorizing equity fills require SIP quote provenance on both entry and exit
+- authorizing equity fills require IEX quote provenance on both entry and exit
   legs; authorizing option fills require OPRA quote provenance on both legs.
   Provider, feed, quote age, and fill source are retained for each leg, and any
   leg older than 30 seconds, bar-only, partial-feed, or missing remains diagnostic;
@@ -280,8 +284,8 @@ executable quote pricing is absent, but is marked quote-required and remains
 non-authorizing.
 
 The standalone `research.py factory run`/`factory-run` preflight requires
-explicit row provenance and SIP for the default equity lane. `--diagnostic-only`
-is an explicit non-authorizing mode for incomplete or non-SIP input and emits
+explicit row provenance and IEX for the default equity lane. `--diagnostic-only`
+is an explicit non-authorizing mode for incomplete or non-IEX input and emits
 no proofs.
 
 The first-signal planned vectors also produce deterministic entry and full

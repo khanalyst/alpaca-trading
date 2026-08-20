@@ -49,6 +49,12 @@ class StartupEdgePolicyMixin:
 
         research = cfg.get("research") if isinstance(cfg.get("research"), Mapping) else {}
         research_enabled = research.get("enabled") is True
+        validated_equity = any(
+            str(record.get("vehicle", "")).lower() in {"equity", "shares"}
+            for record in (getattr(self, "_edge_records", None) or ())
+            if isinstance(record, Mapping)) or str(
+                (getattr(self, "_edge_record", None) or {}).get(
+                    "vehicle", "")).lower() in {"equity", "shares"}
         strategy = cfg.get("strategy") if isinstance(cfg.get("strategy"), Mapping) else {}
         option_execution = str(strategy.get("execution_mode", "shares")).lower() \
             in {"option", "options"}
@@ -63,14 +69,15 @@ class StartupEdgePolicyMixin:
             research_enabled and
             str((getattr(self, "_edge_record", None) or {}).get("vehicle", "")).lower() in
             {"option", "options"})
-        return configured_data, configured_options, research_enabled, (
+        return configured_data, configured_options, (
+            research_enabled or validated_equity), (
             option_execution or option_research)
 
     def _authorize_feeds(self, *, data_feed: str, options_feed: str,
                          data_feed_missing: bool,
                          options_feed_missing: bool) -> None:
         """Enforce provider/config feed identity before trading can start."""
-        configured_data, configured_options, research_enabled, option_lane = \
+        configured_data, configured_options, equity_lane, option_lane = \
             self._feed_policy()
 
         # Explicit config is authoritative even for diagnostics.  This closes
@@ -91,17 +98,17 @@ class StartupEdgePolicyMixin:
                 "provider options feed does not match configured feed "
                 f"{configured_options!r} (provider={options_feed!r})")
 
-        # Research and validated-equity lanes must use the complete SIP view;
-        # option execution/research must use OPRA.  Missing provider metadata
-        # is not evidence of entitlement and therefore fails closed.
-        if research_enabled:
+        # Research and validated-equity lanes use the exact shipped IEX view;
+        # option execution/research remains bound to OPRA.  Missing provider
+        # metadata is not evidence of the configured identity.
+        if equity_lane:
             if data_feed_missing:
                 raise AlpacaError(
                     "provider equity feed metadata is unavailable; "
-                    "research requires the SIP feed entitlement")
-            if data_feed != "sip":
+                    "research requires the IEX feed")
+            if data_feed != "iex":
                 raise AlpacaError(
-                    "research/validated-equity runtime requires the SIP "
+                    "research/validated-equity runtime requires the IEX "
                     f"equity feed (provider={data_feed!r})")
         if option_lane:
             if options_feed_missing:

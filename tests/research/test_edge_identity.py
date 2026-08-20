@@ -30,7 +30,31 @@ class CandidateIdentityTests(unittest.TestCase):
             vehicle="equity", strategy_id="ibr", variant_id="ibr.baseline")
         self.assertEqual(content_hash(backtest), content_hash(shadow))
         self.assertEqual(backtest["strategy"]["variant_id"], "ibr.baseline")
-        self.assertEqual(backtest["broker"]["data_feed"], "sip")
+        self.assertEqual(backtest["broker"]["data_feed"], "iex")
+
+    def test_sip_candidate_assumptions_do_not_resolve_under_iex_runtime(self):
+        base = {
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                         "execution_mode": "shares"},
+            "research": {"enabled": False},
+        }
+        sip_runtime = validate_config({
+            **base, "broker": {"data_feed": "sip"},
+        })
+        iex_runtime = validate_config({
+            **base, "broker": {"data_feed": "iex"},
+        })
+        sip = candidate_assumptions(
+            sip_runtime, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        iex = candidate_assumptions(
+            iex_runtime, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        self.assertNotEqual(content_hash(sip), content_hash(iex))
+        record = {"status": "validated", "strategy_id": "ibr",
+                  "vehicle": "equity", "variant_id": "ibr.baseline",
+                  "config": sip, "config_hash": content_hash(sip)}
+        self.assertFalse(_runtime_identity_matches(record, iex_runtime))
 
     def test_factory_rule_identity_carries_explicit_model_and_is_lane_stable(self):
         model = CostModel(spread_bps=4, slippage_bps=6, fee_bps=.5,
@@ -53,8 +77,12 @@ class CandidateIdentityTests(unittest.TestCase):
         self.assertIn("execution", candidate)
 
     def test_explicit_vehicle_schedule_changes_candidate_identity(self):
-        flat = validate_config({})
-        scheduled = validate_config({"costs": {
+        option_runtime = {
+            "broker": {"options_feed": "opra"},
+            "universe": {"asset_classes": ["us_equity", "us_option"]},
+        }
+        flat = validate_config(option_runtime)
+        scheduled = validate_config({**option_runtime, "costs": {
             "vehicles": {"option": {"spread_bps": 9.0}},
         }})
         legacy = candidate_assumptions(

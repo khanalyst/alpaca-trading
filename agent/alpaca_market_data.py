@@ -102,6 +102,34 @@ def _validate_finite_values(*args, **kwargs):
     return _facade_helper("_validate_finite_values")(*args, **kwargs)
 
 
+def _row_feed(value: Any, requested_feed: str, *, options: bool = False) -> str:
+    """Resolve a provider row's feed without overwriting explicit metadata.
+
+    Alpaca historical models usually omit the feed because it is carried by
+    the request.  In that case the requested feed is a safe annotation.  If a
+    response row (or a nested quote) explicitly carries a feed, canonicalize
+    that value and let the caller enforce request/response identity.
+    """
+    response_feed = _value(value, "feed")
+    # A mapping response is commonly the symbol->rows payload itself.  A
+    # ticker named ``FEED`` therefore produces a list at ``value["feed"]``;
+    # that is not response metadata and must not be parsed as a feed name.
+    if isinstance(response_feed, (Mapping, list, tuple, set)):
+        response_feed = None
+    if response_feed is None or (isinstance(response_feed, str) and
+                                 not response_feed.strip()):
+        return requested_feed
+    return _canonical_feed(response_feed, options=options)
+
+
+def _assert_feed_match(actual: str, requested: str, *, kind: str) -> None:
+    """Fail closed when a provider response identifies another feed."""
+    if actual != requested:
+        raise AlpacaError(
+            f"{kind} response feed {actual!r} does not match requested "
+            f"feed {requested!r}")
+
+
 class AlpacaMarketDataMixin:
     def option_contracts(self, underlying_symbol: str | None = None, **kwargs) -> list[OptionContract]:
         if underlying_symbol is not None:
@@ -204,6 +232,8 @@ class AlpacaMarketDataMixin:
         try:
             response = self.session.stock_data.get_stock_bars(request)
             data = getattr(response, "data", response)
+            response_feed = _row_feed(response, requested_feed)
+            _assert_feed_match(response_feed, requested_feed, kind="stock bars")
             result: dict[str, list[Bar]] = {}
             for key, rows in (data or {}).items():
                 key_symbol = str(key).upper()
@@ -214,7 +244,9 @@ class AlpacaMarketDataMixin:
                     row_symbol = str(_value(row, "symbol", key_symbol) or key_symbol).upper()
                     if row_symbol not in requested_symbols:
                         continue
-                    normalized_rows.append(normalize_bar(row, row_symbol, requested_feed))
+                    row_feed = _row_feed(row, response_feed)
+                    _assert_feed_match(row_feed, requested_feed, kind="stock bar")
+                    normalized_rows.append(normalize_bar(row, row_symbol, row_feed))
                 result[key_symbol] = normalized_rows
             return result
         except AlpacaError:
@@ -242,6 +274,8 @@ class AlpacaMarketDataMixin:
         try:
             response = self.session.stock_data.get_stock_quotes(request)
             data = getattr(response, "data", response)
+            response_feed = _row_feed(response, requested_feed)
+            _assert_feed_match(response_feed, requested_feed, kind="stock quotes")
             result: dict[str, list[Quote]] = {}
             for key, rows in (data or {}).items():
                 key_symbol = str(key).upper()
@@ -252,7 +286,9 @@ class AlpacaMarketDataMixin:
                     row_symbol = str(_value(row, "symbol", key_symbol) or key_symbol).upper()
                     if row_symbol not in requested_symbols:
                         continue
-                    normalized_rows.append(normalize_quote(row, row_symbol, requested_feed))
+                    row_feed = _row_feed(row, response_feed)
+                    _assert_feed_match(row_feed, requested_feed, kind="stock quote")
+                    normalized_rows.append(normalize_quote(row, row_symbol, row_feed))
                 result[key_symbol] = normalized_rows
             return result
         except AlpacaError:
@@ -288,6 +324,8 @@ class AlpacaMarketDataMixin:
                        "end": end, "feed": requested_feed, **kwargs}
         try:
             response = self.session.option_data.get_option_chain(request)
+            response_feed = _row_feed(response, requested_feed, options=True)
+            _assert_feed_match(response_feed, requested_feed, kind="option chain")
             return response.data if hasattr(response, "data") else response
         except AlpacaError:
             raise
@@ -311,6 +349,8 @@ class AlpacaMarketDataMixin:
         result = []
         for row in rows or []:
             row = _mapping(row)
+            row_feed = _row_feed(row, requested_feed, options=True)
+            _assert_feed_match(row_feed, requested_feed, kind="option snapshot")
             contract_value = _value(row, "contract")
             symbol_value = _value(row, "symbol") or _value(contract_value, "symbol")
             symbol = str(symbol_value or "").strip().upper()
@@ -333,6 +373,8 @@ class AlpacaMarketDataMixin:
                     raise AlpacaError(f"option snapshot contract is invalid: {exc}") from exc
                 continue
             quote = _mapping(_value(row, "latest_quote", _value(row, "quote", row)))
+            quote_feed = _row_feed(quote, row_feed, options=True)
+            _assert_feed_match(quote_feed, requested_feed, kind="option snapshot quote")
             def dec(name):
                 try:
                     return _optional_decimal(_value(quote, name), f"option {name}")
@@ -353,7 +395,7 @@ class AlpacaMarketDataMixin:
                 timestamp=timestamp,
                 volume=dec("volume") if dec("volume") is not None else dec("day_volume"),
                 open_interest=dec("open_interest") if dec("open_interest") is not None else dec("oi"),
-                feed=requested_feed,
+                feed=quote_feed,
                 greeks=_validate_finite_values(_value(row, "greeks", {}) or {}, "option greeks"),
                 underlying_price=dec("underlying_price") if dec("underlying_price") is not None else dec("underlying_last")))
         return result
@@ -438,6 +480,8 @@ class AlpacaMarketDataMixin:
         candidates: list[dict[str, Any]] = []
         for raw_row in rows:
             row = _mapping(raw_row)
+            row_feed = _row_feed(row, requested_feed, options=True)
+            _assert_feed_match(row_feed, requested_feed, kind="option candidate")
             contract_value = _value(row, "contract")
             symbol_value = _value(row, "symbol") or _value(contract_value, "symbol")
             symbol = str(symbol_value or "").strip().upper()
@@ -467,6 +511,8 @@ class AlpacaMarketDataMixin:
             if contract.underlying_symbol and contract.underlying_symbol != underlying:
                 continue
             quote = _mapping(_value(row, "latest_quote", _value(row, "quote", row)))
+            quote_feed = _row_feed(quote, row_feed, options=True)
+            _assert_feed_match(quote_feed, requested_feed, kind="option candidate quote")
             daily_bar = _mapping(_value(row, "daily_bar", {}))
             timestamp_value = (_first(quote, "timestamp") if _first(quote, "timestamp") is not None
                                else _first(row, "timestamp"))
@@ -518,7 +564,7 @@ class AlpacaMarketDataMixin:
                 "quote_ts": timestamp, "timestamp": timestamp,
                 "quote_age_seconds": age, "quote_stale": age is None or age < 0,
                 "volume": volume, "open_interest": open_interest,
-                "feed": requested_feed, "side": "buy", "strategy": "single",
+                "feed": quote_feed, "side": "buy", "strategy": "single",
                 "position_intent": "buy_to_open",
             }
             if spot is not None and contract.strike_price is not None and spot > 0:

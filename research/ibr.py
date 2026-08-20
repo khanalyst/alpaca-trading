@@ -140,10 +140,12 @@ class IBRTrade:
     exit_bar_feed: str | None = None
     exit_bar_provider: str | None = None
     # The underlying anchor used to select/size the vehicle.  For options this
-    # is the snapshot/SIP spot, not the option premium in ``entry_reference``;
+    # is the snapshot or policy-bound equity spot, not the option premium in
+    # ``entry_reference``;
     # retaining it lets null/reference controls stay executable when the entry
     # bar's OHLC was observed after the decision boundary.
     underlying_entry: float | None = None
+    underlying_quote_feed: str | None = None
     # The signal's market timestamp remains ``signal_timestamp``.  A delayed
     # recorder event may only become actionable later; retain that causal
     # decision boundary separately so runtime/shadow comparisons do not
@@ -302,7 +304,8 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      exit_provider: str | None = None,
                      planned_risk_per_unit: float | None = None,
                      decision_timestamp: datetime | None = None,
-                     underlying_entry: float | None = None) -> IBRTrade:
+                     underlying_entry: float | None = None,
+                     underlying_quote_feed: str | None = None) -> IBRTrade:
     # Listed options are always bought to open in the runtime, including puts
     # used for a short-underlying thesis.  Their P&L is therefore long-option
     # P&L even when the underlying direction is short.
@@ -367,6 +370,7 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         decision_timestamp=decision_timestamp,
         underlying_entry=(float(underlying_entry)
                           if underlying_entry is not None else None),
+        underlying_quote_feed=underlying_quote_feed,
         evidence_mode=(
             "diagnostic_historical_backfill"
             if any(
@@ -536,6 +540,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     exit_feed: str | None = None
     entry_provider: str | None = None
     exit_provider: str | None = None
+    underlying_quote_feed: str | None = None
     if vehicle == "equity":
         # The fill instant is the entry bar's open.  A quote recorded at that
         # instant is the real executable price; the bar open is a trade print
@@ -585,9 +590,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             if item.underlying_price), underlying_entry)
         if spot is None or spot <= 0:
             # A delayed signal cannot use the stale next-bar OHLC as an
-            # underlying spot proxy.  Use an independently observed fresh SIP
-            # quote at the causal entry boundary when the option snapshot did
-            # not carry spot itself.
+            # underlying spot proxy. Use an independently observed fresh
+            # policy-bound equity quote at the causal entry boundary when the
+            # option snapshot did not carry spot itself.
             spot_quote = quote_fill_record(
                 quotes, symbol=symbol, at=entry_at,
                 side="buy" if direction == "long" else "sell",
@@ -595,6 +600,16 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                 session_date=day)
             if spot_quote is None:
                 return refuse("entry_bar_not_visible")
+            underlying_quote_feed = str(
+                spot_quote.feed or "").strip().lower().replace("-", "_")
+            if underlying_quote_feed == "delayed":
+                underlying_quote_feed = "delayed_sip"
+            if (cfg.policy.strict_market_data and
+                    underlying_quote_feed != cfg.policy.equity_feed):
+                return refuse(
+                    "underlying_quote_feed_mismatch",
+                    {"expected": cfg.policy.equity_feed,
+                     "observed": underlying_quote_feed})
             underlying_entry = spot = spot_quote.price
         snap = min(eligible, key=lambda item: (
             abs(float(item.contract.strike) - float(spot)),
@@ -733,7 +748,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     entry_feed=entry_feed, exit_feed=exit_feed,
                                     entry_provider=entry_provider,
                                     exit_provider=exit_provider,
-                                    planned_risk_per_unit=distance)
+                                    planned_risk_per_unit=distance,
+                                    underlying_quote_feed=underlying_quote_feed)
         if hit_stop or hit_target:
             # Stop wins if both are touched by one candle.
             reason = "stop" if hit_stop else "target"
@@ -763,7 +779,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     entry_feed=entry_feed, exit_feed=exit_feed,
                                     entry_provider=entry_provider,
                                     exit_provider=exit_provider,
-                                    planned_risk_per_unit=distance)
+                                    planned_risk_per_unit=distance,
+                                    underlying_quote_feed=underlying_quote_feed)
     # Force-flat at the last completed bar before the configured close.
     boundary = next((b for b in hold if _local(b.timestamp, zone) >= close_at
                      and _open_visible(b, b.timestamp, cfg.policy)), None)
@@ -804,7 +821,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                             entry_feed=entry_feed, exit_feed=exit_feed,
                             entry_provider=entry_provider,
                             exit_provider=exit_provider,
-                            planned_risk_per_unit=distance)
+                            planned_risk_per_unit=distance,
+                            underlying_quote_feed=underlying_quote_feed)
 
 
 def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,

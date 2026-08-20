@@ -1,13 +1,16 @@
 # Deployment topology
 
 Installation is in [`../SETUP.md`](../SETUP.md); operation, backup, and
-recovery are in [`../OPERATIONS.md`](../OPERATIONS.md). This file records
+recovery are in [`../OPERATIONS.md`](../OPERATIONS.md). For an existing VM
+migrating from a legacy SIP corpus, follow the short [VM feed migration
+handoff](../VM_MIGRATION.md) before starting services. This file records
 process ownership and the two supported paper launch lanes. The runtime scope
 is US-listed equities/ETFs and listed OCC options only; crypto is rejected.
 Every shipped deployment is paper-only (`ALPACA_PAPER=true`, live disabled),
-uses SIP for equities and OPRA for options, and keeps the trader's runtime
-execution profile at `shares`. Options research is enabled as an evidence lane;
-it does not enable options order execution.
+uses the free Basic IEX feed for its equity-only universe, and keeps the
+trader's runtime execution profile at `shares`. Options acquisition/research
+is disabled by default; `indicative` is a non-executable placeholder. An
+explicit option lane requires OPRA and separate review.
 
 ## Docker Compose (recommended)
 
@@ -62,13 +65,17 @@ docker compose run --rm --no-deps recorder \
   python deploy/recorder.py --out runtime/research/recorded --audit
 ```
 
-The probe makes real recent SIP bar/quote requests (and OPRA requests when the
-configured universe records options) without appending corpus rows. A configured
-feed name is not an entitlement check. Deployment now stops before service
-replacement when the probe reports `sip_entitlement_required` or
-`opra_entitlement_required`. The recorder also persists its latest attempt in
+The probe makes real recent IEX bar/quote requests (and OPRA requests only when
+the configured universe explicitly records options) without appending corpus
+rows. A configured feed name is not an entitlement check. Deployment now stops
+before service replacement when the probe reports the generic configured-feed
+entitlement failure (`iex_entitlement_required` or
+`opra_entitlement_required`). The recorder also persists its latest attempt in
 `.recorder-status.json`, so health and the dashboard distinguish a permanent
-subscription failure from an empty or temporarily stale corpus.
+subscription failure from an empty or temporarily stale corpus. IEX is a
+limited venue view rather than consolidated SIP; sparse coverage is expected
+and is never repaired by relabeling another feed. New IEX evidence needs a
+fresh research/shadow proof epoch.
 
 Catch-up requests are split into `ALPACA_RECORDER_FETCH_WINDOW_MINUTES`
 windows (15 minutes by default), so a long outage cannot materialize the whole
@@ -180,9 +187,9 @@ The scheduled research cycle invokes `edge ingest-shadow` by default when
 mounts the same `shadow-data` volume read-only at `/app/shadow` and is the only
 process that writes the live-ingestion authorization marker to EdgeLedger.
 
-The default Compose lane passes the Alpaca paper endpoint and SIP/OPRA feed
-settings explicitly through `ALPACA_PAPER`, `ALPACA_DATA_FEED`, and
-`ALPACA_OPTIONS_FEED`; a partial-feed override is not a supported
+The default Compose lane passes the Alpaca paper endpoint and IEX/indicative
+feed settings explicitly through `ALPACA_PAPER`, `ALPACA_DATA_FEED`, and
+`ALPACA_OPTIONS_FEED`; a partial or mixed-feed override is not a supported
 autonomous-research deployment. Credentials are mounted from
 `ALPACA_AGENT_SECRET_FILE`, never copied into the image. The research service
 also requires `ALPACA_RESEARCH_LLM_SECRET_FILE` to name a separate readable
@@ -214,10 +221,11 @@ carries the parity-matched live-ingestion marker.
 Authorizing fill quality retains provider/feed/source and quote age for both
 legs: required records become actionable at the maximum of event timestamp,
 `as_of`, and `observed_at`. A delayed recorder bar may signal when observed;
-execution enters at that decision/observation time using fresh SIP (equity) or
+execution enters at that decision/observation time using fresh IEX (equity) or
 OPRA (option) evidence. Delayed full OHLC never backfills an earlier entry, and
-partial pre-entry bar ranges are excluded. SIP is required for equity entry and
-exit, OPRA for option entry and exit, each no older than 30 seconds.
+partial pre-entry bar ranges are excluded. IEX is required for shipped equity
+entry and exit, while OPRA is required for an option lane, each no older than
+30 seconds.
 The shipped `execution.strict_market_data` default is `true`; historical bar
 fallback is an explicit diagnostic lane only.
 Bar-only, partial-feed, missing, or stale legs remain diagnostic and cannot
@@ -352,9 +360,10 @@ outside Git and set `ALPACA_AGENT_SECRETS_FILE` only for the processes that
 need it. Copy `agent.env.example`, `research.env.example`, and
 `research-llm.env.example` to `/etc/alpaca-agent-trading/`, fill the Alpaca
 paper key/secret and the separate provider key, then set mode `0400` and owner
-`alpaca`. The research unit defaults to the equity lane, SIP, OPRA, and the
-provider path above. Set `ALPACA_RESEARCH_VEHICLES=all` explicitly when both
-research vehicles are needed; their calibration remains independent. The unit
+`alpaca`. The research unit defaults to the equity lane, IEX, and the
+non-executable indicative options placeholder. Set
+`ALPACA_RESEARCH_VEHICLES=all` explicitly when both research vehicles are
+needed after configuring OPRA; their calibration remains independent. The unit
 fails closed if the provider file is not readable. Enable the full paper lane
 with:
 

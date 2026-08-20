@@ -24,7 +24,7 @@ fi
 if command -v systemctl >/dev/null 2>&1 && \
    systemctl is-active --quiet alpaca-trader.service; then
   echo "alpaca-trader.service is active; refusing to start a second trader." >&2
-  echo "Complete the one-time migration in SETUP.md first." >&2
+  echo "Complete the one-time VM feed handoff in VM_MIGRATION.md first." >&2
   exit 3
 fi
 

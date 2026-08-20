@@ -56,7 +56,7 @@ def _feed(config: dict | None = None) -> str:
     if not isinstance(data, dict):
         data = {}
     value = (os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED")
-             or broker.get("data_feed") or data.get("feed") or "sip")
+             or broker.get("data_feed") or data.get("feed") or "iex")
     return _canonical_feed(value)
 
 
@@ -132,6 +132,29 @@ def _number(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if number == number and abs(number) != float("inf") else None
+
+
+def _row_feed(value, requested_feed: str) -> str:
+    """Use a row's explicit feed metadata, or annotate missing metadata.
+
+    Recorder events must not claim the requested feed when a provider object
+    explicitly identifies another one.  Such a response is rejected rather
+    than mixed into the corpus under a false feed label.
+    """
+    response_feed = getattr(value, "feed", None)
+    if isinstance(value, dict):
+        response_feed = value.get("feed")
+    if response_feed is None or (isinstance(response_feed, str) and
+                                 not response_feed.strip()):
+        return requested_feed
+    return _canonical_feed(response_feed)
+
+
+def _assert_row_feed(actual: str, requested: str, *, kind: str) -> None:
+    if actual != requested:
+        raise RuntimeError(
+            f"{kind} response feed {actual!r} does not match requested "
+            f"feed {requested!r}")
 
 
 def _iso(value) -> str:
@@ -372,6 +395,8 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     for raw_symbol, values in bars.items():
         symbol = validate_equity_symbol(raw_symbol)
         for bar in values:
+            bar_feed = _row_feed(bar, feed)
+            _assert_row_feed(bar_feed, feed, kind="bar")
             timestamp = _iso(getattr(bar, "timestamp", None))
             if not _point_in_time(timestamp):
                 raise RuntimeError(f"bar {symbol!r} has no point-in-time timestamp")
@@ -386,7 +411,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             yield {
                 "event_key": _event_key("bar_1m", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca",
-                "feed": feed,
+                "feed": bar_feed,
                 "event_type": "bar_1m", "symbol": symbol, "contract": "",
                 "timestamp": timestamp, "as_of": bar_complete.isoformat(),
                 "open": _value(bar.open),
@@ -397,6 +422,8 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     for raw_symbol, values in quotes.items():
         symbol = validate_equity_symbol(raw_symbol)
         for quote in values:
+            quote_feed = _row_feed(quote, feed)
+            _assert_row_feed(quote_feed, feed, kind="quote")
             timestamp = _iso(getattr(quote, "timestamp", None))
             if not _point_in_time(timestamp):
                 continue
@@ -405,7 +432,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             yield {
                 "event_key": _event_key("quote", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca",
-                "feed": feed,
+                "feed": quote_feed,
                 "event_type": "quote", "symbol": symbol, "contract": "",
                 "timestamp": timestamp, "as_of": timestamp, "open": "", "high": "",
                 "low": "", "close": "", "volume": "", "bid": _value(quote.bid),

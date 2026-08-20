@@ -128,7 +128,7 @@ class AlpacaRuntimeTests(unittest.TestCase):
                         "timestamp": "2026-08-09T12:00:00+00:00"}}}
 
         provider = AlpacaProvider(
-            {"mode": "paper"},
+            {"mode": "paper", "broker": {"options_feed": "opra"}},
             session=AlpacaSession(paper=True, trading_client=object(),
                                   option_data_client=ChainOptionData()))
         with (patch.object(provider_module, "parse_occ_symbol",
@@ -144,6 +144,93 @@ class AlpacaRuntimeTests(unittest.TestCase):
         self.assertTrue(parse_occ.called)
         self.assertTrue(equity.called)
         self.assertTrue(option.called)
+
+    def test_feed_fallback_and_response_metadata_are_integrity_preserving(self):
+        from agent.alpaca_sdk import _canonical_feed, normalize_bar, normalize_quote
+
+        self.assertEqual(_canonical_feed(None), "iex")
+        self.assertEqual(_canonical_feed(""), "iex")
+        bar = normalize_bar({
+            "symbol": "SPY", "timestamp": "2026-08-07T14:00:00+00:00",
+            "open": 1, "high": 2, "low": 1, "close": 1.5,
+            "feed": "sip"}, feed="iex")
+        quote = normalize_quote({
+            "symbol": "SPY", "timestamp": "2026-08-07T14:00:00+00:00",
+            "bid_price": 1, "ask_price": 2, "feed": "sip"}, feed="iex")
+        self.assertEqual(bar.feed, "sip")
+        self.assertEqual(quote.feed, "sip")
+        self.assertEqual(normalize_quote({
+            "symbol": "SPY", "timestamp": "2026-08-07T14:00:00+00:00",
+            "bid_price": 1, "ask_price": 2}, feed="iex").feed, "iex")
+
+    def test_option_response_feed_mismatch_is_rejected_for_snapshots_and_candidates(self):
+        chain = {
+            "SPY260821C00600000": {
+                "symbol": "SPY260821C00600000",
+                "latest_quote": {
+                    "bid_price": 1, "ask_price": 2,
+                    "timestamp": "2026-08-09T12:00:00+00:00",
+                    "feed": "indicative",
+                },
+            }
+        }
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(paper=True, trading_client=object()))
+        provider.option_chain = lambda *args, **kwargs: chain
+        with self.assertRaisesRegex(AlpacaError, "response feed"):
+            provider.option_snapshots("SPY", feed="opra")
+        with self.assertRaisesRegex(AlpacaError, "response feed"):
+            provider.option_candidates(
+                "SPY", feed="opra",
+                now=datetime(2026, 8, 9, 13, tzinfo=NEW_YORK),
+                underlying_price=Decimal("600"))
+
+    def test_equity_response_feed_mismatch_is_rejected_for_bars_and_quotes(self):
+        class Request:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class StockBarsRequest(Request):
+            pass
+
+        class StockQuotesRequest(Request):
+            pass
+
+        class DataFeed:
+            IEX = "IEX"
+
+        modules = {
+            name: types.ModuleType(name) for name in (
+                "alpaca", "alpaca.data", "alpaca.data.requests",
+                "alpaca.data.timeframe", "alpaca.data.enums")}
+        modules["alpaca.data.requests"].StockBarsRequest = StockBarsRequest
+        modules["alpaca.data.requests"].StockQuotesRequest = StockQuotesRequest
+        modules["alpaca.data.timeframe"].TimeFrame = types.SimpleNamespace(
+            Minute="MINUTE", Day="DAY")
+        modules["alpaca.data.enums"].DataFeed = DataFeed
+
+        class StockData:
+            def get_stock_bars(self, request):
+                return {"SPY": [{
+                    "timestamp": "2026-08-07T14:00:00+00:00",
+                    "open": 1, "high": 2, "low": 1, "close": 1.5,
+                    "feed": "sip"}]}
+
+            def get_stock_quotes(self, request):
+                return {"SPY": [{
+                    "timestamp": "2026-08-07T14:00:00+00:00",
+                    "bid_price": 1, "ask_price": 2,
+                    "feed": "sip"}]}
+
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(paper=True, stock_data_client=StockData()))
+        with patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(AlpacaError, "response feed"):
+                provider.bars(["SPY"], "1m", feed="iex")
+            with self.assertRaisesRegex(AlpacaError, "response feed"):
+                provider.quotes(["SPY"], feed="iex")
 
     def test_a_trading_client_without_option_contracts_is_a_capability_gap(self):
         # option_candidates tolerates exactly one error text when it falls back
@@ -430,11 +517,35 @@ class AlpacaRuntimeTests(unittest.TestCase):
         config = validate_config({})
         self.assertEqual(config["mode"], "paper")
         self.assertTrue(config["broker"]["paper"])
+        self.assertEqual(config["broker"]["data_feed"], "iex")
+        self.assertEqual(config["broker"]["options_feed"], "indicative")
+        self.assertEqual(config["universe"]["asset_classes"], ["us_equity"])
         self.assertFalse(config["llm"]["enabled"])
         with self.assertRaises(ConfigError):
             validate_config({"mode": "live", "broker": {"paper": False}})
         with self.assertRaisesRegex(ConfigError, "model is required"):
             validate_config({"llm": {"enabled": True}})
+
+    def test_research_equity_feed_is_exact_iex_and_option_lane_stays_opra(self):
+        for feed in ("sip", "delayed_sip"):
+            with self.subTest(feed=feed), self.assertRaisesRegex(
+                    ConfigError, "requires the IEX equity feed"):
+                validate_config({"broker": {"data_feed": feed}})
+        diagnostic = validate_config({
+            "research": {"enabled": False},
+            "broker": {"data_feed": "sip"},
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline"},
+        })
+        self.assertEqual(diagnostic["broker"]["data_feed"], "sip")
+        with self.assertRaisesRegex(ConfigError, "OPRA"):
+            validate_config({
+                "universe": {"asset_classes": ["us_equity", "us_option"]},
+            })
+        option = validate_config({
+            "broker": {"options_feed": "opra"},
+            "universe": {"asset_classes": ["us_equity", "us_option"]},
+        })
+        self.assertEqual(option["broker"]["options_feed"], "opra")
 
     def test_live_config_requires_all_three_guards_and_specific_variant(self):
         base = {"mode": "live", "broker": {"paper": False, "allow_live": True},

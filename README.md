@@ -158,13 +158,13 @@ gross/open risk, and daily loss) are all enforced rather than relaxed for
 simulation. Point-in-time required records become actionable at the maximum of
 their event timestamp, `as_of`, and `observed_at`. A delayed recorder bar can
 signal when it is observed; execution enters at that decision/observation time
-using fresh SIP (equity) or OPRA (option) evidence. Delayed full OHLC never
+using fresh IEX (equity) or OPRA (option) evidence. Delayed full OHLC never
 backfills an earlier entry, and partial pre-entry bar ranges are excluded.
 Fit diagnostics may still count planned signal/exit geometry as
 quote-required, non-authorizing measurement. Historical bar fallback remains
 diagnostic and cannot authorize proof.
 Authorizing fills retain provider/feed/age/source for both legs:
-SIP for equity entry and exit, OPRA for option entry and exit, each no older
+IEX for equity entry and exit, OPRA for option entry and exit, each no older
 than 30 seconds. Bar-only, partial-feed, or stale legs cannot authorize proof.
 
 ### Where the LLM is used
@@ -397,7 +397,7 @@ python research.py factory report           # the full discovery narrative
 
 The standalone `research.py factory run` (or `factory-run`) preflight requires
 readable normalized JSONL with explicit provenance; the default equity lane
-requires SIP. `--diagnostic-only` is the explicit non-authorizing escape hatch:
+requires IEX. `--diagnostic-only` is the explicit non-authorizing escape hatch:
 it records the source as diagnostic and emits no proofs.
 
 Three read-only views answer three different questions, and none can change a
@@ -433,7 +433,11 @@ chmod 600 .env
 ```
 
 Set `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER=true`, and the
-SIP/OPRA entitlements in the broker secret. The scheduled research lane also
+free Basic IEX equity feed in the broker secret. The shipped universe is
+equity-only and options acquisition is disabled; configure OPRA only for an
+explicit option-lane review. IEX is a limited venue view rather than the
+consolidated SIP tape; sparse coverage is retained as evidence, and changing
+feeds requires a fresh research/shadow proof. The scheduled research lane also
 requires a separate readable dotenv file with `OPENAI_API_KEY` for the checked
 `openai`/`gpt-5` provider (or the matching configured provider key); set
 `ALPACA_RESEARCH_LLM_SECRET_FILE` to that path. Do not put provider keys in the

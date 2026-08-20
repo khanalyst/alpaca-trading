@@ -160,7 +160,9 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertFalse(diagnostic["authorizing"])
         self.assertTrue(diagnostic["diagnostic_only"])
         provenance = diagnostic["provenance"]
-        self.assertEqual(set(provenance["feeds"]), {"sip"})
+        self.assertEqual(
+            set(provenance["feeds"]) | set(provenance["fills"]["feeds"]),
+            {"iex", "sip"})
         self.assertEqual(set(provenance["providers"]), {"test"})
         self.assertGreater(provenance["observations"], 0)
         pricing = diagnostic["entry_pricing"]

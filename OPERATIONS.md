@@ -180,6 +180,11 @@ Do not delete or edit the SQLite journal to make a reconciliation pass.
 
 ## Backups and recovery
 
+For an existing VM moving from a legacy SIP corpus to the shipped Free Basic
+IEX profile, use the concise [VM feed migration handoff](VM_MIGRATION.md).
+It archives the active corpus and proof volumes, preserves broker
+reconciliation state, and requires a fresh IEX research/shadow proof.
+
 Back up the named volumes or these directories to a different device/off-host
 destination:
 
@@ -402,9 +407,11 @@ monitor any open exposure.
 ## Research and evidence
 
 Research is read-only with respect to broker authority. The shipped paper
-deployment requires SIP equity and OPRA option entitlements and keeps
-`ALPACA_LIVE_ENABLE=false`; these feeds are required for autonomous research
-and executable option evidence. The enabled research strategy LLM is a bounded
+deployment uses the free Basic IEX equity feed, keeps an equity-only universe,
+and keeps `ALPACA_LIVE_ENABLE=false`; no option entitlement is needed by
+default. `indicative` is a non-executable options-feed placeholder. An explicit
+option lane must add option symbols/classes, set `ALPACA_RESEARCH_VEHICLES`, and
+pass the OPRA preflight. The enabled research strategy LLM is a bounded
 proposal lane, not a runtime decision LLM: its separate readable provider
 secret is required, and the cycle fails closed before discovery when that
 secret is absent, unreadable, or missing the selected provider key.
@@ -486,13 +493,13 @@ DTE/spread/liquidity checks, latest-entry and force-flat cutoffs, and portfolio
 position/notional/gross/open-risk/daily-loss limits.
 Required records become actionable at the maximum of event timestamp, `as_of`,
 and `observed_at`. Delayed recorder bars may signal when observed; execution
-enters at that decision/observation time using fresh SIP/OPRA evidence. Delayed
+enters at that decision/observation time using fresh IEX/OPRA evidence. Delayed
 full OHLC never backfills an earlier entry, partial pre-entry ranges are
 excluded, and historical bar-fallback rows are diagnostic only and excluded
 from authorizing statistics. Fit diagnostics may count planned signal/exit
 geometry as quote-required, non-authorizing measurement.
 Authorizing fill quality requires both legs to retain provider/feed/source and
-quote age: SIP for equity entry and exit, OPRA for option entry and exit, each
+quote age: IEX for equity entry and exit, OPRA for option entry and exit, each
 no older than 30 seconds. Bar-only, partial-feed, missing, or stale legs remain
 diagnostic and cannot authorize a proof. Serial inference uses deterministic
 seeded moving-block day/session-cluster bootstrap; its draw count, seed, and
@@ -674,7 +681,7 @@ organization controls.
 | --- | --- |
 | mode/endpoint guard failure | Restore the scoped paper or live guard, check the endpoint, and restart only after authenticated `main.py check`; live also needs `pattern_day_trader=true`. |
 | `market closed` or stale calendar | Do not force an entry; refresh the calendar and wait for the next regular session. |
-| Missing bars/quotes | Run the recorder `--probe`, inspect `failure_kind`/`last_error`, and verify the exact VM credentials have recent SIP (and, when enabled, OPRA) entitlement. `Up` is process liveness, not proof of successful writes; mark the interval unavailable. |
+| Missing bars/quotes | Run the recorder `--probe`, inspect `failure_kind`/`last_error`, and verify the exact VM credentials can read the configured IEX feed (and, only when enabled, OPRA). `Up` is process liveness, not proof of successful writes; mark the interval unavailable. |
 | Option chain lacks a valid single-leg long contract | Skip the trade. Never substitute a multi-leg, uncovered, or short option. |
 | Position remains after close cutoff or startup cleanup | Stop new entries, cancel orders, flatten manually through the scoped Alpaca account, and keep the trader paused. |
 | Local/broker state differs | Broker state wins; preserve logs and reconcile before resuming. |
