@@ -149,8 +149,9 @@ class IBRTrade:
     # decision boundary separately so runtime/shadow comparisons do not
     # silently pretend the signal was known at bar close.
     decision_timestamp: datetime | None = None
-    # Set only when an explicit diagnostic policy consumed historical
-    # backfill at provider-as-of time.  Authorization rejects this marker.
+    # Derived from source provenance whenever any consumed market record was
+    # labelled historical backfill. Authorization rejects this marker; replay
+    # visibility remains controlled independently by the policy.
     evidence_mode: str = "forward_observed"
 
 
@@ -368,7 +369,7 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                           if underlying_entry is not None else None),
         evidence_mode=(
             "diagnostic_historical_backfill"
-            if cfg.policy.allow_historical_backfill_diagnostics and any(
+            if any(
                 historical_backfill_record(item)
                 for item in (signal, entry_bar, exit_bar))
             else "forward_observed"

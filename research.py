@@ -681,10 +681,18 @@ def cmd_edge_ingest_shadow(args: argparse.Namespace) -> int:
     return 0
 
 
-# A run that priced nothing is not a research verdict.  It exits distinctly so
-# the scheduled cycle reports ``no_data`` with the cause instead of
-# ``completed_no_edge``, which would be indistinguishable from real negatives.
+# Factory command exit codes are part of the scheduler boundary.  A run that
+# priced nothing is not a research verdict, while a bounded search or an
+# exhausted LLM provider has a useful, durable diagnosis that must not be
+# collapsed into an ordinary no-proof result.  Keep proof/no-proof compatible
+# with the historical contract (0/2).
 UNEVALUABLE_EXIT = 4
+FACTORY_BOUNDED_SPACE_EXHAUSTED_EXIT = 5
+FACTORY_LLM_ALL_CALLS_FAILED_EXIT = 6
+# Descriptive aliases for deployment callers that name the terminal outcome
+# rather than the factory's result-status spelling.
+FACTORY_SEARCH_EXHAUSTED_EXIT = FACTORY_BOUNDED_SPACE_EXHAUSTED_EXIT
+FACTORY_LLM_PROVIDER_FAILURE_EXIT = FACTORY_LLM_ALL_CALLS_FAILED_EXIT
 
 
 def _report_unevaluable(result: Mapping, gates: Sequence[Mapping]) -> bool:
@@ -788,6 +796,7 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         workers=args.workers, starting_cash=args.starting_cash,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha, max_generations=args.max_generations,
+        max_confirmatory_attempts=getattr(args, "max_confirmatory_attempts", 3),
         costs=CostModel.from_config(runtime_config),
         runtime_config=runtime_config,
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"),
@@ -827,9 +836,23 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         result, [item.get("gate") for item in result.get("results", [])
                  if isinstance(item, Mapping)])
     print(json.dumps(result, sort_keys=True, default=str))
+    if proofs:
+        # A proof is the authorizing result.  It takes precedence over a
+        # diagnostic status that may describe another slot in the same run.
+        return 0
     if stalled:
         return UNEVALUABLE_EXIT
-    return 0 if proofs else 2
+    if diagnostic_only:
+        # The explicit diagnostic escape hatch is never an authorizing
+        # factory verdict, including when its underlying runner reports a
+        # terminal search/provider status.
+        return 2
+    result_status = str(result.get("status") or "").strip().lower()
+    if result_status == "bounded_space_exhausted":
+        return FACTORY_BOUNDED_SPACE_EXHAUSTED_EXIT
+    if result_status == "llm_all_calls_failed":
+        return FACTORY_LLM_ALL_CALLS_FAILED_EXIT
+    return 2
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
@@ -911,6 +934,8 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
                                   f"{PROTOCOL_BACKTEST_MIN_SESSIONS})"))
         parser.add_argument("--alpha", type=float, default=.05)
         parser.add_argument("--max-generations", type=int, default=5)
+        parser.add_argument("--max-confirmatory-attempts", type=int, default=3,
+                            help="durable confirmatory attempts per exact variant")
         parser.add_argument("--config", default=None,
                             help="optional base runtime config JSON")
         parser.set_defaults(func=cmd_factory_run)

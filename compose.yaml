@@ -267,6 +267,10 @@ services:
       - /app/shadow/health.json
       - --interval
       - ${ALPACA_SHADOW_INTERVAL_SECONDS:-60}
+      - --retention-days
+      - ${ALPACA_SHADOW_RETENTION_DAYS:-180}
+    environment:
+      ALPACA_SHADOW_RETENTION_DAYS: ${ALPACA_SHADOW_RETENTION_DAYS:-180}
     volumes:
       - runtime-data:/app/runtime:ro
       - shadow-data:/app/shadow

@@ -345,16 +345,21 @@ def persist_rule_gate(ledger, candidate_id, lane):
     ledger.record_verified_gate(run["run_id"], gate)
     if lane == "shadow":
         source = ledger.run(run["run_id"])["metrics"]["shadow_source"]
+        candidate_record = ledger.candidate(candidate_id)
+        candidate_proof = {
+            key: candidate_record[key]
+            for key in ("candidate_id", "dataset_hash", "config_hash",
+                        "code_hash", "provenance_hash")
+        }
         ledger.record_shadow_ingestion(
             candidate_id,
             {"schema": "shadow-ingest.v1", "candidate_id": candidate_id,
              "vehicle": "equity", "source": source,
              "replay_digests": [item["replay_digest"] for item in source["sessions"]],
-             "run_provenance": {**hashes, "candidate_id": candidate_id},
-             "candidate_proof": {key: ledger.candidate(candidate_id).get(key)
-                                 for key in ("candidate_id", "dataset_hash",
-                                             "config_hash", "code_hash",
-                                             "provenance_hash")},
+             "run_provenance": {**hashes, "candidate_id": candidate_id,
+                                 "vehicle": "equity",
+                                 "candidate_proof": candidate_proof},
+             "candidate_proof": candidate_proof,
              "gate_hash": gate["content_hash"]}, run_id=run["run_id"])
 
 
@@ -831,6 +836,12 @@ class StrategyFactoryTests(unittest.TestCase):
                 strategy_llm={"enabled": True, "provider": "openai",
                               "model": "test-model"},
                 proposal_adapter=Adapter())
+            self.assertEqual(result["status"], "llm_all_calls_failed")
+            self.assertTrue(result["llm_call_evidence"]["all_calls_failed"])
+            self.assertGreater(result["llm_call_evidence"]["failed"], 0)
+            # Provider failure degrades to the bounded deterministic ladder;
+            # it does not erase the isolated accounts that were evaluated.
+            self.assertGreater(result["variants"], 0)
             self.assertFalse(result["replacements"])
             self.assertEqual(result["pending"][0]["reason"],
                              "llm_proposal_failed")

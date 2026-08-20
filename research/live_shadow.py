@@ -54,8 +54,13 @@ DEFAULT_EQUITY = 100_000.0
 DEFAULT_MAX_CANDIDATES = 32
 DEFAULT_MAX_EVENTS = 20_000
 DEFAULT_MAX_DECISIONS = 100_000
-DEFAULT_RETENTION_DAYS = 14
+# Shadow replay metadata must survive the longest supported confirmatory tail
+# (and enough time for an operator to diagnose/replay a delayed session).
+# Keep this as the single source of truth for the library and operations CLI.
+DEFAULT_RETENTION_DAYS = 180
 MAX_PENDING_CORPUS_BYTES = 64 * 1024 * 1024
+MAX_QUARANTINE_EVENTS = 1024
+QUARANTINE_OVERFLOW_KEY = "__quarantine_overflow__"
 
 
 class ShadowError(RuntimeError):
@@ -223,6 +228,96 @@ def _iso_time(value: Any) -> str | None:
 def _number_or_none(value: Any) -> float | None:
     number = _finite(value)
     return None if number is None else round(number, 10)
+
+
+def _opportunity_capacity(rows: Sequence[Mapping[str, Any]], *,
+                          vehicle: str | None = None,
+                          min_trades: int | None = None,
+                          min_sessions: int | None = None) -> dict[str, Any]:
+    """Summarize the complete symbol/session opportunity denominator.
+
+    Replay/account rows deliberately materialize ``no_trade`` opportunities.
+    This diagnostic must therefore operate on the raw rows, before the gate's
+    authorizing projection removes refusals.  One symbol/session is one
+    opportunity even if a malformed retry supplied duplicate rows; an
+    executed row wins over a duplicate refusal for the observed count.
+    """
+    selected: dict[str, dict[str, Any]] = {}
+    refusal_reasons: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if vehicle is not None and str(row.get("vehicle") or vehicle) != str(vehicle):
+            continue
+        symbol = str(row.get("symbol") or "").upper()
+        session = str(row.get("session_date") or "")
+        opportunity = str(row.get("opportunity_id") or "")
+        # Capacity is explicitly symbol×session.  Prefer that stable pair so
+        # a malformed/reused opportunity id cannot collapse two sessions.
+        key = (f"{symbol}:{session}" if symbol and session else opportunity)
+        if not key:
+            # Keep malformed rows visible in the refusal denominator without
+            # allowing an unbounded arbitrary payload to become a key.
+            key = f"__row_{len(selected)}"
+        executed = row.get("no_trade") is not True
+        item = selected.get(key)
+        if item is None or (executed and not item["executed"]):
+            selected[key] = {"executed": executed, "session": session}
+        if not executed:
+            reason = str(row.get("reject_reason") or "unspecified")[:120]
+            refusal_reasons[reason] = refusal_reasons.get(reason, 0) + 1
+    opportunity_count = len(selected)
+    observed_trades = sum(1 for item in selected.values() if item["executed"])
+    observed_sessions = len({item["session"] for item in selected.values()
+                             if item["executed"] and item["session"]})
+    opportunity_sessions = len({item["session"] for item in selected.values()
+                                if item["session"]})
+    floor_trades = (None if min_trades is None else max(0, int(min_trades)))
+    floor_sessions = (None if min_sessions is None else max(0, int(min_sessions)))
+    required_rate = (None if floor_trades is None or opportunity_count <= 0
+                     else floor_trades / opportunity_count)
+    observed_rate = (observed_trades / opportunity_count
+                     if opportunity_count else 0.0)
+    capacity_feasible = bool(
+        (floor_trades is None or opportunity_count >= floor_trades) and
+        (floor_sessions is None or opportunity_sessions >= floor_sessions))
+    observed_feasible = bool(
+        (floor_trades is None or observed_trades >= floor_trades) and
+        (floor_sessions is None or observed_sessions >= floor_sessions))
+    if not capacity_feasible:
+        status = "structurally_impossible"
+        reason = "opportunity capacity cannot satisfy configured floor"
+    elif not observed_feasible:
+        status = "underpowered_observed"
+        reason = "observed executed trades are below configured floor"
+    else:
+        status = "feasible"
+        reason = "opportunity capacity satisfies configured floor"
+    return {
+        "observed_trades": observed_trades,
+        "observed_sessions": observed_sessions,
+        "opportunity_count": opportunity_count,
+        "max_trade_opportunities": opportunity_count,
+        "opportunity_sessions": opportunity_sessions,
+        "observed_trade_rate": observed_rate,
+        "required_trade_rate": required_rate,
+        "required_rate_for_floor": required_rate,
+        # ``feasible`` is the end-to-end observed floor result.  Keep the
+        # structural capacity result separate so selective low-rate lanes are
+        # distinguishable from a corpus that cannot possibly supply enough
+        # symbol/session opportunities.
+        "feasible": bool(capacity_feasible and observed_feasible),
+        "capacity_feasible": capacity_feasible,
+        "observed_feasible": observed_feasible,
+        "status": status,
+        "reason": reason,
+        "shortfalls": {
+            "trades": max(0, (floor_trades or 0) - observed_trades),
+            "opportunities": max(0, (floor_trades or 0) - opportunity_count),
+            "sessions": max(0, (floor_sessions or 0) - opportunity_sessions),
+        },
+        "refusal_reason_counts": dict(sorted(refusal_reasons.items())[:64]),
+    }
 
 
 def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -705,6 +800,59 @@ class ShadowStore:
                 VALUES('quarantine_through_session',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (value,))
 
+    def quarantine_events(self) -> dict[str, dict[str, Any]]:
+        """Return durable malformed-event diagnostics awaiting corrected replay."""
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='quarantine_events'").fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("shadow quarantine metadata is invalid") from exc
+        if not isinstance(value, Mapping):
+            raise ShadowError("shadow quarantine metadata is invalid")
+        result: dict[str, dict[str, Any]] = {}
+        for key, detail in value.items():
+            if not isinstance(key, str) or not isinstance(detail, Mapping):
+                raise ShadowError("shadow quarantine metadata is invalid")
+            result[key] = dict(detail)
+        return result
+
+    def save_quarantine_events(self, value: Mapping[str, Mapping[str, Any]]) -> None:
+        """Persist bounded malformed-event diagnostics as mutable metadata.
+
+        This metadata is not authorizing evidence.  It records why a source
+        offset remains uncommitted and is removed only when the exact event
+        key successfully normalizes on a later corrected replay.
+        """
+        encoded = {str(key): dict(detail) for key, detail in value.items()}
+        if len(encoded) > MAX_QUARANTINE_EVENTS:
+            # Do not silently discard malformed evidence when the diagnostic
+            # bound is reached. Retain a deterministic prefix plus an
+            # unknown-tail sentinel; its missing session identity forces all
+            # replay/gate consumers closed until an operator repairs the
+            # source and explicitly clears the quarantine metadata.
+            existing_overflow = encoded.get(QUARANTINE_OVERFLOW_KEY, {})
+            dropped = int(existing_overflow.get("dropped_events", 0) or 0)
+            keys = sorted(key for key in encoded
+                          if key != QUARANTINE_OVERFLOW_KEY)
+            dropped += max(0, len(keys) - (MAX_QUARANTINE_EVENTS - 1))
+            encoded = {key: encoded[key]
+                       for key in keys[:MAX_QUARANTINE_EVENTS - 1]}
+            encoded[QUARANTINE_OVERFLOW_KEY] = {
+                "event_key": QUARANTINE_OVERFLOW_KEY,
+                "session_date": None,
+                "reason": "quarantine_overflow",
+                "dropped_events": dropped,
+                "unknown_tail": True,
+            }
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value) VALUES('quarantine_events',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                       (_json(encoded),))
+
     def upsert_candidate(self, candidate: Mapping[str, Any]) -> None:
         config = candidate.get("config")
         if config is None:
@@ -938,12 +1086,68 @@ class ShadowStore:
                     result.append(dict(item))
             return result
 
-    def prune(self) -> None:
+    def prune(self) -> dict[str, Any]:
+        """Prune only derived replay metadata and report what was removed.
+
+        Source events, decisions, accounts, and trades are immutable evidence
+        and are intentionally never part of retention.  Returning bounded
+        counters makes retention visible to the polling heartbeat without
+        changing the evidence contract.
+        """
         floor = time.time() - max(1, self.retention_days) * 86400
         # Retention is the only intentional deletion.  The append-only rows
         # themselves cannot be updated or deleted by ordinary writes.
         with self._connection() as db:
+            before = int(db.execute(
+                "SELECT count(*) FROM replay_diffs WHERE created_at < ?",
+                (floor,)).fetchone()[0])
+            previous = db.execute(
+                "SELECT value FROM meta WHERE key='replay_diff_prune_watermark'").fetchone()
+            if before:
+                latest_session = db.execute(
+                    "SELECT MAX(session_date) FROM replay_diffs WHERE created_at < ?",
+                    (floor,)).fetchone()[0]
+                watermark = {
+                    "floor_ts": float(floor),
+                    "pruned_replay_diffs": before,
+                    "latest_pruned_session": (str(latest_session)
+                                               if latest_session else None),
+                    "updated_ts": time.time(),
+                }
+                # The watermark is diagnostic metadata, not an authorizing
+                # row. Commit it in the same transaction before deleting
+                # derived diffs so a crash cannot erase the gap indication.
+                db.execute("""INSERT INTO meta(key,value) VALUES('replay_diff_prune_watermark',?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                           (_json(watermark),))
+            else:
+                try:
+                    watermark = (json.loads(previous["value"])
+                                 if previous is not None else None)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ShadowError("shadow retention watermark is invalid") from exc
+                if watermark is not None and not isinstance(watermark, Mapping):
+                    raise ShadowError("shadow retention watermark is invalid")
             db.execute("DELETE FROM replay_diffs WHERE created_at < ?", (floor,))
+        return {"retention_days": int(self.retention_days),
+                "retention_floor_ts": float(floor),
+                "pruned_replay_diffs": before,
+                "retention_gap_watermark": watermark}
+
+    def prune_watermark(self) -> dict[str, Any] | None:
+        """Return the last non-authorizing replay-diff retention watermark."""
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='replay_diff_prune_watermark'").fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("shadow retention watermark is invalid") from exc
+        if not isinstance(value, Mapping):
+            raise ShadowError("shadow retention watermark is invalid")
+        return dict(value)
 
 
 def _read_candidates(path: Path, *, max_candidates: int) -> list[dict]:
@@ -1416,6 +1620,8 @@ class ShadowRunner:
                 details.update(complete=complete, trade_count=len(trades),
                                opportunity_count=len(evidence_rows), trades=trades,
                                replay_signatures=replay_signatures)
+                details["opportunity_capacity"] = _opportunity_capacity(
+                    evidence_rows, vehicle=candidate_vehicle)
                 # Persist the exact-window randomized-entry null alongside the
                 # candidate replay.  It is a diagnostic research source, not a
                 # runtime shadow decision, and therefore receives its own
@@ -1426,7 +1632,8 @@ class ShadowRunner:
                         vehicle=candidate_vehicle,
                         reference_rows=_null_reference_rows(
                             result, normalized_bars,
-                            str(candidate.get("vehicle") or "equity")),
+                            str(candidate.get("vehicle") or "equity"),
+                            policy=replay_cfg.policy),
                         account_id=f"shadow:null:{candidate_id}:{session}",
                         starting_cash=float(self.config.equity), costs=replay_cfg.costs,
                         quotes=normalized_quotes, fixed_quantity=replay_cfg.quantity,
@@ -1467,6 +1674,8 @@ class ShadowRunner:
                                          setup_type=f"rule_{spec.get('family', 'signal')}")) is not None]
                 details.update(complete=complete, trade_count=len(replay_signatures),
                                replay_signatures=replay_signatures, account=account)
+                details["opportunity_capacity"] = _opportunity_capacity(
+                    rows, vehicle=candidate_vehicle)
                 try:
                     null_account = null_control_account(
                         normalized_bars, normalized_options, spec,
@@ -1577,6 +1786,8 @@ class ShadowRunner:
             self.store.save_source_offsets(offsets)
         pending: list[dict] = []
         next_offsets = dict(offsets)
+        source_consumed: dict[str, int] = {}
+        source_for_event: dict[str, str] = {}
         pending_bytes = sum(max(0, source.stat().st_size - offsets.get(
             str(source.resolve()), 0)) for source in sources)
         skipped_recovery_bytes = 0
@@ -1597,28 +1808,84 @@ class ShadowRunner:
                 key = str(source.resolve())
                 rows, consumed = _read_corpus_append(source, offsets.get(key, 0))
                 pending.extend(rows)
-                next_offsets[key] = consumed
+                source_consumed[key] = consumed
+                for row in rows:
+                    event_key = str(row.get("event_key") or "")
+                    if event_key:
+                        source_for_event[event_key] = key
         selected = _compact_shadow_rows(pending)
         if len(selected) > self.config.max_events:
             raise ShadowError(
                 f"shadow event batch bound {self.config.max_events} exceeded")
+        quarantine = self.store.quarantine_events()
+        invalid_sources: set[str] = set()
+        resolved_quarantine: set[str] = set()
+        invalid_sessions: set[str] = {
+            str(detail.get("session_date"))
+            for detail in quarantine.values()
+            if isinstance(detail, Mapping) and detail.get("session_date")
+        }
+        unknown_quarantine = any(
+            not isinstance(detail, Mapping) or not detail.get("session_date")
+            for detail in quarantine.values())
+        quarantine_overflow = QUARANTINE_OVERFLOW_KEY in quarantine
         for raw in selected:
+            event_key = str(raw.get("event_key") or "")
+            source_key = source_for_event.get(event_key)
             try:
                 _, added = self.store.ingest_event(raw, max_events=self.config.max_events)
             except InputConflict:
                 conflicts += 1
                 raise
             except NormalizationError:
-                # Recorder versions before the post-fetch observation fix can
-                # contain a small number of rows whose source timestamp is
-                # later than their cycle-start observed_at. They are unusable
-                # point-in-time evidence, so quarantine them and advance the
-                # durable source offset instead of retrying the batch forever.
+                # Keep the source offset before this malformed event.  The
+                # event is explicitly quarantined and its local session is
+                # blocked, so an operator can correct the recorder row and the
+                # next poll will retry the exact same bytes.  Advancing over
+                # it would permanently skip an unknown/incomplete session.
                 invalid_events += 1
+                if source_key:
+                    invalid_sources.add(source_key)
+                stamp = _timestamp(raw.get("as_of") or raw.get("timestamp"))
+                session = (stamp.astimezone(NEW_YORK).date().isoformat()
+                           if stamp is not None else None)
+                if session:
+                    invalid_sessions.add(session)
+                else:
+                    unknown_quarantine = True
+                quarantine[event_key or _digest(raw)] = {
+                    "event_key": event_key,
+                    "source": source_key,
+                    "session_date": session,
+                    "reason": "normalization_error",
+                }
                 continue
+            if event_key in quarantine:
+                resolved_quarantine.add(event_key)
             if added:
                 ingested += 1
+        # Only commit offsets for sources whose complete forward batch was
+        # normalized.  Other sources remain at their previous boundary and
+        # are retried after correction; already-ingested rows are idempotent.
+        for key, consumed in source_consumed.items():
+            if key not in invalid_sources:
+                next_offsets[key] = consumed
+        for event_key in resolved_quarantine:
+            quarantine.pop(event_key, None)
+        self.store.save_quarantine_events(quarantine)
         self.store.save_source_offsets(next_offsets)
+        # Recompute the durable block after resolving corrected rows.  A
+        # corrected replay can therefore become eligible in this same poll;
+        # it does not require an operator to run an extra no-op cycle.
+        invalid_sessions = {
+            str(detail.get("session_date"))
+            for detail in quarantine.values()
+            if isinstance(detail, Mapping) and detail.get("session_date")
+        }
+        unknown_quarantine = any(
+            not isinstance(detail, Mapping) or not detail.get("session_date")
+            for detail in quarantine.values())
+        quarantine_overflow = QUARANTINE_OVERFLOW_KEY in quarantine
         events, bars, quotes, options = self._load_events()
         # Process one local session at a time.  A completed replay closes that
         # session's virtual books before the next session is evaluated, which
@@ -1638,7 +1905,8 @@ class ShadowRunner:
                 continue
             session = row_session(event)
             if session is not None and (
-                    quarantine_through is None or session > quarantine_through):
+                    not unknown_quarantine and session not in invalid_sessions and
+                    (quarantine_through is None or session > quarantine_through)):
                 session_events.setdefault(session, []).append(event)
 
         session_inputs: dict[str, tuple[list[dict], list[dict], list[dict]]] = {}
@@ -1706,12 +1974,40 @@ class ShadowRunner:
                     rows = self.store.decisions(paired_id)
                     self._replay(paired, session, session_bars, session_quotes,
                                  rows, session_options)
-        self.store.prune()
+        prune = self.store.prune()
+        stale_tail = {
+            "status": "blocked" if (invalid_sessions or unknown_quarantine) else "clear",
+            "sessions": sorted(invalid_sessions),
+            "unknown_events": bool(unknown_quarantine),
+            "quarantine_overflow": bool(quarantine_overflow),
+            "invalid_events": int(invalid_events),
+        }
+        # Surface the latest per-candidate capacity summaries without copying
+        # raw account rows into the heartbeat.  Replay details are already
+        # bounded at write time; retain only a deterministic candidate/session
+        # tail for the operational result.
+        capacity: list[dict[str, Any]] = []
+        for metadata in self.store.replay_metadata():
+            details = metadata.get("details")
+            summary = details.get("opportunity_capacity") if isinstance(details, Mapping) else None
+            if not isinstance(summary, Mapping):
+                continue
+            capacity.append({
+                "candidate_id": str(metadata.get("candidate_id") or ""),
+                "session_date": str(metadata.get("session_date") or ""),
+                "vehicle": str(metadata.get("vehicle") or ""),
+                **dict(summary),
+            })
+        capacity = sorted(capacity, key=lambda item: (
+            item["candidate_id"], item["session_date"]))[-64:]
         return {"candidates": len(candidates), "ingested_events": ingested,
                 "events": len(events), "decisions": len(self.store.decisions()),
                 "conflicts": conflicts, "invalid_events": invalid_events,
                 "skipped_recovery_bytes": skipped_recovery_bytes,
-                "quarantine_through_session": quarantine_through}
+                "quarantine_through_session": quarantine_through,
+                "stale_tail": stale_tail,
+                "opportunity_capacity": capacity,
+                **prune}
 
 
 def run_shadow_once(config: ShadowConfig) -> dict[str, Any]:
@@ -1746,7 +2042,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
-    "DEFAULT_EQUITY", "InputConflict", "ShadowConfig", "ShadowError",
+    "DEFAULT_EQUITY", "DEFAULT_RETENTION_DAYS", "InputConflict",
+    "_opportunity_capacity",
+    "ShadowConfig", "ShadowError",
     "ShadowRunner", "ShadowStore", "run_shadow_once", "main",
 ]
 

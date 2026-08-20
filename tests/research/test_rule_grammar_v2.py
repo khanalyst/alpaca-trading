@@ -319,6 +319,27 @@ class V2EvaluationTests(unittest.TestCase):
                                        "max_atr_bps": 2.0})
         self.assertIsNone(evaluate_rule_signal(bars, too_wild))
 
+    def test_volatility_confirmation_uses_compression_as_an_upper_bound(self):
+        low_atr = validate_rule_spec({
+            **BASE, "schema": RULE_SCHEMA_V2, "confirmation": "volatility",
+            "compression_bps": 100.0,
+        })
+        high_atr = rising_bars(40, 5, drift=.01)
+        low_atr_rows = rising_bars(40, 5, drift=.001)
+        self.assertIsNotNone(evaluate_rule_signal(low_atr_rows, low_atr))
+        self.assertIsNone(evaluate_rule_signal(high_atr, low_atr))
+
+    def test_volatility_breakout_and_confirmation_share_the_same_polarity(self):
+        rows = ohlc_bars(30, lambda _index: 0.0, last_body=.002)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V2, "family": "volatility_breakout",
+            "lookback": 12, "atr_period": 3, "threshold_bps": 1.0,
+            "compression_bps": 20.0, "confirmation": "volatility",
+        })
+        signal = evaluate_rule_signal(rows, spec)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["direction"], "long")
+
     def test_every_listed_confirmation_must_hold(self):
         quiet = rising_bars(40, 5, volume=10_000)
         passing = validate_rule_spec({**BASE, "schema": RULE_SCHEMA_V2,

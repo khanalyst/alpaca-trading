@@ -18,9 +18,11 @@ import random
 from typing import Any, Mapping, Sequence
 
 from agent.contracts.rule import hold_deadline
-from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
-                    SQLiteQuoteIndexDescriptor, index_quotes, quote_fill,
-                    quote_fill_record)
+from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
+                    CostError, CostModel, ReplayPolicy, SQLiteQuoteIndex,
+                    SQLiteQuoteIndexDescriptor, check_stressed_cost_plan,
+                    index_quotes, quote_fill, quote_fill_record,
+                    stressed_cost_usd)
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, replay_available_at,
                           replay_open_is_available,
@@ -623,12 +625,15 @@ def _opportunity_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) -> li
 
 
 def _null_row(symbol: str, day: str, opportunity: str, vehicle: str,
-              reason: str | None = None) -> dict:
+              reason: str | None = None,
+              telemetry: Mapping[str, Any] | None = None) -> dict:
     row = {"vehicle": vehicle, "symbol": symbol, "session_date": day,
            "opportunity_id": opportunity, "net_pnl": 0.0, "return_value": 0.0,
            "no_trade": True}
     if reason:
         row["reject_reason"] = reason
+    if telemetry:
+        row.update(dict(telemetry))
     return row
 
 
@@ -890,6 +895,67 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             rows.append(_null_row(symbol, day, opportunity, vehicle,
                                   "isolated account risk budget cannot fund one unit"))
             continue
+        stress_enabled = (
+            policy.stressed_cost_scenario_bps is not None or
+            policy.max_stressed_cost_to_risk_ratio is not None)
+        nominal_risk_usd = quantity * float(risk_per_unit)
+        entry_notional = ((float(entry_underlying) * quantity)
+                          if vehicle == "equity" else
+                          (float(entry_ref) * quantity * multiplier))
+        stress_telemetry: dict[str, Any] = {}
+        if stress_enabled:
+            plan = {
+                "execution_profile": "options" if vehicle == "option" else "shares",
+                "contracts": quantity if vehicle == "option" else None,
+                "shares": quantity if vehicle == "equity" else None,
+                "notional": entry_notional,
+                "risk_usd": nominal_risk_usd,
+            }
+            checked, stress_reason = check_stressed_cost_plan(
+                plan,
+                scenario_bps=policy.stressed_cost_scenario_bps,
+                max_ratio=policy.max_stressed_cost_to_risk_ratio,
+                costs=model,
+            )
+            if stress_reason is not None:
+                stress_telemetry = {
+                    "stressed_cost_vehicle": vehicle,
+                    "stressed_cost_schema": STRESSED_COST_SCHEMA,
+                    "stressed_cost_basis": dict(STRESSED_COST_BASIS),
+                    "stressed_cost_entry_notional": float(entry_notional),
+                    "entry_notional": float(entry_notional),
+                    "stressed_cost_scenario_bps": (
+                        policy.stressed_cost_scenario_bps),
+                    "max_stressed_cost_to_risk_ratio": (
+                        policy.max_stressed_cost_to_risk_ratio),
+                    "stressed_cost_risk_usd": float(nominal_risk_usd),
+                    "risk_usd": float(nominal_risk_usd),
+                }
+                try:
+                    if (policy.stressed_cost_scenario_bps is not None and
+                            policy.max_stressed_cost_to_risk_ratio is not None and
+                            nominal_risk_usd > 0 and entry_notional > 0):
+                        stressed = stressed_cost_usd(
+                            entry_notional=entry_notional,
+                            scenario_bps=policy.stressed_cost_scenario_bps,
+                            vehicle=vehicle, quantity=quantity, costs=model)
+                        stress_telemetry.update({
+                            "stressed_cost_usd": float(stressed),
+                            "stressed_cost_to_risk_ratio": float(
+                                stressed / nominal_risk_usd),
+                        })
+                except (CostError, TypeError, ValueError, OverflowError,
+                        ZeroDivisionError):
+                    pass
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      stress_reason, stress_telemetry))
+                continue
+            if checked is not None:
+                stress_telemetry = {
+                    key: value for key, value in checked.items()
+                    if key.startswith("stressed_cost_") or
+                    key == "max_stressed_cost_to_risk_ratio"
+                }
         execution_direction = "long" if vehicle == "option" else direction
         executable = vehicle == "option"
         entry = model.execution_price(
@@ -906,7 +972,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         cash += net
         peak = max(peak, cash)
         drawdown = max(drawdown, peak - cash)
-        rows.append({"vehicle": vehicle, "symbol": symbol, "session_date": day,
+        row = {"vehicle": vehicle, "symbol": symbol, "session_date": day,
                      "opportunity_id": opportunity, "direction": direction,
                      "entry_timestamp": entry_bar.timestamp.isoformat(),
                      "exit_timestamp": exit_bar.end.isoformat(),
@@ -925,18 +991,25 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                      "exit_provider": exit_provider,
                      "evidence_mode": (
                          "diagnostic_historical_backfill"
-                         if policy.allow_historical_backfill_diagnostics and any(
+                         if any(
                              historical_backfill_record(item)
                              for item in (source_entry_bar, entry_bar, exit_bar))
                          else "forward_observed"
-                     )})
+                     )}
+        if stress_enabled:
+            row.update({"quantity": quantity, "risk_usd": nominal_risk_usd,
+                        "nominal_risk_usd": nominal_risk_usd,
+                        "entry_notional": entry_notional})
+            row.update(stress_telemetry)
+        rows.append(row)
     executed = [row for row in rows if row.get("no_trade") is not True]
     return {"account_id": account_id, "starting_cash": float(starting_cash),
             "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
             "max_drawdown": drawdown, "trades": len(executed), "rows": rows}
 
 
-def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) -> list[dict]:
+def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str,
+                         *, policy: ReplayPolicy | Mapping | None = None) -> list[dict]:
     """Describe each replayed opportunity to the randomized-entry null control.
 
     The null needs the underlying anchor the stop was measured from, which an
@@ -944,6 +1017,15 @@ def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) ->
     anchor is the entry bar's open, which is what the replay entered on, so it
     is read back from the bars rather than re-derived from the trade.
     """
+    # Source provenance determines the evidence label; replay visibility is a
+    # separate policy choice.  A strict replay therefore cannot become
+    # historical-bar-visible merely because its source is labelled backfill.
+    if isinstance(policy, Mapping):
+        allow_backfill = bool(policy.get(
+            "allow_historical_backfill_diagnostics", False))
+    else:
+        allow_backfill = bool(
+            getattr(policy, "allow_historical_backfill_diagnostics", False))
     zone = ZoneInfo("America/New_York")
     bars_by_key = {(bar.symbol, bar.timestamp): bar for bar in bars}
     sessions = sorted({(bar.symbol, bar.timestamp.astimezone(zone).date()) for bar in bars})
@@ -977,7 +1059,7 @@ def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) ->
         bar_visible = (entry_bar is not None and
                        replay_open_is_available(
                            entry_bar, entry_bar.timestamp,
-                           allow_historical_backfill_diagnostics=diagnostic))
+                           allow_historical_backfill_diagnostics=allow_backfill))
         # Strict replay may have priced a delayed bar from a fresh boundary
         # quote/snapshot.  Prefer the persisted underlying anchor for both
         # vehicles; the option ``entry_reference`` is its premium and cannot

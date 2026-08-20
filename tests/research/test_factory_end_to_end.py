@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from research.costs import CostModel
 from research.edge_lab import _read_discovery_rows
-from research.factory_core import simulate_account
+from research.factory_core import simulate_account, template_hypothesis
 from research.strategy_factory import run_factory
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -34,9 +34,10 @@ SYMBOLS = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH")
 SESSIONS = 150
 # Slot 0 of the shipped catalog. The refinement protocol keeps the root and
 # changes exactly one coordinate in the second arm.
-ROOT_SPEC = validate_rule_spec({
-    "family": "opening_range_breakout", "range_minutes": 15,
-    "threshold_bps": 5.0, "confirmation": "volume"})
+# Derive the fixture from the canonical factory root. Factory-created roots
+# intentionally use the v2 no-op extension form so every conditional search
+# axis is reachable, while legacy v1 IDs remain frozen for persisted edges.
+ROOT_SPEC = template_hypothesis(0).rule_spec
 WINNING_SPEC = validate_rule_spec({**ROOT_SPEC, "target_r": 2.5})
 ROOT_VARIANT = rule_variant_id(ROOT_SPEC)
 WINNING_VARIANT = rule_variant_id(WINNING_SPEC)

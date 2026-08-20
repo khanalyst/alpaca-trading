@@ -559,7 +559,12 @@ def _confirmation(direction: str, rows: Sequence[Any], spec: Mapping[str, Any],
         return bool(prior and _number(rows[-1], "volume") >= mean(prior) * spec["volume_multiplier"])
     atr = _atr(rows, spec["atr_period"])
     close = closes[-1] if closes else 0.0
-    return bool(atr and close > 0 and atr / close * 10_000 >= spec["compression_bps"])
+    # ``compression_bps`` is an upper bound everywhere: volatility
+    # confirmation admits compressed (low-ATR) prefixes, matching the
+    # volatility-breakout family's range gate.  The previous lower-bound
+    # polarity made a single ``volatility`` confirmation contradict the
+    # breakout predicate and silently selected expanded regimes instead.
+    return bool(atr and close > 0 and atr / close * 10_000 <= spec["compression_bps"])
 
 
 def _session_prefix(bars: Sequence[Any], current: Any) -> list[Any]:

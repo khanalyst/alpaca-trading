@@ -410,7 +410,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         null_results[variant_id] = null_control_account(
             development_bars, list(development_snapshots.values()),
             _null_spec(cfg), vehicle=vehicle,
-            reference_rows=_null_reference_rows(result, development_bars, vehicle),
+            reference_rows=_null_reference_rows(
+                result, development_bars, vehicle, policy=mode_policy),
             account_id=f"ibr:{vehicle}:{variant_id}", costs=cfg.costs,
             quotes=development_quotes, fixed_quantity=cfg.quantity,
             policy=mode_policy)["rows"]

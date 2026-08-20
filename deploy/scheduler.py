@@ -181,7 +181,8 @@ def run_scheduler(args) -> int:
             "job_id", "started_ts", "completed_ts", "run_date",
             "timeout_seconds", "structured_failures", "stdout_chars",
             "stderr_chars", "stdout_truncated", "stderr_truncated",
-            "cycle_status", "research_cycle", "research_progress")
+            "cycle_status", "research_cycle", "research_progress",
+            "research_readiness")
         if key in previous
     }
     signal.signal(signal.SIGTERM, _stop)
@@ -246,7 +247,7 @@ def run_scheduler(args) -> int:
         # Include the field from the first heartbeat onward.  Subsequent
         # heartbeats replace it with the latest validated child event.
         write_status(status_path, "running", **running_detail,
-                     research_progress=None)
+                     research_progress=None, research_readiness=None)
         timed_out = False
         try:
             try:
@@ -314,7 +315,8 @@ def run_scheduler(args) -> int:
             # A no-data cycle is expected to exit 2.  A different non-zero
             # result indicates an operational failure despite its payload.
             final_status = "no_data" if last_exit in {0, 2} else "failed"
-        elif cycle_status in {"completed", "completed_no_edge"}:
+        elif cycle_status in {"completed", "completed_no_edge",
+                              "search_exhausted", "llm_provider_failure"}:
             final_status = (cycle_status if last_exit == 0 else "failed")
         else:
             final_status = "completed" if last_exit == 0 else "failed"
@@ -327,6 +329,7 @@ def run_scheduler(args) -> int:
             cycle_status=cycle_status,
             research_cycle=research_cycle,
             research_progress=capture_detail["research_progress"],
+            research_readiness=capture_detail["research_readiness"],
             stdout_tail=stdout.tail, stderr_tail=stderr.tail,
             stdout_chars=stdout.total_chars, stderr_chars=stderr.total_chars,
             stdout_truncated=stdout.truncated,
@@ -339,6 +342,7 @@ def run_scheduler(args) -> int:
             "cycle_status": cycle_status,
             "research_cycle": research_cycle,
             "research_progress": capture_detail["research_progress"],
+            "research_readiness": capture_detail["research_readiness"],
             "stdout_chars": stdout.total_chars,
             "stderr_chars": stderr.total_chars,
             "stdout_truncated": stdout.truncated,

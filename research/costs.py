@@ -100,6 +100,13 @@ class ReplayPolicy:
     # labelled historical-backfill records to use their provider ``as_of``
     # boundary for mechanics diagnostics; resulting rows are non-authorizing.
     allow_historical_backfill_diagnostics: bool = False
+    # Runtime stressed-cost controls are optional on low-level replay
+    # fixtures.  ``None``/``None`` deliberately disables this runtime-only
+    # veto for historical callers; ``from_config`` carries the validated
+    # production values into replay identity and account simulation.  They
+    # are appended to preserve the positional constructor contract above.
+    stressed_cost_scenario_bps: float | None = None
+    max_stressed_cost_to_risk_ratio: float | None = None
 
     def __post_init__(self) -> None:
         age = float(self.max_market_data_age_seconds)
@@ -122,6 +129,21 @@ class ReplayPolicy:
             value = getattr(self, name)
             if value is not None and (not math.isfinite(float(value)) or float(value) < 0):
                 raise CostError(f"{name} must be finite and non-negative when supplied")
+        scenario = self.stressed_cost_scenario_bps
+        if scenario is not None:
+            if (isinstance(scenario, bool) or
+                    not math.isfinite(float(scenario)) or
+                    float(scenario) not in COST_STRESS_SCENARIOS_BPS):
+                raise CostError(
+                    "stressed_cost_scenario_bps must be one of "
+                    "9, 15, 25, or 50 when supplied")
+        ratio = self.max_stressed_cost_to_risk_ratio
+        if ratio is not None and (isinstance(ratio, bool) or
+                                  not math.isfinite(float(ratio)) or
+                                  float(ratio) < 0):
+            raise CostError(
+                "max_stressed_cost_to_risk_ratio must be finite and non-negative "
+                "when supplied")
         if not isinstance(self.strict_market_data, bool):
             raise CostError("strict_market_data must be true or false")
         if not isinstance(self.require_exact_calendar, bool):
@@ -143,6 +165,12 @@ class ReplayPolicy:
             "options_max_dte": int(self.options_max_dte),
             "options_max_spread_pct": float(self.options_max_spread_pct),
             "risk_per_trade_pct": float(self.risk_per_trade_pct),
+            "stressed_cost_scenario_bps": (
+                None if self.stressed_cost_scenario_bps is None else
+                float(self.stressed_cost_scenario_bps)),
+            "max_stressed_cost_to_risk_ratio": (
+                None if self.max_stressed_cost_to_risk_ratio is None else
+                float(self.max_stressed_cost_to_risk_ratio)),
             "latest_entry_time": (None if self.latest_entry_time is None else
                                    self.latest_entry_time.isoformat()),
             "force_flat_time": (None if self.force_flat_time is None else
@@ -208,6 +236,12 @@ class ReplayPolicy:
             options_max_dte=int(risk.get("options_max_dte", 60)),
             options_max_spread_pct=float(risk.get("options_max_spread_pct", 10.0)),
             risk_per_trade_pct=float(risk.get("risk_per_trade_pct", 0.5)),
+            stressed_cost_scenario_bps=(
+                None if risk.get("stressed_cost_scenario_bps") is None else
+                float(risk["stressed_cost_scenario_bps"])),
+            max_stressed_cost_to_risk_ratio=(
+                None if risk.get("max_stressed_cost_to_risk_ratio") is None else
+                float(risk["max_stressed_cost_to_risk_ratio"])),
             latest_entry_time=latest,
             force_flat_time=force,
             max_concurrent_positions=(None if risk.get("max_concurrent_positions") is None else int(risk["max_concurrent_positions"])),
@@ -667,6 +701,76 @@ def stressed_cost_usd(planned_notional: float | None = None,
     if not math.isfinite(stressed):
         raise CostError("stressed cost is not finite")
     return float(stressed)
+
+
+def check_stressed_cost_plan(
+        plan: Mapping[str, Any], *, scenario_bps: float | None,
+        max_ratio: float | None, costs: Any = None,
+        config: Mapping | None = None) -> tuple[dict[str, Any] | None, str | None]:
+    """Apply the runtime stressed-cost veto to a sized plan.
+
+    This is intentionally a pure, data-only seam so research can exercise the
+    exact same arithmetic and failure reasons as ``RiskEngine`` without
+    importing the runtime risk module (which would create a dependency cycle).
+    A missing *either* control is malformed when the veto is requested; callers
+    that retain legacy fixture behaviour should skip this helper only when both
+    controls are ``None``.
+    """
+    if scenario_bps is None or max_ratio is None:
+        return None, "stressed_cost_invalid"
+    if isinstance(scenario_bps, bool) or isinstance(max_ratio, bool):
+        return None, "stressed_cost_invalid"
+    try:
+        scenario = float(scenario_bps)
+        limit = float(max_ratio)
+    except (TypeError, ValueError, OverflowError):
+        return None, "stressed_cost_invalid"
+    if (not math.isfinite(scenario) or scenario not in COST_STRESS_SCENARIOS_BPS or
+            not math.isfinite(limit) or limit < 0):
+        return None, "stressed_cost_invalid"
+    if not isinstance(plan, Mapping):
+        return None, "stressed_cost_invalid"
+    vehicle = ("option" if str(plan.get("execution_profile", "shares")).lower()
+               in {"option", "options", "defined_risk_options",
+                   "options_defined_risk"} else "equity")
+    if any(isinstance(plan.get(name), bool) for name in
+           ("notional", "risk_usd",
+            "contracts" if vehicle == "option" else "shares")):
+        return None, "stressed_cost_invalid"
+    try:
+        notional = float(plan.get("notional"))
+        risk_usd = float(plan.get("risk_usd"))
+        quantity = float(plan.get("contracts" if vehicle == "option" else "shares"))
+    except (TypeError, ValueError, OverflowError):
+        return None, "stressed_cost_invalid"
+    if (not math.isfinite(notional) or notional <= 0 or
+            not math.isfinite(risk_usd) or risk_usd <= 0 or
+            not math.isfinite(quantity) or quantity <= 0):
+        return None, "stressed_cost_invalid"
+    try:
+        stressed = stressed_cost_usd(
+            entry_notional=notional, scenario_bps=scenario,
+            vehicle=vehicle, quantity=quantity, costs=costs, config=config)
+        ratio = stressed / risk_usd
+    except (CostError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None, "stressed_cost_invalid"
+    if not math.isfinite(stressed) or not math.isfinite(ratio):
+        return None, "stressed_cost_invalid"
+    if ratio > limit:
+        return None, "stressed_cost_risk_limit"
+    enriched = dict(plan)
+    enriched.update({
+        "vehicle": vehicle,
+        "stressed_cost_vehicle": vehicle,
+        "stressed_cost_schema": STRESSED_COST_SCHEMA,
+        "stressed_cost_basis": dict(STRESSED_COST_BASIS),
+        "stressed_cost_entry_notional": float(notional),
+        "stressed_cost_scenario_bps": float(scenario),
+        "stressed_cost_usd": float(stressed),
+        "stressed_cost_to_risk_ratio": float(ratio),
+        "max_stressed_cost_to_risk_ratio": float(limit),
+    })
+    return enriched, None
 
 
 # Concise aliases make the helper convenient for callers while retaining one
@@ -1176,6 +1280,7 @@ __all__ = [
     "replay_policy_for_mode", "replay_policy_for_session",
     "replay_policy_for_bars", "derive_session_replay_policy",
     "cost_model_for_vehicle", "stressed_cost_usd", "stress_cost_usd",
+    "check_stressed_cost_plan",
     "stressed_cost", "risk_unit_report",
     "QuoteFill", "SQLiteQuoteIndex", "SQLiteQuoteIndexDescriptor", "index_quotes",
     "quote_fill", "quote_fill_record",

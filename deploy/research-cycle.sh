@@ -19,6 +19,8 @@ cycle_finalized=0
 cycle_success=0
 cycle_no_edge=0
 cycle_unevaluable=0
+cycle_search_exhausted=0
+cycle_llm_provider_failure=0
 cycle_outcomes=()
 
 emit_progress() {
@@ -46,16 +48,22 @@ emit_cycle() {
   local reason="$2"
   local exit_code="$3"
   local outcomes="${cycle_outcomes[*]-}"
-  "$python_bin" - "$status" "$reason" "$exit_code" "$outcomes" "$cycle_success" "$cycle_no_edge" <<'PY'
+  "$python_bin" - "$status" "$reason" "$exit_code" "$outcomes" \
+    "$cycle_success" "$cycle_no_edge" "$cycle_unevaluable" \
+    "$cycle_search_exhausted" "$cycle_llm_provider_failure" <<'PY'
 import json
 import sys
 
-status, reason, exit_code, raw_outcomes, success, no_edge = sys.argv[1:]
+status, reason, exit_code, raw_outcomes, success, no_edge, unevaluable, \
+    search_exhausted, llm_provider_failure = sys.argv[1:]
 print(json.dumps({
     "schema": "research-cycle.v1", "status": status, "reason": reason,
     "exit_code": int(exit_code),
     "outcomes": raw_outcomes.split() if raw_outcomes else [],
     "proofs": bool(int(success)), "no_edge": bool(int(no_edge)),
+    "unevaluable": bool(int(unevaluable)),
+    "search_exhausted": bool(int(search_exhausted)),
+    "llm_provider_failure": bool(int(llm_provider_failure)),
 }, sort_keys=True))
 PY
 }
@@ -538,6 +546,126 @@ if [ "$validation_status" -ne 0 ]; then
 fi
 emit_progress "validation" 1 1 "steps" "both"
 
+# Emit one bounded, non-authorizing readiness snapshot from the normalized
+# corpus.  This is deliberately separate from research-progress.v1: the
+# scheduler/dashboard may display it, but no lifecycle or gate consumes it.
+# Session capacity is forward-observed only; historical backfill rows cannot
+# make the corpus appear ready.  Never claim ready here: a candidate-specific
+# live-shadow proof remains required even when the count clears every floor.
+"$python_bin" - "$validated_input" "$repo_root" <<'PY' >&2 || true
+from datetime import datetime, timezone
+import json
+import math
+import sys
+from zoneinfo import ZoneInfo
+
+source, repo_root = sys.argv[1:]
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+NY = ZoneInfo("America/New_York")
+now = datetime.now(timezone.utc)
+MAX_HORIZON_SECONDS = 90 * 86400.0
+qualification_fraction = 0.20
+development_fraction = 1.0 - qualification_fraction
+heldout_development_fraction = 0.30
+heldout_fraction = development_fraction * heldout_development_fraction
+
+def timestamp(value):
+    try:
+        raw = str(value or "").strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+sessions = set()
+first = last = None
+try:
+    with open(source, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                continue
+            # ``source_mode`` is the normalized provenance contract.  The
+            # explicit boolean spelling is retained for older external views.
+            provenance = str(payload.get("source_mode") or "").strip().lower()
+            if provenance == "historical_backfill" or bool(
+                    payload.get("historical_backfill_record")):
+                continue
+            stamp = timestamp(payload.get("timestamp"))
+            if stamp is None:
+                continue
+            sessions.add(stamp.astimezone(NY).date().isoformat())
+            first = stamp if first is None or stamp < first else first
+            last = stamp if last is None or stamp > last else last
+except Exception:
+    sessions = set()
+
+try:
+    from research.gates import (PROTOCOL_QUALIFICATION_MIN_SESSIONS,
+                                protocol_minimums)
+    backtest_min = int(protocol_minimums("backtest")["sessions"])
+    qualification_min = int(PROTOCOL_QUALIFICATION_MIN_SESSIONS)
+    shadow_half_min = int(protocol_minimums("shadow")["sessions"])
+except Exception:
+    backtest_min = qualification_min = shadow_half_min = 0
+
+recorded = len(sessions)
+shadow_min = max(0, shadow_half_min * 2)
+offline_parts = []
+if heldout_fraction > 0:
+    offline_parts.append(int(math.ceil(backtest_min / heldout_fraction)))
+if qualification_fraction > 0:
+    offline_parts.append(int(math.ceil(qualification_min / qualification_fraction)))
+offline_required = max(offline_parts, default=0)
+required = offline_required + shadow_min
+remaining = max(0, required - recorded)
+rate = None
+if recorded > 1 and first is not None and last is not None:
+    span_days = max(0.0, (last - first).total_seconds() / 86400.0)
+    if span_days > 0:
+        rate = (recorded - 1) / span_days
+eta = None
+if rate and rate > 0 and remaining > 0:
+    eta = min(now.timestamp() + (remaining / rate) * 86400.0,
+              now.timestamp() + MAX_HORIZON_SECONDS)
+state = "pending" if recorded else "unknown"
+reason = ("forward-observed session count is diagnostic only; "
+          "candidate-specific shadow proof is still required")
+if not recorded:
+    reason = ("no forward-observed session dates were recorded; "
+              "candidate-specific shadow proof is still required")
+print(json.dumps({
+    "schema": "research-readiness.v1",
+    "state": state,
+    "reason": reason,
+    "recorded_sessions": recorded,
+    "heldout_min_sessions": backtest_min,
+    "qualification_min_sessions": qualification_min,
+    "shadow_min_sessions": shadow_min,
+    "shadow_tail_sessions": shadow_min,
+    "offline_required_sessions": offline_required,
+    "heldout_fraction": heldout_fraction,
+    "qualification_fraction": qualification_fraction,
+    "development_fraction": development_fraction,
+    "required_sessions": required,
+    "sessions_remaining": remaining,
+    "progress_age_seconds": 0.0,
+    "progress_rate_sessions_per_day": rate,
+    "observed_session_rate_per_day": rate,
+    "eta_ts": eta,
+    "deadline_ts": now.timestamp() + MAX_HORIZON_SECONDS,
+    "updated_ts": now.isoformat(),
+}, sort_keys=True, separators=(",", ":")), flush=True)
+PY
+
 if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
   emit_progress "backtest" 0 1 "steps" "equity"
   set +e
@@ -591,15 +719,26 @@ run_calibration() {
     echo '{"schema":"research-calibration.v1","status":"blocked","reason":"invalid_max_age","authorization_exit_code":2}' >&2
     return 0
   fi
-  [ -s "$journal" ] || {
-    calibration_reason="journal_unavailable"
-    echo '{"schema":"research-calibration.v1","status":"blocked","reason":"journal_unavailable","authorization_exit_code":2}' >&2
-    return 0
-  }
+  local bootstrap_journal=0
+  if [ ! -s "$journal" ]; then
+    if [ "${ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN:-0}" = "1" ]; then
+      # A first deployment may not have created the runtime journal yet.  Do
+      # not fabricate fills or create a journal here; pass a deterministic
+      # empty report through the normal persistence/freshness path below.
+      bootstrap_journal=1
+    else
+      calibration_reason="journal_unavailable"
+      echo '{"schema":"research-calibration.v1","status":"blocked","reason":"journal_unavailable","authorization_exit_code":2}' >&2
+      return 0
+    fi
+  fi
   set +e
   local calibration_config="${ALPACA_RESEARCH_CALIBRATION_CONFIG:-}"
   local calibration_output_file="$tmp_dir/calibration-output.json"
-  if [ -n "$calibration_config" ]; then
+  if [ "$bootstrap_journal" -eq 1 ]; then
+    printf '%s\n' '{"schema":2,"journal_fills":0,"unique_orders":0,"available_vehicles":[],"authorization_verdict":"insufficient_data","authorization_exit_code":2}' > "$calibration_output_file"
+    local status=2
+  elif [ -n "$calibration_config" ]; then
     if [[ "$calibration_config" != /* ]]; then
       calibration_config="$repo_root/$calibration_config"
     fi
@@ -609,7 +748,7 @@ run_calibration() {
     "$python_bin" "$repo_root/research.py" calibrate "$journal" \
       --vehicle "$vehicle" >"$calibration_output_file"
   fi
-  local status=$?
+  local status=${status:-$?}
   set -e
   local configured_calibration_report="${ALPACA_RESEARCH_CALIBRATION_REPORT:-}"
   local calibration_report
@@ -632,7 +771,7 @@ run_calibration() {
   # report generation time, and the freshness threshold used for promotion.
   local normalized_report
   set +e
-  normalized_report="$($python_bin - "$calibration_output_file" "$journal" "$max_age" "$status" "$vehicle" <<'PY'
+  normalized_report="$($python_bin - "$calibration_output_file" "$journal" "$max_age" "$status" "$vehicle" "${ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN:-0}" <<'PY'
 import json
 import math
 import os
@@ -640,7 +779,8 @@ import sys
 import time
 from pathlib import Path
 
-output_path, journal_path, max_age_raw, command_status, expected_vehicle = sys.argv[1:]
+output_path, journal_path, max_age_raw, command_status, expected_vehicle, bootstrap_raw = sys.argv[1:]
+bootstrap_requested = str(bootstrap_raw).strip() == "1"
 now = time.time()
 report = {}
 reason = None
@@ -686,15 +826,37 @@ if reason is None and journal_age is not None and journal_age > max_age:
 report.setdefault("schema", 2)
 report["vehicle"] = expected_vehicle
 report["vehicle_filter"] = expected_vehicle
-report["calibration_status"] = "authorized" if reason is None else "blocked"
-report["authorization_reason"] = "authorized" if reason is None else reason
+# A brand-new journal has no execution evidence from any vehicle.  An
+# explicitly enabled bootstrap records that fact durably so the selected
+# shadow lane can collect evidence, while the report non-zero authorization
+# code keeps calibration math fail-closed for production promotion.  Any
+# existing or thin history (including another vehicle) remains blocked.
+journal_fills = report.get("journal_fills")
+available_vehicles = report.get("available_vehicles")
+empty_journal = (isinstance(journal_fills, (int, float)) and
+                 not isinstance(journal_fills, bool) and journal_fills == 0 and
+                 isinstance(available_vehicles, list) and not available_vehicles)
+bootstrap = bool(bootstrap_requested and empty_journal and
+                 reason in {"authorization_insufficient_data",
+                            "journal_unavailable"})
+report["calibration_status"] = ("authorized" if reason is None else
+                                 "bootstrap_unknown" if bootstrap else "blocked")
+report["calibration_state"] = ("authorized" if reason is None else
+                                "bootstrap_unknown" if bootstrap else "blocked")
+report["authorization_reason"] = ("authorized" if reason is None else
+                                   "bootstrap_unknown" if bootstrap else reason)
+# Never turn bootstrap into a successful calibration verdict.  Its state is
+# persisted for observability and the shell promotion gate handles it only as
+# an explicitly requested, fresh-vehicle bootstrap.
 report["authorization_exit_code"] = 0 if reason is None else 2
+report["bootstrap_unknown"] = bool(bootstrap)
 report["provenance"] = {
     "journal_path": str(Path(journal_path).resolve()),
     "journal_mtime_ts": journal_mtime,
     "journal_age_seconds": journal_age,
     "generated_ts": now,
     "max_age_seconds": max_age,
+    "bootstrap_requested": bootstrap_requested,
 }
 print(json.dumps(report, sort_keys=True, allow_nan=False))
 raise SystemExit(0 if reason is None else 2)
@@ -711,10 +873,27 @@ PY
       echo "$normalized_report" >&2
     fi
   fi
+  local bootstrap_state=""
+  if [ "$report_persisted" -eq 1 ]; then
+    if grep -Eq '"calibration_state"[[:space:]]*:[[:space:]]*"bootstrap_unknown"' \
+         "$calibration_report" 2>/dev/null; then
+      bootstrap_state="bootstrap_unknown"
+    fi
+  fi
   if [ "$report_status" -eq 0 ] && [ "$report_persisted" -eq 1 ]; then
     calibration_authorized=1
     calibration_reason="authorized"
     echo '{"schema":"research-calibration.v1","status":"authorized","authorization_exit_code":0}' >&2
+  elif [ "$report_status" -eq 2 ] && [ "$report_persisted" -eq 1 ] &&
+       [ "${ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN:-0}" = "1" ] &&
+       [ "$bootstrap_state" = "bootstrap_unknown" ]; then
+    # Bootstrap is intentionally narrow: only the freshly persisted empty
+    # journal state can pass this shadow-ingestion gate.  The persisted report
+    # still carries authorization_exit_code=2, so downstream calibration
+    # consumers cannot mistake it for measured execution authorization.
+    calibration_authorized=1
+    calibration_reason="bootstrap_unknown"
+    echo '{"schema":"research-calibration.v1","status":"bootstrap_unknown","authorization_exit_code":2}' >&2
   else
     if [ "$report_persisted" -ne 1 ]; then
       calibration_reason="report_unwritable"
@@ -780,7 +959,8 @@ run_factory() {
     --min-trades "${ALPACA_FACTORY_MIN_TRADES:-100}" \
     --min-sessions "${ALPACA_FACTORY_MIN_SESSIONS:-30}" \
     --alpha "${ALPACA_FACTORY_ALPHA:-0.05}" \
-    --max-generations "${ALPACA_FACTORY_MAX_GENERATIONS:-5}"
+    --max-generations "${ALPACA_FACTORY_MAX_GENERATIONS:-5}" \
+    --max-confirmatory-attempts "${ALPACA_FACTORY_MAX_CONFIRMATORY_ATTEMPTS:-3}"
   local status=$?
   set -e
   if [ "$status" -eq 0 ]; then
@@ -792,6 +972,12 @@ run_factory() {
   elif [ "$status" -eq 4 ]; then
     cycle_unevaluable=1
     cycle_outcomes+=("$vehicle:factory:unevaluable")
+  elif [ "$status" -eq 5 ]; then
+    cycle_search_exhausted=1
+    cycle_outcomes+=("$vehicle:factory:search_exhausted")
+  elif [ "$status" -eq 6 ]; then
+    cycle_llm_provider_failure=1
+    cycle_outcomes+=("$vehicle:factory:llm_provider_failure")
   else
     finish "failed" "$vehicle factory failed" "$status"
   fi
@@ -889,6 +1075,22 @@ done
 if [ "$cycle_success" -eq 1 ]; then
   emit_progress "completed" 1 1 "cycles" "both"
   finish "completed" "research cycle completed with proof" 0
+fi
+# A provider failure is a durable factory diagnosis even when the bounded
+# deterministic ladder produced ordinary accounts. Keep it separate from a
+# search-space exhaustion so operators can repair credentials/provider access
+# instead of treating the cycle as a valid negative.
+if [ "$cycle_llm_provider_failure" -eq 1 ]; then
+  emit_progress "completed" 1 1 "cycles" "both"
+  finish "llm_provider_failure" \
+    "factory LLM provider exhausted all calls; review llm_call_evidence" 0
+fi
+# A bounded search with no unused successor is also a terminal research
+# outcome. It is not proof and it is not an ordinary no-edge observation.
+if [ "$cycle_search_exhausted" -eq 1 ]; then
+  emit_progress "completed" 1 1 "cycles" "both"
+  finish "search_exhausted" \
+    "factory bounded hypothesis space exhausted; review search_state" 0
 fi
 # A vehicle whose corpus priced nothing tested nothing. Reporting that as
 # "no edge passed the gates" is indistinguishable from a real negative, so the

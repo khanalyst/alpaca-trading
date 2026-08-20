@@ -510,6 +510,15 @@ and randomized-entry-null replays; mismatch or incomplete rows remain quarantine
 and are not gate input. The service has no broker credentials and cannot mutate
 orders, broker state, runtime state, or the EdgeLedger.
 
+Replay-diff metadata is retained for 180 days by default; Compose exposes this
+as `ALPACA_SHADOW_RETENTION_DAYS`. Pruning reports its floor and count in the
+shadow heartbeat without deleting immutable source events, decisions, accounts,
+or trades. A non-authorizing prune watermark makes any candidate boundary that
+predates deleted replay metadata an explicit `retention_gap`; ingestion remains
+blocked until the missing evidence is restored. A corrected malformed recorder
+row is retried from its prior byte offset and its session remains out of gate
+input until the replay is complete.
+
 The scheduled research cycle invokes `edge ingest-shadow` by default when
 `ALPACA_SHADOW_INGEST_ENABLED=1`. The command opens the shadow WAL read-only
 from the shared `shadow-data` volume and is a no-op when the WAL is absent. It
@@ -541,6 +550,12 @@ Selecting the separate `options` execution profile remains paper-only and
 requires reviewed OPRA evidence and controls. The dashboard reports proved
 option edges that the default `shares` runtime cannot execute, so that evidence
 is visible rather than silently discarded.
+
+When the journal is truly empty, the first cycle can be explicitly bootstrapped
+with `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1`. The persisted
+`bootstrap_unknown` state keeps `authorization_exit_code=2`: it only permits
+shadow evidence collection and never claims measured execution calibration.
+Existing, thin, mixed-vehicle, stale, or optimistic history remains blocked.
 
 A slot whose hypothesis proves an edge is reseeded with a new hypothesis in the
 same cycle, so logical research capacity stays constant instead of shrinking
@@ -624,11 +639,19 @@ The paper journal is the source for realized performance summaries:
 `python report.py runtime/paper/journal.db --json`. The dashboard reads this
 journal and edge ledger in read-only mode.
 
-The scheduler records one of four terminal research statuses:
-`completed` (proof produced), `completed_no_edge` (valid run, no eligible
-edge), `no_data` (input unavailable/empty), or `failed` (validation or job
-failure). Treat `completed_no_edge` and `no_data` as distinct from scheduler
-failure; neither permits bypassing the runtime edge gate.
+The scheduler records terminal research statuses: `completed` (proof
+produced), `completed_no_edge` (valid run, no eligible edge), `no_data` (input
+unavailable/empty), `search_exhausted` (the bounded hypothesis space has no
+unused successor), `llm_provider_failure` (all bounded provider calls failed),
+or `failed` (validation or job failure). The factory CLI keeps proof/no-proof
+exit codes at 0/2, reserves 4 for an unevaluable corpus, and uses 5 for
+`bounded_space_exhausted` and 6 for `llm_all_calls_failed`; the cycle wrapper
+normalizes the latter two to structured terminal statuses and exits 0 so the
+reason remains available in scheduler history. Treat `completed_no_edge`,
+`search_exhausted`, and `llm_provider_failure` as explicit research outcomes,
+not as proof; none permits bypassing the runtime edge gate. Configure the
+confirmatory retry budget with `ALPACA_FACTORY_MAX_CONFIRMATORY_ATTEMPTS`
+(default 3).
 
 The dashboard is read-only and localhost-bound. It is an observation aid, not
 an execution console. Protect SSH and host credentials using your normal

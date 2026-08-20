@@ -617,12 +617,17 @@ def measure_fit_diagnostics(
         "exits": _exit_summary(rows),
         "exit_grammar": {
             "schema": "fixed-atr-floor-bracket-r-target-bar-cap.v1",
+            "supported_exit_modes": [
+                "atr_floor_bracket", "r_target", "bar_cap"],
             "bracket": "ATR stop with 30 bps floor",
             "target": "configured R multiple",
             "hold_cap": "configured max_hold_bars",
             "executable_exit_templates_added": False,
             "requires_operator_review": True,
             "authorizing": False,
+            "unsupported_requested_exit_fields": [],
+            "unsupported_exit_requested": False,
+            "status": "supported_fixed_grammar",
         },
         "mde_power": _mde(rows),
         "behavior_fingerprint": {
@@ -747,8 +752,17 @@ def fit_behavior_fingerprint(bars: Sequence[Any],
 
 def audit_exit_grammar(spec: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Describe the currently executable exit grammar for operator review."""
-    return {
+    candidate = spec if isinstance(spec, Mapping) else {}
+    unsupported = sorted(
+        str(key) for key in candidate
+        if any(marker in str(key).lower() for marker in (
+            "exit_mode", "trailing", "partial_exit", "exit_template",
+            "take_profit", "stop_loss")) and str(key) not in {
+                "max_hold_bars"})
+    result = {
         "schema": "fixed-atr-floor-bracket-r-target-bar-cap.v1",
+        "supported_exit_modes": [
+            "atr_floor_bracket", "r_target", "bar_cap"],
         "bracket": "ATR stop with 30 bps floor",
         "target": "configured R multiple",
         "hold_cap": "configured max_hold_bars",
@@ -756,6 +770,11 @@ def audit_exit_grammar(spec: Mapping[str, Any] | None = None) -> dict[str, Any]:
         "requires_operator_review": True,
         "authorizing": False,
     }
+    result["unsupported_requested_exit_fields"] = unsupported
+    result["unsupported_exit_requested"] = bool(unsupported)
+    result["status"] = ("rejected_unsupported_exit_grammar"
+                         if unsupported else "supported_fixed_grammar")
+    return result
 
 
 # Descriptive compatibility spellings for callers that use a builder-style

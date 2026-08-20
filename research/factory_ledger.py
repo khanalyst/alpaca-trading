@@ -13,6 +13,7 @@ import uuid
 
 from .edge_lab import DEFAULT_DB_PATH, EdgeLedger, canonical_json, content_hash
 from .gates import verify_gate_envelope
+from agent.contracts.rule import rule_variant_id
 
 
 FACTORY_SCHEMA = "strategy-factory.v1"
@@ -21,10 +22,16 @@ ACTIVE_HYPOTHESIS_STATES = {
     "queued", "testing", "backtest_passed", "pending_generation_limit",
     "pending_llm_replacement",
 }
-FACTORY_STATUSES = ACTIVE_HYPOTHESIS_STATES | {"validated", "retired"}
+FACTORY_STATUSES = ACTIVE_HYPOTHESIS_STATES | {
+    "validated", "retired", "bounded_space_exhausted",
+}
+# Variant closures are deliberately distinct from hypothesis retirement.  A
+# bounded search can close one exact parameter point while leaving siblings
+# retryable (or while recentering the hypothesis onto the best fit child).
+VARIANT_CLOSURE_MODES = {"scientific", "budget", "recenter"}
 # What a recorded reason was given for.  ``tuning`` changes the numbers of one
 # hypothesis; the rest change which hypothesis a slot holds.
-LESSON_KINDS = {"tuning", "discovery", "replacement", "rotation", "reseed",
+LESSON_KINDS = {"tuning", "tuning_retry", "discovery", "replacement", "rotation", "reseed",
                 # What a live paper trial taught, which is the only lesson kind
                 # produced by real fills rather than a replay.
                 "trial"}
@@ -239,6 +246,20 @@ class FactoryLedger:
                     created_at REAL NOT NULL,
                     UNIQUE(cycle_id,variant_id,vehicle)
                 );
+                CREATE TABLE IF NOT EXISTS factory_variant_closures (
+                    closure_id TEXT PRIMARY KEY,
+                    hypothesis_id TEXT NOT NULL REFERENCES factory_hypotheses(hypothesis_id),
+                    vehicle TEXT NOT NULL CHECK(vehicle IN ('equity','option')),
+                    variant_id TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK(mode IN ('scientific','budget','recenter')),
+                    reason TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(hypothesis_id,variant_id)
+                );
+                CREATE INDEX IF NOT EXISTS factory_variant_closures_vehicle
+                    ON factory_variant_closures(vehicle,variant_id);
                 CREATE TABLE IF NOT EXISTS factory_cycles (
                     cycle_id TEXT PRIMARY KEY,
                     dataset_hash TEXT NOT NULL,
@@ -282,6 +303,7 @@ class FactoryLedger:
                     passed INTEGER NOT NULL,
                     underpowered INTEGER NOT NULL,
                     classification TEXT NOT NULL,
+                    fit_delta REAL,
                     heldout_delta REAL,
                     heldout_net_pnl REAL,
                     q_value REAL,
@@ -326,6 +348,14 @@ class FactoryLedger:
                     BEFORE DELETE ON factory_accounts BEGIN
                     SELECT RAISE(ABORT, 'factory accounts are immutable');
                 END;
+                CREATE TRIGGER IF NOT EXISTS factory_variant_closures_no_update
+                    BEFORE UPDATE ON factory_variant_closures BEGIN
+                    SELECT RAISE(ABORT, 'factory variant closures are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_variant_closures_no_delete
+                    BEFORE DELETE ON factory_variant_closures BEGIN
+                    SELECT RAISE(ABORT, 'factory variant closures are immutable');
+                END;
                 CREATE TRIGGER IF NOT EXISTS factory_events_no_update
                     BEFORE UPDATE ON factory_events BEGIN
                     SELECT RAISE(ABORT, 'factory events are immutable');
@@ -353,6 +383,9 @@ class FactoryLedger:
                            "ADD COLUMN parent_lesson_id TEXT")
             outcome_columns = {str(row["name"]) for row in
                                db.execute("PRAGMA table_info(factory_lesson_outcomes)")}
+            if outcome_columns and "fit_delta" not in outcome_columns:
+                db.execute("ALTER TABLE factory_lesson_outcomes ADD COLUMN fit_delta REAL")
+                outcome_columns.add("fit_delta")
             if outcome_columns and "classification" not in outcome_columns:
                 # Historical adequate non-passes did not carry the upper-bound
                 # evidence needed to distinguish rejection from uncertainty.
@@ -462,13 +495,27 @@ class FactoryLedger:
 
     def retire_hypothesis(self, hypothesis_id: str, *, cycle_id: str,
                           expected_variants: int, reason: str,
-                          payload: Mapping | None = None) -> None:
-        """Retire only after a replacement exists and every intended gate failed."""
+                          payload: Mapping | None = None,
+                          mode: str = "scientific") -> None:
+        """Close a hypothesis after mode-specific durable verification.
+
+        ``scientific`` preserves the historical strict retirement guard: every
+        intended variant needs an adequate, verified terminal rejection.  A
+        ``budget`` close instead requires every intended exact variant to have
+        an immutable closure row (scientific or budget), while ``recenter``
+        requires a same-family successor and a fit-only child selection.  The
+        latter two modes never relabel underpowered evidence as a statistical
+        rejection.
+        """
         if not reason.strip():
             raise FactoryError("factory retirement reason is required")
+        mode = str(mode)
+        if mode not in {"scientific", "budget", "recenter"}:
+            raise FactoryError("unknown hypothesis retirement mode")
         with closing(_connect(self.path)) as db:
-            child = db.execute("""SELECT 1 FROM factory_hypotheses
-                WHERE parent_hypothesis_id=? LIMIT 1""", (hypothesis_id,)).fetchone()
+            child = db.execute("""SELECT * FROM factory_hypotheses
+                WHERE parent_hypothesis_id=? ORDER BY created_at DESC LIMIT 1""",
+                (hypothesis_id,)).fetchone()
             rows = db.execute("""SELECT result_json FROM factory_accounts
                 WHERE cycle_id=? AND hypothesis_id=? ORDER BY variant_id""",
                 (cycle_id, hypothesis_id)).fetchall()
@@ -476,6 +523,57 @@ class FactoryLedger:
             raise FactoryError("hypothesis cannot retire before its replacement is registered")
         if len(rows) != int(expected_variants) or int(expected_variants) < 1:
             raise FactoryError("hypothesis retirement requires every intended variant account")
+        if mode == "budget":
+            with closing(_connect(self.path)) as db:
+                closures = db.execute(
+                    "SELECT variant_id,mode FROM factory_variant_closures "
+                    "WHERE hypothesis_id=?", (hypothesis_id,)).fetchall()
+            closed = {str(row["variant_id"]): str(row["mode"]) for row in closures}
+            account_ids = set()
+            for row in rows:
+                try:
+                    account_ids.add(str(json.loads(row["result_json"])["variant_id"]))
+                except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                    raise FactoryError("hypothesis budget closure evidence is incomplete") from exc
+            if not account_ids.issubset(closed) or len(account_ids) != int(expected_variants):
+                raise FactoryError("hypothesis budget retirement requires every variant closure")
+            detail = {**dict(payload or {}), "mode": mode, "cycle_id": cycle_id,
+                      "expected_variants": int(expected_variants),
+                      "closed_variant_ids": sorted(account_ids),
+                      "closure_modes": {key: closed[key] for key in sorted(account_ids)}}
+            self._append_event(hypothesis_id, "retired", reason, detail)
+            return
+        if mode == "recenter":
+            detail_payload = dict(payload or {})
+            parent = self.hypothesis(hypothesis_id) or {}
+            child_item = dict(child)
+            if str(child_item.get("family")) != str(parent.get("family")):
+                raise FactoryError("recenter successor must remain in the same family")
+            from_variant = str(detail_payload.get("from_variant_id") or "")
+            to_variant = str(detail_payload.get("to_variant_id") or child_item.get("hypothesis_id"))
+            fit_source = str(detail_payload.get("fit_score_source") or "")
+            fit_score = _real(detail_payload.get("fit_score"))
+            if not from_variant or fit_source != "fit_test.mean_delta" or fit_score is None:
+                raise FactoryError("recenter retirement requires immutable fit-only child evidence")
+            try:
+                source_ids = {str(json.loads(row["result_json"])["variant_id"]) for row in rows}
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise FactoryError("recenter evidence is incomplete") from exc
+            if from_variant not in source_ids:
+                raise FactoryError("recenter source variant was not evaluated")
+            try:
+                child_spec = json.loads(child_item["spec_json"])
+                child_variant = str(rule_variant_id(child_spec))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise FactoryError("recenter successor rule spec is invalid") from exc
+            if to_variant != child_variant:
+                raise FactoryError("recenter target variant does not match successor spec")
+            detail = {**detail_payload, "mode": mode, "cycle_id": cycle_id,
+                      "expected_variants": int(expected_variants),
+                      "from_variant_id": from_variant,
+                      "to_variant_id": to_variant}
+            self._append_event(hypothesis_id, "retired", reason, detail)
+            return
         gate_hashes = []
         for row in rows:
             try:
@@ -616,7 +714,22 @@ class FactoryLedger:
                    WHERE hypothesis_id=? AND variant_id=? AND kind=?""",
                 (hypothesis_id, str(variant_id), kind)).fetchone()
             if existing is not None:
-                return str(existing["lesson_id"])
+                # Replaying an exact underpowered/inconclusive point is
+                # scientifically retryable, but the immutable first lesson
+                # cannot be relinked.  Preserve the new citation as a
+                # separate append-only retry lesson; account attempts remain
+                # the authoritative confirmatory budget.
+                if parent_lesson_id and kind == "tuning":
+                    retry_kind = "tuning_retry"
+                    retry = db.execute(
+                        "SELECT lesson_id FROM factory_lessons WHERE "
+                        "hypothesis_id=? AND variant_id=? AND kind=?",
+                        (hypothesis_id, str(variant_id), retry_kind)).fetchone()
+                    if retry is not None:
+                        return str(retry["lesson_id"])
+                    kind = retry_kind
+                else:
+                    return str(existing["lesson_id"])
             lesson_id = uuid.uuid4().hex
             db.execute(
                 """INSERT INTO factory_lessons
@@ -672,7 +785,135 @@ class FactoryLedger:
                    WHERE l.vehicle=?
                      AND o.classification='adequate_negative_rejection'"""
                 + clause, parameters).fetchall()
-        return {str(row["variant_id"]) for row in rows}
+            # Budget-closed exact variants are also terminal for selection,
+            # but remain distinguishable in the durable closure table/report.
+            closed = db.execute(
+                "SELECT DISTINCT c.variant_id FROM factory_variant_closures c "
+                "JOIN factory_hypotheses h ON h.hypothesis_id=c.hypothesis_id "
+                "WHERE c.vehicle=? AND c.mode IN ('budget','scientific')" +
+                (" AND h.family=?" if family is not None else ""),
+                parameters).fetchall()
+        return ({str(row["variant_id"]) for row in rows} |
+                {str(row["variant_id"]) for row in closed})
+
+    def account_attempts(self, hypothesis_id: str, variant_id: str) -> int:
+        """Count all durable account rows for one exact variant."""
+        with closing(_connect(self.path)) as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS n FROM factory_accounts "
+                "WHERE hypothesis_id=? AND variant_id=?",
+                (str(hypothesis_id), str(variant_id))).fetchone()
+        return int(row["n"] if row else 0)
+
+    def variant_attempts(self, hypothesis_id: str, variant_id: str) -> int:
+        """Count eligible confirmatory attempts for one exact variant.
+
+        Underpowered accounts are diagnostic observations and do not spend the
+        finite confirmatory budget.  Likewise a passing account is not a
+        non-passing attempt that can be retired by budget.  The gate is read
+        from each immutable account result, so a restart cannot lose or
+        inflate the eligible prefix.
+        """
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT result_json FROM factory_accounts "
+                "WHERE hypothesis_id=? AND variant_id=?",
+                (str(hypothesis_id), str(variant_id))).fetchall()
+        eligible = 0
+        for row in rows:
+            try:
+                result = json.loads(row["result_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            gate = result.get("gate") if isinstance(result, Mapping) else None
+            if (not isinstance(gate, Mapping) or
+                    gate.get("sample_adequate") is not True or
+                    gate.get("heldout_sample_adequate") is not True or
+                    gate.get("passes") is True):
+                continue
+            eligible += 1
+        return eligible
+
+    def close_variant(self, hypothesis_id: str, variant_id: str, *,
+                      vehicle: str, mode: str, reason: str,
+                      attempts: int | None = None,
+                      evidence: Mapping | None = None) -> dict[str, Any]:
+        """Persist one exact variant's terminal closure idempotently.
+
+        Closure is append-only and intentionally separate from lessons: a
+        lesson can be inconclusive or underpowered, while this row means the
+        exact variant is no longer eligible for scheduling.
+        """
+        if mode not in VARIANT_CLOSURE_MODES:
+            raise FactoryError("unknown variant closure mode")
+        if vehicle not in {"equity", "option"}:
+            raise FactoryError("vehicle must be equity or option")
+        if not str(reason).strip():
+            raise FactoryError("variant closure reason is required")
+        if self.hypothesis(hypothesis_id) is None:
+            raise KeyError(hypothesis_id)
+        eligible_count = self.variant_attempts(hypothesis_id, variant_id)
+        if attempts is not None:
+            try:
+                requested_count = int(attempts)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise FactoryError("variant attempts must be an integer") from exc
+            if requested_count != eligible_count:
+                raise FactoryError(
+                    "variant closure attempts must match durable eligible "
+                    f"confirmatory count ({eligible_count})")
+        count = eligible_count
+        total_count = self.account_attempts(hypothesis_id, variant_id)
+        with closing(_connect(self.path)) as db, db:
+            existing = db.execute(
+                "SELECT * FROM factory_variant_closures WHERE hypothesis_id=? AND variant_id=?",
+                (str(hypothesis_id), str(variant_id))).fetchone()
+            if existing is not None:
+                return dict(existing) | {"evidence": json.loads(existing["evidence_json"]),
+                                         "account_attempts_total": total_count}
+            closure_id = uuid.uuid4().hex
+            db.execute(
+                """INSERT INTO factory_variant_closures
+                   (closure_id,hypothesis_id,vehicle,variant_id,mode,reason,
+                    attempts,evidence_json,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (closure_id, str(hypothesis_id), str(vehicle), str(variant_id),
+                 str(mode), " ".join(str(reason).split()), count,
+                    canonical_json({**dict(evidence or {}),
+                                    "eligible_confirmatory_attempts": count,
+                                    "account_attempts_total": total_count}),
+                 datetime.now().timestamp()))
+            return {"closure_id": closure_id, "hypothesis_id": str(hypothesis_id),
+                    "vehicle": str(vehicle), "variant_id": str(variant_id),
+                    "mode": str(mode), "reason": " ".join(str(reason).split()),
+                    "attempts": count,
+                    "account_attempts_total": total_count,
+                    "evidence": {**dict(evidence or {}),
+                                  "eligible_confirmatory_attempts": count,
+                                  "account_attempts_total": total_count}}
+
+    def variant_closures(self, *, vehicle: str | None = None,
+                         hypothesis_id: str | None = None) -> list[dict[str, Any]]:
+        where, params = [], []
+        if vehicle is not None:
+            where.append("vehicle=?"); params.append(str(vehicle))
+        if hypothesis_id is not None:
+            where.append("hypothesis_id=?"); params.append(str(hypothesis_id))
+        clause = " WHERE " + " AND ".join(where) if where else ""
+        with closing(_connect(self.path)) as db:
+            rows = db.execute("SELECT * FROM factory_variant_closures" + clause +
+                              " ORDER BY created_at,closure_id", params).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = json.loads(item.pop("evidence_json"))
+            output.append(item)
+        return output
+
+    def closed_variant_ids(self, *, vehicle: str,
+                           hypothesis_id: str | None = None) -> set[str]:
+        return {str(item["variant_id"]) for item in self.variant_closures(
+            vehicle=vehicle, hypothesis_id=hypothesis_id)}
 
     def grade_lesson(self, hypothesis_id: str, variant_id: str, *, kind: str,
                      outcome: Mapping) -> str | None:
@@ -687,6 +928,12 @@ class FactoryLedger:
                 """SELECT lesson_id FROM factory_lessons
                    WHERE hypothesis_id=? AND variant_id=? AND kind=?""",
                 (hypothesis_id, str(variant_id), kind)).fetchone()
+            if lesson is None and kind == "tuning":
+                lesson = db.execute(
+                    """SELECT lesson_id FROM factory_lessons
+                       WHERE hypothesis_id=? AND variant_id=? AND kind='tuning_retry'
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (hypothesis_id, str(variant_id))).fetchone()
             if lesson is None:
                 return None
             lesson_id = str(lesson["lesson_id"])
@@ -699,12 +946,13 @@ class FactoryLedger:
                 "adequate_inconclusive"))
             db.execute("""INSERT INTO factory_lesson_outcomes (
                     outcome_id,lesson_id,passed,underpowered,classification,
-                    heldout_delta,heldout_net_pnl,q_value,failed_checks_json,
-                    gate_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                    fit_delta,heldout_delta,heldout_net_pnl,q_value,failed_checks_json,
+                    gate_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 uuid.uuid4().hex, lesson_id,
                 1 if outcome.get("passed") else 0,
                 1 if outcome.get("underpowered") else 0,
-                classification, _real(outcome.get("heldout_delta")),
+                classification, _real(outcome.get("fit_delta")),
+                _real(outcome.get("heldout_delta")),
                 _real(outcome.get("heldout_net_pnl")),
                 _real(outcome.get("q_value")),
                 canonical_json(list(outcome.get("failed_checks") or [])),
@@ -731,7 +979,7 @@ class FactoryLedger:
         with closing(_connect(self.path)) as db:
             rows = db.execute(
                 """SELECT l.*, o.passed, o.underpowered, o.classification,
-                          o.heldout_delta,
+                          o.fit_delta, o.heldout_delta,
                           o.heldout_net_pnl, o.q_value, o.failed_checks_json,
                           o.gate_hash, o.outcome_id
                    FROM factory_lessons l
@@ -750,13 +998,14 @@ class FactoryLedger:
                 "passed": bool(item["passed"]),
                 "underpowered": bool(item["underpowered"]),
                 "classification": item["classification"],
+                "fit_delta": item["fit_delta"],
                 "heldout_delta": item["heldout_delta"],
                 "heldout_net_pnl": item["heldout_net_pnl"],
                 "q_value": item["q_value"],
                 "failed_checks": json.loads(failed) if failed else [],
                 "gate_hash": item["gate_hash"],
             } if graded else None)
-            for key in ("passed", "underpowered", "classification", "heldout_delta",
+            for key in ("passed", "underpowered", "classification", "fit_delta", "heldout_delta",
                         "heldout_net_pnl", "q_value", "gate_hash"):
                 item.pop(key, None)
             output.append(item)
@@ -777,18 +1026,25 @@ class FactoryLedger:
                        if isinstance(envelope, Mapping) else
                        (gate.get("heldout_source") or gate.get("_heldout_rows")
                         if isinstance(gate, Mapping) else ()))
-            try:
-                self._claim_evidence_db(
-                    db, cycle_id=cycle_id, hypothesis_id=hypothesis_id,
-                    vehicle=str(result["vehicle"]), variant_id=str(result["variant_id"]),
-                    kind="heldout", sessions=self._sessions_from_rows(heldout))
-            except FactoryError:
-                # Synthetic/replayed worker rows can be produced after a
-                # previous claim (for example during a crash-recovery retry).
-                # Preserve the immutable account for audit, while the
-                # scheduler's evidence-session filter and qualification claim
-                # ensure the reused rows cannot authorize a fresh promotion.
-                pass
+            # Underpowered siblings are diagnostic only.  They must not claim
+            # held-out evidence (or advance a boundary) merely by being
+            # persisted as an account.  Adequacy is checked independently for
+            # every variant, so one thin sibling cannot veto a qualified pass.
+            eligible = bool(isinstance(gate, Mapping) and
+                            gate.get("sample_adequate") is True and
+                            gate.get("heldout_sample_adequate") is True)
+            if eligible:
+                try:
+                    self._claim_evidence_db(
+                        db, cycle_id=cycle_id, hypothesis_id=hypothesis_id,
+                        vehicle=str(result["vehicle"]), variant_id=str(result["variant_id"]),
+                        kind="heldout", sessions=self._sessions_from_rows(heldout))
+                except FactoryError:
+                    # Synthetic/replayed worker rows can be produced after a
+                    # previous claim (for example during crash-recovery retry).
+                    # Preserve the immutable account for audit; the scheduler
+                    # filters consumed sessions before a new evaluation.
+                    pass
 
     @staticmethod
     def _sessions_from_rows(rows: Any) -> tuple[str, ...]:
@@ -1055,16 +1311,80 @@ class FactoryLedger:
     online_fdr = record_fdr_decision
     cumulative_fdr = record_fdr_decision
 
-    def fdr_state(self, scope: str = "global") -> dict[str, Any]:
+    def fdr_state(self, scope: str = "global", *, alpha: float = .05) -> dict[str, Any]:
+        """Return an auditable snapshot of a cumulative FDR scope.
+
+        ``alpha`` is the preregistered nominal level, not a spendable LORD
+        wealth balance.  Once a scope has a durable decision its value is
+        immutable and a conflicting requested value is rejected, just as it
+        is by :meth:`next_fdr_allocation` and
+        :meth:`record_fdr_decision`.  The preview is computed from the current
+        decision prefix and does not append a row or reserve an allocation.
+
+        The explicit depletion/resolution fields are intentionally diagnostic:
+        they describe whether a finite next allocation can be resolved by a
+        caller, and never turn ``alpha - alpha_spent`` into an authorization
+        quantity.
+        """
+        nominal = float(alpha)
+        if not math.isfinite(nominal) or not 0 < nominal <= 1:
+            raise FactoryError("alpha must be in (0,1]")
+        resolved_scope = str(scope)
         with closing(_connect(self.path)) as db:
-            rows = db.execute("SELECT * FROM factory_fdr WHERE scope=? ORDER BY created_at,decision_id",
-                              (str(scope),)).fetchall()
-        method, p_kind = _fdr_semantics(str(scope))
-        return {"scope": str(scope), "cumulative": True, "tests": len(rows),
-                "alpha_spent": sum(float(row["allocated_alpha"]) for row in rows),
-                "discoveries": sum(int(row["decision"]) for row in rows),
-                "method": method, "p_value_kind": p_kind,
-                "decisions": [dict(row) for row in rows]}
+            rows = db.execute(
+                "SELECT * FROM factory_fdr WHERE scope=? "
+                "ORDER BY created_at,decision_id", (resolved_scope,)).fetchall()
+        nominal = _locked_scope_alpha(list(rows), nominal)
+        decisions = [dict(row) for row in rows]
+        test_index, next_allocated = _fdr_allocation(list(rows), nominal)
+        method, p_kind = _fdr_semantics(resolved_scope)
+        # Floating point underflow is the only practical way this telescoping
+        # allocation reaches zero.  Keep the threshold explicit so readers do
+        # not mistake ``alpha_spent`` for remaining online-FDR wealth.
+        resolution_epsilon = float(math.ulp(max(1.0, nominal)))
+        resolution_exhausted = bool(next_allocated <= resolution_epsilon)
+        preview = {
+            "scope": resolved_scope,
+            "alpha": nominal,
+            "allocated_alpha": next_allocated,
+            "next_allocated_alpha": next_allocated,
+            "tests": test_index,
+            "cumulative": True,
+            "method": method,
+            "p_value_kind": p_kind,
+            "preview": True,
+        }
+        return {
+            "scope": resolved_scope,
+            "cumulative": True,
+            "alpha": nominal,
+            "alpha_locked": bool(rows),
+            "alpha_immutable": True,
+            "alpha_source": "durable" if rows else "default_preview",
+            "alpha_spent": sum(float(row["allocated_alpha"]) for row in rows),
+            "tests": len(rows),
+            "discoveries": sum(int(row["decision"]) for row in rows),
+            "next_test": test_index,
+            "next_allocated_alpha": next_allocated,
+            "next_preview": preview,
+            "next_allocation": preview,
+            "next_allocation_preview": preview,
+            "preview": preview,
+            "resolution_epsilon": resolution_epsilon,
+            "depleted": bool(next_allocated <= 0.0),
+            "allocation_depleted": bool(next_allocated <= 0.0),
+            "is_depleted": bool(next_allocated <= 0.0),
+            "resolution_exhausted": resolution_exhausted,
+            "resolution_available": not resolution_exhausted,
+            "has_resolution": not resolution_exhausted,
+            "resolution_reason": ("next_allocation_available"
+                                  if not resolution_exhausted
+                                  else "next_allocation_underflow"),
+            "resolution_status": "exhausted" if resolution_exhausted else "available",
+            "method": method,
+            "p_value_kind": p_kind,
+            "decisions": decisions,
+        }
 
     online_fdr_state = fdr_state
 
@@ -1075,12 +1395,16 @@ class FactoryLedger:
                 "SELECT COUNT(*) AS n FROM factory_accounts").fetchone()["n"]
             cycles = db.execute(
                 "SELECT COUNT(*) AS n FROM factory_cycles").fetchone()["n"]
+            closures = db.execute(
+                "SELECT COUNT(*) AS n FROM factory_variant_closures").fetchone()["n"]
         return {"schema": FACTORY_SCHEMA, "hypotheses": hypotheses,
-                "accounts": int(accounts), "cycles": int(cycles)}
+                "accounts": int(accounts), "cycles": int(cycles),
+                "variant_closures": int(closures)}
 
 
 __all__ = [
     "ACTIVE_HYPOTHESIS_STATES", "FACTORY_SCHEMA", "FACTORY_IDENTITY_SCHEMA", "FACTORY_STATUSES",
+    "VARIANT_CLOSURE_MODES",
     "FDR_METHOD", "LEGACY_FDR_METHOD", "LESSON_KINDS", "LESSON_SOURCES", "FactoryError", "FactoryLedger",
     "deferred_fdr",
     "experiment_identity",

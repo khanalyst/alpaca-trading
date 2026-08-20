@@ -332,6 +332,87 @@ class _StockDataFake:
 
 
 class DeployTests(unittest.TestCase):
+    def _calibration_normalizer(self, report, *, bootstrap=False,
+                                journal_present=True):
+        """Execute the research-cycle calibration normalizer in isolation."""
+        script = Path("deploy/research-cycle.sh").read_text(encoding="utf-8")
+        marker = 'normalized_report="$('
+        start = script.index("<<'PY'\n", script.index(marker)) + len("<<'PY'\n")
+        end = script.index("\nPY\n", start)
+        body = script[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "calibration.json"
+            journal = root / "journal.db"
+            output.write_text(json.dumps(report), encoding="utf-8")
+            if journal_present:
+                journal.touch()
+            result = subprocess.run(
+                [sys.executable, "-", str(output), str(journal), "86400", "2",
+                 "option", "1" if bootstrap else "0"],
+                input=body, text=True, capture_output=True, check=False)
+        return result
+
+    def test_calibration_bootstrap_unknown_is_opt_in_and_fail_closed(self):
+        empty = {"authorization_verdict": "insufficient_data",
+                 "authorization_exit_code": 2, "journal_fills": 0,
+                 "available_vehicles": []}
+        denied = self._calibration_normalizer(empty)
+        self.assertEqual(denied.returncode, 2)
+        self.assertEqual(json.loads(denied.stdout)["calibration_status"], "blocked")
+
+        bootstrap = self._calibration_normalizer(empty, bootstrap=True)
+        self.assertEqual(bootstrap.returncode, 2)
+        payload = json.loads(bootstrap.stdout)
+        self.assertEqual(payload["calibration_status"], "bootstrap_unknown")
+        self.assertEqual(payload["calibration_state"], "bootstrap_unknown")
+        self.assertEqual(payload["authorization_exit_code"], 2)
+        self.assertTrue(payload["bootstrap_unknown"])
+
+        missing = self._calibration_normalizer(
+            empty, bootstrap=True, journal_present=False)
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(json.loads(missing.stdout)["calibration_status"],
+                         "bootstrap_unknown")
+
+        for history in (
+                {"journal_fills": 1, "available_vehicles": ["option"]},
+                {"journal_fills": 0, "available_vehicles": ["equity"]},
+                {"journal_fills": 3, "available_vehicles": ["equity", "option"]}):
+            with self.subTest(history=history):
+                report = {**empty, **history}
+                result = self._calibration_normalizer(report, bootstrap=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(json.loads(result.stdout)["calibration_status"],
+                                 "blocked")
+
+    def test_research_cycle_missing_journal_bootstrap_is_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "data.csv"
+            dataset.write_text(_replay_corpus_csv(quotes=True), encoding="utf-8")
+            journal = root / "missing" / "journal.db"
+            report_path = root / "calibration-%s.json"
+            denied = _run_research_cycle(
+                dataset, root / "off",
+                ALPACA_RESEARCH_JOURNAL=str(journal),
+                ALPACA_RESEARCH_CALIBRATION_REPORT=str(report_path),
+                ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN="0")
+            self.assertIn("journal_unavailable", denied.stderr)
+
+            allowed = _run_research_cycle(
+                dataset, root / "on",
+                ALPACA_RESEARCH_JOURNAL=str(journal),
+                ALPACA_RESEARCH_CALIBRATION_REPORT=str(root / "on" /
+                                                       "calibration-%s.json"),
+                ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN="1")
+            report = root / "on" / "calibration-equity.json"
+            self.assertTrue(report.is_file(), allowed.stderr)
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(payload["calibration_state"], "bootstrap_unknown")
+            self.assertEqual(payload["authorization_exit_code"], 2)
+            self.assertIn("bootstrap_unknown", allowed.stderr)
+
     def test_direct_health_probe_bootstraps_repo_import(self):
         env = dict(os.environ)
         env.pop("PYTHONPATH", None)
@@ -449,6 +530,65 @@ class DeployTests(unittest.TestCase):
             "component": "review", "status": "RETRY_PENDING",
             "reviewed": 2, "retry_pending": 1, "failed": 0,
         }])
+
+    def test_research_cycle_factory_status_contract_is_explicit(self):
+        script = Path("deploy/research-cycle.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            '--max-confirmatory-attempts "${ALPACA_FACTORY_MAX_CONFIRMATORY_ATTEMPTS:-3}"',
+            script)
+        self.assertIn('cycle_outcomes+=("$vehicle:factory:search_exhausted")',
+                      script)
+        self.assertIn('cycle_outcomes+=("$vehicle:factory:llm_provider_failure")',
+                      script)
+        self.assertIn('finish "search_exhausted"', script)
+        self.assertIn('finish "llm_provider_failure"', script)
+
+        for status in ("search_exhausted", "llm_provider_failure"):
+            with self.subTest(status=status):
+                payload = scheduler_output.structured_research_cycle({
+                    "schema": "research-cycle.v1", "status": status,
+                    "reason": "factory diagnostic", "exit_code": 0,
+                    "outcomes": [f"equity:factory:{status}"],
+                    "proofs": False, "no_edge": False,
+                })
+                self.assertIsNotNone(payload)
+                self.assertEqual(payload["status"], status)
+
+    def test_scheduler_persists_explicit_factory_terminal_statuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text("mode: paper\nbroker:\n  paper: true\n",
+                              encoding="utf-8")
+            script = root / "cycle.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$CYCLE_RESULT\"\n"
+                "exit \"${CYCLE_EXIT:-0}\"\n", encoding="utf-8")
+            script.chmod(0o755)
+            status_file = root / "health.json"
+            for status in ("search_exhausted", "llm_provider_failure"):
+                scheduler._running = True
+                env = dict(os.environ,
+                           CYCLE_RESULT=json.dumps({
+                               "schema": "research-cycle.v1",
+                               "status": status,
+                               "reason": "factory diagnostic",
+                               "exit_code": 0,
+                               "outcomes": [f"equity:factory:{status}"],
+                               "proofs": False, "no_edge": False,
+                           }), CYCLE_EXIT="0")
+                with patch.dict(os.environ, env, clear=True):
+                    args = SimpleNamespace(
+                        status_file=str(status_file), config=str(config),
+                        script=str(script), root=str(root), hour=3, minute=0,
+                        once=True, timeout_seconds=10,
+                        output_limit_chars=4096)
+                    self.assertEqual(scheduler.run_scheduler(args), 0)
+                payload = json.loads(status_file.read_text(encoding="utf-8"))
+                self.assertEqual(payload["status"], status)
+                self.assertEqual(payload["cycle_status"], status)
+                self.assertEqual(payload["research_cycle"]["status"], status)
 
     def test_scheduler_output_start_capture_drains_text_stream(self):
         stream = io.StringIO("line one\nline two\n")
@@ -641,6 +781,27 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(payload["exit_code"], 2)
             self.assertIn('"schema":"research-llm.v1"', result.stderr)
             self.assertIn('"status":"disabled"', result.stderr)
+
+    def test_research_cycle_emits_forward_readiness_after_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "market.csv"
+            dataset.write_text(_replay_corpus_csv(quotes=True, sessions=2),
+                               encoding="utf-8")
+            result = _run_research_cycle(dataset, root,
+                                         ALPACA_RESEARCH_BACKTEST="0")
+        readiness = [item for item in _cycle_payloads(result.stderr, "schema")
+                     if item.get("schema") == "research-readiness.v1"]
+        self.assertTrue(readiness, result.stderr)
+        event = readiness[0]
+        self.assertEqual(event["state"], "pending")
+        self.assertEqual(event["recorded_sessions"], 2)
+        self.assertEqual(event["shadow_min_sessions"], 60)
+        self.assertAlmostEqual(event["heldout_fraction"], .24)
+        self.assertEqual(event["offline_required_sessions"], 150)
+        self.assertEqual(event["required_sessions"], 210)
+        self.assertGreater(event["sessions_remaining"], 0)
+        self.assertIn("candidate-specific shadow proof", event["reason"])
 
     def test_research_cycle_fails_fast_when_enabled_llm_has_no_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1837,6 +1998,26 @@ class DeployTests(unittest.TestCase):
         self.assertIn("  shadow:\n", text)
         self.assertNotIn("profiles:", text)
         self.assertIn("ALPACA_RESEARCH_DATASET", text)
+
+    def test_shadow_retention_defaults_are_shared_and_explicit(self):
+        self.assertEqual(shadow_service.parser().parse_args([]).retention_days, 180)
+        text = Path("compose.yaml").read_text(encoding="utf-8")
+        self.assertIn("--retention-days", text)
+        self.assertIn("${ALPACA_SHADOW_RETENTION_DAYS:-180}", text)
+
+    def test_shadow_health_exposes_retention_and_stale_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "shadow.json"
+            path.write_text(json.dumps({
+                "status": "running", "updated_ts": 100,
+                "retention_days": 180, "retention_floor_ts": 1.0,
+                "pruned_replay_diffs": 2,
+                "stale_tail": {"status": "blocked", "sessions": ["2026-01-02"]},
+            }), encoding="utf-8")
+            result = health.shadow(path, 60, now=100)
+        self.assertEqual(result["retention_days"], 180)
+        self.assertEqual(result["pruned_replay_diffs"], 2)
+        self.assertEqual(result["stale_tail"]["status"], "blocked")
 
 
 if __name__ == "__main__":

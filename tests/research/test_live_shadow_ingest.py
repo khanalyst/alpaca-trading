@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -232,6 +233,45 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(result["ingested"], 0)
         self.assertEqual(self.ledger.runs(cid, lane="shadow"), [])
         self.assertEqual(self.ledger.candidate(cid)["status"], "backtest_passed")
+
+    def test_control_only_forward_session_is_not_skipped(self):
+        """A session present only in a required arm blocks boundary advance."""
+        cid = self.candidate["candidate_id"]
+        self._rows(cid, [2.0] * 16)
+        self._rows(self.baseline["candidate_id"], [0.0] * 16)
+        self._rows(f"shadow:null:{cid}", [-1.0] * 16)
+        # Add a newer session to the controls only.  The candidate arm must
+        # not authorize the older complete subset while this tail is missing.
+        self._row(self.baseline["candidate_id"], 17, 0.0)
+        self._row(f"shadow:null:{cid}", 17, -1.0)
+        result = ingest_shadow(ShadowIngestConfig(
+            self.edge_path, self.shadow_path, min_trades=1, min_sessions=1))
+        self.assertEqual(result["ingested"], 0)
+        row = result["candidates"][0]
+        self.assertEqual(row["status"], "incomplete")
+        self.assertIn("session 2024-04-17", row["reason"])
+        self.assertEqual(row["boundary"], "2024-02-01")
+        self.assertEqual(FactoryLedger(self.edge_path).fdr_state(
+            "shadow-confirmation-v4:equity")["tests"], 0)
+
+    def test_retention_gap_is_explicit_and_does_not_advance_boundary(self):
+        cid = self.candidate["candidate_id"]
+        self._rows(cid, [2.0] * 16)
+        self._rows(self.baseline["candidate_id"], [0.0] * 16)
+        self._rows(f"shadow:null:{cid}", [-1.0] * 16)
+        aged = time.time() - 20 * 86400
+        with sqlite3.connect(self.shadow_path) as db:
+            db.execute("UPDATE replay_diffs SET created_at=?", (aged,))
+        pruned = ShadowStore(self.shadow_path, retention_days=14).prune()
+        self.assertEqual(pruned["pruned_replay_diffs"], 48)
+        result = ingest_shadow(ShadowIngestConfig(
+            self.edge_path, self.shadow_path, min_trades=1, min_sessions=1))
+        row = result["candidates"][0]
+        self.assertEqual(row["status"], "retention_gap")
+        self.assertTrue(row["retention_gap"])
+        self.assertEqual(row["boundary"], "2024-02-01")
+        self.assertEqual(FactoryLedger(self.edge_path).fdr_state(
+            "shadow-confirmation-v4:equity")["tests"], 0)
 
     def test_repeated_ingestion_is_idempotent(self):
         cid = self.candidate["candidate_id"]

@@ -12,6 +12,7 @@ import json
 import math
 import random
 from statistics import NormalDist
+from typing import Mapping
 
 
 PAIRED_SIGN_FLIP_NULL_ASSUMPTION = (
@@ -734,6 +735,259 @@ def effective_breadth_report(
             "correlation": correlations}
 
 
+def _family_session_observations(values, sessions=None, *,
+                                 family_key: str = "family",
+                                 session_key: str = "session",
+                                 value_key: str = "statistic"):
+    """Coerce common family/session vector shapes into finite observations.
+
+    This helper is deliberately permissive because the report is an
+    observability surface, not an authorizing gate.  It accepts nested
+    ``family -> session -> value`` mappings, row mappings, and triples of
+    ``(family, session, value)``.  A sequence value is reduced to its finite
+    arithmetic mean; callers that need a separate statistic should pass one
+    report per statistic.  Duplicate family/session cells are retained so the
+    public report can disclose that they were averaged.
+    """
+    observations: list[tuple[str, str, float]] = []
+    invalid = 0
+    dimensions: dict[tuple[str, str], int] = {}
+
+    def scalar(value):
+        nonlocal invalid
+        if isinstance(value, bool) or value is None:
+            invalid += 1
+            return None
+        if isinstance(value, (list, tuple)):
+            finite = []
+            for item in value:
+                try:
+                    number = float(item)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(number):
+                    finite.append(number)
+            if not finite:
+                invalid += 1
+                return None
+            return sum(finite) / len(finite)
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            invalid += 1
+            return None
+        if not math.isfinite(number):
+            invalid += 1
+            return None
+        return number
+
+    def add(family, session, value):
+        number = scalar(value)
+        if number is None:
+            return
+        key = (str(family), str(session))
+        observations.append((key[0], key[1], number))
+        if isinstance(value, (list, tuple)):
+            dimensions[key] = max(dimensions.get(key, 0), len(value))
+
+    if isinstance(values, Mapping):
+        # Also accept a flat tuple-key mapping: {(family, session): value}.
+        for family, per_family in values.items():
+            if (isinstance(family, (tuple, list)) and len(family) >= 2 and
+                    not isinstance(per_family, Mapping)):
+                add(family[0], family[1], per_family)
+                continue
+            if isinstance(per_family, Mapping):
+                for session, value in per_family.items():
+                    add(family, session, value)
+                continue
+            if sessions is None:
+                continue
+            try:
+                paired_sessions = list(sessions)
+                paired_values = list(per_family)
+            except (TypeError, ValueError):
+                invalid += 1
+                continue
+            for session, value in zip(paired_sessions, paired_values):
+                add(family, session, value)
+    else:
+        try:
+            iterable = list(values or ())
+        except TypeError:
+            iterable = []
+            invalid += 1
+        for row in iterable:
+            if isinstance(row, Mapping):
+                family = row.get(family_key, row.get("family"))
+                session = row.get(session_key, row.get("session"))
+                value = row.get(value_key, row.get("value"))
+                if value is None:
+                    value = row.get("delta", row.get("net_pnl"))
+            else:
+                try:
+                    family, session, value = row[:3]
+                except (TypeError, ValueError, IndexError):
+                    invalid += 1
+                    continue
+            if family is None or session is None:
+                invalid += 1
+                continue
+            add(family, session, value)
+    return observations, dimensions, invalid
+
+
+def cross_family_dependence_report(
+        family_session_vectors, sessions=None, *,
+        family_key: str = "family", session_key: str = "session",
+        value_key: str = "statistic", min_sessions: int = 3,
+        strong_threshold: float = .8) -> dict:
+    """Describe dependence between strategy families over shared sessions.
+
+    The input is interpreted as one statistic per family/session cell (or a
+    short vector whose finite mean is used for that cell).  Correlations are
+    pairwise Pearson correlations over complete shared sessions and are
+    strictly diagnostic: this function never changes a gate, BH correction,
+    allocation, or runtime grouping.  Missing cells, duplicate cells, and
+    degenerate vectors are reported explicitly instead of being imputed.
+    """
+    try:
+        minimum = max(2, int(min_sessions))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_sessions must be a positive integer") from exc
+    try:
+        threshold = float(strong_threshold)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("strong_threshold must be a finite number") from exc
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("strong_threshold must be between zero and one")
+    observations, dimensions, invalid = _family_session_observations(
+        family_session_vectors, sessions, family_key=family_key,
+        session_key=session_key, value_key=value_key)
+    grouped: dict[tuple[str, str], list[float]] = {}
+    for family, session, value in observations:
+        grouped.setdefault((family, session), []).append(value)
+    families = sorted({family for family, _ in grouped})
+    ordered_sessions = sorted({session for _, session in grouped})
+    matrix = {key: sum(values) / len(values) for key, values in grouped.items()}
+    duplicate_cells = sum(max(0, len(values) - 1) for values in grouped.values())
+    expected = len(families) * len(ordered_sessions)
+    complete = [session for session in ordered_sessions
+                if all((family, session) in matrix for family in families)]
+    vectors = {
+        family: [matrix[(family, session)] for session in complete]
+        for family in families
+    }
+    common = {
+        "schema": "cross-family-dependence.v1",
+        "method": "pairwise_complete_session_pearson",
+        "available": False,
+        "families": families,
+        "sessions": ordered_sessions,
+        "complete_sessions": complete,
+        "vectors": vectors,
+        "family_session_vectors": vectors,
+        "pairwise": [],
+        "pair_reports": [],
+        "correlations": {},
+        "correlation_matrix": {},
+        "family_count": len(families),
+        "session_count": len(ordered_sessions),
+        "complete_session_count": len(complete),
+        "minimum_sessions": minimum,
+        "observations": len(matrix),
+        "expected_observations": expected,
+        "missing_cells": max(0, expected - len(matrix)),
+        "duplicate_cells": duplicate_cells,
+        "invalid_observations": invalid,
+        "vector_dimensions": {
+            f"{family}:{session}": dimensions[(family, session)]
+            for family, session in sorted(dimensions)
+        },
+        "strong_threshold": threshold,
+        "dependence": {
+            "strong_pairs": [], "moderate_pairs": [],
+            "mean_absolute_correlation": None,
+            "max_absolute_correlation": None,
+        },
+    }
+    if len(families) < 2:
+        return {**common, "reason": "insufficient_families"}
+    if len(complete) < minimum:
+        return {**common, "reason": "insufficient_complete_sessions"}
+    pairwise = []
+    for index, left in enumerate(families):
+        for right in families[index + 1:]:
+            left_values = vectors[left]
+            right_values = vectors[right]
+            left_mean = sum(left_values) / len(left_values)
+            right_mean = sum(right_values) / len(right_values)
+            left_centered = [value - left_mean for value in left_values]
+            right_centered = [value - right_mean for value in right_values]
+            left_var = sum(value * value for value in left_centered)
+            right_var = sum(value * value for value in right_centered)
+            covariance = sum(a * b for a, b in zip(left_centered, right_centered))
+            correlation = (covariance / math.sqrt(left_var * right_var)
+                           if left_var > 1e-18 and right_var > 1e-18 else None)
+            if correlation is not None:
+                correlation = min(1.0, max(-1.0, correlation))
+            absolute = abs(correlation) if correlation is not None else None
+            item = {
+                "families": [left, right],
+                "left": left,
+                "right": right,
+                "sessions": len(complete),
+                "correlation": correlation,
+                "absolute_correlation": absolute,
+                "available": correlation is not None,
+                "reason": None if correlation is not None else "degenerate_vector",
+            }
+            pairwise.append(item)
+    available_pairs = [item for item in pairwise if item["available"]]
+    correlations = {
+        f"{item['left']}|{item['right']}": item["correlation"]
+        for item in available_pairs
+    }
+    correlation_matrix = {family: {other: (1.0 if family == other else None)
+                                   for other in families}
+                          for family in families}
+    for item in available_pairs:
+        correlation_matrix[item["left"]][item["right"]] = item["correlation"]
+        correlation_matrix[item["right"]][item["left"]] = item["correlation"]
+    absolute_values = [item["absolute_correlation"] for item in available_pairs]
+    strong = [item["families"] for item in available_pairs
+              if item["absolute_correlation"] >= threshold]
+    moderate = [item["families"] for item in available_pairs
+                if item["absolute_correlation"] >= .5]
+    dependence = {
+        "strong_pairs": strong,
+        "moderate_pairs": moderate,
+        "mean_absolute_correlation": (
+            sum(absolute_values) / len(absolute_values)
+            if absolute_values else None),
+        "max_absolute_correlation": max(absolute_values)
+        if absolute_values else None,
+        "mean_abs_correlation": (
+            sum(absolute_values) / len(absolute_values)
+            if absolute_values else None),
+        "max_abs_correlation": max(absolute_values)
+        if absolute_values else None,
+    }
+    return {**common, "available": bool(available_pairs), "reason": None
+            if available_pairs else "no_non_degenerate_pairs",
+            "pairwise": pairwise, "correlations": correlations,
+            "pair_reports": pairwise, "correlation_matrix": correlation_matrix,
+            "dependence": dependence}
+
+
+# Explicit aliases make the report easy to discover for callers that describe
+# the input as a mapping rather than a vector table.
+family_session_dependence_report = cross_family_dependence_report
+cross_family_report = cross_family_dependence_report
+cross_family_dependence = cross_family_dependence_report
+family_dependence_report = cross_family_dependence_report
+
+
 def paired_cluster_sign_flip(
         pairs: list[tuple[float, float, float]], *,
         cluster_seconds: int = 21_600, exact_max_clusters: int = 16,
@@ -813,6 +1067,9 @@ __all__ = ["DEFAULT_BREADTH_MIN_CLUSTERS", "DEFAULT_BREADTH_MIN_SESSIONS",
            "clustered_mde_power_report", "clustered_mde_report",
            "clustered_mde_power", "mde_power_report",
            "effective_breadth_report",
+           "cross_family_dependence_report", "family_session_dependence_report",
+           "cross_family_report", "cross_family_dependence",
+           "family_dependence_report",
            "moving_block_cluster_bootstrap_lower_bound",
            "paired_cluster_sign_flip", "sign_flip_null_statistics",
            "stable_seed"]

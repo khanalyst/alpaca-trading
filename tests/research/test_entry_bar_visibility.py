@@ -11,7 +11,7 @@ from research.edge_discovery_core import _null_reference_rows
 from research.edge_lab import _read_discovery_rows
 from research.factory_core import _simulate_trade
 from research.fit_diagnostics import _fit_prefixes, measure_fit_diagnostics
-from research.ibr import IBRConfig, replay_ibr
+from research.ibr import IBRConfig, IBRResult, replay_ibr
 from research.gates import authorization_projection
 from research.market_data import normalize_underlying_bar
 from research.strategy_factory import null_control_account
@@ -39,6 +39,45 @@ def _delayed(bar, minutes=5):
 
 
 class EntryBarVisibilityTests(unittest.TestCase):
+    def test_backfill_label_comes_from_provenance_and_null_visibility_is_policy_bound(self):
+        historical = [replace(
+            bar, identity=replace(bar.identity,
+                                   source_mode="historical_backfill"))
+                      for bar in bars_for_day()]
+        policy_off = ReplayPolicy(strict_market_data=False)
+        result = replay_ibr(
+            historical,
+            config=permissive_config(stop_pct=.01, target_pct=.02,
+                                     costs=FREE, policy=policy_off),
+        )
+        self.assertEqual(len(result.trades), 1)
+        # The source label is truthful even though the diagnostic policy was
+        # off; policy controls only whether the backfill is visible to replay.
+        self.assertEqual(result.trades[0].evidence_mode,
+                         "diagnostic_historical_backfill")
+
+        # Remove the persisted anchor so this check exercises opening-bar
+        # visibility rather than a separately recorded executable quote.
+        trade = replace(result.trades[0], underlying_entry=None)
+        result = IBRResult(vehicle="equity", trades=[trade])
+        delayed = [replace(
+            bar,
+            identity=replace(
+                bar.identity,
+                source_mode="historical_backfill",
+                observed_at=bar.timestamp + timedelta(minutes=5),
+            ),
+        ) if index == 31 else bar for index, bar in enumerate(historical)]
+        hidden = _null_reference_rows(
+            result, delayed, "equity", policy=policy_off)[0]
+        visible = _null_reference_rows(
+            result, delayed, "equity",
+            policy=diagnostic_backfill_policy(ReplayPolicy()))[0]
+        self.assertTrue(hidden["no_trade"])
+        self.assertFalse(visible["no_trade"])
+        self.assertEqual(hidden["evidence_mode"],
+                         "diagnostic_historical_backfill")
+
     def test_backfill_requires_explicit_diagnostic_policy_and_cannot_authorize(self):
         observed = datetime(2026, 8, 19, tzinfo=timezone.utc)
         bars = [replace(
@@ -201,6 +240,15 @@ class EntryBarVisibilityTests(unittest.TestCase):
                          delayed_observation.isoformat())
         self.assertEqual(measure_fit_diagnostics(delayed, SPEC)
                          ["first_signal"]["signals"], 1)
+
+        historical_trade = _simulate_trade(
+            [replace(bar, identity=replace(
+                bar.identity, source_mode="historical_backfill"))
+             for bar in baseline],
+            SPEC, [], "equity", policy=BAR_FALLBACK)
+        self.assertIsNotNone(historical_trade)
+        self.assertEqual(historical_trade["evidence_mode"],
+                         "diagnostic_historical_backfill")
 
     def test_factory_accepts_recorder_style_delayed_bar_with_boundary_quote(self):
         _raw, bars, snapshots, quotes = _read_discovery_rows(edge_corpus(1))

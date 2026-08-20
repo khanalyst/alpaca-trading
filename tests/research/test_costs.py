@@ -22,7 +22,8 @@ from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
                             DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
                             RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy,
                             STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
-                            SQLiteQuoteIndex, index_quotes, quote_fill,
+                            SQLiteQuoteIndex, check_stressed_cost_plan,
+                            index_quotes, quote_fill, quote_fill_record,
                             cost_model_for_vehicle, risk_unit_report,
                             stressed_cost_usd)
 from research.edge_discovery_core import (DiscoveryError,
@@ -79,6 +80,48 @@ def _quote(minute, bid, ask, *, as_of_minute=None):
 
 
 class CostModelTests(unittest.TestCase):
+    def test_replay_policy_stress_controls_are_runtime_only_and_identity_bound(self):
+        direct = ReplayPolicy()
+        self.assertIsNone(direct.stressed_cost_scenario_bps)
+        self.assertIsNone(direct.max_stressed_cost_to_risk_ratio)
+        runtime = ReplayPolicy.from_config(validate_config({}))
+        self.assertEqual(runtime.stressed_cost_scenario_bps, 25.0)
+        self.assertEqual(runtime.max_stressed_cost_to_risk_ratio, .30)
+        self.assertEqual(runtime.as_dict()["stressed_cost_scenario_bps"], 25.0)
+        self.assertEqual(runtime.as_dict()["max_stressed_cost_to_risk_ratio"], .30)
+
+    def test_research_stress_veto_matches_runtime_at_boundary(self):
+        config = validate_config({"risk": {
+            "stressed_cost_scenario_bps": 25.0,
+            "max_stressed_cost_to_risk_ratio": .30,
+        }})
+        engine = RiskEngine(config)
+        for distance_bps, expected in ((30.0, "stressed_cost_risk_limit"),
+                                       (84.0, None)):
+            with self.subTest(distance_bps=distance_bps):
+                plan = {"execution_profile": "shares", "shares": 10,
+                        "notional": 1_000.0,
+                        "risk_usd": 10 * distance_bps / 100.0}
+                runtime, runtime_reason = engine.check_stressed_cost(
+                    plan, cfg=config)
+                research, research_reason = check_stressed_cost_plan(
+                    plan, scenario_bps=25.0, max_ratio=.30,
+                    config=config)
+                self.assertEqual(research_reason, runtime_reason)
+                self.assertEqual(research_reason, expected)
+                self.assertEqual(research is None, runtime is None)
+                if research is not None:
+                    self.assertAlmostEqual(
+                        research["stressed_cost_to_risk_ratio"],
+                        runtime["stressed_cost_to_risk_ratio"])
+
+    def test_partial_null_stress_controls_fail_closed_like_runtime(self):
+        plan = {"execution_profile": "shares", "shares": 1,
+                "notional": 100.0, "risk_usd": 1.0}
+        _, reason = check_stressed_cost_plan(
+            plan, scenario_bps=None, max_ratio=.30)
+        self.assertEqual(reason, "stressed_cost_invalid")
+
     def test_stress_names_entry_notional_and_basis_without_changing_formula(self):
         self.assertAlmostEqual(
             stressed_cost_usd(entry_notional=1_000.0, scenario_bps=25.0,
@@ -441,6 +484,14 @@ class ExitGapThroughTests(unittest.TestCase):
 
 
 class QuoteDrivenFillTests(unittest.TestCase):
+    def test_quote_fill_record_preserves_executable_provenance(self):
+        indexed = index_quotes([_quote(4, 100.0, 100.1)])
+        record = quote_fill_record(indexed, symbol="SPY",
+                                   at=BASE + timedelta(minutes=4), side="buy")
+        self.assertIsNotNone(record)
+        self.assertAlmostEqual(record.price, 100.1)
+        self.assertEqual((record.feed, record.provider), ("sip", "test"))
+
     def test_the_latest_visible_quote_at_the_instant_wins(self):
         indexed = index_quotes([_quote(3, 99.0, 99.1), _quote(4, 100.0, 100.1),
                                 _quote(5, 200.0, 200.1)])
@@ -601,6 +652,31 @@ class NullControlSharesTheFillModelTests(unittest.TestCase):
             bars, [], SPEC, vehicle="equity", reference_rows=reference,
             account_id="null", risk_pct=.05, policy=PERMISSIVE_POLICY)
         self.assertGreater(free["ending_equity"], priced["ending_equity"])
+
+    def test_candidate_and_null_share_the_stressed_cost_veto(self):
+        bars = _bars(RISING + FLAT)
+        # Build the null reference without the runtime veto so it has the same
+        # authored geometry the candidate would present to RiskEngine.
+        reference = simulate_account(
+            bars, [], SPEC, vehicle="equity", account_id="reference-stress",
+            risk_pct=.05, policy=PERMISSIVE_POLICY)["rows"]
+        stressed = ReplayPolicy(
+            strict_market_data=False, risk_per_trade_pct=.05,
+            stressed_cost_scenario_bps=25.0,
+            max_stressed_cost_to_risk_ratio=.30)
+        candidate = simulate_account(
+            bars, [], SPEC, vehicle="equity", account_id="candidate-stress",
+            risk_pct=.05, policy=stressed)
+        null = null_control_account(
+            bars, [], SPEC, vehicle="equity", reference_rows=reference,
+            account_id="null-stress", risk_pct=.05, policy=stressed)
+        self.assertEqual(candidate["rows"][0]["reject_reason"],
+                         "stressed_cost_risk_limit")
+        null_rows = [row for row in null["rows"]
+                     if row.get("no_trade") is True]
+        self.assertTrue(null_rows)
+        self.assertTrue(any(row.get("reject_reason") ==
+                            "stressed_cost_risk_limit" for row in null_rows))
 
 
 class NotionalCapAnchorTests(unittest.TestCase):

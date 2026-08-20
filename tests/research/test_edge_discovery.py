@@ -452,7 +452,18 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                  "vehicle": "equity", "source": live_source,
                  "replay_digests": [item["replay_digest"]
                                     for item in live_source["sessions"]],
-                 "run_provenance": {**hashes, "candidate_id": candidate_id},
+                 # Keep the persisted marker's provenance identical to the
+                 # production ingest contract.  The verifier binds these
+                 # identity fields to the immutable candidate and run before
+                 # accepting the shadow proof for promotion.
+                 "run_provenance": {
+                     **hashes,
+                     "candidate_id": candidate_id,
+                     "vehicle": "equity",
+                     "candidate_proof": {key: candidate.get(key) for key in (
+                         "candidate_id", "dataset_hash", "config_hash",
+                         "code_hash", "provenance_hash")},
+                 },
                  "candidate_proof": {key: candidate.get(key) for key in (
                      "candidate_id", "dataset_hash", "config_hash", "code_hash",
                      "provenance_hash")},

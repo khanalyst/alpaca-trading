@@ -25,7 +25,8 @@ class ScheduledResearchTests(unittest.TestCase):
             db="edge.sqlite3", vehicle="equity", strategies=1,
             variants=2, workers=1, starting_cash=100_000.0,
             min_trades=1, min_sessions=1, alpha=.05, max_generations=1,
-            worker_data=None, diagnostic_only=diagnostic_only)
+            max_confirmatory_attempts=3, worker_data=None,
+            diagnostic_only=diagnostic_only)
 
     @staticmethod
     def _factory_config() -> dict:
@@ -44,7 +45,8 @@ class ScheduledResearchTests(unittest.TestCase):
             agent_config="config.yaml", config=None, data="market.jsonl",
             db="edge.sqlite3", vehicle="equity", strategies=1,
             variants=2, workers=1, starting_cash=100_000.0,
-            min_trades=1, min_sessions=1, alpha=.05, max_generations=1)
+            min_trades=1, min_sessions=1, alpha=.05, max_generations=1,
+            max_confirmatory_attempts=7)
         captured = {}
 
         def fake_run_factory(*_args, **kwargs):
@@ -66,6 +68,66 @@ class ScheduledResearchTests(unittest.TestCase):
         self.assertEqual(model.slippage_bps, 4.0)
         self.assertEqual(model.max_spread_bps, 20.0)
         self.assertEqual(model.max_slippage_bps, 15.0)
+        self.assertEqual(captured["max_confirmatory_attempts"], 7)
+
+    def test_factory_status_exit_codes_are_distinct_and_proof_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "market.jsonl"
+            source.write_text(json.dumps({
+                "kind": "bar", "provider": "alpaca", "feed": "sip",
+            }) + "\n", encoding="utf-8")
+            base = self._factory_args(source)
+            for status, expected in (
+                    ("complete", 2),
+                    ("bounded_space_exhausted",
+                     research_cli.FACTORY_BOUNDED_SPACE_EXHAUSTED_EXIT),
+                    ("llm_all_calls_failed",
+                     research_cli.FACTORY_LLM_ALL_CALLS_FAILED_EXIT)):
+                with self.subTest(status=status), \
+                        patch.object(research_cli, "_agent_config",
+                                     return_value=self._factory_config()), \
+                        patch.object(research_cli, "_factory_dataset_preflight",
+                                     return_value={"authorizing": True,
+                                                   "diagnostic_only": False,
+                                                   "source": {}}), \
+                        patch.object(research_cli, "run_factory",
+                                     return_value={"status": status,
+                                                    "results": []}), \
+                        patch.object(research_cli, "_emit_proofs",
+                                     return_value=[]), \
+                        patch.object(research_cli, "_write_factory_report",
+                                     return_value=None), \
+                        patch.object(research_cli, "print"):
+                    self.assertEqual(research_cli.cmd_factory_run(base), expected)
+
+            # A proof is the authorizing outcome even if a status also records
+            # a provider/search diagnosis for another slot.
+            with patch.object(research_cli, "_agent_config",
+                              return_value=self._factory_config()), \
+                 patch.object(research_cli, "_factory_dataset_preflight",
+                              return_value={"authorizing": True,
+                                            "diagnostic_only": False,
+                                            "source": {}}), \
+                 patch.object(research_cli, "run_factory",
+                              return_value={"status": "llm_all_calls_failed",
+                                             "results": []}), \
+                 patch.object(research_cli, "_emit_proofs",
+                              return_value=[{"candidate_id": "edge-1"}]), \
+                 patch.object(research_cli, "_write_factory_report",
+                              return_value=None), \
+                 patch.object(research_cli, "print"):
+                self.assertEqual(research_cli.cmd_factory_run(base), 0)
+
+    def test_factory_parser_exposes_confirmatory_attempt_budget(self):
+        parser = research_cli.build_parser()
+        for argv in (
+                ["factory", "run", "--data", "market.jsonl",
+                 "--max-confirmatory-attempts", "9"],
+                ["factory-run", "--data", "market.jsonl",
+                 "--max-confirmatory-attempts", "9"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(
+                    parser.parse_args(argv).max_confirmatory_attempts, 9)
 
     def test_factory_default_rejects_non_sip_or_missing_provenance_before_runner(self):
         for row in (

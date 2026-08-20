@@ -26,13 +26,16 @@ from research.factory_core import (
 )
 from research.factory_ledger import FactoryError, FactoryLedger
 from research.llm_strategy import (
-    MAX_REASON_CHARS, MAX_TUNED_VARIANTS, TUNING_SCHEMA, ProposalResult,
+    MAX_REASON_CHARS, MAX_TUNED_VARIANTS, PROPOSAL_SCHEMA, TUNING_SCHEMA,
+    ProposalResult,
     RuleProposalAdapter,
 )
 import research.gates as gates
 import research.strategy_factory as factory_module
-from research.strategy_factory import (_lesson_brief, _sanitize_fit_selection,
-                                        _tuned_variants, run_factory)
+from research.strategy_factory import (_interaction_lessons, _lesson_brief,
+                                        _llm_replacement, _sanitize_fit_selection,
+                                        _tuned_variants,
+                                        run_factory)
 
 from .test_strategy_factory import losing_breakouts
 
@@ -111,6 +114,14 @@ class TuningContractTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("family", result.error)
 
+    def test_tuning_rejects_categorical_confirmation_changes(self):
+        changed = {**ROOT, "confirmation": "trend"}
+        adapter = _adapter(_reply((
+            changed, "Changed confirmation after the diagnosed trend failure.")))
+        result = adapter.tune("equity", 0, ROOT, DIAGNOSIS, count=1)
+        self.assertFalse(result.success)
+        self.assertIn("numeric values only", result.error)
+
     def test_coordinate_tuning_rejects_a_bundled_change(self):
         bundled = {**ROOT, "threshold_bps": 40.0, "target_r": 1.5}
         adapter = _adapter(_reply((
@@ -147,10 +158,18 @@ class TuningContractTests(unittest.TestCase):
         Reaching them is inventing structure, not tuning values, so tuning is
         pinned to the root's own grammar version.
         """
-        wider = {**ROOT, "schema": "rule-strategy.v2",
+        # Keep this regression anchored to a v1 root even when the shared
+        # family template defaults evolve to v2.
+        root = validate_rule_spec({
+            key: value for key, value in ROOT.items()
+            if key not in {"confirmations", "entry_after_minutes",
+                           "entry_before_minutes", "min_atr_bps",
+                           "max_atr_bps"}
+        } | {"schema": "rule-strategy.v1"})
+        wider = {**root, "schema": "rule-strategy.v2",
                  "confirmations": ["trend"], "entry_after_minutes": 45}
         adapter = _adapter(_reply((wider, "Added a time window and a filter.")))
-        result = adapter.tune("equity", 0, ROOT, DIAGNOSIS, count=1)
+        result = adapter.tune("equity", 0, root, DIAGNOSIS, count=1)
         self.assertFalse(result.success)
         self.assertIn("may not widen the grammar", result.error)
 
@@ -392,6 +411,24 @@ class CitedLearningTests(unittest.TestCase):
             self.assertEqual(chain[second], first)
             self.assertIsNone(chain[first])
 
+    def test_novel_tuning_marker_survives_durable_lesson_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            variant = rule_variant_id(
+                validate_rule_spec({**hypothesis.rule_spec, "stop_atr": 1.2}))
+            factory.record_lesson(
+                hypothesis.hypothesis_id, vehicle="equity",
+                family=hypothesis.family, variant_id=variant, kind="tuning",
+                source="llm", reason="Raised stop_atr after a prior attempt.",
+                evidence={"novel_tuning": True})
+            factory.grade_lesson(
+                hypothesis.hypothesis_id, variant, kind="tuning",
+                outcome={"passed": False, "underpowered": False})
+            brief = _lesson_brief(factory, vehicle="equity")
+        self.assertTrue(brief[0]["novel_tuning"])
+
     def test_failed_variant_ids_only_closes_explicit_powered_rejections(self):
         """Uncertainty is not an answer, so it is not a closed door."""
         with tempfile.TemporaryDirectory() as directory:
@@ -422,6 +459,41 @@ class CitedLearningTests(unittest.TestCase):
 
 
 class VariantSelectionTests(unittest.TestCase):
+    def test_malformed_success_is_recorded_as_rejected_llm_call(self):
+        class Adapter:
+            def propose(self, **_kwargs):
+                return ProposalResult(
+                    True, schema=PROPOSAL_SCHEMA,
+                    rule_spec={"family": "not-a-rule-family"},
+                    variant_id="rule.invalid")
+
+        observations = []
+        replacement, proposal, reason = _llm_replacement(
+            {"vehicle": "equity", "slot": 0, "generation": 0,
+             "hypothesis_id": "hypothesis", "rule_spec": ROOT},
+            DIAGNOSIS, config={"model": "test"}, max_generations=3,
+            not_before=None, existing_variant_ids=set(), adapter=Adapter(),
+            llm_observations=observations)
+        self.assertIsNone(replacement)
+        self.assertFalse(proposal.success)
+        self.assertEqual(reason, "llm_proposal_failed")
+        self.assertEqual(len(observations), 1)
+        self.assertFalse(observations[0]["success"])
+        self.assertTrue(observations[0]["provider_success"])
+
+    def test_interaction_lessons_ignore_injected_heldout_score(self):
+        lessons = _interaction_lessons([
+            {"fit_delta": "0.25", "heldout_delta": 999.0,
+             "changed": {"lookback": {"from": 10, "to": 11}}},
+            {"fit_delta": float("nan"), "heldout_delta": -999.0,
+             "changed": {"threshold_bps": {"from": 5.0, "to": 6.0}}},
+            {"heldout_delta": 123.0,
+             "changed": {"target_r": {"from": 2.0, "to": 2.2}}},
+        ])
+        self.assertEqual(lessons[0]["heldout_delta"], .25)
+        self.assertEqual(lessons[1]["heldout_delta"], 0.0)
+        self.assertEqual(lessons[2]["heldout_delta"], 0.0)
+
     """What actually reaches an isolated simulated account."""
 
     def test_with_the_llm_off_selection_is_the_previous_mutation_exactly(self):
@@ -453,6 +525,62 @@ class VariantSelectionTests(unittest.TestCase):
         self.assertEqual(origins.count("llm"), 2)
         self.assertEqual(
             len({rule_variant_id(item.rule_spec) for item in chosen}), 4)
+
+    def test_only_one_novel_numeric_value_is_accepted_per_cycle(self):
+        first = _tuned({"stop_atr": 1.2},
+                       "Raised stop_atr after the diagnosis showed marginal entries.")
+        second = _tuned({"stop_atr": 1.1},
+                        "Lowered stop_atr after the diagnosis showed weak entries.")
+        chosen, proposal = _tuned_variants(
+            {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=4,
+            vehicle="equity", llm_enabled=True, config={"model": "test"},
+            adapter=_adapter(_reply(first, second)))
+        self.assertTrue(proposal.success, proposal.error)
+        self.assertEqual(sum(item.novel_tuning for item in chosen), 1)
+        self.assertEqual(sum(item.source == "llm" for item in chosen), 1)
+        self.assertEqual(len(chosen), 4)
+
+    def test_grid_reordering_does_not_spend_novel_tuning_cap(self):
+        lessons = [{"id": f"{index + 1:012x}", "proposed_by": "llm",
+                    "novel_tuning": False,
+                    "tried": {"threshold_bps": {"from": 5.0, "to": 4.0}},
+                    "verdict": "failed"}
+                   for index in range(8)]
+        reply = json.dumps({"schema": TUNING_SCHEMA, "variants": [
+            {"rule_spec": _tuned({"threshold_bps": 4.0})[0],
+             "reason": "Lowered threshold_bps after a prior failed attempt.",
+             "builds_on": lessons[0]["id"]},
+            {"rule_spec": _tuned({"threshold_bps": 6.0})[0],
+             "reason": "Raised threshold_bps after a prior failed attempt.",
+             "builds_on": lessons[0]["id"]},
+        ]})
+        chosen, proposal = _tuned_variants(
+            {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=4,
+            vehicle="equity", llm_enabled=True, config={"model": "test"},
+            adapter=_adapter(reply),
+            lessons=lessons)
+        self.assertTrue(proposal.success, proposal.error)
+        self.assertEqual(sum(item.source == "llm" for item in chosen), 2)
+        self.assertFalse(any(item.novel_tuning for item in chosen))
+
+    def test_eight_durable_novel_lessons_block_the_ninth_value(self):
+        lessons = [{"id": f"{index + 1:012x}", "proposed_by": "llm",
+                    "novel_tuning": True,
+                    "tried": {"stop_atr": {"from": 1.0, "to": 1.2}},
+                    "verdict": "failed"}
+                   for index in range(8)]
+        novel = _tuned({"stop_atr": 1.2},
+                       "Raised stop_atr after a prior failed attempt.")
+        reply = json.dumps({"schema": TUNING_SCHEMA, "variants": [
+            {"rule_spec": novel[0], "reason": novel[1],
+             "builds_on": lessons[0]["id"]}]})
+        chosen, proposal = _tuned_variants(
+            {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=4,
+            vehicle="equity", llm_enabled=True, config={"model": "test"},
+            adapter=_adapter(reply), lessons=lessons)
+        self.assertTrue(proposal.success, proposal.error)
+        self.assertFalse(any(item.novel_tuning for item in chosen))
+        self.assertEqual({item.source for item in chosen}, {"deterministic"})
 
     def test_a_failed_or_broken_adapter_still_fills_every_variant(self):
         class Exploding:
@@ -671,6 +799,22 @@ class FeedbackLoopTests(unittest.TestCase):
                     rule_spec, diagnosis)
                     if rule_variant_id(spec) != rule_variant_id(rule_spec)
                     and rule_variant_id(spec) not in tried][:count]
+                # V3 tuning is numeric-only.  If the prior lesson is a
+                # categorical confirmation change from an older fixture,
+                # continue with the next unused numeric coordinate so this
+                # feedback-loop test still exercises durable citation.
+                specs = [spec for spec in specs
+                         if all(isinstance(rule_spec.get(field), (int, float))
+                                and not isinstance(rule_spec.get(field), bool)
+                                for field in spec_delta(rule_spec, spec))]
+                if not specs:
+                    specs = [spec for spec, _reason in coordinate_mutation_pool(
+                        rule_spec, diagnosis)
+                             if rule_variant_id(spec) != rule_variant_id(rule_spec)
+                             and rule_variant_id(spec) not in tried
+                             and all(isinstance(rule_spec.get(field), (int, float))
+                                     and not isinstance(rule_spec.get(field), bool)
+                                     for field in spec_delta(rule_spec, spec))][:count]
                 return ProposalResult(
                     True, schema=TUNING_SCHEMA, rule_spec=rule_spec,
                     evidence={"kind": "tuning"},

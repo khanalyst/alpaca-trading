@@ -283,7 +283,8 @@ def _tuning_reason_check(reason: str, root: Mapping[str, Any],
         if (isinstance(before, bool) or isinstance(after, bool) or
                 not isinstance(before, (int, float)) or
                 not isinstance(after, (int, float))):
-            continue
+            raise ValueError(
+                f"tuning may change numeric values only; {key} is categorical")
         origin = float(before)
         moved = abs(float(after) - origin)
         if origin == 0.0:
@@ -782,9 +783,72 @@ class RuleProposalAdapter:
         # OpenAI Responses API JSON schema; Anthropic accepts the same schema
         # under ``output_config.format`` on versions supporting structured
         # outputs.  additionalProperties is deliberately false.
-        rule_schema = rule_spec_json_schema()
+        # Provider structured-output dialects implement a deliberately small
+        # JSON Schema subset.  In particular, OpenAI strict schemas reject
+        # validation-only keywords such as ``minimum`` and ``pattern`` with a
+        # 400 rather than simply ignoring them.  The provider schema is only a
+        # shape hint: ``validate_rule_spec``/``_safe_text``/``_parse_response``
+        # remain the authoritative bounds and response gates below.
+        provider_keys = frozenset((
+            "type", "properties", "required", "items",
+            "additionalProperties", "enum", "anyOf",
+        ))
+
+        def provider_schema(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                result: dict[str, Any] = {}
+                type_values: list[Any] | None = None
+                for key, item in value.items():
+                    # Keep only the portable strict-output vocabulary.  This
+                    # deny-by-default handling also strips all currently
+                    # known validation/annotation keywords (minimum/maximum,
+                    # minItems/maxItems, pattern/format, contains,
+                    # unevaluated*, and their relatives) if the grammar grows.
+                    if key not in provider_keys and key not in {"oneOf", "const"}:
+                        continue
+                    if key == "const":
+                        # Structured-output providers accept singleton enums
+                        # more consistently than JSON Schema ``const``.
+                        result["enum"] = [provider_schema(item)]
+                        continue
+                    if key == "oneOf":
+                        result["anyOf"] = provider_schema(item)
+                        continue
+                    if key == "properties":
+                        # Property names are data, not schema keywords, so
+                        # they must not pass through the allowlist above.
+                        result[key] = {
+                            str(property_name): provider_schema(property_schema)
+                            for property_name, property_schema in item.items()
+                        }
+                        continue
+                    if key == "type" and isinstance(item, (list, tuple)):
+                        # Nullable properties are represented as a union in
+                        # the provider dialect.  Keeping the enclosing
+                        # object's ``required`` list unchanged means a
+                        # nullable field is still always present.
+                        type_values = list(item)
+                        continue
+                    result[key] = provider_schema(item)
+                if type_values is not None:
+                    nullable = [{"type": provider_schema(item)}
+                                for item in type_values]
+                    # A type-array and oneOf are not emitted by the audited
+                    # grammar together.  If a future schema does combine
+                    # them, retain both alternatives rather than silently
+                    # dropping one of the provider-safe branches.
+                    existing = result.get("anyOf")
+                    if existing is not None:
+                        nullable.extend(existing)
+                    result["anyOf"] = nullable
+                return result
+            if isinstance(value, list):
+                return [provider_schema(item) for item in value]
+            return value
+
+        rule_schema = provider_schema(rule_spec_json_schema())
         if name == TUNING_SCHEMA:
-            return {
+            return provider_schema({
                 "type": "object", "additionalProperties": False,
                 "required": ["schema", "variants"],
                 "properties": {
@@ -805,7 +869,7 @@ class RuleProposalAdapter:
                                 # nullable rather than optional.
                                 "builds_on": {"type": ["string", "null"],
                                               "maxLength": LESSON_REF_CHARS},
-                            }}}}}
+                            }}}}})
         properties: dict[str, Any] = {
             "schema": {"type": "string", "const": name},
             "rule_spec": rule_schema,
@@ -814,8 +878,8 @@ class RuleProposalAdapter:
         if name == DISCOVERY_SCHEMA:
             properties["thesis"] = {"type": "string", "maxLength": MAX_THESIS_CHARS}
             required.append("thesis")
-        return {"type": "object", "additionalProperties": False,
-                "required": required, "properties": properties}
+        return provider_schema({"type": "object", "additionalProperties": False,
+                                "required": required, "properties": properties})
 
     def _provider_call(self, system_prompt: str,
                        request: Mapping[str, Any], timeout: float,

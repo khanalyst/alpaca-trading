@@ -156,6 +156,14 @@ existing evidence, baselines the current recorder file ends, and resumes only
 from subsequently committed rows. This is intentionally forward-only: a large
 recorder recovery is research input, not a synthetic live-shadow window.
 
+Replay-diff metadata is retained for 180 days by default so a complete
+confirmatory tail remains inspectable; set `ALPACA_SHADOW_RETENTION_DAYS` only
+when a shorter operational window is deliberately accepted. Pruning reports
+its floor and count in the shadow heartbeat; a non-authorizing watermark turns
+any candidate boundary predating deleted replay metadata into a blocked
+`retention_gap`. Source events, decisions, accounts, and trades remain
+immutable evidence.
+
 The scheduled research cycle invokes `edge ingest-shadow` by default when
 `ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a no-op. The consumer
 mounts the same `shadow-data` volume read-only at `/app/shadow` and is the only
@@ -220,6 +228,14 @@ The shipped `max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade
 is about `0.833` cost-to-risk at the 25-bps stress and is vetoed before option
 fees.
 
+On a genuinely empty journal only, an operator may explicitly set
+`ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1` for the first research cycle.
+That cycle persists `calibration_state=bootstrap_unknown` and keeps
+`authorization_exit_code=2`; it permits shadow evidence collection but is not
+measured execution calibration and cannot authorize production. Any existing,
+thin, mixed-vehicle, stale, or optimistic history remains blocked until the
+normal measured calibration is authorized.
+
 The executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
 configured R target, and bar-cap time exit. Fit-only factory diagnostics expose
 signal-prefix/floor binding, planned exits, cost/risk, power, behavior aliases,
@@ -282,8 +298,13 @@ upper-bound rejection across multiple negative windows for every bounded
 variant; a valid bounded LLM replacement is
 registered before retirement when enabled, and demoted candidates can re-prove
 on a newer shadow run. Scheduler
-terminal statuses are `completed`, `completed_no_edge`, `no_data`, and
-`failed`.
+terminal statuses are `completed`, `completed_no_edge`, `no_data`,
+`search_exhausted`, `llm_provider_failure`, and `failed`. The factory wrapper
+passes `ALPACA_FACTORY_MAX_CONFIRMATORY_ATTEMPTS` (default `3`) to each run.
+Factory exits 5 (`bounded_space_exhausted`) and 6 (`llm_all_calls_failed`) are
+normalized into the two explicit cycle statuses and the wrapper exits 0 so
+the structured reason is retained in scheduler history; they are not proof
+and do not bypass the runtime edge gate.
 Gate envelopes retain per-arm candidate, baseline, and randomized-null counts,
 fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
 and directional/pair coverage. Quote density can change null/control evidence

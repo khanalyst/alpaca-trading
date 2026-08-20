@@ -15,12 +15,15 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    RULE_FAMILIES, RULE_SCHEMA_V2, SESSION_MINUTES, evaluate_rule_signal,
+    RULE_FAMILIES, RULE_SCHEMA_V2, SESSION_MINUTES, V2_DEFAULT_EXTENSIONS,
+    evaluate_rule_signal,
     feature_window_bars, hold_deadline, rule_semantic_signature,
     rule_variant_id, validate_rule_spec,
 )
-from .costs import (BAR, QUOTE, CostError, CostModel, ReplayPolicy,
-                    index_quotes, quote_fill, quote_fill_record,
+from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
+                    CostError, CostModel, ReplayPolicy,
+                    check_stressed_cost_plan, index_quotes, quote_fill,
+                    quote_fill_record, stressed_cost_usd,
                     replay_policy_for_bars)
 from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
@@ -118,7 +121,13 @@ FAMILY_TEMPLATES: tuple[dict[str, Any], ...] = (
 def family_template(family: str) -> dict[str, Any]:
     for template in FAMILY_TEMPLATES:
         if template["family"] == family:
-            return dict(template)
+            # The raw catalog remains v1 so its historical content-addressed
+            # IDs stay readable.  Factory-created roots are promoted through
+            # this seam to v2's documented no-op extension defaults, giving
+            # every family the same conditional mutation axes without
+            # rewriting any persisted v1 specification.
+            return {**dict(template), "schema": RULE_SCHEMA_V2,
+                    **V2_DEFAULT_EXTENSIONS}
     raise FactoryError(f"unknown rule family: {family!r}")
 
 
@@ -127,7 +136,9 @@ def template_hypothesis(slot: int, *, vehicle: str = "equity",
     """Return the generation-zero hypothesis a slot starts from."""
     if not 0 <= int(slot) < MAX_STRATEGIES:
         raise FactoryError(f"slot must be between 0 and {MAX_STRATEGIES - 1}")
-    spec = validate_rule_spec(dict(FAMILY_TEMPLATES[int(slot)]))
+    # Factory roots use the promoted v2 no-op form; the raw catalog remains
+    # available above for legacy v1 content-addressed IDs.
+    spec = validate_rule_spec(family_template(FAMILY_TEMPLATES[int(slot)]["family"]))
     return StrategyHypothesis(
         _hypothesis_id(vehicle, int(slot), int(generation), spec), int(slot),
         int(generation), vehicle, spec["family"], _thesis(spec),
@@ -630,7 +641,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                        if vehicle == "option" else real_risk),
             "evidence_mode": (
                 "diagnostic_historical_backfill"
-                if resolved_policy.allow_historical_backfill_diagnostics and any(
+                if any(
                     historical_backfill_record(item)
                     for item in (signal_bar, entry_bar, exit_bar))
                 else "forward_observed"
@@ -796,8 +807,21 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 max(0.0, current_equity * float(resolved_policy.max_position_notional_pct) / 100.0) /
                 max(float(raw["entry_reference"]) * int(raw["contract_multiplier"]), 1e-9)))
         multiplier = int(raw["contract_multiplier"])
-        risk_usd = quantity * float(raw["realized_risk_per_unit"])
-        entry_notional = float(raw["entry_reference"]) * quantity * multiplier
+        nominal_risk_usd = quantity * float(raw["risk_per_unit"])
+        realized_risk_usd = quantity * float(raw["realized_risk_per_unit"])
+        # Runtime brackets size and stress-check against the authored signal
+        # plan, not a next-bar gap fill.  Equity notional therefore uses
+        # ``plan_entry`` while options use premium × multiplier × contracts.
+        entry_notional = ((float(raw["plan_entry"]) * quantity)
+                          if vehicle == "equity" else
+                          (float(raw["entry_reference"]) * quantity * multiplier))
+        stress_enabled = (
+            resolved_policy.stressed_cost_scenario_bps is not None or
+            resolved_policy.max_stressed_cost_to_risk_ratio is not None)
+        # Keep direct ReplayPolicy fixtures behaviour-compatible when both
+        # controls are omitted, while validated runtime policies expose the
+        # nominal risk unit used by RiskEngine.
+        risk_usd = nominal_risk_usd if stress_enabled else realized_risk_usd
         reject_reason = None
         if (resolved_policy.max_concurrent_positions is not None and
                 len(active) >= resolved_policy.max_concurrent_positions):
@@ -817,11 +841,59 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             reject_reason = "daily loss limit reached"
         if quantity <= 0:
             reject_reason = reject_reason or "isolated account risk budget cannot fund one unit"
+        stress_telemetry: dict[str, Any] = {}
+        if reject_reason is None and stress_enabled:
+            plan = {
+                "execution_profile": "options" if vehicle == "option" else "shares",
+                "contracts": quantity if vehicle == "option" else None,
+                "shares": quantity if vehicle == "equity" else None,
+                "notional": entry_notional,
+                "risk_usd": nominal_risk_usd,
+            }
+            checked, stress_reason = check_stressed_cost_plan(
+                plan,
+                scenario_bps=resolved_policy.stressed_cost_scenario_bps,
+                max_ratio=resolved_policy.max_stressed_cost_to_risk_ratio,
+                costs=model,
+            )
+            if stress_reason is not None:
+                reject_reason = stress_reason
+                stress_telemetry = {
+                    "vehicle": vehicle,
+                    "stressed_cost_vehicle": vehicle,
+                    "stressed_cost_schema": STRESSED_COST_SCHEMA,
+                    "stressed_cost_basis": dict(STRESSED_COST_BASIS),
+                    "stressed_cost_entry_notional": float(entry_notional),
+                    "entry_notional": float(entry_notional),
+                    "stressed_cost_scenario_bps": (
+                        resolved_policy.stressed_cost_scenario_bps),
+                    "max_stressed_cost_to_risk_ratio": (
+                        resolved_policy.max_stressed_cost_to_risk_ratio),
+                    "stressed_cost_risk_usd": float(nominal_risk_usd),
+                    "risk_usd": float(nominal_risk_usd),
+                }
+                try:
+                    if (resolved_policy.stressed_cost_scenario_bps is not None and
+                            resolved_policy.max_stressed_cost_to_risk_ratio is not None and
+                            nominal_risk_usd > 0 and entry_notional > 0):
+                        stressed = stressed_cost_usd(
+                            entry_notional=entry_notional,
+                            scenario_bps=resolved_policy.stressed_cost_scenario_bps,
+                            vehicle=vehicle, quantity=quantity, costs=model)
+                        stress_telemetry.update({
+                            "stressed_cost_usd": float(stressed),
+                            "stressed_cost_to_risk_ratio": float(
+                                stressed / nominal_risk_usd),
+                        })
+                except (CostError, TypeError, ValueError, OverflowError,
+                        ZeroDivisionError):
+                    pass
         if reject_reason:
             rows.append({"vehicle": vehicle, "symbol": symbol,
                          "session_date": day.isoformat(), "opportunity_id": opportunity,
                          "net_pnl": 0.0, "return_value": 0.0, "no_trade": True,
-                         "reject_reason": reject_reason})
+                         "reject_reason": reject_reason,
+                         **stress_telemetry})
             continue
         execution_direction = "long" if vehicle == "option" else raw["direction"]
         entry = model.execution_price(
@@ -842,9 +914,27 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         row.update({"quantity": quantity, "entry_price": entry, "exit_price": exit_price,
                     "gross_pnl": gross, "costs": fees, "net_pnl": net,
                     "risk_budget": risk_budget, "risk_usd": risk_usd,
+                    "nominal_risk_usd": nominal_risk_usd,
+                    "realized_risk_usd": realized_risk_usd,
                     "r_multiple": net / risk_usd if risk_usd > 0 else None,
                     "return_value": net / cash if cash > 0 else 0.0,
                     "no_trade": False, "entry_notional": entry_notional})
+        if stress_enabled:
+            # ``checked`` is populated on the pass path above.  Recompute the
+            # small pure seam here only to carry its canonical telemetry into
+            # the persisted trade row; this cannot change acceptance.
+            checked, _ = check_stressed_cost_plan(
+                {"execution_profile": "options" if vehicle == "option" else "shares",
+                 "contracts": quantity if vehicle == "option" else None,
+                 "shares": quantity if vehicle == "equity" else None,
+                 "notional": entry_notional, "risk_usd": nominal_risk_usd},
+                scenario_bps=resolved_policy.stressed_cost_scenario_bps,
+                max_ratio=resolved_policy.max_stressed_cost_to_risk_ratio,
+                costs=model)
+            if checked is not None:
+                row.update({key: value for key, value in checked.items()
+                            if key.startswith("stressed_cost_") or
+                            key == "max_stressed_cost_to_risk_ratio"})
         rows.append(row)
         active.append(row)
     if active:
@@ -975,6 +1065,12 @@ _ZERO_AXIS_STEPS = {
     "min_atr_bps": (5.0, 15.0),
     "entry_after_minutes": (30, 60),
 }
+# Stop distance is the economic lever for the stressed-cost boundary.  A
+# local +/-20% nudge around a one-ATR root never reaches the several-ATR
+# distance needed for a 25 bps / 30% cost-to-risk gate on SPY-like ATRs, so
+# expose the audited grammar span explicitly while retaining one-coordinate
+# mutations.  Values are ordered from tight to wide for deterministic search.
+_STOP_ATR_LADDER = (0.2, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
 
 
 def _coordinate_values(root: Mapping[str, Any], field: str) -> list[Any]:
@@ -1000,6 +1096,9 @@ def _coordinate_values(root: Mapping[str, Any], field: str) -> list[Any]:
             if item not in current:
                 values.append([*current, item])
         return values
+    if field == "stop_atr":
+        return [value for value in _STOP_ATR_LADDER
+                if float(value) != float(root.get(field))]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return []
     if field in _ZERO_AXIS_STEPS and float(value) == 0.0:

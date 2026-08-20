@@ -4,6 +4,7 @@ import unittest
 
 from agent.config import validate_config
 from agent.contracts.rule import validate_rule_spec, rule_variant_id
+from agent.edge import _runtime_identity_matches
 from research.costs import CostModel
 from research.edge_discovery_core import _effective_ibr_config
 from research.edge_identity import candidate_assumptions
@@ -64,6 +65,29 @@ class CandidateIdentityTests(unittest.TestCase):
         self.assertNotEqual(content_hash(legacy), content_hash(candidate))
         self.assertNotIn("vehicles", legacy["costs"])
         self.assertEqual(candidate["costs"]["vehicles"]["option"]["spread_bps"], 9.0)
+
+    def test_runtime_llm_setting_is_hashed_and_mismatch_fails_closed(self):
+        disabled = validate_config({
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                         "execution_mode": "shares"},
+            "llm": {"enabled": False},
+        })
+        enabled = validate_config({
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                         "execution_mode": "shares"},
+            "llm": {"enabled": True, "model": "paper-test"},
+        })
+        off = candidate_assumptions(
+            disabled, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        on = candidate_assumptions(
+            enabled, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        self.assertNotEqual(content_hash(off), content_hash(on))
+        record = {"status": "validated", "strategy_id": "ibr",
+                  "vehicle": "equity", "variant_id": "ibr.baseline",
+                  "config": off, "config_hash": content_hash(off)}
+        self.assertFalse(_runtime_identity_matches(record, enabled))
 
 
 if __name__ == "__main__":

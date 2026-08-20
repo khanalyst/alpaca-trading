@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from research.live_shadow import ShadowConfig, ShadowRunner  # noqa: E402
+from research.live_shadow import (DEFAULT_RETENTION_DAYS, ShadowConfig,
+                                  ShadowRunner)  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
@@ -34,7 +35,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--max-candidates", type=int, default=32)
     p.add_argument("--max-events", type=int, default=20_000)
     p.add_argument("--max-decisions", type=int, default=100_000)
-    p.add_argument("--retention-days", type=int, default=14)
+    p.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
     return p
 
 
@@ -77,7 +78,10 @@ def main(argv: list[str] | None = None) -> int:
             safe_result = {key: result.get(key) for key in (
                 "candidates", "events", "decisions", "ingested_events",
                 "conflicts", "invalid_events", "skipped_recovery_bytes",
-                "quarantine_through_session") if key in result}
+                "quarantine_through_session", "pruned_replay_diffs",
+                "retention_days", "retention_floor_ts",
+                "retention_gap_watermark", "stale_tail")
+                if key in result}
             _write_health(health_file, "running", last_error=None, **safe_result)
             print(json.dumps(result, sort_keys=True), flush=True)
         except Exception as exc:

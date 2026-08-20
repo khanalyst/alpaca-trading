@@ -268,11 +268,16 @@ and stressed cost-to-risk (9/15/25/50 bps) summaries, delivered versus intended
 risk, realized exit reasons/ties/gaps, and a diagnostic clustered MDE/power
 report whose effect and cluster units are explicit. It also records
 provider/feed provenance, entry-pricing source, configured limits, and
-pass/fail/unknown row counts. The current fixed exit grammar (ATR-floor
-bracket, configured R target, and bar cap) is surfaced for operator review and
-never expanded by this measurement. Planned signal/exit geometry may be
-counted even when executable quote pricing is absent, but is marked
-quote-required and remains non-authorizing.
+pass/fail/unknown row counts. The current fixed exit grammar is machine-readable
+as `fixed-atr-floor-bracket-r-target-bar-cap.v1`; its only supported modes are
+the parity-verified ATR-floor bracket, configured R target, and configured bar
+cap. `executable_exit_templates_added` remains `false` and
+`requires_operator_review` remains `true`. An attempted trailing, partial, or
+other unsupported exit field is flagged as
+`rejected_unsupported_exit_grammar` before research and cannot be treated as a
+research result. Planned signal/exit geometry may be counted even when
+executable quote pricing is absent, but is marked quote-required and remains
+non-authorizing.
 
 The standalone `research.py factory run`/`factory-run` preflight requires
 explicit row provenance and SIP for the default equity lane. `--diagnostic-only`

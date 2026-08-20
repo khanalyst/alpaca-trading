@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -21,7 +22,9 @@ from research.live_shadow import (InputConflict, ShadowConfig, ShadowRunner,
                                    ShadowError, ShadowStore, _compact_shadow_rows,
                                    _replay_signature,
                                    _shadow_signature, _signature_diffs,
-                                   run_shadow_once)
+                                   _opportunity_capacity,
+                                   run_shadow_once, MAX_QUARANTINE_EVENTS,
+                                   QUARANTINE_OVERFLOW_KEY)
 
 
 class LiveShadowTests(unittest.TestCase):
@@ -34,6 +37,38 @@ class LiveShadowTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_opportunity_capacity_counts_refused_symbol_sessions(self):
+        rows = [
+            {"vehicle": "equity", "symbol": "SPY", "session_date": "2026-01-02",
+             "opportunity_id": "SPY:2026-01-02", "no_trade": False},
+            {"vehicle": "equity", "symbol": "QQQ", "session_date": "2026-01-02",
+             "opportunity_id": "QQQ:2026-01-02", "no_trade": True,
+             "reject_reason": "no fresh equity quote at exit"},
+            {"vehicle": "equity", "symbol": "SPY", "session_date": "2026-01-03",
+             "opportunity_id": "SPY:2026-01-03", "no_trade": True,
+             "reject_reason": "no fresh equity quote at exit"},
+        ]
+        summary = _opportunity_capacity(rows, vehicle="equity",
+                                         min_trades=2, min_sessions=2)
+        self.assertEqual(summary["opportunity_count"], 3)
+        self.assertEqual(summary["max_trade_opportunities"], 3)
+        self.assertEqual(summary["observed_trades"], 1)
+        self.assertAlmostEqual(summary["observed_trade_rate"], 1 / 3)
+        self.assertEqual(summary["required_rate_for_floor"], 2 / 3)
+        self.assertFalse(summary["feasible"])
+        self.assertTrue(summary["capacity_feasible"])
+        self.assertEqual(summary["status"], "underpowered_observed")
+        self.assertEqual(summary["refusal_reason_counts"]["no fresh equity quote at exit"], 2)
+
+    def test_opportunity_capacity_flags_structurally_impossible_floor(self):
+        summary = _opportunity_capacity([
+            {"vehicle": "equity", "symbol": "SPY", "session_date": "2026-01-02",
+             "opportunity_id": "SPY:2026-01-02", "no_trade": True},
+        ], vehicle="equity", min_trades=2, min_sessions=2)
+        self.assertFalse(summary["feasible"])
+        self.assertEqual(summary["status"], "structurally_impossible")
+        self.assertEqual(summary["shortfalls"]["opportunities"], 1)
 
     def _candidate(self, *, variant="ibr.baseline", strategy="ibr", vehicle="equity",
                    status="backtest_passed", config=None):
@@ -128,6 +163,82 @@ class LiveShadowTests(unittest.TestCase):
         self.corpus.write_text(text, encoding="utf-8")
         with self.assertRaises((InputConflict, ShadowError)):
             self._run(max_events=20)
+
+    def test_invalid_session_is_quarantined_and_replayed_after_correction(self):
+        """Malformed evidence blocks its session without consuming its offset."""
+        self._candidate()
+        self._write_rows()
+        rows = list(iter_corpus_rows(self.corpus))
+        rows[1]["as_of"] = "2026-01-02T14:34:00+00:00"
+        with self.corpus.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+        first = self._run(max_events=20)
+        self.assertEqual(first["invalid_events"], 1)
+        self.assertEqual(first["stale_tail"]["status"], "blocked")
+        self.assertEqual(self._run(max_events=20)["invalid_events"], 1)
+        self.assertEqual(ShadowStore(self.shadow).source_offsets(), {})
+
+        rows[1]["as_of"] = "2026-01-02T14:32:00+00:00"
+        with self.corpus.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        recovered = self._run(max_events=20)
+        self.assertEqual(recovered["invalid_events"], 0)
+        self.assertEqual(recovered["stale_tail"]["status"], "clear")
+        self.assertEqual(recovered["ingested_events"], 1)
+
+    def test_default_retention_preserves_twenty_day_replay_metadata(self):
+        store = ShadowStore(self.shadow)
+        replay = "replay-retention"
+        row = {"vehicle": "equity", "symbol": "SPY",
+               "session_date": "2026-01-02", "opportunity_id": "retention",
+               "net_pnl": 1.0, "return_value": 1.0, "no_trade": False}
+        store.replay_diff(
+            candidate_id="candidate", session_date="2026-01-02",
+            source_digest="source", shadow_digest="shadow",
+            replay_digest=replay, status="match",
+            details={"complete": True, "signature_match": True})
+        store.record_replay_evidence(
+            candidate_id="candidate", session_date="2026-01-02",
+            replay_digest=replay, vehicle="equity", starting_cash=100_000,
+            ending_cash=100_001, realized_pnl=1.0, trades=[row],
+            replay_status="match")
+        aged = time.time() - 20 * 86400
+        with sqlite3.connect(self.shadow) as db:
+            db.execute("UPDATE replay_diffs SET created_at=?", (aged,))
+
+        retained = store.prune()
+        self.assertEqual(retained["pruned_replay_diffs"], 0)
+        self.assertEqual(len(store.replay_metadata("candidate")), 1)
+        self.assertEqual(store.gate_rows("candidate", "2026-01-02"), [row])
+
+        pruned = ShadowStore(self.shadow, retention_days=14).prune()
+        self.assertEqual(pruned["pruned_replay_diffs"], 1)
+        self.assertEqual(pruned["retention_gap_watermark"]["latest_pruned_session"],
+                         "2026-01-02")
+        self.assertEqual(ShadowStore(self.shadow).prune_watermark(),
+                         pruned["retention_gap_watermark"])
+        self.assertEqual(store.replay_metadata("candidate"), [])
+        self.assertEqual(store.gate_rows("candidate", "2026-01-02"), [])
+
+    def test_quarantine_metadata_overflow_is_bounded_and_unknown_tail(self):
+        store = ShadowStore(self.shadow)
+        entries = {
+            f"event-{index}": {"event_key": f"event-{index}",
+                                "session_date": "2026-01-02",
+                                "reason": "normalization_error"}
+            for index in range(MAX_QUARANTINE_EVENTS + 5)
+        }
+        store.save_quarantine_events(entries)
+        stored = store.quarantine_events()
+        self.assertEqual(len(stored), MAX_QUARANTINE_EVENTS)
+        self.assertIn(QUARANTINE_OVERFLOW_KEY, stored)
+        self.assertTrue(stored[QUARANTINE_OVERFLOW_KEY]["unknown_tail"])
+        self.assertEqual(stored[QUARANTINE_OVERFLOW_KEY]["dropped_events"], 6)
 
     def test_quote_burst_preserves_first_and_last_quote_per_symbol_minute(self):
         start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)

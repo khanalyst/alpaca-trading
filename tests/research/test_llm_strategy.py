@@ -3,10 +3,23 @@ from pathlib import Path
 import unittest
 
 from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V2,
-                                  rule_spec_hash, rule_variant_id)
+                                  rule_spec_hash, rule_variant_id,
+                                  validate_rule_spec)
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
-                                    RuleProposalAdapter, canonical_json,
-                                    content_hash)
+                                    TUNING_SCHEMA, RuleProposalAdapter,
+                                    _parse_response, _safe_text,
+                                    canonical_json, content_hash)
+
+
+UNSUPPORTED_PROVIDER_SCHEMA_KEYS = frozenset({
+    "oneOf", "const", "minimum", "maximum", "exclusiveMinimum",
+    "exclusiveMaximum", "multipleOf", "minItems", "maxItems", "uniqueItems",
+    "minLength", "maxLength", "pattern", "format", "minProperties",
+    "maxProperties", "contains", "minContains", "maxContains",
+    "patternProperties", "propertyNames", "unevaluatedProperties",
+    "unevaluatedItems", "allOf", "not", "if", "then", "else", "$ref",
+    "$defs", "definitions",
+})
 
 
 def proposal(spec=None):
@@ -16,6 +29,89 @@ def proposal(spec=None):
 
 
 class LLMRuleStrategyTests(unittest.TestCase):
+    def test_provider_schema_is_recursive_strict_subset(self):
+        schema = RuleProposalAdapter._schema()
+
+        def walk(value):
+            if isinstance(value, dict):
+                self.assertTrue(
+                    UNSUPPORTED_PROVIDER_SCHEMA_KEYS.isdisjoint(value),
+                    f"unsupported provider keywords: "
+                    f"{UNSUPPORTED_PROVIDER_SCHEMA_KEYS.intersection(value)}")
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(schema)
+        rule = schema["properties"]["rule_spec"]
+        self.assertIn("anyOf", rule)
+        lookback = rule["anyOf"][0]["properties"]["lookback"]
+        self.assertEqual(lookback["type"], "integer")
+        self.assertNotIn("minimum", lookback)
+        self.assertNotIn("maximum", lookback)
+
+        tuning = RuleProposalAdapter._schema(TUNING_SCHEMA)
+        builds_on = tuning["properties"]["variants"]["items"]["properties"]["builds_on"]
+        self.assertEqual({branch["type"] for branch in builds_on["anyOf"]},
+                         {"string", "null"})
+        self.assertIn("builds_on", tuning["properties"]["variants"]["items"]["required"])
+
+    def test_openai_responses_seam_receives_sanitized_schema(self):
+        seen = {}
+
+        class Response:
+            output_text = proposal()
+
+        class Responses:
+            def create(self, **kwargs):
+                seen.update(kwargs)
+                return Response()
+
+        class Client:
+            responses = Responses()
+
+        result = RuleProposalAdapter(client=Client(), model="test-model",
+                                     max_attempts=1).propose(
+            vehicle="equity", generation=0,
+            prior_validated_rule_spec=DEFAULT_RULE_SPEC, diagnosis={})
+        self.assertTrue(result.success)
+        provider_schema = seen["text"]["format"]["schema"]
+
+        def walk(value):
+            if isinstance(value, dict):
+                self.assertTrue(UNSUPPORTED_PROVIDER_SCHEMA_KEYS.isdisjoint(value))
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(provider_schema)
+        threshold = (provider_schema["properties"]["rule_spec"]["anyOf"][0]
+                     ["properties"]["threshold_bps"])
+        self.assertEqual(threshold["type"], "number")
+        self.assertNotIn("minimum", threshold)
+        self.assertNotIn("maximum", threshold)
+
+    def test_internal_validation_retains_removed_provider_bounds(self):
+        with self.assertRaises(ValueError):
+            validate_rule_spec({**DEFAULT_RULE_SPEC, "threshold_bps": 500.1})
+
+        too_many_confirmations = {
+            **DEFAULT_RULE_SPEC,
+            "schema": RULE_SCHEMA_V2,
+            "confirmations": ["trend", "volume", "volatility", "trend"],
+        }
+        with self.assertRaises(ValueError):
+            validate_rule_spec(too_many_confirmations)
+
+        with self.assertRaises(ValueError):
+            _safe_text("x" * 241, label="reason", limit=240)
+        with self.assertRaises(ValueError):
+            _parse_response(proposal(), max_bytes=16)
+
     def test_strict_success_hashes_and_content_ids(self):
         calls = []
 

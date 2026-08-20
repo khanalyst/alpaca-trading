@@ -22,6 +22,69 @@ def _progress(*, phase="discover", unit="rows", vehicle="equity", done=1,
 
 
 class ResearchProgressTests(unittest.TestCase):
+    def test_readiness_derives_minimums_and_caps_eta_without_audit_constant(self):
+        readiness = scheduler_output.derive_research_readiness(
+            {"schema": "research-progress.v1", "phase": "record",
+             "unit": "sessions", "vehicle": "both", "done": 4,
+             "total": 10, "updated_ts": 90},
+            {"schema": "research-readiness.v1", "state": "pending",
+             "heldout_min_sessions": 3, "shadow_min_sessions": 2,
+             "shadow_tail_sessions": 2, "qualification_min_sessions": 2,
+             "heldout_fraction": .5, "shadow_fraction": .5,
+             "qualification_fraction": .5,
+             "recorded_sessions": 4, "progress_rate_sessions_per_day": 1,
+             "updated_ts": 90}, now=100)
+        self.assertEqual(readiness["offline_required_sessions"], 6)
+        self.assertEqual(readiness["required_sessions"], 8)
+        self.assertEqual(readiness["sessions_remaining"], 4)
+        self.assertEqual(readiness["state"], "pending")
+        self.assertLessEqual(readiness["eta_ts"], 100 + 90 * 86400)
+
+    def test_readiness_unknown_when_progress_has_no_session_count(self):
+        readiness = scheduler_output.derive_research_readiness(
+            _progress(done=1, total=1, unit="steps", updated_ts=99), now=100)
+        self.assertEqual(readiness["state"], "unknown")
+        self.assertIsNone(readiness["recorded_sessions"])
+        self.assertIsNone(readiness["sessions_remaining"])
+
+    def test_readiness_accepts_bounded_lane_minimum_and_fraction_aliases(self):
+        payload = {
+            "schema": "research-readiness.v1", "state": "pending",
+            "minimums": {"heldout": {"sessions": 4},
+                          "shadow": {"sessions": 5}},
+            "fractions": {"heldout": .5, "shadow": .25},
+            "qualification_min_sessions": 5,
+            "qualification_fraction": .25,
+            "recorded_session_count": 2,
+        }
+        parsed = scheduler_output.structured_research_readiness(payload)
+        self.assertEqual(parsed["heldout_min_sessions"], 4)
+        self.assertEqual(parsed["shadow_min_sessions"], 5)
+        derived = scheduler_output.derive_research_readiness(readiness=parsed, now=100)
+        self.assertEqual(derived["offline_required_sessions"], 20)
+        self.assertEqual(derived["required_sessions"], 25)
+        self.assertEqual(derived["sessions_remaining"], 23)
+
+    def test_scheduler_captures_cycle_readiness_event_with_shadow_reason(self):
+        payload = {
+            "schema": "research-readiness.v1", "state": "pending",
+            "reason": "candidate-specific shadow proof is still required",
+            "recorded_sessions": 12, "heldout_min_sessions": 30,
+            "qualification_min_sessions": 30, "shadow_min_sessions": 60,
+            "heldout_fraction": .24, "qualification_fraction": .2,
+            "development_fraction": .8, "required_sessions": 150,
+            "sessions_remaining": 138, "progress_age_seconds": 0,
+            "observed_session_rate_per_day": 1.0,
+            "progress_rate_sessions_per_day": 1.0,
+            "eta_ts": 1000, "deadline_ts": 2000, "updated_ts": 100,
+        }
+        parsed = scheduler_output.structured_research_readiness(payload)
+        self.assertIsNotNone(parsed)
+        capture = scheduler_output._BoundedCapture(500)
+        capture.feed(json.dumps(payload) + "\n")
+        self.assertEqual(capture.research_readiness["shadow_min_sessions"], 60)
+        self.assertIn("candidate-specific shadow proof", capture.research_readiness["reason"])
+
     def test_parser_is_strict_and_bounded(self):
         valid = _progress()
         self.assertEqual(scheduler_output.structured_research_progress(valid),

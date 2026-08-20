@@ -102,6 +102,40 @@ QUALIFICATION_MAX_BYTES = 2_000_000
 COST_STRESS_SCENARIOS_BPS = (9.0, 15.0, 25.0, 50.0)
 COST_STRESS_REQUIRED_BPS = 25.0
 
+# A gate's booleans often share one underlying source statistic.  Keeping this
+# map explicit makes that overlap visible to reports without changing any
+# authorizing decision.  Paths are relative to a verified gate envelope.
+_GATE_SOURCE_STATISTICS = {
+    "actual_control_available": ("control.matched", "control.available"),
+    "fit_delta_positive": ("fit_control.mean_delta",),
+    "heldout_delta_positive": ("control.mean_delta",),
+    "heldout_delta_lcb_positive": ("control.mean_delta_lcb",),
+    "heldout_p_significant": ("statistics.p_value", "statistics.alpha"),
+    "family_fdr_significant": ("statistics.family_q_value", "statistics.alpha"),
+    "global_fdr_significant": ("statistics.q_value", "statistics.alpha"),
+    "cumulative_fdr_significant": (
+        "online_fdr.p_value", "online_fdr.allocated_alpha"),
+    "heldout_net_pnl_positive": ("performance.heldout_net_pnl",),
+    "heldout_expectancy_positive": ("performance.heldout_expectancy",),
+    "falsification": ("falsification.p_value", "falsification.alpha"),
+    "separated": ("separation.overlap_sessions", "separation.passes"),
+    "walk_forward_available": ("walk_forward.available",),
+    "walk_forward_adequate": ("walk_forward.adequate",),
+    "walk_forward_majority_positive": ("walk_forward.majority_positive",),
+    "null_control_available": ("null_control.available", "null_control.matched"),
+    "null_control_delta_positive": ("null_control.mean_delta",),
+    "qualification_available": ("qualification.available",),
+    "qualification_net_positive": ("qualification.net_pnl",),
+    "qualification_delta_positive": ("qualification.mean_delta",),
+    "fit_floor_adequate": ("floors.fit.adequate",),
+    "heldout_floor_adequate": ("floors.heldout.adequate",),
+    "qualification_floor_adequate": ("floors.qualification.adequate",),
+    "max_drawdown_supported": ("performance.max_drawdown",),
+    "risk_unit_adequate": ("risk_unit_report.adequate",),
+    "fill_quality_adequate": ("fill_quality.adequate",),
+    "cost_stress_adequate": ("cost_stress.adequate",),
+}
+
 # A replay row is useful diagnostic evidence even when it cannot authorize a
 # statistical conclusion.  Keep the projection schema deliberately small and
 # deterministic: callers persist the raw rows separately and this summary
@@ -1582,6 +1616,104 @@ def arm_evidence_report(*, candidate: Iterable[Mapping],
             "arms": arms, "pairing": pairing}
 
 
+def gate_dependence_report(envelope: Mapping | None = None, *,
+                           gate: Mapping | None = None,
+                           checks: Mapping | None = None) -> dict:
+    """Report shared source statistics behind gate booleans.
+
+    This is a policy-neutral explanation of *what was reused* by the gate,
+    not a new independence test.  A verified envelope (or a containing gate
+    record) is accepted; each check is mapped to the source paths that produce
+    its statistic, and paths used by multiple checks are grouped explicitly.
+    Missing paths remain visible with ``None`` values so a sparse diagnostic
+    envelope cannot be mistaken for a complete authorizing explanation.
+    """
+    candidate = envelope if isinstance(envelope, Mapping) else gate
+    if isinstance(candidate, Mapping) and isinstance(candidate.get("verified_gate"), Mapping):
+        candidate = candidate["verified_gate"]
+    source = dict(candidate or {}) if isinstance(candidate, Mapping) else {}
+    reported_checks = checks if isinstance(checks, Mapping) else source.get("checks")
+    if not isinstance(reported_checks, Mapping):
+        reported_checks = source.get("checks_without_family")
+    if not isinstance(reported_checks, Mapping):
+        reported_checks = {}
+
+    def lookup(path: str):
+        value: Any = source
+        for part in path.split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                return None
+            value = value[part]
+        return value
+
+    check_dependencies: dict[str, dict[str, Any]] = {}
+    statistic_usage: dict[str, dict[str, Any]] = {}
+    source_usage: dict[str, list[str]] = {}
+    for name in sorted(str(key) for key in reported_checks):
+        paths = tuple(_GATE_SOURCE_STATISTICS.get(name, ()))
+        if not paths:
+            # Unknown/additional checks are still represented, but are not
+            # assigned an invented statistic or policy meaning.
+            check_dependencies[name] = {
+                "decision": bool(reported_checks[name]),
+                "source_statistics": [], "known": False,
+            }
+            continue
+        details = {
+            "decision": bool(reported_checks[name]),
+            "source_statistics": list(paths), "known": True,
+            "values": {path: lookup(path) for path in paths},
+        }
+        check_dependencies[name] = details
+        for path in paths:
+            item = statistic_usage.setdefault(path, {
+                "checks": [], "value": lookup(path),
+            })
+            item["checks"].append(name)
+            root = path.split(".", 1)[0]
+            source_usage.setdefault(root, []).append(name)
+    for item in statistic_usage.values():
+        item["checks"] = sorted(set(item["checks"]))
+    for names in source_usage.values():
+        names[:] = sorted(set(names))
+    shared = {
+        path: item for path, item in sorted(statistic_usage.items())
+        if len(item["checks"]) > 1
+    }
+    source_counts = {}
+    for name in ("fit_source", "heldout_source", "fit_baseline_source",
+                 "heldout_baseline_source", "null_source"):
+        rows = source.get(name)
+        if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
+            source_counts[name] = len(rows)
+    return {
+        "schema": "gate-dependence-report.v1",
+        "available": bool(check_dependencies),
+        "policy_neutral": True,
+        "checks": check_dependencies,
+        "check_dependencies": check_dependencies,
+        "source_statistics": dict(sorted(statistic_usage.items())),
+        "source_statistic_dependencies": dict(sorted(statistic_usage.items())),
+        "shared_source_statistics": shared,
+        "shared_statistics": shared,
+        "dependent_checks": [item["checks"] for item in shared.values()],
+        "dependence_pairs": [item["checks"] for item in shared.values()],
+        "source_usage": dict(sorted(source_usage.items())),
+        "source_counts": source_counts,
+        "known_checks": sum(1 for item in check_dependencies.values()
+                             if item.get("known")),
+        "unknown_checks": sum(1 for item in check_dependencies.values()
+                               if not item.get("known")),
+    }
+
+
+# Names used by report consumers that focus on source/statistic provenance.
+gate_source_statistic_report = gate_dependence_report
+source_statistic_report = gate_dependence_report
+gate_source_dependence_report = gate_dependence_report
+source_statistic_dependence_report = gate_dependence_report
+
+
 def _fill_quality_adequate(fit: Sequence[Mapping], heldout: Sequence[Mapping],
                            *, vehicle: str, lane: str) -> bool:
     partitions = [heldout] if lane == "shadow" else [fit, heldout]
@@ -2627,7 +2759,10 @@ def _close_number(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
 
 __all__ = ["AcceptanceFloor", "ARM_EVIDENCE_SCHEMA", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
            "GATE_REQUIRED_CHECKS", "AUTHORIZATION_PROJECTION_SCHEMA",
-           "authorization_projection", "arm_evidence_report", "fill_source_summary", "floor_feasibility",
+           "authorization_projection", "arm_evidence_report", "gate_dependence_report",
+           "gate_source_statistic_report", "source_statistic_report",
+           "gate_source_dependence_report", "source_statistic_dependence_report",
+           "fill_source_summary", "floor_feasibility",
            "unevaluable_reason",
            "protocol_minimums", "validate_protocol_floor",
            "PROTOCOL_BACKTEST_MIN_TRADES", "PROTOCOL_BACKTEST_MIN_SESSIONS",

@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 _ASSUMPTION_KEYS = (
     "broker", "data", "session", "universe", "strategy", "risk",
-    "execution", "costs",
+    "execution", "costs", "llm",
 )
 _RUNTIME_CONFIG_KEYS = {
     "mode", "broker", "data", "session", "universe", "strategy", "risk",

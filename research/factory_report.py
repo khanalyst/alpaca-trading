@@ -23,7 +23,9 @@ import sqlite3
 from typing import Any, Mapping, Sequence
 
 from agent.contracts.rule import RULE_FAMILIES
+from .gates import gate_dependence_report
 from .edge_ledger_store import DEFAULT_DB_PATH, VEHICLES
+from .stats import cross_family_dependence_report
 
 REPORT_SCHEMA = "factory-report.v1"
 
@@ -101,6 +103,7 @@ def _variant_row(record: Mapping[str, Any]) -> dict:
     statistics = gate.get("global_multiple_tests")
     q_value = (_number(statistics.get("p_adjusted"))
                if isinstance(statistics, Mapping) else None)
+    verified = gate.get("verified_gate")
     spec = record.get("rule_spec") if isinstance(record.get("rule_spec"), Mapping) else {}
     return {
         "variant_id": record.get("variant_id"),
@@ -141,6 +144,10 @@ def _variant_row(record: Mapping[str, Any]) -> dict:
         "fit_diagnostics": (diagnosis.get("fit_diagnostics")
                              if isinstance(diagnosis.get("fit_diagnostics"), Mapping)
                              else None),
+        # Explain which source statistics are shared by multiple gate checks;
+        # this is diagnostic provenance and does not alter the verdict.
+        "gate_dependence": gate_dependence_report(
+            verified if isinstance(verified, Mapping) else gate),
         "gate_hash": gate.get("gate_hash"),
         # Why this variant was tried, and who decided to try it.  Fixed before
         # the gate beside it was computed, so the pair reads as a prediction
@@ -248,7 +255,9 @@ def _outcome(events: Sequence[Mapping[str, Any]], status: str) -> dict:
         if event.get("status") == "retired":
             diagnosis = payload.get("diagnostic") or {}
             return {
-                "kind": "rotated" if payload.get("rotation") else "retired",
+                "kind": ("recentered" if payload.get("recentered") or
+                          payload.get("mode") == "recenter" else
+                          "rotated" if payload.get("rotation") else "retired"),
                 "reason": event.get("reason"),
                 "variants_tested": payload.get("tested_variants"),
                 "variants_intended": payload.get("expected_variants"),
@@ -259,7 +268,17 @@ def _outcome(events: Sequence[Mapping[str, Any]], status: str) -> dict:
                 # Retirement is only legal against adequately powered failed
                 # gates; their hashes are the proof it was.
                 "failed_gate_hashes": payload.get("verified_gate_hashes") or [],
+                "from_variant_id": payload.get("from_variant_id"),
+                "to_variant_id": payload.get("to_variant_id"),
+                "fit_score": payload.get("fit_score"),
+                "fit_score_source": payload.get("fit_score_source"),
+                "closure_mode": payload.get("mode"),
             }
+        if event.get("status") == "bounded_space_exhausted":
+            return {"kind": "bounded_space_exhausted",
+                    "reason": event.get("reason"),
+                    "search_state": payload.get("search_state") or {},
+                    "max_generations": payload.get("generation_cap")}
         if event.get("status") == "validated" and payload.get("passing"):
             return {"kind": "proved", "reason": event.get("reason"),
                     "proved_variants": payload.get("passing"),
@@ -351,13 +370,48 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             item["payload"] = _loads(item.pop("payload_json")) or {}
             events.setdefault(str(item["hypothesis_id"]), []).append(item)
         accounts: dict[str, list[dict]] = {}
+        closures: dict[str, list[dict]] = {}
+        if "factory_variant_closures" in tables:
+            for row in db.execute(
+                    "SELECT * FROM factory_variant_closures ORDER BY created_at,closure_id"):
+                item = dict(row)
+                item["evidence"] = _loads(item.pop("evidence_json")) or {}
+                closures.setdefault(str(item["hypothesis_id"]), []).append(item)
+        # Session-level candidate statistics are reduced to family vectors for
+        # the cross-family dependence diagnostic.  Raw rows never leave this
+        # reader; the resulting report contains only aggregates/correlations.
+        family_vectors: dict[str, list[tuple[str, str, float]]] = {}
         for row in db.execute(
                 """SELECT hypothesis_id, result_json, created_at
                    FROM factory_accounts ORDER BY created_at, account_id"""):
             record = _loads(row["result_json"])
             if isinstance(record, Mapping):
-                accounts.setdefault(str(row["hypothesis_id"]), []).append(
-                    _variant_row(record))
+                hypothesis_id = str(row["hypothesis_id"])
+                accounts.setdefault(hypothesis_id, []).append(_variant_row(record))
+                spec = record.get("rule_spec")
+                family = (spec.get("family") if isinstance(spec, Mapping)
+                          else record.get("family"))
+                gate = record.get("gate")
+                verified = (gate.get("verified_gate")
+                            if isinstance(gate, Mapping) else None)
+                source_rows = (verified.get("heldout_source")
+                               if isinstance(verified, Mapping) else None)
+                if not isinstance(source_rows, Sequence):
+                    source_rows = (gate.get("heldout_source")
+                                   if isinstance(gate, Mapping) else None)
+                if family and isinstance(source_rows, Sequence):
+                    vehicle_name = str(record.get("vehicle") or "equity")
+                    bucket = family_vectors.setdefault(vehicle_name, [])
+                    for source_row in source_rows:
+                        if not isinstance(source_row, Mapping):
+                            continue
+                        session = source_row.get("session_date")
+                        value = source_row.get("net_pnl")
+                        if value is None:
+                            value = source_row.get("delta")
+                        number = _number(value)
+                        if session is not None and number is not None:
+                            bucket.append((str(family), str(session), number))
         deployed: dict[tuple[str, str], str] = {}
         if {"candidates", "candidate_state"}.issubset(tables):
             for row in db.execute(
@@ -386,12 +440,15 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                               "CASE WHEN o.passed=1 THEN 'proved' "
                               "WHEN o.underpowered=1 THEN 'underpowered' "
                               "ELSE 'legacy_unclassified' END AS classification")
+            fit_delta = ("o.fit_delta" if "fit_delta" in outcome_columns
+                         else "NULL AS fit_delta")
             reasons: dict[str, str] = {}
             for row in db.execute(
                     f"""SELECT l.lesson_id, {parent}, l.vehicle, l.family,
                               l.kind, l.source, l.reason, l.evidence_json,
                               l.changed_json, l.variant_id, l.created_at,
                               o.passed, o.underpowered, {classification},
+                              {fit_delta},
                               o.heldout_delta,
                               o.q_value, o.failed_checks_json, o.outcome_id
                        FROM factory_lessons l
@@ -413,6 +470,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                     "evidence": _loads(row["evidence_json"]) or {},
                     "graded": graded,
                     "verdict": None if not graded else row["classification"],
+                    "fit_delta": _number(row["fit_delta"]),
                     "heldout_delta": _number(row["heldout_delta"]),
                     "q_value": _number(row["q_value"]),
                     "failed_checks": [
@@ -439,6 +497,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             own = events.get(hypothesis_id, [])
             parent = events.get(str(item["parent_hypothesis_id"] or ""), [])
             variants = accounts.get(hypothesis_id, [])
+            own_closures = closures.get(hypothesis_id, [])
             fit_audit = _fit_events(own)
             for row in variants:
                 row["ledger_status"] = deployed.get(
@@ -468,6 +527,11 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                     "proposed_behavior_aliases"],
                 "tuning": _tuning_events(own),
                 "variants_tested": len(variants),
+                "variant_closures": own_closures,
+                "search_state": next((dict((event.get("payload") or {}).get("search_state"))
+                                       for event in reversed(own)
+                                       if isinstance((event.get("payload") or {}).get("search_state"), Mapping)),
+                                      None),
                 "outcome": _outcome(own, str(item["status"] or "")),
             })
         active = sum(1 for item in local if item["status"] in {
@@ -485,8 +549,20 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
         tested_families = {str(item["family"])
                            for rows in slots.values() for item in rows
                            if item["variants"]}
+        cross_family = cross_family_dependence_report(family_vectors.get(name, ()))
+        vehicle_search_state = {
+            str(slot_id): entry["search_state"]
+            for slot_id, entries in slots.items()
+            for entry in entries
+            if entry.get("search_state") is not None
+        }
         report_vehicles.append({
             "vehicle": name,
+            "cross_family_dependence": cross_family,
+            "search_state": vehicle_search_state,
+            "search_exhausted": bool(vehicle_search_state) and all(
+                str(state.get("state")) == "bounded_space_exhausted"
+                for state in vehicle_search_state.values()),
             "summary": {
                 "slots": len(slots),
                 "active_slots": active,
@@ -505,11 +581,11 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                     for label in (
                         "proved", "adequate_negative_rejection",
                         "adequate_negative_inconclusive",
-                        "adequate_inconclusive", "underpowered")
+                        "adequate_inconclusive", "budget_exhausted", "underpowered")
                 },
                 "retired_hypotheses": sum(
                     1 for rows in slots.values() for item in rows
-                    if item["outcome"]["kind"] in {"retired", "rotated"}),
+                    if item["outcome"]["kind"] in {"retired", "rotated", "recentered"}),
                 # Authored by the model, not merely asked of it.  A rejected
                 # proposal still records provider evidence, so counting the
                 # presence of that evidence reported a deterministic template
@@ -539,6 +615,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 # rather than starting from nothing.
                 "reasons_built_on_a_prior_lesson": sum(
                     1 for item in local_lessons if item.get("parent_lesson_id")),
+                "cross_family_dependence": cross_family,
             },
             "lessons": local_lessons,
             "slots": [{"slot": key, "generations": slots[key]}
@@ -592,11 +669,41 @@ def render_text(report: Mapping[str, Any]) -> str:
         add(f"  families explored: {', '.join(summary['families_explored'])}")
         add("  families not yet tested: " +
             (", ".join(summary.get("families_untested", ())) or "none"))
+        dependence = vehicle.get("cross_family_dependence") or {}
+        if dependence.get("available"):
+            diag = dependence.get("dependence") or {}
+            add("  cross-family dependence: "
+                f"{dependence.get('complete_session_count', 0)} shared sessions, "
+                f"mean |r| {_fmt(diag.get('mean_absolute_correlation'))}, "
+                f"strong pairs {len(diag.get('strong_pairs') or ())}")
+        else:
+            add("  cross-family dependence: unavailable "
+                f"({dependence.get('reason', 'not enough complete sessions')})")
         add("  verdict classes: " +
             json.dumps(summary.get("classifications", {}), sort_keys=True))
         add(f"  hypotheses proposed by the LLM: {summary['llm_seeded_hypotheses']}"
             f" ({summary['llm_proposals_rejected']} proposal(s) refused)")
         add(f"  hypotheses retired/rotated: {summary['retired_hypotheses']}")
+        add(f"  search exhausted: {vehicle.get('search_exhausted', False)}")
+        if vehicle.get("search_state"):
+            for slot_id, state in sorted(vehicle["search_state"].items()):
+                eligible_attempts = state.get(
+                    "eligible_confirmatory_attempts",
+                    # Compatibility with reports written before the explicit
+                    # eligible/total accounting names were introduced.
+                    state.get("confirmatory_attempts", 0))
+                account_attempts = state.get("account_attempts_total")
+                account_suffix = (f"; account attempts total {account_attempts}"
+                                  if account_attempts is not None else "")
+                add(f"  slot {slot_id} search state: {state.get('state')}"
+                    f" (coordinate {state.get('coordinate_remaining')}/"
+                    f"{state.get('coordinate_total')}, interaction "
+                    f"{state.get('interaction_remaining')}/"
+                    f"{state.get('interaction_total')}, closed "
+                    f"{state.get('closed_count')}, eligible confirmatory "
+                    f"attempts {eligible_attempts}/"
+                    f"{state.get('confirmatory_budget')}"
+                    f"{account_suffix})")
         add(f"  variants the model tuned: {summary['llm_tuned_variants']}"
             f" | reasons recorded {summary['reasons_recorded']}"
             f" ({summary['reasons_graded']} graded,"
@@ -727,15 +834,31 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 f"- Families explored: {', '.join(summary['families_explored'])}",
                 f"- Families not yet tested: "
                 f"{', '.join(summary.get('families_untested', ())) or 'none'}",
+                f"- Cross-family dependence: "
+                f"{('available' if (vehicle.get('cross_family_dependence') or {}).get('available') else 'unavailable')}",
                 f"- Verdict classes: {json.dumps(summary.get('classifications', {}), sort_keys=True)}",
                 f"- Proposed by the LLM: {summary['llm_seeded_hypotheses']}"
                 f" ({summary['llm_proposals_rejected']} refused)",
                 f"- Retired or rotated: {summary['retired_hypotheses']}",
+                f"- Search exhausted: {vehicle.get('search_exhausted', False)}",
                 f"- Variants the model tuned: {summary['llm_tuned_variants']}",
                 f"- LLM reseeds after proof: {summary['llm_reseeds']}",
                 f"- Reasons recorded: {summary['reasons_recorded']}"
                 f" ({summary['reasons_graded']} graded)",
                 f"- Proved edges: {', '.join(summary['proved_variants']) or 'none yet'}"]
+        if vehicle.get("search_state"):
+            for slot_id, state in sorted(vehicle["search_state"].items()):
+                eligible_attempts = state.get(
+                    "eligible_confirmatory_attempts",
+                    state.get("confirmatory_attempts", 0))
+                account_attempts = state.get("account_attempts_total")
+                account_suffix = (f"; account attempts total {account_attempts}"
+                                  if account_attempts is not None else "")
+                out.append(
+                    f"- Slot {slot_id} search state: {state.get('state')}; "
+                    f"eligible confirmatory attempts {eligible_attempts}/"
+                    f"{state.get('confirmatory_budget')}"
+                    f"{account_suffix}")
         if vehicle.get("lessons"):
             out += ["", "#### What it tried, why, and what happened", "",
                     "| verdict | kind | by | reason | built on | changed |"

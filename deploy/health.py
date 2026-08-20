@@ -19,7 +19,8 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from deploy import load_config
-from deploy.scheduler_output import structured_research_progress
+from deploy.scheduler_output import (derive_research_readiness,
+                                     structured_research_progress)
 
 
 def _read_json(path: Path) -> dict:
@@ -193,6 +194,10 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         # status file; scheduler-produced values already satisfy this schema.
         "research_progress": structured_research_progress(
             heartbeat.get("research_progress")),
+        "research_readiness": derive_research_readiness(
+            structured_research_progress(heartbeat.get("research_progress")),
+            heartbeat.get("research_readiness"), now=current,
+            deadline_ts=heartbeat.get("deadline_ts")),
     }
 
 
@@ -213,8 +218,17 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "events": heartbeat.get("events"),
         "decisions": heartbeat.get("decisions"),
         "ingested_events": heartbeat.get("ingested_events"),
+        "pruned_replay_diffs": heartbeat.get("pruned_replay_diffs"),
+        "retention_days": heartbeat.get("retention_days"),
+        "retention_floor_ts": heartbeat.get("retention_floor_ts"),
+        "retention_gap_watermark": heartbeat.get("retention_gap_watermark"),
+        "stale_tail": heartbeat.get("stale_tail"),
         "quarantine_through_session": heartbeat.get(
             "quarantine_through_session"),
+        # Shadow capacity is diagnostic only.  Keep it bounded by forwarding
+        # the already-capped summary emitted by the worker/ingester.
+        "opportunity_capacity": heartbeat.get("opportunity_capacity") or
+        heartbeat.get("capacity"),
     }
 
 

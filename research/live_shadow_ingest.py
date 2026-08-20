@@ -26,7 +26,7 @@ from .edge_lab import _strengthen_gate
 from .edge_ledger import EdgeLedger, VEHICLES, provenance_hash
 from .edge_ledger_store import REPLAY_ENGINE_EPOCH, content_hash
 from .gates import sample_counts, verify_gate_envelope, validate_protocol_floor
-from .live_shadow import ShadowError, ShadowStore
+from .live_shadow import ShadowError, ShadowStore, _opportunity_capacity
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from .factory_ledger import FDR_METHOD, FactoryLedger
 from .stats import benjamini_hochberg
@@ -135,14 +135,32 @@ def _split_sessions(sessions: Sequence[str], min_sessions: int) -> tuple[list[st
     return selection, confirmatory
 
 
-def _window_counts(rows: Sequence[Mapping[str, Any]], vehicle: str) -> dict[str, int]:
+def _window_counts(rows: Sequence[Mapping[str, Any]], vehicle: str) -> dict[str, Any]:
     counts = sample_counts(rows, vehicle=vehicle)
-    return {key: int(counts.get(key, 0)) for key in
-            ("trades", "sessions", "clusters")}
+    capacity = _opportunity_capacity(rows, vehicle=vehicle)
+    return {
+        **{key: int(counts.get(key, 0)) for key in
+           ("trades", "sessions", "clusters")},
+        "observed_trades": int(capacity["observed_trades"]),
+        "observed_sessions": int(counts.get("sessions", 0)),
+        "opportunity_count": int(capacity["opportunity_count"]),
+        "max_trade_opportunities": int(capacity["max_trade_opportunities"]),
+        "opportunity_sessions": int(capacity["opportunity_sessions"]),
+        "observed_trade_rate": float(capacity["observed_trade_rate"]),
+        "refusal_reason_counts": dict(capacity["refusal_reason_counts"]),
+    }
+
+
+def _window_capacity(rows: Sequence[Mapping[str, Any]], *, vehicle: str,
+                     min_trades: int, min_sessions: int) -> dict[str, Any]:
+    """Return bounded non-authorizing capacity/readiness telemetry."""
+    return _opportunity_capacity(
+        rows, vehicle=vehicle, min_trades=int(min_trades),
+        min_sessions=int(min_sessions))
 
 
 def _window_ready(rows: Sequence[Mapping[str, Any]], *, vehicle: str,
-                  min_trades: int, min_sessions: int) -> tuple[bool, dict[str, int]]:
+                  min_trades: int, min_sessions: int) -> tuple[bool, dict[str, Any]]:
     counts = _window_counts(rows, vehicle)
     return bool(counts["trades"] >= int(min_trades) and
                 counts["sessions"] >= int(min_sessions)), counts
@@ -556,12 +574,71 @@ class ShadowIngestor:
         if prior is None or boundary is None:
             return {"candidate_id": candidate_id, "status": "no_prior_proof",
                     "ingested": False, "boundary": boundary}
-        metadata = self.store.replay_metadata(candidate_id)
-        available = sorted({_session(row.get("session_date")) for row in metadata
-                            if _session(row.get("session_date")) > boundary})
+
+        # A short explicit retention window can remove replay metadata needed
+        # to prove the chronological tail after this candidate's boundary. The
+        # non-authorizing watermark makes that loss visible; never treat the
+        # remaining subset as a complete tail or advance the boundary across
+        # the gap.
+        retention_watermark = self.store.prune_watermark()
+        latest_pruned = (str(retention_watermark.get("latest_pruned_session"))
+                         if isinstance(retention_watermark, Mapping) and
+                         retention_watermark.get("latest_pruned_session") else None)
+        if latest_pruned is not None and str(boundary) < latest_pruned:
+            return {
+                "candidate_id": candidate_id,
+                "status": "retention_gap",
+                "reason": "shadow replay metadata was pruned after the prior boundary",
+                "ingested": False,
+                "boundary": boundary,
+                "retention_gap": True,
+                "retention_watermark": retention_watermark,
+                "stale_tail": {"status": "blocked",
+                               "reason": "retention_gap",
+                               "latest_pruned_session": latest_pruned},
+            }
+        baseline_id = self._paired_id(candidate, self.config.baseline_candidate_id)
+        null_id = self._paired_id(candidate, self.config.null_candidate_id, null=True)
+        if not baseline_id or not null_id:
+            return {"candidate_id": candidate_id, "status": "control_unavailable",
+                    "ingested": False, "boundary": boundary,
+                    "baseline_candidate_id": baseline_id,
+                    "null_candidate_id": null_id}
+
+        # Build the forward tail from every required arm.  Looking only at the
+        # candidate arm can silently skip a control-only or malformed session
+        # and then advance the candidate boundary past evidence still being
+        # repaired.  Unknown session labels are explicit incomplete tails.
+        arm_metadata = {
+            "candidate": self.store.replay_metadata(candidate_id),
+            "baseline": self.store.replay_metadata(baseline_id),
+            "null": self.store.replay_metadata(null_id),
+        }
+        unknown_sessions = sorted({
+            _session(row.get("session_date"))
+            for values in arm_metadata.values() for row in values
+            if not _session(row.get("session_date"))
+        })
+        if unknown_sessions:
+            return {"candidate_id": candidate_id, "status": "incomplete",
+                    "reason": "shadow metadata contains an unknown session",
+                    "unknown_sessions": unknown_sessions, "ingested": False,
+                    "boundary": boundary,
+                    "stale_tail": {"status": "blocked",
+                                   "unknown_sessions": unknown_sessions}}
+        session_sets = {
+            _session(row.get("session_date"))
+            for values in arm_metadata.values() for row in values
+            if _session(row.get("session_date"))
+        }
+        stale_sessions = sorted(day for day in session_sets if day <= boundary)
+        available = sorted(day for day in session_sets if day > boundary)
         if not available:
             return {"candidate_id": candidate_id, "status": "no_new_session",
-                    "ingested": False, "boundary": boundary}
+                    "ingested": False, "boundary": boundary,
+                    "stale_tail": {"status": "stale" if stale_sessions else "clear",
+                                   "sessions": stale_sessions,
+                                   "unknown_sessions": []}}
         selection_sessions, confirmatory_sessions = _split_sessions(
             available, self.config.min_sessions)
         if not selection_sessions or not confirmatory_sessions:
@@ -585,13 +662,6 @@ class ShadowIngestor:
             return {"candidate_id": candidate_id, "status": "incomplete",
                     "reason": reason, "ingested": False, "boundary": boundary}
 
-        baseline_id = self._paired_id(candidate, self.config.baseline_candidate_id)
-        null_id = self._paired_id(candidate, self.config.null_candidate_id, null=True)
-        if not baseline_id or not null_id:
-            return {"candidate_id": candidate_id, "status": "control_unavailable",
-                    "ingested": False, "boundary": boundary,
-                    "baseline_candidate_id": baseline_id,
-                    "null_candidate_id": null_id}
         baseline_rows, reason = _rows_for(self.store, baseline_id, available, vehicle)
         if reason:
             return {"candidate_id": candidate_id, "status": "control_incomplete",
@@ -638,22 +708,43 @@ class ShadowIngestor:
                     arm_rows, vehicle=vehicle,
                     min_trades=self.config.min_trades,
                     min_sessions=self.config.min_sessions)
-                arm_checks[arm_name] = {"ready": ready, "counts": counts}
+                capacity = _window_capacity(
+                    arm_rows, vehicle=vehicle,
+                    min_trades=self.config.min_trades,
+                    min_sessions=self.config.min_sessions)
+                arm_checks[arm_name] = {
+                    "ready": ready,
+                    "counts": counts,
+                    "capacity": capacity,
+                }
             arm_checks["ready"] = all(
                 bool(value.get("ready")) for key, value in arm_checks.items()
                 if key != "ready")
+            arm_checks["capacity_feasible"] = all(
+                bool(value.get("capacity", {}).get("capacity_feasible"))
+                for key, value in arm_checks.items() if key not in {"ready", "capacity_feasible"})
+            arm_checks["capacity_status"] = (
+                "feasible" if arm_checks["capacity_feasible"]
+                else "structurally_impossible")
             window_checks[name] = arm_checks
         if not all(bool(item.get("ready")) for item in window_checks.values()):
+            structurally_impossible = any(
+                not bool(item.get("capacity_feasible"))
+                for item in window_checks.values())
             return {
                 "candidate_id": candidate_id,
                 "status": "underpowered_confirmatory_window",
-                "reason": "selection and confirmatory windows must each meet structural minimums",
+                "reason": ("opportunity capacity is structurally impossible for the "
+                           "configured floor" if structurally_impossible else
+                           "selection and confirmatory windows must each meet structural minimums"),
                 "ingested": False,
                 "boundary": boundary,
                 "sessions": available,
                 "selection_sessions": selection_sessions,
                 "confirmatory_sessions": confirmatory_sessions,
                 "window_checks": window_checks,
+                "capacity_status": ("structurally_impossible"
+                                    if structurally_impossible else "underpowered_observed"),
                 "online_allocation_spent": False,
             }
 
@@ -704,6 +795,14 @@ class ShadowIngestor:
             "null": {"candidate_id": null_id,
                       "rows_digest": _digest(null_rows),
                       "role": "randomized_entry_null"},
+            "capacity": {
+                name: {
+                    arm: dict(value.get("capacity") or {})
+                    for arm, value in checks.items()
+                    if arm in {"candidate", "baseline", "null"}
+                }
+                for name, checks in window_checks.items()
+            },
         }
         previous_run, previous_gate = prior
         qualification = previous_gate.get("qualification")
@@ -735,6 +834,10 @@ class ShadowIngestor:
                         "sessions": available,
                         "selection_sessions": selection_sessions,
                         "confirmatory_sessions": confirmatory_sessions,
+                        "window_checks": window_checks,
+                        "capacity_status": {
+                            name: checks.get("capacity_status")
+                            for name, checks in window_checks.items()},
                         "independent_confirmatory": True,
                         "test_iterations": int(test_iterations)}
             correction = dict(correction or {})
@@ -766,6 +869,10 @@ class ShadowIngestor:
                         "global": dict(global_data),
                         "preflight_ready": preflight_ready,
                         "preflight_checks": preflight_checks,
+                        "window_checks": window_checks,
+                        "capacity_status": {
+                            name: checks.get("capacity_status")
+                            for name, checks in window_checks.items()},
                         "independent_confirmatory": True,
                         "online_allocation_spent": False}
 
@@ -1029,7 +1136,12 @@ class ShadowIngestor:
                 "preflight_ready": preflight_ready,
                 "preflight_checks": preflight_checks,
                 "transitions": transitions, "gate_hash": envelope["content_hash"],
-                "source": source}
+                "source": source,
+                "capacity": source.get("capacity", {}),
+                "capacity_status": {
+                    name: checks.get("capacity_status")
+                    for name, checks in window_checks.items()},
+                }
 
     def ingest(self) -> dict[str, Any]:
         candidate_ids = self._candidate_ids()
