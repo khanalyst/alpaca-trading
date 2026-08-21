@@ -433,6 +433,17 @@ class DeployTests(unittest.TestCase):
         self.assertIn("ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials",
                       recorder)
         self.assertIn("source: agent_credentials", recorder)
+        self.assertIn(
+            "ALPACA_RECORDER_FETCH_WINDOW_MINUTES: ${ALPACA_RECORDER_FETCH_WINDOW_MINUTES:-1}",
+            recorder)
+
+    def test_recorder_fetch_window_default_and_override(self):
+        with patch.dict(os.environ):
+            os.environ.pop("ALPACA_RECORDER_FETCH_WINDOW_MINUTES", None)
+            self.assertEqual(recorder._fetch_window_minutes(), 1)
+        with patch.dict(os.environ, {
+                "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "30"}):
+            self.assertEqual(recorder._fetch_window_minutes(), 30)
 
     def test_research_service_has_no_broker_credentials(self):
         text = Path("compose.yaml").read_text(encoding="utf-8")

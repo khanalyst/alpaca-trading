@@ -116,7 +116,7 @@ PARTITION_SOURCE_SCHEMA = "recorder-partition-source.v1"
 # failure rather than a silent append -- replaying an old key is impossible, not
 # merely unlikely.
 DEDUP_HORIZON = timedelta(minutes=15)
-DEFAULT_FETCH_WINDOW_MINUTES = 15
+DEFAULT_FETCH_WINDOW_MINUTES = 1
 DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
 # Calendar metadata is an audit boundary, not a deduplication cache.  Keep the

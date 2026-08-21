@@ -78,8 +78,10 @@ and is never repaired by relabeling another feed. New IEX evidence needs a
 fresh research/shadow proof epoch.
 
 Catch-up requests are split into `ALPACA_RECORDER_FETCH_WINDOW_MINUTES`
-windows (15 minutes by default), so a long outage cannot materialize the whole
-quote backlog in one process. A legacy single-file `market.csv` is streamed,
+windows (1 minute by default), so a long outage cannot materialize the whole
+quote backlog in one process. The small default bounds peak memory, at the cost
+of more API requests and a slower stale-corpus catch-up. A legacy single-file
+`market.csv` is streamed,
 audited, and partitioned in place on the first run after upgrade, then kept
 beside the corpus as `market.csv.migrated`.
 
