@@ -198,6 +198,29 @@ case "$llm_provider" in
     finish "failed" "strategy LLM provider is unsupported" 3
     ;;
 esac
+
+# Resolve selected lanes before preprocessing the dataset.  Equity-only
+# research may safely ignore indicative option snapshots in a mixed corpus;
+# explicitly selecting option/all instead requires executable OPRA evidence.
+set +e
+vehicles="$("$python_bin" "$repo_root/research.py" vehicles \
+  --agent-config "$agent_config" \
+  --vehicles "${ALPACA_RESEARCH_VEHICLES:-equity}")"
+vehicle_status=$?
+set -e
+if [ "$vehicle_status" -ne 0 ] || [ -z "$vehicles" ]; then
+  finish "failed" "no research vehicle resolved from the agent config" 3
+fi
+option_research_selected=0
+for vehicle in $vehicles; do
+  if [ "$vehicle" = "option" ]; then
+    option_research_selected=1
+  fi
+done
+if [ "$option_research_selected" -eq 1 ] && [ "$configured_option_feed" != "opra" ]; then
+  finish "failed" "selected option research requires OPRA entitlement" 3
+fi
+
 dataset="${ALPACA_RESEARCH_DATASET:-}"
 dataset_from_recorder=0
 recorded_root="${ALPACA_RECORDED_DATASET_ROOT:-$repo_root/runtime/research/recorded}"
@@ -327,6 +350,48 @@ dataset_report="$("$python_bin" "$repo_root/deploy/research_dataset.py" "$valida
   --bars "$bars_input" --quotes "$quotes_input" --options "$options_input" \
   --replay "$replay_input")"
 validated_input="$normalized_input"
+
+# Scope the normalized stream to the selected research lanes without mutating
+# the append-only source corpus.  In an equity-only cycle, option rows are
+# diagnostic context only and must not reach calendar/provenance validation,
+# replay, or factory workers.  Option/all retains them for strict OPRA checks.
+vehicle_input="$tmp_dir/market-vehicles.jsonl"
+set +e
+vehicle_filter_status="$("$python_bin" - "$validated_input" "$vehicle_input" "$vehicles" <<'PY'
+import json
+import sys
+
+source, target, raw_vehicles = sys.argv[1:]
+selected = {item for item in raw_vehicles.split() if item}
+option_kinds = {"option", "option_snapshot", "option_quote"}
+excluded = 0
+with open(source, encoding="utf-8") as source_file, \
+        open(target, "w", encoding="utf-8") as target_file:
+    for line in source_file:
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        if (str(payload.get("kind", "")).lower() in option_kinds
+                and "option" not in selected):
+            excluded += 1
+            continue
+        target_file.write(json.dumps(payload, sort_keys=True) + "\n")
+print(json.dumps({
+    "schema": "research-cycle-vehicle-filter.v1",
+    "status": "filtered" if excluded else "unchanged",
+    "selected_vehicles": sorted(selected),
+    "excluded_option_rows": excluded,
+    "source_unchanged": True,
+}, sort_keys=True))
+PY
+)"
+vehicle_filter_exit=$?
+set -e
+if [ "$vehicle_filter_exit" -ne 0 ]; then
+  finish "failed" "research vehicle stream filtering failed" 3
+fi
+printf '%s\n' "$vehicle_filter_status" >&2
+validated_input="$vehicle_input"
 
 # Add exact broker calendar boundaries to the temporary research view. The
 # recorder corpus remains append-only; external inputs must already carry both
@@ -508,12 +573,16 @@ PY
 
 # Preserve the quarantine record and report view sizes without rescanning the
 # generated files. ``research_dataset.py`` counted them during its source pass.
-"$python_bin" - "$dataset_report" <<'PY' >&2
+"$python_bin" - "$dataset_report" "$vehicle_filter_status" <<'PY' >&2
 import json
 import sys
 
 report = json.loads(sys.argv[1])
+vehicle_filter = json.loads(sys.argv[2])
 counts = report.pop("view_counts", {})
+excluded_options = int(vehicle_filter.get("excluded_option_rows", 0))
+counts["options"] = max(0, int(counts.get("options", 0)) - excluded_options)
+counts["replay"] = max(0, int(counts.get("replay", 0)) - excluded_options)
 print(json.dumps(report, sort_keys=True))
 print(json.dumps({
     "schema": "research-cycle-views.v1",
@@ -1017,19 +1086,6 @@ run_shadow_ingest() {
   fi
   emit_progress "shadow_ingest" 1 1 "steps" "$vehicle"
 }
-
-# The scheduled research profile follows the deployed equity vehicle by
-# default. ALPACA_RESEARCH_VEHICLES can explicitly select option or all/both
-# when those lanes are intentionally enabled.
-set +e
-vehicles="$("$python_bin" "$repo_root/research.py" vehicles \
-  --agent-config "$agent_config" \
-  --vehicles "${ALPACA_RESEARCH_VEHICLES:-equity}")"
-vehicle_status=$?
-set -e
-if [ "$vehicle_status" -ne 0 ] || [ -z "$vehicles" ]; then
-  finish "failed" "no research vehicle resolved from the agent config" 3
-fi
 
 # Judge the paper-account trials before proposing anything new, so a trial that
 # just finished below its floor is already a recorded lesson by the time this

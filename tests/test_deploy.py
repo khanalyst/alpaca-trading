@@ -1043,6 +1043,110 @@ class DeployTests(unittest.TestCase):
                 ).fetchall())
             self.assertEqual(vehicles, {"equity": 11})
 
+    def test_research_cycle_equity_only_filters_indicative_options(self):
+        """A mixed indicative corpus remains usable for the equity lane."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "research-test-config.json"
+            config.write_text(json.dumps({
+                "mode": "paper",
+                "broker": {"paper": True, "allow_live": False,
+                           "data_feed": "iex", "options_feed": "indicative"},
+                "universe": {"asset_classes": ["us_equity"]},
+                "session": {"require_exact_calendar": False},
+                "strategy": {"selection_mode": "all_proved",
+                             "execution_mode": "shares"},
+                "research": {"enabled": True,
+                             "require_validated_variant": True,
+                             "strategy_llm": {"enabled": False}},
+            }), encoding="utf-8")
+            dataset = root / "market.jsonl"
+            rows = [
+                {"kind": "bar", "provider": "alpaca", "feed": "iex",
+                 "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
+                 "as_of": "2026-08-08T13:30:00+00:00",
+                 "observed_at": "2026-08-08T13:31:00+00:00",
+                 "open": 100, "high": 101, "low": 99, "close": 100.5,
+                 "volume": 10},
+                {"kind": "option_snapshot", "provider": "alpaca",
+                 "feed": "indicative", "symbol": "SPY260918C00100000",
+                 "contract": "SPY260918C00100000",
+                 "timestamp": "2026-08-08T13:30:02+00:00",
+                 "as_of": "2026-08-08T13:30:02+00:00",
+                 "observed_at": "2026-08-08T13:31:00+00:00",
+                 "underlying": "SPY", "expiration": "2026-09-18",
+                 "strike": 100, "right": "call", "multiplier": 100,
+                 "bid": 1, "ask": 1.1, "bid_size": 10, "ask_size": 11,
+                 "volume": 100, "open_interest": 200,
+                 "underlying_price": 100},
+            ]
+            dataset.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8")
+            source_bytes = dataset.read_bytes()
+            result = _run_research_cycle(
+                dataset, root, ALPACA_AGENT_CONFIG=str(config),
+                ALPACA_OPTIONS_FEED="indicative",
+                ALPACA_RESEARCH_VEHICLES="equity",
+                ALPACA_FACTORY_ENABLED="1")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            diagnostics = [item for item in _cycle_payloads(
+                result.stderr, "schema")
+                           if item["schema"] ==
+                           "research-cycle-vehicle-filter.v1"]
+            self.assertEqual(diagnostics, [{
+                "excluded_option_rows": 1,
+                "schema": "research-cycle-vehicle-filter.v1",
+                "selected_vehicles": ["equity"],
+                "source_unchanged": True,
+                "status": "filtered",
+            }])
+            views = [item for item in _cycle_payloads(result.stderr, "schema")
+                     if item["schema"] == "research-cycle-views.v1"][0]
+            self.assertEqual((views["bars"], views["options"], views["replay"]),
+                             (1, 0, 1))
+            validation = [item for item in _cycle_payloads(result.stdout, "valid")][0]
+            self.assertTrue(validation["valid"])
+            self.assertEqual(dataset.read_bytes(), source_bytes)
+            with closing(sqlite3.connect(root / "edge.sqlite3")) as db:
+                vehicles = dict(db.execute(
+                    "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
+                ).fetchall())
+            self.assertEqual(vehicles, {"equity": 11})
+
+    def test_research_cycle_selected_all_with_indicative_options_fails(self):
+        """Selecting the option lane requires configured OPRA provenance."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "research-test-config.json"
+            config.write_text(json.dumps({
+                "mode": "paper",
+                "broker": {"paper": True, "allow_live": False,
+                           "data_feed": "iex", "options_feed": "indicative"},
+                "universe": {"asset_classes": ["us_equity"]},
+                "session": {"require_exact_calendar": False},
+                "strategy": {"selection_mode": "all_proved",
+                             "execution_mode": "shares"},
+                "research": {"enabled": True,
+                             "require_validated_variant": True,
+                             "strategy_llm": {"enabled": False}},
+            }), encoding="utf-8")
+            dataset = root / "market.jsonl"
+            dataset.write_text(json.dumps({
+                "kind": "bar", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
+                "as_of": "2026-08-08T13:30:00+00:00",
+                "observed_at": "2026-08-08T13:31:00+00:00",
+                "open": 100, "high": 101, "low": 99, "close": 100.5,
+                "volume": 10,
+            }) + "\n", encoding="utf-8")
+            result = _run_research_cycle(
+                dataset, root, ALPACA_AGENT_CONFIG=str(config),
+                ALPACA_OPTIONS_FEED="indicative",
+                ALPACA_RESEARCH_VEHICLES="all")
+            self.assertEqual(result.returncode, 3, result.stderr + result.stdout)
+            self.assertIn("OPRA", result.stdout)
+
     def test_dashboard_tradeable_vehicle_matches_the_runtime_resolver(self):
         from agent.edge import runtime_vehicle
         for mode, expected in (("shares", "equity"), ("options", "option"),

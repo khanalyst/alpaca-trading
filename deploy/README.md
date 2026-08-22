@@ -366,7 +366,10 @@ paper key/secret and the separate provider key, then set mode `0400` and owner
 non-executable indicative options placeholder. Set
 `ALPACA_RESEARCH_VEHICLES=all` explicitly when both research vehicles are
 needed after configuring OPRA; their calibration remains independent. The unit
-fails closed if the provider file is not readable. Enable the full paper lane
+fails closed if the provider file is not readable. Equity-only cycles keep the
+mixed recorder corpus append-only but use a temporary view that excludes
+option rows (and records the excluded count); selecting `option` or `all`
+retains those rows and applies strict OPRA validation. Enable the full paper lane
 with:
 
 ```sh
