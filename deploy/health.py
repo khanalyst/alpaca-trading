@@ -23,6 +23,8 @@ from deploy.scheduler_output import (derive_research_readiness,
                                      structured_research_preflight,
                                      structured_research_progress)
 
+MAX_RECORDER_INDEX_BYTES = 16 * 1024 * 1024
+
 
 def _read_json(path: Path) -> dict:
     try:
@@ -107,7 +109,13 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
     # is authoritative; nested files must not mask a stale recorder.
     index_path = path / ".recorder-index.json"
     index_write = index_path.stat().st_mtime if index_path.is_file() else None
-    index = _read_json(index_path)
+    # A legacy recorder index can contain more than a million recent quote keys.
+    # Health only needs compact metadata and must not compete with migration for
+    # the recorder's cgroup, so defer decoding until the recorder rewrites it.
+    index_oversized = bool(
+        index_path.is_file() and
+        index_path.stat().st_size > MAX_RECORDER_INDEX_BYTES)
+    index = {} if index_oversized else _read_json(index_path)
     attempt = _read_json(path / ".recorder-status.json")
     attempt_failed = attempt.get("status") == "failed"
     raw_coverage = index.get("bar_coverage")
@@ -148,6 +156,7 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
         "latest_write_ts": latest,
         "latest_csv_write_ts": latest_csv,
         "index_write_ts": index_write,
+        "index_migration_pending": index_oversized,
         "data_feed": index.get("data_feed"),
         "configured_data_feed": (attempt.get("data_feed") or
                                   configured_data_feed),

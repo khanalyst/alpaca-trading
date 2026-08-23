@@ -2147,6 +2147,22 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(result["index_write_ts"], 900)
             self.assertEqual(result["latest_write_ts"], 900)
 
+    def test_recorder_health_does_not_decode_oversized_legacy_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "sessions" / "market-2026-08-07.csv"
+            csv_path.parent.mkdir()
+            csv_path.write_text("event_key\n", encoding="utf-8")
+            index_path = root / ".recorder-index.json"
+            index_path.write_text(json.dumps({
+                "data_feed": "iex", "recent_keys": {"x": "y"},
+            }), encoding="utf-8")
+            with patch.object(health, "MAX_RECORDER_INDEX_BYTES", 16):
+                result = health.recorder(root, max_age=300)
+
+            self.assertTrue(result["index_migration_pending"])
+            self.assertIsNone(result["data_feed"])
+
     def test_recorder_health_is_stale_when_index_and_corpus_are_stale(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
