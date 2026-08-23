@@ -620,7 +620,8 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                     for label in (
                         "proved", "adequate_negative_rejection",
                         "adequate_negative_inconclusive",
-                        "adequate_inconclusive", "budget_exhausted", "underpowered")
+                        "adequate_inconclusive", "budget_exhausted", "underpowered",
+                        "execution_blocked", "qualification_unavailable")
                 },
                 "retired_hypotheses": sum(
                     1 for rows in slots.values() for item in rows
@@ -687,6 +688,18 @@ def _fmt(value: Any, digits: int = 4) -> str:
     if number is None:
         return "—" if value is None else str(value)
     return f"{number:,.{digits}f}".rstrip("0").rstrip(".") or "0"
+
+
+def _variant_classification(variant: Mapping[str, Any]) -> str:
+    """Return the persisted classification, with a legacy compatibility fallback."""
+    classification = variant.get("classification")
+    if classification not in (None, ""):
+        return str(classification)
+    if variant.get("passes"):
+        return "proved"
+    if variant.get("underpowered"):
+        return "underpowered"
+    return "fail"
 
 
 def render_text(report: Mapping[str, Any]) -> str:
@@ -829,8 +842,7 @@ def render_text(report: Mapping[str, Any]) -> str:
                         f" | proposed canonicalization {len(proposed)}"
                         f" | excluded before replay {len(excluded)}")
                 for variant in item["variants"]:
-                    verdict = ("PASS" if variant["passes"] else
-                               "underpowered" if variant["underpowered"] else "fail")
+                    verdict = _variant_classification(variant)
                     add(f"        - {variant['variant_id']}  [{verdict}]"
                         f"  lane={variant['lane']}")
                     add(f"            trades {variant['trades']}"
@@ -936,8 +948,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                     out += ["| variant | lane | trades | held-out Δ | lcb | q | verdict |",
                             "| --- | --- | --- | --- | --- | --- | --- |"]
                     for variant in item["variants"]:
-                        verdict = ("**pass**" if variant["passes"] else
-                                   "underpowered" if variant["underpowered"] else "fail")
+                        classification = _variant_classification(variant)
+                        verdict = ("**pass**" if classification == "proved"
+                                   else classification)
                         out.append(
                             f"| `{variant['variant_id']}` | {variant['lane']} |"
                             f" {variant['trades']} | {_fmt(variant['heldout_delta'])} |"

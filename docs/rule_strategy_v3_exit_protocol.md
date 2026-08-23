@@ -7,8 +7,12 @@ The canonical forms and content hashes of v1 and v2 are unchanged.
 
 New deterministic equity factory roots use v3 with `breakeven_r: null`, then
 their bounded coordinate neighborhood and discovery ladder traverse finite
-breakeven triggers below `target_r`. Option roots and discovery remain on v2;
+breakeven triggers below `target_r`. Option roots and discovery remain on
+executable v1/v2 schemas;
 the v3 exit is reachable without relying on an LLM-authored proposal.
+The equity provider-facing proposal schema accepts `breakeven_r` as nullable
+number-or-null, while the validator remains authoritative for bounds. Tuning a
+v3 root keeps `schema: rule-strategy.v3`; options remain restricted to v1/v2.
 
 ## Executable vehicle boundary
 

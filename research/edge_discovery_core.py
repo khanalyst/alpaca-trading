@@ -21,9 +21,11 @@ from agent.contracts.rule import (completed_bar_exit_transition, hold_deadline,
                                   initialize_exit_state,
                                   rule_vehicle_executable, validate_rule_spec)
 from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
-                    CostError, CostModel, ReplayPolicy, SQLiteQuoteIndex,
+                    CostError, CostModel,
+                    ReplayPolicy, SQLiteQuoteIndex,
                     SQLiteQuoteIndexDescriptor, check_stressed_cost_plan,
-                    index_quotes, quote_fill, quote_fill_record,
+                    check_entry_slippage, index_quotes, quote_fill,
+                    quote_fill_record,
                     stressed_cost_usd)
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, replay_available_at,
@@ -737,6 +739,10 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         )
         entry_underlying = (float(entry_bar.open)
                             if entry_bar_visible else None)
+        # Preserve the pre-quote reference.  An executable quote is the fill,
+        # but it must be checked against the boundary reference before it is
+        # allowed to replace that anchor.
+        entry_reference = entry_underlying
         entry_ref = entry_underlying
         entry_source = BAR
         entry_feed = entry_provider = None
@@ -749,6 +755,15 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 max_age_seconds=policy.max_market_data_age_seconds,
                 session_date=entry_bar.session_date)
             if quoted is not None:
+                if entry_reference is not None:
+                    slippage, slippage_reason = check_entry_slippage(
+                        side, entry_reference, quoted.price,
+                        model.max_slippage_bps)
+                    if slippage_reason is not None:
+                        rows.append(_null_row(
+                            symbol, day, opportunity, vehicle,
+                            slippage_reason, slippage))
+                        continue
                 entry_underlying = quoted.price
                 entry_ref, entry_source = quoted.price, QUOTE
                 entry_feed, entry_provider = quoted.feed, quoted.provider

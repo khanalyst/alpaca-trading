@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import MIN_STOP_DISTANCE_FRACTION
 from .costs import (BAR, QUOTE, CostError, CostModel, ReplayPolicy,
-                    index_quotes, quote_fill_record, replay_policy_for_bars)
+                    check_entry_slippage, index_quotes, quote_fill_record,
+                    replay_policy_for_bars)
 
 RUNTIME_MAX_MARKET_DATA_AGE_SECONDS = 30.0
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
@@ -551,6 +552,16 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             max_age_seconds=cfg.policy.max_market_data_age_seconds,
             session_date=day)
         if quoted is not None:
+            entry_side = "buy" if direction == "long" else "sell"
+            # Compare executable quote evidence with the independent boundary
+            # reference before replacing it as the fill anchor.  This is the
+            # same fail-closed cap the runtime applies to submitted entries.
+            if underlying_entry is not None:
+                slippage, slippage_reason = check_entry_slippage(
+                    entry_side, underlying_entry, quoted.price,
+                    cfg.costs.max_slippage_bps)
+                if slippage_reason is not None:
+                    return refuse(slippage_reason, slippage)
             # A boundary quote is independent executable evidence.  Use it as
             # the underlying anchor too, so a completed recorder bar observed
             # after its open cannot leak its OHLC into strict replay.

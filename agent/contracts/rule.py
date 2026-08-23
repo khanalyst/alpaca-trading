@@ -248,8 +248,11 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
     """Return a small deterministic normalized distance between two rules.
 
     The metric is intentionally transparent (no fuzzy model): categorical
-    executable changes cost one, and numeric changes are normalized by their
-    audited grammar span.  A distance of zero means semantic equivalence.
+    executable changes cost one. Continuous numeric changes use a
+    relative/local scale instead of the full grammar span, while discrete
+    integer coordinates retain their audited span. This keeps an economically
+    meaningful proportional nudge visible without expanding integer aliases.
+    A distance of zero means semantic equivalence.
     """
     a = validate_rule_spec(left)
     b = validate_rule_spec(right)
@@ -257,6 +260,12 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
         return 1.0
     distance = 0.0
     dimensions = 0
+    # A grammar-wide span makes ordinary local changes on continuous axes (for
+    # example a 20% threshold adjustment) look negligible merely because the
+    # field's legal maximum is large. Use the values being compared as the
+    # local scale for floats, while retaining the audited span for discrete
+    # integer coordinates such as lookback. Validation above remains the
+    # source of truth for legal ranges.
     bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS}
     fields = _semantic_fields(a) | _semantic_fields(b)
     for name, default in V2_DEFAULT_EXTENSIONS.items():
@@ -272,8 +281,11 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
             distance += 0.0 if set(av or ()) == set(bv or ()) else 1.0
         elif name in bounds and isinstance(av, (int, float)) and isinstance(bv, (int, float)):
             low, high, _ = bounds[name]
-            span = max(float(high) - float(low), 1.0)
-            distance += min(1.0, abs(float(av) - float(bv)) / span)
+            if isinstance(av, int) and isinstance(bv, int):
+                scale = max(float(high) - float(low), 1.0)
+            else:
+                scale = max(abs(float(av)), abs(float(bv)), 1.0)
+            distance += min(1.0, abs(float(av) - float(bv)) / scale)
         else:
             distance += 0.0 if av == bv else 1.0
     return distance / max(dimensions, 1)

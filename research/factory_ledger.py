@@ -784,6 +784,57 @@ class FactoryLedger:
         return {str(item["family"]) for item in self.hypotheses(vehicle=vehicle)
                 if int(item["slot"]) == int(slot)}
 
+    def novel_tuning_values(self, *, hypothesis_id: str, vehicle: str,
+                            family: str) -> set[str]:
+        """Return model-authored novel values already spent in this lineage.
+
+        Prompt briefs are intentionally short, so counting only their latest
+        rows lets a restarted cycle spend the same novelty allowance again.
+        Walk the immutable parent chain and aggregate every marked lesson for
+        this family.  The returned immutable lesson/value tokens make the cap
+        durable across restarts and prompt truncation; each marked attempt
+        consumes one allowance unit.
+        """
+        lineage: set[str] = set()
+        current = str(hypothesis_id)
+        while current and current not in lineage:
+            lineage.add(current)
+            item = self.hypothesis(current)
+            if item is None:
+                break
+            parent = item.get("parent_hypothesis_id")
+            current = str(parent) if parent else ""
+        if not lineage:
+            return set()
+        placeholders = ",".join("?" for _ in lineage)
+        parameters: list[Any] = [str(vehicle), str(family), *sorted(lineage)]
+        values: set[str] = set()
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT lesson_id,changed_json,evidence_json FROM factory_lessons "
+                "WHERE vehicle=? AND family=? AND hypothesis_id IN (" +
+                placeholders + ")", parameters).fetchall()
+        for row in rows:
+            try:
+                evidence = json.loads(row["evidence_json"] or "{}")
+                changed = json.loads(row["changed_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(evidence, Mapping) or evidence.get("novel_tuning") is not True:
+                continue
+            if not isinstance(changed, Mapping):
+                continue
+            for name, change in changed.items():
+                if isinstance(change, Mapping) and "to" in change:
+                    # Keep the immutable lesson id in the token: every
+                    # authored novel attempt spends one durable budget unit,
+                    # even if a provider repeats the same value after a
+                    # restart.  The value payload remains available for
+                    # duplicate suppression in the caller.
+                    values.add(str(row["lesson_id"]) + ":" + canonical_json({
+                        "parameter": str(name), "value": change.get("to")}))
+        return values
+
     def slot_event_count(self, vehicle: str, slot: int, *, status: str,
                          flag: str) -> int:
         """Count a slot's events carrying ``payload[flag] is True``."""

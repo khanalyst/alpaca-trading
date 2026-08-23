@@ -4,12 +4,15 @@ from dataclasses import asdict
 import unittest
 
 from agent.config import ConfigError, validate_config
-from agent.contracts.rule import rule_variant_id, validate_rule_spec
+from agent.contracts.rule import (RULE_SCHEMA_V2, RULE_SCHEMA_V3,
+                                  rule_semantic_distance,
+                                  rule_semantic_signature, rule_variant_id,
+                                  rule_vehicle_executable, validate_rule_spec)
 from research.factory_core import family_template, template_hypothesis, mutate_with_reasons
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
                                     TUNING_SCHEMA, ProposalResult)
 from research.strategy_factory import (
-    NEAR_DUPLICATE_DISTANCE, _behavior_signature, _llm_replacement,
+    NEAR_DUPLICATE_DISTANCE, _behavior_distance, _behavior_signature, _llm_replacement,
     _seed_slot, _semantic_duplicate, _structurally_distinct,
     _tuned_variants, structure_signature,
 )
@@ -50,6 +53,64 @@ class _ReplacementAdapter:
 
 
 class SemanticNearDuplicateTests(unittest.TestCase):
+    def test_all_eleven_equity_roots_have_stable_semantic_signatures(self):
+        from research.factory_core import initial_hypotheses
+
+        roots = initial_hypotheses(11, vehicle="equity")
+        self.assertEqual(len(roots), 11)
+        signatures = [rule_semantic_signature(item.rule_spec) for item in roots]
+        self.assertTrue(all(signatures))
+        self.assertEqual(len(set(signatures)), 11)
+
+    def test_v1_and_noop_v2_are_semantic_equivalents(self):
+        v1 = validate_rule_spec({"family": "momentum_continuation",
+                                 "threshold_bps": 18.0})
+        v2 = validate_rule_spec({**v1, "schema": RULE_SCHEMA_V2})
+        self.assertEqual(rule_semantic_signature(v1), rule_semantic_signature(v2))
+        self.assertEqual(rule_semantic_distance(v1, v2), 0.0)
+
+    def test_v3_breakeven_is_nullable_noop_until_activated(self):
+        v2 = validate_rule_spec({"schema": RULE_SCHEMA_V2,
+                                 "family": "momentum_continuation"})
+        neutral = validate_rule_spec({"schema": RULE_SCHEMA_V3,
+                                      "family": "momentum_continuation"})
+        active = validate_rule_spec({**neutral, "breakeven_r": 0.5})
+        self.assertEqual(rule_semantic_signature(v2),
+                         rule_semantic_signature(neutral))
+        self.assertNotEqual(rule_semantic_signature(neutral),
+                            rule_semantic_signature(active))
+        self.assertGreater(rule_semantic_distance(neutral, active), 0.0)
+
+    def test_v3_breakeven_numeric_motion_is_local_but_activation_is_distinct(self):
+        neutral = validate_rule_spec({"schema": RULE_SCHEMA_V3,
+                                      "family": "momentum_continuation"})
+        half = validate_rule_spec({**neutral, "breakeven_r": 0.5})
+        slightly_higher = validate_rule_spec({**neutral, "breakeven_r": 0.6})
+        local = _behavior_distance(half, slightly_higher)
+        activation = _behavior_distance(neutral, half)
+        self.assertGreater(local, 0.0)
+        self.assertLess(local, activation)
+
+    def test_relative_numeric_change_is_visible_despite_broad_threshold_bound(self):
+        root = validate_rule_spec({"family": "momentum_continuation",
+                                   "threshold_bps": 5.0})
+        changed = validate_rule_spec({**root, "threshold_bps": 6.0})
+        self.assertGreater(rule_semantic_distance(root, changed), 0.001)
+
+    def test_one_step_integer_lookback_remains_a_near_duplicate(self):
+        root = validate_rule_spec({"family": "momentum_continuation",
+                                   "lookback": 12})
+        changed = validate_rule_spec({**root, "lookback": 13})
+        self.assertLessEqual(rule_semantic_distance(root, changed), 0.001)
+
+    def test_v3_is_not_executable_for_options(self):
+        v3 = validate_rule_spec({"schema": RULE_SCHEMA_V3,
+                                 "family": "momentum_continuation"})
+        v2 = validate_rule_spec({"schema": RULE_SCHEMA_V2,
+                                 "family": "momentum_continuation"})
+        self.assertFalse(rule_vehicle_executable(v3, "option"))
+        self.assertTrue(rule_vehicle_executable(v2, "option"))
+
     def test_legacy_confirmation_and_v2_confirmation_list_share_behavior_key(self):
         legacy = validate_rule_spec({"family": "momentum_continuation",
                                      "confirmation": "volume"})

@@ -175,6 +175,25 @@ class FitDiagnosticsTests(unittest.TestCase):
         statuses = diagnostic["cost_to_risk"]["stressed"]["25"]["row_status"]
         self.assertEqual(statuses, {"pass": 0, "fail": 1, "unknown": 1})
 
+    def test_fit_output_keeps_no_trade_rejection_counts(self):
+        diagnostic = measure_fit_diagnostics(
+            [], ROOT_SPEC,
+            account_rows=[
+                {"vehicle": "equity", "no_trade": True,
+                 "reject_reason": "stressed_cost_risk_limit"},
+                {"vehicle": "equity", "no_trade": True,
+                 "reject_reason": "entry_slippage_exceeds_limit"},
+                {"vehicle": "equity", "no_trade": False},
+            ])
+        summary = diagnostic["execution_rejections"]
+        self.assertEqual(summary["no_trade_rows"], 2)
+        self.assertEqual(summary["executed_rows"], 1)
+        self.assertEqual(summary["reject_reason_counts"], {
+            "entry_slippage_exceeds_limit": 1,
+            "stressed_cost_risk_limit": 1,
+        })
+        self.assertFalse(summary["execution_blocked"])
+
 
 if __name__ == "__main__":
     unittest.main()

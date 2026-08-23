@@ -10,7 +10,9 @@ that decision/observation time using fresh IEX (equity) or OPRA (option)
 evidence. Delayed full OHLC never backfills an earlier entry, and partial
 pre-entry bar ranges are excluded. `as_of` may never be later than
 `observed_at`. Records retain provider/feed identity and the New York session
-date used for grouping.
+date used for grouping. Feed provenance is request-bound: an explicit
+provider-row feed label is retained when present; otherwise the
+configured/requested feed label is used, not an independent venue attestation.
 
 The shipped paper deployment uses the free Basic IEX equity feed and does not
 acquire options (`universe.asset_classes=["us_equity"]`). `indicative` is the
@@ -73,6 +75,10 @@ Every replay must establish the following invariants:
 - a fill landing on a bar boundary uses fresh executable quote evidence at the
   causal decision/observation time when strict; a delayed full OHLC record never
   backfills an earlier entry, and any bar fallback is explicitly diagnostic;
+- quote entries use one pure entry-slippage cap shared by runtime, factory,
+  explicit IBR replay, and randomized-null controls. Malformed inputs fail
+  closed as `entry_slippage_invalid`; an over-cap quote is a no-trade/refusal
+  with `entry_slippage_exceeds_limit`;
 - spread, slippage, and both-side fees are charged from one shared model;
 - an option leg is priced only from a quote no older than the strict 30-second
   freshness bound at the instant being priced; a signal whose contract has no such quote
@@ -98,7 +104,9 @@ slippage, 0.5 bps per-side notional fee, and a 0.65 currency-unit option fee
 per contract per side. The runtime's `execution.max_slippage_bps`
 and `max_spread_bps` are rejection caps, not expectations: they bound the
 model, and a model expecting a cost the runtime would refuse to submit fails
-closed. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps; 25
+closed. The pure entry-slippage check applies that cap to quote-versus-reference
+prices in every quote-entry lane and keeps the stable invalid and over-cap
+reasons above. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps; 25
 bps is the authorization requirement and the others remain diagnostics.
 Stress bps are charged against entry notional, with listed-option round-trip
 fees added for both per-contract sides; they are not per-side bps. The shipped
@@ -247,6 +255,9 @@ the shadow WAL read-only, requires strictly newer complete parity-matched rows,
 prior qualification, source/config/code/provenance/replay/gate hashes, family
 and global BH plus durable online FDR, then appends the immutable `lane=shadow`
 proof and live marker; only then can the candidate become `validated`/`champion`.
+A semantic or mid-tail incomplete session remains fail-closed until source
+correction and a bounded complete parity replay records its repair; quarantine
+is recoverable rather than permanent loss.
 A candidate cannot skip the lifecycle or silently move backwards. Paper
 outcomes are append-only, proof-epoch scoped, and may demote a deployed edge.
 Normal operation needs no manual promotion. Explicit `edge promote` is
@@ -283,6 +294,14 @@ research result. Planned signal/exit geometry may be counted even when
 executable quote pricing is absent, but is marked quote-required and remains
 non-authorizing.
 
+The execution-rejection portion of fit diagnostics exposes only aggregate
+counts and reason labels to proposal generation; it remains diagnostic and
+non-authorizing. If
+every fit opportunity is explicitly rejected at execution, the fit is classified
+as `execution_blocked`, distinct from sparse or otherwise underpowered data. It
+may close after the bounded attempt budget only to progress and observe search
+exhaustion; it is not a powered negative edge conclusion.
+
 The standalone `research.py factory run`/`factory-run` preflight requires
 explicit row provenance and IEX for the default equity lane. `--diagnostic-only`
 is an explicit non-authorizing mode for incomplete or non-IEX input and emits
@@ -305,6 +324,9 @@ variant must preserve both its root's `family` and its root's grammar
 `schema`, so it may change only the values of fields the root already carries.
 Selecting a different family, or a wider grammar version, is a discovery
 decision and follows the discovery path with its own gates.
+Equity provider guidance and schemas accept `rule-strategy.v3` with nullable
+numeric `breakeven_r`; options remain on executable v1/v2 schemas. A v3 root
+stays v3 during tuning, including when `breakeven_r` is activated.
 
 The three LLM request contracts use strict full-schema structured output with
 `additionalProperties: false`; tuning must echo the complete normalized root
@@ -315,24 +337,35 @@ errors as evidence.
 
 Every proposal — deterministic or model-authored — records a stated reason
 before the gate that judges it is computed, and that reason is graded against
-the resulting gate afterwards. Both records are append-only and the grade is
-written once. A model-authored proposal made against a non-empty history must
-additionally cite the graded lesson it reasoned from; the citation is resolved
-against the ledger and stored, and an unresolvable one is refused. A parameter
-set is closed only when a graded lesson records a powered upper-bound rejection
-of the minimum useful edge; an underpowered or adequate-but-inconclusive result
-is not such a record. The graded pairs may
-be fed back into later proposals; because they describe only completed,
-already-corrected evaluations, doing so adds no information about unseen data.
+fit-derived evidence afterwards. Both records are append-only and the grade is
+written once. Proposal verdicts and shared learning use fit results only;
+underpowered attempts, including `execution_blocked`, do not count as family or
+parameter successes or failures. Held-out, sealed, and qualification evidence
+is retained for audit but is unavailable to proposal generation. A
+model-authored proposal made against a non-empty history must additionally cite
+the graded lesson it reasoned from; the citation is resolved against the ledger
+and stored, and an unresolvable one is refused. A parameter set is closed only
+when a graded lesson records a powered upper-bound rejection of the minimum
+useful edge; an underpowered or adequate-but-inconclusive result is not such a
+record. The graded pairs may be fed back into later proposals; because they
+describe only completed, already-corrected evaluations, doing so adds no
+information about unseen data.
 Multiple-test correction is what prices the search, so a tuned variant counts
 against the same family-local and cycle-global false-discovery budget as a
 mutated one.
 
 Variant identity is de-duplicated by a family-specific executable semantic
-signature, including the v1/v2 no-op alias. A graded
+signature, including v1/v2/v3 no-op aliases. Continuous numeric axes use
+relative/local scaling for semantic novelty, while integer/topology axes use
+their grammar spans; exact signatures and validation remain unchanged. A graded
 `adequate_negative_rejection` suppresses only that exact failed variant id;
 underpowered and inconclusive outcomes do not suppress a future attempt and do
 not close the family.
+
+The tuning lane allows at most eight model-authored novel numeric values per
+lineage/family. The allowance is recorded in the factory ledger across parent
+hypotheses and cycles, so a short prompt history or restart cannot reset it;
+deterministic grid values do not spend this allowance.
 
 Refinement follows a fixed sequence. Coordinate phase changes exactly one
 executable field per child. Interaction phase begins only after every bounded

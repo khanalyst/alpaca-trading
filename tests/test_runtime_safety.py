@@ -33,6 +33,7 @@ from agent.engine_cycle import _rule_runtime_bars
 from research.edge_lab import EdgeLedger
 from research.edge_identity import candidate_assumptions
 from research.edge_ledger_store import hash_config
+from research.costs import ENTRY_SLIPPAGE_REJECT_REASON, check_entry_slippage
 
 
 class FakeProvider:
@@ -939,6 +940,9 @@ class RuntimeSafetyTests(unittest.TestCase):
     def test_entry_slippage_strictly_above_fifty_bps_is_rejected(self):
         engine = Engine(_cfg(), light=True, provider=FakeProvider())
         self.addCleanup(engine.close)
+        telemetry, reason = check_entry_slippage("buy", 100.0, 100.51, 50.0)
+        self.assertEqual(reason, ENTRY_SLIPPAGE_REJECT_REASON)
+        self.assertAlmostEqual(telemetry["adverse_bps"], 51.0, places=9)
         with self.assertRaisesRegex(ValueError, r"51\.00 bps"):
             engine._entry_execution("buy", {"bid": 100, "ask": 100.51}, 100)
 

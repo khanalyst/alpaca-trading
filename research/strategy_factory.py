@@ -141,6 +141,7 @@ _FIT_SELECTION_ROOT_KEYS = frozenset({
     "primary_failure", "failure_mode", "trades", "sessions", "net_pnl",
     "expectancy", "win_rate", "profit_factor", "max_drawdown", "stop_rate",
     "target_rate", "fit_diagnostics", "refinement_phase",
+    "execution_blocked", "execution_rejection_count",
     "coordinate_candidates_remaining", "interaction_candidates_remaining",
     "shared_learning", "lessons", "already_failed_variant_ids",
     "tried_families", "last_diagnosis", "slot", "reason", "previous_family",
@@ -151,6 +152,7 @@ _FIT_DIAGNOSTIC_KEYS = frozenset({
     "atr_bps", "floor_30bps", "planned", "vehicle", "cost_to_risk",
     "risk", "exits", "exit_grammar", "mde_power", "behavior_fingerprint",
     "30bps_floor_binding", "planned_effective", "cost_to_risk_stressed",
+    "execution_rejections",
 })
 _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "eligible", "total", "rate", "needed_prefix_bars", "signals",
@@ -164,6 +166,13 @@ _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "bracket", "target", "hold_cap", "diagnostic_only", "effect_unit",
     "cluster_unit", "available", "reason", "entry", "full", "entry_alias_key",
     "full_alias_key", "signal_count", "planned_vector_count", "authorizing",
+    "rows", "executed_rows", "no_trade_rows",
+    "explicit_rejections", "reject_reason_counts", "execution_blocked",
+})
+_FIT_SELECTION_REJECTION_KEYS = frozenset({
+    "rows", "executed_rows", "no_trade_rows",
+    "explicit_rejections", "reject_reason_counts",
+    "execution_blocked", "diagnostic_only", "authorizing",
 })
 _FIT_SELECTION_LESSON_KEYS = frozenset({
     "id", "family", "tried", "changed", "fit_delta", "reason",
@@ -239,6 +248,12 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
                      "quantiles", "cost_summary", "risk", "exits",
                      "exit_grammar", "mde_power", "behavior_fingerprint"}:
         allowed = _FIT_SELECTION_AGGREGATE_KEYS
+    elif context == "rejections":
+        allowed = _FIT_SELECTION_REJECTION_KEYS
+    elif context == "reason_counts":
+        # Machine-readable replay reason labels are dynamic; their values are
+        # still finite scalar counts and pass the global denied-key filter.
+        allowed = None
     elif context == "lesson":
         allowed = _FIT_SELECTION_LESSON_KEYS
     elif context == "shared_learning":
@@ -264,7 +279,11 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
     result: dict[str, Any] = {}
     for raw_key, item in value.items():
         key = _selection_key(raw_key)
-        if _selection_denied(key):
+        # ``rows`` is denied globally to prevent raw market-row leakage, but
+        # these scalar count labels are the explicit fit-only exception.
+        safe_rejection_count = (context == "rejections" and key in {
+            "rows", "executed_rows", "no_trade_rows"})
+        if _selection_denied(key) and not safe_rejection_count:
             continue
         # ``tried`` and ``changed`` are coordinate maps, so their keys are
         # dynamic but must still name an executable rule parameter.
@@ -273,10 +292,14 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
                 continue
             child_context = "delta"
         else:
-            if key not in allowed:
+            if allowed is not None and key not in allowed:
                 continue
             if key in {"fit_diagnostics"}:
                 child_context = "fit_diagnostics"
+            elif key == "execution_rejections":
+                child_context = "rejections"
+            elif key == "reject_reason_counts":
+                child_context = "reason_counts"
             elif key in {"last_diagnosis"}:
                 child_context = "diagnostic"
             elif key in {"lessons"}:
@@ -416,9 +439,40 @@ def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
 def _trim_lessons(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
     """Compact graded lessons into the aggregate brief a prompt may carry."""
     brief: list[dict] = []
+    fit_classifications = {
+        "execution_blocked", "underpowered", "fit_positive", "fit_negative",
+        "fit_inconclusive",
+    }
     for row in rows:
         outcome = row.get("outcome") or {}
         evidence = row.get("evidence") or {}
+        fit_delta = outcome.get("fit_delta")
+        # ``fit_classification`` is the explicit proposal-learning verdict.
+        # Fall back to ``classification`` only when that field itself already
+        # carries a fit-only enum; full-gate labels must remain neutral.
+        explicit_fit = outcome.get("fit_classification")
+        raw_classification = outcome.get("classification")
+        explicit_fit_valid = (isinstance(explicit_fit, str) and
+                              explicit_fit in fit_classifications)
+        raw_classification_valid = (isinstance(raw_classification, str) and
+                                    raw_classification in fit_classifications)
+        classification = (explicit_fit if explicit_fit_valid
+                           else raw_classification if raw_classification_valid
+                           else None)
+        # Only an explicitly absent/legacy classification may be upgraded from
+        # a fit score. Post-selection classifications (for example
+        # ``qualification_unavailable``) must remain neutral even when a
+        # development score is present.
+        infer_from_delta = (explicit_fit in (None, "", "legacy_unclassified") and
+                            raw_classification in (None, "", "legacy_unclassified"))
+        if classification is None and infer_from_delta:
+            try:
+                score = float(fit_delta)
+                classification = ("fit_positive" if score > 0 else
+                                  "fit_negative") if math.isfinite(score) else None
+            except (TypeError, ValueError, OverflowError):
+                classification = None
+        verdict = classification or "fit_ungraded"
         brief.append({
             # The short handle a proposal must cite to say what it learned
             # from.  Truncated because the brief is a prompt, and resolvable
@@ -432,12 +486,8 @@ def _trim_lessons(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
             # from a model merely reordering the audited deterministic grid.
             # Older lessons have no marker and therefore never spend this cap.
             "novel_tuning": evidence.get("novel_tuning") is True,
-            "verdict": (outcome.get("classification") or
-                        ("passed" if outcome.get("passed") else
-                         "underpowered" if outcome.get("underpowered") else
-                         "inconclusive")),
-            "heldout_delta": outcome.get("heldout_delta"),
-            "failed_checks": list(outcome.get("failed_checks") or [])[:4],
+            "verdict": verdict,
+            "fit_delta": fit_delta,
         })
         # Trim from the oldest end rather than failing the request: a brief
         # that outgrew its bound should lose history, not become no history.
@@ -554,6 +604,7 @@ def _behavior_distance(left: Mapping[str, Any], right: Mapping[str, Any]) -> flo
               "compression_bps": (1.0, 2000.0), "zscore": (.25, 5.0),
               "volume_multiplier": (.25, 10.0), "atr_period": (3.0, 100.0),
               "stop_atr": (.2, 10.0), "target_r": (.25, 10.0),
+              "breakeven_r": (0.0, 10.0),
               "max_hold_bars": (1.0, 390.0),
               "entry_after_minutes": (0.0, 389.0),
               "entry_before_minutes": (1.0, 390.0),
@@ -561,8 +612,18 @@ def _behavior_distance(left: Mapping[str, Any], right: Mapping[str, Any]) -> flo
     for name in sorted(fields):
         av, bv = a.get(name), b.get(name)
         if name in bounds and isinstance(av, (int, float)) and isinstance(bv, (int, float)):
+            # Economic tuning axes use local/proportional motion, while
+            # topology/window axes retain their grammar span: a one-minute
+            # lookback nudge is an alias, whereas a 20% threshold move is
+            # meaningful. This field-aware scale mirrors the contract's
+            # relative metric without allowing structural aliases through.
             low, high = bounds[name]
-            distance += min(1.0, abs(float(av) - float(bv)) / max(high - low, 1.0))
+            topology = {"lookback", "slow_lookback", "range_minutes",
+                        "atr_period", "max_hold_bars",
+                        "entry_after_minutes", "entry_before_minutes"}
+            scale = (max(high - low, 1.0) if name in topology else
+                     max(abs(float(av)), abs(float(bv)), 1.0))
+            distance += min(1.0, abs(float(av) - float(bv)) / scale)
         else:
             distance += 0.0 if av == bv else 1.0
     left_confirmations = set(str(a.get("confirmation") or "none") for _ in (0,))
@@ -768,10 +829,59 @@ def shared_learning(factory: FactoryLedger, *, vehicle: str,
     parameters: dict[tuple[str, str], dict[str, int]] = {}
     families: dict[str, dict[str, int]] = {}
     trials = {"run": 0, "failed": 0}
+    graded_count = 0
     for row in rows:
         outcome = row.get("outcome") or {}
-        passed = bool(outcome.get("passed"))
-        underpowered = bool(outcome.get("underpowered"))
+        # Use only fit-derived outcomes for proposal learning. Older ledgers
+        # may lack ``fit_delta``; a durable full-gate pass bit is never a
+        # substitute. A present fit score/classification/fit pass bit is the
+        # only admissible evidence, and held-out/qualification fields are
+        # ignored.
+        fit_delta = outcome.get("fit_delta")
+        try:
+            fit_score = float(fit_delta)
+            fit_score_valid = math.isfinite(fit_score)
+        except (TypeError, ValueError, OverflowError):
+            fit_score, fit_score_valid = 0.0, False
+        fit_classifications = {
+            "execution_blocked", "underpowered", "fit_positive", "fit_negative",
+            "fit_inconclusive",
+        }
+        explicit_fit = outcome.get("fit_classification")
+        raw_classification = outcome.get("classification")
+        explicit_fit_valid = (isinstance(explicit_fit, str) and
+                              explicit_fit in fit_classifications)
+        raw_classification_valid = (isinstance(raw_classification, str) and
+                                    raw_classification in fit_classifications)
+        classification = (explicit_fit if explicit_fit_valid else
+                          raw_classification if raw_classification_valid else "")
+        is_trial = row.get("kind") == "trial"
+        # Legacy factory lessons carry only full-gate outcomes; they cannot
+        # safely teach proposal ordering. Live-paper trials remain a separate
+        # telemetry lane and may use their own passed bit. A fit score or the
+        # explicit fit pass bit is sufficient provenance when an older writer
+        # omitted the newer classification field.
+        fit_passed = outcome.get("fit_passed")
+        no_fit_classification = (
+            explicit_fit in (None, "", "legacy_unclassified") and
+            raw_classification in (None, "", "legacy_unclassified"))
+        fit_evidence = (bool(classification) or
+                        (no_fit_classification and fit_score_valid) or
+                        (no_fit_classification and isinstance(fit_passed, bool)))
+        if not fit_evidence and not is_trial:
+            continue
+        graded_count += 1
+        passed = (fit_score > 0 if fit_score_valid else
+                  bool(fit_passed) if isinstance(fit_passed, bool) else
+                  bool(outcome.get("passed")) if is_trial else
+                  classification == "fit_positive")
+        underpowered = bool(outcome.get("underpowered")) or classification in {
+            "underpowered", "execution_blocked",
+        }
+        if underpowered:
+            # Underpowered evidence does not say whether a parameter/family
+            # succeeds or fails; do not let it manufacture a trend.
+            continue
         if row.get("kind") == "trial":
             trials["run"] += 1
             trials["failed"] += 0 if passed else 1
@@ -779,10 +889,6 @@ def shared_learning(factory: FactoryLedger, *, vehicle: str,
         bucket = families.setdefault(family, {"attempts": 0, "passed": 0})
         bucket["attempts"] += 1
         bucket["passed"] += 1 if passed else 0
-        if underpowered:
-            # An underpowered attempt says nothing about the parameter; only
-            # about the sample.  Counting it would manufacture a trend.
-            continue
         for name, change in (row.get("changed") or {}).items():
             direction = _direction(change)
             if direction is None:
@@ -799,7 +905,7 @@ def shared_learning(factory: FactoryLedger, *, vehicle: str,
     ]
     ranked.sort(key=lambda item: (-item["attempts"], item["parameter"]))
     return {
-        "graded_attempts": len(rows),
+        "graded_attempts": graded_count,
         "parameters": ranked[:SHARED_LEARNING_ROWS],
         "families": sorted(
             ({"family": name, **stats} for name, stats in families.items()),
@@ -1026,6 +1132,7 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                     refinement_state: dict[str, Any] | None = None,
                     llm_observations: list[dict[str, Any]] | None = None,
                     closed_variant_ids: frozenset[str] = frozenset(),
+                    durable_novel_tuning_values: frozenset[str] = frozenset(),
                     ) -> tuple[list[TunedVariant], ProposalResult | None]:
     """Choose this hypothesis's variants, each with the reason it was chosen.
 
@@ -1114,9 +1221,21 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     chosen: list[TunedVariant] = []
     seen: set[str] = set()
     novel_count = 0
-    prior_novel_count = sum(1 for item in safe_lessons
-                            if isinstance(item, Mapping) and
-                            item.get("novel_tuning") is True)
+    # The durable ledger is authoritative; the prompt brief is only a
+    # fallback for callers that do not have a ledger (including small unit
+    # tests).  Counting distinct field/value tokens prevents retries and
+    # repeated explanations from consuming the cap twice.
+    prior_novel_values = set(str(item) for item in durable_novel_tuning_values)
+    if not prior_novel_values:
+        for lesson_index, item in enumerate(safe_lessons):
+            if not isinstance(item, Mapping) or item.get("novel_tuning") is not True:
+                continue
+            for name, change in (item.get("tried") or item.get("changed") or {}).items():
+                if isinstance(change, Mapping) and "to" in change:
+                    prior_novel_values.add(f"brief:{lesson_index}:" + json.dumps(
+                        {"parameter": str(name), "value": change.get("to")},
+                        sort_keys=True, separators=(",", ":"), default=str))
+    prior_novel_count = len(prior_novel_values)
     allowed_pool_ids = {rule_variant_id(spec) for spec, _reason in pool}
     deterministic_seed = pool[0] if pool else None
     if deterministic_seed is not None:
@@ -1163,11 +1282,21 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                            if root.get(key) != normalized_entry.get(key)]
                 if len(changed) != (2 if phase == "interaction" else 1):
                     continue
-                if any(not isinstance(root.get(key), (int, float)) or
-                       isinstance(root.get(key), bool) or
-                       not isinstance(normalized_entry.get(key), (int, float)) or
-                       isinstance(normalized_entry.get(key), bool)
-                       for key in changed):
+                # v3's nullable breakeven axis is the one intentional
+                # non-numeric transition: ``None`` activates a numeric
+                # completed-close stop. All other novel values remain
+                # numeric-only and locally bounded.
+                def _novel_numeric(key: str) -> bool:
+                    before, after = root.get(key), normalized_entry.get(key)
+                    if (key == "breakeven_r" and before is None and
+                            isinstance(after, (int, float)) and
+                            not isinstance(after, bool)):
+                        return True
+                    return (isinstance(before, (int, float)) and
+                            not isinstance(before, bool) and
+                            isinstance(after, (int, float)) and
+                            not isinstance(after, bool))
+                if any(not _novel_numeric(key) for key in changed):
                     continue
             # Re-proposing a parameter set a graded lesson already recorded as
             # an adequate failure is not a new experiment; the ledger has that
@@ -1185,6 +1314,11 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                 # provider rows must not consume the durable cap for a later
                 # valid proposal in this same cycle.
                 novel_count += 1
+                for key in changed:
+                    prior_novel_values.add(json.dumps(
+                        {"parameter": str(key),
+                         "value": normalized_entry.get(key)},
+                        sort_keys=True, separators=(",", ":"), default=str))
             # Tuning proposals are now exact members of the deterministic
             # neighborhood. Near-duplicate suppression would discard that
             # entire local grid against its own root, so exact variant/lesson
@@ -1213,7 +1347,13 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
         chosen.append(TunedVariant(spec, reason, "deterministic", None))
     _record_llm_observation(
         llm_observations, "tuning", proposal,
-        accepted=any(item.source == "llm" for item in chosen))
+        # A well-formed provider response that is fully rejected by the
+        # bounded grammar still means the model lane answered; deterministic
+        # fallback is expected for exactly this case (for example a broad
+        # stop_atr suggestion during execution-blocked steering).
+        accepted=(any(item.source == "llm" for item in chosen) or
+                  bool(proposal is not None and proposal.success and
+                       proposal.variants)))
     return chosen, proposal
 
 
@@ -1903,6 +2043,14 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                              equity_feed=equity_feed),
                          "null": null_projection}),
     }
+    fit_execution_rows = [row for row in raw_fit if isinstance(row, Mapping)]
+    fit_execution_no_trade = [row for row in fit_execution_rows
+                              if row.get("no_trade") is True]
+    fit_execution_blocked = (
+        bool(fit_execution_no_trade) and
+        len(fit_execution_no_trade) == len(fit_execution_rows) and
+        all(str(row.get("reject_reason") or "").strip()
+            for row in fit_execution_no_trade))
     return {
         "passes_without_family": bool(all(checks.values())),
         "development_passes_without_family": bool(all(development_checks.values())),
@@ -1930,6 +2078,7 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "falsification": falsification, "heldout_separation": separation,
         "checks_without_family": checks,
         "mode": mode, "alpha": float(alpha), "is_root": bool(is_root),
+        "fit_execution_blocked": fit_execution_blocked,
         "_fit_rows": fit, "_heldout_rows": heldout,
         "_fit_baseline_rows": base_fit,
         "_heldout_baseline_rows": base_heldout,
@@ -1980,6 +2129,8 @@ def _terminal_negative(local: Sequence[tuple[Mapping, Mapping]]) -> bool:
 
 def _gate_classification(gate: Mapping[str, Any]) -> str:
     """Name the scientific verdict without collapsing absence into failure."""
+    if _fit_execution_blocked(gate):
+        return "execution_blocked"
     if gate.get("passes") is True:
         return "proved"
     if not (gate.get("sample_adequate") and gate.get("heldout_sample_adequate")):
@@ -1993,7 +2144,50 @@ def _gate_classification(gate: Mapping[str, Any]) -> str:
         return ("adequate_negative_rejection" if
                 _terminal_negative([({}, gate)]) else
                 "adequate_negative_inconclusive")
+    qualification = gate.get("qualification")
+    # A positive/development result with no post-selection window is an
+    # unavailable qualification, not evidence that the strategy failed.
+    if (isinstance(qualification, Mapping) and
+            qualification.get("available") is not True and
+            gate.get("development_passes_without_family") is True):
+        return "qualification_unavailable"
     return "adequate_inconclusive"
+
+
+def _fit_execution_blocked(gate: Mapping[str, Any]) -> bool:
+    """True when every fit opportunity was explicitly rejected at execution."""
+    if gate.get("fit_execution_blocked") is True:
+        return True
+    diagnostics = gate.get("fit_diagnostics")
+    if isinstance(diagnostics, Mapping):
+        summary = diagnostics.get("execution_rejections")
+        if isinstance(summary, Mapping) and summary.get("execution_blocked") is True:
+            return True
+    rows = gate.get("_fit_raw_rows") or gate.get("_fit_rows") or ()
+    rows = [row for row in rows if isinstance(row, Mapping)]
+    no_trade = [row for row in rows if row.get("no_trade") is True]
+    return bool(no_trade) and len(no_trade) == len(rows) and all(
+        str(row.get("reject_reason") or "").strip() for row in no_trade)
+
+
+def _fit_lesson_classification(gate: Mapping[str, Any]) -> tuple[str, bool, bool]:
+    """Return (fit verdict, underpowered, fit passed) for proposal feedback."""
+    if _fit_execution_blocked(gate):
+        # No executable fills means no effect estimate; it is a distinct
+        # steering state but still underpowered for success/failure learning.
+        return "execution_blocked", True, False
+    floor = gate.get("fit_floor") or {}
+    adequate = bool(floor.get("adequate"))
+    if not adequate:
+        return "underpowered", True, False
+    fit = gate.get("fit_test") or {}
+    try:
+        score = float(fit.get("mean_delta"))
+        if not math.isfinite(score):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        return "fit_inconclusive", False, False
+    return ("fit_positive" if score > 0 else "fit_negative"), False, score > 0
 
 
 def _recenter_successor(hypothesis: Mapping[str, Any],
@@ -2574,6 +2768,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                                                     family=family),
                     closed_variant_ids=frozenset(factory.closed_variant_ids(
                         vehicle=vehicle, hypothesis_id=hypothesis_id)),
+                    durable_novel_tuning_values=frozenset(
+                        factory.novel_tuning_values(
+                            hypothesis_id=hypothesis_id, vehicle=vehicle,
+                            family=family)),
                     shared=shared,
                     existing_specs=existing_specs,
                     refinement_state=refinement,
@@ -3054,11 +3252,16 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     def _lesson_outcome(gate: Mapping[str, Any]) -> dict:
         """Grade one reason against the gate its variant actually earned."""
         statistics = gate.get("global_multiple_tests")
+        fit_classification, fit_underpowered, fit_passed = _fit_lesson_classification(gate)
         return {
             "passed": bool(gate.get("passes")),
-            "underpowered": not (gate.get("sample_adequate") and
-                                 gate.get("heldout_sample_adequate")),
-            "classification": _gate_classification(gate),
+            # Proposal feedback is fit-derived.  Held-out/sealed fields below
+            # remain durable audit metadata but are excluded by the prompt
+            # projection and never determine verdict/shared learning.
+            "underpowered": fit_underpowered,
+            "fit_passed": fit_passed,
+            "fit_classification": fit_classification,
+            "classification": fit_classification,
             "fit_delta": (gate.get("fit_test") or {}).get("mean_delta"),
             "heldout_delta": (gate.get("test") or {}).get("mean_delta"),
             "heldout_net_pnl": gate.get("heldout_net_pnl"),
@@ -3173,6 +3376,24 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                             "gate_hash": gate.get("gate_hash"),
                             "eligible_confirmatory_attempts": attempts,
                             "account_attempts_total": total_attempts})
+                elif classification == "execution_blocked" and \
+                        total_attempts >= int(max_confirmatory_attempts):
+                    # Execution-blocked fit points are not statistical
+                    # rejections: close only after the bounded account budget
+                    # and leave the lineage eligible to surface exhaustion.
+                    factory.close_variant(
+                        str(hypothesis["hypothesis_id"]), str(variant["variant_id"]),
+                        vehicle=vehicle, mode="budget",
+                        reason="execution-blocked attempt budget exhausted",
+                        # ``close_variant`` validates its ``attempts`` field
+                        # against eligible confirmatory rows; blocked rows
+                        # are intentionally underpowered (usually zero).
+                        attempts=attempts, evidence={
+                            "classification": classification,
+                            "max_confirmatory_attempts": int(max_confirmatory_attempts),
+                            "eligible_confirmatory_attempts": attempts,
+                            "account_attempts_total": total_attempts,
+                            "fit_execution_blocked": True})
                 elif (classification == "adequate_negative_inconclusive" or
                       classification == "adequate_inconclusive") and \
                         attempts >= int(max_confirmatory_attempts):

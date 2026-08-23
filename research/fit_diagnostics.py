@@ -496,6 +496,36 @@ def _exit_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _execution_rejection_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate fit-only execution outcomes, including rejected rows.
+
+    Risk/cost summaries intentionally operate on executable fills and
+    therefore skip ``no_trade`` rows.  Proposal diagnostics still need to
+    distinguish a genuinely sparse signal from a populated fit whose every
+    opportunity was refused at execution, so retain a compact reason count
+    here.  The input is already the fit partition; no held-out/sealed data is
+    consulted.
+    """
+    no_trade = [row for row in rows if row.get("no_trade") is True]
+    reasons = Counter(str(row.get("reject_reason") or "unknown")
+                      for row in no_trade)
+    explicit = sum(1 for row in no_trade
+                   if str(row.get("reject_reason") or "").strip())
+    executed = len(rows) - len(no_trade)
+    blocked = bool(no_trade) and executed == 0 and explicit == len(no_trade)
+    result = {
+        "rows": len(rows),
+        "executed_rows": executed,
+        "no_trade_rows": len(no_trade),
+        "explicit_rejections": explicit,
+        "reject_reason_counts": dict(sorted(reasons.items())),
+        "execution_blocked": blocked,
+        "diagnostic_only": True,
+        "authorizing": False,
+    }
+    return result
+
+
 def _mde(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     deltas: list[float] = []
     clusters: list[str] = []
@@ -561,6 +591,7 @@ def measure_fit_diagnostics(
     if rows:
         provenance["fills"] = _provenance_summary(rows, fill_rows=True)
     pricing = _entry_pricing_summary(signals)
+    execution_rejections = _execution_rejection_summary(rows)
     configured_stress = (stressed.get(str(int(stress_scenario)), {})
                          if stress_scenario is not None else {})
     configured_status = configured_stress.get(
@@ -616,6 +647,10 @@ def measure_fit_diagnostics(
             "authorizing": False,
             "diagnostic_only": True,
         },
+        # Unlike ``risk_controls`` (which is fill-only), this aggregate keeps
+        # every fit no-trade row and its explicit reason.  It is descriptive
+        # context for proposal ordering, never an authorization signal.
+        "execution_rejections": execution_rejections,
         "cost_to_risk": {"configured": configured, "stressed": stressed},
         "risk": _risk_summary(rows),
         "exits": _exit_summary(rows),

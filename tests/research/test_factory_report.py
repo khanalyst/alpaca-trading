@@ -11,6 +11,7 @@ a partial or malformed ledger.
 
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -247,6 +248,46 @@ class ReportDegradationTests(unittest.TestCase):
 
 
 class ReportRenderingTests(unittest.TestCase):
+    def test_persisted_classifications_survive_counts_and_rendering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = _run(directory)
+            with sqlite3.connect(db) as connection:
+                rows = connection.execute(
+                    "SELECT cycle_id, hypothesis_id, vehicle, starting_cash, "
+                    "ending_equity, realized_pnl, max_drawdown, trades, "
+                    "worker_pid, result_json FROM factory_accounts "
+                    "ORDER BY account_id").fetchall()
+                self.assertGreaterEqual(len(rows), 2)
+                for index, (row, classification) in enumerate(zip(
+                        rows, ("execution_blocked", "qualification_unavailable"))):
+                    (cycle_id, hypothesis_id, vehicle, starting_cash,
+                     ending_equity, realized_pnl, max_drawdown, trades,
+                     worker_pid, raw) = row
+                    payload = json.loads(raw)
+                    payload["classification"] = classification
+                    payload["variant_id"] = f"report-fixture-{index}"
+                    connection.execute(
+                        "INSERT INTO factory_accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (f"report-fixture-account-{index}", cycle_id,
+                         hypothesis_id, payload["variant_id"], vehicle,
+                         starting_cash, ending_equity, realized_pnl,
+                         max_drawdown, trades, worker_pid,
+                         json.dumps(payload, sort_keys=True),
+                         0.0))
+
+            report = build_report(db)
+            summary = report["vehicles"][0]["summary"]["classifications"]
+            self.assertEqual(summary["execution_blocked"], 1)
+            self.assertEqual(summary["qualification_unavailable"], 1)
+
+            text = render_text(report)
+            self.assertIn("[execution_blocked]", text)
+            self.assertIn("[qualification_unavailable]", text)
+
+            markdown = render_markdown(report)
+            self.assertIn("| execution_blocked |", markdown)
+            self.assertIn("| qualification_unavailable |", markdown)
+
     def test_text_renders_the_narrative_a_reader_needs(self):
         with tempfile.TemporaryDirectory() as directory:
             text = render_text(build_report(_run(directory)))

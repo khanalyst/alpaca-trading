@@ -9,7 +9,7 @@ from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from research.factory_core import initial_hypotheses
 from research.factory_ledger import FactoryError, FactoryLedger
 from research.factory_report import build_report, render_markdown, render_text
-from research.strategy_factory import _gate_classification, _recenter_successor
+from research.strategy_factory import _gate, _gate_classification, _recenter_successor
 
 
 def _account_result(hypothesis_id: str, variant_id: str, *, cycle: str,
@@ -77,6 +77,74 @@ class RecenterLifecycleTests(unittest.TestCase):
 
 
 class VariantBudgetTests(unittest.TestCase):
+    def test_gate_execution_blocked_survives_fit_row_persistence_boundary(self):
+        rows = [
+            {
+                "vehicle": "equity", "symbol": "SPY",
+                "session_date": f"2026-01-{index:02d}",
+                "opportunity_id": f"blocked-{index}",
+                "net_pnl": 0.0, "no_trade": True,
+                "reject_reason": "entry_slippage_exceeds_limit",
+            }
+            for index in range(1, 6)
+        ]
+        gate = _gate(
+            rows, rows, vehicle="equity", mode="backtest",
+            min_trades=1, min_sessions=1, alpha=1.0, null_rows=rows,
+        )
+        self.assertEqual(_gate_classification(gate), "execution_blocked")
+        # Persistence removes raw partitions before lifecycle grading.  The
+        # compact verdict must remain available after that boundary.
+        gate.pop("_fit_raw_rows", None)
+        self.assertEqual(_gate_classification(gate), "execution_blocked")
+
+    def test_popped_fit_rows_retain_execution_blocked_classification(self):
+        gate = {
+            "fit_execution_blocked": True,
+            "passes": False,
+            "sample_adequate": False,
+            "heldout_sample_adequate": False,
+        }
+        self.assertEqual(_gate_classification(gate), "execution_blocked")
+
+    def test_unavailable_qualification_is_not_called_a_failure(self):
+        gate = {
+            "passes": False,
+            "sample_adequate": True,
+            "heldout_sample_adequate": True,
+            "heldout_net_pnl": 1.0,
+            "heldout_expectancy": .1,
+            "development_passes_without_family": True,
+            "qualification": {"available": False},
+        }
+        self.assertEqual(_gate_classification(gate), "qualification_unavailable")
+
+    def test_execution_blocked_budget_uses_account_attempt_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            hypothesis = initial_hypotheses(1)[0]
+            ledger.register(hypothesis)
+            variant_id = rule_variant_id(hypothesis.rule_spec)
+            blocked_gate = {
+                "passes": False, "sample_adequate": False,
+                "heldout_sample_adequate": False,
+            }
+            for attempt in range(3):
+                ledger.add_account(
+                    f"blocked-{attempt}", hypothesis.hypothesis_id,
+                    _account_result(hypothesis.hypothesis_id, variant_id,
+                                    cycle=f"blocked-{attempt}", gate=blocked_gate))
+            # Execution-blocked accounts have zero eligible confirmatory
+            # attempts, but their durable account rows still bound retries.
+            closure = ledger.close_variant(
+                hypothesis.hypothesis_id, variant_id, vehicle="equity",
+                mode="budget", reason="execution blocked", attempts=0,
+                evidence={"classification": "execution_blocked",
+                          "account_attempts_total": 3})
+            self.assertEqual(closure["mode"], "budget")
+            self.assertEqual(closure["attempts"], 0)
+            self.assertEqual(closure["account_attempts_total"], 3)
+
     def test_underpowered_accounts_do_not_spend_confirmatory_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = FactoryLedger(Path(directory) / "edge.sqlite3")

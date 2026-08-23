@@ -227,7 +227,9 @@ execution enters at that decision/observation time using fresh IEX (equity) or
 OPRA (option) evidence. Delayed full OHLC never backfills an earlier entry, and
 partial pre-entry bar ranges are excluded. IEX is required for shipped equity
 entry and exit, while OPRA is required for an option lane, each no older than
-30 seconds.
+30 seconds. Feed provenance is request-bound: an explicit provider-row feed
+label is retained when present, otherwise the configured/requested feed label is
+used; it is not an independent venue attestation.
 The shipped `execution.strict_market_data` default is `true`; historical bar
 fallback is an explicit diagnostic lane only.
 Bar-only, partial-feed, missing, or stale legs remain diagnostic and cannot
@@ -248,6 +250,10 @@ round-trip fees for both per-contract sides; it is not a per-side bps charge.
 The shipped `max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade
 is about `0.833` cost-to-risk at the 25-bps stress and is vetoed before option
 fees.
+The pure entry-slippage cap is shared by runtime, factory, explicit IBR replay,
+and randomized-null quote entries; malformed inputs use the stable reason
+`entry_slippage_invalid`, while over-cap quotes use
+`entry_slippage_exceeds_limit` as a no-trade/refusal.
 
 Compose ships `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1` so a fresh
 installation with no paper journal can collect broker-free shadow evidence.
@@ -268,15 +274,20 @@ required arms produce a complete parity match is the entry changed to
 `status=repaired`. The read-only `edge ingest-shadow` consumer refuses to
 advance its boundary or spend FDR while a quarantine entry or an
 authoritative-calendar gap remains, and its retry records the repaired
-session explicitly. A missing or stale recorder calendar is reported as
+session explicitly. Semantic or mid-tail incompleteness therefore fails closed
+without permanently losing the session; correction plus the bounded replay is
+the repair path. A missing or stale recorder calendar is reported as
 `catalog_unavailable`/unknown rather than inferred from weekdays.
 
 The executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
 configured R target, and bar-cap time exit. Fit-only factory diagnostics expose
 signal-prefix/floor binding, planned exits, cost/risk, power, behavior aliases,
-provider/feed provenance, pricing source, configured limits, and
-pass/fail/unknown row counts for operator review; they are non-authorizing and
-do not expand exits.
+provider/feed provenance, pricing source, configured limits,
+pass/fail/unknown row counts, and aggregate fit-partition execution-rejection
+counts/reasons for operator review; they are non-authorizing and do not expand
+exits. A fit whose opportunities are all explicitly execution-rejected is
+`execution_blocked`, distinct from sparse/underpowered data; bounded budget
+closure only progresses search exhaustion and is not a powered negative edge.
 
 Research never rewrites the append-only recorder corpus. A temporary cycle view
 explicitly quarantines legacy rows whose `as_of` is later than `observed_at`,

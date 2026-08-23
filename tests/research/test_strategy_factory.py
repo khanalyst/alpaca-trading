@@ -424,6 +424,20 @@ class StrategyFactoryTests(unittest.TestCase):
             previous, diagnosis, max_generations=4)
         self.assertEqual(replacement_one, replacement_two)
 
+    def test_fit_execution_rejections_are_distinct_from_sparse_signals(self):
+        blocked = core_module.diagnose([
+            {"session_date": "2026-01-01", "no_trade": True,
+             "reject_reason": "stressed_cost_risk_limit"},
+            {"session_date": "2026-01-02", "no_trade": True,
+             "reject_reason": "entry_slippage_exceeds_limit"},
+        ])
+        sparse = core_module.diagnose([
+            {"session_date": "2026-01-01", "no_trade": True},
+            {"session_date": "2026-01-02", "no_trade": True},
+        ])
+        self.assertEqual(blocked["primary_failure"], "execution_blocked")
+        self.assertEqual(sparse["primary_failure"], "insufficient_signals")
+
     def test_underpowered_shadow_accounts_do_not_advance_the_forward_boundary(self):
         # Accounts are diagnostic rows and are written before adequacy is
         # known.  Only a durable shadow proof run may advance last_boundary.

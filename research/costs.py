@@ -67,6 +67,82 @@ class CostError(ValueError):
     """Raised for a malformed or internally inconsistent cost model."""
 
 
+# Stable machine-readable reasons shared by runtime and replay entry checks.
+# Keep the human-facing runtime error separate: it retains the historical
+# wording while telemetry/replay rows can be compared without parsing text.
+ENTRY_SLIPPAGE_INVALID_REASON = "entry_slippage_invalid"
+ENTRY_SLIPPAGE_REJECT_REASON = "entry_slippage_exceeds_limit"
+
+
+def check_entry_slippage(
+        side: Any, reference_price: Any, executable_quote: Any,
+        max_slippage_bps: Any) -> tuple[dict[str, Any], str | None]:
+    """Validate and evaluate one executable entry quote.
+
+    The runtime and replay lanes must make the same adverse-price decision.
+    This pure helper therefore owns both fail-closed input validation and the
+    single adverse-basis-point calculation.  It never raises for malformed
+    caller input; callers receive stable telemetry and a machine-readable
+    reason instead.  ``buy`` entries are adverse above the reference and
+    ``sell`` entries are adverse below it.  A non-adverse quote is accepted
+    with zero slippage.
+    """
+    telemetry: dict[str, Any] = {
+        "side": (side.strip().lower() if isinstance(side, str) else None),
+        "reference_price": None,
+        "executable_quote": None,
+        "adverse_bps": None,
+        "slippage_bps": None,
+        "max_slippage_bps": None,
+        "accepted": False,
+        "reason": ENTRY_SLIPPAGE_INVALID_REASON,
+    }
+
+    normalized_side = telemetry["side"]
+    if normalized_side not in {"buy", "sell"}:
+        return telemetry, ENTRY_SLIPPAGE_INVALID_REASON
+
+    def finite_number(value: Any, *, positive: bool = False) -> float | None:
+        # Numeric strings and booleans are configuration/data mistakes.  A
+        # Decimal or other numeric scalar is fine once converted to float.
+        if isinstance(value, (bool, str, bytes, bytearray)):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or (number <= 0 if positive else number < 0):
+            return None
+        return number
+
+    reference = finite_number(reference_price, positive=True)
+    executable = finite_number(executable_quote, positive=True)
+    maximum = finite_number(max_slippage_bps)
+    if reference is None or executable is None or maximum is None:
+        return telemetry, ENTRY_SLIPPAGE_INVALID_REASON
+    telemetry.update({
+        "reference_price": reference,
+        "executable_quote": executable,
+        "max_slippage_bps": maximum,
+    })
+
+    # Compute the adverse basis points exactly once; every caller consumes this
+    # value for both the rejection decision and its telemetry.
+    adverse = (max(0.0, executable - reference)
+               if normalized_side == "buy" else
+               max(0.0, reference - executable))
+    adverse_bps = adverse / reference * 10_000.0
+    accepted = adverse_bps <= maximum
+    reason = None if accepted else ENTRY_SLIPPAGE_REJECT_REASON
+    telemetry.update({
+        "adverse_bps": adverse_bps,
+        "slippage_bps": adverse_bps,
+        "accepted": accepted,
+        "reason": reason,
+    })
+    return telemetry, reason
+
+
 @dataclass(frozen=True)
 class ReplayPolicy:
     """Point-in-time and portfolio limits shared by replay lanes.
@@ -1295,7 +1371,9 @@ def quote_fill_record(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | 
 
 
 __all__ = [
-    "BAR", "CONFIG_BLOCK", "CostError", "CostModel", "DEFAULT_FEE_BPS",
+    "BAR", "CONFIG_BLOCK", "CostError", "CostModel",
+    "ENTRY_SLIPPAGE_INVALID_REASON", "ENTRY_SLIPPAGE_REJECT_REASON",
+    "check_entry_slippage", "DEFAULT_FEE_BPS",
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_SPREAD_BPS", "QUOTE",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS",

@@ -55,9 +55,11 @@ cycle can cover every bounded rule family. Each slot holds one hypothesis and
 evaluates four isolated-account variants. It diagnoses only chronological fit
 data, then judges the variants on untouched held-out data.
 Candidates are de-duplicated by their family-specific executable semantic
-signature (including v1/v2 no-op aliases). A variant is suppressed only after
-a powered upper-bound rejection; underpowered and adequate-but-inconclusive
-results remain eligible for more evidence.
+signature (including v1/v2/v3 no-op aliases). Continuous numeric axes use
+relative/local scaling for semantic novelty, while integer/topology axes use
+grammar-span scaling; exact signatures and validation are unchanged. A variant
+is suppressed only after a powered upper-bound rejection; underpowered and
+adequate-but-inconclusive results remain eligible for more evidence.
 A candidate must clear structural trade/session floors, matched controls,
 absolute after-cost profitability, falsification, fixed-rule rolling-origin
 stability, and family-local plus cycle-global false-discovery correction. A
@@ -71,9 +73,12 @@ stop floor), configured R target, and bounded bar-cap time exit. Factory
 fit-only measurement reports eligible prefixes/first signals, 30-bps floor
 binding, planned exits, configured/stressed economics, power,
 delivered-versus-intended risk, provider/feed provenance, pricing source,
-configured limits, pass/fail/unknown row counts, and behavioral aliases for
-operator review; it is diagnostic only, does not expand exits, and cannot
-authorize a candidate.
+configured limits, pass/fail/unknown row counts, behavioral aliases, and
+aggregate fit-partition execution-rejection counts/reasons for operator review;
+it is diagnostic only, does not expand exits, and cannot authorize a candidate.
+If every fit opportunity is explicitly execution-rejected, the fit is
+`execution_blocked`, distinct from sparse/underpowered data; bounded budget
+closure only progresses search exhaustion and is not a powered negative edge.
 
 The authorizing floors are immutable: backtest/factory evidence requires 100
 trades and 30 complete sessions/clusters; the sealed qualification window
@@ -98,7 +103,10 @@ recorder tail must be evaluated by the broker-free ShadowRunner, then consumed
 by `edge ingest-shadow` as a complete parity-matched proof before the candidate
 can become `validated` or `champion`. An underpowered, mismatched, or incomplete
 shadow cycle advances no durable boundary, so those sessions are reconsidered
-when enough data exists instead of being silently consumed.
+when enough data exists instead of being silently consumed. Semantic or
+mid-tail incompleteness is an intentional fail-closed quarantine, not permanent
+loss; correct the source and run the bounded replay repair before retrying
+ingestion.
 
 The `shadow-confirmation-v4` live-shadow scope is independent and chronological:
 each complete tail is split into an older selection window and a newer disjoint
@@ -165,7 +173,10 @@ quote-required, non-authorizing measurement. Historical bar fallback remains
 diagnostic and cannot authorize proof.
 Authorizing fills retain provider/feed/age/source for both legs:
 IEX for equity entry and exit, OPRA for option entry and exit, each no older
-than 30 seconds. Bar-only, partial-feed, or stale legs cannot authorize proof.
+than 30 seconds. Feed provenance is request-bound: an explicit provider-row
+feed label is retained when present, otherwise the configured/requested feed
+label is used; it is not an independent venue attestation. Bar-only,
+partial-feed, or stale legs cannot authorize proof.
 
 ### Where the LLM is used
 
@@ -185,7 +196,11 @@ evidence records call counts, circuit state, and each attempt's hashes/errors.
 The optional paper-runtime call has a strict timeout. Empty or irrelevant
 output means “no veto,” returning control to the already-audited deterministic
 path; provider errors or malformed non-empty output veto that cycle. The LLM
-never has broker authority.
+never has broker authority. Proposal lessons and shared learning are fit-derived
+only: underpowered or `execution_blocked` attempts do not count as family or
+parameter successes/failures, and held-out/sealed/qualification evidence is not
+shown to proposal generation. Model-authored novel tuning is capped at eight
+numeric values per lineage/family in the durable factory ledger.
 
 Custom provider endpoints are a trust boundary. `llm.base_url`,
 `OPENAI_BASE_URL`, and `ANTHROPIC_BASE_URL` can receive the provider key and the
@@ -208,6 +223,10 @@ check, while the others are diagnostics. Runtime rejection caps are separate
 from expected costs. Stress applies the scenario bps to entry notional and then
 adds listed-option round-trip fees for both per-contract sides; it is not a
 per-side bps charge. The shipped `max_stressed_cost_to_risk_ratio` is `0.30`.
+Runtime, factory, explicit IBR, and randomized-null quote-entry replays share
+one pure entry-slippage cap; malformed inputs use `entry_slippage_invalid`,
+and over-cap quotes use `entry_slippage_exceeds_limit` as stable
+refusal/no-trade reasons. This cap is separate from expected costs.
 For a 30-bps-floor trade, 25 bps of entry-notional stress is about `0.833` of
 risk, so the trade is vetoed by that limit before any option fees.
 
@@ -326,12 +345,15 @@ normalizes account, asset, quote/bar, calendar, option-chain, order, and trade
 update data for the rest of the application. `agent/alpaca_session.py` owns
 the NYSE calendar and session policy. `agent/contracts/rule.py` is the safe
 strategy grammar shared by research and runtime; generated specifications can
-never contain executable code. It has two versions: `rule-strategy.v1` is
-unchanged and keeps every existing variant id, and `rule-strategy.v2` is a
-strict superset adding entry-side predicates only — a multi-filter confirmation
-list, a session-time entry window, and an ATR volatility band — so a hypothesis
-can express a conditional edge without any extension reaching sizing, exits, or
-order placement. `agent/contracts/ibr.py` remains the explicit
+never contain executable code. It has three versions: `rule-strategy.v1` is
+unchanged and keeps every existing variant id, `rule-strategy.v2` is a strict
+superset adding entry-side predicates only — a multi-filter confirmation list,
+a session-time entry window, and an ATR volatility band — and
+`rule-strategy.v3` adds nullable numeric `breakeven_r` for equity shares.
+Options remain on executable v1/v2 schemas; a v3 root stays v3 while tuning.
+V2 entry predicates do not reach sizing or execution; v3 affects only the shared
+bounded breakeven stop-transition path and cannot author arbitrary orders.
+`agent/contracts/ibr.py` remains the explicit
 IBR replay/baseline. Risk and execution
 profiles enforce sizing, single-leg long-option checks, idempotent client
 order IDs, and end-of-day flattening.

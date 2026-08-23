@@ -19,7 +19,7 @@ import re
 from threading import Lock, Thread
 from typing import Any, Callable, Mapping, Sequence
 
-from agent.contracts.rule import (RULE_SCHEMA_V1, RULE_SCHEMA_V2,
+from agent.contracts.rule import (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
                                   rule_spec_hash, rule_variant_id,
                                   rule_spec_json_schema, validate_rule_spec)
 
@@ -52,8 +52,12 @@ _PROVIDER_CONFIG_ERROR_TOKENS = (
 SYSTEM_PROMPT = """You propose bounded replacement rule strategies for an audited
 research process.  Return one JSON object and nothing else, exactly:
 {"schema":"llm-rule-proposal.v1","rule_spec":{...}}
-The rule_spec must include every required key of either the explicit
-rule-strategy.v1 or rule-strategy.v2 grammar; schema is never inferred.
+The rule_spec must include every required key of the explicit grammar; schema
+is never inferred. The request includes a vehicle: equity may use
+rule-strategy.v1, rule-strategy.v2, or rule-strategy.v3 (with nullable
+"breakeven_r" in v3), while options may use only executable v1/v2 and never
+"breakeven_r". The vehicle-specific provider schema and validator are
+authoritative.
 All numeric bounds and enum values are exactly those shown in the provider JSON
 schema. Never return
 markdown, Python/source code, executable instructions, credentials, market
@@ -67,13 +71,17 @@ rows, or fields outside schema and rule_spec.
 DISCOVERY_SYSTEM_PROMPT = """You propose new bounded intraday edge hypotheses for
 an audited research process.  Return one JSON object and nothing else, exactly:
 {"schema":"llm-edge-discovery.v1","rule_spec":{...},"thesis":"..."}
-The rule_spec must use only the finite rule-strategy grammar and must set
-"schema":"rule-strategy.v2" inside rule_spec to use the wider grammar, which
-adds: "confirmations" (a list of extra filters from trend/volume/volatility,
+The rule_spec must use only the finite rule-strategy grammar. Set
+"schema":"rule-strategy.v2" to use its wider entry predicates, which add
+"confirmations" (a list of extra filters from trend/volume/volatility,
 all of which must hold), "entry_after_minutes" and "entry_before_minutes"
 (the minutes-from-09:30-New-York window in which a signal may fire), and
 "min_atr_bps"/"max_atr_bps" (the volatility regime the rule is allowed to
-trade).  Use them to express a conditional edge, not just retuned numbers.
+trade). Use them to express a conditional edge, not just retuned numbers.
+rule-strategy.v3 extends v2 with equity-only exit control via nullable
+"breakeven_r". The request vehicle controls versions: equity may use v1/v2/v3;
+options remain on executable v1/v2 and never use "breakeven_r". The
+vehicle-specific provider schema and validator are authoritative.
 Propose something structurally different from the already-tried and
 already-proved rules you are shown; a near-duplicate is rejected.  "thesis" is
 one plain sentence, at most 240 characters, saying why the edge should exist.
@@ -103,6 +111,10 @@ how each is computed from the bars — are fixed code that you are tuning, not
 designing.  You cannot introduce a new signal, indicator or data source, and a
 reply that tries to is rejected outright.  Changing which idea is being tested
 is a different job, done elsewhere.
+For an equity root using rule-strategy.v3, the nullable numeric
+"breakeven_r" may be activated by changing null to one finite in-bounds number
+as a single coordinate change. Options remain on their executable schema and
+may never use rule-strategy.v3 or "breakeven_r".
 
 EXPERIMENT PHASE.  The request names a refinement_phase.  In "coordinate"
 phase every returned variant must change exactly ONE field, so its effect is
@@ -262,6 +274,13 @@ def _safe_reason(value: Any) -> str:
     return _safe_text(value, label="reason", limit=MAX_REASON_CHARS)
 
 
+def _validate_vehicle_rule_spec(spec: Mapping[str, Any], vehicle: str) -> None:
+    """Apply the vehicle executable-schema gate after grammar validation."""
+
+    if vehicle == "option" and spec.get("schema") == RULE_SCHEMA_V3:
+        raise ValueError("rule-strategy.v3 is not executable for options")
+
+
 def _tuning_reason_check(reason: str, root: Mapping[str, Any],
                          normalized: Mapping[str, Any],
                          diagnosis: Mapping[str, Any],
@@ -280,20 +299,35 @@ def _tuning_reason_check(reason: str, root: Mapping[str, Any],
     for key in changed:
         before = root.get(key)
         after = normalized.get(key)
-        if (isinstance(before, bool) or isinstance(after, bool) or
-                not isinstance(before, (int, float)) or
-                not isinstance(after, (int, float))):
+        nullable_numeric_activation = (
+            key == "breakeven_r" and root.get("schema") == RULE_SCHEMA_V3 and
+            before is None and isinstance(after, (int, float)) and
+            not isinstance(after, bool))
+        if (not nullable_numeric_activation and
+                (isinstance(before, bool) or isinstance(after, bool) or
+                 not isinstance(before, (int, float)) or
+                 not isinstance(after, (int, float)))):
             raise ValueError(
                 f"tuning may change numeric values only; {key} is categorical")
-        origin = float(before)
-        moved = abs(float(after) - origin)
-        if origin == 0.0:
-            limit = _TUNING_ZERO_AXIS_LIMITS.get(
-                key, 1.0 if isinstance(before, int) else .25)
-        elif isinstance(before, int):
-            limit = float(max(1, int(round(abs(origin) * .2))))
+        if nullable_numeric_activation:
+            # ``None`` has no meaningful relative origin.  Match the
+            # deterministic factory's first breakeven coordinate (one
+            # quarter of target R), while retaining a bounded minimum step.
+            target = float(root.get("target_r") or 0.0)
+            # Keep a useful first trigger (0.5R) available for roots whose
+            # target is below 2R, while still scaling with wider targets.
+            limit = max(.5, target * .25)
+            moved = abs(float(after))
         else:
-            limit = max(.25, abs(origin) * .2)
+            origin = float(before)
+            moved = abs(float(after) - origin)
+            if origin == 0.0:
+                limit = _TUNING_ZERO_AXIS_LIMITS.get(
+                    key, 1.0 if isinstance(before, int) else .25)
+            elif isinstance(before, int):
+                limit = float(max(1, int(round(abs(origin) * .2))))
+            else:
+                limit = max(.25, abs(origin) * .2)
         if moved > limit + 1e-12:
             raise ValueError(
                 f"tuning change for {key} exceeds the bounded local step "
@@ -717,13 +751,17 @@ class RuleProposalAdapter:
 
     def _base_evidence(self, *, kind: str, schema_name: str,
                        prompt_hash: str | None = None,
-                       request_hash: str | None = None) -> dict[str, Any]:
+                       request_hash: str | None = None,
+                       vehicle: str | None = None) -> dict[str, Any]:
         evidence = {
             "provider": self.provider,
             "model": self.model,
             "kind": kind,
             "config_hash": self._config_hash(),
-            "response_schema_hash": self._schema_hash(schema_name),
+            "response_schema_hash": self._schema_hash(schema_name, vehicle),
+            # This remains the complete audited grammar fingerprint; the
+            # vehicle-specific provider shape is captured separately by
+            # ``response_schema_hash``.
             "grammar_schema_hash": content_hash(rule_spec_json_schema()),
         }
         if prompt_hash is not None:
@@ -738,18 +776,19 @@ class RuleProposalAdapter:
     def _attempt_evidence(self, *, attempt: int,
                           schema_name: str,
                           prompt_hash: str,
-                          request_hash: str) -> dict[str, Any]:
+                          request_hash: str,
+                          vehicle: str | None = None) -> dict[str, Any]:
         return {
             "attempt": int(attempt),
             "request_hash": request_hash,
             "system_prompt_hash": prompt_hash,
             "config_hash": self._config_hash(),
-            "response_schema_hash": self._schema_hash(schema_name),
+            "response_schema_hash": self._schema_hash(schema_name, vehicle),
             "grammar_schema_hash": content_hash(rule_spec_json_schema()),
         }
 
-    def _schema_hash(self, name: str) -> str:
-        return content_hash(self._schema(name))
+    def _schema_hash(self, name: str, vehicle: str | None = None) -> str:
+        return content_hash(self._schema(name, vehicle=vehicle))
 
     def _lazy_client(self) -> Any:
         if self._auth_unavailable:
@@ -779,7 +818,25 @@ class RuleProposalAdapter:
         return self.client
 
     @staticmethod
-    def _schema(name: str = PROPOSAL_SCHEMA) -> dict[str, Any]:
+    def _grammar_schema(vehicle: str | None = None) -> dict[str, Any]:
+        """Return the provider-facing rule grammar for one vehicle.
+
+        The full audited grammar remains the default for backwards
+        compatibility. Options are intentionally narrowed to v1/v2 because
+        v3's exit amendment is not executable in the option lane. Internal
+        ``validate_rule_spec`` remains authoritative for bounds and ordering.
+        """
+
+        if vehicle == "option":
+            return {"oneOf": [
+                rule_spec_json_schema(RULE_SCHEMA_V1),
+                rule_spec_json_schema(RULE_SCHEMA_V2),
+            ]}
+        return rule_spec_json_schema()
+
+    @staticmethod
+    def _schema(name: str = PROPOSAL_SCHEMA,
+                vehicle: str | None = None) -> dict[str, Any]:
         # OpenAI Responses API JSON schema; Anthropic accepts the same schema
         # under ``output_config.format`` on versions supporting structured
         # outputs.  additionalProperties is deliberately false.
@@ -846,7 +903,7 @@ class RuleProposalAdapter:
                 return [provider_schema(item) for item in value]
             return value
 
-        rule_schema = provider_schema(rule_spec_json_schema())
+        rule_schema = provider_schema(RuleProposalAdapter._grammar_schema(vehicle))
         if name == TUNING_SCHEMA:
             return provider_schema({
                 "type": "object", "additionalProperties": False,
@@ -903,7 +960,9 @@ class RuleProposalAdapter:
                 ],
                 text={"format": {"type": "json_schema", "name": "llm_rule_proposal",
                                   "strict": True,
-                                  "schema": self._schema(schema_name)}},
+                                  "schema": self._schema(
+                                      schema_name,
+                                      vehicle=request.get("vehicle"))}},
                 timeout=timeout,
             )
             return _raw_text(response, max_bytes=self.max_response_bytes)
@@ -912,7 +971,9 @@ class RuleProposalAdapter:
             system=system_prompt,
             messages=[{"role": "user", "content": request_text}],
             output_config={"format": {"type": "json_schema",
-                                      "schema": self._schema(schema_name)}},
+                                      "schema": self._schema(
+                                          schema_name,
+                                          vehicle=request.get("vehicle"))}},
             timeout=timeout,
         )
         return _raw_text(response, max_bytes=self.max_response_bytes)
@@ -929,6 +990,7 @@ class RuleProposalAdapter:
                 raise ValueError("generation must be a non-negative integer")
             prior = validate_rule_spec(_finite(prior_validated_rule_spec,
                                                path="prior_validated_rule_spec"))
+            _validate_vehicle_rule_spec(prior, vehicle)
             safe_diagnosis = _safe_diagnosis(diagnosis)
             request = {"vehicle": vehicle, "generation": generation,
                        "prior_validated_rule_spec": prior,
@@ -940,7 +1002,7 @@ class RuleProposalAdapter:
                 False, error=str(exc),
                 evidence=self._base_evidence(
                     kind="proposal", schema_name=PROPOSAL_SCHEMA,
-                    prompt_hash=content_hash(self.system_prompt)))
+                    prompt_hash=content_hash(self.system_prompt), vehicle=vehicle))
 
         errors: list[str] = []
         raw_hash: str | None = None
@@ -948,7 +1010,8 @@ class RuleProposalAdapter:
         for attempt in range(1, self.max_attempts + 1):
             attempt_record = self._attempt_evidence(
                 attempt=attempt, schema_name=PROPOSAL_SCHEMA,
-                prompt_hash=system_hash, request_hash=request_hash)
+                prompt_hash=system_hash, request_hash=request_hash,
+                vehicle=vehicle)
             try:
                 raw_value = _call_with_timeout(
                     self._provider_call, self.timeout_seconds,
@@ -962,6 +1025,7 @@ class RuleProposalAdapter:
                 parsed, raw = _parse_response(raw,
                                               max_bytes=self.max_response_bytes)
                 normalized = validate_rule_spec(parsed["rule_spec"])
+                _validate_vehicle_rule_spec(normalized, vehicle)
                 spec_hash = rule_spec_hash(normalized)
                 variant = rule_variant_id(normalized)
                 attempt_record["normalized_spec_hash"] = spec_hash
@@ -970,7 +1034,8 @@ class RuleProposalAdapter:
                 evidence = {
                     **self._base_evidence(
                         kind="proposal", schema_name=PROPOSAL_SCHEMA,
-                        prompt_hash=system_hash, request_hash=request_hash),
+                        prompt_hash=system_hash, request_hash=request_hash,
+                        vehicle=vehicle),
                     "raw_response_hash": raw_hash,
                     "normalized_spec_hash": spec_hash,
                     "spec_id": spec_hash,
@@ -994,7 +1059,7 @@ class RuleProposalAdapter:
                     break
         evidence = self._base_evidence(
             kind="proposal", schema_name=PROPOSAL_SCHEMA,
-            prompt_hash=system_hash, request_hash=request_hash)
+            prompt_hash=system_hash, request_hash=request_hash, vehicle=vehicle)
         evidence["attempts"] = len(attempt_evidence)
         if raw_hash is not None:
             evidence["raw_response_hash"] = raw_hash
@@ -1029,7 +1094,7 @@ class RuleProposalAdapter:
                 False, error=str(exc), schema=DISCOVERY_SCHEMA,
                 evidence=self._base_evidence(
                     kind="discovery", schema_name=DISCOVERY_SCHEMA,
-                    prompt_hash=content_hash(prompt)))
+                    prompt_hash=content_hash(prompt), vehicle=vehicle))
 
         errors: list[str] = []
         raw_hash: str | None = None
@@ -1037,7 +1102,8 @@ class RuleProposalAdapter:
         for attempt in range(1, self.max_attempts + 1):
             attempt_record = self._attempt_evidence(
                 attempt=attempt, schema_name=DISCOVERY_SCHEMA,
-                prompt_hash=system_hash, request_hash=request_hash)
+                prompt_hash=system_hash, request_hash=request_hash,
+                vehicle=vehicle)
             try:
                 raw_value = _call_with_timeout(
                     self._discovery_call, self.timeout_seconds, prompt, request)
@@ -1048,6 +1114,7 @@ class RuleProposalAdapter:
                     raw, max_bytes=self.max_response_bytes,
                     schema=DISCOVERY_SCHEMA, keys=_DISCOVERY_RESPONSE_KEYS)
                 normalized = validate_rule_spec(parsed["rule_spec"])
+                _validate_vehicle_rule_spec(normalized, vehicle)
                 thesis = _safe_thesis(parsed["thesis"])
                 spec_hash = rule_spec_hash(normalized)
                 variant = rule_variant_id(normalized)
@@ -1057,7 +1124,8 @@ class RuleProposalAdapter:
                 evidence = {
                     **self._base_evidence(
                         kind="discovery", schema_name=DISCOVERY_SCHEMA,
-                        prompt_hash=system_hash, request_hash=request_hash),
+                        prompt_hash=system_hash, request_hash=request_hash,
+                        vehicle=vehicle),
                     "raw_response_hash": raw_hash,
                     "normalized_spec_hash": spec_hash,
                     "spec_id": spec_hash,
@@ -1083,7 +1151,7 @@ class RuleProposalAdapter:
                     break
         evidence = self._base_evidence(
             kind="discovery", schema_name=DISCOVERY_SCHEMA,
-            prompt_hash=system_hash, request_hash=request_hash)
+            prompt_hash=system_hash, request_hash=request_hash, vehicle=vehicle)
         evidence["attempts"] = len(attempt_evidence)
         if raw_hash is not None:
             evidence["raw_response_hash"] = raw_hash
@@ -1129,6 +1197,7 @@ class RuleProposalAdapter:
                 raise ValueError(
                     f"count must be between 1 and {MAX_TUNED_VARIANTS}")
             root = validate_rule_spec(_finite(rule_spec, path="rule_spec"))
+            _validate_vehicle_rule_spec(root, vehicle)
             safe_lessons = _safe_lessons(lessons)
             known_lessons = frozenset(
                 str(item["id"]) for item in safe_lessons
@@ -1146,7 +1215,7 @@ class RuleProposalAdapter:
                 False, error=str(exc), schema=TUNING_SCHEMA,
                 evidence=self._base_evidence(
                     kind="tuning", schema_name=TUNING_SCHEMA,
-                    prompt_hash=content_hash(prompt)))
+                    prompt_hash=content_hash(prompt), vehicle=vehicle))
 
         errors: list[str] = []
         raw_hash: str | None = None
@@ -1154,7 +1223,8 @@ class RuleProposalAdapter:
         for attempt in range(1, self.max_attempts + 1):
             attempt_record = self._attempt_evidence(
                 attempt=attempt, schema_name=TUNING_SCHEMA,
-                prompt_hash=system_hash, request_hash=request_hash)
+                prompt_hash=system_hash, request_hash=request_hash,
+                vehicle=vehicle)
             try:
                 raw_value = _call_with_timeout(
                     self._tuning_call, self.timeout_seconds, prompt, request)
@@ -1172,6 +1242,7 @@ class RuleProposalAdapter:
                 for index, entry in enumerate(entries):
                     try:
                         normalized = validate_rule_spec(entry["rule_spec"])
+                        _validate_vehicle_rule_spec(normalized, vehicle)
                     except Exception:
                         # Preserve the grammar validator's precise contract
                         # (unknown fields, unsupported family, or bad bounds)
@@ -1230,7 +1301,8 @@ class RuleProposalAdapter:
                 evidence = {
                     **self._base_evidence(
                         kind="tuning", schema_name=TUNING_SCHEMA,
-                        prompt_hash=system_hash, request_hash=request_hash),
+                        prompt_hash=system_hash, request_hash=request_hash,
+                        vehicle=vehicle),
                     "raw_response_hash": raw_hash,
                     "root_variant_id": rule_variant_id(root),
                     "family": root["family"],
@@ -1260,7 +1332,7 @@ class RuleProposalAdapter:
                     break
         evidence = self._base_evidence(
             kind="tuning", schema_name=TUNING_SCHEMA,
-            prompt_hash=system_hash, request_hash=request_hash)
+            prompt_hash=system_hash, request_hash=request_hash, vehicle=vehicle)
         evidence.update({
             "requested": int(count),
             "lessons_supplied": len(safe_lessons),

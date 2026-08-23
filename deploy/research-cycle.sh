@@ -1164,4 +1164,4 @@ if [ "$cycle_unevaluable" -eq 1 ] && [ "$cycle_no_edge" -eq 0 ]; then
 fi
 cycle_no_edge=1
 emit_progress "completed" 1 1 "cycles" "both"
-finish "completed_no_edge" "no candidate was proved; review adequate-negative, underpowered, and untested classifications" 0
+finish "completed_no_edge" "no candidate was proved; review adequate-negative, execution-blocked, qualification-unavailable, underpowered, and untested classifications" 0

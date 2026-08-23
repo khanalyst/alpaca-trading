@@ -155,10 +155,14 @@ The executable exit grammar is fixed to the ATR-derived bracket (including the
 factory's fit-only diagnostics expose signal eligibility, 30-bps floor binding,
 planned exits, configured/stressed economics, clustered power, behavioral alias
 fingerprints, intended-versus-delivered risk, provider/feed provenance,
-entry-pricing source, configured limits, and pass/fail/unknown row counts for
-operator review. Planned signal/exit geometry may be counted as quote-required
-measurement when delayed pricing is unavailable; it remains non-authorizing.
-Diagnostics never expand the exit grammar or authorize a candidate.
+entry-pricing source, configured limits, pass/fail/unknown row counts, and
+aggregate fit-partition execution-rejection counts/reasons for operator review.
+Planned signal/exit geometry may be counted as quote-required measurement when
+delayed pricing is unavailable; it remains non-authorizing. If every fit
+opportunity is explicitly execution-rejected, the fit is `execution_blocked`,
+distinct from sparse/underpowered data; bounded budget closure only progresses
+search exhaustion and is not a powered negative edge. Diagnostics never expand
+the exit grammar or authorize a candidate.
 
 The runtime persists the resulting `hold_deadline_ts` on the trade, so the exit
 survives a restart. `agent.execution_lifecycle` fires the `max_hold` close from
@@ -328,7 +332,10 @@ delayed bars can signal when observed, and execution enters at that
 decision/observation time using fresh IEX/OPRA evidence. Delayed full OHLC
 never backfills an earlier entry, partial pre-entry ranges are excluded, and
 historical bar fallback remains diagnostic and is excluded from authorizing
-statistics.
+statistics. Feed provenance is request-bound: an explicit provider-row feed
+label is retained when present, otherwise the configured/requested feed label is
+used;
+it is not an independent venue attestation.
 
 ### Explicit IBR path
 
@@ -347,6 +354,12 @@ charges scenario bps against entry notional, plus listed-option round-trip fees
 for both per-contract sides; it is not a per-side bps charge. The shipped
 25-bps scenario and `max_stressed_cost_to_risk_ratio: 0.30` veto a 30-bps-floor
 trade at about `0.833` cost-to-risk before option fees.
+
+Quote entries in runtime, factory, explicit IBR replay, and randomized-null
+controls use one pure entry-slippage cap against their boundary reference.
+Malformed inputs produce `entry_slippage_invalid`; an over-cap quote produces
+`entry_slippage_exceeds_limit` as a stable refusal/no-trade reason. This cap is
+separate from expected-cost parameters.
 
 `research.edge_discovery_core` owns deterministic corpus loading, effective
 IBR configuration, opportunity materialization, the randomized-entry null
@@ -378,11 +391,15 @@ The grammar is versioned. `rule-strategy.v1` is unchanged and keeps every
 existing `variant_id` byte-identical, so ledgers written before v2 stay
 resolvable. `rule-strategy.v2` is a strict superset, reached only by naming it,
 that adds four entry-side predicates — a multi-filter `confirmations` list, a
-session-time entry window, and an ATR volatility band. Each is a pure function
-of the same completed-bar prefix, so `evaluate_rule_signal` remains the single
-evaluator shared by research and runtime and no extension can reach sizing,
-exits, or order placement. A v2 spec that admits a signal emits exactly the v1
-plan.
+session-time entry window, and an ATR volatility band. `rule-strategy.v3`
+retains those predicates and adds nullable numeric `breakeven_r` for equity
+shares; options remain on executable v1/v2 schemas. Each entry extension is a
+pure function of the same completed-bar prefix, so `evaluate_rule_signal`
+remains the single evaluator shared by research and runtime. V2 entry
+predicates remain outside sizing/execution; v3 affects only the shared bounded
+breakeven stop-transition path. A v2 spec that admits a signal emits exactly the
+v1 plan;
+a v3 spec adds only its declared equity exit state.
 
 ### Corpus acquisition
 
@@ -423,8 +440,9 @@ A slot is a unit of logical research capacity. Its hypothesis leaves
 `ACTIVE_HYPOTHESIS_STATES` permanently on a shadow pass, because the proved
 variant is deployed and must never be re-tuned; the slot is therefore reseeded
 with a new hypothesis in the same cycle. Reseeding prefers an untried family at
-that family's template and then continues into a deterministic conditional-v2
-ladder. Each reseed grants one further `max_generations` budget and is counted
+that family's template and then continues into a deterministic conditional
+grammar ladder (v2 entry predicates and v3 equity exits). Each reseed grants one
+further `max_generations` budget and is counted
 separately from the failure-recovery rotation budget, which it never consumes.
 `run_factory` additionally revives any slot holding no active hypothesis before
 scheduling, so an older ledger or a raised `strategies` count recovers without
@@ -476,9 +494,11 @@ them.
 
 Tuning is narrower again: a tuned spec keeps its root's `family` *and* its
 root's `schema`. The family pin keeps "which idea is under test" a discovery
-decision; the schema pin stops a v1 root reaching v2's extra predicate
-categories, which would be adding structure rather than tuning values. What is
-left is the values of fields the root already carries. The unmutated root is
+decision; the schema pin stops a root reaching a wider grammar (v1 to v2/v3),
+which would be adding structure rather than tuning values. A v3 equity root may
+activate its nullable numeric `breakeven_r`, but remains v3; options stay on
+v1/v2. What is left is the values of fields the root already carries. The
+unmutated root is
 always variant zero and is never proposed away. It is compared with an
 independent randomized-entry null that preserves the candidate's
 session/symbol/direction distribution and exit rules; it is never compared with
@@ -488,8 +508,11 @@ Anything the model does not supply, supplies as a duplicate, or supplies
 invalidly is topped up from the same deterministic mutation table, so the
 variant count is unchanged whether a provider answered or not. Discovery and
 tuning de-duplicate by the family-specific executable semantic signature
-(including v1/v2 no-op aliases); only exact variant ids with an adequate
-recorded failure are suppressed, while underpowered failures remain eligible.
+(including v1/v2/v3 no-op aliases). Continuous numeric axes use relative/local
+scaling for semantic novelty, while integer/topology axes use their grammar
+spans; exact signatures and validation remain unchanged. Only exact variant ids
+with an adequate recorded failure are suppressed, while underpowered failures
+remain eligible.
 
 The cycle therefore runs in two scheduled phases. `_diagnose_worker` replays
 each hypothesis's root on its fit partition only; the orchestrator then chooses
@@ -505,11 +528,15 @@ unbounded OS-level parallelism.
 records what the gates then said. They are two append-only tables rather than
 one updated row because the two facts are learned at different times: the
 reason exists when a variant is proposed, the grade only after its gate is
-computed. Fixing the reason first is what makes it a prediction rather than a
-story told afterwards. Deterministic mutations record reasons in the same
-shape, including an explicit "no diagnosis behind it" for the arithmetic sweep
-that fills variants past the diagnosed changes, so the feedback loop can
-compare a tuned reason against the fixed table instead of only against itself.
+computed. Proposal verdicts and shared learning are fit-derived; underpowered
+attempts, including `execution_blocked`, do not count as family or parameter
+successes or failures. Held-out, sealed, and qualification evidence remains
+audit metadata and is unavailable to proposal generation. Fixing the reason
+first is what makes it a prediction rather than a story told afterwards.
+Deterministic mutations record reasons in the same shape, including an explicit
+"no diagnosis behind it" for the arithmetic sweep that fills variants past the
+diagnosed changes, so the feedback loop can compare a tuned reason against the
+fixed table rather than only against itself.
 
 `_lesson_brief` reads the graded pairs back into the next tuning and discovery
 request, trimming oldest-first to stay inside the adapter's aggregate bound. A
@@ -527,6 +554,11 @@ excludes underpowered results, so a thin sample never closes a door. The
 citation is resolved through `resolve_lesson_ref` and stored as
 `parent_lesson_id`, making "B was tried because A failed this way" a durable
 edge the report renders and counts.
+
+The model may add at most eight novel numeric tuning values per lineage/family.
+The factory ledger records marked novel attempts across parent hypotheses and
+cycles, so the allowance survives prompt trimming and restarts; deterministic
+grid values do not consume it.
 
 ### Statistical gates and lifecycle
 
@@ -620,6 +652,9 @@ ingest-shadow` opens its WAL read-only, requires complete parity matches and
 prior qualification plus source/config/code/provenance/replay/gate hashes,
 applies family and global BH with durable online FDR, and only then appends an
 immutable `lane=shadow` proof that may transition a candidate to `validated`.
+Semantic or mid-tail incomplete sessions remain fail-closed in replay quarantine
+until the source is corrected and a bounded complete parity replay records the
+repair; they are recoverable, not permanently discarded.
 The ingester previews the next allocation without writing it and increases
 Monte Carlo resolution enough for the batch-adjusted p-value grid to cross that
 allocation. A two-million-draw cap turns an unresolvable test into an explicit

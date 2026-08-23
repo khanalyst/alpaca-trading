@@ -2,11 +2,11 @@ import json
 from pathlib import Path
 import unittest
 
-from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V2,
+from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
                                   rule_spec_hash, rule_variant_id,
                                   validate_rule_spec)
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
-                                    TUNING_SCHEMA, RuleProposalAdapter,
+                                    SYSTEM_PROMPT, TUNING_SCHEMA, RuleProposalAdapter,
                                     _parse_response, _safe_text,
                                     canonical_json, content_hash)
 
@@ -29,6 +29,16 @@ def proposal(spec=None):
 
 
 class LLMRuleStrategyTests(unittest.TestCase):
+    def test_prompts_describe_vehicle_schema_boundaries(self):
+        adapter = RuleProposalAdapter()
+        for prompt in (SYSTEM_PROMPT, adapter.discovery_prompt):
+            self.assertIn("rule-strategy.v3", prompt)
+            self.assertIn("breakeven_r", prompt)
+            self.assertIn("options", prompt)
+
+        self.assertIn("rule-strategy.v3", adapter.discovery_prompt)
+        self.assertIn("options remain on executable v1/v2", adapter.discovery_prompt)
+
     def test_provider_schema_is_recursive_strict_subset(self):
         schema = RuleProposalAdapter._schema()
 
@@ -57,6 +67,21 @@ class LLMRuleStrategyTests(unittest.TestCase):
         self.assertEqual({branch["type"] for branch in builds_on["anyOf"]},
                          {"string", "null"})
         self.assertIn("builds_on", tuning["properties"]["variants"]["items"]["required"])
+
+    def test_vehicle_provider_schema_excludes_v3_for_options(self):
+        equity = RuleProposalAdapter._schema(DISCOVERY_SCHEMA, vehicle="equity")
+        option = RuleProposalAdapter._schema(DISCOVERY_SCHEMA, vehicle="option")
+        equity_schemas = {
+            branch["properties"]["schema"]["enum"][0]
+            for branch in equity["properties"]["rule_spec"]["anyOf"]
+        }
+        option_schemas = {
+            branch["properties"]["schema"]["enum"][0]
+            for branch in option["properties"]["rule_spec"]["anyOf"]
+        }
+        self.assertEqual(equity_schemas, {"rule-strategy.v1", "rule-strategy.v2",
+                                          RULE_SCHEMA_V3})
+        self.assertEqual(option_schemas, {"rule-strategy.v1", "rule-strategy.v2"})
 
     def test_openai_responses_seam_receives_sanitized_schema(self):
         seen = {}
@@ -111,6 +136,24 @@ class LLMRuleStrategyTests(unittest.TestCase):
             _safe_text("x" * 241, label="reason", limit=240)
         with self.assertRaises(ValueError):
             _parse_response(proposal(), max_bytes=16)
+
+    def test_v3_tuning_allows_nullable_breakeven_activation_but_not_options(self):
+        root = validate_rule_spec({"schema": RULE_SCHEMA_V3,
+                                   "family": "momentum_continuation"})
+        tuned = {**root, "breakeven_r": 0.5}
+        reply = json.dumps({"schema": TUNING_SCHEMA, "variants": [{
+            "rule_spec": tuned,
+            "reason": "Activated breakeven_r to protect gains after the diagnosed loss.",
+        }]})
+        adapter = RuleProposalAdapter(caller=lambda **_: reply, max_attempts=1)
+        equity = adapter.tune("equity", 0, root, {"primary_failure": "negative_expectancy"},
+                              count=1)
+        self.assertTrue(equity.success, equity.error)
+        self.assertEqual(equity.variants[0]["rule_spec"]["breakeven_r"], 0.5)
+        option = adapter.tune("option", 0, root, {"primary_failure": "negative_expectancy"},
+                              count=1)
+        self.assertFalse(option.success)
+        self.assertIn("not executable for options", option.error or "")
 
     def test_strict_success_hashes_and_content_ids(self):
         calls = []
@@ -267,6 +310,19 @@ class LLMDiscoveryTests(unittest.TestCase):
         self.assertNotIn("raw_response", result.evidence)
         self.assertEqual(result.evidence["raw_response_hash"],
                          content_hash(discovery()))
+
+    def test_equity_discovery_accepts_v3_breakeven_and_option_discovery_rejects_it(self):
+        v3 = validate_rule_spec({"schema": RULE_SCHEMA_V3,
+                                 "family": "mean_reversion",
+                                 "breakeven_r": 0.5})
+        adapter = RuleProposalAdapter(
+            caller=lambda **_: discovery(spec=v3), max_attempts=1)
+        equity = adapter.discover(vehicle="equity", slot=0, context={})
+        self.assertTrue(equity.success, equity.error)
+        self.assertEqual(equity.rule_spec["schema"], RULE_SCHEMA_V3)
+        option = adapter.discover(vehicle="option", slot=0, context={})
+        self.assertFalse(option.success)
+        self.assertIn("not executable for options", option.error or "")
 
     def test_discovery_uses_its_own_prompt_and_schema(self):
         seen = {}

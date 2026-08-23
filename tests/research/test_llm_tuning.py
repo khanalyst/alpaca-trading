@@ -726,6 +726,37 @@ class LessonLedgerTests(unittest.TestCase):
             self.assertEqual(len(ids), 1)
             self.assertEqual(len(factory.lessons(vehicle="equity")), 1)
 
+    def test_novel_tuning_cap_survives_restart_and_long_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = self._seeded(factory)
+            for index in range(9):
+                spec = validate_rule_spec({
+                    **hypothesis.rule_spec, "stop_atr": 1.1 + index * .1})
+                factory.record_lesson(
+                    hypothesis.hypothesis_id, vehicle="equity",
+                    family=hypothesis.family,
+                    variant_id=rule_variant_id(spec) + f".{index}",
+                    kind="tuning", source="llm", reason="Novel stop tuning.",
+                    changed={"stop_atr": {"from": 1.0,
+                                            "to": spec["stop_atr"]}},
+                    evidence={"novel_tuning": True})
+            restarted = FactoryLedger(factory.path)
+            durable = restarted.novel_tuning_values(
+                hypothesis_id=hypothesis.hypothesis_id, vehicle="equity",
+                family=hypothesis.family)
+            self.assertEqual(len(durable), 9)
+            novel = ({**hypothesis.rule_spec, "stop_atr": 1.2},
+                     "Raised stop_atr after durable prior attempts.")
+            chosen, proposal = _tuned_variants(
+                {"rule_spec": hypothesis.rule_spec, "slot": 0}, DIAGNOSIS,
+                count=4, vehicle="equity", llm_enabled=True,
+                config={"model": "test"},
+                adapter=_adapter(_reply(novel)),
+                durable_novel_tuning_values=frozenset(durable))
+        self.assertTrue(proposal.success)
+        self.assertFalse(any(item.novel_tuning for item in chosen))
+
     def test_lessons_are_immutable_and_validated(self):
         with tempfile.TemporaryDirectory() as directory:
             factory, _edge = _ledgers(directory)
@@ -849,7 +880,10 @@ class FeedbackLoopTests(unittest.TestCase):
         self.assertEqual(briefs[0], [], "the first cycle has nothing to learn from")
         self.assertTrue(briefs[1], "the second cycle must receive graded history")
         for entry in briefs[1]:
-            self.assertIn(entry["verdict"], {"passed", "failed", "underpowered"})
+            self.assertIn(entry["verdict"], {
+                "fit_positive", "fit_negative", "fit_inconclusive",
+                "underpowered", "execution_blocked", "fit_ungraded",
+            })
             self.assertTrue(entry["reason"])
             self.assertIn("proposed_by", entry)
             self.assertRegex(entry["id"], r"^[0-9a-f]{12}$")
@@ -999,7 +1033,20 @@ class SharedLearningTests(unittest.TestCase):
             factory.grade_lesson(hypothesis.hypothesis_id, variant, kind=kind,
                                  outcome={"passed": passed,
                                           "underpowered": False,
-                                          "failed_checks": []})
+                                          "failed_checks": [],
+                                          # Shared proposal learning is
+                                          # intentionally fit-only.  Keep this
+                                          # helper explicit so these tests do
+                                          # not rely on the retired full-gate
+                                          # ``passed`` bit.
+                                          "fit_classification": (
+                                              "fit_positive" if passed else
+                                              "fit_negative"),
+                                          "classification": (
+                                              "fit_positive" if passed else
+                                              "fit_negative"),
+                                          "fit_passed": bool(passed),
+                                          "fit_delta": 1.0 if passed else -1.0})
 
     def test_it_aggregates_parameter_directions_across_families(self):
         from research.strategy_factory import shared_learning
@@ -1045,7 +1092,31 @@ class SharedLearningTests(unittest.TestCase):
                                      kind="tuning",
                                      outcome={"passed": False,
                                               "underpowered": True})
+        digest = shared_learning(factory, vehicle="equity")
+        self.assertEqual(digest["parameters"], [])
+        self.assertEqual(digest["families"], [])
+        self.assertEqual(digest["live_trials"], {"run": 0, "failed": 0})
+
+    def test_legacy_full_gate_lesson_is_not_shared_as_fit_learning(self):
+        from research.strategy_factory import shared_learning
+
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            variant = rule_variant_id(validate_rule_spec(
+                {**hypothesis.rule_spec, "threshold_bps": 31.0}))
+            factory.record_lesson(
+                hypothesis.hypothesis_id, vehicle="equity",
+                family=hypothesis.family, variant_id=variant, kind="tuning",
+                source="llm", reason="Legacy gate result.",
+                changed={"threshold_bps": {"from": 5.0, "to": 31.0}})
+            factory.grade_lesson(
+                hypothesis.hypothesis_id, variant, kind="tuning",
+                outcome={"passed": True, "underpowered": False,
+                         "classification": "proved", "heldout_delta": 99.0})
             digest = shared_learning(factory, vehicle="equity")
+        self.assertEqual(digest["graded_attempts"], 0)
         self.assertEqual(digest["parameters"], [])
 
     def test_a_single_attempt_is_not_reported_as_a_pattern(self):

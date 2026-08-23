@@ -24,7 +24,8 @@ from agent.contracts.rule import (
 )
 from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     CostError, CostModel, ReplayPolicy,
-                    check_stressed_cost_plan, index_quotes, quote_fill,
+                    check_entry_slippage, check_stressed_cost_plan,
+                    index_quotes, quote_fill,
                     quote_fill_record, stressed_cost_usd,
                     replay_policy_for_bars)
 from .edge_ledger import content_hash
@@ -403,6 +404,12 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         entry_underlying: float | None = (
             float(entry_bar.open) if entry_bar_visible else None)
         entry_ref: float | None = entry_underlying
+        # Preserve the point-in-time signal/bar reference separately from the
+        # executable quote.  ``entry_reference`` remains the historical fill
+        # field (and therefore keeps existing report contracts); the parity
+        # check in ``simulate_account`` compares this boundary reference to
+        # the quote before pricing the fill.
+        entry_slippage_reference: float | None = entry_underlying
         entry_source = BAR
         entry_feed = entry_provider = None
         entry_age = 0.0
@@ -590,6 +597,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "exit_bar_feed": exit_bar.feed,
             "exit_bar_provider": exit_bar.provider,
             "entry_reference": entry_ref, "exit_reference": exit_ref,
+            "entry_slippage_reference": entry_slippage_reference,
             "underlying_entry": entry_underlying, "stop_price": stop,
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
             "contract": contract, "contract_multiplier": multiplier,
@@ -878,6 +886,28 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                          "reject_reason": reject_reason,
                          **stress_telemetry})
             continue
+        # An executable quote is already the selected fill price, but the
+        # runtime refuses an adverse quote beyond its configured cap.  Apply
+        # the same pure helper here before charging modelled slippage so a
+        # factory account cannot trade an opportunity the runtime would have
+        # rejected.  Missing boundary references are accepted: strict replay
+        # may legitimately have a quote without a visible bar anchor.
+        slippage_telemetry = None
+        if (vehicle == "equity" and raw.get("entry_fill_source") == QUOTE and
+                raw.get("entry_slippage_reference") is not None):
+            slippage_telemetry, slippage_reason = check_entry_slippage(
+                "buy" if raw.get("direction") == "long" else "sell",
+                raw.get("entry_slippage_reference"), raw.get("entry_reference"),
+                model.max_slippage_bps)
+            if slippage_reason is not None:
+                rows.append({"vehicle": vehicle, "symbol": symbol,
+                             "session_date": day.isoformat(),
+                             "opportunity_id": opportunity,
+                             "net_pnl": 0.0, "return_value": 0.0,
+                             "no_trade": True,
+                             "reject_reason": slippage_reason,
+                             "entry_slippage": slippage_telemetry})
+                continue
         execution_direction = "long" if vehicle == "option" else raw["direction"]
         entry = model.execution_price(
             raw["entry_reference"], execution_direction, entry=True,
@@ -902,6 +932,8 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                     "r_multiple": net / risk_usd if risk_usd > 0 else None,
                     "return_value": net / cash if cash > 0 else 0.0,
                     "no_trade": False, "entry_notional": entry_notional})
+        if slippage_telemetry is not None:
+            row["entry_slippage"] = slippage_telemetry
         if stress_enabled:
             # ``checked`` is populated on the pass path above.  Recompute the
             # small pure seam here only to carry its canonical telemetry into
@@ -940,7 +972,19 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
     expectancy = mean(pnl) if pnl else 0.0
     profit_factor = (sum(wins) / abs(sum(losses))) if losses else (float("inf") if wins else 0.0)
     drawdown = max_drawdown_of(rows)
-    if len(trades) < max(3, len(sessions) // 3):
+    # A fit can have plenty of actionable opportunities while every one is
+    # refused by an explicit execution/risk boundary.  Preserve that signal
+    # for the bounded search loop; a plain zero-signal stream has no reason
+    # code and remains the ordinary ``insufficient_signals`` diagnosis.
+    no_trade_rows = [row for row in rows if row.get("no_trade") is True]
+    reject_reasons = [str(row.get("reject_reason") or "").strip()
+                      for row in no_trade_rows]
+    execution_blocked = (bool(no_trade_rows) and not trades and
+                         all(reject_reasons) and
+                         any(row.get("reject_reason") for row in no_trade_rows))
+    if execution_blocked:
+        failure = "execution_blocked"
+    elif len(trades) < max(3, len(sessions) // 3):
         failure = "insufficient_signals"
     elif expectancy <= 0:
         failure = "negative_expectancy"
@@ -955,6 +999,8 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
     return {
         "primary_failure": failure, "trades": len(trades),
         "sessions": len(sessions), "net_pnl": sum(pnl), "expectancy": expectancy,
+        "execution_blocked": execution_blocked,
+        "execution_rejection_count": len(no_trade_rows) if execution_blocked else 0,
         "win_rate": len(wins) / len(trades) if trades else 0.0,
         "profit_factor": profit_factor if math.isfinite(profit_factor) else 999.0,
         "max_drawdown": drawdown,
@@ -1031,7 +1077,11 @@ _COORDINATE_FIELDS = (
 _FAILURE_FIELD_PRIORITY = {
     "insufficient_signals": (
         "threshold_bps", "confirmation", "lookback", "range_minutes",
-        "zscore", "volume_multiplier", "entry_before_minutes"),
+        "zscore", "volume_multiplier", "entry_before_minutes", "stop_atr",
+        "min_atr_bps"),
+    "execution_blocked": (
+        "stop_atr", "min_atr_bps", "threshold_bps", "entry_before_minutes",
+        "lookback", "range_minutes"),
     "negative_expectancy": (
         "threshold_bps", "target_r", "breakeven_r", "stop_atr", "max_hold_bars",
         "confirmation", "side"),

@@ -299,6 +299,19 @@ class ProtectionHarness(unittest.TestCase):
 class BrokerProtectionTests(ProtectionHarness):
     # 1. submit shape
 
+    def test_entry_slippage_cap_rejects_before_bracket_submission(self):
+        self._bind_engine(runtime_name="runtime-entry-slippage-cap")
+        events = []
+        self.engine._event = lambda kind, payload: events.append((kind, payload))
+        signal = self._signal()
+        signal["entry_price"] = 100.0
+        result = self.engine._risk_order(
+            "SPY", signal, self._row(), self.provider.account(), [], self.NOW)
+        self.assertIsNone(result)
+        self.assertEqual(self.provider.submitted, [])
+        self.assertEqual(events[-1][0], "execution_reject")
+        self.assertIn("quoted entry slippage", events[-1][1]["reason"])
+
     def test_stressed_cost_veto_happens_before_order_submission(self):
         self._bind_engine(runtime_name="runtime-stressed-cost-veto")
         self.engine.cfg["risk"]["max_stressed_cost_to_risk_ratio"] = 0.0

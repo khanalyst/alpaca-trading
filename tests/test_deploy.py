@@ -554,6 +554,9 @@ class DeployTests(unittest.TestCase):
                       script)
         self.assertIn('finish "search_exhausted"', script)
         self.assertIn('finish "llm_provider_failure"', script)
+        self.assertIn("execution-blocked", script)
+        self.assertIn("qualification-unavailable", script)
+        self.assertIn('finish "completed_no_edge"', script)
 
         for status in ("search_exhausted", "llm_provider_failure"):
             with self.subTest(status=status):

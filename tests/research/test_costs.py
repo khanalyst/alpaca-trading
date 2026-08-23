@@ -20,9 +20,12 @@ from research import calibration
 from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
                             DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE,
                             DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
+                            ENTRY_SLIPPAGE_INVALID_REASON,
+                            ENTRY_SLIPPAGE_REJECT_REASON,
                             RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy,
                             STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                             SQLiteQuoteIndex, check_stressed_cost_plan,
+                            check_entry_slippage,
                             index_quotes, quote_fill, quote_fill_record,
                             cost_model_for_vehicle, risk_unit_report,
                             stressed_cost_usd)
@@ -80,6 +83,34 @@ def _quote(minute, bid, ask, *, as_of_minute=None):
 
 
 class CostModelTests(unittest.TestCase):
+    def test_entry_slippage_helper_is_adverse_once_and_stable(self):
+        telemetry, reason = check_entry_slippage("buy", 101.0, 101.06, 5.0)
+        self.assertEqual(reason, ENTRY_SLIPPAGE_REJECT_REASON)
+        self.assertFalse(telemetry["accepted"])
+        self.assertAlmostEqual(telemetry["adverse_bps"],
+                               (101.06 - 101.0) / 101.0 * 10_000.0)
+        self.assertEqual(telemetry["slippage_bps"], telemetry["adverse_bps"])
+        self.assertEqual(telemetry["reason"], ENTRY_SLIPPAGE_REJECT_REASON)
+
+        accepted, accepted_reason = check_entry_slippage(
+            "sell", 101.0, 101.01, 5.0)
+        self.assertIsNone(accepted_reason)
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(accepted["adverse_bps"], 0.0)
+
+    def test_entry_slippage_helper_fails_closed_for_malformed_inputs(self):
+        for values in (
+                ("hold", 100.0, 100.0, 50.0),
+                ("buy", "100", 100.0, 50.0),
+                ("buy", 100.0, float("nan"), 50.0),
+                ("buy", 100.0, 100.0, -1.0),
+                ("buy", 0.0, 100.0, 50.0),
+        ):
+            with self.subTest(values=values):
+                telemetry, reason = check_entry_slippage(*values)
+                self.assertEqual(reason, ENTRY_SLIPPAGE_INVALID_REASON)
+                self.assertFalse(telemetry["accepted"])
+
     def test_replay_policy_stress_controls_are_runtime_only_and_identity_bound(self):
         direct = ReplayPolicy()
         self.assertEqual(direct.equity_feed, "iex")

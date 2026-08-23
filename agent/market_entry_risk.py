@@ -20,6 +20,8 @@ from .alpaca_provider import AlpacaError
 from .contracts.rule import RULE_SCHEMA_V3
 from .execution_lifecycle import _plain, _value
 from .instruments import validate_equity_symbol
+from research.costs import (ENTRY_SLIPPAGE_INVALID_REASON,
+                             check_entry_slippage)
 
 log = logging.getLogger("engine")
 
@@ -326,18 +328,20 @@ class MarketEntryRiskMixin:
         execution = self.cfg.get("execution", {})
         order_type = str(execution.get("order_type", "market")).lower()
         time_in_force = str(execution.get("time_in_force", "day")).lower()
+        normalized_side = side.strip().lower() if isinstance(side, str) else side
         bid = self._number(quote.get("bid", quote.get("bid_price")))
         ask = self._number(quote.get("ask", quote.get("ask_price")))
-        executable = ask if side == "buy" else bid
+        executable = ask if normalized_side == "buy" else bid
         reference = self._number(reference_price)
-        if executable is None or executable <= 0 or reference is None or reference <= 0:
+        maximum = execution.get("max_slippage_bps", 50)
+        telemetry, reason = check_entry_slippage(
+            normalized_side, reference, executable, maximum)
+        if reason == ENTRY_SLIPPAGE_INVALID_REASON:
             raise ValueError("entry quote or reference price is unavailable")
-        adverse = max(0.0, executable - reference) if side == "buy" else max(0.0, reference - executable)
-        slippage_bps = adverse / reference * 10_000.0
-        maximum = float(execution.get("max_slippage_bps", 50) or 0)
-        if slippage_bps > maximum:
+        if reason is not None:
             raise ValueError(
-                f"quoted entry slippage {slippage_bps:.2f} bps exceeds {maximum:.2f} bps")
+                f"quoted entry slippage {telemetry['slippage_bps']:.2f} bps "
+                f"exceeds {telemetry['max_slippage_bps']:.2f} bps")
         limit_price = Decimal(str(executable)) if order_type == "limit" else None
         return order_type, time_in_force, limit_price
 
