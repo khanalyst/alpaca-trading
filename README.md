@@ -85,7 +85,15 @@ trades and 30 complete sessions/clusters; the sealed qualification window
 requires 100 trades and 30 complete sessions/clusters; the parity-matched
 live-shadow tail requires 150 trades and 30 complete sessions. Effective
 breadth is persisted as a matched symbol/session correlation diagnostic, is
-re-verified with the proof, and never counts as extra independent N.
+re-verified with the proof, and never counts as extra independent N. It is
+separate from authorizing dependence: before a factory cycle, completed
+prior-cycle family deltas are frozen into a hash-verified dependence map. When
+that map has enough history, its family clusters receive a conservative
+cluster-level BH veto in addition to family-local and cycle-global BH; the
+cluster veto can only reject. Paper `selection_mode: all_proved` then admits
+the strongest proved edge per verified frozen cluster. Families without a
+verified assignment use the existing held-out correlation fallback and never
+gain independence from missing data.
 
 Serial inference is deterministic. Session/day-cluster deltas use a seeded
 moving-block cluster bootstrap, with draw count, seed, and block length carried
@@ -106,7 +114,8 @@ shadow cycle advances no durable boundary, so those sessions are reconsidered
 when enough data exists instead of being silently consumed. Semantic or
 mid-tail incompleteness is an intentional fail-closed quarantine, not permanent
 loss; correct the source and run the bounded replay repair before retrying
-ingestion.
+ingestion. There is no unsafe auto-skip: unresolved quarantine blocks watermark
+and FDR advancement until the repair completes.
 
 The `shadow-confirmation-v4` live-shadow scope is independent and chronological:
 each complete tail is split into an older selection window and a newer disjoint
@@ -120,7 +129,12 @@ a time. Only after that coordinate neighborhood is measured can it combine two
 of the best one-field values; a final unchanged confirmation follows before the
 family can be replaced. Model-tuned proposals are held to the same one-field or
 two-field contract, so a useful entry, exit, filter, or payoff parameter is not
-discarded inside an unexplained bundle.
+discarded inside an unexplained bundle. For v2/v3 roots with measured
+`min_atr_bps` and `stop_atr` coordinate lessons, an `execution_blocked` fit
+diagnosis makes coordinate exhaustion schedule exactly one bounded measured
+interaction. It uses configured stress geometry when available, never invents
+missing values, changes no risk constants, and does not claim the pair will
+trade.
 
 When a slot proves an edge, the proved rule is frozen and the slot is reseeded
 with a new hypothesis so research capacity does not shrink. Retirement requires
@@ -131,7 +145,8 @@ A valid bounded replacement is registered first when enabled; a demoted
 candidate may re-prove on a newer
 shadow run and starts a new evidence epoch. Paper
 `selection_mode: all_proved` can then select one strongest proved variant per
-independent family under one global risk book and correlation cap. Live paper
+verified frozen dependence cluster under one global risk book and correlation
+cap. Live paper
 outcomes are scoped to the exact shadow proof that authorized the trade; if the
 same candidate is later demoted, re-proved, and re-trialled, old outcomes do not
 decide the new trial.
@@ -205,11 +220,27 @@ numeric values per lineage/family in the durable factory ledger.
 Custom provider endpoints are a trust boundary. `llm.base_url`,
 `OPENAI_BASE_URL`, and `ANTHROPIC_BASE_URL` can receive the provider key and the
 prompt, so configure only a trusted HTTPS service; the application does not
-currently enforce a host allowlist for LLM endpoints. Recorded hashes prove
-which prompt/request/response was used, not that a provider will reproduce the
-same answer later. The adapter's call budget is a per-run call-count guard, not
-spend accounting; provider-side quotas remain an operational control for
-unattended research.
+currently enforce a host allowlist for LLM endpoints. The OpenAI research path
+uses the Responses API structured-output request. Prompt, request, schema,
+configuration (including the fixed sampling setting), and received-response
+hashes make the evidence reproducible for
+the exact invocation, but they do not guarantee bit-for-bit identical model
+output on a later call. The checked Responses request pins `temperature` to
+`0`, fixing the sampling setting without making provider output deterministic;
+the hashes preserve the actual request and response. The adapter's call budget
+is a per-run call-count guard, not spend accounting; provider-side quotas remain
+an operational control for unattended research.
+
+### Boundaries for future research extensions
+
+Universe expansion is not a tuning-only change: it requires an operator-approved
+exact symbol list, recorder coverage for that list, and a new identity/proof.
+Event conditioning requires a point-in-time event source with its own provider,
+`as_of`, and observation provenance. Prior-session, true multi-timeframe, and
+cross-sectional features require explicit context in the replay input; missing
+or ambiguous context fails closed. Shadow quarantine is not an auto-skip: an
+unresolved quarantined session blocks watermark/FDR advancement until its source
+is corrected and the bounded parity replay completes.
 
 ### Costs and authorization checks
 

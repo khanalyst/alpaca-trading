@@ -22,7 +22,7 @@ from research.edge_lab import EdgeLedger
 from research.factory_core import (
     MAX_VARIANTS, _REASON_LIMIT, coordinate_mutation_pool, family_template,
     initial_hypotheses, mutate_from_diagnosis, mutate_with_reasons,
-    mutation_reason, spec_delta,
+    interaction_mutation_pool, mutation_reason, spec_delta,
 )
 from research.factory_ledger import FactoryError, FactoryLedger
 from research.llm_strategy import (
@@ -665,6 +665,88 @@ class VariantSelectionTests(unittest.TestCase):
             }), refinement_state=confirm_state)
         self.assertEqual(confirm_state["phase"], "confirmatory")
         self.assertEqual([item.rule_spec for item in confirmed], [ROOT])
+
+    def test_execution_blocked_atr_pair_is_deferred_bounded_and_measured(self):
+        diagnosis = {"primary_failure": "execution_blocked"}
+        coordinate = coordinate_mutation_pool(ROOT, diagnosis)
+        lessons = [
+            {"id": f"coordinate-{index}", "changed": spec_delta(ROOT, spec),
+             "fit_delta": 0.0}
+            for index, (spec, _reason) in enumerate(coordinate[1:], start=1)
+        ]
+
+        early = interaction_mutation_pool(
+            ROOT, lessons, diagnostic=diagnosis, coordinate_exhausted=False)
+        early_pairs = [
+            spec for spec, _reason in early
+            if {key for key in spec_delta(ROOT, spec)} ==
+            {"min_atr_bps", "stop_atr"}
+        ]
+        self.assertEqual(early_pairs, [])
+
+        late = interaction_mutation_pool(
+            ROOT, lessons, diagnostic=diagnosis, coordinate_exhausted=True)
+        pairs = [
+            (spec, reason) for spec, reason in late
+            if {key for key in spec_delta(ROOT, spec)} ==
+            {"min_atr_bps", "stop_atr"}
+        ]
+        self.assertEqual(len(pairs), 1)
+        pair, reason = pairs[0]
+        self.assertEqual((pair["min_atr_bps"], pair["stop_atr"]), (15.0, 6.0))
+        self.assertIn("coordinate-", reason)
+        self.assertLessEqual(len(late), 12)
+        self.assertEqual(
+            len({rule_variant_id(spec) for spec, _reason in late}), len(late))
+
+    def test_execution_blocked_pair_uses_first_measured_geometry_clear(self):
+        diagnosis = {"primary_failure": "execution_blocked"}
+        lessons = [
+            {"id": "min-5", "changed": {
+                "min_atr_bps": {"from": ROOT["min_atr_bps"], "to": 5.0}},
+             "fit_delta": 0.0},
+            {"id": "min-15", "changed": {
+                "min_atr_bps": {"from": ROOT["min_atr_bps"], "to": 15.0}},
+             "fit_delta": 0.0},
+            {"id": "stop-2", "changed": {
+                "stop_atr": {"from": ROOT["stop_atr"], "to": 2.0}},
+             "fit_delta": 0.0},
+            {"id": "stop-6", "changed": {
+                "stop_atr": {"from": ROOT["stop_atr"], "to": 6.0}},
+             "fit_delta": 0.0},
+        ]
+        pool = interaction_mutation_pool(
+            ROOT, lessons, diagnostic=diagnosis, coordinate_exhausted=True,
+            risk_config={"stressed_cost_scenario_bps": 9.0,
+                         "max_stressed_cost_to_risk_ratio": .30})
+        pair = [spec for spec, _reason in pool
+                if {key for key in spec_delta(ROOT, spec)} ==
+                {"min_atr_bps", "stop_atr"}]
+        self.assertEqual(len(pair), 1)
+        # 5 * 6 == 30 bps clears the configured 9/.30 geometry and is the
+        # first deterministic measured pair; 15/6 is not forced when config
+        # is available.
+        self.assertEqual((pair[0]["min_atr_bps"], pair[0]["stop_atr"]),
+                         (5.0, 6.0))
+
+    def test_execution_blocked_pair_never_invents_unmeasured_fallback_values(self):
+        diagnosis = {"primary_failure": "execution_blocked"}
+        lessons = [
+            {"id": "min-5", "changed": {
+                "min_atr_bps": {"from": ROOT["min_atr_bps"], "to": 5.0}},
+             "fit_delta": 0.0},
+            {"id": "stop-2", "changed": {
+                "stop_atr": {"from": ROOT["stop_atr"], "to": 2.0}},
+             "fit_delta": 0.0},
+        ]
+        pool = interaction_mutation_pool(
+            ROOT, lessons, diagnostic=diagnosis, coordinate_exhausted=True)
+        pair = [spec for spec, _reason in pool
+                if {key for key in spec_delta(ROOT, spec)} ==
+                {"min_atr_bps", "stop_atr"}]
+        self.assertEqual(len(pair), 1)
+        self.assertEqual((pair[0]["min_atr_bps"], pair[0]["stop_atr"]),
+                         (5.0, 2.0))
 
     def test_the_reason_limit_matches_the_adapters(self):
         """The core states the bound without importing the optional adapter."""

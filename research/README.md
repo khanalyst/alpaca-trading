@@ -47,7 +47,10 @@ Seven is slot/worker capacity, not the number of families. Each generated
 variant owns an isolated simulated account processed by one bounded worker; no
 capital or P&L is shared between arms.
 Paper runtime selection can then use `selection_mode: all_proved`, which keeps
-one best proven variant per independent family under one global risk book.
+one strongest proven variant per verified frozen prior-cycle dependence cluster
+under one global risk book. Families without a verified cluster assignment use
+the held-out correlation-safe fallback; symbol breadth is not an independence
+license.
 
 Historical `deploy/backfill.py` partitions retain the recorder schema but carry
 `source_mode: historical_backfill` and exact Alpaca session open/close metadata,
@@ -230,10 +233,12 @@ label must be computed from events at or before its as-of timestamp.  A
 completed-bar fixture and a no-look-ahead test are required for every new
 replay path.  Fixed-rule rolling-origin forward-stability, paired-baseline, placebo/falsification, and
 acceptance-floor checks are mandatory gates, with fit/held-out structural
-floors, family-local and cycle-global false-discovery correction, sealed
+floors, family-local, frozen-dependence-cluster, and cycle-global false-discovery
+correction, sealed
 qualification source binding, and a durable verified gate. A family-local pass
-with a cycle-global failure is a normal marginal result; only the global result
-can authorize cross-family selection. The gates are applied per vehicle and per
+with a cycle-global failure is a normal marginal result; only a candidate that
+also clears the frozen-cluster veto can authorize cross-family selection. The
+gates are applied per vehicle and per
 session rather than to a pooled equity/options series. Rolling-origin uses the
 same fixed rule in every fold. The cumulative
 online-FDR allocation is durable per vehicle scope and persists across cycles;
@@ -246,7 +251,20 @@ cluster bootstrap (with its draw count, seed, and block length). The persisted
 effective-breadth report is a correlation/eigenvalue participation-ratio
 diagnostic over matched symbol-by-session deltas. Breadth is re-derived and
 verified with the proof, but it never counts as additional independent sample
-size; independence still comes from session clusters.
+size; independence still comes from session clusters. Authorizing dependence is
+separate: before each factory cycle, completed prior-cycle family deltas are
+frozen into a hash-verified map. Strong clusters receive an additional
+cluster-level BH veto, and runtime allocation admits at most the strongest edge
+per verified frozen cluster; an unavailable map never grants independence.
+
+Remaining extension boundaries are explicit. Universe expansion requires an
+operator-approved exact symbol list, recorder coverage for that list, and a new
+identity/proof. Event conditioning requires a point-in-time event source with
+provider, `as_of`, and observation provenance. Prior-session, true
+multi-timeframe, and cross-sectional features require explicit replay context;
+missing or ambiguous context fails closed. Shadow quarantine is not an auto-skip:
+an unresolved session blocks watermark/FDR advancement until source correction
+and a bounded parity replay complete.
 
 ## Edge laboratory
 
@@ -271,7 +289,8 @@ newer shadow run; re-proving begins a new trial epoch instead of aggregating
 lifetime outcomes. Candidates are scored
 separately for `equity` and `option` vehicles. Gates require chronological
 held-out data, fit/held-out trade and session structural floors, matched
-controls, cluster-aware randomisation, family-local and cycle-global FDR,
+controls, cluster-aware randomisation, family-local, frozen-dependence-cluster,
+and cycle-global FDR,
 sealed qualification observations/digests, and placebo/falsification.
 Underpowered or inconclusive data is not failure. Retirement is allowed only
 after all bounded coordinate/interaction points and the final confirmation
@@ -316,10 +335,12 @@ credentials, order path, or broker/runtime state authority. The scheduled
 research cycle runs `edge ingest-shadow` by default when enabled; absent shadow
 DB is a no-op. Ingestion opens the WAL read-only and requires strictly newer,
 complete parity-matched rows, prior qualification, source/config/code/
-provenance/replay/gate hashes, family/global BH, and durable online FDR before
+provenance/replay/gate hashes, family/global BH plus the frozen-dependence-cluster
+veto, and durable online FDR before
 appending the immutable `lane=shadow` proof and live marker. Semantic or
 mid-tail incompleteness fails closed but is repairable: correct the source and
-run the bounded complete parity replay before retrying ingestion.
+run the bounded complete parity replay before retrying ingestion. There is no
+unsafe auto-skip: unresolved quarantine blocks the watermark and FDR boundary.
 The unchanged `shadow-confirmation-v4` scope splits each tail into older
 chronological selection sessions and a newer disjoint confirmatory window; BH
 uses the selection p-values, and only the selected candidate's raw confirmatory
@@ -398,7 +419,12 @@ refinement changes exactly one executable field at a time. After all such
 points are measured, at most two measured fields are combined in a bounded
 interaction phase, followed by one unchanged confirmation. A family is retired
 only when every point explicitly rejects a useful edge with adequate powered
-evidence; if LLM replacement is enabled, a valid bounded proposal is registered first. A
+evidence; if LLM replacement is enabled, a valid bounded proposal is registered first. For
+v2/v3 roots with measured `min_atr_bps` and `stop_atr` coordinate lessons, an
+`execution_blocked` fit diagnosis makes coordinate exhaustion schedule exactly
+one bounded measured interaction. It uses configured stress geometry when
+available, never invents missing values, changes no risk constants, and does not
+claim the pair will trade. A
 missing or invalid LLM proposal leaves the family pending replacement, not
 retired. Insufficient data is not treated as failure. Backtest winners must
 still pass strictly later forward data before runtime can select them.
@@ -638,17 +664,21 @@ with OpenAI `gpt-5`. Compose uses the host override
 separate readable file, never from the broker secret. An enabled adapter
 without its provider key fails before discovery; invalid or rejected model
 output records a pending replacement and cannot retire a family prematurely.
-Successful proof produces a deterministic,
-content-addressed finding. `research.proof.webhook_url` may send that finding
+Successful proof produces a content-addressed finding. `research.proof.webhook_url` may send that finding
 to an HTTPS webhook without changing the durable artifact.
 
 `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` are trust boundaries: a configured
 endpoint receives the provider key and the bounded aggregate prompt. Use only a
 trusted HTTPS service; there is no application host allowlist. Prompt, request,
-and raw-response hashes prove what the cycle consumed, but they do not make a
-mutable model/provider response reproducible. The adapter's call budget is a
-per-run call-count guard rather than spend accounting; provider-side quotas
-remain an operational control.
+schema, configuration (including the fixed sampling setting), and raw-response
+hashes prove what the cycle consumed, and make the evidence reproducible for
+that exact invocation, but they do not guarantee bit-for-bit identical model
+output later. The OpenAI path uses the Responses API structured-output request
+and pins `temperature` to `0`, fixing the sampling setting without making
+provider output deterministic; the hashes preserve the actual request and
+response. The adapter's call budget is a per-run call-count
+guard rather than spend accounting; provider-side quotas remain an operational
+control.
 
 The scheduled cycle reports `completed`, `completed_no_edge`, `no_data`, or
 `failed`. `completed_no_edge` means the input was valid but no candidate was

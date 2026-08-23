@@ -806,8 +806,9 @@ class EdgeLedger(EdgeLedgerProofMixin):
             sum(recent_r) <= PAPER_DEMOTION_R_FLOOR)
         drift = self.paper_drift(candidate_id)
         # Every deployed candidate is guarded, not only the champion: paper
-        # ``all_proved`` selection trades one validated candidate per family,
-        # and an unguarded validated loser would trade indefinitely.
+        # ``all_proved`` selection may trade one validated candidate per
+        # verified frozen dependence cluster, and an unguarded validated loser
+        # would trade indefinitely.
         breach = None
         if automatic_guard:
             breach = ("rolling_r_guard",

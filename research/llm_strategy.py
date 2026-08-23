@@ -31,6 +31,8 @@ DEFAULT_RESPONSE_BYTES = 16_384
 DEFAULT_ATTEMPTS = 2
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_TOTAL_CALLS = 64
+# Research proposals use one pinned sampling policy across providers.
+RESEARCH_SAMPLING_TEMPERATURE = 0
 # A tuning reply proposes the variants of one hypothesis, so it is bounded by
 # the same ``MAX_VARIANTS`` the factory itself accepts.
 MAX_TUNED_VARIANTS = 8
@@ -686,6 +688,7 @@ class RuleProposalAdapter:
     def _config_hash(self) -> str:
         """Hash non-secret adapter configuration for reproducible evidence."""
         return content_hash({"provider": self.provider, "model": self.model,
+                             "temperature": RESEARCH_SAMPLING_TEMPERATURE,
                              "max_attempts": self.max_attempts,
                              "timeout_seconds": self.timeout_seconds,
                              "max_response_bytes": self.max_response_bytes,
@@ -963,11 +966,13 @@ class RuleProposalAdapter:
                                   "schema": self._schema(
                                       schema_name,
                                       vehicle=request.get("vehicle"))}},
+                temperature=RESEARCH_SAMPLING_TEMPERATURE,
                 timeout=timeout,
             )
             return _raw_text(response, max_bytes=self.max_response_bytes)
         response = client.messages.create(
-            model=self.model, max_tokens=1200, temperature=0,
+            model=self.model, max_tokens=1200,
+            temperature=RESEARCH_SAMPLING_TEMPERATURE,
             system=system_prompt,
             messages=[{"role": "user", "content": request_text}],
             output_config={"format": {"type": "json_schema",

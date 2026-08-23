@@ -269,7 +269,12 @@ universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`,
 `XLV`), improving opportunity capacity, but real signal rates still require
 sufficient history. Floor feasibility fails closed when 100 held-out trades
 cannot be supported; widen `universe.symbols` and/or the backfill window, never
-lower the evidence floor.
+lower the evidence floor. A universe expansion requires an operator-approved
+exact symbol list, recorder coverage for that list, and a new identity/proof;
+do not reuse an older proof after changing the list. Event conditioning requires
+a point-in-time event source with provider/as-of/observation provenance. Prior-
+session, true multi-timeframe, and cross-sectional features require explicit
+replay context and fail closed when it is missing or ambiguous.
 
 Run the backfill before starting the trader, or outside market hours, so the
 recorder's first live cycle resumes from a completed session boundary.
@@ -425,8 +430,10 @@ vehicles separately, and writes evidence. Each variant has its own simulated
 cash/equity account; default capacity is eleven logical strategy slots and four
 variants per strategy, covering the catalog of eleven rule families on a fresh
 ledger. Each isolated book is processed by one
-bounded worker. Paper `selection_mode: all_proved` keeps one best
-proven variant per independent family under one global risk book. The edge
+bounded worker. Paper `selection_mode: all_proved` keeps one strongest proven
+variant per verified frozen prior-cycle dependence cluster under one global risk
+book; families without a verified assignment use the held-out correlation-safe
+fallback. The edge
 ledger is
 initialized at `runtime/research/edge_lab.sqlite3`; inspect it with
 `python research.py edge status`. The autonomous lifecycle requires an initial
@@ -434,8 +441,8 @@ corpus backtest followed by later unseen offline forward-shadow evidence.
 Offline historical/forward replay may persist only a `lane=shadow` candidate
 status; it never authorizes runtime entries. Validation requires
 fit and held-out structural floors, matched controls, placebo/falsification,
-fixed-rule rolling-origin forward stability, family-local
-and cycle-global FDR, and a durable verified gate. Offline post-selection
+fixed-rule rolling-origin forward stability, family-local, frozen-dependence-
+cluster, and cycle-global FDR, and a durable verified gate. Offline post-selection
 records an explicit cumulative-FDR deferral rather than spending alpha on data
 that cannot authorize deployment. A family pass
 with a global failure is a normal marginal result and cannot authorize
@@ -483,8 +490,14 @@ ingest-shadow` can append a complete parity-matched live proof and advance
 marker. Legacy validated/champion rows without it can be evaluated or migrated
 but remain ineligible until a new authorized live proof. Manual `edge promote`
 remains an audited control subject to lifecycle/evidence rules. Backward rollback is rejected; explicit demotion is
-the operator safety action. Good edges emit deterministic,
-content-addressed edge proof reports and may send an optional HTTPS webhook. Keep data
+the operator safety action. Good edges emit content-addressed edge proof reports
+and may send an optional HTTPS webhook. The OpenAI research path uses the
+Responses API; prompt/request/schema/configuration/response hashes (with the
+fixed sampling setting included in configuration) reproduce the evidence for
+that invocation, not a guaranteed bit-for-bit identical later model output. The
+checked request pins `temperature` to `0`, fixing the sampling setting without
+making provider output deterministic; the hashes preserve the actual request
+and response. Keep data
 provenance, session date, feed, contract identity, and costs with each result.
 Do not combine regular-session evidence with pre/post-market or overnight data.
 Replay uses the runtime `ReplayPolicy`: `execution.strict_market_data` defaults
@@ -505,6 +518,10 @@ diagnostic and cannot authorize a proof. Serial inference uses deterministic
 seeded moving-block day/session-cluster bootstrap; its draw count, seed, and
 block length are persisted. Effective breadth is persisted/re-verified as a
 matched symbol/session correlation diagnostic and never counts as additional N.
+Before each factory cycle, prior-cycle family deltas are frozen into a
+hash-verified dependence map; the cluster-level BH veto and runtime
+one-strongest-per-verified-cluster allocation are authorizing controls, not
+breadth diagnostics.
 
 ### Broker-free live shadow and ingestion
 
@@ -531,8 +548,9 @@ The scheduled research cycle invokes `edge ingest-shadow` by default when
 from the shared `shadow-data` volume and is a no-op when the WAL is absent. It
 accepts only strictly newer,
 complete, parity-matched rows with prior qualification and matching
-source/config/code/provenance/replay/gate hashes; family and global BH plus
-durable online-FDR are applied before an immutable `lane=shadow` proof and
+source/config/code/provenance/replay/gate hashes; family and global BH plus the
+frozen-dependence-cluster veto and durable online-FDR are applied before an
+immutable `lane=shadow` proof and
 live-ingestion marker are appended. The unchanged `shadow-confirmation-v4`
 ingester first splits the tail into
 older chronological selection sessions and a newer disjoint confirmatory
@@ -544,7 +562,9 @@ confirmatory p-value resolution scales
 to the next allocation; if the bounded simulation cap cannot resolve it, the
 ingester reports `confirmatory_resolution_exhausted` without spending alpha or
 advancing a boundary. A failed/mismatched/incomplete tail likewise leaves the
-candidate unchanged and ineligible.
+candidate unchanged and ineligible. There is no unsafe auto-skip: unresolved
+quarantine blocks the shadow watermark and FDR boundary until source correction
+and a bounded parity replay complete.
 
 Scheduled research evaluates the equity vehicle only by default because the
 shipped trader remains on the `shares` execution profile. Set

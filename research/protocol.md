@@ -138,7 +138,12 @@ Serial inference is deterministic: day/session-cluster deltas use a seeded
 moving-block cluster bootstrap with persisted draw count, seed, and block
 length. Effective breadth is persisted and re-verified as a matched
 symbol-by-session correlation/eigenvalue diagnostic only; it never increases N
-or replaces independent session clusters.
+or replaces independent session clusters. Authorizing dependence is separate:
+before each factory cycle, completed prior-cycle family deltas are frozen into a
+hash-verified map. Strong family groups receive an additional cluster-level BH
+veto, while runtime `all_proved` admits at most one strongest edge per verified
+frozen cluster. An unavailable or unknown assignment uses the safe fallback and
+never implies independence.
 
 The IBR implementation in `research/ibr.py` provides these invariants. A
 missing or partial opening range is `no trade`, not an imputed range. When the
@@ -168,6 +173,15 @@ without this provenance are descriptive only and cannot pass a qualification
 gate. Walk-forward and held-out checks must be chronological. Paired baseline,
 placebo, and acceptance-floor checks are evaluated independently for each
 vehicle and may not pool option and underlying returns.
+
+Remaining extension boundaries are explicit. Universe expansion requires an
+operator-approved exact symbol list, recorder coverage for that list, and a new
+identity/proof. Event conditioning requires a point-in-time event source with
+provider, `as_of`, and observation provenance. Prior-session, true
+multi-timeframe, and cross-sectional features require explicit replay context;
+missing or ambiguous context fails closed. Shadow quarantine is not an auto-skip:
+an unresolved session blocks watermark/FDR advancement until source correction
+and a bounded parity replay complete.
 
 ## Deployment states
 
@@ -233,7 +247,8 @@ hash covering feeds, session/calendar, strategy, risk, execution, and costs.
 The runtime reapplies the candidate and recomputes that hash before selection;
 legacy evidence or any assumption drift fails closed and must be re-researched.
 Paper `selection_mode: all_proved` may run one strongest passing variant per
-independent family under one global risk book. Live mode resolves exactly one
+verified frozen dependence cluster under one global risk book. Families without
+a verified assignment use the held-out correlation-safe fallback. Live mode resolves exactly one
 proved record: preferably one `selection_mode: pinned` entry, or one legacy
 `selection_mode: specific` variant. It never substitutes a different
 candidate when the requested proof/configuration no longer re-verifies.
@@ -253,11 +268,13 @@ book and remains isolated from EdgeLedger lifecycle state. Research-side
 `edge ingest-shadow` opens
 the shadow WAL read-only, requires strictly newer complete parity-matched rows,
 prior qualification, source/config/code/provenance/replay/gate hashes, family
-and global BH plus durable online FDR, then appends the immutable `lane=shadow`
+and global BH plus the frozen-cluster veto and durable online FDR, then appends
+the immutable `lane=shadow`
 proof and live marker; only then can the candidate become `validated`/`champion`.
 A semantic or mid-tail incomplete session remains fail-closed until source
 correction and a bounded complete parity replay records its repair; quarantine
-is recoverable rather than permanent loss.
+is recoverable rather than permanent loss. There is no unsafe auto-skip: an
+unresolved quarantine blocks the watermark and FDR boundary.
 A candidate cannot skip the lifecycle or silently move backwards. Paper
 outcomes are append-only, proof-epoch scoped, and may demote a deployed edge.
 Normal operation needs no manual promotion. Explicit `edge promote` is
@@ -372,8 +389,15 @@ executable field per child. Interaction phase begins only after every bounded
 coordinate point is closed and combines exactly two of the strongest measured
 one-field values. A final unchanged replay confirms the conclusion before a
 replacement is allowed. Model tuning is schema-validated against the same
-one-field/two-field rule; it cannot hide a bundle of changes inside a reason.
-Multiple-test correction covers every variant evaluated in the cycle. A
+one-field/two-field rule; it cannot hide a bundle of changes inside a reason. For
+v2/v3 roots with measured `min_atr_bps` and `stop_atr` coordinate lessons, an
+`execution_blocked` fit diagnosis makes coordinate exhaustion schedule exactly
+one bounded measured interaction. It uses configured stress geometry when
+available, never invents missing values, changes no risk constants, and does not
+claim the pair will trade.
+Multiple-test correction covers every variant evaluated in the cycle, including
+the frozen-dependence-cluster veto in addition to the family-local and
+cycle-global budgets. A
 replacement hypothesis may be generated only after the root family has at
 least 100 executed trades in each fit/held-out partition, at least 30 held-out
 sessions, a 95% clustered upper bound no greater than the 0.05R minimum useful
@@ -383,9 +407,10 @@ churn.
 
 Each transition requires a chronological fit/held-out boundary, fit and
 held-out structural floors for trades/sessions/clusters, matched baseline
-deltas, cluster-level sign randomisation, and both family-local and
-cycle-global false-discovery correction. Selection compares candidates across
-families, so the q-value that authorizes a champion is the global one. Because
+deltas, cluster-level sign randomisation, and family-local, frozen-dependence-
+cluster, and cycle-global false-discovery correction. Selection compares
+candidates across families, so the q-value that authorizes a champion is the
+global one, subject to the additional cluster veto. Because
 Benjamini-Hochberg is monotone in the number of tests, cycle-global q is never
 less conservative than family q; a family pass/global fail is therefore a
 normal result for a marginal candidate, and proof verification must compare
@@ -394,8 +419,9 @@ each decision flag with its own q-value.
 The post-selection test also consumes a durable cumulative online-FDR
 allocation. Its LORD-style state is stored per scope in the factory ledger and
 persists across cycles, so alpha allocation and discoveries are not reset by a
-new run. LORD receives the raw confirmatory p-value; the family/global BH
-q-values select the candidate but are not spent as online p-values. Formal
+new run. LORD receives the raw confirmatory p-value; family/global BH and the
+frozen-cluster veto select or reject the candidate but are not spent as online
+p-values. Formal
 LORD validity still requires that confirmatory p-value to be based on evidence
 not reused for the adaptive selection step (the in-process replay remains
 diagnostic unless that independence boundary is established).
@@ -404,8 +430,9 @@ Live-shadow ingestion establishes that boundary chronologically. The unchanged
 `shadow-confirmation-v4` scope handles each complete new tail by splitting it
 deterministically into an older selection window and a newer, disjoint
 confirmatory window; both windows must independently meet the configured
-trade/session floors before any online allocation is spent. Family and global BH
-use only the selection-window raw p-values. At most the selected, preflight-ready
+trade/session floors before any online allocation is spent. Family/global BH and
+the frozen-cluster veto use only the selection-window raw p-values. At most the
+selected, preflight-ready
 candidate is recomputed on the confirmatory window, and only that gate's raw p is
 sent to LORD. The source and provenance persist both session lists, their
 digests, the disjointness marker, and the confirmatory p-value source. Legacy
@@ -509,7 +536,8 @@ paired synthetic root-control, and randomized-null replays; mismatched/incomplet
 quarantined. `edge ingest-shadow` is the sole authorization boundary: it opens
 the WAL read-only, requires strictly newer complete parity-matched rows, prior
 qualification, source/config/code/provenance/replay/gate hashes, family/global
-BH, and durable online FDR before appending immutable `lane=shadow` proof and
+BH plus the frozen-cluster veto, and durable online FDR before appending
+immutable `lane=shadow` proof and
 the live-ingestion marker.
 
 The live-shadow Compose service is broker-free and starts with the plain
@@ -523,12 +551,19 @@ signatures for parity; only the research consumer can append the authorization
 marker.
 
 The checked research config enables the bounded strategy LLM with model
-`gpt-5`. Compose requires the host override
+`gpt-5`. The OpenAI path uses the Responses API structured-output request.
+Prompt, request, schema, configuration (including the fixed sampling setting),
+and received-response hashes make the evidence reproducible for the exact
+invocation, but model output is not guaranteed bit-for-bit identical on a later
+call. The checked Responses request pins `temperature` to `0`, fixing the
+sampling setting without making provider output deterministic; the hashes
+preserve the actual request and response.
+Compose requires the host override
 `ALPACA_RESEARCH_LLM_SECRET_FILE` and mounts that separate readable provider
 dotenv as `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing, unreadable, or keyless
 credentials fail the cycle closed before discovery. Invalid model output leaves
 a pending replacement and cannot trigger premature retirement. Good edges
-produce deterministic content-addressed edge proof reports under
+produce content-addressed edge proof reports under
 `research/results/edges/`, with an optional HTTPS webhook notification.
 Scheduled cycles report
 `completed`, `completed_no_edge`, `no_data`, or `failed`; no status bypasses the

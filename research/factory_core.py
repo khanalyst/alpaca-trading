@@ -125,10 +125,10 @@ def family_template(family: str) -> dict[str, Any]:
     for template in FAMILY_TEMPLATES:
         if template["family"] == family:
             # The raw catalog remains v1 so its historical content-addressed
-            # IDs stay readable.  Factory-created roots are promoted through
-            # this seam to v2's documented no-op extension defaults, giving
-            # every family the same conditional mutation axes without
-            # rewriting any persisted v1 specification.
+            # IDs stay readable.  This family template is v2's documented
+            # no-op extension form; ``template_hypothesis`` promotes new
+            # equity factory roots to v3 without rewriting persisted v1
+            # specifications.
             return {**dict(template), "schema": RULE_SCHEMA_V2,
                     **V2_DEFAULT_EXTENSIONS}
     raise FactoryError(f"unknown rule family: {family!r}")
@@ -1193,9 +1193,117 @@ def coordinate_mutation_pool(
     return variants
 
 
+def _measured_axis_values(
+        root: Mapping[str, Any], lessons: Sequence[Mapping[str, Any]],
+        field: str) -> list[tuple[float, str]]:
+    """Return validated, deterministic values measured for one coordinate."""
+    values: dict[float, str] = {}
+    for lesson in lessons:
+        if not isinstance(lesson, Mapping):
+            continue
+        changed = lesson.get("tried") or lesson.get("changed") or {}
+        if not isinstance(changed, Mapping) or len(changed) != 1:
+            continue
+        change = changed.get(field)
+        if not isinstance(change, Mapping) or "to" not in change:
+            continue
+        try:
+            value = float(change["to"])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(value) or value == float(root.get(field)):
+            continue
+        try:
+            candidate = _safe_variant(root, **{field: value})
+        except (TypeError, ValueError):
+            continue
+        if float(candidate.get(field)) != value:
+            continue
+        lesson_id = str(lesson.get("id") or lesson.get("lesson_id") or "")
+        # Keep the lexicographically first durable lesson for a measured
+        # value. Numeric ordering below is independent of database or
+        # provider sequence and keeps neutral lessons deterministic.
+        previous = values.get(value)
+        if previous is None or lesson_id < previous:
+            values[value] = lesson_id
+    return sorted(values.items(), key=lambda item: (item[0], item[1]))
+
+
+def _blocked_stress_pair(
+        root: Mapping[str, Any], lessons: Sequence[Mapping[str, Any]], *,
+        diagnostic: Mapping[str, Any] | None,
+        risk_config: Mapping[str, Any] | None,
+        coordinate_exhausted: bool,
+        ) -> tuple[dict, str] | None:
+    """Choose one measured ATR interaction for an exhausted blocked fit."""
+    if (not coordinate_exhausted or
+            not isinstance(diagnostic, Mapping) or
+            str(diagnostic.get("primary_failure") or "") !=
+            "execution_blocked"):
+        return None
+    if "min_atr_bps" not in root or "stop_atr" not in root:
+        return None
+    mins = _measured_axis_values(root, lessons, "min_atr_bps")
+    stops = _measured_axis_values(root, lessons, "stop_atr")
+    if not mins or not stops:
+        return None
+    pairs = [(minimum, stop, minimum_id, stop_id)
+             for minimum, minimum_id in mins
+             for stop, stop_id in stops]
+    controls = None
+    if isinstance(risk_config, Mapping):
+        scenario = risk_config.get("stressed_cost_scenario_bps")
+        limit = risk_config.get("max_stressed_cost_to_risk_ratio")
+        if not isinstance(scenario, bool) and not isinstance(limit, bool):
+            try:
+                scenario_value = float(scenario)
+                limit_value = float(limit)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if (math.isfinite(scenario_value) and
+                        math.isfinite(limit_value) and
+                        scenario_value >= 0.0 and limit_value > 0.0):
+                    controls = (scenario_value, limit_value)
+    chosen = None
+    if controls is not None:
+        scenario, limit = controls
+        required_product = scenario / limit
+        chosen = next((pair for pair in pairs
+                       if pair[0] * pair[1] >= required_product), None)
+    if chosen is None and controls is None:
+        # This is a preference only.  Values are still required to have been
+        # measured and validated above; no stress or risk value is invented.
+        chosen = next((pair for pair in pairs
+                       if math.isclose(pair[0], 15.0, rel_tol=0.0,
+                                       abs_tol=1e-12) and
+                       math.isclose(pair[1], 6.0, rel_tol=0.0,
+                                    abs_tol=1e-12)), None)
+    if chosen is None:
+        # A configured geometry with no clearing pair remains a bounded,
+        # measured experiment; selecting its first deterministic pair does
+        # not claim that execution will pass.
+        chosen = pairs[0]
+    minimum, stop, minimum_id, stop_id = chosen
+    try:
+        candidate = _safe_variant(root, min_atr_bps=minimum, stop_atr=stop)
+    except (TypeError, ValueError):
+        return None
+    if len(spec_delta(root, candidate)) != 2:
+        return None
+    reason = (
+        "Bounded execution-blocked ATR interaction: min_atr_bps from lesson "
+        f"{minimum_id or 'recorded'}; stop_atr from lesson "
+        f"{stop_id or 'recorded'}."
+    )[:_REASON_LIMIT]
+    return candidate, reason
+
+
 def interaction_mutation_pool(
         spec: Mapping[str, Any], lessons: Sequence[Mapping[str, Any]], *,
-        limit: int = 12) -> list[tuple[dict, str]]:
+        limit: int = 12, diagnostic: Mapping[str, Any] | None = None,
+        risk_config: Mapping[str, Any] | None = None,
+        coordinate_exhausted: bool = True) -> list[tuple[dict, str]]:
     """Combine only the strongest previously measured one-factor changes.
 
     Interaction search is unavailable until coordinate lessons exist.  It
@@ -1233,6 +1341,14 @@ def interaction_mutation_pool(
     root_signature = rule_semantic_signature(root)
     seen = {rule_variant_id(root)}
     variants: list[tuple[dict, str]] = []
+    blocked_pair = _blocked_stress_pair(
+        root, lessons, diagnostic=diagnostic,
+        risk_config=risk_config, coordinate_exhausted=coordinate_exhausted)
+    blocked_pair_id = (rule_variant_id(blocked_pair[0])
+                       if blocked_pair is not None else None)
+    blocked_execution = (
+        isinstance(diagnostic, Mapping) and
+        str(diagnostic.get("primary_failure") or "") == "execution_blocked")
     for left_index, (left, (_ls, left_value, left_lesson)) in enumerate(selected):
         for right, (_rs, right_value, right_lesson) in selected[left_index + 1:]:
             try:
@@ -1245,15 +1361,27 @@ def interaction_mutation_pool(
                     rule_semantic_signature(candidate) == root_signature or
                     len(spec_delta(root, candidate)) != 2):
                 continue
+            if ((blocked_pair is not None or blocked_execution) and
+                    {left, right} == {"min_atr_bps", "stop_atr"}):
+                # Keep exactly one measured ATR interaction; the dedicated
+                # selector below chooses the geometry-aware member.
+                continue
             seen.add(variant_id)
             reason = (
                 f"Bounded interaction after coordinate evidence: {left} from "
                 f"lesson {left_lesson or 'recorded'}; {right} from lesson "
                 f"{right_lesson or 'recorded'}.")[:_REASON_LIMIT]
             variants.append((candidate, reason))
-            if len(variants) >= max(0, int(limit)):
+            if blocked_pair is None and len(variants) >= max(0, int(limit)):
                 return variants
-    return variants
+    if blocked_pair is None:
+        return variants[:max(0, int(limit))]
+    # The dedicated pair is first so a bounded interaction batch cannot spend
+    # its entire allowance on weaker generic combinations.  Trim only after
+    # inserting it, preserving the existing pool cap and identity semantics.
+    variants = [blocked_pair] + [item for item in variants
+                                 if rule_variant_id(item[0]) != blocked_pair_id]
+    return variants[:max(0, int(limit))]
 
 
 def mutate_with_reasons(spec: Mapping[str, Any], diagnostic: Mapping[str, Any],

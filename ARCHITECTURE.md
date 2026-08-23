@@ -184,20 +184,29 @@ bound, then smaller max drawdown, then held-out trade count, then the point
 estimate, with ids only to break ties — and a missing or non-finite metric
 collapses to its worst admissible value.
 
-Ranked candidates are then admitted greedily under a correlation cap: a
-candidate is refused while a free concurrent position slot is unavailable, or
-when it is already represented by an admitted candidate it correlates with at
-or above the threshold, so one directional bet expressed several ways does not
-become several risks. Correlation is Pearson on held-out per-session R, matched
-by session date, taken from the persisted trades of the candidate's latest
-re-verified shadow run — the same evidence that authorized deployment. Fewer
-than ten shared sessions, a zero-variance series, or an unreadable run all
-yield correlation 1.0: absence of evidence is maximal correlation, never
-independence. A negative estimate is floored at zero, so no extra slot is
-granted on the strength of a claimed hedge. Every input appears exactly once in
-the admitted or rejected list and every rejection carries a durable reason,
-journalled as an `allocation_reject` event; an allocation failure falls back to
-the single best-ranked edge.
+Before current-cycle selection, the factory freezes a hash-verified dependence
+map from completed prior cycles. Strongly correlated family deltas become
+frozen dependence clusters; the same policy is persisted with the proof. The
+current-cycle family and global BH decisions remain mandatory, and a
+cluster-level BH veto from this prior-cycle map can only reject a candidate.
+An unavailable or unknown family uses a singleton safe fallback rather than
+claiming independence. `all_proved` runtime allocation consumes verified frozen
+clusters first and admits at most one strongest candidate per cluster.
+
+Remaining candidates are then admitted greedily under the held-out correlation
+cap: a candidate is refused while a free concurrent position slot is
+unavailable, or when it is already represented by an admitted candidate it
+correlates with at or above the threshold, so one directional bet expressed
+several ways does not become several risks. Correlation is Pearson on held-out
+per-session R, matched by session date, taken from the persisted trades of the
+candidate's latest re-verified shadow run — the same evidence that authorized
+deployment. Fewer than ten shared sessions, a zero-variance series, or an
+unreadable run all yield correlation 1.0: absence of evidence is maximal
+correlation, never independence. A negative estimate is floored at zero, so no
+extra slot is granted on the strength of a claimed hedge. Every input appears
+exactly once in the admitted or rejected list and every rejection carries a
+durable reason, journalled as an `allocation_reject` event; an allocation
+failure falls back to the single best-ranked edge.
 
 Allocation only narrows and reorders. Every per-order risk check in the cycle
 still runs unchanged, so it reallocates within the existing risk caps and
@@ -475,6 +484,14 @@ path, retire a family on invalid output, or authorize trading. Every seeding and
 tuning path has a deterministic fallback, so the factory keeps discovering with
 no provider configured.
 
+The OpenAI lane uses the Responses API structured-output request. Prompt,
+request, schema, configuration (including the fixed sampling setting), and
+received-response hashes make the evidence reproducible for the exact
+invocation, but do not guarantee bit-for-bit identical model output on a later
+call. The checked Responses request pins `temperature` to `0`, fixing the
+sampling setting without making provider output deterministic; the hashes
+preserve the actual request and response.
+
 `agent.brain.DecisionBrain` is a separate optional paper-runtime adapter. It is
 consulted only after a deterministic strategy has produced a setup; it can
 subtract that opportunity with a matching veto but cannot author a setup,
@@ -483,6 +500,15 @@ the client for the rest of the process after a hung request. Provider errors or
 malformed non-empty responses veto the cycle; an empty or irrelevant response
 means no veto and returns to the deterministic path. Live mode rejects both
 `llm.enabled: true` and a directly injected brain at the Engine boundary.
+
+Future research extensions keep explicit evidence boundaries. Universe expansion
+requires an operator-approved exact symbol list, recorder coverage for that
+list, and a new identity/proof. Event conditioning requires a point-in-time
+event source with provider, `as_of`, and observation provenance. Prior-session,
+true multi-timeframe, and cross-sectional features require explicit replay
+context and fail closed when that context is missing or ambiguous. Shadow
+quarantine is never an unsafe auto-skip: unresolved sessions block watermark
+and FDR advancement until source correction and a bounded parity replay complete.
 
 No lane can extend the signal vocabulary. `RULE_FAMILIES`, `CONFIRMATIONS`,
 `SIDES`, the permitted field set and the numeric bounds in
@@ -565,16 +591,18 @@ grid values do not consume it.
 `research.gates` provides chronological splits, structural floors, paired and
 cluster-aware controls, placebo/falsification tests, held-out separation,
 drawdown, sample counts, fixed-rule rolling-origin forward-stability checks,
-family-local and cycle-global false-discovery correction inputs, and the
-verified-gate envelope. The family and global decisions are separate: global q
-is always at least as conservative as the family q, so a marginal candidate
-commonly passes its family test while failing the cycle-global test. The
-rolling-origin rule is fixed across folds. Proof verification compares each
-flag with its own q-value; only the global decision
-can authorize cross-family selection.
+family-local, frozen-dependence-cluster, and cycle-global false-discovery
+correction inputs, and the verified-gate envelope. The family and global
+decisions are separate: global q is always at least as conservative as the
+family q, so a marginal candidate commonly passes its family test while failing
+the cycle-global test. The frozen prior-cycle cluster BH is an additional veto,
+never an admission path. The rolling-origin rule is fixed across folds. Proof
+verification compares each flag with its own q-value; only a candidate passing
+the global and cluster decisions can authorize cross-family selection.
 
 Offline post-selection does not consume cumulative alpha. It records an
-explicit, non-authorizing deferral after family and global BH, then uses the
+explicit, non-authorizing deferral after family/global BH and the frozen-cluster
+veto, then uses the
 sealed window only for qualification. The strictly newer parity-matched
 live-shadow tail receives the one durable cumulative online-FDR test per
 vehicle scope. Its balanced LORD-style state is persisted in the factory
@@ -650,7 +678,8 @@ being lost to a prematurely advanced boundary. The live ShadowRunner consumes
 strictly newer recorder sessions in candidate-isolated books; `edge
 ingest-shadow` opens its WAL read-only, requires complete parity matches and
 prior qualification plus source/config/code/provenance/replay/gate hashes,
-applies family and global BH with durable online FDR, and only then appends an
+applies the persisted family/global BH and frozen-cluster veto with durable
+online FDR, and only then appends an
 immutable `lane=shadow` proof that may transition a candidate to `validated`.
 Semantic or mid-tail incomplete sessions remain fail-closed in replay quarantine
 until the source is corrected and a bounded complete parity replay records the
@@ -661,7 +690,9 @@ allocation. A two-million-draw cap turns an unresolvable test into an explicit
 no-op rather than a false failure or spent decision.
 
 Retirement guards every deployed candidate, not only the champion, because
-`all_proved` selection trades one validated candidate per family. Two
+`all_proved` selection trades one validated candidate per verified frozen
+dependence cluster (with the held-out correlation fallback for unclustered
+families). Two
 independent signals demote: the registered rolling-R floor, and a one-sided
 sequential likelihood test of live paper R against the held-out R distribution
 the candidate's re-verified shadow proof was computed over. The sequential

@@ -118,8 +118,10 @@ N sessions, and `ALPACA_RESEARCH_DATASET` can override the source with
 normalized JSONL. The edge ledger is stored at
 `runtime/research/edge_lab.sqlite3` (override with `ALPACA_EDGE_DB`) and is
 read-only from the dashboard. Research cannot place orders or mutate broker
-state. Paper `selection_mode: all_proved` runs one best proven variant per
-independent family under one global risk book. Defaults are eleven logical
+state. Paper `selection_mode: all_proved` runs one strongest proven variant per
+verified frozen prior-cycle dependence cluster under one global risk book;
+families without a verified assignment use the held-out correlation-safe
+fallback. Defaults are eleven logical
 strategy slots over all eleven bounded rule families and four isolated variant
 accounts per strategy; each isolated book is processed by one bounded worker.
 Scheduled research evaluates the equity vehicle only by default because runtime
@@ -136,10 +138,20 @@ sessions/clusters; sealed qualification requires 100 trades and 30 complete
 sessions/clusters; parity-matched live shadow requires 150 trades and 30
 complete sessions. Real signal rates still require sufficient history, and
 floor feasibility fails closed; widen history and/or the configured universe,
-never lower a floor. Effective breadth is a persisted/re-verified matched
-symbol/session diagnostic and never counts as extra independent N. Serial
+never lower a floor. An expansion requires an operator-approved exact symbol
+list, recorder coverage for that list, and a new candidate identity/proof; it is
+not a parameter-only tuning arm. Effective breadth is a persisted/re-verified matched
+symbol/session diagnostic and never counts as extra independent N. Before each
+factory cycle, completed prior-cycle family deltas are frozen into a
+hash-verified map; strong clusters receive a cluster-level BH veto and runtime
+allocation admits one strongest edge per verified frozen cluster. Serial
 inference uses a deterministic seeded moving-block day/session-cluster
 bootstrap.
+
+Event conditioning requires a point-in-time event source with provider,
+`as_of`, and observation provenance. Prior-session, true multi-timeframe, and
+cross-sectional features require explicit replay context and fail closed when
+that context is missing or ambiguous.
 
 Research qualification requires at least 100 trades, 30 complete sessions, and
 30 session-level clusters. Epoch 5 retains epoch-4 point-in-time,
@@ -276,7 +288,8 @@ advance its boundary or spend FDR while a quarantine entry or an
 authoritative-calendar gap remains, and its retry records the repaired
 session explicitly. Semantic or mid-tail incompleteness therefore fails closed
 without permanently losing the session; correction plus the bounded replay is
-the repair path. A missing or stale recorder calendar is reported as
+the repair path. There is no unsafe auto-skip of quarantine, and no watermark/FDR
+advancement occurs until the repair is complete. A missing or stale recorder calendar is reported as
 `catalog_unavailable`/unknown rather than inferred from weekdays.
 
 The executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
@@ -308,7 +321,13 @@ research-provider dotenv file before startup; it is mounted read-only as
 `/run/secrets/research_llm_credentials`. The file must be readable by the
 container's restricted UID and contain `OPENAI_API_KEY` for the checked
 `openai`/`gpt-5` provider (or the matching `ANTHROPIC_API_KEY` when configured).
-Broker credentials are not mounted into the research service.
+Broker credentials are not mounted into the research service. The OpenAI path
+uses the Responses API structured-output request; prompt, request, schema, and
+configuration (including the fixed sampling setting), plus response hashes,
+reproduce the evidence for the exact invocation but do not guarantee bit-for-bit
+identical later model output. The checked request pins `temperature` to `0`,
+fixing the sampling setting without making provider output deterministic; the
+hashes preserve the actual request and response.
 
 The shipped Compose and systemd lanes are paper-scoped. A live deployment is a
 separate reviewed config/runtime scope: `mode: live`, `broker.paper: false`,
@@ -323,20 +342,24 @@ validation and the Engine constructor. The authenticated live preflight also
 requires `pattern_day_trader=true`.
 Research lifecycle gates include fit/held-out structural floors, matched
 controls, placebo/falsification, fixed-rule rolling-origin stability,
-family-local/cycle-global FDR, sealed qualification source binding (one
+family-local/frozen-dependence-cluster/cycle-global FDR, sealed qualification
+source binding (one
 preselected candidate alone consumes the window), and durable verification.
 Offline historical/forward replay defers cumulative online FDR, may leave a
 candidate at `shadow` only, and never authorizes runtime. Research-side `edge
 ingest-shadow` opens the shadow WAL read-only, requires strictly newer complete
 parity-matched rows, prior qualification, source/config/code/provenance/replay/
-gate hashes, family/global BH plus durable online FDR, then appends the
+gate hashes, family/global BH plus the frozen-dependence-cluster veto and
+durable online FDR, then appends the
 immutable `lane=shadow` proof and live marker. Underpowered, mismatched, or
 incomplete shadow data advances no boundary and is reconsidered. The unchanged
 `shadow-confirmation-v4` ingestion scope splits each tail into older
 chronological selection sessions and a newer disjoint confirmatory window; BH
 uses selection raw p-values, while only the selected candidate's raw
 confirmatory p-value reaches LORD. Same-tail v3
-rows remain auditable but quarantined. Simulation resolution scales to the next
+rows remain auditable but quarantined; there is no unsafe auto-skip, so an
+unresolved quarantine blocks watermark/FDR advancement until a bounded parity
+replay repairs it. Simulation resolution scales to the next
 online allocation and stops without spending at its bounded cap. Legacy
 validated/champion rows without the marker can be evaluated/migrated but remain
 ineligible until a new authorized live proof. Retirement requires a powered

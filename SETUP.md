@@ -220,6 +220,14 @@ defaults to `gpt-5`; leave `research.strategy_llm.enabled: true`. Set
 key. Compose mounts this file separately and systemd reads it through
 `ALPACA_RESEARCH_LLM_SECRETS_FILE`; never put provider keys in `agent.env`.
 
+For the checked OpenAI provider, requests use the Responses API structured
+output path. Prompt, request, schema, configuration (including the fixed
+sampling setting), and received-response hashes make the evidence reproducible
+for the exact invocation, but model output is not guaranteed bit-for-bit
+identical on a later call. The checked Responses request pins `temperature` to
+`0`, fixing the sampling setting without making provider output deterministic;
+the hashes preserve the actual request and response.
+
 Treat a custom provider base URL as a secret-bearing outbound destination.
 `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` receives the provider key and bounded
 research prompt; use only a trusted HTTPS endpoint. The application does not
@@ -257,7 +265,15 @@ evidence floor is as much a *universe width* requirement as a history-length
 one. The eight-symbol default improves opportunity capacity, but real signal
 rates still require sufficient history. Floor feasibility fails closed when the
 100-trade floor cannot be supported; widen history and/or `universe.symbols`,
-never lower the floor. Keep them US equity/ETF symbols.
+never lower the floor. Any expansion requires an operator-approved exact list,
+recorded coverage for that list, and a new candidate identity/proof; it is not a
+parameter-only tuning arm. Keep the list to US equity/ETF symbols.
+
+Future event conditioning requires a point-in-time event source with provider,
+`as_of`, and observation provenance. Prior-session, true multi-timeframe, and
+cross-sectional features require explicit replay context and fail closed when
+that context is missing or ambiguous; shadow quarantine is repaired, never
+silently skipped.
 
 **`strategy.execution_mode`** picks one execution profile per trader process:
 
@@ -588,10 +604,13 @@ consumes the same events in its own virtual book and remains outside EdgeLedger
 lifecycle state. Mismatch or incomplete rows are quarantined. Ingestion opens that WAL
 read-only, requires strictly newer sessions, prior qualification, complete
 parity, and matching source/config/code/provenance/replay/gate hashes; family
-and global BH plus durable online FDR must pass before an immutable live marker
+and global BH plus the frozen-dependence-cluster veto and durable online FDR must
+pass before an immutable live marker
 is appended. Historical and offline-forward selection explicitly defers this
 cumulative test; it cannot consume the budget or authorize deployment. Manual/
 offline promotion cannot bypass it.
+There is no unsafe auto-skip: unresolved quarantine blocks the shadow watermark
+and FDR boundary until source correction and a bounded parity replay complete.
 Gate envelopes retain per-arm candidate, baseline, and randomized-null counts,
 fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
 and directional/pair coverage. Quote density can change null/control evidence
@@ -631,7 +650,11 @@ Inference preserves serial dependence with a deterministic, seeded moving-block
 bootstrap over chronological day/session clusters. Reports persist the draw
 count, seed, and block length. Effective breadth is a persisted and
 re-verified diagnostic over matched symbol/session deltas; it never counts as
-extra independent observations or raises the trade/session N.
+extra independent observations or raises the trade/session N. Before a factory
+cycle, completed prior-cycle family deltas are frozen into a hash-verified map;
+strong clusters receive the additional BH veto and runtime admits at most one
+strongest edge per verified frozen cluster. Missing assignments never imply
+independence.
 
 - the latest 20% of sessions are sealed into a final qualification window
   before any worker runs, leaving 80% as development corpus;
@@ -810,7 +833,7 @@ When a candidate finally earns a live-shadow proof:
 1. `edge ingest-shadow` appends an immutable `lane=shadow` run and
    parity-matched live-ingestion marker; its ledger candidate may then become
    `validated` or `champion`.
-2. A deterministic, content-addressed edge proof report is written under
+2. A content-addressed edge proof report is written under
    `research/results/edges/<vehicle>/`.
 3. The dashboard lists it — but only while its latest verified shadow gate and
    live-ingestion marker still pass.

@@ -6,7 +6,8 @@ from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V2, RULE_SCHEMA
                                   rule_spec_hash, rule_variant_id,
                                   validate_rule_spec)
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
-                                    SYSTEM_PROMPT, TUNING_SCHEMA, RuleProposalAdapter,
+                                    RESEARCH_SAMPLING_TEMPERATURE, SYSTEM_PROMPT,
+                                    TUNING_SCHEMA, RuleProposalAdapter,
                                     _parse_response, _safe_text,
                                     canonical_json, content_hash)
 
@@ -102,6 +103,7 @@ class LLMRuleStrategyTests(unittest.TestCase):
             vehicle="equity", generation=0,
             prior_validated_rule_spec=DEFAULT_RULE_SPEC, diagnosis={})
         self.assertTrue(result.success)
+        self.assertEqual(seen["temperature"], RESEARCH_SAMPLING_TEMPERATURE)
         provider_schema = seen["text"]["format"]["schema"]
 
         def walk(value):
@@ -119,6 +121,23 @@ class LLMRuleStrategyTests(unittest.TestCase):
         self.assertEqual(threshold["type"], "number")
         self.assertNotIn("minimum", threshold)
         self.assertNotIn("maximum", threshold)
+
+    def test_sampling_setting_is_part_of_evidence_config(self):
+        adapter = RuleProposalAdapter(model="test-model", caller=lambda **_: proposal(),
+                                      max_attempts=1)
+        expected = content_hash({
+            "provider": "openai", "model": "test-model",
+            "temperature": RESEARCH_SAMPLING_TEMPERATURE,
+            "max_attempts": adapter.max_attempts,
+            "timeout_seconds": adapter.timeout_seconds,
+            "max_response_bytes": adapter.max_response_bytes,
+            "max_total_calls": adapter.max_total_calls,
+        })
+        result = adapter.propose(
+            vehicle="equity", generation=0,
+            prior_validated_rule_spec=DEFAULT_RULE_SPEC, diagnosis={})
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.evidence["config_hash"], expected)
 
     def test_internal_validation_retains_removed_provider_bounds(self):
         with self.assertRaises(ValueError):

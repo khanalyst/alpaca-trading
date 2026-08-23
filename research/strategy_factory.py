@@ -1123,6 +1123,7 @@ def _adapter(config: Mapping[str, Any],
 def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any],
                     *, count: int, vehicle: str, llm_enabled: bool,
                     config: Mapping[str, Any],
+                    risk_config: Mapping[str, Any] | None = None,
                     adapter: RuleProposalAdapter | None,
                     lessons: Sequence[Mapping[str, Any]] = (),
                     already_failed: frozenset[str] = frozenset(),
@@ -1166,7 +1167,9 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     interaction_source = (safe_refinement_lessons
                           if safe_refinement_lessons else safe_lessons)
     interactions = interaction_mutation_pool(
-        root, _interaction_lessons(interaction_source))
+        root, _interaction_lessons(interaction_source),
+        diagnostic=safe_diagnostic, risk_config=risk_config,
+        coordinate_exhausted=not remaining_coordinate)
     remaining_interactions = [item for item in interactions
                                if not _failed_variant(item[0], failed)]
     if remaining_coordinate:
@@ -2761,6 +2764,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     hypothesis, diagnostic,
                     count=int(variants_per_strategy), vehicle=vehicle,
                     llm_enabled=llm_enabled, config=llm_config,
+                    risk_config=risk_assumptions,
                     adapter=llm_adapter,
                     lessons=family_lessons,
                     refinement_lessons=refinement_lessons,
