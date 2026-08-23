@@ -82,7 +82,7 @@
       "enabled": true,
       "provider": "openai",
       "model": "gpt-5",
-      "deployment": null,
+      "deployment": "gpt-5-sol-coding",
       "max_attempts": 2,
       "timeout_seconds": 30,
       "max_response_bytes": 16384,
