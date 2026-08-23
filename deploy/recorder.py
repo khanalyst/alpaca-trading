@@ -7,25 +7,28 @@ authenticated read exits non-zero so the service health check cannot report a
 fresh but empty dataset.
 
 Storage is partitioned by New York session date under ``sessions/`` next to the
-nominal dataset path, with a durable sidecar index holding the watermark, the
-per-symbol last bar and coverage evidence, a time-bounded dedup window and the
-option contracts held open for continued sampling. A cycle therefore costs
-O(new rows) instead of rescanning the corpus. The index is a cache with a
-corruption check: partition sizes are verified on load and a mismatch rebuilds
-it from the partitions.
+nominal dataset path. A compact JSON sidecar holds the watermark, per-symbol
+last bar, coverage evidence, and option contracts held open for continued
+sampling; an exact SQLite sidecar holds the time-bounded dedup window without
+materializing high-rate quote keys in memory. A cycle therefore costs O(new
+rows) instead of rescanning the corpus. Both sidecars are caches bound to the
+partition sizes and watermark; any mismatch rebuilds them from the partitions.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
+import hashlib
 import json
+import mmap
 import os
 import sqlite3
 import sys
 import tempfile
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -104,6 +107,9 @@ def _validate_dataset_row(row: dict) -> tuple[str, str, datetime]:
 NEW_YORK = ZoneInfo("America/New_York")
 INDEX_NAME = ".recorder-index.json"
 INDEX_SCHEMA = "recorder-index.v1"
+RECENT_KEY_INDEX_NAME = ".recorder-recent-keys.sqlite3"
+RECENT_KEY_INDEX_SCHEMA = "recorder-recent-keys.v1"
+CORPUS_LOCK_NAME = ".recorder.lock"
 STATUS_NAME = ".recorder-status.json"
 STATUS_SCHEMA = "recorder-status.v1"
 PARTITION_DIR = "sessions"
@@ -116,6 +122,8 @@ PARTITION_SOURCE_SCHEMA = "recorder-partition-source.v1"
 # failure rather than a silent append -- replaying an old key is impossible, not
 # merely unlikely.
 DEDUP_HORIZON = timedelta(minutes=15)
+MAX_INLINE_INDEX_BYTES = 16 * 1024 * 1024
+RECENT_KEY_BATCH_SIZE = 10_000
 DEFAULT_FETCH_WINDOW_MINUTES = 1
 DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
@@ -206,6 +214,7 @@ def _save_partition_source(output: Path, day: date, source_mode: str) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    _fsync_directory(path.parent)
 
 
 def _partition_sources_from_markers(output: Path) -> dict[str, dict[str, str]]:
@@ -224,10 +233,16 @@ def _partition_sources_from_markers(output: Path) -> dict[str, dict[str, str]]:
         source_mode = payload.get("source_mode") if isinstance(payload, dict) else None
         if (not isinstance(payload, dict) or
                 payload.get("schema") != PARTITION_SOURCE_SCHEMA or
-                not isinstance(partition, str) or partition not in existing or
+                not isinstance(partition, str) or
                 path.name != partition + ".source.json" or
                 source_mode != "historical_backfill"):
             raise RuntimeError(f"invalid recorder partition source marker {path}")
+        # Marker-before-partition ordering prevents a backfilled CSV from ever
+        # looking forward-observed. A crash in that narrow gap can leave a
+        # valid orphan marker; ignore it until the resumable backfill writes the
+        # referenced partition.
+        if partition not in existing:
+            continue
         result[partition] = {"source_mode": source_mode}
     return result
 
@@ -301,24 +316,22 @@ def _scan_corpus(output: Path) -> dict:
             "recorder corpus mixes equity data feeds: " +
             ", ".join(sorted(data_feeds)))
 
-    recent_keys: dict[str, str] = {}
-    if watermark is not None:
-        floor = watermark - DEDUP_HORIZON
-        for _row, key, _event, _symbol, parsed in _validated_corpus_rows(output):
-            if parsed < floor:
-                continue
-            if key in recent_keys:
-                raise RuntimeError(f"recorder dataset repeats recent event_key {key}")
-            recent_keys[key] = parsed.isoformat()
+    partitions = _partition_sizes(output)
+    fingerprints = _partition_fingerprints(output)
+    recent_key_index = _rebuild_recent_key_index(
+        output, watermark=watermark, partitions=partitions,
+        fingerprints=fingerprints)
 
     index = {"schema": INDEX_SCHEMA,
              "watermark": watermark.isoformat() if watermark else None,
-             "latest_bars": latest_bars, "recent_keys": recent_keys,
+             "latest_bars": latest_bars,
+             "recent_key_index": recent_key_index,
              "option_pins": {}, "bar_coverage": {},
              "session_calendar": {},
              "partition_sources": _partition_sources_from_markers(output),
              "data_feed": next(iter(data_feeds), None),
-             "partitions": _partition_sizes(output)}
+             "partitions": partitions,
+             "partition_fingerprints": fingerprints}
     return _prune_index(index)
 
 
@@ -367,34 +380,392 @@ def _partition_sizes(output: Path) -> dict[str, int]:
     return {path.name: path.stat().st_size for path in corpus_partitions(output)}
 
 
+def _partition_fingerprints(output: Path) -> dict[str, dict[str, int]]:
+    """Cheap mutation evidence for caches; the explicit audit hashes contents."""
+    result = {}
+    for path in corpus_partitions(output):
+        stat = path.stat()
+        result[path.name] = {
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    return result
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make an atomic replacement durable across a host power loss."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def corpus_write_lock(output: Path):
+    """Serialize every CSV/SQLite/JSON corpus mutation across processes."""
+    root = _corpus_root(output)
+    root.mkdir(parents=True, exist_ok=True)
+    handle = (root / CORPUS_LOCK_NAME).open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _recent_key_index_path(output: Path) -> Path:
+    return _corpus_root(output) / RECENT_KEY_INDEX_NAME
+
+
+def _recent_key_signature(watermark: object,
+                          partitions: dict[str, int],
+                          fingerprints: dict[str, dict[str, int]]) -> str:
+    payload = json.dumps({
+        "watermark": str(watermark) if watermark not in (None, "") else None,
+        "partitions": partitions,
+        "partition_fingerprints": fingerprints,
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _recent_key_timestamp(value: object) -> str:
+    """Return one UTC representation so SQLite text ordering is chronological."""
+    parsed = _timestamp(value)
+    if parsed is None:
+        raise RuntimeError("recorder recent-key index has an invalid timestamp")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+class RecentKeyIndex:
+    """Disk-backed membership for the recorder's overlap deduplication window.
+
+    A time horizon is not a memory bound: a high-volume IEX minute can contain
+    tens of thousands of quote updates.  Keeping those hashes in JSON caused a
+    110 MiB sidecar to expand beyond the recorder's 768 MiB cgroup while being
+    decoded.  SQLite keeps membership exact without materializing the window.
+    """
+
+    def __init__(self, path: Path, *, create: bool = False,
+                 read_only: bool = False) -> None:
+        self.path = path
+        if read_only:
+            uri = f"file:{path.resolve()}?mode=ro"
+            self.db = sqlite3.connect(uri, uri=True)
+        elif create:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.db = sqlite3.connect(path)
+        else:
+            if not path.is_file():
+                raise RuntimeError("recorder recent-key index is missing")
+            uri = f"file:{path.resolve()}?mode=rw"
+            self.db = sqlite3.connect(uri, uri=True)
+        if not read_only:
+            self.db.execute("PRAGMA journal_mode=DELETE")
+            self.db.execute("PRAGMA synchronous=FULL")
+            self.db.execute("PRAGMA temp_store=FILE")
+        if create:
+            with self.db:
+                self.db.execute(
+                    "CREATE TABLE IF NOT EXISTS recent_keys ("
+                    "event_key TEXT PRIMARY KEY, event_ts TEXT NOT NULL) "
+                    "WITHOUT ROWID")
+                self.db.execute(
+                    "CREATE INDEX IF NOT EXISTS recent_keys_event_ts "
+                    "ON recent_keys(event_ts)")
+                self.db.execute(
+                    "CREATE TABLE IF NOT EXISTS metadata ("
+                    "key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID")
+
+    def close(self) -> None:
+        self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.close()
+
+    def contains(self, event_key: str) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM recent_keys WHERE event_key=? LIMIT 1",
+            (event_key,)).fetchone() is not None
+
+    def add_many(self, entries) -> None:
+        values = [(str(key), _recent_key_timestamp(stamp))
+                  for key, stamp in entries]
+        if not values:
+            return
+        try:
+            with self.db:
+                self.db.executemany(
+                    "INSERT INTO recent_keys(event_key,event_ts) VALUES (?,?)",
+                    values)
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError(
+                "recorder recent-key index repeats an event_key") from exc
+
+    def prune(self, floor: datetime | None) -> None:
+        if floor is None:
+            return
+        with self.db:
+            self.db.execute(
+                "DELETE FROM recent_keys WHERE event_ts < ?",
+                (_recent_key_timestamp(floor),))
+
+    def count(self) -> int:
+        row = self.db.execute("SELECT COUNT(*) FROM recent_keys").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def metadata(self) -> dict[str, str]:
+        try:
+            return {str(key): str(value) for key, value in self.db.execute(
+                "SELECT key,value FROM metadata")}
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError("recorder recent-key index is invalid") from exc
+
+    def bind(self, *, signature: str) -> dict:
+        count = self.count()
+        values = {
+            "schema": RECENT_KEY_INDEX_SCHEMA,
+            "corpus_signature": signature,
+            "count": str(count),
+        }
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO metadata(key,value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                sorted(values.items()))
+        return {
+            "schema": RECENT_KEY_INDEX_SCHEMA,
+            "name": RECENT_KEY_INDEX_NAME,
+            "count": count,
+            "corpus_signature": signature,
+        }
+
+
+def _remove_sqlite_artifacts(path: Path) -> None:
+    for candidate in (path, Path(str(path) + "-journal"),
+                      Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        candidate.unlink(missing_ok=True)
+
+
+def _build_recent_key_index(output: Path, entries, *, watermark: object,
+                            partitions: dict[str, int],
+                            fingerprints: dict[str, dict[str, int]]) -> dict:
+    """Atomically replace the disk-backed overlap index from streamed keys."""
+    target = _recent_key_index_path(output)
+    temporary = target.with_name(target.name + ".tmp")
+    _remove_sqlite_artifacts(temporary)
+    signature = _recent_key_signature(watermark, partitions, fingerprints)
+    try:
+        with RecentKeyIndex(temporary, create=True) as store:
+            batch = []
+            for key, stamp in entries:
+                batch.append((key, stamp))
+                if len(batch) >= RECENT_KEY_BATCH_SIZE:
+                    store.add_many(batch)
+                    batch.clear()
+            store.add_many(batch)
+            metadata = store.bind(signature=signature)
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+        return metadata
+    except Exception:
+        _remove_sqlite_artifacts(temporary)
+        raise
+
+
+def _rebuild_recent_key_index(output: Path, *, watermark: datetime | None,
+                              partitions: dict[str, int],
+                              fingerprints: dict[str, dict[str, int]]) -> dict:
+    floor = watermark - DEDUP_HORIZON if watermark is not None else None
+
+    def entries():
+        for _row, key, _event, _symbol, parsed in _validated_corpus_rows(output):
+            if floor is None or parsed >= floor:
+                yield key, parsed.isoformat()
+
+    return _build_recent_key_index(
+        output, entries(), watermark=watermark.isoformat() if watermark else None,
+        partitions=partitions, fingerprints=fingerprints)
+
+
+def _recent_key_index_matches(output: Path, metadata: object, *,
+                              watermark: object,
+                              partitions: dict[str, int],
+                              fingerprints: dict[str, dict[str, int]]) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    signature = _recent_key_signature(watermark, partitions, fingerprints)
+    if (metadata.get("schema") != RECENT_KEY_INDEX_SCHEMA or
+            metadata.get("name") != RECENT_KEY_INDEX_NAME or
+            metadata.get("corpus_signature") != signature or
+            not isinstance(metadata.get("count"), int) or
+            metadata.get("count") < 0):
+        return False
+    try:
+        with RecentKeyIndex(
+                _recent_key_index_path(output), read_only=True) as store:
+            durable = store.metadata()
+            durable_count = store.count()
+    except (OSError, RuntimeError, sqlite3.DatabaseError):
+        return False
+    return (
+        durable.get("schema") == RECENT_KEY_INDEX_SCHEMA and
+        durable.get("corpus_signature") == signature and
+        durable.get("count") == str(metadata.get("count")) and
+        durable_count == metadata.get("count")
+    )
+
+
 def _prune_index(index: dict) -> dict:
-    """Drop dedup keys and option pins that fell out of their bounded window."""
+    """Normalize bounded metadata; legacy inline keys are pruned for migration."""
     index.setdefault("bar_coverage", {})
     index.setdefault("session_calendar", {})
     index.setdefault("partition_sources", {})
     index.setdefault("data_feed", None)
     watermark = _timestamp(index.get("watermark"))
-    if watermark is not None:
+    recent_keys = index.get("recent_keys")
+    if watermark is not None and isinstance(recent_keys, dict):
         floor = (watermark - DEDUP_HORIZON).isoformat()
-        index["recent_keys"] = {key: value for key, value in index["recent_keys"].items()
+        index["recent_keys"] = {key: value for key, value in recent_keys.items()
                                 if value >= floor}
     return index
 
 
-def _load_index(output: Path) -> dict | None:
-    """Return the sidecar index when it demonstrably matches the partitions."""
-    path = _corpus_root(output) / INDEX_NAME
-    if not path.is_file():
-        return None
-    try:
-        index = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+def _stream_index_metadata(path: Path) -> dict:
+    """Read compact top-level fields while skipping a huge legacy key object."""
+    whitespace = frozenset(b" \t\r\n")
+
+    def skip_space(view, position: int) -> int:
+        while position < len(view) and view[position] in whitespace:
+            position += 1
+        return position
+
+    def string_end(view, position: int) -> int:
+        if position >= len(view) or view[position] != ord('"'):
+            raise ValueError("expected a JSON string")
+        escaped = False
+        position += 1
+        while position < len(view):
+            value = view[position]
+            if escaped:
+                escaped = False
+            elif value == ord("\\"):
+                escaped = True
+            elif value == ord('"'):
+                return position + 1
+            position += 1
+        raise ValueError("unterminated JSON string")
+
+    def value_end(view, position: int) -> int:
+        if position >= len(view):
+            raise ValueError("missing JSON value")
+        opening = view[position]
+        if opening == ord('"'):
+            return string_end(view, position)
+        if opening in (ord("{"), ord("[")):
+            stack = [ord("}") if opening == ord("{") else ord("]")]
+            position += 1
+            while position < len(view) and stack:
+                value = view[position]
+                if value == ord('"'):
+                    position = string_end(view, position)
+                    continue
+                if value == ord("{"):
+                    stack.append(ord("}"))
+                elif value == ord("["):
+                    stack.append(ord("]"))
+                elif value in (ord("}"), ord("]")):
+                    if value != stack[-1]:
+                        raise ValueError("mismatched JSON container")
+                    stack.pop()
+                position += 1
+            if stack:
+                raise ValueError("unterminated JSON container")
+            return position
+        end = position
+        while end < len(view) and view[end] not in (ord(","), ord("}")):
+            end += 1
+        while end > position and view[end - 1] in whitespace:
+            end -= 1
+        if end == position:
+            raise ValueError("empty JSON value")
+        return end
+
+    result: dict = {}
+    seen: set[str] = set()
+    with path.open("rb") as handle, mmap.mmap(
+            handle.fileno(), 0, access=mmap.ACCESS_READ) as view:
+        position = skip_space(view, 0)
+        if position >= len(view) or view[position] != ord("{"):
+            raise ValueError("recorder index is not a JSON object")
+        position = skip_space(view, position + 1)
+        if position < len(view) and view[position] == ord("}"):
+            position = skip_space(view, position + 1)
+            if position != len(view):
+                raise ValueError("recorder index has trailing data")
+            return result
+        while True:
+            key_start = position
+            key_end = string_end(view, key_start)
+            if key_end - key_start > 4_096:
+                raise ValueError("recorder index key is too large")
+            key = json.loads(bytes(view[key_start:key_end]).decode("utf-8"))
+            if not isinstance(key, str) or key in seen:
+                raise ValueError("recorder index has an invalid duplicate key")
+            seen.add(key)
+            position = skip_space(view, key_end)
+            if position >= len(view) or view[position] != ord(":"):
+                raise ValueError("recorder index key has no value")
+            value_start = skip_space(view, position + 1)
+            end = value_end(view, value_start)
+            if key != "recent_keys":
+                if end - value_start > MAX_INLINE_INDEX_BYTES:
+                    raise ValueError(f"recorder index metadata {key!r} is too large")
+                result[key] = json.loads(
+                    bytes(view[value_start:end]).decode("utf-8"))
+            position = skip_space(view, end)
+            if position >= len(view):
+                raise ValueError("unterminated recorder index")
+            if view[position] == ord("}"):
+                position = skip_space(view, position + 1)
+                if position != len(view):
+                    raise ValueError("recorder index has trailing data")
+                break
+            if view[position] != ord(","):
+                raise ValueError("recorder index has an invalid separator")
+            position = skip_space(view, position + 1)
+    return result
+
+
+def _validate_index(index: object, output: Path, *, require_recent: bool,
+                    require_partition_match: bool = True) -> dict | None:
+    """Validate compact metadata and, for normal loads, its dedup sidecar."""
     if not isinstance(index, dict) or index.get("schema") != INDEX_SCHEMA:
         return None
-    for name in ("latest_bars", "recent_keys", "option_pins", "partitions"):
+    index = dict(index)
+    for name in ("latest_bars", "option_pins", "partitions"):
         if not isinstance(index.get(name), dict):
             return None
+    raw_watermark = index.get("watermark")
+    if raw_watermark is not None and _timestamp(raw_watermark) is None:
+        return None
+    inline_keys = index.get("recent_keys")
+    recent_metadata = index.get("recent_key_index")
+    if inline_keys is not None:
+        if not isinstance(inline_keys, dict):
+            return None
+        for key, value in inline_keys.items():
+            if (not isinstance(key, str) or not key or
+                    not isinstance(value, str) or _timestamp(value) is None):
+                return None
+    elif require_recent and not isinstance(recent_metadata, dict):
+        return None
     coverage = index.get("bar_coverage")
     if coverage is None:  # backward-compatible additive recorder-index.v1 field
         index["bar_coverage"] = {}
@@ -433,8 +804,9 @@ def _load_index(output: Path) -> dict | None:
                     not isinstance(value.get("source_mode"), str)):
                 return None
     durable_sources = _partition_sources_from_markers(output)
-    if any(index["partition_sources"].get(name) != value
-           for name, value in durable_sources.items()):
+    if (require_partition_match and
+            any(index["partition_sources"].get(name) != value
+                for name, value in durable_sources.items())):
         return None
     data_feed = index.get("data_feed")
     if data_feed is not None and not isinstance(data_feed, str):
@@ -448,31 +820,144 @@ def _load_index(output: Path) -> dict | None:
         index["data_feed"] = None
     # A cycle appends rows and then rewrites the index; a crash between the two
     # leaves the index short. Byte sizes catch exactly that and force a rebuild.
-    if index["partitions"] != _partition_sizes(output):
+    partitions = _partition_sizes(output)
+    if require_partition_match and index["partitions"] != partitions:
         return None
-    if output.exists() and output.stat().st_size:
+    fingerprints = _partition_fingerprints(output)
+    indexed_fingerprints = index.get("partition_fingerprints")
+    if indexed_fingerprints is not None:
+        if not isinstance(indexed_fingerprints, dict):
+            return None
+        if require_partition_match and indexed_fingerprints != fingerprints:
+            return None
+    elif require_recent and inline_keys is None:
         return None
-    return _prune_index(index)
+    if require_partition_match and output.exists() and output.stat().st_size:
+        return None
+    index = _prune_index(index)
+    if require_recent and "recent_keys" not in index and not _recent_key_index_matches(
+            output, index.get("recent_key_index"),
+            watermark=index.get("watermark"), partitions=partitions,
+            fingerprints=fingerprints):
+        return None
+    return index
 
 
-def _save_index(output: Path, index: dict) -> None:
+def _load_index(output: Path) -> dict | None:
+    """Return the sidecar index when it demonstrably matches the partitions."""
+    path = _corpus_root(output) / INDEX_NAME
+    if not path.is_file():
+        return None
+    try:
+        # Legacy v1 files embedded every recent key.  Refuse to decode an
+        # oversized cache: recovery streams the corpus into SQLite instead of
+        # briefly allocating several times the JSON byte size.
+        if path.stat().st_size > MAX_INLINE_INDEX_BYTES:
+            return None
+        index = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _validate_index(index, output, require_recent=True)
+
+
+def _load_preserved_index_metadata(output: Path) -> dict | None:
+    """Recover non-key evidence even when a cache mismatch forces a rescan."""
+    path = _corpus_root(output) / INDEX_NAME
+    try:
+        if not path.is_file():
+            return None
+        if path.stat().st_size > MAX_INLINE_INDEX_BYTES:
+            index = _stream_index_metadata(path)
+        else:
+            index = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return _validate_index(
+        index, output, require_recent=False, require_partition_match=False)
+
+
+def _save_index(output: Path, index: dict,
+                recent_store: RecentKeyIndex | None = None) -> None:
     root = _corpus_root(output)
     root.mkdir(parents=True, exist_ok=True)
-    index = {**index, "schema": INDEX_SCHEMA, "partitions": _partition_sizes(output)}
+    index = _prune_index(dict(index))
+    partitions = _partition_sizes(output)
+    fingerprints = _partition_fingerprints(output)
+    index.update({
+        "schema": INDEX_SCHEMA,
+        "partitions": partitions,
+        "partition_fingerprints": fingerprints,
+    })
+    inline_keys = index.pop("recent_keys", None)
+    signature = _recent_key_signature(
+        index.get("watermark"), partitions, fingerprints)
+    if isinstance(inline_keys, dict):
+        metadata = _build_recent_key_index(
+            output, inline_keys.items(), watermark=index.get("watermark"),
+            partitions=partitions, fingerprints=fingerprints)
+    else:
+        owned_store = None
+        try:
+            if recent_store is None:
+                path = _recent_key_index_path(output)
+                if path.is_file():
+                    owned_store = RecentKeyIndex(path)
+                    recent_store = owned_store
+                else:
+                    metadata = _rebuild_recent_key_index(
+                        output, watermark=_timestamp(index.get("watermark")),
+                        partitions=partitions, fingerprints=fingerprints)
+            if recent_store is not None:
+                watermark = _timestamp(index.get("watermark"))
+                recent_store.prune(
+                    watermark - DEDUP_HORIZON if watermark is not None else None)
+                metadata = recent_store.bind(signature=signature)
+        finally:
+            if owned_store is not None:
+                owned_store.close()
+    index["recent_key_index"] = metadata
     temporary = root / (INDEX_NAME + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(index, handle, sort_keys=True)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, root / INDEX_NAME)
+    _fsync_directory(root)
 
 
-def _existing_state(output: Path) -> tuple[set[str], datetime | None, dict[str, datetime]]:
-    """Durable state for one cycle: dedup window, watermark, per-symbol bars."""
-    index = _load_index(output) or _scan_corpus(output)
+def _prepare_index(output: Path) -> dict:
+    """Load or rebuild both caches while preserving irreplaceable metadata."""
+    index = _load_index(output)
+    if index is None:
+        preserved = _load_preserved_index_metadata(output)
+        index = _scan_corpus(output)
+        if preserved is not None:
+            # Partition provenance is reconstructed from marker files and must
+            # never be replaced by the stale aggregate sidecar being salvaged.
+            for name in ("bar_coverage", "session_calendar", "option_pins"):
+                index[name] = dict(preserved.get(name) or {})
+        _save_index(output, index)
+        loaded = _load_index(output)
+        if loaded is None:
+            raise RuntimeError("recorder index recovery failed")
+        return loaded
+    if "recent_keys" in index:  # bounded legacy v1 cache
+        _save_index(output, index)
+        loaded = _load_index(output)
+        if loaded is None:
+            raise RuntimeError("recorder recent-key index migration failed")
+        return loaded
+    return index
+
+
+def _existing_state(output: Path) -> tuple[RecentKeyIndex, datetime | None,
+                                           dict[str, datetime]]:
+    """Open disk-backed dedup state; the caller must close the first value."""
+    index = _prepare_index(output)
     latest_bars = {symbol: _timestamp(value)
                    for symbol, value in index["latest_bars"].items()}
-    return (set(index["recent_keys"]), _timestamp(index.get("watermark")),
+    return (RecentKeyIndex(_recent_key_index_path(output)),
+            _timestamp(index.get("watermark")),
             {symbol: value for symbol, value in latest_bars.items() if value is not None})
 
 
@@ -813,6 +1298,8 @@ def _append_partitions(output: Path, rows: list[dict]) -> None:
                              for row in by_day[day])
             handle.flush()
             os.fsync(handle.fileno())
+        if fresh:
+            _fsync_directory(path.parent)
 
 
 def migrate_corpus(output: Path) -> int:
@@ -932,7 +1419,7 @@ def _resolved_feed(provider, feed: str | None, config: dict | None) -> str:
     return _canonical_data_feed(value)
 
 
-def _ingest_chunk(output: Path, index: dict, seen: set[str],
+def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
                   watermark: datetime | None,
                   latest_bars: dict[str, datetime], pins: dict,
                   rows: list[dict], symbols: list[str],
@@ -948,6 +1435,8 @@ def _ingest_chunk(output: Path, index: dict, seen: set[str],
         policy=bar_gap_policy, maximum=bar_gap_maximum)
     _update_bar_coverage(index, coverage, observed_at)
     unique_rows: list[dict] = []
+    unique_keys: set[str] = set()
+    recent_entries: list[tuple[str, str]] = []
     for row in rows:
         parsed = _timestamp(row.get("timestamp"))
         if parsed is None:
@@ -965,11 +1454,11 @@ def _ingest_chunk(output: Path, index: dict, seen: set[str],
             # the option contract remains pinned while the recorder observes it.
             pins[str(row.get("contract") or row.get("symbol"))] = (
                 observed_at + option_hold).isoformat()
-        if key in seen:
+        if key in unique_keys or recent_store.contains(key):
             continue
-        seen.add(key)
+        unique_keys.add(key)
         unique_rows.append(row)
-        index["recent_keys"][key] = parsed.isoformat()
+        recent_entries.append((key, parsed.isoformat()))
         if watermark is None or parsed > watermark:
             watermark = parsed
         if row.get("event_type") in {"bar", "bar_1m"}:
@@ -986,10 +1475,14 @@ def _ingest_chunk(output: Path, index: dict, seen: set[str],
     if rows:
         if unique_rows:
             _append_partitions(output, unique_rows)
+            # The corpus append happens first.  If the process dies before the
+            # SQLite and JSON commits, partition sizes no longer match the
+            # sidecars and recovery rebuilds them from the authoritative CSV.
+            recent_store.add_many(recent_entries)
         # Persist even a duplicate-only response: the sidecar write is the
         # recorder's durable liveness signal, while the corpus remains unchanged.
-        _save_index(output, index)
-    return index, set(index["recent_keys"]), watermark, latest_bars, pins, len(unique_rows)
+        _save_index(output, index, recent_store=recent_store)
+    return index, watermark, latest_bars, pins, len(unique_rows)
 
 
 def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
@@ -997,6 +1490,20 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
                 include_options: bool | None = None, option_limit: int = 5,
                 option_hold: timedelta = timedelta(minutes=180),
                 calendar: CalendarCache | None = None) -> int:
+    with corpus_write_lock(output):
+        return _record_once_locked(
+            provider, symbols, output, feed=feed, config=config,
+            include_options=include_options, option_limit=option_limit,
+            option_hold=option_hold, calendar=calendar)
+
+
+def _record_once_locked(provider: AlpacaProvider, symbols: list[str], output: Path,
+                        *, feed: str | None = None,
+                        config: dict | None = None,
+                        include_options: bool | None = None,
+                        option_limit: int = 5,
+                        option_hold: timedelta = timedelta(minutes=180),
+                        calendar: CalendarCache | None = None) -> int:
     symbols = [validate_equity_symbol(symbol) for symbol in symbols]
     if not symbols:
         raise ValueError("at least one US equity symbol is required")
@@ -1007,7 +1514,26 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
                               for value in classes)
     _corpus_root(output).mkdir(parents=True, exist_ok=True)
     migrate_corpus(output)
-    index = _load_index(output) or _scan_corpus(output)
+    index = _prepare_index(output)
+    recent_store = RecentKeyIndex(_recent_key_index_path(output))
+    try:
+        return _record_once_with_index(
+            provider, symbols, output, index, recent_store, now=now, feed=feed,
+            config=config, include_options=include_options,
+            option_limit=option_limit, option_hold=option_hold,
+            calendar=calendar)
+    finally:
+        recent_store.close()
+
+
+def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
+                            output: Path, index: dict,
+                            recent_store: RecentKeyIndex, *, now: datetime,
+                            feed: str | None, config: dict | None,
+                            include_options: bool, option_limit: int,
+                            option_hold: timedelta,
+                            calendar: CalendarCache | None) -> int:
+    """Run one recorder cycle with an already validated disk-backed index."""
     session_cfg = (config or {}).get("session") if isinstance(config, dict) else {}
     require_exact_calendar = bool(
         session_cfg.get("require_exact_calendar", False)
@@ -1029,7 +1555,6 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
     index["data_feed"] = resolved_feed
     bar_gap_policy = _bar_gap_policy(resolved_feed)
     bar_gap_maximum = timedelta(minutes=_bar_gap_minutes())
-    seen = set(index["recent_keys"])
     watermark = _timestamp(index.get("watermark"))
     latest_bars = {symbol: parsed for symbol, parsed in
                    ((key, _timestamp(value))
@@ -1076,12 +1601,13 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
                     f"exact broker calendar metadata missing or row outside session: {session}")
             if inside:
                 rows.append(row)
-        index, seen, watermark, latest_bars, pins, unique = _ingest_chunk(
-            output, index, seen, watermark, latest_bars, pins, rows, symbols,
+        index, watermark, latest_bars, pins, unique = _ingest_chunk(
+            output, index, recent_store, watermark, latest_bars, pins, rows, symbols,
             window_end, now, option_hold, horizon, calendar,
             feed=resolved_feed, bar_gap_policy=bar_gap_policy,
             bar_gap_maximum=bar_gap_maximum)
         total_unique += unique
+        horizon = None if watermark is None else watermark - DEDUP_HORIZON
         if window_end >= now:
             break
         cursor = window_end

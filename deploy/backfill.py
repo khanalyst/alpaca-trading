@@ -56,12 +56,13 @@ from deploy.recorder import (  # noqa: E402
     NEW_YORK,
     _append_partitions,
     _corpus_data_feed,
-    _load_index,
     _partition_path,
+    _prepare_index,
     _save_index,
     _save_partition_source,
     _scan_corpus,
     audit_corpus,
+    corpus_write_lock,
     corpus_partitions,
 )
 from deploy.recorder_market import (  # noqa: E402
@@ -199,6 +200,18 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
              feed: str | None = None, include_quotes: bool = False,
              now: datetime | None = None, overwrite: bool = False,
              progress=None) -> dict:
+    with corpus_write_lock(output):
+        return _backfill_locked(
+            provider, symbols, output, days=days, feed=feed,
+            include_quotes=include_quotes, now=now, overwrite=overwrite,
+            progress=progress)
+
+
+def _backfill_locked(provider, symbols, output: Path, *,
+                     days: int = DEFAULT_BACKFILL_DAYS,
+                     feed: str | None = None, include_quotes: bool = False,
+                     now: datetime | None = None, overwrite: bool = False,
+                     progress=None) -> dict:
     """Write completed historical sessions into the recorder's corpus.
 
     Sessions that already have a partition are skipped, so an interrupted run
@@ -218,7 +231,7 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
             getattr(provider, "data_feed", None) or _feed())
     except ValueError as exc:
         raise BackfillError(str(exc)) from exc
-    index = _load_index(output)
+    index = _prepare_index(output)
     existing_calendar = dict(index.get("session_calendar") or {}) \
         if index is not None else {}
     existing_sources = dict(index.get("partition_sources") or {}) \

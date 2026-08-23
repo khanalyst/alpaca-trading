@@ -478,8 +478,11 @@ than being treated as automatic corpus corruption; replay gates still refuse a
 gap where the strategy actually needs adjacent bars.
 
 The recorder writes one append-only partition per New York session date under
-`runtime/research/recorded/sessions/`, with a sidecar `.recorder-index.json`
-holding the watermark and dedup state.
+`runtime/research/recorded/sessions/`. The compact `.recorder-index.json`
+sidecar holds the watermark and coverage metadata, while
+`.recorder-recent-keys.sqlite3` keeps the exact fifteen-minute dedup window on
+disk. Both are rebuildable caches tied to the authoritative partition
+fingerprints, and recorder/backfill writers share one corpus lock.
 
 Recorder controls have working defaults:
 

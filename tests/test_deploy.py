@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import call, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1416,14 +1416,272 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(list(recorder.iter_corpus_rows(path)), before_rows)
             self.assertEqual(index_path.read_text(encoding="utf-8"), before_index)
 
-    def test_recorder_scan_retains_only_recent_keys(self):
+    def test_recorder_scan_retains_only_recent_keys_on_disk(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "market.csv"
             rows = _corpus_rows(sessions=30, per_session=200)
             recorder._append_partitions(path, rows)
             index = recorder._scan_corpus(path)
-            self.assertLess(len(index["recent_keys"]), len(rows))
-            self.assertLessEqual(len(index["recent_keys"]), 16)
+            metadata = index["recent_key_index"]
+            self.assertLess(metadata["count"], len(rows))
+            self.assertLessEqual(metadata["count"], 16)
+            self.assertNotIn("recent_keys", index)
+            with recorder.RecentKeyIndex(
+                    Path(directory) / recorder.RECENT_KEY_INDEX_NAME,
+                    read_only=True) as recent:
+                self.assertEqual(recent.count(), metadata["count"])
+
+    def test_recorder_high_rate_window_keeps_json_index_small(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            start = datetime(2026, 8, 8, 13, 30, tzinfo=timezone.utc)
+            rows = []
+            for number in range(20_000):
+                stamp = start + timedelta(microseconds=number)
+                row = {field: "" for field in recorder.FIELDS}
+                row.update({
+                    "event_key": recorder._event_key(
+                        "quote", "SPY", stamp.isoformat()),
+                    "observed_at": stamp.isoformat(), "provider": "alpaca",
+                    "feed": "iex", "event_type": "quote", "symbol": "SPY",
+                    "timestamp": stamp.isoformat(), "as_of": stamp.isoformat(),
+                    "bid": "100", "ask": "101", "last": "100.5",
+                })
+                rows.append(row)
+            recorder._append_partitions(path, rows)
+            index = recorder._scan_corpus(path)
+            recorder._save_index(path, index)
+
+            index_path = root / recorder.INDEX_NAME
+            self.assertLess(index_path.stat().st_size, 16_384)
+            loaded = recorder._load_index(path)
+            self.assertIsNotNone(loaded)
+            self.assertNotIn("recent_keys", loaded)
+            self.assertEqual(loaded["recent_key_index"]["count"], len(rows))
+            with recorder.RecentKeyIndex(
+                    root / recorder.RECENT_KEY_INDEX_NAME,
+                    read_only=True) as recent:
+                self.assertEqual(recent.count(), len(rows))
+                self.assertTrue(recent.contains(rows[-1]["event_key"]))
+
+    def test_recorder_does_not_decode_oversized_legacy_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=2)
+            recorder._append_partitions(path, rows)
+            index = recorder._scan_corpus(path)
+            legacy = {
+                **index,
+                "recent_keys": {
+                    row["event_key"]: row["timestamp"] for row in rows},
+            }
+            legacy.pop("recent_key_index")
+            (root / recorder.INDEX_NAME).write_text(
+                json.dumps(legacy), encoding="utf-8")
+            with patch.object(recorder, "MAX_INLINE_INDEX_BYTES", 64):
+                self.assertIsNone(recorder._load_index(path))
+
+    def test_recorder_oversized_migration_preserves_calendar_and_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=3)
+            recorder._append_partitions(path, rows)
+            legacy = recorder._scan_corpus(path)
+            legacy.pop("recent_key_index")
+            legacy.pop("partition_fingerprints")
+            legacy["recent_keys"] = {
+                f"{number:064x}": "2026-01-05T15:00:00+00:00"
+                for number in range(200)
+            }
+            legacy["bar_coverage"] = {
+                "SPY": {"status": "covered", "observations": 7},
+            }
+            legacy["session_calendar"] = {
+                "2026-01-05": {
+                    "open": "2026-01-05T14:30:00+00:00",
+                    "close": "2026-01-05T21:00:00+00:00",
+                    "source": "alpaca_calendar",
+                },
+            }
+            legacy["option_pins"] = {
+                "SPY260116C00600000": "2026-01-05T18:00:00+00:00",
+            }
+            index_path = root / recorder.INDEX_NAME
+            index_path.write_text(json.dumps(legacy, sort_keys=True),
+                                  encoding="utf-8")
+            self.assertGreater(index_path.stat().st_size, 8_192)
+
+            with patch.object(recorder, "MAX_INLINE_INDEX_BYTES", 8_192):
+                migrated = recorder._prepare_index(path)
+
+            self.assertEqual(migrated["bar_coverage"], legacy["bar_coverage"])
+            self.assertEqual(migrated["session_calendar"],
+                             legacy["session_calendar"])
+            self.assertEqual(migrated["option_pins"], legacy["option_pins"])
+            self.assertNotIn("recent_keys", migrated)
+            self.assertLess(index_path.stat().st_size, 8_192)
+            with recorder.RecentKeyIndex(
+                    root / recorder.RECENT_KEY_INDEX_NAME,
+                    read_only=True) as recent:
+                self.assertEqual(
+                    recent.count(), migrated["recent_key_index"]["count"])
+
+    def test_recorder_same_size_partition_rewrite_invalidates_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=3)
+            recorder._append_partitions(path, rows)
+            index = recorder._scan_corpus(path)
+            index["session_calendar"] = {
+                "2026-01-05": {
+                    "open": "2026-01-05T14:30:00+00:00",
+                    "close": "2026-01-05T21:00:00+00:00",
+                    "source": "alpaca_calendar",
+                },
+            }
+            recorder._save_index(path, index)
+            partition = recorder.corpus_partitions(path)[0]
+            before = partition.stat()
+            content = partition.read_bytes()
+            old_key = rows[-1]["event_key"]
+            new_key = "f" * len(old_key)
+            if new_key == old_key:
+                new_key = "e" * len(old_key)
+            partition.write_bytes(content.replace(
+                old_key.encode("utf-8"), new_key.encode("utf-8"), 1))
+            os.utime(partition, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+
+            self.assertEqual(partition.stat().st_size, before.st_size)
+            self.assertIsNone(recorder._load_index(path))
+            recovered = recorder._prepare_index(path)
+            self.assertEqual(recovered["session_calendar"],
+                             index["session_calendar"])
+
+    def test_recorder_append_crash_recovery_preserves_compact_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=2)
+            recorder._append_partitions(path, rows)
+            index = recorder._scan_corpus(path)
+            index["bar_coverage"] = {
+                "SPY": {"status": "covered", "observations": 3},
+            }
+            index["session_calendar"] = {
+                "2026-01-05": {
+                    "open": "2026-01-05T14:30:00+00:00",
+                    "close": "2026-01-05T21:00:00+00:00",
+                    "source": "alpaca_calendar",
+                },
+            }
+            recorder._save_index(path, index)
+            before_size = (root / recorder.INDEX_NAME).stat().st_size
+
+            # Simulate a crash after the authoritative CSV fsync but before
+            # SQLite/JSON sidecar commits. The marker is newer than the stale
+            # aggregate index, as it is during interrupted backfill.
+            extra = _corpus_rows(sessions=2, per_session=1)[0]
+            extra_day = recorder._session_date(
+                datetime.fromisoformat(extra["timestamp"]))
+            recorder._save_partition_source(
+                path, extra_day, "historical_backfill")
+            recorder._append_partitions(path, [extra])
+            self.assertIsNone(recorder._load_index(path))
+            recovered = recorder._prepare_index(path)
+
+            self.assertEqual(recovered["bar_coverage"], index["bar_coverage"])
+            self.assertEqual(recovered["session_calendar"],
+                             index["session_calendar"])
+            self.assertEqual(recovered["partition_sources"], {
+                recorder._partition_path(path, extra_day).name: {
+                    "source_mode": "historical_backfill",
+                },
+            })
+            self.assertLess((root / recorder.INDEX_NAME).stat().st_size,
+                            max(16_384, before_size * 2))
+
+    def test_recorder_fsyncs_new_partition_and_provenance_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=1)
+            day = recorder._session_date(
+                datetime.fromisoformat(rows[0]["timestamp"]))
+            sessions = Path(directory) / recorder.PARTITION_DIR
+            with patch.object(recorder, "_fsync_directory") as fsync:
+                recorder._save_partition_source(
+                    path, day, "historical_backfill")
+                recorder._append_partitions(path, rows)
+            self.assertEqual(fsync.call_args_list, [
+                call(sessions),
+                call(sessions),
+            ])
+
+    def test_recorder_tolerates_marker_only_backfill_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            day = datetime(2026, 8, 7, tzinfo=timezone.utc).date()
+            recorder._save_partition_source(
+                path, day, "historical_backfill")
+
+            self.assertEqual(
+                recorder._partition_sources_from_markers(path), {})
+            rebuilt = recorder._scan_corpus(path)
+            self.assertEqual(rebuilt["partition_sources"], {})
+
+    def test_recorder_corpus_lock_serializes_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            command = [
+                sys.executable, "-c",
+                "from pathlib import Path; import sys; "
+                "from deploy.recorder import corpus_write_lock; "
+                "\nwith corpus_write_lock(Path(sys.argv[1])): "
+                "print('acquired', flush=True)",
+                str(path),
+            ]
+            with recorder.corpus_write_lock(path):
+                child = subprocess.Popen(
+                    command, cwd=Path(__file__).resolve().parents[1],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    child.communicate(timeout=0.2)
+            stdout, stderr = child.communicate(timeout=5)
+            self.assertEqual(child.returncode, 0, stderr)
+            self.assertEqual(stdout.strip(), "acquired")
+
+    def test_recorder_rebuilds_when_recent_key_count_does_not_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=3)
+            recorder._append_partitions(path, rows)
+            recorder._save_index(path, recorder._scan_corpus(path))
+
+            database = root / recorder.RECENT_KEY_INDEX_NAME
+            with closing(sqlite3.connect(database)) as db:
+                with db:
+                    db.execute(
+                        "DELETE FROM recent_keys WHERE event_key=?",
+                        (rows[-1]["event_key"],))
+
+            self.assertIsNone(recorder._load_index(path))
+
+    def test_recorder_recent_key_timestamps_are_normalized_to_utc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / recorder.RECENT_KEY_INDEX_NAME
+            with recorder.RecentKeyIndex(database, create=True) as recent:
+                recent.add_many([
+                    ("first", "2026-08-08T08:59:00-04:00"),
+                    ("second", "2026-08-08T13:01:00+00:00"),
+                ])
+                recent.prune(datetime(
+                    2026, 8, 8, 13, 0, tzinfo=timezone.utc))
+                self.assertFalse(recent.contains("first"))
+                self.assertTrue(recent.contains("second"))
 
     def test_recorder_service_retries_errors_without_exiting(self):
         with tempfile.TemporaryDirectory() as directory:

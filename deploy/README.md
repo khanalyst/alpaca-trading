@@ -49,13 +49,15 @@ the lock.
 
 The recorder writes its mixed bars/quotes/options corpus partitioned by New
 York session date under `runtime/research/recorded/sessions/market-<date>.csv`,
-with a sidecar `.recorder-index.json` holding the watermark, the per-symbol last
-bar and bounded coverage evidence, the corpus equity feed, a fifteen-minute
-dedup window and the option contracts held open for continued sampling. A cycle
-costs O(new rows); the index is verified against partition sizes on load and
-rebuilt from the partitions when they disagree. The rebuild retains only the
-bounded dedup window; use the explicit audit command when a full historical
-duplicate check is required:
+with a compact `.recorder-index.json` sidecar holding the watermark, per-symbol
+last bar, bounded coverage evidence, corpus equity feed, and option contracts
+held open for continued sampling. Exact keys for the fifteen-minute dedup
+window live in `.recorder-recent-keys.sqlite3`, so high-rate quote bursts do not
+expand a large JSON object in recorder memory. Both caches are bound to the
+partition size/mtime fingerprints and watermark and are rebuilt by streaming
+the partitions when they disagree. Recorder and backfill mutations share one
+corpus lock. The rebuild retains only the bounded dedup window; use the
+explicit audit command when a full historical duplicate check is required:
 
 ```sh
 docker compose run --rm --no-deps recorder \
