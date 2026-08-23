@@ -552,13 +552,15 @@ signatures for parity; only the research consumer can append the authorization
 marker.
 
 The checked research config enables the bounded strategy LLM with model
-`gpt-5`. The OpenAI path uses the Responses API structured-output request.
-Prompt, request, schema, configuration (including the fixed sampling setting),
-and received-response hashes make the evidence reproducible for the exact
-invocation, but model output is not guaranteed bit-for-bit identical on a later
-call. The checked Responses request pins `temperature` to `0`, fixing the
-sampling setting without making provider output deterministic; the hashes
-preserve the actual request and response.
+`gpt-5.6-terra`. The OpenAI path uses the Responses API structured-output request.
+Prompt, request, schema, configuration (including the effective sampling
+setting), and received-response hashes make the evidence reproducible for the
+exact invocation, but model output is not guaranteed bit-for-bit identical on a
+later call. OpenAI requests send `temperature: 0` when supported; when the
+configured model or deployment is exactly `gpt-5.6-terra`, the adapter omits
+that unsupported parameter and records `temperature: null` in configuration
+evidence. Anthropic requests keep `temperature` at `0`; the hashes preserve the
+actual request and response.
 Compose requires the host override
 `ALPACA_RESEARCH_LLM_SECRET_FILE` and mounts that separate readable provider
 dotenv as `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing, unreadable, or keyless

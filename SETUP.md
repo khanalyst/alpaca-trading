@@ -215,7 +215,7 @@ ANTHROPIC_API_KEY=<research-provider-key>
 ```
 
 The model is set in `config.yaml` under `research.strategy_llm.model` and
-defaults to `gpt-5`; leave `research.strategy_llm.enabled: true`. Set
+defaults to `gpt-5.6-terra`; leave `research.strategy_llm.enabled: true`. Set
 `research.strategy_llm.provider` to `anthropic` if you supplied an Anthropic
 key. When `OPENAI_BASE_URL` points at Azure, also set
 `research.strategy_llm.deployment` to the exact resource-local deployment
@@ -224,12 +224,14 @@ when the alias is absent. Compose mounts this file separately and systemd reads 
 `ALPACA_RESEARCH_LLM_SECRETS_FILE`; never put provider keys in `agent.env`.
 
 For the checked OpenAI provider, requests use the Responses API structured
-output path. Prompt, request, schema, configuration (including the fixed
+output path. Prompt, request, schema, configuration (including the effective
 sampling setting), and received-response hashes make the evidence reproducible
 for the exact invocation, but model output is not guaranteed bit-for-bit
-identical on a later call. The checked Responses request pins `temperature` to
-`0`, fixing the sampling setting without making provider output deterministic;
-the hashes preserve the actual request and response.
+identical on a later call. OpenAI requests send `temperature: 0` when
+supported; when the configured model or deployment is exactly
+`gpt-5.6-terra`, the adapter omits that unsupported parameter and records
+`temperature: null` in configuration evidence. Anthropic requests keep
+`temperature` at `0`; the hashes preserve the actual request and response.
 
 Treat a custom provider base URL as a secret-bearing outbound destination.
 `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` receives the provider key and bounded
@@ -745,7 +747,7 @@ exactly why anything was retired. A slice of real output:
       thesis  Late-morning stretch from session VWAP reverts when volume confirms.
       refuted if: The vwap reversion rule has no positive held-out and forward
                   expectancy after costs and multiple-test correction.
-      proposed by openai/gpt-5 in 1 attempt(s)
+      proposed by openai/gpt-5.6-terra in 1 attempt(s)
         prompt ssssssssssssssss…  request rrrrrrrrrrrrrrrr…  response xxxxxxxxxxxxxxxx…
       variants tested: 2
         - rule.vwap-reversion.4b63bb08503e875b  [fail]  lane=backtest

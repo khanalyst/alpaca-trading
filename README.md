@@ -222,14 +222,15 @@ Custom provider endpoints are a trust boundary. `llm.base_url`,
 prompt, so configure only a trusted HTTPS service; the application does not
 currently enforce a host allowlist for LLM endpoints. The OpenAI research path
 uses the Responses API structured-output request. Prompt, request, schema,
-configuration (including the fixed sampling setting), and received-response
+configuration (including the effective sampling setting), and received-response
 hashes make the evidence reproducible for the exact invocation, but they do not
-guarantee bit-for-bit identical model output on a later call. The checked
-Responses request pins `temperature` to `0`, fixing the sampling setting without
-making provider output deterministic; the hashes preserve the actual request
-and response. The adapter's call budget is a per-run call-count guard, not spend
-accounting; provider-side quotas remain an operational control for unattended
-research.
+guarantee bit-for-bit identical model output on a later call. OpenAI requests
+send `temperature: 0` when supported; when the configured model or deployment
+is exactly `gpt-5.6-terra`, the adapter omits that unsupported parameter and
+records `temperature: null` in configuration evidence. Anthropic requests keep
+`temperature` at `0`; the hashes preserve the actual request and response. The
+adapter's call budget is a per-run call-count guard, not spend accounting;
+provider-side quotas remain an operational control for unattended research.
 
 Before any dataset work, the scheduled cycle runs one bounded, non-authorizing
 `python3 research.py llm-preflight --agent-config config.yaml` probe through the
@@ -503,7 +504,7 @@ explicit option-lane review. IEX is a limited venue view rather than the
 consolidated SIP tape; sparse coverage is retained as evidence, and changing
 feeds requires a fresh research/shadow proof. The scheduled research lane also
 requires a separate readable dotenv file with `OPENAI_API_KEY` for the checked
-`openai`/`gpt-5` provider (or the matching configured provider key); set
+`openai`/`gpt-5.6-terra` provider (or the matching configured provider key); set
 `ALPACA_RESEARCH_LLM_SECRET_FILE` to that path. Azure endpoints additionally
 require the exact resource-local alias in
 `research.strategy_llm.deployment`; do not substitute a catalog model ID.
@@ -512,7 +513,7 @@ broker secret. `check` is the
 authenticated preflight by default; `check --offline` validates local
 configuration only and is not a trading preflight. Unit tests use fakes and do
 not need credentials. Research LLM discovery/replacement/tuning is enabled with
-the checked `openai`/`gpt-5` provider and fails closed before discovery when its
+the checked `openai`/`gpt-5.6-terra` provider and fails closed before discovery when its
 separate secret is absent, unreadable, or keyless. Provider credentials are
 read only from `ALPACA_RESEARCH_LLM_SECRET_FILE`; invalid model output leaves a
 pending replacement and never retires a family or authorizes trading.

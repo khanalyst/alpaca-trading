@@ -758,7 +758,7 @@ class RuleProposalAdapter:
         """Hash non-secret adapter configuration for reproducible evidence."""
         return content_hash({"provider": self.provider, "model": self.model,
                              "deployment": self.deployment,
-                             "temperature": RESEARCH_SAMPLING_TEMPERATURE,
+                             "temperature": self._request_temperature(),
                              "max_attempts": self.max_attempts,
                              "timeout_seconds": self.timeout_seconds,
                              "max_response_bytes": self.max_response_bytes,
@@ -850,6 +850,15 @@ class RuleProposalAdapter:
     def _provider_model(self) -> str:
         """Return the inference identifier without discarding catalog metadata."""
         return self.deployment or self.model
+
+    def _request_temperature(self) -> int | None:
+        """Return the supported deterministic sampling value for this model."""
+        identifiers = {self.model.strip().lower(),
+                       (self.deployment or "").strip().lower()}
+        if self.provider == "openai" and any(
+                value == "gpt-5.6-terra" for value in identifiers):
+            return None
+        return RESEARCH_SAMPLING_TEMPERATURE
 
     @staticmethod
     def _azure_endpoint_configured() -> bool:
@@ -1054,20 +1063,24 @@ class RuleProposalAdapter:
             # Current OpenAI Responses API structured output shape.
             format_name = ("llm_provider_preflight" if preflight else
                            "llm_rule_proposal")
-            response = client.responses.create(
-                model=self._provider_model(), input=[
+            request_kwargs: dict[str, Any] = {
+                "model": self._provider_model(), "input": [
                     {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                     {"role": "user", "content": [{"type": "input_text", "text": request_text}]},
                 ],
-                text={"format": {"type": "json_schema", "name": format_name,
-                                      "strict": True,
-                                      "schema": self._schema(
-                                          schema_name,
-                                          vehicle=request.get("vehicle"))}},
-                temperature=RESEARCH_SAMPLING_TEMPERATURE,
-                **({"max_output_tokens": 32} if preflight else {}),
-                timeout=timeout,
-            )
+                "text": {"format": {"type": "json_schema", "name": format_name,
+                                     "strict": True,
+                                     "schema": self._schema(
+                                         schema_name,
+                                         vehicle=request.get("vehicle"))}},
+                "timeout": timeout,
+            }
+            temperature = self._request_temperature()
+            if temperature is not None:
+                request_kwargs["temperature"] = temperature
+            if preflight:
+                request_kwargs["max_output_tokens"] = 32
+            response = client.responses.create(**request_kwargs)
             # Connectivity probes intentionally do not inspect/model-parse
             # the response body; a successful HTTP/API return is sufficient.
             return response if preflight else _raw_text(

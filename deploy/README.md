@@ -329,17 +329,19 @@ Model-assisted research is enabled in the shipped paper configuration. Set
 research-provider dotenv file before startup; it is mounted read-only as
 `/run/secrets/research_llm_credentials`. The file must be readable by the
 container's restricted UID and contain `OPENAI_API_KEY` for the checked
-`openai`/`gpt-5` provider (or the matching `ANTHROPIC_API_KEY` when configured).
+`openai`/`gpt-5.6-terra` provider (or the matching `ANTHROPIC_API_KEY` when configured).
 When `OPENAI_BASE_URL` is Azure, set the exact resource-local alias in
 `research.strategy_llm.deployment`; the catalog model name is retained only as
 evidence and is not guessed as the deployment.
 Broker credentials are not mounted into the research service. The OpenAI path
 uses the Responses API structured-output request; prompt, request, schema, and
-configuration (including the fixed sampling setting), plus response hashes,
+configuration (including the effective sampling setting), plus response hashes,
 reproduce the evidence for the exact invocation but do not guarantee bit-for-bit
-identical later model output. The checked request pins `temperature` to `0`,
-fixing the sampling setting without making provider output deterministic; the
-hashes preserve the actual request and response.
+identical later model output. OpenAI requests send `temperature: 0` when
+supported; when the configured model or deployment is exactly
+`gpt-5.6-terra`, the adapter omits that unsupported parameter and records
+`temperature: null` in configuration evidence. Anthropic requests keep
+`temperature` at `0`; the hashes preserve the actual request and response.
 
 The shipped Compose and systemd lanes are paper-scoped. A live deployment is a
 separate reviewed config/runtime scope: `mode: live`, `broker.paper: false`,

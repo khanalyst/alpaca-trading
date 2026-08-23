@@ -679,7 +679,7 @@ directional/pair coverage. Quote density can legitimately change null/control
 evidence even when the candidate count is unchanged.
 
 The checked config enables model-assisted discovery, replacement, and tuning
-with OpenAI `gpt-5`. Azure-compatible endpoints also require the exact
+with OpenAI `gpt-5.6-terra`. Azure-compatible endpoints also require the exact
 resource-local alias in `research.strategy_llm.deployment`; preflight rejects
 an unset alias before loading the corpus. Compose uses the host override
 `ALPACA_RESEARCH_LLM_SECRET_FILE`; the scheduler reads the mounted path through
@@ -693,13 +693,15 @@ to an HTTPS webhook without changing the durable artifact.
 `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` are trust boundaries: a configured
 endpoint receives the provider key and the bounded aggregate prompt. Use only a
 trusted HTTPS service; there is no application host allowlist. Prompt, request,
-schema, configuration (including the fixed sampling setting), and raw-response
-hashes prove what the cycle consumed, and make the evidence reproducible for
-that exact invocation, but they do not guarantee bit-for-bit identical model
-output later. The OpenAI path uses the Responses API structured-output request
-and pins `temperature` to `0`, fixing the sampling setting without making
-provider output deterministic; the hashes preserve the actual request and
-response. The adapter's call budget is a per-run call-count
+schema, configuration (including the effective sampling setting), and
+raw-response hashes prove what the cycle consumed, and make the evidence
+reproducible for that exact invocation, but they do not guarantee bit-for-bit
+identical model output later. The OpenAI path uses the Responses API
+structured-output request and sends `temperature: 0` when supported; when the
+configured model or deployment is exactly `gpt-5.6-terra`, the adapter omits
+that unsupported parameter and records `temperature: null` in configuration
+evidence. Anthropic requests keep `temperature` at `0`; the hashes preserve the
+actual request and response. The adapter's call budget is a per-run call-count
 guard rather than spend accounting; provider-side quotas remain an operational
 control.
 

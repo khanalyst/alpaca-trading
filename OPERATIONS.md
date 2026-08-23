@@ -508,11 +508,13 @@ remains an audited control subject to lifecycle/evidence rules. Backward rollbac
 the operator safety action. Good edges emit content-addressed edge proof reports
 and may send an optional HTTPS webhook. The OpenAI research path uses the
 Responses API; prompt/request/schema/configuration/response hashes (with the
-fixed sampling setting included in configuration) reproduce the evidence for
-that invocation, not a guaranteed bit-for-bit identical later model output. The
-checked request pins `temperature` to `0`, fixing the sampling setting without
-making provider output deterministic; the hashes preserve the actual request
-and response. Keep data
+effective sampling setting included in configuration) reproduce the evidence
+for that invocation, not a guaranteed bit-for-bit identical later model output.
+OpenAI requests send `temperature: 0` when supported; when the configured
+model or deployment is exactly `gpt-5.6-terra`, the adapter omits that
+unsupported parameter and records `temperature: null` in configuration
+evidence. Anthropic requests keep `temperature` at `0`; the hashes preserve
+the actual request and response. Keep data
 provenance, session date, feed, contract identity, and costs with each result.
 Do not combine regular-session evidence with pre/post-market or overnight data.
 Replay uses the runtime `ReplayPolicy`: `execution.strict_market_data` defaults

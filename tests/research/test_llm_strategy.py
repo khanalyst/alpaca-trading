@@ -147,6 +147,40 @@ class LLMRuleStrategyTests(unittest.TestCase):
         self.assertEqual(result.evidence["model"], "gpt-catalog")
         self.assertEqual(result.evidence["deployment"], "azure-prod")
 
+    def test_gpt5_deployment_omits_unsupported_temperature(self):
+        seen = {}
+
+        class Response:
+            output_text = proposal()
+
+        class Responses:
+            def create(self, **kwargs):
+                seen.update(kwargs)
+                return Response()
+
+        class Client:
+            responses = Responses()
+
+        adapter = RuleProposalAdapter(
+            client=Client(), model="gpt-5.6-terra",
+            deployment="gpt-5.6-terra", max_attempts=1)
+        result = adapter.preflight()
+        self.assertEqual(result.status, "ready", result.reason)
+        self.assertNotIn("temperature", seen)
+        self.assertEqual(seen["max_output_tokens"], 32)
+
+        expected = content_hash({
+            "provider": "openai",
+            "model": "gpt-5.6-terra",
+            "deployment": "gpt-5.6-terra",
+            "temperature": None,
+            "max_attempts": adapter.max_attempts,
+            "timeout_seconds": adapter.timeout_seconds,
+            "max_response_bytes": adapter.max_response_bytes,
+            "max_total_calls": adapter.max_total_calls,
+        })
+        self.assertEqual(result.evidence["config_hash"], expected)
+
     def test_sampling_and_deployment_are_part_of_evidence_config(self):
         adapter = RuleProposalAdapter(
             model="gpt-catalog", deployment="azure-prod",

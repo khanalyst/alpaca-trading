@@ -485,12 +485,13 @@ tuning path has a deterministic fallback, so the factory keeps discovering with
 no provider configured.
 
 The OpenAI lane uses the Responses API structured-output request. Prompt,
-request, schema, configuration (including the fixed sampling setting), and
+request, schema, configuration (including the effective sampling setting), and
 received-response hashes make the evidence reproducible for the exact
 invocation, but do not guarantee bit-for-bit identical model output on a later
-call. The checked Responses request pins `temperature` to `0`, fixing the
-sampling setting without making provider output deterministic; the hashes
-preserve the actual request and response.
+call. OpenAI requests send `temperature: 0` when supported; the checked
+`gpt-5.6-terra` model omits that unsupported parameter and records
+`temperature: null` in configuration evidence. Anthropic requests keep
+`temperature` at `0`; the hashes preserve the actual request and response.
 
 `agent.brain.DecisionBrain` is a separate optional paper-runtime adapter. It is
 consulted only after a deterministic strategy has produced a setup; it can
