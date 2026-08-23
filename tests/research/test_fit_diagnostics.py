@@ -6,7 +6,7 @@ import unittest
 
 from agent.contracts.rule import evaluate_rule_signal_metadata
 from research.edge_lab import _read_discovery_rows
-from research.costs import CostModel
+from research.costs import CostModel, diagnostic_backfill_policy
 from research.fit_diagnostics import (
     collapse_behavior_aliases, measure_fit_diagnostics,
 )
@@ -77,6 +77,32 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertGreater(baseline["first_signal"]["signals"], 0)
         self.assertEqual(diagnostic["first_signal"]["signals"], 0)
         self.assertEqual(diagnostic["eligible_prefix"]["eligible"], 0)
+
+    def test_explicit_backfill_diagnostics_recover_prefix_without_authorizing(self):
+        bars, _snapshots, _quotes = self._fit()
+        historical = [replace(
+            row,
+            identity=replace(
+                row.identity,
+                as_of=row.timestamp,
+                observed_at=row.timestamp + timedelta(days=30),
+                source_mode="historical_backfill",
+            ),
+        ) for row in bars]
+        refused = measure_fit_diagnostics(historical, ROOT_SPEC)
+        self.assertEqual(refused["first_signal"]["signals"], 0)
+        policy = diagnostic_backfill_policy()
+        diagnostic = measure_fit_diagnostics(
+            historical, ROOT_SPEC, policy=policy)
+        self.assertGreater(diagnostic["first_signal"]["signals"], 0)
+        self.assertFalse(diagnostic["authorizing"])
+        self.assertTrue(diagnostic["diagnostic_only"])
+        self.assertTrue(diagnostic["historical_backfill"]["included"])
+        self.assertFalse(diagnostic["historical_backfill"]["authorizing"])
+        self.assertEqual(
+            historical[0].identity.observed_at,
+            bars[0].timestamp + timedelta(days=30),
+        )
 
     def test_missing_immediate_entry_bar_cannot_become_a_signal(self):
         bars, _snapshots, _quotes = self._fit()

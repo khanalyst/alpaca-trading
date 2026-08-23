@@ -27,7 +27,8 @@ from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V1, RULE_SCHEMA_V2,
                                   rule_semantic_signature, rule_variant_id,
                                   validate_rule_spec)
 from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
-                    index_quotes, quote_fill, replay_policy_for_mode)
+                    diagnostic_backfill_policy, index_quotes, quote_fill,
+                    replay_policy_for_mode)
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
@@ -152,7 +153,7 @@ _FIT_DIAGNOSTIC_KEYS = frozenset({
     "atr_bps", "floor_30bps", "planned", "vehicle", "cost_to_risk",
     "risk", "exits", "exit_grammar", "mde_power", "behavior_fingerprint",
     "30bps_floor_binding", "planned_effective", "cost_to_risk_stressed",
-    "execution_rejections",
+    "execution_rejections", "historical_backfill",
 })
 _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "eligible", "total", "rate", "needed_prefix_bars", "signals",
@@ -168,6 +169,7 @@ _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "full_alias_key", "signal_count", "planned_vector_count", "authorizing",
     "rows", "executed_rows", "no_trade_rows",
     "explicit_rejections", "reject_reason_counts", "execution_blocked",
+    "diagnostic_policy", "included",
 })
 _FIT_SELECTION_REJECTION_KEYS = frozenset({
     "rows", "executed_rows", "no_trade_rows",
@@ -996,6 +998,7 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
         selected = adapter or RuleProposalAdapter(
             provider=str(config.get("provider") or "openai"),
             model=str(config.get("model") or ""),
+            deployment=config.get("deployment"),
             max_attempts=int(config.get("max_attempts", 1)),
             timeout_seconds=float(config.get("timeout_seconds", 30)),
             max_response_bytes=int(config.get("max_response_bytes", 16_384)),
@@ -1113,6 +1116,7 @@ def _adapter(config: Mapping[str, Any],
     return adapter or RuleProposalAdapter(
         provider=str(config.get("provider") or "openai"),
         model=str(config.get("model") or ""),
+        deployment=config.get("deployment"),
         max_attempts=int(config.get("max_attempts", 1)),
         timeout_seconds=float(config.get("timeout_seconds", 30)),
         max_response_bytes=int(config.get("max_response_bytes", 16_384)),
@@ -1377,6 +1381,7 @@ def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any],
     selected = adapter or RuleProposalAdapter(
         provider=str(config.get("provider") or "openai"),
         model=str(config.get("model") or ""),
+        deployment=config.get("deployment"),
         max_attempts=int(config.get("max_attempts", 1)),
         timeout_seconds=float(config.get("timeout_seconds", 30)),
         max_response_bytes=int(config.get("max_response_bytes", 16_384)),
@@ -1716,7 +1721,8 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
         fit_diagnostics = measure_fit_diagnostics(
             fit_bars, hypothesis["rule_spec"],
             account_rows=root_account["rows"], costs=payload["costs"],
-            vehicle=vehicle, risk_config=payload.get("risk_config"))
+            vehicle=vehicle, risk_config=payload.get("risk_config"),
+            policy=payload.get("policy"))
         return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
                 "diagnostic": {
                     **diagnose(root_account["rows"], starting_cash=starting_cash),
@@ -1753,7 +1759,8 @@ def _fit_variants_worker(payload: Mapping[str, Any]) -> dict:
             output[variant_id] = measure_fit_diagnostics(
                 fit_bars, spec, account_rows=account["rows"],
                 costs=payload["costs"], vehicle=str(payload["vehicle"]),
-                risk_config=payload.get("risk_config"))
+                risk_config=payload.get("risk_config"),
+                policy=payload.get("policy"))
         return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
                 "fit_diagnostics": output, "worker_pid": os.getpid()}
     finally:
@@ -2173,6 +2180,33 @@ def _fit_execution_blocked(gate: Mapping[str, Any]) -> bool:
         str(row.get("reject_reason") or "").strip() for row in no_trade)
 
 
+def _execution_blocked_exhausted(
+        local: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+        worker: Mapping[str, Any], refinement: Mapping[str, Any],
+        coordinate_remaining: int) -> bool:
+    """Whether a bounded search batch exhausted only execution-blocked points.
+
+    This is deliberately separate from :func:`_terminal_negative`: an
+    execution rejection has no effect estimate and must never be converted
+    into a statistical retirement.  Rotation is allowed only on the final
+    interaction/confirmation batch, after all coordinate candidates have
+    been consumed, and only when every intended point in that batch was
+    explicitly rejected at execution.
+    """
+    if not local or coordinate_remaining > 0:
+        return False
+    if str(refinement.get("phase") or "") not in {"interaction", "confirmatory"}:
+        return False
+    expected = int(worker.get("expected_variants", 0) or 0)
+    if expected <= 0 or len(local) != expected:
+        return False
+    interaction_remaining = int(
+        refinement.get("interaction_remaining_before") or 0)
+    if interaction_remaining > len(local):
+        return False
+    return all(_fit_execution_blocked(gate) for _variant, gate in local)
+
+
 def _fit_lesson_classification(gate: Mapping[str, Any]) -> tuple[str, bool, bool]:
     """Return (fit verdict, underpowered, fit passed) for proposal feedback."""
     if _fit_execution_blocked(gate):
@@ -2265,6 +2299,78 @@ def _existing_specs(edge: EdgeLedger, hypothesis_id: str, vehicle: str) -> list[
     return specs
 
 
+def _run_diagnostic_factory(
+        data: str | Path | Sequence[Mapping], *, vehicle: str,
+        strategies: int, starting_cash: float,
+        costs: CostModel | None,
+        runtime_config: Mapping[str, Any] | None,
+        ) -> dict[str, Any]:
+    """Evaluate an explicitly diagnostic corpus without touching ledgers.
+
+    Historical-backfill bars are useful for checking signal reachability and
+    planned geometry, but they cannot authorize an edge.  This path therefore
+    uses the bars-capable diagnostic replay policy and returns fit summaries
+    only; it deliberately does not construct ``FactoryLedger``/``EdgeLedger``
+    instances, run gates/FDR, reserve boundaries, or emit proofs.
+    """
+    if vehicle not in {"equity", "option"}:
+        raise FactoryError("vehicle must be equity or option")
+    if not 1 <= int(strategies) <= MAX_STRATEGIES:
+        raise FactoryError(f"strategies must be between 1 and {MAX_STRATEGIES}")
+    model = costs or CostModel.from_config(runtime_config, vehicle=vehicle)
+    base_policy = ReplayPolicy.from_config(runtime_config)
+    policy = diagnostic_backfill_policy(base_policy)
+    raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
+        data, require_provenance=False,
+        expected_equity_feed=policy.equity_feed)
+    quotes = quote_rows if callable(getattr(quote_rows, "quote_fill", None)) \
+        else list(quote_rows)
+    reports: list[dict[str, Any]] = []
+    for hypothesis in initial_hypotheses(int(strategies), vehicle=vehicle):
+        account = simulate_account(
+            bars, list(snapshot_map.values()), hypothesis.rule_spec,
+            vehicle=vehicle,
+            account_id=f"diagnostic:{hypothesis.hypothesis_id}",
+            starting_cash=float(starting_cash), costs=model, quotes=quotes,
+            policy=policy)
+        diagnostic = measure_fit_diagnostics(
+            bars, hypothesis.rule_spec, account_rows=account["rows"],
+            costs=model, vehicle=vehicle,
+            risk_config=((runtime_config or {}).get("risk")
+                         if isinstance(runtime_config, Mapping) else None),
+            policy=policy)
+        reports.append({
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "variant_id": rule_variant_id(hypothesis.rule_spec),
+            "vehicle": vehicle,
+            "family": hypothesis.family,
+            "authorizing": False,
+            "diagnostic_only": True,
+            "rule_spec": hypothesis.rule_spec,
+            "diagnostic": diagnostic,
+            "account": account,
+        })
+    close = getattr(quote_rows, "close", None)
+    if callable(close) and isinstance(quote_rows, SQLiteQuoteIndex):
+        close()
+    return {
+        "schema": FACTORY_SCHEMA,
+        "status": "diagnostic_only",
+        "authorizing": False,
+        "diagnostic_only": True,
+        "vehicle": vehicle,
+        "strategies": len(reports),
+        "variants": len(reports),
+        "accounts": len(reports),
+        "results": [],
+        "proofs": [],
+        "raw_rows": len(raw_rows),
+        "reports": reports,
+        "replay_policy": policy.as_dict(),
+        "authorization": {"eligible": [], "proofs": [], "fdr": False},
+    }
+
+
 def run_factory(data: str | Path | Sequence[Mapping], *,
                 db_path: str | Path = DEFAULT_DB_PATH, vehicle: str = "equity",
                 strategies: int = DEFAULT_STRATEGIES,
@@ -2281,8 +2387,16 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 proposal_adapter: RuleProposalAdapter | None = None,
                 worker_data: str | Path | None = None,
                 progress_callback: Any | None = None,
-                backtest_bar_fallback: bool = False) -> dict:
+                backtest_bar_fallback: bool = False,
+                diagnostic_only: bool = False) -> dict:
     """Run one cycle and always release its parent-owned quote index."""
+    if not isinstance(diagnostic_only, bool):
+        raise FactoryError("diagnostic_only must be true or false")
+    if diagnostic_only:
+        return _run_diagnostic_factory(
+            data, vehicle=vehicle, strategies=strategies,
+            starting_cash=starting_cash, costs=costs,
+            runtime_config=runtime_config)
     resources: list[SQLiteQuoteIndex] = []
     try:
         return _run_factory(
@@ -2422,6 +2536,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         llm_adapter = RuleProposalAdapter(
             provider=str(llm_config.get("provider") or "openai"),
             model=str(llm_config.get("model") or ""),
+            deployment=llm_config.get("deployment"),
             max_attempts=int(llm_config.get("max_attempts", 1)),
             timeout_seconds=float(llm_config.get("timeout_seconds", 30)),
             max_response_bytes=int(llm_config.get("max_response_bytes", 16_384)),
@@ -2478,7 +2593,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     }
     llm_assumptions = {
         key: llm_config.get(key) for key in (
-            "enabled", "provider", "model", "max_attempts", "timeout_seconds",
+            "enabled", "provider", "model", "deployment", "max_attempts", "timeout_seconds",
             "max_response_bytes", "max_total_calls", "near_duplicate_distance")
         if key in llm_config
     }
@@ -3301,10 +3416,13 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             vehicle=vehicle, hypothesis_id=str(hypothesis["hypothesis_id"])))
         coordinate_total = int(refinement_snapshot.get("coordinate_total") or 0)
         interaction_total = int(refinement_snapshot.get("interaction_total") or 0)
-        coordinate_remaining = max(0, int(refinement_snapshot.get(
-            "coordinate_remaining_before") or coordinate_total) - len(
-                local_ids & set(str(item) for item in refinement_snapshot.get(
-                    "pool_variant_ids", ()))))
+        remaining_before = refinement_snapshot.get("coordinate_remaining_before")
+        coordinate_remaining = max(
+            0,
+            int(coordinate_total if remaining_before is None
+                else remaining_before) - len(
+                    local_ids & set(str(item) for item in refinement_snapshot.get(
+                        "pool_variant_ids", ()))))
         eligible_confirmatory_attempts = sum(factory.variant_attempts(
             str(hypothesis["hypothesis_id"]), variant_id) for variant_id in local_ids)
         account_attempts_total = sum(factory.account_attempts(
@@ -3339,6 +3457,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             int(worker.get("expected_variants", 0)) > 0 and
             len(local) == int(worker.get("expected_variants", 0)) and
             len(adequate) == len(local))
+        execution_blocked_exhausted = _execution_blocked_exhausted(
+            local, worker, refinement_snapshot, coordinate_remaining)
         # Adequacy is a per-variant property.  A passing sibling may persist
         # its own proof/qualification even when another sibling is
         # underpowered; the thin sibling gets only a diagnostic account and
@@ -3617,7 +3737,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 {**refinement, "tested_variant_ids": sorted(tested_ids),
                  "remaining_in_phase_after": len(remaining),
                  "replacement_eligible": False})
-        elif all_intended_adequate and _terminal_negative(local):
+        elif ((all_intended_adequate and _terminal_negative(local)) or
+              execution_blocked_exhausted):
             # The best near-miss is the least negative/highest-P&L result, not
             # the result with the largest absolute loss.  Replacement and its
             # lesson should preserve what worked best in the exhausted lineage.
@@ -3633,7 +3754,15 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             reseeds_used = _slot_reseeds(factory, vehicle, slot)
             generation_cap = int(max_generations) * (
                 rotations_used + reseeds_used + 1)
-            if llm_enabled:
+            if execution_blocked_exhausted:
+                # A blocked batch has no statistical outcome to optimize and
+                # therefore rotates directly through the bounded discovery
+                # lane.  This keeps execution starvation from being reported
+                # as a negative-performance rejection.
+                replacement = None
+                proposal = None
+                replacement_error = None
+            elif llm_enabled:
                 replacement, proposal, replacement_error = _llm_replacement(
                     hypothesis, aggregate, config=llm_config,
                     max_generations=generation_cap,
@@ -3706,7 +3835,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                             "deterministic replacement registered after every intended variant failed"),
                     payload=retirement_payload)
                 replacements.append(asdict(replacement))
-            elif llm_enabled and replacement_error != "generation_limit":
+            elif (llm_enabled and replacement_error != "generation_limit" and
+                  not execution_blocked_exhausted):
                 detail = {
                     "diagnostic": aggregate,
                     "failure": replacement_error or "llm_proposal_failed",
@@ -3726,7 +3856,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 # Only a family that actually spent a mutation budget may be
                 # rotated away; reseeding one that was never mutated would be
                 # family churn rather than bounded exploration.
-                if (int(hypothesis["generation"]) >= 1 and
+                if ((int(hypothesis["generation"]) >= 1 or
+                     execution_blocked_exhausted) and
                         rotations_used < int(max_rotations) and
                         len(rotations) < int(rotation_budget)):
                     tried = _slot_families(factory, vehicle, slot)

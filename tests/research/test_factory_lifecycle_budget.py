@@ -9,7 +9,11 @@ from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from research.factory_core import initial_hypotheses
 from research.factory_ledger import FactoryError, FactoryLedger
 from research.factory_report import build_report, render_markdown, render_text
-from research.strategy_factory import _gate, _gate_classification, _recenter_successor
+from research.strategy_factory import (
+    _execution_blocked_exhausted, _gate, _gate_classification,
+    _recenter_successor, run_factory,
+)
+from .test_factory_end_to_end import edge_corpus
 
 
 def _account_result(hypothesis_id: str, variant_id: str, *, cycle: str,
@@ -77,6 +81,48 @@ class RecenterLifecycleTests(unittest.TestCase):
 
 
 class VariantBudgetTests(unittest.TestCase):
+    def test_diagnostic_factory_is_non_authorizing_and_does_not_create_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "diagnostic.sqlite3"
+            result = run_factory(
+                edge_corpus(1), db_path=db_path, vehicle="equity",
+                strategies=1, variants_per_strategy=2, workers=1,
+                diagnostic_only=True)
+            self.assertTrue(result["diagnostic_only"])
+            self.assertFalse(result["authorizing"])
+            self.assertEqual(result["results"], [])
+            self.assertEqual(result["proofs"], [])
+            self.assertFalse(result["authorization"]["fdr"])
+            self.assertFalse(db_path.exists())
+            report = result["reports"][0]["diagnostic"]
+            self.assertTrue(report["diagnostic_only"])
+            self.assertFalse(report["authorizing"])
+
+    def test_all_execution_blocked_exhaustion_is_rotation_eligible_not_statistical(self):
+        blocked = {
+            "fit_execution_blocked": True,
+            "sample_adequate": False,
+            "heldout_sample_adequate": False,
+        }
+        worker = {"expected_variants": 2}
+        refinement = {
+            "phase": "interaction",
+            "interaction_remaining_before": 2,
+        }
+        local = [({"variant_id": "a"}, blocked),
+                 ({"variant_id": "b"}, blocked)]
+        self.assertTrue(_execution_blocked_exhausted(
+            local, worker, refinement, coordinate_remaining=0))
+        self.assertFalse(_execution_blocked_exhausted(
+            local, worker, refinement, coordinate_remaining=1))
+        statistical = {**blocked, "fit_execution_blocked": False,
+                       "sample_adequate": True,
+                       "heldout_sample_adequate": True}
+        self.assertFalse(_execution_blocked_exhausted(
+            [({"variant_id": "a"}, statistical),
+             ({"variant_id": "b"}, blocked)],
+            worker, refinement, coordinate_remaining=0))
+
     def test_gate_execution_blocked_survives_fit_row_persistence_boundary(self):
         rows = [
             {

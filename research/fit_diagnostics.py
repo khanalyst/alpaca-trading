@@ -23,7 +23,9 @@ from agent.contracts.rule import (
 )
 from .costs import (STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     stressed_cost_usd)
-from .market_data import record_available_at, record_is_available
+from .market_data import (historical_backfill_record, record_available_at,
+                           record_is_available, replay_available_at,
+                           replay_record_is_available)
 from .stats import clustered_mde_power_report
 
 
@@ -201,8 +203,17 @@ def _planned_vector(metadata: Mapping[str, Any], *, full: bool) -> dict[str, Any
     return vector
 
 
-def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any]) -> dict[str, Any]:
+def _diagnostic_backfill_enabled(policy: Any | None) -> bool:
+    """Resolve the explicit, non-authorizing historical-backfill switch."""
+    if isinstance(policy, Mapping):
+        return policy.get("allow_historical_backfill_diagnostics") is True
+    return bool(getattr(policy, "allow_historical_backfill_diagnostics", False))
+
+
+def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
+                  policy: Any | None = None) -> dict[str, Any]:
     """Collect only first-signal metadata from the fit bars."""
+    allow_backfill = _diagnostic_backfill_enabled(policy)
     grouped: dict[tuple[str, str], list[Any]] = {}
     for row in bars:
         day = _session(row)
@@ -238,9 +249,14 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any]) -> dict[str, Any
             feature_start = (0 if feature_window is None else
                              max(0, index + 1 - int(feature_window)))
             feature_rows = rows[feature_start:index + 1]
-            available = [record_available_at(item)
+            available = [replay_available_at(
+                            item,
+                            allow_historical_backfill_diagnostics=allow_backfill)
                          for item in feature_rows
-                         if record_available_at(item) is not None]
+                         if replay_available_at(
+                             item,
+                             allow_historical_backfill_diagnostics=allow_backfill)
+                         is not None]
             if len(available) != len(feature_rows):
                 continue
             decision_timestamp = max([signal_end, *available])
@@ -267,12 +283,13 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any]) -> dict[str, Any
                          # the planned signal/economics, but make the pricing
                          # requirement explicit instead of reading delayed
                          # entry-bar OHLC as a fabricated fill.
-                         "entry_pricing": ("bar" if
-                                            record_is_available(
-                                                entry, _timestamp(entry))
+                         "entry_pricing": ("bar" if replay_record_is_available(
+                                                entry, _timestamp(entry),
+                                                allow_historical_backfill_diagnostics=allow_backfill)
                                             else "quote_required"),
-                         "entry_bar_available": record_is_available(
-                             entry, _timestamp(entry))}
+                         "entry_bar_available": replay_record_is_available(
+                             entry, _timestamp(entry),
+                             allow_historical_backfill_diagnostics=allow_backfill)}
         if first is not None:
             first_signals.append(first)
         if session_had_eligible_prefix:
@@ -552,7 +569,8 @@ def measure_fit_diagnostics(
         account_rows: Sequence[Mapping[str, Any]] = (),
         costs: Any | None = None, vehicle: str | None = None,
         risk_config: Mapping[str, Any] | None = None,
-        config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        config: Mapping[str, Any] | None = None,
+        policy: Any | None = None) -> dict[str, Any]:
     """Measure compact fit-only behavior and execution summaries.
 
     ``bars`` and ``account_rows`` must already be the fit/development slice.
@@ -560,7 +578,7 @@ def measure_fit_diagnostics(
     callers own that boundary.
     """
     normalized = validate_rule_spec(spec)
-    prefix = _fit_prefixes(list(bars), normalized)
+    prefix = _fit_prefixes(list(bars), normalized, policy=policy)
     signals = prefix["first_signals"]
     entry_vectors = [_planned_vector(item, full=False) for item in signals]
     full_vectors = [_planned_vector(item, full=True) for item in signals]
@@ -664,6 +682,18 @@ def measure_fit_diagnostics(
             "signal_count": len(signals),
             "planned_vector_count": len(full_vectors),
         },
+    }
+    # Historical backfill can be inspected only through the explicit policy
+    # above. Keep that provenance visible and permanently non-authorizing so a
+    # diagnostic prefix cannot advance a proof or emit an authorization.
+    backfill_rows = [row for row in bars if historical_backfill_record(row)]
+    fit_diagnostics["historical_backfill"] = {
+        "rows": len(backfill_rows),
+        "diagnostic_policy": bool(_diagnostic_backfill_enabled(policy)),
+        "included": bool(backfill_rows and
+                          _diagnostic_backfill_enabled(policy)),
+        "authorizing": False,
+        "diagnostic_only": True,
     }
     # Stable descriptive aliases keep downstream reports readable while the
     # canonical sections above remain versioned and compact.

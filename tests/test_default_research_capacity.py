@@ -6,8 +6,12 @@ from agent.config import DEFAULT_CONFIG, validate_config
 
 
 class DefaultResearchCapacityTests(unittest.TestCase):
-    def test_shipped_and_code_defaults_use_the_eight_etf_universe(self):
-        expected = ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"]
+    def test_shipped_and_code_defaults_use_the_24_symbol_universe(self):
+        expected = [
+            "SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV",
+            "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO",
+            "VB", "EFA", "EEM", "TLT", "HYG", "GLD", "SLV", "SMH",
+        ]
         self.assertEqual(DEFAULT_CONFIG["universe"]["symbols"], expected)
         self.assertEqual(validate_config({})["universe"]["symbols"], expected)
 

@@ -29,6 +29,7 @@ from deploy.scheduler_output import (  # noqa: E402
     structured_failure,
     structured_research_progress,
     structured_research_cycle,
+    structured_research_preflight,
 )
 
 
@@ -182,7 +183,7 @@ def run_scheduler(args) -> int:
             "timeout_seconds", "structured_failures", "stdout_chars",
             "stderr_chars", "stdout_truncated", "stderr_truncated",
             "cycle_status", "research_cycle", "research_progress",
-            "research_readiness")
+            "research_readiness", "research_preflight")
         if key in previous
     }
     signal.signal(signal.SIGTERM, _stop)
@@ -247,7 +248,8 @@ def run_scheduler(args) -> int:
         # Include the field from the first heartbeat onward.  Subsequent
         # heartbeats replace it with the latest validated child event.
         write_status(status_path, "running", **running_detail,
-                     research_progress=None, research_readiness=None)
+                     research_progress=None, research_readiness=None,
+                     research_preflight=None)
         timed_out = False
         try:
             try:
@@ -274,6 +276,9 @@ def run_scheduler(args) -> int:
         structured_failures.extend(stderr.structured_failures)
         research_cycles = [*stdout.research_cycles, *stderr.research_cycles]
         research_cycle = research_cycles[-1] if research_cycles else None
+        research_preflight = (
+            research_cycle.get("preflight") if research_cycle else None
+        ) or capture_detail.get("research_preflight")
         cycle_status = (str(research_cycle.get("status")).lower()
                         if research_cycle else None)
         if stdout.tail:
@@ -328,6 +333,7 @@ def run_scheduler(args) -> int:
             structured_failures=structured_failures,
             cycle_status=cycle_status,
             research_cycle=research_cycle,
+            research_preflight=research_preflight,
             research_progress=capture_detail["research_progress"],
             research_readiness=capture_detail["research_readiness"],
             stdout_tail=stdout.tail, stderr_tail=stderr.tail,
@@ -341,6 +347,7 @@ def run_scheduler(args) -> int:
             "structured_failures": structured_failures,
             "cycle_status": cycle_status,
             "research_cycle": research_cycle,
+            "research_preflight": research_preflight,
             "research_progress": capture_detail["research_progress"],
             "research_readiness": capture_detail["research_readiness"],
             "stdout_chars": stdout.total_chars,

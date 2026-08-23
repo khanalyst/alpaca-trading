@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -48,6 +49,49 @@ RESEARCH_PROGRESS_VEHICLES = frozenset({"equity", "option", "both"})
 _RESEARCH_PROGRESS_FIELDS = frozenset({
     "schema", "phase", "unit", "vehicle", "done", "total", "updated_ts",
 })
+
+_PREFLIGHT_SCHEMAS = frozenset({
+    "research-llm-preflight.v1", "llm-provider-preflight.v1",
+})
+_PREFLIGHT_STATUSES = frozenset({
+    "not_run", "disabled", "ready", "degraded", "fatal",
+})
+_PREFLIGHT_EVIDENCE_FIELDS = frozenset({
+    "provider", "model", "deployment", "kind", "config_hash",
+    "response_schema_hash", "grammar_schema_hash", "system_prompt_hash",
+    "request_hash", "attempts", "request_kind", "response_parsed",
+    "error", "error_type", "status_code", "calls_used", "max_total_calls",
+    "calls_remaining", "auth_circuit_open", "provider_circuit_open",
+    "provider_error", "response_observed", "azure_deployment_required",
+})
+
+
+def _safe_preflight_text(value: object) -> str:
+    """Bound and redact strings before they enter status/history evidence."""
+    text = " ".join(str(value).split())
+    text = re.sub(
+        r"(?i)[\"']?(?:authorization|proxy-authorization|auth)[\"']?\s*[=:]\s*"
+        r"[\"']?(?:(?:bearer|basic)\s+)?[^\"',;}]+",
+        "authorization=<redacted>", text)
+    text = re.sub(
+        r"(?i)[\"']?(?:x-api-key|api[ _-]?key|apikey|access[_-]?token|token|"
+        r"secret|password|credential)[\"']?(?:\s+provided)?\s*[=:]\s*"
+        r"[\"']?[^\"'\s,;}]+",
+        "credential=<redacted>", text)
+    text = re.sub(r"(?i)\bsk-[a-z0-9_-]{4,}\b", "sk-<redacted>", text)
+    text = re.sub(
+        r"(?i)([?&](?:api[_-]?key|apikey|key|access[_-]?token|token|sig|"
+        r"signature|secret|password|credential|auth|jwt|code|policy|expires|"
+        r"x-amz-(?:signature|credential|security-token|securitytoken|expires|date)|"
+        r"x-goog-(?:signature|credential|security-token)|"
+        r"(?:awsaccesskeyid|googleaccessid|se|sp|sv|sr))=)[^&#\s]+",
+        r"\1<redacted>", text)
+    text = re.sub(
+        r"(?i)((?:^|[\s;&])(?:x-amz-(?:signature|credential|security-token|"
+        r"securitytoken|expires|date)|x-goog-(?:signature|credential|"
+        r"security-token)|(?:awsaccesskeyid|googleaccessid))=)[^\s;&]+",
+        r"\1<redacted>", text)
+    return text[:240]
 
 
 def _readiness_number(value: object, *, minimum: float = 0.0,
@@ -254,6 +298,7 @@ class _BoundedCapture:
         self.research_cycles: list[dict] = []
         self.research_progress: dict | None = None
         self.research_readiness: dict | None = None
+        self.research_preflight: dict | None = None
 
     def feed(self, text: str) -> None:
         value = str(text)
@@ -286,9 +331,15 @@ class _BoundedCapture:
                                if previous else None) or 0.0
                 if previous is None or current_ts >= previous_ts:
                     self.research_readiness = readiness
+            preflight = structured_research_preflight(payload)
+            if preflight is not None:
+                self.research_preflight = preflight
             cycle = structured_research_cycle(payload)
             if cycle is not None and len(self.research_cycles) < 8:
                 self.research_cycles.append(cycle)
+                nested_preflight = cycle.get("preflight")
+                if isinstance(nested_preflight, dict):
+                    self.research_preflight = nested_preflight
             reason = structured_failure(payload)
             if reason is not None and len(self.structured_failures) < 32:
                 self.structured_failures.append(reason)
@@ -397,12 +448,60 @@ def structured_research_cycle(payload: object) -> dict | None:
         "proofs": bool(payload.get("proofs")),
         "no_edge": bool(payload.get("no_edge")),
     }
+    preflight = structured_research_preflight(payload.get("preflight"))
+    if preflight is not None:
+        result["preflight"] = preflight
     # These additive flags are emitted by newer cycle wrappers. Keep parsing
     # older payloads byte-compatible for callers that compare the bounded
     # dictionary exactly.
     for key in ("unevaluable", "search_exhausted", "llm_provider_failure"):
         if key in payload:
             result[key] = bool(payload.get(key))
+    return result
+
+
+def structured_research_preflight(payload: object) -> dict | None:
+    """Validate the bounded provider preflight record crossing the scheduler.
+
+    Provider exceptions are already redacted by the adapter/CLI. This second
+    closed-schema boundary prevents a malformed child or hand-edited status
+    file from turning arbitrary response/configuration data into durable
+    health or dashboard output.
+    """
+    if not isinstance(payload, dict):
+        return None
+    schema = str(payload.get("schema") or "")
+    if schema not in _PREFLIGHT_SCHEMAS:
+        return None
+    status = str(payload.get("status") or "").lower()
+    if status not in _PREFLIGHT_STATUSES:
+        return None
+    result: dict[str, object] = {
+        "schema": schema,
+        "status": status,
+        "reason": _safe_preflight_text(payload.get("reason") or ""),
+    }
+    evidence = payload.get("evidence")
+    if isinstance(evidence, Mapping):
+        bounded: dict[str, object] = {}
+        for key, value in list(evidence.items())[:32]:
+            name = str(key)
+            if name not in _PREFLIGHT_EVIDENCE_FIELDS:
+                continue
+            if isinstance(value, bool):
+                bounded[name] = value
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    number = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(number):
+                    bounded[name] = value
+            elif isinstance(value, str):
+                bounded[name] = _safe_preflight_text(value)
+        result["evidence"] = bounded
+    else:
+        result["evidence"] = {}
     return result
 
 
@@ -436,6 +535,7 @@ def _capture_detail(stdout: _BoundedCapture | None,
         out.research_progress, err.research_progress)
     readiness = _latest_research_readiness(
         out.research_readiness, err.research_readiness)
+    preflight = out.research_preflight or err.research_preflight
     return {
         "stdout_tail": out.tail, "stderr_tail": err.tail,
         "stdout_chars": out.total_chars, "stderr_chars": err.total_chars,
@@ -446,6 +546,7 @@ def _capture_detail(stdout: _BoundedCapture | None,
         "research_cycles": [*out.research_cycles, *err.research_cycles],
         "research_progress": progress,
         "research_readiness": readiness,
+        "research_preflight": preflight,
     }
 
 

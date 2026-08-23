@@ -303,6 +303,79 @@ class TuningContractTests(unittest.TestCase):
         self.assertTrue(result.evidence["provider_circuit_open"])
         self.assertIn("DeploymentNotFound", result.error)
 
+    def test_preflight_success_is_one_non_authorizing_call(self):
+        calls = []
+
+        def probe(*_args, **_kwargs):
+            calls.append(1)
+            return object()
+
+        result = RuleProposalAdapter(model="gpt-test", caller=probe).preflight()
+        self.assertEqual(result.status, "ready")
+        self.assertTrue(result.ok)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(result.evidence["response_parsed"])
+        self.assertEqual(result.evidence["attempts"], 1)
+
+    def test_preflight_uses_a_tiny_dedicated_provider_schema(self):
+        calls = []
+
+        class Responses:
+            @staticmethod
+            def create(**kwargs):
+                calls.append(kwargs)
+                return object()
+
+        client = type("Client", (), {"responses": Responses()})()
+        result = RuleProposalAdapter(
+            provider="openai", model="gpt-test", client=client).preflight()
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["max_output_tokens"], 32)
+        output_format = calls[0]["text"]["format"]
+        self.assertEqual(output_format["name"], "llm_provider_preflight")
+        self.assertEqual(output_format["schema"]["required"], ["status"])
+        self.assertNotIn("rule_spec", json.dumps(output_format["schema"]))
+
+    def test_preflight_fatal_deployment_is_one_call_and_safe(self):
+        class DeploymentMissing(RuntimeError):
+            status_code = 404
+
+        calls = []
+
+        def probe(*_args, **_kwargs):
+            calls.append(1)
+            raise DeploymentMissing(
+                "Incorrect API key provided: sk-SECRET; DeploymentNotFound: gpt-missing")
+
+        result = RuleProposalAdapter(model="gpt-missing", caller=probe).preflight()
+        self.assertEqual(result.status, "fatal")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result.evidence["provider_circuit_open"])
+        self.assertNotIn("SECRET", result.reason)
+        self.assertNotIn("sk-SECRET", result.evidence["error"])
+
+    def test_preflight_redacts_dict_shaped_credentials(self):
+        def probe(*_args, **_kwargs):
+            raise RuntimeError(
+                "{'api_key': 'sk-live-secret', "
+                "'authorization': 'Basic VERYSECRET', "
+                "'url': 'https://host/v1?sig=SIGNEDSECRET'}")
+
+        result = RuleProposalAdapter(model="gpt-test", caller=probe).preflight()
+        self.assertNotIn("sk-live-secret", result.reason)
+        self.assertNotIn("sk-live-secret", result.evidence["error"])
+        self.assertNotIn("VERYSECRET", result.reason)
+        self.assertNotIn("SIGNEDSECRET", result.reason)
+
+    def test_preflight_network_failure_is_degraded(self):
+        def probe(*_args, **_kwargs):
+            raise ConnectionError("network unavailable")
+
+        result = RuleProposalAdapter(model="gpt-test", caller=probe).preflight()
+        self.assertEqual(result.status, "degraded")
+        self.assertFalse(result.ok)
+
 
 class CitedLearningTests(unittest.TestCase):
     """A proposal has to say what it learned from, or it is a guess."""
@@ -674,79 +747,77 @@ class VariantSelectionTests(unittest.TestCase):
              "fit_delta": 0.0}
             for index, (spec, _reason) in enumerate(coordinate[1:], start=1)
         ]
-
         early = interaction_mutation_pool(
             ROOT, lessons, diagnostic=diagnosis, coordinate_exhausted=False)
-        early_pairs = [
+        self.assertEqual([
             spec for spec, _reason in early
-            if {key for key in spec_delta(ROOT, spec)} ==
-            {"min_atr_bps", "stop_atr"}
-        ]
-        self.assertEqual(early_pairs, [])
-
+            if set(spec_delta(ROOT, spec)) == {"min_atr_bps", "stop_atr"}
+        ], [])
         late = interaction_mutation_pool(
             ROOT, lessons, diagnostic=diagnosis, coordinate_exhausted=True)
-        pairs = [
-            (spec, reason) for spec, reason in late
-            if {key for key in spec_delta(ROOT, spec)} ==
-            {"min_atr_bps", "stop_atr"}
-        ]
+        pairs = [(spec, reason) for spec, reason in late
+                  if set(spec_delta(ROOT, spec)) == {"min_atr_bps", "stop_atr"}]
         self.assertEqual(len(pairs), 1)
         pair, reason = pairs[0]
         self.assertEqual((pair["min_atr_bps"], pair["stop_atr"]), (15.0, 6.0))
         self.assertIn("coordinate-", reason)
         self.assertLessEqual(len(late), 12)
-        self.assertEqual(
-            len({rule_variant_id(spec) for spec, _reason in late}), len(late))
+        self.assertEqual(len({rule_variant_id(spec) for spec, _ in late}), len(late))
 
     def test_execution_blocked_pair_uses_first_measured_geometry_clear(self):
         diagnosis = {"primary_failure": "execution_blocked"}
         lessons = [
-            {"id": "min-5", "changed": {
-                "min_atr_bps": {"from": ROOT["min_atr_bps"], "to": 5.0}},
-             "fit_delta": 0.0},
-            {"id": "min-15", "changed": {
-                "min_atr_bps": {"from": ROOT["min_atr_bps"], "to": 15.0}},
-             "fit_delta": 0.0},
-            {"id": "stop-2", "changed": {
-                "stop_atr": {"from": ROOT["stop_atr"], "to": 2.0}},
-             "fit_delta": 0.0},
-            {"id": "stop-6", "changed": {
-                "stop_atr": {"from": ROOT["stop_atr"], "to": 6.0}},
-             "fit_delta": 0.0},
+            {"id": "min-5", "changed": {"min_atr_bps": {
+                "from": ROOT["min_atr_bps"], "to": 5.0}}, "fit_delta": 0.0},
+            {"id": "min-15", "changed": {"min_atr_bps": {
+                "from": ROOT["min_atr_bps"], "to": 15.0}}, "fit_delta": 0.0},
+            {"id": "stop-2", "changed": {"stop_atr": {
+                "from": ROOT["stop_atr"], "to": 2.0}}, "fit_delta": 0.0},
+            {"id": "stop-6", "changed": {"stop_atr": {
+                "from": ROOT["stop_atr"], "to": 6.0}}, "fit_delta": 0.0},
         ]
         pool = interaction_mutation_pool(
             ROOT, lessons, diagnostic=diagnosis, coordinate_exhausted=True,
             risk_config={"stressed_cost_scenario_bps": 9.0,
                          "max_stressed_cost_to_risk_ratio": .30})
         pair = [spec for spec, _reason in pool
-                if {key for key in spec_delta(ROOT, spec)} ==
-                {"min_atr_bps", "stop_atr"}]
+                if set(spec_delta(ROOT, spec)) == {"min_atr_bps", "stop_atr"}]
         self.assertEqual(len(pair), 1)
-        # 5 * 6 == 30 bps clears the configured 9/.30 geometry and is the
-        # first deterministic measured pair; 15/6 is not forced when config
-        # is available.
-        self.assertEqual((pair[0]["min_atr_bps"], pair[0]["stop_atr"]),
-                         (5.0, 6.0))
+        self.assertEqual((pair[0]["min_atr_bps"], pair[0]["stop_atr"]), (5.0, 6.0))
 
     def test_execution_blocked_pair_never_invents_unmeasured_fallback_values(self):
         diagnosis = {"primary_failure": "execution_blocked"}
         lessons = [
-            {"id": "min-5", "changed": {
-                "min_atr_bps": {"from": ROOT["min_atr_bps"], "to": 5.0}},
-             "fit_delta": 0.0},
-            {"id": "stop-2", "changed": {
-                "stop_atr": {"from": ROOT["stop_atr"], "to": 2.0}},
-             "fit_delta": 0.0},
+            {"id": "min-5", "changed": {"min_atr_bps": {
+                "from": ROOT["min_atr_bps"], "to": 5.0}}, "fit_delta": 0.0},
+            {"id": "stop-2", "changed": {"stop_atr": {
+                "from": ROOT["stop_atr"], "to": 2.0}}, "fit_delta": 0.0},
         ]
         pool = interaction_mutation_pool(
             ROOT, lessons, diagnostic=diagnosis, coordinate_exhausted=True)
         pair = [spec for spec, _reason in pool
-                if {key for key in spec_delta(ROOT, spec)} ==
-                {"min_atr_bps", "stop_atr"}]
+                if set(spec_delta(ROOT, spec)) == {"min_atr_bps", "stop_atr"}]
         self.assertEqual(len(pair), 1)
-        self.assertEqual((pair[0]["min_atr_bps"], pair[0]["stop_atr"]),
-                         (5.0, 2.0))
+        self.assertEqual((pair[0]["min_atr_bps"], pair[0]["stop_atr"]), (5.0, 2.0))
+
+    def test_generic_interaction_ties_use_failure_priority_and_numeric_values(self):
+        lessons = [
+            {"id": "threshold-high", "changed": {"threshold_bps": {
+                "from": ROOT["threshold_bps"], "to": 10.0}}, "heldout_delta": 0.1},
+            {"id": "threshold-low", "changed": {"threshold_bps": {
+                "from": ROOT["threshold_bps"], "to": 6.0}}, "heldout_delta": 0.1},
+            {"id": "target", "changed": {"target_r": {
+                "from": ROOT["target_r"], "to": 1.5}}, "heldout_delta": 0.1},
+        ]
+        pool = interaction_mutation_pool(
+            ROOT, lessons, diagnostic={"primary_failure": "negative_expectancy"},
+            limit=1)
+        self.assertEqual(len(pool), 1)
+        spec, _reason = pool[0]
+        # ``threshold_bps`` is the first negative-expectancy axis, and 6.0 is
+        # selected numerically before 10.0 even though string ordering differs.
+        self.assertEqual(spec["threshold_bps"], 6.0)
+        self.assertEqual(spec["target_r"], 1.5)
 
     def test_the_reason_limit_matches_the_adapters(self):
         """The core states the bound without importing the optional adapter."""

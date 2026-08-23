@@ -22,6 +22,9 @@ cycle_unevaluable=0
 cycle_search_exhausted=0
 cycle_llm_provider_failure=0
 cycle_outcomes=()
+# Every terminal cycle carries a bounded preflight record. ``not_run`` is
+# explicit for failures that happen before the provider probe.
+llm_preflight_record='{"schema":"research-llm-preflight.v1","status":"not_run","reason":"provider preflight was not reached","evidence":{}}'
 
 emit_progress() {
   local phase="$1"
@@ -50,12 +53,29 @@ emit_cycle() {
   local outcomes="${cycle_outcomes[*]-}"
   "$python_bin" - "$status" "$reason" "$exit_code" "$outcomes" \
     "$cycle_success" "$cycle_no_edge" "$cycle_unevaluable" \
-    "$cycle_search_exhausted" "$cycle_llm_provider_failure" <<'PY'
+    "$cycle_search_exhausted" "$cycle_llm_provider_failure" \
+    "$llm_preflight_record" <<'PY'
 import json
 import sys
 
 status, reason, exit_code, raw_outcomes, success, no_edge, unevaluable, \
-    search_exhausted, llm_provider_failure = sys.argv[1:]
+    search_exhausted, llm_provider_failure, raw_preflight = sys.argv[1:]
+try:
+    preflight = json.loads(raw_preflight)
+except (TypeError, ValueError):
+    preflight = {
+        "schema": "research-llm-preflight.v1",
+        "status": "not_run",
+        "reason": "provider preflight record was malformed",
+        "evidence": {},
+    }
+if not isinstance(preflight, dict):
+    preflight = {
+        "schema": "research-llm-preflight.v1",
+        "status": "not_run",
+        "reason": "provider preflight record was malformed",
+        "evidence": {},
+    }
 print(json.dumps({
     "schema": "research-cycle.v1", "status": status, "reason": reason,
     "exit_code": int(exit_code),
@@ -64,6 +84,7 @@ print(json.dumps({
     "unevaluable": bool(int(unevaluable)),
     "search_exhausted": bool(int(search_exhausted)),
     "llm_provider_failure": bool(int(llm_provider_failure)),
+    "preflight": preflight,
 }, sort_keys=True))
 PY
 }
@@ -182,20 +203,56 @@ set -e
   finish "failed" "agent configuration validation failed: ${llm_provider:-unknown error}" 3
 case "$llm_provider" in
   disabled)
-    echo '{"schema":"research-llm.v1","status":"disabled","reason":"configuration"}' >&2
     ;;
   openai)
-    [ -n "${OPENAI_API_KEY:-}" ] || \
+    if [ -z "${OPENAI_API_KEY:-}" ]; then
+      llm_preflight_record='{"schema":"research-llm-preflight.v1","status":"fatal","reason":"configuration: OPENAI_API_KEY is unavailable","evidence":{}}'
       finish "failed" "strategy LLM is enabled but OPENAI_API_KEY is unavailable" 3
-    echo '{"schema":"research-llm.v1","status":"ready","provider":"openai"}' >&2
+    fi
     ;;
   anthropic)
-    [ -n "${ANTHROPIC_API_KEY:-}" ] || \
+    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+      llm_preflight_record='{"schema":"research-llm-preflight.v1","status":"fatal","reason":"configuration: ANTHROPIC_API_KEY is unavailable","evidence":{}}'
       finish "failed" "strategy LLM is enabled but ANTHROPIC_API_KEY is unavailable" 3
-    echo '{"schema":"research-llm.v1","status":"ready","provider":"anthropic"}' >&2
+    fi
     ;;
   *)
+    llm_preflight_record='{"schema":"research-llm-preflight.v1","status":"fatal","reason":"configuration: strategy LLM provider is unsupported","evidence":{}}'
     finish "failed" "strategy LLM provider is unsupported" 3
+    ;;
+esac
+
+# Probe the same provider API path used by the factory before resolving lanes
+# or touching any dataset.  A fatal configuration/authentication result stops
+# the cycle; a transient result is durable degraded evidence and keeps the
+# deterministic fallback available.
+set +e
+llm_preflight_output="$($python_bin "$repo_root/research.py" llm-preflight \
+  --agent-config "$agent_config")"
+llm_preflight_status=$?
+set -e
+printf '%s\n' "$llm_preflight_output" >&2
+# The CLI emits a closed, redacted object. Keep the persisted argument bounded;
+# ``emit_cycle`` falls back to a safe ``not_run`` record if it is malformed.
+llm_preflight_record="${llm_preflight_output:0:8192}"
+case "$llm_preflight_status" in
+  0)
+    # Preserve the legacy diagnostic event for dashboards.  It is emitted only
+    # after the authoritative preflight result (never as a key-only claim).
+    if [ "$llm_provider" = "disabled" ]; then
+      printf '%s\n' '{"schema":"research-llm.v1","status":"disabled","reason":"configuration"}' >&2
+    else
+      printf '%s\n' "{\"schema\":\"research-llm.v1\",\"status\":\"preflight_ready\",\"provider\":\"$llm_provider\"}" >&2
+    fi
+    ;;
+  4)
+    printf '%s\n' '{"schema":"research-llm-preflight-warning.v1","status":"degraded","reason":"transient provider failure; deterministic fallback continues"}' >&2
+    ;;
+  3)
+    finish "failed" "strategy LLM preflight fatal configuration/authentication failure" 3
+    ;;
+  *)
+    finish "failed" "strategy LLM preflight failed" 3
     ;;
 esac
 

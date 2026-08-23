@@ -264,10 +264,11 @@ historical endpoint reconstructs, so the option lane still needs recorded
 sessions. And **history alone is not enough**: `_simulate_trade` takes at most
 one trade per symbol-session, so the 100-trade held-out floor and 30-cluster
 session floor are as much a universe-width requirement as a history-length one.
-The shipped default
-universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`,
-`XLV`), improving opportunity capacity, but real signal rates still require
-sufficient history. Floor feasibility fails closed when 100 held-out trades
+The shipped default universe is 24 liquid ETFs spanning broad-market, size,
+sector, international, rates/credit, metals, and semiconductor exposures (the
+exact operator-approved list is in `config.yaml`). This improves opportunity
+capacity, but real signal rates still require sufficient history. Floor
+feasibility fails closed when 100 held-out trades
 cannot be supported; widen `universe.symbols` and/or the backfill window, never
 lower the evidence floor. A universe expansion requires an operator-approved
 exact symbol list, recorder coverage for that list, and a new identity/proof;
@@ -420,6 +421,20 @@ pass the OPRA preflight. The enabled research strategy LLM is a bounded
 proposal lane, not a runtime decision LLM: its separate readable provider
 secret is required, and the cycle fails closed before discovery when that
 secret is absent, unreadable, or missing the selected provider key.
+Before an expensive cycle, and after changing the provider endpoint or model,
+run one bounded, non-authorizing probe:
+
+```bash
+python3 research.py llm-preflight --agent-config config.yaml
+```
+
+The probe is non-authorizing and does not touch the dataset; its model/deployment
+contract and fatal/degraded classification are documented in
+[research/README.md](research/README.md#provider-preflight). The scheduled
+wrapper retains its bounded, redacted result in terminal cycle JSON, status,
+and history, including transient `degraded` outcomes. If all runtime LLM calls
+fail, the cycle reports terminal `llm_provider_failure` unless an authorizing
+proof already exists.
 It discovers the
 recorder's mixed bars/quotes/options corpus under
 `runtime/research/recorded/sessions/` by default (or uses

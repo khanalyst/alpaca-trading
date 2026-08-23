@@ -37,6 +37,7 @@ from research.gates import (
 from research.proof import write_proof
 from research.strategy_factory import (DEFAULT_STRATEGIES, DEFAULT_WORKERS,
                                        factory_status, run_factory)
+from research.llm_strategy import RuleProposalAdapter, _safe_error
 from agent.config import load_config as load_agent_config
 
 
@@ -798,6 +799,7 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         max_confirmatory_attempts=getattr(args, "max_confirmatory_attempts", 3),
         costs=CostModel.from_config(runtime_config),
         runtime_config=runtime_config,
+        diagnostic_only=diagnostic_only,
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"),
         # A worker projection is itself a strict, authorizing view.  Do not
         # let it turn the explicit diagnostic escape hatch back into a hard
@@ -826,11 +828,11 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         proofs: list[dict[str, Any]] = []
     else:
         proofs = _emit_proofs(args, result, agent_config)
-    # Archive the narrative every cycle, not only when an edge proves out. A
-    # cycle that found nothing is exactly the one an operator needs to read,
-    # and on a headless deployment the dashboard's report list is the only
-    # place they will see it.
-    result["report"] = _write_factory_report(args)
+    # Archive the ledger-backed narrative every authorizing cycle, not only
+    # when an edge proves out. Diagnostics-only never opens or reads the
+    # authorizing ledger; its bounded reports already live in this result.
+    result["report"] = (None if diagnostic_only else
+                        _write_factory_report(args))
     stalled = _report_unevaluable(
         result, [item.get("gate") for item in result.get("results", [])
                  if isinstance(item, Mapping)])
@@ -839,19 +841,71 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         # A proof is the authorizing result.  It takes precedence over a
         # diagnostic status that may describe another slot in the same run.
         return 0
-    if stalled:
-        return UNEVALUABLE_EXIT
     if diagnostic_only:
         # The explicit diagnostic escape hatch is never an authorizing
         # factory verdict, including when its underlying runner reports a
         # terminal search/provider status.
         return 2
     result_status = str(result.get("status") or "").strip().lower()
+    if result_status in {"llm_all_calls_failed", "llm_provider_failure"}:
+        return FACTORY_LLM_ALL_CALLS_FAILED_EXIT
     if result_status == "bounded_space_exhausted":
         return FACTORY_BOUNDED_SPACE_EXHAUSTED_EXIT
-    if result_status == "llm_all_calls_failed":
-        return FACTORY_LLM_ALL_CALLS_FAILED_EXIT
+    if stalled:
+        return UNEVALUABLE_EXIT
     return 2
+
+
+def cmd_llm_preflight(args: argparse.Namespace) -> int:
+    """Probe the configured research strategy provider once.
+
+    The adapter owns provider/API details and returns only bounded evidence;
+    this command deliberately does not load secret files or persist output.
+    """
+    try:
+        agent_config = _agent_config(args)
+    except Exception as exc:  # noqa: BLE001 - preserve the CLI JSON contract
+        payload = {
+            "schema": "research-llm-preflight.v1", "status": "fatal",
+            "reason": f"configuration error: {_safe_error(exc)}",
+            "evidence": {},
+        }
+        print(json.dumps(payload, sort_keys=True))
+        return 3
+    research_config = agent_config.get("research") or {}
+    llm_config = research_config.get("strategy_llm")
+    if not isinstance(llm_config, Mapping) or not llm_config.get("enabled"):
+        payload = {"schema": "research-llm-preflight.v1", "status": "disabled",
+                   "reason": "configuration", "evidence": {}}
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+    try:
+        adapter = RuleProposalAdapter(
+            provider=str(llm_config.get("provider") or "openai"),
+            model=str(llm_config.get("model") or ""),
+            deployment=(str(llm_config.get("deployment")).strip()
+                        if llm_config.get("deployment") not in (None, "")
+                        else None),
+            max_attempts=int(llm_config.get("max_attempts", 1)),
+            timeout_seconds=float(llm_config.get("timeout_seconds", 30)),
+            max_response_bytes=int(llm_config.get("max_response_bytes", 16_384)),
+            max_total_calls=int(llm_config.get("max_total_calls", 64)),
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the CLI JSON contract
+        payload = {
+            "schema": "research-llm-preflight.v1", "status": "fatal",
+            "reason": f"configuration error: {_safe_error(exc)}",
+            "evidence": {},
+        }
+        print(json.dumps(payload, sort_keys=True))
+        return 3
+    outcome = adapter.preflight()
+    print(json.dumps(outcome.as_dict(), sort_keys=True, default=str))
+    if outcome.status == "ready":
+        return 0
+    if outcome.status == "degraded":
+        return 4
+    return 3
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
@@ -1064,6 +1118,11 @@ def build_parser() -> argparse.ArgumentParser:
                                "configured execution profile)")
     vehicles.add_argument("--json", action="store_true")
     vehicles.set_defaults(func=cmd_vehicles)
+    llm_preflight = sub.add_parser(
+        "llm-preflight", help="probe the configured research strategy provider")
+    llm_preflight.add_argument("--agent-config", default=None,
+                               help="validated agent config (default: config.yaml)")
+    llm_preflight.set_defaults(func=cmd_llm_preflight)
     calibrate = sub.add_parser(
         "calibrate", help="compare modelled fill costs against journaled fills")
     calibrate.add_argument("journal")

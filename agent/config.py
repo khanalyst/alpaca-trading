@@ -75,7 +75,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mode": "paper",
     "broker": {"paper": True, "allow_live": False, "data_feed": "iex", "options_feed": "indicative"},
     "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "require_exact_calendar": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
-    "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"], "asset_classes": ["us_equity"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
+    "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO", "VB", "EFA", "EEM", "TLT", "HYG", "GLD", "SLV", "SMH"], "asset_classes": ["us_equity"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
     "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
     "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0, "stressed_cost_scenario_bps": 25.0, "max_stressed_cost_to_risk_ratio": 0.30},
     "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100, "strict_market_data": True},
@@ -90,6 +90,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "backtest_bar_fallback": True,
         "champion_min_confidence": 0.95,
         "strategy_llm": {"enabled": True, "provider": "openai", "model": "gpt-5",
+                         "deployment": None,
                          "max_attempts": 1, "timeout_seconds": 30,
                          "max_response_bytes": 16_384,
                          "max_total_calls": 64,
@@ -412,7 +413,8 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     strategy_llm_defaults = DEFAULT_CONFIG["research"]["strategy_llm"]
     strategy_llm = dict(strategy_llm_defaults)
     strategy_llm.update(_map(research.get("strategy_llm", {}), "research.strategy_llm"))
-    _unknown(strategy_llm, {"enabled", "provider", "model", "max_attempts",
+    _unknown(strategy_llm, {"enabled", "provider", "model", "deployment",
+                            "max_attempts",
                             "timeout_seconds", "max_response_bytes",
                             "max_total_calls", "near_duplicate_distance"},
              "research.strategy_llm")
@@ -424,6 +426,12 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         raise ConfigError("research.strategy_llm.model must be a string")
     if strategy_llm["enabled"] and not strategy_llm["model"].strip():
         raise ConfigError("research.strategy_llm.model is required when enabled=true")
+    deployment = strategy_llm.get("deployment")
+    if deployment is not None:
+        if not isinstance(deployment, str) or not deployment.strip():
+            raise ConfigError(
+                "research.strategy_llm.deployment must be a non-empty string or null")
+        strategy_llm["deployment"] = deployment.strip()
     strategy_llm["max_attempts"] = _int(
         strategy_llm, "max_attempts", "research.strategy_llm", 1, 3, 1)
     strategy_llm["timeout_seconds"] = _num(

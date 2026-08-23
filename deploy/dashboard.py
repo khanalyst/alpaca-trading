@@ -25,6 +25,7 @@ if str(REPO) not in sys.path:
 
 from deploy import health, load_config
 from deploy.scheduler_output import (derive_research_readiness,
+                                     structured_research_preflight,
                                      structured_research_progress,
                                      structured_research_readiness)
 from research.gates import verify_gate_envelope
@@ -626,7 +627,7 @@ def _safe_heartbeat(path: Path) -> dict:
         "run_date", "timeout_seconds", "deadline_ts",
         "structured_failures", "stdout_chars", "stderr_chars",
         "stdout_truncated", "stderr_truncated", "cycle_status",
-        "research_cycle",
+        "research_cycle", "research_preflight",
     }
     result = {key: value for key, value in raw.items() if key in allowed}
     # Progress is the one nested heartbeat object intentionally exposed.  It
@@ -640,6 +641,12 @@ def _safe_heartbeat(path: Path) -> dict:
         result["research_readiness"] = derive_research_readiness(
             progress, readiness, now=time.time(),
             deadline_ts=raw.get("deadline_ts"))
+    preflight = structured_research_preflight(result.get("research_preflight"))
+    if preflight is None and isinstance(result.get("research_cycle"), dict):
+        preflight = structured_research_preflight(
+            result["research_cycle"].get("preflight"))
+    if preflight is not None:
+        result["research_preflight"] = preflight
     return result
 
 
@@ -772,7 +779,7 @@ function table(parent,rows,cols){const t=el('table'),h=el('tr');cols.forEach(c=>
 async function showReport(path){const r=await fetch('/api/report?path='+encodeURIComponent(path));const j=await r.json();const p=card(path,true);p.append(el('pre',j.text||j.error||'unavailable'));p.scrollIntoView({behavior:'smooth'})}
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();cards.replaceChildren();
  let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'execution profile',d.strategy.execution_mode);row(c,'configured variant',d.strategy.variant_id);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'edge entry gate',d.research.entry_gate_required?'required':'disabled',d.research.entry_gate_required?'warn':'ok');
- c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'equity feed',d.recorder.configured_data_feed||d.recorder.data_feed||'—');row(c,'options feed',d.recorder.configured_options_feed||'disabled');row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'bar coverage',d.recorder.coverage_status,d.recorder.coverage_status==='covered'?'ok':'warn');row(c,'bar gap symbols',(d.recorder.bar_gap_symbols||[]).join(', ')||'none',(d.recorder.bar_gap_symbols||[]).length?'warn':'ok');row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'cycle outcome',d.research_service.heartbeat.cycle_status);const rp=d.research_service.heartbeat.research_progress||{};const rpLine=rp.phase?rp.phase+' · '+rp.vehicle+' · '+rp.done+'/'+rp.total+' '+rp.unit:'—';row(c,'research progress',rpLine);const rr=d.research_service.health.research_readiness||{};row(c,'research readiness',rr.state||'unknown',rr.state==='ready'?'ok':'warn');row(c,'sessions remaining',rr.sessions_remaining??'—');row(c,'readiness ETA',when(rr.eta_ts));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
+ c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'equity feed',d.recorder.configured_data_feed||d.recorder.data_feed||'—');row(c,'options feed',d.recorder.configured_options_feed||'disabled');row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'bar coverage',d.recorder.coverage_status,d.recorder.coverage_status==='covered'?'ok':'warn');row(c,'bar gap symbols',(d.recorder.bar_gap_symbols||[]).join(', ')||'none',(d.recorder.bar_gap_symbols||[]).length?'warn':'ok');row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'cycle outcome',d.research_service.heartbeat.cycle_status);const pf=d.research_service.health.research_preflight||d.research_service.heartbeat.research_preflight||{};row(c,'provider preflight',pf.status||'not_run',pf.status==='ready'||pf.status==='disabled'?'ok':pf.status==='degraded'?'warn':'bad');const rp=d.research_service.heartbeat.research_progress||{};const rpLine=rp.phase?rp.phase+' · '+rp.vehicle+' · '+rp.done+'/'+rp.total+' '+rp.unit:'—';row(c,'research progress',rpLine);const rr=d.research_service.health.research_readiness||{};row(c,'research readiness',rr.state||'unknown',rr.state==='ready'?'ok':'warn');row(c,'sessions remaining',rr.sessions_remaining??'—');row(c,'readiness ETA',when(rr.eta_ts));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
  c=card('Execution journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
  c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);row(c,'tradeable vehicle',d.research.tradeable_vehicle);row(c,'proved but untradeable',d.research.untradeable_proved_edges,d.research.untradeable_proved_edges?'warn':'ok');c.append(el('p',d.research.note||'No research status.','muted'));
  c=card('Proved edges — evidence at promotion',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);

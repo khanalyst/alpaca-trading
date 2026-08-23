@@ -18,6 +18,7 @@ from queue import Empty, Queue
 import re
 from threading import Lock, Thread
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import urlparse
 
 from agent.contracts.rule import (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
                                   rule_spec_hash, rule_variant_id,
@@ -27,6 +28,7 @@ from agent.contracts.rule import (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3
 PROPOSAL_SCHEMA = "llm-rule-proposal.v1"
 DISCOVERY_SCHEMA = "llm-edge-discovery.v1"
 TUNING_SCHEMA = "llm-variant-tuning.v1"
+PREFLIGHT_SCHEMA = "llm-provider-preflight.v1"
 DEFAULT_RESPONSE_BYTES = 16_384
 DEFAULT_ATTEMPTS = 2
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -141,6 +143,16 @@ against the result later.
 Never return markdown, Python/source code, executable instructions,
 credentials, market rows, or fields outside schema, variants, rule_spec,
 reason and builds_on.
+"""
+
+# The preflight prompt intentionally asks for no strategy content.  The
+# request still travels through the exact structured-output provider path used
+# by proposal/discovery/tuning calls, which is what catches endpoint,
+# deployment, and API-capability mismatches before a research cycle starts.
+PREFLIGHT_SYSTEM_PROMPT = """Respond with exactly {"status":"ok"}.  This is a
+connectivity probe, not a strategy request; do not return a rule, market data,
+credentials, or instructions.  The response is ignored and never authorizes
+research.
 """
 
 _FORBIDDEN_KEYS = {
@@ -369,9 +381,41 @@ def _tuning_reason_check(reason: str, root: Mapping[str, Any],
 def _safe_error(exc: BaseException, *, limit: int = 240) -> str:
     """Describe a provider failure without persisting response/secret content."""
     message = " ".join(str(exc).split())
-    for token in ("api_key", "apikey", "token", "secret", "password", "credential"):
-        message = re.sub(rf"{token}\s*[=:]\s*[^ ,;]+", f"{token}=<redacted>",
-                         message, flags=re.IGNORECASE)
+    message = re.sub(
+        r"(?i)[\"']?(?:authorization|proxy-authorization|auth)[\"']?\s*[=:]\s*"
+        r"[\"']?(?:(?:bearer|basic)\s+)?[^\"',;}\]]+",
+        "authorization=<redacted>", message)
+    # Provider SDKs use several common spellings, including prose such as
+    # ``Incorrect API key provided: sk-...`` and dict-shaped error payloads.
+    message = re.sub(
+        r"(?i)[\"']?(?:x-api-key|api[ _-]?key|apikey|access[ _-]?token|token|secret|"
+        r"password|credential)[\"']?(?:\s+provided)?\s*[=:]\s*[\"']?"
+        r"[^\"'\s,;}\]]+",
+        "credential=<redacted>", message)
+    # Redact OpenAI-style key values even when the SDK omits a field label.
+    message = re.sub(r"(?i)\bsk-[a-z0-9_-]{4,}\b", "sk-<redacted>", message)
+    # SDK errors occasionally echo an endpoint URL (including basic-auth
+    # userinfo or bearer/query credentials). Keep only the host/path shape.
+    message = re.sub(r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@",
+                     r"\1<redacted>@", message)
+    message = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1<redacted>", message)
+    # Signed provider URLs use both generic names (``sig``/``token``) and
+    # cloud-specific names. Redact the complete value, including URL-safe
+    # base64 and percent-encoded values, while preserving route/key names.
+    message = re.sub(
+        r"(?i)([?&](?:api[_-]?key|apikey|key|access[_-]?token|token|sig|signature|"
+        r"secret|password|credential|auth|jwt|code|policy|expires|expiry|"
+        r"x-amz-(?:signature|credential|security-token|securitytoken|expires|date)|"
+        r"x-goog-(?:signature|credential|security-token)|"
+        r"(?:awsaccesskeyid|googleaccessid|se|sp|sv|sr))=)[^&#\s]+",
+        r"\1<redacted>", message)
+    # Also cover SDK exceptions that print a query pair without the leading
+    # URL delimiter (for example ``X-Amz-Signature=...`` on its own line).
+    message = re.sub(
+        r"(?i)((?:^|[\s;&])(?:x-amz-(?:signature|credential|security-token|"
+        r"securitytoken|expires|date)|x-goog-(?:signature|credential|"
+        r"security-token)|(?:awsaccesskeyid|googleaccessid))=)[^\s;&]+",
+        r"\1<redacted>", message)
     return f"{type(exc).__name__}: {message[:limit]}"
 
 
@@ -642,10 +686,33 @@ class ProposalResult:
         return self.success
 
 
+@dataclass(frozen=True)
+class PreflightResult:
+    """Safe, non-authorizing result from :meth:`RuleProposalAdapter.preflight`.
+    """
+
+    status: str
+    reason: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
+    schema: str = "research-llm-preflight.v1"
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ready"
+
+    def as_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"schema": self.schema, "status": self.status,
+                                  "evidence": dict(self.evidence)}
+        if self.reason:
+            result["reason"] = self.reason
+        return result
+
+
 class RuleProposalAdapter:
     """Bounded provider adapter for ``llm-rule-proposal.v1`` proposals."""
 
     def __init__(self, provider: str = "openai", *, model: str = "",
+                 deployment: str | None = None,
                  caller: Callable[..., Any] | None = None,
                  system_prompt: str | None = None,
                  discovery_prompt: str | None = None,
@@ -669,6 +736,8 @@ class RuleProposalAdapter:
             raise ValueError("max_total_calls must be between 1 and 256")
         self.provider = provider
         self.model = str(model)
+        self.deployment = (str(deployment).strip()
+                           if deployment not in (None, "") else None)
         self.caller = caller
         self.client = client
         self.system_prompt = str(system_prompt or SYSTEM_PROMPT)
@@ -688,6 +757,7 @@ class RuleProposalAdapter:
     def _config_hash(self) -> str:
         """Hash non-secret adapter configuration for reproducible evidence."""
         return content_hash({"provider": self.provider, "model": self.model,
+                             "deployment": self.deployment,
                              "temperature": RESEARCH_SAMPLING_TEMPERATURE,
                              "max_attempts": self.max_attempts,
                              "timeout_seconds": self.timeout_seconds,
@@ -759,6 +829,7 @@ class RuleProposalAdapter:
         evidence = {
             "provider": self.provider,
             "model": self.model,
+            **({"deployment": self.deployment} if self.deployment else {}),
             "kind": kind,
             "config_hash": self._config_hash(),
             "response_schema_hash": self._schema_hash(schema_name, vehicle),
@@ -775,6 +846,21 @@ class RuleProposalAdapter:
         if self._auth_error:
             evidence["auth_error"] = self._auth_error
         return evidence
+
+    def _provider_model(self) -> str:
+        """Return the inference identifier without discarding catalog metadata."""
+        return self.deployment or self.model
+
+    @staticmethod
+    def _azure_endpoint_configured() -> bool:
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+        if not base_url:
+            return False
+        try:
+            host = (urlparse(base_url).hostname or "").lower()
+        except ValueError:
+            return False
+        return host.endswith(".openai.azure.com") or host.endswith(".azure.com")
 
     def _attempt_evidence(self, *, attempt: int,
                           schema_name: str,
@@ -906,6 +992,15 @@ class RuleProposalAdapter:
                 return [provider_schema(item) for item in value]
             return value
 
+        if name == PREFLIGHT_SCHEMA:
+            return provider_schema({
+                "type": "object", "additionalProperties": False,
+                "required": ["status"],
+                "properties": {
+                    "status": {"type": "string", "enum": ["ok"]},
+                },
+            })
+
         rule_schema = provider_schema(RuleProposalAdapter._grammar_schema(vehicle))
         if name == TUNING_SCHEMA:
             return provider_schema({
@@ -943,7 +1038,8 @@ class RuleProposalAdapter:
 
     def _provider_call(self, system_prompt: str,
                        request: Mapping[str, Any], timeout: float,
-                       schema_name: str = PROPOSAL_SCHEMA) -> Any:
+                       schema_name: str = PROPOSAL_SCHEMA,
+                       *, preflight: bool = False) -> Any:
         self._reserve_call()
         if self.caller is not None:
             # The outer proposal loop applies the hard timeout. Keeping this
@@ -956,22 +1052,28 @@ class RuleProposalAdapter:
         request_text = canonical_json(request)
         if self.provider == "openai":
             # Current OpenAI Responses API structured output shape.
+            format_name = ("llm_provider_preflight" if preflight else
+                           "llm_rule_proposal")
             response = client.responses.create(
-                model=self.model, input=[
+                model=self._provider_model(), input=[
                     {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                     {"role": "user", "content": [{"type": "input_text", "text": request_text}]},
                 ],
-                text={"format": {"type": "json_schema", "name": "llm_rule_proposal",
-                                  "strict": True,
-                                  "schema": self._schema(
-                                      schema_name,
-                                      vehicle=request.get("vehicle"))}},
+                text={"format": {"type": "json_schema", "name": format_name,
+                                      "strict": True,
+                                      "schema": self._schema(
+                                          schema_name,
+                                          vehicle=request.get("vehicle"))}},
                 temperature=RESEARCH_SAMPLING_TEMPERATURE,
+                **({"max_output_tokens": 32} if preflight else {}),
                 timeout=timeout,
             )
-            return _raw_text(response, max_bytes=self.max_response_bytes)
+            # Connectivity probes intentionally do not inspect/model-parse
+            # the response body; a successful HTTP/API return is sufficient.
+            return response if preflight else _raw_text(
+                response, max_bytes=self.max_response_bytes)
         response = client.messages.create(
-            model=self.model, max_tokens=1200,
+            model=self._provider_model(), max_tokens=(32 if preflight else 1200),
             temperature=RESEARCH_SAMPLING_TEMPERATURE,
             system=system_prompt,
             messages=[{"role": "user", "content": request_text}],
@@ -981,7 +1083,90 @@ class RuleProposalAdapter:
                                           vehicle=request.get("vehicle"))}},
             timeout=timeout,
         )
-        return _raw_text(response, max_bytes=self.max_response_bytes)
+        return response if preflight else _raw_text(
+            response, max_bytes=self.max_response_bytes)
+
+    @staticmethod
+    def _preflight_status(exc: BaseException) -> str:
+        """Classify one provider failure without leaking response contents."""
+        if RuleProposalAdapter._is_auth_error(exc):
+            return "fatal"
+        status = getattr(exc, "status_code", None)
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+        # Every non-auth 4xx is a configuration/capability problem.  A 408
+        # request timeout and 429 rate limit are explicitly transient.
+        if status is not None:
+            if status == 404 or 400 <= status < 500 and status not in {408, 429}:
+                return "fatal"
+            if status == 408 or status == 429 or status >= 500:
+                return "degraded"
+        message = str(exc).lower()
+        name = type(exc).__name__.lower()
+        if (isinstance(exc, (TimeoutError, OSError, ConnectionError)) or
+                any(token in message or token in name for token in (
+                    "timeout", "timed out", "network", "connection", "dns",
+                    "temporar", "unavailable", "retry"))):
+            return "degraded"
+        # Missing optional SDKs and malformed provider setup are fatal
+        # configuration errors. Unknown exceptions are conservatively treated
+        # as degraded so a transient SDK/network issue never authorizes a
+        # misleading ready state.
+        if isinstance(exc, (ImportError, ValueError)) or any(
+                token in message for token in ("endpoint", "deployment", "capability")):
+            return "fatal"
+        return "degraded"
+
+    def preflight(self) -> PreflightResult:
+        """Probe the configured provider exactly once, without parsing output.
+
+        The call uses the same ``_provider_call`` path as all model-assisted
+        research.  Its tiny request/output budget and ignored response make
+        the operation connectivity-only and non-authorizing.
+        """
+        request = {"vehicle": "equity", "purpose": "connectivity_preflight"}
+        request_hash = content_hash(request)
+        prompt_hash = content_hash(PREFLIGHT_SYSTEM_PROMPT)
+        evidence = self._base_evidence(
+            kind="preflight", schema_name=PREFLIGHT_SCHEMA,
+            prompt_hash=prompt_hash, request_hash=request_hash, vehicle="equity")
+        evidence.update({"attempts": 1, "request_kind": "minimal",
+                         "response_parsed": False})
+        if (self.provider == "openai" and self._azure_endpoint_configured()
+                and not self.deployment):
+            reason = ("fatal provider configuration failure: Azure OpenAI base URL "
+                      "requires research.strategy_llm.deployment")
+            evidence.update({"error_type": "ConfigurationError",
+                             "azure_deployment_required": True})
+            return PreflightResult(status="fatal", reason=reason,
+                                   evidence=evidence)
+        try:
+            # ``_call_with_timeout`` supplies the same hard timeout boundary as
+            # proposal calls.  No retry loop is intentionally present here.
+            _call_with_timeout(
+                lambda system_prompt, request, timeout: self._provider_call(
+                    system_prompt, request, timeout, PREFLIGHT_SCHEMA,
+                    preflight=True),
+                self.timeout_seconds, PREFLIGHT_SYSTEM_PROMPT, request)
+        except Exception as exc:  # noqa: BLE001 - classify safely below
+            self._mark_auth_unavailable(exc)
+            self._mark_provider_unavailable(exc)
+            status = self._preflight_status(exc)
+            safe = _safe_error(exc)
+            evidence.update({"error": safe, "error_type": type(exc).__name__})
+            status_code = getattr(exc, "status_code", None)
+            if isinstance(status_code, int):
+                evidence["status_code"] = status_code
+            # Capture circuit evidence after marking the failure.
+            evidence.update(self._budget_evidence())
+            reason = ("fatal provider configuration/authentication failure: "
+                      if status == "fatal" else "transient provider failure: ") + safe
+            return PreflightResult(status=status, reason=reason, evidence=evidence)
+        evidence.update(self._budget_evidence())
+        evidence["response_observed"] = True
+        return PreflightResult(status="ready", evidence=evidence)
 
     def propose(self, vehicle: str, generation: int,
                 prior_validated_rule_spec: Mapping[str, Any],
@@ -1389,8 +1574,10 @@ def tune_rule(*args: Any, adapter: RuleProposalAdapter | None = None,
 __all__ = [
     "DEFAULT_TOTAL_CALLS", "DISCOVERY_SCHEMA", "DISCOVERY_SYSTEM_PROMPT", "LESSON_REF_CHARS",
     "MAX_REASON_CHARS", "MAX_THESIS_CHARS", "MAX_TUNED_VARIANTS",
-    "PROPOSAL_SCHEMA", "SYSTEM_PROMPT", "TUNING_SCHEMA", "TUNING_SYSTEM_PROMPT",
-    "ProposalResult", "RuleProposalResult",
+    "PREFLIGHT_SCHEMA", "PROPOSAL_SCHEMA", "PREFLIGHT_SYSTEM_PROMPT",
+    "RESEARCH_SAMPLING_TEMPERATURE", "SYSTEM_PROMPT", "TUNING_SCHEMA",
+    "TUNING_SYSTEM_PROMPT",
+    "ProposalResult", "PreflightResult", "RuleProposalResult",
     "RuleProposalAdapter", "LLMRuleProposalAdapter", "LLMStrategy", "canonical_json",
     "content_hash", "discover_rule", "propose_rule", "tune_rule",
 ]

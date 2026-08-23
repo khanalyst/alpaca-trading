@@ -543,6 +543,46 @@ class DeployTests(unittest.TestCase):
             "reviewed": 2, "retry_pending": 1, "failed": 0,
         }])
 
+    def test_scheduler_persists_bounded_provider_preflight_in_cycle(self):
+        preflight = {
+            "schema": "research-llm-preflight.v1", "status": "degraded",
+            "reason": "transient provider failure",
+            "evidence": {"error": "token=<redacted>",
+                         "calls_used": 1,
+                         "raw": {"secret": "must not cross"}},
+        }
+        payload = scheduler_output.structured_research_cycle({
+            "schema": "research-cycle.v1", "status": "completed_no_edge",
+            "reason": "fallback", "exit_code": 0, "preflight": preflight,
+        })
+        self.assertEqual(payload["preflight"]["status"], "degraded")
+        self.assertNotIn("raw", payload["preflight"]["evidence"])
+        capture = scheduler_output._BoundedCapture(4096)
+        capture.feed(json.dumps({
+            "schema": "research-llm-preflight.v1", "status": "degraded",
+            "reason": "transient", "evidence": {"error": "safe"},
+        }) + "\n")
+        self.assertEqual(
+            scheduler_output._capture_detail(capture, None)["research_preflight"]["status"],
+            "degraded")
+
+    def test_scheduler_preflight_drops_unknown_and_redacts_adversarial_evidence(self):
+        payload = scheduler_output.structured_research_preflight({
+            "schema": "research-llm-preflight.v1", "status": "fatal",
+            "reason": "X-Amz-Signature=reason-secret",
+            "evidence": {
+                "api_key": "api-secret", "authorization": "Basic secret",
+                "X-Amz-Signature": "signed-secret",
+                "error": "https://provider.test/?token=query-secret",
+                "raw_response": "should be dropped",
+            },
+        })
+        serialized = json.dumps(payload)
+        for secret in ("reason-secret", "api-secret", "signed-secret",
+                       "query-secret", "should be dropped"):
+            self.assertNotIn(secret, serialized)
+        self.assertEqual(set(payload["evidence"]), {"error"})
+
     def test_research_cycle_factory_status_contract_is_explicit(self):
         script = Path("deploy/research-cycle.sh").read_text(encoding="utf-8")
         self.assertIn(
@@ -568,6 +608,17 @@ class DeployTests(unittest.TestCase):
                 })
                 self.assertIsNotNone(payload)
                 self.assertEqual(payload["status"], status)
+
+    def test_research_cycle_llm_preflight_fails_before_dataset_work(self):
+        script = Path("deploy/research-cycle.sh").read_text(encoding="utf-8")
+        preflight = script.index('research.py" llm-preflight')
+        vehicles = script.index('research.py" vehicles')
+        dataset = script.index('dataset="${ALPACA_RESEARCH_DATASET:-}"')
+        self.assertLess(preflight, vehicles)
+        self.assertLess(preflight, dataset)
+        fatal = script.index('finish "failed" "strategy LLM preflight fatal')
+        self.assertLess(fatal, vehicles)
+        self.assertIn('research-llm-preflight-warning.v1', script)
 
     def test_scheduler_persists_explicit_factory_terminal_statuses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -893,6 +944,23 @@ class DeployTests(unittest.TestCase):
                 "status": "no_data", "updated_ts": now,
                 "last_exit_code": 2}), encoding="utf-8")
             self.assertFalse(health.research(path, 60, now=now)["ok"])
+
+    def test_research_health_exposes_transient_provider_degraded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            now = datetime.now(timezone.utc).timestamp()
+            path.write_text(json.dumps({
+                "status": "completed_no_edge", "updated_ts": now,
+                "last_exit_code": 0,
+                "research_preflight": {
+                    "schema": "research-llm-preflight.v1",
+                    "status": "degraded", "reason": "transient",
+                    "evidence": {"error": "safe"},
+                },
+            }), encoding="utf-8")
+            result = health.research(path, 60, now=now)
+        self.assertEqual(result["research_preflight"]["status"], "degraded")
+        self.assertTrue(result["provider_preflight_degraded"])
 
     def test_running_research_is_judged_independently_of_previous_cycle(self):
         with tempfile.TemporaryDirectory() as directory:

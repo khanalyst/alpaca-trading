@@ -217,7 +217,10 @@ ANTHROPIC_API_KEY=<research-provider-key>
 The model is set in `config.yaml` under `research.strategy_llm.model` and
 defaults to `gpt-5`; leave `research.strategy_llm.enabled: true`. Set
 `research.strategy_llm.provider` to `anthropic` if you supplied an Anthropic
-key. Compose mounts this file separately and systemd reads it through
+key. When `OPENAI_BASE_URL` points at Azure, also set
+`research.strategy_llm.deployment` to the exact resource-local deployment
+alias; a catalog model ID is not a deployment name, and preflight fails closed
+when the alias is absent. Compose mounts this file separately and systemd reads it through
 `ALPACA_RESEARCH_LLM_SECRETS_FILE`; never put provider keys in `agent.env`.
 
 For the checked OpenAI provider, requests use the Responses API structured
@@ -259,10 +262,10 @@ else:
 Two settings are worth understanding now, because they shape how long step 12
 takes:
 
-**`universe.symbols`** defaults to `["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"]`.
+**`universe.symbols`** defaults to `["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO", "VB", "EFA", "EEM", "TLT", "HYG", "GLD", "SLV", "SMH"]`.
 Research takes at most one trade per symbol per session, so the 100-trade
 evidence floor is as much a *universe width* requirement as a history-length
-one. The eight-symbol default improves opportunity capacity, but real signal
+one. The 24-symbol default improves opportunity capacity, but real signal
 rates still require sufficient history. Floor feasibility fails closed when the
 100-trade floor cannot be supported; widen history and/or `universe.symbols`,
 never lower the floor. Any expansion requires an operator-approved exact list,
@@ -554,6 +557,17 @@ It runs daily at 03:00 UTC. To run one cycle immediately:
 docker compose run --rm research \
   /bin/bash deploy/research-cycle.sh
 ```
+
+Run the bounded, non-authorizing provider probe before that cycle (and after
+changing the research endpoint or model):
+
+```bash
+docker compose run --rm research \
+  python3 research.py llm-preflight --agent-config config.yaml
+```
+
+The probe and its fatal/degraded outcomes are documented in
+[research/README.md](research/README.md#provider-preflight).
 
 Runtime depends on corpus size and configured factory capacity. While a cycle
 runs, `runtime/health/research.json` and the dashboard show the current phase

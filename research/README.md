@@ -63,8 +63,9 @@ The authorizing evidence floors are immutable: backtest/factory windows require
 100 trades, 30 complete sessions, and 30 session clusters; qualification
 requires 100 trades and 30 complete sessions/clusters; the parity-matched
 live-shadow tail requires 150 trades and 30 complete sessions. These are
-evidence floors, not tuning knobs. The shipped default universe is eight liquid
-ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`, `XLV`), improving
+evidence floors, not tuning knobs. The shipped default universe is 24 liquid
+ETFs spanning broad-market, size, sector, international, rates/credit, metals,
+and semiconductor exposures (the exact list is in `config.yaml`), improving
 opportunity capacity, but real signal rates still require sufficient history.
 Replay allows at most one trade per symbol-session; floor feasibility fails
 closed when a required floor cannot be supported. Widen history and/or
@@ -146,12 +147,32 @@ The command-line surface is intentionally small:
 python research.py validate-data bars.jsonl --provider alpaca --feed iex
 python research.py backtest-ibr bars.jsonl --vehicle equity
 python research.py backtest-ibr bars.jsonl --vehicle equity --strict-market-data
+python3 research.py llm-preflight --agent-config config.yaml
 ```
 
 `backtest-ibr` defaults to historical bar fallback; `--strict-market-data`
-opts into strict diagnostics. Both commands are offline and read JSONL only.
-They never download data, call an exchange, place orders, or modify trading
-state.
+opts into strict diagnostics. `validate-data` and `backtest-ibr` are offline and
+read JSONL only. They never download data, call an exchange, place orders, or
+modify trading state. `llm-preflight` is the provider-network exception described
+below; it does not load market data or touch trading state.
+
+### Provider preflight
+
+`llm-preflight` makes one bounded, non-authorizing provider call and does not
+load a dataset or write standalone artifacts. Run it after changing the
+research endpoint or model and before an expensive cycle. The scheduled
+wrapper persists the same bounded, redacted result in the terminal cycle JSON,
+status heartbeat, and operational history (including `degraded` transient
+outages), while still allowing deterministic fallback. `research.strategy_llm.model` accepts a
+provider model ID for generic endpoints. For Azure OpenAI-compatible base URLs,
+set the optional `research.strategy_llm.deployment` to the resource-local
+deployment alias; the preflight fails clearly before corpus work when that
+alias is absent, while retaining `model` as catalog/evidence metadata.
+Authentication/configuration failures and HTTP 404 `DeploymentNotFound` are
+fatal and stop the scheduled cycle. Timeouts, 429s, and 5xx responses are
+transient: the cycle records degraded provider evidence and keeps its
+deterministic fallback. If every runtime LLM call later fails, the cycle ends
+with explicit `llm_provider_failure` unless an authorizing proof already exists.
 
 ## Costs and fill calibration
 
@@ -658,7 +679,9 @@ directional/pair coverage. Quote density can legitimately change null/control
 evidence even when the candidate count is unchanged.
 
 The checked config enables model-assisted discovery, replacement, and tuning
-with OpenAI `gpt-5`. Compose uses the host override
+with OpenAI `gpt-5`. Azure-compatible endpoints also require the exact
+resource-local alias in `research.strategy_llm.deployment`; preflight rejects
+an unset alias before loading the corpus. Compose uses the host override
 `ALPACA_RESEARCH_LLM_SECRET_FILE`; the scheduler reads the mounted path through
 `ALPACA_RESEARCH_LLM_SECRETS_FILE`. Provider keys are read only from that
 separate readable file, never from the broker secret. An enabled adapter

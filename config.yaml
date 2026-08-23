@@ -15,7 +15,7 @@
     "reject_new_entries_minutes_before_close": 5
   },
   "universe": {
-    "symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"],
+    "symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO", "VB", "EFA", "EEM", "TLT", "HYG", "GLD", "SLV", "SMH"],
     "asset_classes": ["us_equity"],
     "min_price": 1.0,
     "max_symbols": 50,
@@ -82,6 +82,7 @@
       "enabled": true,
       "provider": "openai",
       "model": "gpt-5",
+      "deployment": null,
       "max_attempts": 2,
       "timeout_seconds": 30,
       "max_response_bytes": 16384,

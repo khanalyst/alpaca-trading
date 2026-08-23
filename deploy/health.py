@@ -20,6 +20,7 @@ if str(REPO) not in sys.path:
 
 from deploy import load_config
 from deploy.scheduler_output import (derive_research_readiness,
+                                     structured_research_preflight,
                                      structured_research_progress)
 
 
@@ -183,6 +184,11 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         and str(heartbeat.get("cycle_status") or "").lower() == "no_data"
         and last_exit == 2
     )
+    cycle = heartbeat.get("research_cycle")
+    preflight = structured_research_preflight(
+        heartbeat.get("research_preflight"))
+    if preflight is None and isinstance(cycle, dict):
+        preflight = structured_research_preflight(cycle.get("preflight"))
     # In both ``waiting`` and ``running``, ``last_exit_code`` describes the
     # previous completed cycle rather than the scheduler process now being
     # probed.  Preserve that result in the response, but judge current
@@ -205,6 +211,14 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "waiting_after_no_data": waiting_after_no_data,
         "next_run_ts": heartbeat.get("next_run_ts"),
         "structured_failures": heartbeat.get("structured_failures") or [],
+        # A transient provider outage is explicitly non-authorizing evidence:
+        # deterministic research may continue, but operators must see that
+        # the model lane was degraded in the terminal cycle and history.
+        "research_preflight": preflight,
+        "provider_preflight_status": (preflight.get("status")
+                                       if preflight else None),
+        "provider_preflight_degraded": bool(
+            preflight and preflight.get("status") == "degraded"),
         # Keep the health response bounded even if an operator hand-edits a
         # status file; scheduler-produced values already satisfy this schema.
         "research_progress": structured_research_progress(

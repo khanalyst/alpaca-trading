@@ -697,6 +697,7 @@ class AlpacaRuntimeTests(unittest.TestCase):
         cfg = validate_config({"research": {
             "strategy_llm": {"enabled": True, "provider": "anthropic",
                              "model": "model", "max_attempts": 3,
+                             "deployment": "  research-prod  ",
                              "timeout_seconds": 120,
                              "max_response_bytes": 65536},
             "proof": {"directory": "proofs",
@@ -704,7 +705,12 @@ class AlpacaRuntimeTests(unittest.TestCase):
                       "webhook_timeout_seconds": 30},
         }})
         self.assertEqual(cfg["research"]["strategy_llm"]["max_attempts"], 3)
+        self.assertEqual(cfg["research"]["strategy_llm"]["deployment"],
+                         "research-prod")
         self.assertEqual(cfg["research"]["proof"]["directory"], "proofs")
+        with self.assertRaisesRegex(ConfigError, "deployment"):
+            validate_config({"research": {"strategy_llm": {
+                "deployment": "   "}}})
         with self.assertRaisesRegex(ConfigError, "HTTPS"):
             validate_config({"research": {"proof": {
                 "webhook_url": "http://example.test/hook"}}})

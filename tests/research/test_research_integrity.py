@@ -118,6 +118,101 @@ class ScheduledResearchTests(unittest.TestCase):
                  patch.object(research_cli, "print"):
                 self.assertEqual(research_cli.cmd_factory_run(base), 0)
 
+            # Provider exhaustion remains a distinct terminal diagnosis even
+            # when every candidate gate also says the corpus was unevaluable.
+            stalled_gate = {"fill_quality": {
+                "fit": {"opportunities": 1, "executed": 0,
+                         "dominant_reject_reason": "no quote"},
+                "heldout": {"opportunities": 1, "executed": 0,
+                             "dominant_reject_reason": "no quote"},
+            }}
+            with patch.object(research_cli, "_agent_config",
+                              return_value=self._factory_config()), \
+                 patch.object(research_cli, "_factory_dataset_preflight",
+                              return_value={"authorizing": True,
+                                            "diagnostic_only": False,
+                                            "source": {}}), \
+                 patch.object(research_cli, "run_factory",
+                              return_value={"status": "llm_all_calls_failed",
+                                            "results": [{"gate": stalled_gate}]}), \
+                 patch.object(research_cli, "_emit_proofs", return_value=[]), \
+                 patch.object(research_cli, "_write_factory_report",
+                              return_value=None), \
+                 patch.object(research_cli, "print"):
+                self.assertEqual(research_cli.cmd_factory_run(base),
+                                 research_cli.FACTORY_LLM_ALL_CALLS_FAILED_EXIT)
+
+            with patch.object(research_cli, "_agent_config",
+                              return_value=self._factory_config()), \
+                 patch.object(research_cli, "_factory_dataset_preflight",
+                              return_value={"authorizing": True,
+                                            "diagnostic_only": False,
+                                            "source": {}}), \
+                 patch.object(research_cli, "run_factory",
+                              return_value={"status": "llm_provider_failure",
+                                            "results": []}), \
+                 patch.object(research_cli, "_emit_proofs", return_value=[]), \
+                 patch.object(research_cli, "_write_factory_report",
+                              return_value=None), \
+                 patch.object(research_cli, "print"):
+                self.assertEqual(research_cli.cmd_factory_run(base),
+                                 research_cli.FACTORY_LLM_ALL_CALLS_FAILED_EXIT)
+
+    def test_llm_preflight_cli_status_and_exit_contract(self):
+        args = Namespace(agent_config="config.yaml")
+        disabled = {"research": {"strategy_llm": {"enabled": False}}}
+        output = []
+        with patch.object(research_cli, "_agent_config", return_value=disabled), \
+             patch.object(research_cli, "print",
+                          side_effect=lambda value, **_kwargs: output.append(value)):
+            self.assertEqual(research_cli.cmd_llm_preflight(args), 0)
+        self.assertEqual(json.loads(output[-1])["schema"],
+                         "research-llm-preflight.v1")
+        self.assertEqual(json.loads(output[-1])["status"], "disabled")
+
+        class FakeOutcome:
+            def __init__(self, status):
+                self.status = status
+
+            def as_dict(self):
+                return {"schema": "research-llm-preflight.v1",
+                        "status": self.status, "evidence": {}}
+
+        enabled = {"research": {"strategy_llm": {
+            "enabled": True, "provider": "openai", "model": "gpt-test",
+            "max_attempts": 1, "timeout_seconds": 1,
+            "max_response_bytes": 1024, "max_total_calls": 1}}}
+        for status, expected in (("ready", 0), ("degraded", 4), ("fatal", 3)):
+            with self.subTest(status=status):
+                output = []
+                fake = type("FakeAdapter", (), {
+                    "__init__": lambda self, **_kwargs: None,
+                    "preflight": lambda self, _status=status: FakeOutcome(_status),
+                })
+                with patch.object(research_cli, "_agent_config", return_value=enabled), \
+                     patch.object(research_cli, "RuleProposalAdapter", fake), \
+                     patch.object(research_cli, "print",
+                                  side_effect=lambda value, **_kwargs: output.append(value)):
+                    self.assertEqual(research_cli.cmd_llm_preflight(args), expected)
+                self.assertEqual(json.loads(output[-1])["status"], status)
+
+    def test_llm_preflight_cli_redacts_configuration_exception_and_signed_url(self):
+        args = Namespace(agent_config="config.yaml")
+        output = []
+        secret = "sig=super-secret&X-Amz-Security-Token=another-secret"
+        with patch.object(
+                research_cli, "_agent_config",
+                side_effect=RuntimeError(
+                    f"bad endpoint https://example.test/probe?{secret}")), \
+             patch.object(research_cli, "print",
+                          side_effect=lambda value, **_kwargs: output.append(value)):
+            self.assertEqual(research_cli.cmd_llm_preflight(args), 3)
+        payload = json.loads(output[-1])
+        self.assertEqual(payload["status"], "fatal")
+        self.assertNotIn("super-secret", payload["reason"])
+        self.assertNotIn("another-secret", payload["reason"])
+        self.assertLessEqual(len(payload["reason"]), 300)
+
     def test_factory_parser_exposes_confirmatory_attempt_budget(self):
         parser = research_cli.build_parser()
         for argv in (
@@ -168,6 +263,7 @@ class ScheduledResearchTests(unittest.TestCase):
                               side_effect=lambda value, **_kwargs: output.append(value)):
                 self.assertEqual(research_cli.cmd_factory_run(args), 2)
             factory.assert_called_once()
+            self.assertTrue(factory.call_args.kwargs["diagnostic_only"])
             emit.assert_not_called()
             result = json.loads(output[-1])
             self.assertTrue(result["diagnostic_only"])
@@ -218,6 +314,14 @@ class ScheduledResearchTests(unittest.TestCase):
                                                      "deploy" / "research-cycle.sh")],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_research_cycle_preflights_llm_before_vehicle_resolution(self):
+        script = (Path(__file__).parents[2] / "deploy" / "research-cycle.sh").read_text()
+        probe = script.index("research.py\" llm-preflight")
+        vehicles = script.index('research.py" vehicles')
+        self.assertLess(probe, vehicles)
+        self.assertIn("research-llm-preflight-warning.v1", script)
+        self.assertNotIn('research-llm.v1","status":"ready"', script)
 
 
 if __name__ == "__main__":

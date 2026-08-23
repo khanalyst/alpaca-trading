@@ -1272,7 +1272,7 @@ def _blocked_stress_pair(
         chosen = next((pair for pair in pairs
                        if pair[0] * pair[1] >= required_product), None)
     if chosen is None and controls is None:
-        # This is a preference only.  Values are still required to have been
+        # This is a preference only. Values are still required to have been
         # measured and validated above; no stress or risk value is invented.
         chosen = next((pair for pair in pairs
                        if math.isclose(pair[0], 15.0, rel_tol=0.0,
@@ -1323,7 +1323,8 @@ def interaction_mutation_pool(
         if "to" not in change:
             continue
         try:
-            score = float(lesson.get("heldout_delta"))
+            score = float(lesson.get("heldout_delta",
+                                     lesson.get("fit_delta")))
         except (TypeError, ValueError, OverflowError):
             continue
         if not math.isfinite(score):
@@ -1333,11 +1334,38 @@ def interaction_mutation_pool(
     # Retain one best measured value per field.  Positive relative improvements
     # rank first, while the closest negative near-misses remain usable when no
     # coordinate helped enough on its own.
+    # Ties are resolved by the diagnosed failure's field priority, then by
+    # the numeric value itself (never its string rendering, where ``10``
+    # would sort before ``5``).  This keeps a generic interaction batch
+    # deterministic while still spending its bounded allowance on the axes
+    # most likely to address the observed failure.
+    failure = str((diagnostic or {}).get("primary_failure") or "")
+    priority = {field: index for index, field in enumerate(
+        _FAILURE_FIELD_PRIORITY.get(failure, ())) }
+
+    def value_key(value: Any) -> tuple[int, Any]:
+        if isinstance(value, bool):
+            return (1, str(value))
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return (1, str(value))
+        return ((0, numeric) if math.isfinite(numeric)
+                else (1, str(value)))
+
+    def lesson_key(item: tuple[float, str, Any, str]) -> tuple[Any, ...]:
+        score, field, value, lesson_id = item
+        return (-score, priority.get(field, len(priority)), field,
+                value_key(value), lesson_id)
+
     best: dict[str, tuple[float, Any, str]] = {}
     for score, field, value, lesson_id in sorted(
-            ranked, key=lambda item: (-item[0], item[1], str(item[2]))):
+            ranked, key=lesson_key):
         best.setdefault(field, (score, value, lesson_id))
-    selected = sorted(best.items(), key=lambda item: (-item[1][0], item[0]))[:6]
+    selected = sorted(
+        best.items(),
+        key=lambda item: (-item[1][0], priority.get(item[0], len(priority)),
+                          item[0], value_key(item[1][1]), item[1][2]))[:6]
     root_signature = rule_semantic_signature(root)
     seen = {rule_variant_id(root)}
     variants: list[tuple[dict, str]] = []
@@ -1377,7 +1405,7 @@ def interaction_mutation_pool(
     if blocked_pair is None:
         return variants[:max(0, int(limit))]
     # The dedicated pair is first so a bounded interaction batch cannot spend
-    # its entire allowance on weaker generic combinations.  Trim only after
+    # its entire allowance on weaker generic combinations. Trim only after
     # inserting it, preserving the existing pool cap and identity semantics.
     variants = [blocked_pair] + [item for item in variants
                                  if rule_variant_id(item[0]) != blocked_pair_id]

@@ -131,8 +131,9 @@ vehicles independently; their calibration and authorization evidence stays
 per vehicle. Capacity is configurable through the
 `ALPACA_FACTORY_*` environment variables.
 
-The shipped/default universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`,
-`XLF`, `XLK`, `XLE`, `XLV`), improving opportunity capacity. Authorizing floors
+The shipped/default universe is 24 liquid ETFs spanning broad-market, size,
+sector, international, rates/credit, metals, and semiconductor exposures (the
+exact list is in `config.yaml`), improving opportunity capacity. Authorizing floors
 are immutable: backtest/factory requires 100 trades and 30 complete
 sessions/clusters; sealed qualification requires 100 trades and 30 complete
 sessions/clusters; parity-matched live shadow requires 150 trades and 30
@@ -227,6 +228,14 @@ discovery, replacement, and tuning. Credentials come only from
 the research cycle before discovery. LLM requests use full-schema structured
 contracts, a per-run call budget and authentication circuit, and record
 per-attempt evidence. The runtime decision LLM is hard-off in the paper trader.
+Before resolving lanes or touching the dataset, the cycle runs one bounded,
+non-authorizing `python3 research.py llm-preflight --agent-config config.yaml`
+probe. Its bounded, redacted result is retained in the terminal cycle JSON,
+status heartbeat, and operational history, including transient `degraded`
+outages that permit deterministic fallback. See
+[research/README.md](../research/README.md#provider-preflight) for the
+model/deployment contract and fatal/degraded classification; operators should
+rerun it after endpoint/model changes and before an expensive cycle.
 The trader opens
 entries only when the SQLite ledger has a vehicle-local `validated` or
 `champion` edge for its configured execution profile whose latest shadow proof
@@ -321,6 +330,9 @@ research-provider dotenv file before startup; it is mounted read-only as
 `/run/secrets/research_llm_credentials`. The file must be readable by the
 container's restricted UID and contain `OPENAI_API_KEY` for the checked
 `openai`/`gpt-5` provider (or the matching `ANTHROPIC_API_KEY` when configured).
+When `OPENAI_BASE_URL` is Azure, set the exact resource-local alias in
+`research.strategy_llm.deployment`; the catalog model name is retained only as
+evidence and is not guessed as the deployment.
 Broker credentials are not mounted into the research service. The OpenAI path
 uses the Responses API structured-output request; prompt, request, schema, and
 configuration (including the fixed sampling setting), plus response hashes,

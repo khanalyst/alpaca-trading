@@ -223,24 +223,35 @@ prompt, so configure only a trusted HTTPS service; the application does not
 currently enforce a host allowlist for LLM endpoints. The OpenAI research path
 uses the Responses API structured-output request. Prompt, request, schema,
 configuration (including the fixed sampling setting), and received-response
-hashes make the evidence reproducible for
-the exact invocation, but they do not guarantee bit-for-bit identical model
-output on a later call. The checked Responses request pins `temperature` to
-`0`, fixing the sampling setting without making provider output deterministic;
-the hashes preserve the actual request and response. The adapter's call budget
-is a per-run call-count guard, not spend accounting; provider-side quotas remain
-an operational control for unattended research.
+hashes make the evidence reproducible for the exact invocation, but they do not
+guarantee bit-for-bit identical model output on a later call. The checked
+Responses request pins `temperature` to `0`, fixing the sampling setting without
+making provider output deterministic; the hashes preserve the actual request
+and response. The adapter's call budget is a per-run call-count guard, not spend
+accounting; provider-side quotas remain an operational control for unattended
+research.
+
+Before any dataset work, the scheduled cycle runs one bounded, non-authorizing
+`python3 research.py llm-preflight --agent-config config.yaml` probe through the
+same provider path used by research. The provider model/deployment contract,
+fatal versus degraded outcomes, and operator timing are documented in
+[research/README.md](research/README.md#provider-preflight). The bounded,
+redacted preflight result is retained in cycle/status/history and shown by
+health/dashboard; transient `degraded` results keep deterministic fallback
+available. If all later runtime LLM calls fail, the terminal status is
+`llm_provider_failure` unless an authorizing proof already exists.
 
 ### Boundaries for future research extensions
 
-Universe expansion is not a tuning-only change: it requires an operator-approved
-exact symbol list, recorder coverage for that list, and a new identity/proof.
-Event conditioning requires a point-in-time event source with its own provider,
-`as_of`, and observation provenance. Prior-session, true multi-timeframe, and
-cross-sectional features require explicit context in the replay input; missing
-or ambiguous context fails closed. Shadow quarantine is not an auto-skip: an
-unresolved quarantined session blocks watermark/FDR advancement until its source
-is corrected and the bounded parity replay completes.
+The shipped 24-symbol ETF universe is an explicit operator-approved expansion;
+any later universe change still requires an exact symbol list, recorder coverage
+for that list, and a new identity/proof. Event conditioning requires a
+point-in-time event source with its own provider, `as_of`, and observation
+provenance. Prior-session, true multi-timeframe, and cross-sectional features
+require explicit context in the replay input; missing or ambiguous context fails
+closed. Shadow quarantine is not an auto-skip: an unresolved quarantined session
+blocks watermark/FDR advancement until its source is corrected and the bounded
+parity replay completes.
 
 ### Costs and authorization checks
 
@@ -493,7 +504,10 @@ consolidated SIP tape; sparse coverage is retained as evidence, and changing
 feeds requires a fresh research/shadow proof. The scheduled research lane also
 requires a separate readable dotenv file with `OPENAI_API_KEY` for the checked
 `openai`/`gpt-5` provider (or the matching configured provider key); set
-`ALPACA_RESEARCH_LLM_SECRET_FILE` to that path. Do not put provider keys in the
+`ALPACA_RESEARCH_LLM_SECRET_FILE` to that path. Azure endpoints additionally
+require the exact resource-local alias in
+`research.strategy_llm.deployment`; do not substitute a catalog model ID.
+Do not put provider keys in the
 broker secret. `check` is the
 authenticated preflight by default; `check --offline` validates local
 configuration only and is not a trading preflight. Unit tests use fakes and do
@@ -537,9 +551,11 @@ open/close metadata (including early closes). Its fetch-time `observed_at` is
 not backdated. Historical rows may be inspected only through the explicit
 diagnostic replay policy and are marked `diagnostic_historical_backfill`; they
 are never authorizing evidence or a live-shadow authorization. Options are not
-backfilled and still need recorded sessions. The shipped default universe is eight liquid ETFs (`SPY`,
-`QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`, `XLV`), which improves opportunity
-capacity, but real signal rates still require sufficient history. Floor
+backfilled and still need recorded sessions. The shipped default universe is
+24 liquid ETFs spanning broad-market, size, sector, international, rates/credit,
+metals, and semiconductor exposures (the exact list is in `config.yaml`).
+This improves opportunity capacity, but real signal rates still require
+sufficient history. Floor
 feasibility fails closed when the 100-trade held-out floor cannot be met;
 widen the history and/or `universe.symbols`, never lower the evidence floor. On a
 fresh ledger, `run` starts safely but will not submit entries: first collect an

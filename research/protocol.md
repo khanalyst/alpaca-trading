@@ -480,8 +480,9 @@ final window rather than each carrying its own; a corpus too thin to seal a
 window or to support rolling-origin folds is underpowered, not failed.
 
 The held-out trade floor is evidence, not a tuning knob. The shipped default
-universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`,
-`XLV`), improving opportunity capacity, but real signal rates still require
+universe is 24 liquid ETFs spanning broad-market, size, sector, international,
+rates/credit, metals, and semiconductor exposures (the exact list is in
+`config.yaml`), improving opportunity capacity, but real signal rates still require
 sufficient history. Replay allows at most one trade per symbol-session; floor
 feasibility fails closed when 100 held-out trades cannot be supported. Widen
 history and/or the universe, never lower the floor.
