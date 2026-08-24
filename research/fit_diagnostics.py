@@ -30,6 +30,12 @@ from .stats import clustered_mde_power_report
 
 
 FIT_DIAGNOSTICS_SCHEMA = "fit-diagnostics.v1"
+FIT_BEHAVIOR_ALIAS_SCHEMA = "fit-behavior-alias.v1"
+# Quantization is deliberately much tighter than an executable market tick.
+# It merges only numerical representation noise in otherwise identical
+# planned fit behavior, while producing a transitive, hashable equivalence
+# relation (unlike order-dependent pairwise tolerance clustering).
+FIT_BEHAVIOR_ALIAS_DECIMALS = 8
 COST_STRESS_MULTIPLIERS = (9, 15, 25, 50)
 _NY = ZoneInfo("America/New_York")
 
@@ -176,12 +182,38 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
-def _planned_vector(metadata: Mapping[str, Any], *, full: bool) -> dict[str, Any]:
+def _fit_evidence_key(bars: Sequence[Any], *, policy: Any | None) -> str:
+    """Bind an alias fingerprint to the exact fit corpus and policy view."""
+    names = (
+        "provider", "feed", "symbol", "timestamp", "as_of", "observed_at",
+        "source_mode", "interval_seconds", "open", "high", "low", "close",
+        "volume", "session_open", "session_close",
+    )
+    vectors = []
+    for row in bars:
+        identity = getattr(row, "identity", None)
+        values = {}
+        for name in names:
+            value = (row.get(name) if isinstance(row, Mapping) else
+                     getattr(row, name, None))
+            if value is None and identity is not None:
+                value = getattr(identity, name, None)
+            values[name] = value.isoformat() if isinstance(value, datetime) else value
+        vectors.append(values)
+    vectors.sort(key=_canonical)
+    return _digest({
+        "bars": vectors,
+        "diagnostic_backfill": _diagnostic_backfill_enabled(policy),
+    })
+
+
+def _planned_vector(metadata: Mapping[str, Any], *, full: bool,
+                    decimals: int = 10) -> dict[str, Any]:
     def rounded(value: Any) -> Any:
         number = _number(value)
         if number is None:
             return value
-        return round(number, 10)
+        return round(number, int(decimals))
     vector = {
         "session_date": str(metadata.get("session_date") or ""),
         "symbol": str(metadata.get("symbol") or "").upper(),
@@ -524,16 +556,31 @@ def _execution_rejection_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str,
     consulted.
     """
     no_trade = [row for row in rows if row.get("no_trade") is True]
+    no_signal = [row for row in no_trade
+                 if row.get("execution_disposition") == "no_signal"]
+    refused = [row for row in no_trade
+               if (row.get("execution_disposition") == "refused" or
+                   (not row.get("execution_disposition") and
+                    row.get("reject_reason")))]
+    unclassified = [row for row in no_trade
+                    if (row.get("execution_disposition") not in {
+                            "no_signal", "refused"} and
+                        not row.get("reject_reason"))]
     reasons = Counter(str(row.get("reject_reason") or "unknown")
-                      for row in no_trade)
-    explicit = sum(1 for row in no_trade
+                      for row in refused)
+    explicit = sum(1 for row in refused
                    if str(row.get("reject_reason") or "").strip())
     executed = len(rows) - len(no_trade)
-    blocked = bool(no_trade) and executed == 0 and explicit == len(no_trade)
+    blocked = (bool(refused) and executed == 0 and not unclassified and
+               explicit == len(refused) and
+               all(row.get("signal_opportunity") is not False
+                   for row in refused))
     result = {
         "rows": len(rows),
         "executed_rows": executed,
         "no_trade_rows": len(no_trade),
+        "no_signal_rows": len(no_signal),
+        "unclassified_no_trade_rows": len(unclassified),
         "explicit_rejections": explicit,
         "reject_reason_counts": dict(sorted(reasons.items())),
         "execution_blocked": blocked,
@@ -582,6 +629,14 @@ def measure_fit_diagnostics(
     signals = prefix["first_signals"]
     entry_vectors = [_planned_vector(item, full=False) for item in signals]
     full_vectors = [_planned_vector(item, full=True) for item in signals]
+    alias_entry_vectors = [
+        _planned_vector(item, full=False,
+                        decimals=FIT_BEHAVIOR_ALIAS_DECIMALS)
+        for item in signals]
+    alias_full_vectors = [
+        _planned_vector(item, full=True,
+                        decimals=FIT_BEHAVIOR_ALIAS_DECIMALS)
+        for item in signals]
     eligible = int(prefix["eligible_prefixes"])
     total = int(prefix["total_prefixes"])
     floor_count = sum(bool(item.get("floor_binding")) for item in signals)
@@ -675,10 +730,14 @@ def measure_fit_diagnostics(
         "exit_grammar": audit_exit_grammar(normalized),
         "mde_power": _mde(rows),
         "behavior_fingerprint": {
+            "fit_evidence_key": _fit_evidence_key(
+                bars, policy=policy),
             "entry": _digest(entry_vectors),
             "full": _digest(full_vectors),
-            "entry_alias_key": _digest(entry_vectors),
-            "full_alias_key": _digest(full_vectors),
+            "entry_alias_key": _digest(alias_entry_vectors),
+            "full_alias_key": _digest(alias_full_vectors),
+            "alias_schema": FIT_BEHAVIOR_ALIAS_SCHEMA,
+            "alias_numeric_decimals": FIT_BEHAVIOR_ALIAS_DECIMALS,
             "signal_count": len(signals),
             "planned_vector_count": len(full_vectors),
         },
@@ -712,81 +771,157 @@ def _record_spec(record: Any) -> tuple[dict[str, Any], str, str]:
 
 
 def collapse_behavior_aliases(
-        records: Sequence[Any], *, diagnostics: Mapping[str, Mapping[str, Any]] | None = None
+        records: Sequence[Any], *,
+        diagnostics: Mapping[str, Mapping[str, Any]] | None = None,
+        freeze: bool = False,
         ) -> dict[str, Any]:
-    """Return deterministic full-behavior aliases and a kept candidate list.
+    """Return deterministic fit-behavior aliases and a kept candidate list.
 
     A zero-signal fingerprint is never collapsed.  For a non-empty full
     fingerprint, the canonical member is deterministic-source first, then the
-    lexicographically smallest variant id.  Alias groups are diagnostic-only
-    proposals: every intended member remains in ``kept`` for full replay and
-    multiple-testing correction.
+    lexicographically smallest variant id/candidate key.  The default remains
+    measurement-only for compatibility.  ``freeze=True`` applies the fixed
+    fit-only equivalence rule before any held-out replay: one representative
+    remains in ``kept`` and all exclusions are returned with their canonical
+    candidate.  A diagnostic without an explicit ``scope=fit_only`` can never
+    authorize that frozen reduction.
     """
     diagnostics = diagnostics or {}
     normalized: list[dict[str, Any]] = []
-    for item in records:
+    for index, item in enumerate(records):
         spec, variant_id, source = _record_spec(item)
-        diagnostic = diagnostics.get(variant_id)
+        candidate_key = str(
+            item.get("candidate_key") or variant_id
+            if isinstance(item, Mapping) else variant_id)
+        diagnostic = diagnostics.get(candidate_key) or diagnostics.get(variant_id)
         if diagnostic is None and isinstance(item, Mapping):
             diagnostic = item.get("fit_diagnostics")
         diagnostic = diagnostic if isinstance(diagnostic, Mapping) else {}
         fingerprint = diagnostic.get("behavior_fingerprint") or {}
+        try:
+            signal_count = int(fingerprint.get("signal_count") or 0)
+            planned_vector_count = int(
+                fingerprint.get("planned_vector_count") or 0)
+        except (TypeError, ValueError, OverflowError):
+            signal_count = planned_vector_count = 0
+        fit_only = diagnostic.get("scope") == "fit_only"
+        fit_evidence_key = str(fingerprint.get("fit_evidence_key") or "")
+        alias_schema = str(fingerprint.get("alias_schema") or
+                           "legacy-exact-fit-behavior")
+        try:
+            alias_decimals = int(fingerprint.get(
+                "alias_numeric_decimals", 10))
+        except (TypeError, ValueError, OverflowError):
+            alias_decimals = 10
         normalized.append({"record": item, "spec": spec, "variant_id": variant_id,
+                           "candidate_key": candidate_key,
+                           "record_key": f"{candidate_key}\x1f{index}",
+                           "family": str(spec.get("family") or ""),
                            "source": source, "diagnostic": diagnostic,
-                           "entry": str(fingerprint.get("entry") or ""),
-                           "full": str(fingerprint.get("full") or ""),
-                           "signal_count": int(fingerprint.get("signal_count") or 0)})
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+                           "fit_only": fit_only,
+                           "fit_evidence_key": fit_evidence_key,
+                           "alias_schema": alias_schema,
+                           "alias_decimals": alias_decimals,
+                           "entry": str(fingerprint.get("entry_alias_key") or
+                                        fingerprint.get("entry") or ""),
+                           "full": str(fingerprint.get("full_alias_key") or
+                                       fingerprint.get("full") or ""),
+                           "signal_count": signal_count,
+                           "planned_vector_count": planned_vector_count})
+    groups: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
     for item in normalized:
-        if item["signal_count"] > 0 and item["full"]:
-            groups.setdefault((item["full"], item["entry"]), []).append(item)
-    # Measurement-first policy: aliases are proposed for review, never removed
-    # from the intended replay/BH family in this stage.  Keeping this separate
-    # from ``kept`` makes the no-mutation invariant explicit to callers.
-    kept_ids = {item["variant_id"] for item in normalized}
+        eligible_scope = item["fit_only"] if freeze else (
+            item["diagnostic"].get("scope") in {None, "fit_only"})
+        if (eligible_scope and (item["fit_evidence_key"] or not freeze) and
+                item["signal_count"] > 0 and
+                item["planned_vector_count"] == item["signal_count"] and
+                item["full"] and item["entry"]):
+            groups.setdefault((item["fit_evidence_key"], item["alias_schema"],
+                               item["alias_decimals"],
+                               item["full"], item["entry"]), []).append(item)
+    kept_record_keys = {item["record_key"] for item in normalized}
     proposed_exclusions: list[dict[str, Any]] = []
     full_aliases: list[dict[str, Any]] = []
     parameter_collapse: list[dict[str, Any]] = []
-    for (full, entry), members in sorted(groups.items()):
+    for (fit_evidence_key, alias_schema, alias_decimals,
+         full, entry), members in sorted(groups.items()):
         if len(members) < 2:
             continue
         canonical = sorted(members, key=lambda item: (
-            0 if item["source"] in {"deterministic", "carried_forward"} else 1,
-            item["variant_id"]))[0]
+            0 if item["source"] in {
+                "deterministic", "deterministic_template", "carried_forward"} else 1,
+            item["variant_id"], item["candidate_key"]))[0]
         aliases = [item for item in members if item is not canonical]
         for item in aliases:
-            proposed_exclusions.append({
+            exclusion = {
+                "candidate_key": item["candidate_key"],
                 "variant_id": item["variant_id"],
+                "family": item["family"],
+                "canonical_candidate_key": canonical["candidate_key"],
                 "canonical_variant_id": canonical["variant_id"],
+                "canonical_family": canonical["family"],
                 "entry_fingerprint": entry,
                 "full_fingerprint": full,
-                "reason": "fit_behavioral_alias_proposed",
-            })
+                "fit_evidence_key": fit_evidence_key,
+                "alias_schema": alias_schema,
+                "alias_numeric_decimals": alias_decimals,
+                "selection_scope": "fit_only",
+                "reason": "fit_behavioral_alias_frozen" if freeze else
+                          "fit_behavioral_alias_proposed",
+            }
+            proposed_exclusions.append(exclusion)
+            if freeze:
+                kept_record_keys.discard(item["record_key"])
         full_aliases.append({"entry_fingerprint": entry,
                              "full_fingerprint": full,
+                             "fit_evidence_key": fit_evidence_key,
+                             "alias_schema": alias_schema,
+                             "alias_numeric_decimals": alias_decimals,
+                             "canonical_candidate_key": canonical["candidate_key"],
                              "canonical_variant_id": canonical["variant_id"],
+                             "canonical_family": canonical["family"],
+                             "candidate_keys": sorted(
+                                 item["candidate_key"] for item in members),
                              "variant_ids": sorted(item["variant_id"] for item in members),
+                             "families": sorted({item["family"] for item in members}),
                              "signal_count": max(item["signal_count"] for item in members)})
         fields = sorted({key for item in members for key in set(item["spec"])
                          if any(item["spec"].get(key) != other["spec"].get(key)
                                 for other in members)})
-        parameter_collapse.append({"canonical_variant_id": canonical["variant_id"],
+        parameter_collapse.append({
+                                   "canonical_candidate_key": canonical["candidate_key"],
+                                   "canonical_variant_id": canonical["variant_id"],
+                                   "candidate_keys": sorted(
+                                       item["candidate_key"] for item in members),
                                    "variant_ids": sorted(item["variant_id"] for item in members),
                                    "fields": fields})
-    kept = [item["record"] for item in normalized if item["variant_id"] in kept_ids]
-    entry_groups: dict[str, list[str]] = {}
+    kept = [item["record"] for item in normalized
+            if item["record_key"] in kept_record_keys]
+    entry_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for item in normalized:
-        if item["signal_count"] > 0 and item["entry"]:
-            entry_groups.setdefault(item["entry"], []).append(item["variant_id"])
-    entry_aliases = [{"entry_fingerprint": key, "variant_ids": sorted(value)}
-                     for key, value in sorted(entry_groups.items()) if len(value) > 1]
-    return {"kept": kept, "excluded": [],
+        if (item["fit_only"] and item["signal_count"] > 0 and item["entry"]):
+            entry_groups.setdefault(
+                (item["fit_evidence_key"], item["entry"]), []).append(item)
+    entry_aliases = [
+        {"fit_evidence_key": fit_evidence_key,
+         "entry_fingerprint": key,
+         "candidate_keys": sorted(item["candidate_key"] for item in value),
+         "variant_ids": sorted(item["variant_id"] for item in value),
+         "families": sorted({item["family"] for item in value})}
+        for (fit_evidence_key, key), value in sorted(entry_groups.items())
+        if len(value) > 1]
+    excluded = list(proposed_exclusions) if freeze else []
+    return {"kept": kept, "excluded": excluded,
             "proposed_exclusions": proposed_exclusions,
             "entry_aliases": entry_aliases, "full_aliases": full_aliases,
             "parameter_collapse": parameter_collapse,
             "signals_present": any(item["signal_count"] > 0 for item in normalized),
-            "dedup_status": "diagnostic_only",
-            "requires_operator_review": bool(proposed_exclusions),
+            "dedup_status": ("fit_preregistered_frozen" if freeze else
+                             "diagnostic_only"),
+            "selection_scope": "fit_only",
+            "alias_schema": FIT_BEHAVIOR_ALIAS_SCHEMA,
+            "alias_numeric_decimals": FIT_BEHAVIOR_ALIAS_DECIMALS,
+            "requires_operator_review": bool(proposed_exclusions) and not freeze,
             "intended_variant_count": len(normalized),
             "kept_variant_count": len(kept)}
 
@@ -858,7 +993,8 @@ fit_behavior_diagnostics = measure_fit_diagnostics
 
 
 __all__ = [
-    "COST_STRESS_MULTIPLIERS", "FIT_DIAGNOSTICS_SCHEMA",
+    "COST_STRESS_MULTIPLIERS", "FIT_BEHAVIOR_ALIAS_DECIMALS",
+    "FIT_BEHAVIOR_ALIAS_SCHEMA", "FIT_DIAGNOSTICS_SCHEMA",
     "audit_exit_grammar", "build_fit_diagnostics", "collapse_aliases",
     "collapse_behavior_aliases", "diagnose_fit", "filter_behavior_aliases",
     "fit_behavior_diagnostics", "fit_behavior_fingerprint",

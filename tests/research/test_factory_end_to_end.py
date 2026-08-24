@@ -172,11 +172,20 @@ class EarnedGatePassTests(unittest.TestCase):
     def test_a_replayed_edge_earns_a_passing_backtest_gate(self):
         self.assertEqual(self.result["status"], "complete")
         rows = self._by_variant(self.result)
-        self.assertEqual(
-            sorted(rows), sorted([ROOT_VARIANT, FIRST_COORDINATE_VARIANT]))
+        self.assertEqual(sorted(rows), [ROOT_VARIANT])
+        aliases = self.result["fit_behavior_canonicalization"]
+        self.assertEqual(aliases["dedup_status"], "fit_preregistered_frozen")
+        self.assertEqual(aliases["selection_scope"], "fit_only")
+        self.assertEqual(aliases["intended_variant_count"], 2)
+        self.assertEqual(aliases["kept_variant_count"], 1)
+        self.assertEqual(len(aliases["excluded"]), 1)
+        self.assertEqual(aliases["excluded"][0]["variant_id"],
+                         FIRST_COORDINATE_VARIANT)
+        self.assertEqual(aliases["excluded"][0]["canonical_variant_id"],
+                         ROOT_VARIANT)
         # Selection is made once on development evidence.  In this corpus the
-        # simpler root has the stronger lower confidence bound, so the final
-        # window is spent on it and the mutation remains diagnostic.
+        # two planned variants are exact fit-behavior aliases, so the simpler
+        # root is frozen before held-out replay/BH and spends the final window.
         winner = rows[ROOT_VARIANT]
         gate = winner["gate"]
         self.assertTrue(gate["passes"])

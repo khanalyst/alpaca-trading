@@ -5,7 +5,7 @@ import unittest
 from research.gates import (
     AcceptanceFloor, SealedWindowError, chronological_split,
     deterministic_placebo_deltas, falsification_gate, matched_cluster_test,
-    expectancy_rejection_report, paired_delta, performance_floor,
+    expectancy_rejection_report, gate_dependence_report, paired_delta, performance_floor,
     placebo_null_distribution,
     qualification_report, recompute_gate_statistics, seal_final_window, structural_floor,
     risk_unit_report, verified_gate_envelope, verify_gate_envelope,
@@ -271,22 +271,62 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertFalse(falsification_gate(
             mixed_null["observed"], mixed_null["placebo"])["passes"])
 
+    def test_falsification_reuses_preregistered_p_but_keeps_null_guards(self):
+        placebo = [-1.0, -.5, .5, 1.0]
+        decision = falsification_gate(
+            [2.0, 2.0], placebo, preregistered_p_value=.01)
+        self.assertTrue(decision["passes"])
+        self.assertEqual(decision["p_value"], .01)
+        self.assertEqual(decision["p_value_source"],
+                         "heldout_paired_cluster_sign_flip")
+        self.assertTrue(decision["positive_mean"])
+        self.assertTrue(decision["distinct"])
+        self.assertTrue(decision["ratio_adequate"])
+        dependence = gate_dependence_report({
+            "checks": {"heldout_p_significant": True, "falsification": True},
+            "statistics": {"p_value": .01, "alpha": .05},
+            "falsification": decision,
+        })
+        self.assertEqual(
+            dependence["shared_source_statistics"]["statistics.p_value"]
+            ["checks"],
+            ["falsification", "heldout_p_significant"])
+
+        # A significant preregistered p-value is necessary but cannot bypass
+        # the independent falsification guards.
+        self.assertFalse(falsification_gate(
+            [-2.0], placebo, preregistered_p_value=.001)["passes"])
+        self.assertFalse(falsification_gate(
+            [2.0], [0.0, 0.0], preregistered_p_value=.001)["passes"])
+        self.assertFalse(falsification_gate(
+            [1.0], [-10.0, 10.0],
+            preregistered_p_value=.001)["passes"])
+        for invalid in (True, -0.1, 1.1, float("nan")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                falsification_gate(
+                    [2.0], placebo, preregistered_p_value=invalid)
+
     def test_placebo_draws_are_reproducible_from_persisted_content(self):
         candidate = _rows(9, net=4.0)
         baseline = _rows(9, net=0.0, prefix="root")
         control = matched_cluster_test(candidate, baseline, vehicle="equity")
         null = placebo_null_distribution(candidate, baseline, vehicle="equity")
+        decision = falsification_gate(
+            null["observed"], null["placebo"],
+            preregistered_p_value=control["p_value"])
         envelope = verified_gate_envelope(
             lane="backtest", vehicle="equity", fit=[], heldout=candidate,
             fit_floor={}, heldout_floor={},
             control=control, p_value=control["p_value"], q_value=.01, alpha=.05,
-            falsification={"passes": True, "draws": null["draws"],
-                           "seed": null["seed"], "p_value": null["p_value"]},
+            falsification={**decision, "draws": null["draws"],
+                           "seed": null["seed"]},
             separation={"passes": True}, checks={"falsification": True},
             passes=True)
         recomputed = recompute_gate_statistics(envelope)
         self.assertTrue(recomputed["available"])
         self.assertAlmostEqual(recomputed["p_value"], control["p_value"])
+        self.assertAlmostEqual(recomputed["falsification_p_value"],
+                               control["p_value"])
         self.assertAlmostEqual(recomputed["mean_delta"], 4.0)
         self.assertAlmostEqual(recomputed["mean_delta_lcb"],
                                control["mean_delta_lcb"])

@@ -255,7 +255,10 @@ def _option_liquid(snapshot: OptionSnapshot) -> bool:
 def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
               direction: str, reason: str, *, contract: str | None = None,
               decision_timestamp: datetime | None = None,
-              entry_timestamp: datetime | None = None) -> dict:
+              entry_timestamp: datetime | None = None,
+              stage: str = "pricing",
+              signal_opportunity: bool = True,
+              detail: Mapping[str, Any] | None = None) -> dict:
     """Mark a real signal that has no honest fill price.
 
     Returning ``None`` here would make the observation indistinguishable from a
@@ -263,6 +266,10 @@ def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
     contract stopped being quoted — the least random subset there is.
     """
     return {"unpriced_reason": reason, "direction": direction, "contract": contract,
+            "execution_disposition": "refused",
+            "signal_opportunity": bool(signal_opportunity),
+            "reject_stage": str(stage),
+            "reject_detail": dict(detail or {}),
             "session_date": day.isoformat(),
             "signal_bar_feed": signal_bar.feed,
             "signal_bar_provider": signal_bar.provider,
@@ -271,6 +278,20 @@ def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
             "signal_timestamp": signal_bar.end.isoformat(),
             "decision_timestamp": ((decision_timestamp or signal_bar.end).isoformat()),
             "entry_timestamp": ((entry_timestamp or entry_bar.timestamp).isoformat())}
+
+
+def _no_signal(session_bars: Sequence[UnderlyingBar], *,
+               reason: str = "rule_not_triggered") -> dict:
+    """Return the explicit terminal disposition for a valid zero-signal day."""
+    first = session_bars[0]
+    return {
+        "execution_disposition": "no_signal",
+        "signal_opportunity": False,
+        "no_signal_reason": str(reason),
+        "session_date": first.session_date.isoformat(),
+        "signal_bar_feed": first.feed,
+        "signal_bar_provider": first.provider,
+    }
 
 
 def _coerce_policy(policy: ReplayPolicy | Mapping[str, Any] | None) -> ReplayPolicy:
@@ -325,13 +346,19 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     quotes: Mapping[str, Sequence[QuoteSnapshot]] | None = None,
                     policy: ReplayPolicy | Mapping[str, Any] | None = None) -> dict | None:
     resolved_policy = _coerce_policy(policy)
-    if not _session_bars_valid(session_bars):
+    if not session_bars:
         return None
+    if not _session_bars_valid(session_bars):
+        return _unpriced(
+            session_bars[0], session_bars[0], session_bars[0].session_date,
+            "unknown", "invalid_session_bars", stage="data_validation",
+            signal_opportunity=False)
     spec = validate_rule_spec(spec)
     if not rule_vehicle_executable(spec, vehicle):
         return _unpriced(
             session_bars[0], session_bars[0], session_bars[0].session_date,
-            "unknown", "rule-strategy.v3 is not executable for options")
+            "unknown", "rule-strategy.v3 is not executable for options",
+            stage="rule_eligibility", signal_opportunity=False)
     try:
         resolved_policy = replay_policy_for_bars(
             resolved_policy, session_bars,
@@ -339,17 +366,22 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     except CostError as exc:
         return _unpriced(session_bars[0], session_bars[0],
                          session_bars[0].session_date,
-                         "unknown", str(exc))
+                         "unknown", str(exc), stage="data_validation",
+                         signal_opportunity=False)
     metadata = (session_bars[0].session_open, session_bars[0].session_close)
     if metadata[0] is not None and metadata[1] is not None:
         if any(bar.timestamp < metadata[0] or bar.end > metadata[1]
                for bar in session_bars):
             return _unpriced(session_bars[0], session_bars[0],
                              session_bars[0].session_date, "unknown",
-                             "bar_outside_exact_session")
+                             "bar_outside_exact_session",
+                             stage="data_validation", signal_opportunity=False)
     # ``None`` means the family accumulates from the session open, so its
     # window starts at the session's first bar rather than a trailing offset.
     window = feature_window_bars(spec)
+    last_refusal: dict | None = None
+    evaluated_prefixes = 0
+    gapped_prefixes = 0
     for index in range(1, len(session_bars) - 1):
         signal_bar = session_bars[index]
         # The bars a signal is computed from must be consecutive: a gap inside
@@ -358,7 +390,9 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         feature_start = (0 if window is None
                          else max(0, index + 1 - int(window)))
         if not _contiguous(session_bars, feature_start, index + 1):
+            gapped_prefixes += 1
             continue
+        evaluated_prefixes += 1
         signal = evaluate_rule_signal(session_bars[:index + 1], spec)
         if signal is None:
             continue
@@ -368,6 +402,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                      if _available(item, resolved_policy) is not None]
         signal_ready = max([signal_bar.end, *available], default=None)
         if signal_ready is None:
+            last_refusal = _unpriced(
+                signal_bar, entry_bar, signal_bar.session_date,
+                str(signal.get("direction") or "unknown"),
+                "signal_not_observable", stage="signal_visibility")
             continue
         boundary = signal_bar.end
         entry_at = boundary if signal_ready <= boundary else signal_ready
@@ -376,10 +414,22 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         # first full bar after an outage because its decision did not exist at
         # the missing next-bar boundary.
         if entry_bar.timestamp != boundary and signal_ready <= boundary:
+            last_refusal = _unpriced(
+                signal_bar, entry_bar, signal_bar.session_date,
+                str(signal.get("direction") or "unknown"),
+                "entry_bar_not_adjacent", stage="entry_causality",
+                decision_timestamp=signal_ready,
+                entry_timestamp=boundary)
             continue
         entry_index = next((probe for probe in range(index + 1, len(session_bars))
                             if session_bars[probe].timestamp >= entry_at), None)
         if entry_index is None:
+            last_refusal = _unpriced(
+                signal_bar, entry_bar, signal_bar.session_date,
+                str(signal.get("direction") or "unknown"),
+                "no_entry_bar_after_signal", stage="entry_causality",
+                decision_timestamp=signal_ready,
+                entry_timestamp=entry_at)
             continue
         entry_bar = session_bars[entry_index]
         # The completed bar record is not visible until its end, but its open
@@ -389,8 +439,20 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         local_entry = entry_at.astimezone(ZoneInfo("America/New_York"))
         if (resolved_policy.latest_entry_time is not None and
                 local_entry.time() > resolved_policy.latest_entry_time):
+            last_refusal = _unpriced(
+                signal_bar, entry_bar, signal_bar.session_date,
+                str(signal.get("direction") or "unknown"),
+                "past_latest_entry_time", stage="entry_policy",
+                decision_timestamp=signal_ready,
+                entry_timestamp=entry_at)
             continue
         if not _at_or_before_force_flat(entry_at, resolved_policy):
+            last_refusal = _unpriced(
+                signal_bar, entry_bar, signal_bar.session_date,
+                str(signal.get("direction") or "unknown"),
+                "entry_at_or_after_force_flat", stage="entry_policy",
+                decision_timestamp=signal_ready,
+                entry_timestamp=entry_at)
             continue
         direction = signal["direction"]
         # A completed recorder bar is normally observed at its end, so it
@@ -431,8 +493,14 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                  signal_bar.session_date, direction,
                                  "no fresh equity quote at entry",
                                  decision_timestamp=signal_ready,
-                                 entry_timestamp=entry_at)
+                                 entry_timestamp=entry_at,
+                                 stage="entry_pricing")
             elif not entry_bar_visible:
+                last_refusal = _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date, direction,
+                    "entry_bar_not_visible", stage="entry_pricing",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at)
                 continue
         elif vehicle == "option":
             entry_snap = _option_at(
@@ -443,7 +511,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 return _unpriced(signal_bar, entry_bar, signal_bar.session_date,
                                  direction, "no option quote within staleness bound at entry",
                                  decision_timestamp=signal_ready,
-                                 entry_timestamp=entry_at)
+                                 entry_timestamp=entry_at,
+                                 stage="entry_pricing")
             # OPRA carries the underlying spot used to select the contract.
             # If that point-in-time spot is absent, only a boundary-visible bar
             # may supply the fallback; a delayed bar's open is never consumed.
@@ -455,7 +524,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 return _unpriced(signal_bar, entry_bar, signal_bar.session_date,
                                  direction, "entry_bar_not_visible",
                                  decision_timestamp=signal_ready,
-                                 entry_timestamp=entry_at)
+                                 entry_timestamp=entry_at,
+                                 stage="entry_pricing")
             entry_ref = entry_snap.ask
             entry_source = QUOTE
             entry_feed = str(entry_snap.identity.feed)
@@ -463,6 +533,11 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             entry_age = max(
                 0.0, (entry_at - entry_snap.timestamp).total_seconds())
         if entry_underlying is None or entry_ref is None:
+            last_refusal = _unpriced(
+                signal_bar, entry_bar, signal_bar.session_date, direction,
+                "entry_price_unavailable", stage="entry_pricing",
+                decision_timestamp=signal_ready,
+                entry_timestamp=entry_at)
             continue
         distance = float(signal["stop_distance"])
         # The runtime submits the bracket legs with the entry order, before any
@@ -546,7 +621,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     return _unpriced(signal_bar, entry_bar, day, direction,
                                      "no fresh equity quote at exit",
                                      decision_timestamp=signal_ready,
-                                     entry_timestamp=entry_at)
+                                     entry_timestamp=entry_at,
+                                     stage="exit_pricing")
         entry_option_feed = exit_option_feed = None
         if vehicle == "option":
             assert entry_snap is not None
@@ -562,7 +638,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                  "entry contract stopped being quoted before exit",
                                  contract=entry_snap.contract.symbol,
                                  decision_timestamp=signal_ready,
-                                 entry_timestamp=entry_at)
+                                 entry_timestamp=entry_at,
+                                 stage="exit_pricing")
             contract = entry_snap.contract.symbol
             entry_option_feed = str(entry_snap.contract.feed).lower()
             exit_option_feed = str(exit_snap.contract.feed).lower()
@@ -579,6 +656,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             exit_age = max(0.0, (pricing_cutoff - exit_snap.timestamp).total_seconds())
         trade_row = {
             "vehicle": vehicle, "symbol": signal_bar.symbol,
+            "execution_disposition": "candidate",
+            "signal_opportunity": True,
             "session_date": day.isoformat(), "direction": direction,
             "signal_timestamp": signal_bar.end.isoformat(),
             "decision_timestamp": signal_ready.isoformat(),
@@ -638,7 +717,16 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
             })
         return trade_row
-    return None
+    if last_refusal is not None:
+        return last_refusal
+    if gapped_prefixes:
+        return _unpriced(
+            session_bars[0], session_bars[0], session_bars[0].session_date,
+            "unknown", "no_contiguous_feature_window",
+            stage="data_validation", signal_opportunity=False,
+            detail={"gapped_prefixes": gapped_prefixes,
+                    "evaluated_prefixes": evaluated_prefixes})
+    return _no_signal(session_bars)
 
 
 def _fresh(raw: Mapping[str, Any], leg: str,
@@ -693,14 +781,34 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         opportunity = f"{rule_variant_id(spec)}:{vehicle}:{symbol}:{day.isoformat()}"
         raw = _simulate_trade(session_bars, spec, snapshots, vehicle,
                               quotes=quote_index, policy=resolved_policy)
-        if raw is None or raw.get("unpriced_reason"):
+        if raw is None:
+            # A non-empty grouped session must always have a terminal
+            # disposition. Keep an internal contract breach visible and
+            # unevaluable instead of silently turning it into no signal.
+            rows.append({
+                "vehicle": vehicle, "symbol": symbol,
+                "session_date": day.isoformat(), "opportunity_id": opportunity,
+                "net_pnl": 0.0, "return_value": 0.0, "no_trade": True,
+                "execution_disposition": "refused",
+                "signal_opportunity": False,
+                "reject_stage": "simulation_contract",
+                "reject_reason": "simulation_missing_disposition",
+            })
+            continue
+        if raw.get("execution_disposition") == "no_signal":
             row = {"vehicle": vehicle, "symbol": symbol,
                    "session_date": day.isoformat(), "opportunity_id": opportunity,
                    "net_pnl": 0.0, "return_value": 0.0, "no_trade": True}
-            if raw is not None:
-                row.update({key: value for key, value in raw.items()
-                            if key != "unpriced_reason"})
-                row["reject_reason"] = str(raw["unpriced_reason"])
+            row.update(raw)
+            rows.append(row)
+            continue
+        if raw.get("unpriced_reason"):
+            row = {"vehicle": vehicle, "symbol": symbol,
+                   "session_date": day.isoformat(), "opportunity_id": opportunity,
+                   "net_pnl": 0.0, "return_value": 0.0, "no_trade": True}
+            row.update({key: value for key, value in raw.items()
+                        if key != "unpriced_reason"})
+            row["reject_reason"] = str(raw["unpriced_reason"])
             rows.append(row)
             continue
         candidates.append({**raw, "opportunity_id": opportunity,
@@ -814,24 +922,30 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         # nominal risk unit used by RiskEngine.
         risk_usd = nominal_risk_usd if stress_enabled else realized_risk_usd
         reject_reason = None
+        reject_stage = None
         if (resolved_policy.max_concurrent_positions is not None and
                 len(active) >= resolved_policy.max_concurrent_positions):
             reject_reason = "max concurrent positions reached"
+            reject_stage = "position_limit"
         elif (resolved_policy.max_gross_exposure_pct is not None and
               sum(float(item.get("entry_notional", 0.0)) for item in active) + entry_notional >
               current_equity * float(resolved_policy.max_gross_exposure_pct) / 100.0):
             reject_reason = "buying power/notional limit reached"
+            reject_stage = "gross_exposure_limit"
         elif (resolved_policy.max_open_risk_pct is not None and
               sum(float(item.get("risk_usd", 0.0)) for item in active) + risk_usd >
               current_equity * float(resolved_policy.max_open_risk_pct) / 100.0):
             reject_reason = "max open risk reached"
+            reject_stage = "open_risk_limit"
         elif (resolved_policy.daily_loss_limit_pct is not None and
               current_equity - day_start_equity[day_key] <=
               -day_start_equity[day_key] *
               float(resolved_policy.daily_loss_limit_pct) / 100.0):
             reject_reason = "daily loss limit reached"
+            reject_stage = "daily_loss_limit"
         if quantity <= 0:
             reject_reason = reject_reason or "isolated account risk budget cannot fund one unit"
+            reject_stage = reject_stage or "position_sizing"
         stress_telemetry: dict[str, Any] = {}
         if reject_reason is None and stress_enabled:
             plan = {
@@ -849,6 +963,7 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             )
             if stress_reason is not None:
                 reject_reason = stress_reason
+                reject_stage = "cost_stress"
                 stress_telemetry = {
                     "vehicle": vehicle,
                     "stressed_cost_vehicle": vehicle,
@@ -883,6 +998,9 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             rows.append({"vehicle": vehicle, "symbol": symbol,
                          "session_date": day.isoformat(), "opportunity_id": opportunity,
                          "net_pnl": 0.0, "return_value": 0.0, "no_trade": True,
+                         "execution_disposition": "refused",
+                         "signal_opportunity": True,
+                         "reject_stage": reject_stage or "account_policy",
                          "reject_reason": reject_reason,
                          **stress_telemetry})
             continue
@@ -905,6 +1023,9 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                              "opportunity_id": opportunity,
                              "net_pnl": 0.0, "return_value": 0.0,
                              "no_trade": True,
+                             "execution_disposition": "refused",
+                             "signal_opportunity": True,
+                             "reject_stage": "entry_slippage",
                              "reject_reason": slippage_reason,
                              "entry_slippage": slippage_telemetry})
                 continue
@@ -931,7 +1052,9 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                     "realized_risk_usd": realized_risk_usd,
                     "r_multiple": net / risk_usd if risk_usd > 0 else None,
                     "return_value": net / cash if cash > 0 else 0.0,
-                    "no_trade": False, "entry_notional": entry_notional})
+                    "no_trade": False, "entry_notional": entry_notional,
+                    "execution_disposition": "executed",
+                    "signal_opportunity": True})
         if slippage_telemetry is not None:
             row["entry_slippage"] = slippage_telemetry
         if stress_enabled:
@@ -957,6 +1080,15 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
     rows.sort(key=lambda row: (str(row.get("session_date", "")),
                                str(row.get("symbol", "")),
                                str(row.get("entry_timestamp", ""))))
+    for row in rows:
+        disposition = str(row.get("execution_disposition") or "")
+        if disposition not in {"executed", "refused", "no_signal"}:
+            raise RuntimeError("factory row has no terminal execution disposition")
+        if (disposition == "refused" and
+                not str(row.get("reject_reason") or "").strip()):
+            raise RuntimeError("factory refusal has no durable reason")
+        if disposition == "no_signal" and row.get("signal_opportunity") is not False:
+            raise RuntimeError("no-signal row is marked as a signal opportunity")
     executed = [row for row in rows if row.get("no_trade") is not True]
     return {"account_id": account_id, "starting_cash": float(starting_cash),
             "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
@@ -977,11 +1109,22 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
     # for the bounded search loop; a plain zero-signal stream has no reason
     # code and remains the ordinary ``insufficient_signals`` diagnosis.
     no_trade_rows = [row for row in rows if row.get("no_trade") is True]
+    no_signal_rows = [row for row in no_trade_rows
+                      if row.get("execution_disposition") == "no_signal"]
+    refused_rows = [row for row in no_trade_rows
+                    if (row.get("execution_disposition") == "refused" or
+                        (not row.get("execution_disposition") and
+                         row.get("reject_reason")))]
+    unclassified_rows = [row for row in no_trade_rows
+                         if (row.get("execution_disposition") not in {
+                                 "no_signal", "refused"} and
+                             not row.get("reject_reason"))]
     reject_reasons = [str(row.get("reject_reason") or "").strip()
-                      for row in no_trade_rows]
-    execution_blocked = (bool(no_trade_rows) and not trades and
-                         all(reject_reasons) and
-                         any(row.get("reject_reason") for row in no_trade_rows))
+                      for row in refused_rows]
+    execution_blocked = (bool(refused_rows) and not trades and
+                         not unclassified_rows and all(reject_reasons) and
+                         all(row.get("signal_opportunity") is not False
+                             for row in refused_rows))
     if execution_blocked:
         failure = "execution_blocked"
     elif len(trades) < max(3, len(sessions) // 3):
@@ -1000,7 +1143,9 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
         "primary_failure": failure, "trades": len(trades),
         "sessions": len(sessions), "net_pnl": sum(pnl), "expectancy": expectancy,
         "execution_blocked": execution_blocked,
-        "execution_rejection_count": len(no_trade_rows) if execution_blocked else 0,
+        "execution_rejection_count": len(refused_rows),
+        "no_signal_count": len(no_signal_rows),
+        "unclassified_no_trade_count": len(unclassified_rows),
         "win_rate": len(wins) / len(trades) if trades else 0.0,
         "profit_factor": profit_factor if math.isfinite(profit_factor) else 999.0,
         "max_drawdown": drawdown,

@@ -166,13 +166,17 @@ _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "tie_rate", "entry_gaps", "entry_gap_rate", "exit_gaps", "exit_gap_rate",
     "bracket", "target", "hold_cap", "diagnostic_only", "effect_unit",
     "cluster_unit", "available", "reason", "entry", "full", "entry_alias_key",
-    "full_alias_key", "signal_count", "planned_vector_count", "authorizing",
+    "full_alias_key", "fit_evidence_key", "alias_schema",
+    "alias_numeric_decimals", "signal_count",
+    "planned_vector_count", "authorizing",
     "rows", "executed_rows", "no_trade_rows",
+    "no_signal_rows", "unclassified_no_trade_rows",
     "explicit_rejections", "reject_reason_counts", "execution_blocked",
     "diagnostic_policy", "included",
 })
 _FIT_SELECTION_REJECTION_KEYS = frozenset({
     "rows", "executed_rows", "no_trade_rows",
+    "no_signal_rows", "unclassified_no_trade_rows",
     "explicit_rejections", "reject_reason_counts",
     "execution_blocked", "diagnostic_only", "authorizing",
 })
@@ -284,7 +288,8 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
         # ``rows`` is denied globally to prevent raw market-row leakage, but
         # these scalar count labels are the explicit fit-only exception.
         safe_rejection_count = (context == "rejections" and key in {
-            "rows", "executed_rows", "no_trade_rows"})
+            "rows", "executed_rows", "no_trade_rows", "no_signal_rows",
+            "unclassified_no_trade_rows"})
         if _selection_denied(key) and not safe_rejection_count:
             continue
         # ``tried`` and ``changed`` are coordinate maps, so their keys are
@@ -1767,6 +1772,114 @@ def _fit_variants_worker(payload: Mapping[str, Any]) -> dict:
         _close_task_quotes(quotes)
 
 
+def _freeze_fit_behavior_candidates(
+        scheduled: Sequence[dict[str, Any]],
+        fit_probe_results: Mapping[str, Mapping[str, Mapping[str, Any]]],
+        proposals: Mapping[str, Mapping[str, tuple[Any, str]]]) -> dict[str, Any]:
+    """Freeze one fit-selected representative for each behavior alias group.
+
+    This function runs before ``_worker`` can see held-out rows.  Its only
+    inputs are validated rule specs, their precomputed fit-only fingerprints,
+    and proposal source labels fixed before evaluation.  The cycle-global
+    record list is intentional: an identical planned behavior authored under
+    another rule family is still one experiment, not a fresh BH entry.
+
+    Tasks lacking a complete fit probe are retained unchanged.  Failing open
+    here is conservative for multiplicity: it may replay an extra candidate,
+    but can never remove one based on missing or non-fit evidence.
+    """
+    records: list[dict[str, Any]] = []
+    task_candidate_keys: dict[str, set[str]] = {}
+    for task in scheduled:
+        if task.get("mode") != "backtest":
+            continue
+        hypothesis_id = str(task["hypothesis"]["hypothesis_id"])
+        diagnostics_by_variant = fit_probe_results.get(hypothesis_id)
+        if not isinstance(diagnostics_by_variant, Mapping) or not diagnostics_by_variant:
+            continue
+        task["fit_diagnostics"] = dict(diagnostics_by_variant)
+        keys: set[str] = set()
+        for spec in task.get("specs", ()):
+            variant_id = rule_variant_id(spec)
+            diagnostic = diagnostics_by_variant.get(variant_id)
+            if not isinstance(diagnostic, Mapping):
+                # A partial probe cannot silently exclude its missing member.
+                continue
+            candidate_key = f"{hypothesis_id}:{variant_id}"
+            keys.add(candidate_key)
+            records.append({
+                "candidate_key": candidate_key,
+                "hypothesis_id": hypothesis_id,
+                "variant_id": variant_id,
+                "rule_spec": spec,
+                "source": proposals.get(hypothesis_id, {}).get(
+                    variant_id, (None, ""))[1],
+                "fit_diagnostics": diagnostic,
+            })
+        if keys:
+            task_candidate_keys[hypothesis_id] = keys
+    aliases = collapse_behavior_aliases(records, freeze=True)
+    kept_keys = {
+        str(item.get("candidate_key"))
+        for item in aliases.get("kept", ())
+        if isinstance(item, Mapping) and item.get("candidate_key")
+    }
+    all_exclusions = list(aliases.get("excluded") or ())
+    all_proposals = list(aliases.get("proposed_exclusions") or ())
+    for task in scheduled:
+        if task.get("mode") != "backtest":
+            continue
+        hypothesis_id = str(task["hypothesis"]["hypothesis_id"])
+        own_keys = task_candidate_keys.get(hypothesis_id)
+        if not own_keys:
+            continue
+        original_specs = list(task.get("specs", ()))
+        task["specs"] = [
+            spec for spec in original_specs
+            if (f"{hypothesis_id}:{rule_variant_id(spec)}" not in own_keys or
+                f"{hypothesis_id}:{rule_variant_id(spec)}" in kept_keys)
+        ]
+
+        def relevant(group: Mapping[str, Any]) -> bool:
+            members = {str(item) for item in group.get("candidate_keys", ())}
+            return bool(members & own_keys)
+
+        task_full_aliases = [
+            dict(item) for item in aliases.get("full_aliases", ())
+            if isinstance(item, Mapping) and relevant(item)]
+        task_parameter_collapse = [
+            dict(item) for item in aliases.get("parameter_collapse", ())
+            if isinstance(item, Mapping) and relevant(item)]
+        task_entry_aliases = [
+            dict(item) for item in aliases.get("entry_aliases", ())
+            if isinstance(item, Mapping) and relevant(item)]
+        task_exclusions = [
+            dict(item) for item in all_exclusions
+            if str(item.get("candidate_key")) in own_keys]
+        task_proposals = [
+            dict(item) for item in all_proposals
+            if (str(item.get("candidate_key")) in own_keys or
+                str(item.get("canonical_candidate_key")) in own_keys)]
+        task["behavior_aliases"] = {
+            "entry_aliases": task_entry_aliases,
+            "full_aliases": task_full_aliases,
+            "parameter_collapse": task_parameter_collapse,
+            "signals_present": bool(aliases.get("signals_present")),
+            "dedup_status": aliases.get("dedup_status"),
+            "selection_scope": aliases.get("selection_scope"),
+            "alias_schema": aliases.get("alias_schema"),
+            "alias_numeric_decimals": aliases.get("alias_numeric_decimals"),
+            "requires_operator_review": aliases.get("requires_operator_review"),
+            "intended_variant_count": len(original_specs),
+            "kept_variant_count": len(task["specs"]),
+            "cycle_intended_variant_count": aliases.get("intended_variant_count"),
+            "cycle_kept_variant_count": aliases.get("kept_variant_count"),
+        }
+        task["excluded_behavior_aliases"] = task_exclusions
+        task["proposed_behavior_aliases"] = task_proposals
+    return aliases
+
+
 def _worker(payload: Mapping[str, Any]) -> dict:
     bars, snapshots, quotes = _task_corpus(payload)
     try:
@@ -1914,7 +2027,9 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
     placebo = placebo_null_distribution(
         heldout, base_heldout, vehicle=vehicle, equity_feed=equity_feed)
     falsification = {
-        **falsification_gate(placebo["observed"], placebo["placebo"], alpha=alpha),
+        **falsification_gate(
+            placebo["observed"], placebo["placebo"], alpha=alpha,
+            preregistered_p_value=float(test["p_value"])),
         "method": placebo["method"], "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),
         "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
@@ -2056,11 +2171,24 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
     fit_execution_rows = [row for row in raw_fit if isinstance(row, Mapping)]
     fit_execution_no_trade = [row for row in fit_execution_rows
                               if row.get("no_trade") is True]
+    fit_execution_refused = [
+        row for row in fit_execution_no_trade
+        if (row.get("execution_disposition") == "refused" or
+            (not row.get("execution_disposition") and row.get("reject_reason")))
+    ]
+    fit_execution_unclassified = [
+        row for row in fit_execution_no_trade
+        if (row.get("execution_disposition") not in {"no_signal", "refused"} and
+            not row.get("reject_reason"))
+    ]
     fit_execution_blocked = (
-        bool(fit_execution_no_trade) and
-        len(fit_execution_no_trade) == len(fit_execution_rows) and
-        all(str(row.get("reject_reason") or "").strip()
-            for row in fit_execution_no_trade))
+        bool(fit_execution_refused) and
+        not [row for row in fit_execution_rows
+             if row.get("no_trade") is not True] and
+        not fit_execution_unclassified and
+        all(row.get("signal_opportunity") is not False and
+            str(row.get("reject_reason") or "").strip()
+            for row in fit_execution_refused))
     return {
         "passes_without_family": bool(all(checks.values())),
         "development_passes_without_family": bool(all(development_checks.values())),
@@ -2176,8 +2304,18 @@ def _fit_execution_blocked(gate: Mapping[str, Any]) -> bool:
     rows = gate.get("_fit_raw_rows") or gate.get("_fit_rows") or ()
     rows = [row for row in rows if isinstance(row, Mapping)]
     no_trade = [row for row in rows if row.get("no_trade") is True]
-    return bool(no_trade) and len(no_trade) == len(rows) and all(
-        str(row.get("reject_reason") or "").strip() for row in no_trade)
+    refused = [row for row in no_trade
+               if (row.get("execution_disposition") == "refused" or
+                   (not row.get("execution_disposition") and
+                    row.get("reject_reason")))]
+    unclassified = [row for row in no_trade
+                    if (row.get("execution_disposition") not in {
+                            "no_signal", "refused"} and
+                        not row.get("reject_reason"))]
+    executed = [row for row in rows if row.get("no_trade") is not True]
+    return bool(refused) and not executed and not unclassified and all(
+        row.get("signal_opportunity") is not False and
+        str(row.get("reject_reason") or "").strip() for row in refused)
 
 
 def _execution_blocked_exhausted(
@@ -2301,9 +2439,11 @@ def _existing_specs(edge: EdgeLedger, hypothesis_id: str, vehicle: str) -> list[
 
 def _run_diagnostic_factory(
         data: str | Path | Sequence[Mapping], *, vehicle: str,
-        strategies: int, starting_cash: float,
+        strategies: int, variants_per_strategy: int, starting_cash: float,
+        strategy_llm: Mapping[str, Any] | None,
         costs: CostModel | None,
         runtime_config: Mapping[str, Any] | None,
+        proposal_adapter: RuleProposalAdapter | None,
         ) -> dict[str, Any]:
     """Evaluate an explicitly diagnostic corpus without touching ledgers.
 
@@ -2317,42 +2457,184 @@ def _run_diagnostic_factory(
         raise FactoryError("vehicle must be equity or option")
     if not 1 <= int(strategies) <= MAX_STRATEGIES:
         raise FactoryError(f"strategies must be between 1 and {MAX_STRATEGIES}")
+    if not 2 <= int(variants_per_strategy) <= MAX_VARIANTS:
+        raise FactoryError(
+            f"variants_per_strategy must be between 2 and {MAX_VARIANTS}")
     model = costs or CostModel.from_config(runtime_config, vehicle=vehicle)
     base_policy = ReplayPolicy.from_config(runtime_config)
     policy = diagnostic_backfill_policy(base_policy)
+    llm_config = dict(strategy_llm or {})
+    llm_config.setdefault("near_duplicate_distance", NEAR_DUPLICATE_DISTANCE)
+    llm_enabled = bool(llm_config.get("enabled", False))
+    if (llm_enabled and not str(llm_config.get("model") or "").strip()
+            and proposal_adapter is None):
+        raise FactoryError(
+            "strategy LLM model is required when diagnostic LLM discovery is enabled")
+    llm_adapter = proposal_adapter
+    if llm_enabled and llm_adapter is None:
+        llm_adapter = _adapter(llm_config, None)
+    llm_observations: list[dict[str, Any]] = []
     raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
         data, require_provenance=False,
         expected_equity_feed=policy.equity_feed)
     quotes = quote_rows if callable(getattr(quote_rows, "quote_fill", None)) \
         else list(quote_rows)
-    reports: list[dict[str, Any]] = []
-    for hypothesis in initial_hypotheses(int(strategies), vehicle=vehicle):
-        account = simulate_account(
-            bars, list(snapshot_map.values()), hypothesis.rule_spec,
+    snapshots = list(snapshot_map.values())
+    templates = initial_hypotheses(int(strategies), vehicle=vehicle)
+    selected_hypotheses: list[tuple[StrategyHypothesis, str,
+                                    ProposalResult | None, dict[str, Any]]] = []
+    existing_variant_ids: set[str] = set()
+    existing_specs: list[Mapping[str, Any]] = [
+        item.rule_spec for item in templates]
+    seeded_this_cycle: list[Mapping[str, Any]] = []
+    for template in templates:
+        root_account = simulate_account(
+            bars, snapshots, template.rule_spec,
             vehicle=vehicle,
-            account_id=f"diagnostic:{hypothesis.hypothesis_id}",
+            account_id=f"diagnostic-context:{template.hypothesis_id}",
             starting_cash=float(starting_cash), costs=model, quotes=quotes,
             policy=policy)
-        diagnostic = measure_fit_diagnostics(
-            bars, hypothesis.rule_spec, account_rows=account["rows"],
+        root_fit = measure_fit_diagnostics(
+            bars, template.rule_spec, account_rows=root_account["rows"],
             costs=model, vehicle=vehicle,
             risk_config=((runtime_config or {}).get("risk")
                          if isinstance(runtime_config, Mapping) else None),
             policy=policy)
+        root_diagnostic = {
+            **diagnose(root_account["rows"], starting_cash=float(starting_cash)),
+            "fit_diagnostics": root_fit,
+            "authorizing": False,
+            "diagnostic_only": True,
+        }
+        hypothesis = template
+        source = "deterministic_template"
+        discovery: ProposalResult | None = None
+        if llm_enabled:
+            previous = asdict(template)
+            context = _discovery_context(
+                slot=template.slot, reason="diagnostic_backfill_epoch",
+                previous=previous, tried_families={template.family},
+                proved_families=(), diagnostic=root_diagnostic,
+                seeded_this_cycle=seeded_this_cycle)
+            discovered, discovery, source = _seed_slot(
+                previous, generation=1, not_before=None,
+                existing_variant_ids=existing_variant_ids,
+                tried_families={template.family}, context=context,
+                llm_enabled=True, config=llm_config, adapter=llm_adapter,
+                existing_specs=existing_specs,
+                llm_observations=llm_observations)
+            if discovered is not None:
+                hypothesis = discovered
+        _mark_variant(hypothesis.rule_spec, existing_variant_ids)
+        existing_specs.append(hypothesis.rule_spec)
+        seeded_this_cycle.append(asdict(hypothesis))
+        selected_hypotheses.append(
+            (hypothesis, source, discovery, root_diagnostic))
+
+    reports: list[dict[str, Any]] = []
+    tuning_proposals: list[dict[str, Any]] = []
+    risk_config = ((runtime_config or {}).get("risk")
+                   if isinstance(runtime_config, Mapping) else None)
+    for hypothesis, source, discovery, discovery_context in selected_hypotheses:
+        root_account = simulate_account(
+            bars, snapshots, hypothesis.rule_spec, vehicle=vehicle,
+            account_id=f"diagnostic-root:{hypothesis.hypothesis_id}",
+            starting_cash=float(starting_cash), costs=model, quotes=quotes,
+            policy=policy)
+        root_fit = measure_fit_diagnostics(
+            bars, hypothesis.rule_spec, account_rows=root_account["rows"],
+            costs=model, vehicle=vehicle, risk_config=risk_config,
+            policy=policy)
+        diagnosis = {
+            **diagnose(root_account["rows"], starting_cash=float(starting_cash)),
+            "fit_diagnostics": root_fit,
+            "authorizing": False,
+            "diagnostic_only": True,
+        }
+        chosen, tuning = _tuned_variants(
+            asdict(hypothesis), diagnosis,
+            count=int(variants_per_strategy), vehicle=vehicle,
+            llm_enabled=llm_enabled, config=llm_config,
+            risk_config=risk_config, adapter=llm_adapter,
+            existing_specs=existing_specs,
+            llm_observations=llm_observations)
+        if not chosen:
+            chosen = [TunedVariant(
+                hypothesis.rule_spec,
+                "Unchanged root retained because the bounded mutation pool was empty.",
+                "deterministic", None)]
+        if tuning is not None:
+            tuning_proposals.append({
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "schema": tuning.schema,
+                "success": bool(tuning.success),
+                "error": tuning.error,
+                "evidence": dict(tuning.evidence or {}),
+                "accepted_llm_variants": sum(
+                    1 for item in chosen if item.source == "llm"),
+            })
+        variants: list[dict[str, Any]] = []
+        for selected in chosen:
+            account = simulate_account(
+                bars, snapshots, selected.rule_spec, vehicle=vehicle,
+                account_id=(f"diagnostic:{hypothesis.hypothesis_id}:"
+                            f"{rule_variant_id(selected.rule_spec)}"),
+                starting_cash=float(starting_cash), costs=model, quotes=quotes,
+                policy=policy)
+            fit = measure_fit_diagnostics(
+                bars, selected.rule_spec, account_rows=account["rows"],
+                costs=model, vehicle=vehicle, risk_config=risk_config,
+                policy=policy)
+            variants.append({
+                "variant_id": rule_variant_id(selected.rule_spec),
+                "rule_spec": selected.rule_spec,
+                "selection_source": selected.source,
+                "selection_reason": selected.reason,
+                "builds_on": selected.builds_on,
+                "novel_tuning": selected.novel_tuning,
+                "diagnostic": {
+                    **diagnose(account["rows"],
+                               starting_cash=float(starting_cash)),
+                    "fit_diagnostics": fit,
+                },
+                "account": account,
+            })
         reports.append({
             "hypothesis_id": hypothesis.hypothesis_id,
             "variant_id": rule_variant_id(hypothesis.rule_spec),
             "vehicle": vehicle,
             "family": hypothesis.family,
+            "hypothesis_source": source,
+            "thesis": hypothesis.thesis,
+            "falsification": hypothesis.falsification,
+            "rule_spec": hypothesis.rule_spec,
+            "discovery": ({
+                "schema": discovery.schema,
+                "success": bool(discovery.success),
+                "error": discovery.error,
+                "evidence": dict(discovery.evidence or {}),
+            } if discovery is not None else None),
+            "discovery_context_diagnostic": discovery_context,
+            "root_diagnostic": diagnosis,
+            # Preserve the original diagnostic-only report contract while the
+            # model-assisted epoch adds an explicit root/variant hierarchy.
+            "diagnostic": diagnosis,
+            "account": root_account,
             "authorizing": False,
             "diagnostic_only": True,
-            "rule_spec": hypothesis.rule_spec,
-            "diagnostic": diagnostic,
-            "account": account,
+            "variants": variants,
         })
     close = getattr(quote_rows, "close", None)
     if callable(close) and isinstance(quote_rows, SQLiteQuoteIndex):
         close()
+    llm_attempted = len(llm_observations)
+    llm_succeeded = sum(1 for item in llm_observations
+                        if bool(item.get("success")))
+    budget_evidence: dict[str, Any] = {}
+    if llm_adapter is not None:
+        budget = getattr(llm_adapter, "_budget_evidence", None)
+        if callable(budget):
+            budget_evidence = dict(budget())
     return {
         "schema": FACTORY_SCHEMA,
         "status": "diagnostic_only",
@@ -2360,14 +2642,39 @@ def _run_diagnostic_factory(
         "diagnostic_only": True,
         "vehicle": vehicle,
         "strategies": len(reports),
-        "variants": len(reports),
-        "accounts": len(reports),
+        "variants": sum(len(item["variants"]) for item in reports),
+        "accounts": sum(len(item["variants"]) for item in reports),
         "results": [],
         "proofs": [],
         "raw_rows": len(raw_rows),
+        "dataset_hash": content_hash(raw_rows),
         "reports": reports,
+        "tuning": tuning_proposals,
+        "llm_call_evidence": {
+            "attempted": llm_attempted,
+            "succeeded": llm_succeeded,
+            "failed": llm_attempted - llm_succeeded,
+            "all_calls_failed": bool(
+                llm_enabled and llm_attempted and llm_succeeded == 0),
+            "failures": [
+                {"kind": item.get("kind"), "error": item.get("error"),
+                 "evidence": item.get("evidence") or {}}
+                for item in llm_observations if not item.get("success")
+            ],
+        },
+        "strategy_llm": {
+            "enabled": llm_enabled,
+            "provider": llm_config.get("provider") if llm_enabled else None,
+            "model": llm_config.get("model") if llm_enabled else None,
+            "deployment": llm_config.get("deployment") if llm_enabled else None,
+            **budget_evidence,
+        },
         "replay_policy": policy.as_dict(),
-        "authorization": {"eligible": [], "proofs": [], "fdr": False},
+        "authorization": {
+            "eligible": [], "proofs": [], "fdr": False,
+            "paper_promotion_allowed": False,
+            "reason": "historical diagnostic evidence cannot authorize",
+        },
     }
 
 
@@ -2395,8 +2702,10 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     if diagnostic_only:
         return _run_diagnostic_factory(
             data, vehicle=vehicle, strategies=strategies,
-            starting_cash=starting_cash, costs=costs,
-            runtime_config=runtime_config)
+            variants_per_strategy=variants_per_strategy,
+            starting_cash=starting_cash, strategy_llm=strategy_llm,
+            costs=costs, runtime_config=runtime_config,
+            proposal_adapter=proposal_adapter)
     resources: list[SQLiteQuoteIndex] = []
     try:
         return _run_factory(
@@ -2794,6 +3103,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
 
     max_workers = min(int(workers), len(tasks))
     worker_results = []
+    fit_behavior_canonicalization: dict[str, Any] = {}
     worker_failures = []
     tuning_proposals: list[dict] = []
     # variant_id -> (reason, source), per hypothesis: what the orchestrator
@@ -2949,11 +3259,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
 
         # Before any full replay or multiple-testing correction, measure each
         # backtest candidate on the same fit prefix used for diagnosis.  Full
-        # behavioral aliases receive a deterministic canonical review member;
-        # every intended member remains scheduled, including zero-signal
-        # aliases, because fit fingerprints cannot authorize exclusion.  The
-        # compact summaries are persisted on the testing event below and never
-        # contain fit trade rows.
+        # behavioral aliases receive one deterministic representative across
+        # the entire cycle.  This choice is frozen exclusively from the fit
+        # prefix before any held-out replay or BH input exists.  Zero-signal
+        # variants and candidates with incomplete probes remain scheduled.
+        # The compact summaries persisted below never contain fit trade rows.
         fit_probe_tasks = [task for task in scheduled
                            if task["mode"] == "backtest" and task.get("specs")]
         fit_probe_results: dict[str, dict] = {}
@@ -2972,42 +3282,19 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     # probe must not turn a valid replay into a failure or
                     # silently remove a candidate.
                     task["fit_diagnostic_error"] = f"{type(exc).__name__}: {exc}"
+        fit_behavior_canonicalization = _freeze_fit_behavior_candidates(
+            scheduled, fit_probe_results, proposals)
         for task in scheduled:
-            if task["mode"] != "backtest":
+            if task["mode"] != "backtest" or not task.get("fit_diagnostics"):
                 continue
             hypothesis_id = str(task["hypothesis"]["hypothesis_id"])
-            diagnostics_by_variant = fit_probe_results.get(hypothesis_id)
-            if not diagnostics_by_variant:
-                continue
-            records = [{"rule_spec": spec,
-                        "variant_id": rule_variant_id(spec),
-                        "source": proposals.get(hypothesis_id, {}).get(
-                            rule_variant_id(spec), (None, ""))[1]}
-                       for spec in task.get("specs", ())]
-            aliases = collapse_behavior_aliases(
-                records, diagnostics=diagnostics_by_variant)
-            task["fit_diagnostics"] = diagnostics_by_variant
-            task["behavior_aliases"] = {
-                key: aliases.get(key)
-                for key in ("entry_aliases", "full_aliases",
-                            "parameter_collapse", "signals_present",
-                            "dedup_status", "requires_operator_review",
-                            "intended_variant_count", "kept_variant_count")}
-            # Measurement-first: retain every intended variant in replay and
-            # BH.  Alias groups are a proposed canonicalization for operator
-            # review only; no fit fingerprint can erase held-out divergence.
-            task["excluded_behavior_aliases"] = []
-            task["proposed_behavior_aliases"] = list(
-                aliases.get("proposed_exclusions") or ())
-            task["specs"] = [item["rule_spec"] if isinstance(item, Mapping)
-                              and isinstance(item.get("rule_spec"), Mapping)
-                              else item for item in aliases["kept"]]
             factory.event(
                 hypothesis_id, "testing",
-                "fit diagnostics completed before full replay",
-                {"fit_diagnostics": diagnostics_by_variant,
+                "fit-only behavior canonicalization frozen before full replay",
+                {"fit_diagnostics": task["fit_diagnostics"],
                  "behavior_aliases": task["behavior_aliases"],
-                 "excluded_behavior_aliases": [],
+                 "excluded_behavior_aliases": task[
+                     "excluded_behavior_aliases"],
                  "proposed_behavior_aliases": task[
                      "proposed_behavior_aliases"]})
 
@@ -4023,6 +4310,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "experiment_provenance": experiment_provenance_body,
         "parallel_workers": max_workers,
         "parallel_backend": backend,
+        "fit_behavior_canonicalization": fit_behavior_canonicalization,
         "worker_pids": sorted({row["worker_pid"] for row in summaries}),
         "strategies": len(worker_results), "variants": len(summaries),
         "accounts": len(summaries), "results": summaries,

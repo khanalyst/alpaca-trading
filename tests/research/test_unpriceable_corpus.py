@@ -105,6 +105,23 @@ class FillQualityTests(unittest.TestCase):
         self.assertFalse(summary["priced_nothing"])
         self.assertEqual(summary["opportunities"], 0)
 
+    def test_explicit_no_signal_rows_are_not_unpriced_opportunities(self):
+        rows = [{
+            "vehicle": "equity", "symbol": "SPY",
+            "session_date": "2026-02-02", "opportunity_id": "flat",
+            "net_pnl": 0.0, "no_trade": True,
+            "execution_disposition": "no_signal",
+            "signal_opportunity": False,
+            "no_signal_reason": "rule_not_triggered",
+        }]
+        summary = fill_source_summary(rows, vehicle="equity")
+        self.assertEqual(summary["opportunities"], 1)
+        self.assertEqual(summary["execution_opportunities"], 0)
+        self.assertEqual(summary["no_signal"], 1)
+        self.assertFalse(summary["priced_nothing"])
+        self.assertIsNone(unevaluable_reason(
+            [{"fill_quality": {"fit": summary, "heldout": summary}}]))
+
 
 class UnevaluableCorpusTests(unittest.TestCase):
     """The distinction the cycle status was collapsing."""
@@ -214,7 +231,7 @@ class RealReplayReproductionTests(unittest.TestCase):
             stamp += timedelta(days=1)
         return rows
 
-    def _account(self, policy):
+    def _account(self, policy, *, corpus=None):
         from agent.contracts.rule import validate_rule_spec
         from research.edge_lab import _read_discovery_rows
         from research.factory_core import simulate_account
@@ -222,7 +239,8 @@ class RealReplayReproductionTests(unittest.TestCase):
         spec = validate_rule_spec({"family": "opening_range_breakout",
                                    "range_minutes": 15, "threshold_bps": 5.0,
                                    "confirmation": "volume"})
-        _raw, bars, _snapshots, quotes = _read_discovery_rows(self._corpus())
+        _raw, bars, _snapshots, quotes = _read_discovery_rows(
+            self._corpus() if corpus is None else corpus)
         return simulate_account(bars, [], spec, vehicle="equity",
                                 account_id="unpriceable", quotes=quotes,
                                 policy=policy)
@@ -231,6 +249,10 @@ class RealReplayReproductionTests(unittest.TestCase):
         rows = self._account(ReplayPolicy())["rows"]
         self.assertTrue(rows, "the fixture must materialise opportunities")
         self.assertEqual([row for row in rows if row.get("no_trade") is not True], [])
+        self.assertTrue(all(row.get("execution_disposition") == "refused"
+                            for row in rows))
+        self.assertTrue(all(row.get("reject_stage") == "entry_pricing"
+                            for row in rows))
 
         summary = fill_source_summary(rows, vehicle="equity")
         self.assertTrue(summary["priced_nothing"])
@@ -255,6 +277,26 @@ class RealReplayReproductionTests(unittest.TestCase):
         self.assertFalse(summary["priced_nothing"])
         self.assertEqual(summary["sources"], {BAR: len(executed)})
         self.assertEqual(summary["quoted_fraction"], 0.0)
+        self.assertIsNone(unevaluable_reason(
+            [{"fill_quality": {"fit": summary, "heldout": summary}}]))
+
+    def test_a_valid_flat_corpus_is_no_signal_not_unpriceable(self):
+        corpus = []
+        for source in self._corpus():
+            row = dict(source)
+            row.update({"open": 100.0, "high": 100.01, "low": 99.99,
+                        "close": 100.0, "volume": 1000})
+            corpus.append(row)
+        rows = self._account(ReplayPolicy(), corpus=corpus)["rows"]
+        self.assertTrue(rows)
+        self.assertTrue(all(row.get("execution_disposition") == "no_signal"
+                            for row in rows))
+        self.assertTrue(all(row.get("signal_opportunity") is False
+                            for row in rows))
+        self.assertTrue(all(not row.get("reject_reason") for row in rows))
+        summary = fill_source_summary(rows, vehicle="equity")
+        self.assertEqual(summary["execution_opportunities"], 0)
+        self.assertFalse(summary["priced_nothing"])
         self.assertIsNone(unevaluable_reason(
             [{"fill_quality": {"fit": summary, "heldout": summary}}]))
 

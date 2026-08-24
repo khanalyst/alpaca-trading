@@ -1213,8 +1213,11 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     placebo = deterministic_placebo_deltas(
         heldout, base_heldout, vehicle=vehicle,
         equity_feed=equity_feed)
+    candidate_p = float(delta_held.get("p_value", 1.0))
     falsification = {
-        **falsification_gate(placebo["observed"], placebo["placebo"], alpha=alpha),
+        **falsification_gate(
+            placebo["observed"], placebo["placebo"], alpha=alpha,
+            preregistered_p_value=candidate_p),
         "method": placebo["method"],
         "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),
@@ -1242,7 +1245,6 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "delta_positive": False,
         "post_selection": {"preselected": False, "candidate_id": None},
     })
-    candidate_p = float(delta_held.get("p_value", 1.0))
     checks = {
         "fit_structurally_adequate": bool(fit_floor["adequate"]),
         "heldout_structurally_adequate": bool(held_floor["adequate"]),

@@ -278,6 +278,30 @@ class ScheduledResearchTests(unittest.TestCase):
                              {"provider": "alpaca", "feed": "sip"})
             self.assertEqual(result["proofs"], [])
 
+    def test_factory_diagnostic_report_is_separate_and_atomic(self):
+        row = {"kind": "bar", "provider": "alpaca", "feed": "sip"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "market.jsonl"
+            report = root / "reports" / "terra-equity.json"
+            source.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            args = self._factory_args(source, diagnostic_only=True)
+            with patch.dict("os.environ", {
+                    "ALPACA_FACTORY_DIAGNOSTIC_REPORT": str(report)}), \
+                 patch.object(research_cli, "_agent_config",
+                              return_value=self._factory_config()), \
+                 patch.object(research_cli, "run_factory",
+                              return_value={"results": [], "proofs": []}), \
+                 patch.object(research_cli, "_emit_proofs") as emit, \
+                 patch.object(research_cli, "print"):
+                self.assertEqual(research_cli.cmd_factory_run(args), 2)
+            emit.assert_not_called()
+            persisted = json.loads(report.read_text(encoding="utf-8"))
+            self.assertTrue(persisted["diagnostic_only"])
+            self.assertFalse(persisted["authorizing"])
+            self.assertEqual(persisted["report"], str(report))
+            self.assertFalse(report.with_name(report.name + ".tmp").exists())
+
     def test_factory_iex_default_keeps_proof_emission_path(self):
         row = {"kind": "bar", "provider": "alpaca", "feed": "iex"}
         with tempfile.TemporaryDirectory() as directory:
@@ -322,6 +346,18 @@ class ScheduledResearchTests(unittest.TestCase):
         self.assertLess(probe, vehicles)
         self.assertIn("research-llm-preflight-warning.v1", script)
         self.assertNotIn('research-llm.v1","status":"ready"', script)
+
+    def test_research_cycle_diagnostic_epoch_skips_authorizing_lanes(self):
+        script = (Path(__file__).parents[2] / "deploy" /
+                  "research-cycle.sh").read_text()
+        self.assertIn("ALPACA_FACTORY_DIAGNOSTIC_ONLY", script)
+        self.assertIn("--diagnostic-only", script)
+        self.assertIn("factory-%s-latest.json", script)
+        diagnostic_branch = script.index(
+            'if [ "${ALPACA_FACTORY_DIAGNOSTIC_ONLY:-0}" = "1" ]; then',
+            script.index("for vehicle in $vehicles"))
+        self.assertLess(diagnostic_branch, script.index(
+            'if [ "${ALPACA_TRIAL_REVIEW_ENABLED:-1}" = "1" ]; then'))
 
 
 if __name__ == "__main__":

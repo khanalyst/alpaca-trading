@@ -292,7 +292,11 @@ class AlpacaRuntimeTests(unittest.TestCase):
         self.assertEqual(trading.calls, [("stop-old", Decimal("101.50"))])
         self.assertEqual(replacement.id, "stop-new")
         self.assertEqual(replacement.replaces, "stop-old")
-        self.assertEqual(replacement.raw["stop_price"], "101.50")
+        # The real Alpaca SDK declares ``stop_price`` as a float and therefore
+        # normalizes Decimal("101.50") to 101.5.  Assert numeric fidelity rather
+        # than a textual scale the SDK cannot preserve.
+        self.assertEqual(
+            Decimal(str(replacement.raw["stop_price"])), Decimal("101.50"))
 
     def test_stop_replacement_wraps_a_non_finite_response_price(self):
         class MalformedReplacementTrading(TradingFake):

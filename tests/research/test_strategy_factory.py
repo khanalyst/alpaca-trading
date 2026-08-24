@@ -424,6 +424,72 @@ class StrategyFactoryTests(unittest.TestCase):
             previous, diagnosis, max_generations=4)
         self.assertEqual(replacement_one, replacement_two)
 
+    def test_fit_behavior_freeze_is_cycle_global_and_pre_worker(self):
+        hypotheses = initial_hypotheses(4)
+        first, second, zero_first, zero_second = hypotheses
+
+        def diagnostic(key, signals):
+            return {
+                "scope": "fit_only",
+                "behavior_fingerprint": {
+                    "fit_evidence_key": "sealed-fit-corpus",
+                    "entry_alias_key": f"entry-{key}",
+                    "full_alias_key": f"full-{key}",
+                    "alias_schema": "fit-behavior-alias.v1",
+                    "alias_numeric_decimals": 8,
+                    "signal_count": signals,
+                    "planned_vector_count": signals,
+                },
+            }
+
+        scheduled = [
+            {"mode": "backtest", "hypothesis": vars(first),
+             "specs": [first.rule_spec, zero_first.rule_spec]},
+            {"mode": "backtest", "hypothesis": vars(second),
+             "specs": [second.rule_spec, zero_second.rule_spec]},
+        ]
+        probes = {
+            first.hypothesis_id: {
+                rule_variant_id(first.rule_spec): diagnostic("shared", 4),
+                rule_variant_id(zero_first.rule_spec): diagnostic("zero", 0),
+            },
+            second.hypothesis_id: {
+                rule_variant_id(second.rule_spec): diagnostic("shared", 4),
+                rule_variant_id(zero_second.rule_spec): diagnostic("zero", 0),
+            },
+        }
+        proposals = {
+            first.hypothesis_id: {
+                rule_variant_id(first.rule_spec): ("model", "llm"),
+                rule_variant_id(zero_first.rule_spec): ("model", "llm"),
+            },
+            second.hypothesis_id: {
+                rule_variant_id(second.rule_spec): ("grid", "deterministic"),
+                rule_variant_id(zero_second.rule_spec): ("grid", "deterministic"),
+            },
+        }
+        frozen = factory_module._freeze_fit_behavior_candidates(
+            scheduled, probes, proposals)
+
+        self.assertEqual(frozen["intended_variant_count"], 4)
+        self.assertEqual(frozen["kept_variant_count"], 3)
+        remaining = {
+            (task["hypothesis"]["hypothesis_id"], rule_variant_id(spec))
+            for task in scheduled for spec in task["specs"]}
+        self.assertNotIn(
+            (first.hypothesis_id, rule_variant_id(first.rule_spec)), remaining)
+        self.assertIn(
+            (second.hypothesis_id, rule_variant_id(second.rule_spec)), remaining)
+        self.assertIn(
+            (first.hypothesis_id, rule_variant_id(zero_first.rule_spec)), remaining)
+        self.assertIn(
+            (second.hypothesis_id, rule_variant_id(zero_second.rule_spec)), remaining)
+        self.assertEqual(
+            scheduled[0]["excluded_behavior_aliases"][0]
+            ["canonical_family"], second.family)
+        self.assertEqual(
+            scheduled[0]["behavior_aliases"]["selection_scope"], "fit_only")
+
     def test_fit_execution_rejections_are_distinct_from_sparse_signals(self):
         blocked = core_module.diagnose([
             {"session_date": "2026-01-01", "no_trade": True,
@@ -437,6 +503,14 @@ class StrategyFactoryTests(unittest.TestCase):
         ])
         self.assertEqual(blocked["primary_failure"], "execution_blocked")
         self.assertEqual(sparse["primary_failure"], "insufficient_signals")
+        structural = core_module.diagnose([{
+            "session_date": "2026-01-01", "no_trade": True,
+            "execution_disposition": "refused",
+            "signal_opportunity": False,
+            "reject_reason": "invalid_session_bars",
+        }])
+        self.assertEqual(structural["primary_failure"], "insufficient_signals")
+        self.assertFalse(structural["execution_blocked"])
 
     def test_underpowered_shadow_accounts_do_not_advance_the_forward_boundary(self):
         # Accounts are diagnostic rows and are written before adequacy is
@@ -493,6 +567,25 @@ class StrategyFactoryTests(unittest.TestCase):
         def fake_diagnose(task):
             return {"hypothesis_id": task["hypothesis"]["hypothesis_id"],
                     "diagnostic": {"primary_failure": "negative_expectancy"}}
+
+        def fake_fit_probe(task):
+            output = {}
+            for spec in task["specs"]:
+                variant_id = rule_variant_id(spec)
+                output[variant_id] = {
+                    "scope": "fit_only",
+                    "behavior_fingerprint": {
+                        "fit_evidence_key": "bh-isolation-fit-corpus",
+                        "entry_alias_key": f"entry:{variant_id}",
+                        "full_alias_key": f"full:{variant_id}",
+                        "alias_schema": "fit-behavior-alias.v1",
+                        "alias_numeric_decimals": 8,
+                        "signal_count": 1,
+                        "planned_vector_count": 1,
+                    },
+                }
+            return {"hypothesis_id": task["hypothesis"]["hypothesis_id"],
+                    "fit_diagnostics": output, "worker_pid": 1}
 
         def fake_worker(task):
             sessions = sorted({factory_module._session(bar) for bar in task["bars"]})
@@ -582,6 +675,8 @@ class StrategyFactoryTests(unittest.TestCase):
                               side_effect=OSError), \
                  patch.object(factory_module, "_diagnose_worker",
                               side_effect=fake_diagnose), \
+                 patch.object(factory_module, "_fit_variants_worker",
+                              side_effect=fake_fit_probe), \
                  patch.object(factory_module, "_worker",
                               side_effect=fake_worker), \
                  patch.object(factory_module, "_gate",
@@ -882,7 +977,7 @@ class StrategyFactoryTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "retirement requires"):
                 ledger.event(parent["hypothesis_id"], "retired", "manual")
 
-    def test_configured_seven_strategy_shape_runs_fourteen_isolated_arms(self):
+    def test_configured_seven_strategy_shape_freezes_fit_aliases_before_arms(self):
         with tempfile.TemporaryDirectory() as directory:
             result = run_factory(
                 losing_breakouts(3), db_path=Path(directory) / "edge.sqlite3",
@@ -890,9 +985,17 @@ class StrategyFactoryTests(unittest.TestCase):
                 min_trades=50, min_sessions=10, alpha=.05)
             self.assertEqual(result["parallel_workers"], 7)
             self.assertEqual(result["strategies"], 7)
-            self.assertEqual(result["variants"], 14)
-            self.assertEqual(result["accounts"], 14)
-            self.assertEqual(len({row["account_id"] for row in result["results"]}), 14)
+            aliases = result["fit_behavior_canonicalization"]
+            self.assertEqual(aliases["intended_variant_count"], 14)
+            self.assertEqual(aliases["kept_variant_count"], 12)
+            self.assertEqual(len(aliases["excluded"]), 2)
+            self.assertTrue(all(
+                item["selection_scope"] == "fit_only"
+                for item in aliases["excluded"]))
+            self.assertEqual(result["variants"], 12)
+            self.assertEqual(result["accounts"], 12)
+            self.assertEqual(
+                len({row["account_id"] for row in result["results"]}), 12)
 
     def test_validated_generated_rule_is_the_only_runtime_activation_path(self):
         spec = validate_rule_spec({"family": "momentum_continuation",

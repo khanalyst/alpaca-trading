@@ -436,6 +436,9 @@ class DeployTests(unittest.TestCase):
         self.assertIn(
             "ALPACA_RECORDER_FETCH_WINDOW_MINUTES: ${ALPACA_RECORDER_FETCH_WINDOW_MINUTES:-1}",
             recorder)
+        self.assertIn(
+            "ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES: ${ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES:-15}",
+            recorder)
 
     def test_recorder_fetch_window_default_and_override(self):
         with patch.dict(os.environ):
@@ -444,6 +447,20 @@ class DeployTests(unittest.TestCase):
         with patch.dict(os.environ, {
                 "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "30"}):
             self.assertEqual(recorder._fetch_window_minutes(), 30)
+
+    def test_recorder_forward_observation_lag_is_bounded_and_validated(self):
+        name = "ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES"
+        with patch.dict(os.environ):
+            os.environ.pop(name, None)
+            self.assertEqual(
+                recorder._forward_observation_max_lag(), timedelta(minutes=15))
+        with patch.dict(os.environ, {name: "30"}):
+            self.assertEqual(
+                recorder._forward_observation_max_lag(), timedelta(minutes=30))
+        for value in ("0", "-1", "not-a-number"):
+            with self.subTest(value=value), patch.dict(os.environ, {name: value}):
+                with self.assertRaisesRegex(RuntimeError, "positive integer"):
+                    recorder._forward_observation_max_lag()
 
     def test_research_service_has_no_broker_credentials(self):
         text = Path("compose.yaml").read_text(encoding="utf-8")
@@ -461,6 +478,12 @@ class DeployTests(unittest.TestCase):
             research)
         self.assertIn(
             "ALPACA_FACTORY_WORKERS: ${ALPACA_FACTORY_WORKERS:-2}",
+            research)
+        self.assertIn(
+            "ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY: ${ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY:-}",
+            research)
+        self.assertIn(
+            "ALPACA_FACTORY_DIAGNOSTIC_ONLY: ${ALPACA_FACTORY_DIAGNOSTIC_ONLY:-0}",
             research)
         self.assertIn(
             "mem_limit: ${ALPACA_RESEARCH_MEMORY_LIMIT:-10g}",
@@ -714,6 +737,46 @@ class DeployTests(unittest.TestCase):
             with closing(sqlite3.connect(edge_db)) as db:
                 self.assertGreater(db.execute(
                     "SELECT COUNT(*) FROM candidates").fetchone()[0], 0)
+
+    def test_research_cycle_reuses_only_explicitly_identified_preprocessing(self):
+        csv_text = (
+            "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
+            "open,high,low,close,volume\n"
+            "k,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY,"
+            "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
+            "100,101,99,100.5,10\n")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "market.csv"
+            cache = root / "preprocessing-cache"
+            dataset.write_text(csv_text, encoding="utf-8")
+            cache_env = {
+                "ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY":
+                    "sha256:" + "a" * 64,
+                "ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT": str(cache),
+                "ALPACA_RESEARCH_BACKTEST": "0",
+            }
+
+            first = _run_research_cycle(dataset, root / "first", **cache_env)
+            self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+            first_cache = [
+                item for item in _cycle_payloads(first.stderr, "schema")
+                if item.get("schema") ==
+                "research-preprocessing-cache-result.v1"]
+            self.assertEqual([item["status"] for item in first_cache],
+                             ["miss", "published"])
+
+            second = _run_research_cycle(dataset, root / "first", **cache_env)
+            self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+            second_cache = [
+                item for item in _cycle_payloads(second.stderr, "schema")
+                if item.get("schema") ==
+                "research-preprocessing-cache-result.v1"]
+            self.assertEqual([item["status"] for item in second_cache], ["hit"])
+            self.assertTrue(second_cache[0]["hit"])
+            views = [item for item in _cycle_payloads(second.stderr, "schema")
+                     if item.get("schema") == "research-cycle-views.v1"]
+            self.assertEqual(views[0]["bars"], 1)
 
     def test_research_cycle_quarantines_legacy_observation_inversions(self):
         csv_text = (
@@ -1316,6 +1379,28 @@ class DeployTests(unittest.TestCase):
             self.assertGreater(len(windows), 1)
             self.assertTrue(all(end - start <= timedelta(minutes=30)
                                 for _kind, start, end in windows))
+            index = recorder._prepare_index(path)
+            stale_day = recorder._session_date(stamp)
+            self.assertEqual(index["partition_sources"][
+                recorder._partition_path(path, stale_day).name], {
+                    "source_mode": "historical_backfill",
+                })
+
+    def test_recorder_classifies_only_late_first_observations_as_historical(self):
+        observed = datetime(2026, 8, 13, 14, 0, tzinfo=timezone.utc)
+
+        def row(stamp, lag):
+            return {
+                "timestamp": stamp.isoformat(),
+                "as_of": (stamp + timedelta(minutes=1)).isoformat(),
+                "observed_at": (stamp + timedelta(minutes=1, seconds=lag)).isoformat(),
+            }
+
+        live = datetime(2026, 8, 13, 13, 58, tzinfo=timezone.utc)
+        stale = observed - timedelta(days=2)
+        days = recorder._historical_partition_days(
+            [row(live, 10), row(stale, 16 * 60)], timedelta(minutes=15))
+        self.assertEqual(days, {recorder._session_date(stale)})
 
     def test_sparse_iex_gap_advances_and_is_exposed_as_coverage(self):
         fixed_now = datetime(2026, 8, 13, 16, 0, tzinfo=timezone.utc)
@@ -1632,6 +1717,37 @@ class DeployTests(unittest.TestCase):
             })
             self.assertLess((root / recorder.INDEX_NAME).stat().st_size,
                             max(16_384, before_size * 2))
+
+    def test_recorder_repairs_missing_historical_partition_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            rows = _corpus_rows(sessions=2, per_session=1)
+            stale_stamp = datetime.fromisoformat(rows[0]["timestamp"])
+            rows[0]["observed_at"] = (
+                stale_stamp + timedelta(days=2)).isoformat()
+            recorder._append_partitions(path, rows)
+            recorder._save_index(path, recorder._scan_corpus(path))
+
+            result = recorder.repair_partition_provenance(
+                path, maximum_lag=timedelta(minutes=15))
+
+            stale_day = recorder._session_date(stale_stamp)
+            live_day = recorder._session_date(
+                datetime.fromisoformat(rows[1]["timestamp"]))
+            self.assertEqual(result["rows_scanned"], 2)
+            self.assertEqual(result["new_historical_partitions"], 1)
+            sources = recorder._prepare_index(path)["partition_sources"]
+            self.assertEqual(sources, {
+                recorder._partition_path(path, stale_day).name: {
+                    "source_mode": "historical_backfill",
+                },
+            })
+            self.assertNotIn(recorder._partition_path(path, live_day).name,
+                             sources)
+
+            repeated = recorder.repair_partition_provenance(
+                path, maximum_lag=timedelta(minutes=15))
+            self.assertEqual(repeated["new_historical_partitions"], 0)
 
     def test_recorder_fsyncs_new_partition_and_provenance_directories(self):
         with tempfile.TemporaryDirectory() as directory:

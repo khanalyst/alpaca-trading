@@ -106,6 +106,44 @@ class TuningContractTests(unittest.TestCase):
         for key in ("request_hash", "raw_response_hash", "system_prompt_hash"):
             self.assertRegex(result.evidence[key], r"^[0-9a-f]{64}$")
 
+    def test_fit_execution_rejection_counts_reach_tuning_but_rows_do_not(self):
+        seen = {}
+
+        def caller(*, system_prompt, request, timeout):
+            seen.update(request)
+            return _reply(_tuned({"threshold_bps": 6.0}))
+
+        adapter = RuleProposalAdapter(
+            model="test", caller=caller, max_attempts=1)
+        diagnosis = {
+            **DIAGNOSIS,
+            "fit_diagnostics": {
+                "execution_rejections": {
+                    "rows": 126,
+                    "executed_rows": 0,
+                    "no_trade_rows": 126,
+                    "execution_blocked": True,
+                },
+            },
+        }
+        result = adapter.tune("equity", 0, ROOT, diagnosis, count=1)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            seen["diagnosis"]["fit_diagnostics"]["execution_rejections"]
+                ["rows"], 126)
+
+        unsafe = {
+            **diagnosis,
+            "fit_diagnostics": {
+                "execution_rejections": {
+                    "rows": [{"close": 101.0}],
+                },
+            },
+        }
+        refused = adapter.tune("equity", 0, ROOT, unsafe, count=1)
+        self.assertFalse(refused.success)
+        self.assertIn("non-negative integer count", refused.error or "")
+
     def test_tuning_may_not_change_the_family(self):
         """Changing the idea is discovery's job; tuning changes its numbers."""
         adapter = _adapter(_reply(({**ROOT, "family": "mean_reversion"},

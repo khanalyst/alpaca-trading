@@ -125,6 +125,7 @@ DEDUP_HORIZON = timedelta(minutes=15)
 MAX_INLINE_INDEX_BYTES = 16 * 1024 * 1024
 RECENT_KEY_BATCH_SIZE = 10_000
 DEFAULT_FETCH_WINDOW_MINUTES = 1
+DEFAULT_FORWARD_OBSERVATION_MAX_LAG_MINUTES = 15
 DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
 # Calendar metadata is an audit boundary, not a deduplication cache.  Keep the
@@ -373,6 +374,41 @@ def audit_corpus(output: Path) -> dict:
         "rows": rows,
         "watermark": watermark.isoformat() if watermark else None,
         "partitions": _partition_sizes(output),
+    }
+
+
+def repair_partition_provenance(
+        output: Path, *, maximum_lag: timedelta | None = None) -> dict:
+    """Recover missing historical markers from each row's observation lag.
+
+    This is an explicit, streaming maintenance operation for corpora written by
+    recorder versions that persisted ``observed_at`` correctly but omitted the
+    partition source sidecar.  It only removes authorization power: an existing
+    historical marker is retained and no row is ever relabelled forward.
+    """
+    limit = maximum_lag or _forward_observation_max_lag()
+    if limit <= timedelta(0):
+        raise ValueError("provenance repair maximum lag must be positive")
+    rows = 0
+    historical_days: set[date] = set()
+    with corpus_write_lock(output):
+        index = _prepare_index(output)
+        for row, _key, _event, _symbol, _parsed in _validated_corpus_rows(output):
+            rows += 1
+            historical_days.update(_historical_partition_days([row], limit))
+        before = _partition_sources_from_markers(output)
+        for day in sorted(historical_days):
+            _save_partition_source(output, day, "historical_backfill")
+        after = _partition_sources_from_markers(output)
+        index["partition_sources"] = after
+        _save_index(output, index)
+    return {
+        "schema": "recorder-provenance-repair.v1",
+        "status": "ok",
+        "rows_scanned": rows,
+        "maximum_forward_lag_seconds": int(limit.total_seconds()),
+        "historical_partitions": len(after),
+        "new_historical_partitions": len(set(after) - set(before)),
     }
 
 
@@ -1469,6 +1505,49 @@ def _fetch_window_minutes() -> int:
     return value
 
 
+def _forward_observation_max_lag() -> timedelta:
+    """Maximum delay that may still count as forward-observed evidence.
+
+    The recorder can legitimately see a just-completed bar or quote a little
+    after its market timestamp.  A response first observed beyond this bounded
+    delay is catch-up/backfill evidence and must be labelled as such so replay
+    cannot pretend it existed at the historical decision boundary.
+    """
+    raw = os.getenv(
+        "ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES",
+        str(DEFAULT_FORWARD_OBSERVATION_MAX_LAG_MINUTES))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES must be a "
+            "positive integer") from exc
+    if value <= 0:
+        raise RuntimeError(
+            "ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES must be a "
+            "positive integer")
+    return timedelta(minutes=value)
+
+
+def _historical_partition_days(rows: list[dict],
+                               maximum_lag: timedelta) -> set[date]:
+    """Return stored session partitions whose first observation was too late."""
+    result: set[date] = set()
+    for row in rows:
+        stamp = _timestamp(row.get("timestamp"))
+        available = _timestamp(row.get("as_of") or row.get("timestamp"))
+        observed = _timestamp(row.get("observed_at"))
+        if stamp is None or available is None or observed is None:
+            raise RuntimeError(
+                "recorder row has invalid provenance timestamps")
+        if observed + timedelta(seconds=5) < available:
+            raise RuntimeError(
+                "recorder row was observed before it became available")
+        if observed - available > maximum_lag:
+            result.add(_session_date(stamp))
+    return result
+
+
 def _bar_gap_minutes() -> int:
     raw = os.getenv("ALPACA_RECORDER_BAR_GAP_MINUTES",
                     str(DEFAULT_BAR_GAP_MINUTES))
@@ -1526,7 +1605,8 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
                   horizon: datetime | None,
                   calendar: CalendarCache | None, *, feed: str,
                   bar_gap_policy: str,
-                  bar_gap_maximum: timedelta):
+                  bar_gap_maximum: timedelta,
+                  forward_observation_max_lag: timedelta):
     """Validate and durably append one bounded provider response."""
     coverage = _verify_bar_continuity(
         rows, latest_bars, window_end, symbols, calendar, feed=feed,
@@ -1572,6 +1652,19 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
     index = _prune_index(index)
     if rows:
         if unique_rows:
+            # Provenance is durable before the authoritative append.  A crash
+            # can therefore only conservatively label an existing partition as
+            # historical; it can never leave late-observed rows looking like
+            # forward evidence.  Partition-level metadata intentionally never
+            # downgrades from historical_backfill.
+            historical_days = _historical_partition_days(
+                unique_rows, forward_observation_max_lag)
+            sources = index.setdefault("partition_sources", {})
+            for day in sorted(historical_days):
+                _save_partition_source(output, day, "historical_backfill")
+                sources[_partition_path(output, day).name] = {
+                    "source_mode": "historical_backfill",
+                }
             _append_partitions(output, unique_rows)
             # The corpus append happens first.  If the process dies before the
             # SQLite and JSON commits, partition sizes no longer match the
@@ -1653,6 +1746,7 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
     index["data_feed"] = resolved_feed
     bar_gap_policy = _bar_gap_policy(resolved_feed)
     bar_gap_maximum = timedelta(minutes=_bar_gap_minutes())
+    forward_observation_max_lag = _forward_observation_max_lag()
     watermark = _timestamp(index.get("watermark"))
     latest_bars = {symbol: parsed for symbol, parsed in
                    ((key, _timestamp(value))
@@ -1702,7 +1796,8 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             output, index, recent_store, watermark, latest_bars, pins, rows, symbols,
             window_end, now, option_hold, horizon, calendar,
             feed=resolved_feed, bar_gap_policy=bar_gap_policy,
-            bar_gap_maximum=bar_gap_maximum)
+            bar_gap_maximum=bar_gap_maximum,
+            forward_observation_max_lag=forward_observation_max_lag)
         total_unique += unique
         horizon = None if watermark is None else watermark - DEDUP_HORIZON
         if window_end >= now:
@@ -1764,6 +1859,10 @@ def parser() -> argparse.ArgumentParser:
               "writing corpus rows"))
     p.add_argument("--audit", action="store_true",
                    help="validate the full corpus and detect duplicate keys")
+    p.add_argument(
+        "--repair-provenance", action="store_true",
+        help=("stream stored observation timestamps and durably mark late-seen "
+              "partitions as diagnostic historical backfill"))
     p.add_argument("--config", default="config.yaml")
     return p
 
@@ -1783,6 +1882,17 @@ def main(argv=None) -> int:
         except Exception as exc:  # explicit audit must report a machine-readable failure
             print(json.dumps({
                 "schema": "recorder-audit.v1",
+                "status": "failed",
+                "error": str(exc),
+            }, sort_keys=True), file=sys.stderr, flush=True)
+            return 2
+    if args.repair_provenance:
+        try:
+            print(json.dumps(repair_partition_provenance(output), sort_keys=True))
+            return 0
+        except Exception as exc:
+            print(json.dumps({
+                "schema": "recorder-provenance-repair.v1",
                 "status": "failed",
                 "error": str(exc),
             }, sort_keys=True), file=sys.stderr, flush=True)

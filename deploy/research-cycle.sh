@@ -397,6 +397,97 @@ PY
   validated_input="$external_jsonl"
   source_format="jsonl"
 fi
+
+# Reuse preprocessing only when the caller supplies an immutable source
+# identity that covers the selected partition bytes *and* recorder provenance
+# sidecars. Mutable recorder paths, sizes, and mtimes are never cache keys.
+preprocess_cache_hit=0
+preprocess_cache_enabled=0
+cache_lookup_output=""
+cache_source_identity="${ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY:-}"
+cache_root="${ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT:-$repo_root/research/cache/preprocessing}"
+if [[ "$cache_root" != /* ]]; then
+  cache_root="$repo_root/$cache_root"
+fi
+cache_dataset_report="$tmp_dir/cache-dataset-report.json"
+cache_vehicle_report="$tmp_dir/cache-vehicle-report.json"
+if [ -n "$cache_source_identity" ] && [ "$dataset" != "-" ]; then
+  preprocess_cache_enabled=1
+  cache_config_identity="$($python_bin - "$agent_config" <<'PY'
+import hashlib
+import sys
+with open(sys.argv[1], "rb") as handle:
+    print("sha256:" + hashlib.sha256(handle.read()).hexdigest())
+PY
+)"
+  cache_code_identity="$($python_bin - "$repo_root/deploy/research_dataset.py" \
+    "$repo_root/deploy/research_cache.py" "$repo_root/deploy/research-cycle.sh" <<'PY'
+import hashlib
+import sys
+digest = hashlib.sha256()
+for name in sys.argv[1:]:
+    digest.update(name.rsplit("/", 1)[-1].encode() + b"\0")
+    with open(name, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+print("sha256:" + digest.hexdigest())
+PY
+)"
+  cache_context_identity="format=$source_format;recorder=$dataset_from_recorder;vehicles=$vehicles;session_window=${ALPACA_RESEARCH_SESSION_WINDOW:-0};equity_feed=$configured_feed;option_feed=$configured_option_feed;bundle=normalized-bars-quotes-options-replay-v1"
+  set +e
+  cache_lookup_output="$($python_bin "$repo_root/deploy/research_cache.py" lookup \
+    --cache-root "$cache_root" \
+    --source-identity "$cache_source_identity" \
+    --config-identity "$cache_config_identity" \
+    --code-identity "$cache_code_identity" \
+    --context-identity "$cache_context_identity")"
+  cache_lookup_status=$?
+  set -e
+  printf '%s\n' "$cache_lookup_output" >&2
+  if [ "$cache_lookup_status" -eq 0 ]; then
+    preprocess_cache_hit=1
+  elif [ "$cache_lookup_status" -ne 1 ]; then
+    finish "failed" "research preprocessing cache lookup failed" 3
+  fi
+else
+  printf '%s\n' '{"schema":"research-preprocessing-cache-result.v1","operation":"lookup","status":"disabled","hit":false,"reason":"immutable_source_identity_unavailable"}' >&2
+fi
+
+cache_artifact_path() {
+  "$python_bin" - "$cache_lookup_output" "$1" <<'PY'
+import json
+import sys
+payload = json.loads(sys.argv[1])
+record = (payload.get("artifacts") or {}).get(sys.argv[2]) or {}
+path = record.get("path")
+if not isinstance(path, str) or not path:
+    raise SystemExit(1)
+print(path)
+PY
+}
+
+if [ "$preprocess_cache_hit" -eq 1 ]; then
+  validated_input="$(cache_artifact_path validated)" || \
+    finish "failed" "preprocessing cache has no validated artifact" 3
+  bars_input="$(cache_artifact_path bars)" || \
+    finish "failed" "preprocessing cache has no bars artifact" 3
+  quotes_input="$(cache_artifact_path quotes)" || \
+    finish "failed" "preprocessing cache has no quotes artifact" 3
+  options_input="$(cache_artifact_path options)" || \
+    finish "failed" "preprocessing cache has no options artifact" 3
+  replay_input="$(cache_artifact_path replay)" || \
+    finish "failed" "preprocessing cache has no replay artifact" 3
+  cache_dataset_report="$(cache_artifact_path dataset_report)" || \
+    finish "failed" "preprocessing cache has no dataset report" 3
+  cache_vehicle_report="$(cache_artifact_path vehicle_report)" || \
+    finish "failed" "preprocessing cache has no vehicle report" 3
+  dataset_report="$(cat "$cache_dataset_report")"
+  vehicle_filter_status="$(cat "$cache_vehicle_report")"
+  printf '%s\n' "$vehicle_filter_status" >&2
+else
 normalized_input="$tmp_dir/market.jsonl"
 # Preserve the append-only recorder corpus byte-for-byte. Only the temporary
 # research view quarantines the known legacy point-in-time inversion; malformed
@@ -627,6 +718,32 @@ with open(options_path, "w", encoding="utf-8") as options, \
         elif kind in bar_kinds:
             replay.write(serialized)
 PY
+
+  if [ "$preprocess_cache_enabled" -eq 1 ]; then
+    printf '%s\n' "$dataset_report" > "$cache_dataset_report"
+    printf '%s\n' "$vehicle_filter_status" > "$cache_vehicle_report"
+    set +e
+    cache_publish_output="$($python_bin "$repo_root/deploy/research_cache.py" publish \
+      --cache-root "$cache_root" \
+      --source-identity "$cache_source_identity" \
+      --config-identity "$cache_config_identity" \
+      --code-identity "$cache_code_identity" \
+      --context-identity "$cache_context_identity" \
+      --artifact "validated=$validated_input" \
+      --artifact "bars=$bars_input" \
+      --artifact "quotes=$quotes_input" \
+      --artifact "options=$options_input" \
+      --artifact "replay=$replay_input" \
+      --artifact "dataset_report=$cache_dataset_report" \
+      --artifact "vehicle_report=$cache_vehicle_report")"
+    cache_publish_status=$?
+    set -e
+    printf '%s\n' "$cache_publish_output" >&2
+    if [ "$cache_publish_status" -ne 0 ]; then
+      finish "failed" "research preprocessing cache publish failed" 3
+    fi
+  fi
+fi
 
 # Preserve the quarantine record and report view sizes without rescanning the
 # generated files. ``research_dataset.py`` counted them during its source pass.
@@ -1079,6 +1196,13 @@ run_discovery() {
 
 run_factory() {
   local vehicle="$1"
+  local diagnostic_flag=""
+  if [ "${ALPACA_FACTORY_DIAGNOSTIC_ONLY:-0}" = "1" ]; then
+    diagnostic_flag="--diagnostic-only"
+    if [ -z "${ALPACA_FACTORY_DIAGNOSTIC_REPORT:-}" ]; then
+      export ALPACA_FACTORY_DIAGNOSTIC_REPORT="$repo_root/runtime/research/diagnostics/factory-%s-latest.json"
+    fi
+  fi
   emit_progress "factory" 0 1 "tasks" "$vehicle"
   set +e
   "$python_bin" "$repo_root/research.py" factory run \
@@ -1093,7 +1217,8 @@ run_factory() {
     --min-sessions "${ALPACA_FACTORY_MIN_SESSIONS:-30}" \
     --alpha "${ALPACA_FACTORY_ALPHA:-0.05}" \
     --max-generations "${ALPACA_FACTORY_MAX_GENERATIONS:-5}" \
-    --max-confirmatory-attempts "${ALPACA_FACTORY_MAX_CONFIRMATORY_ATTEMPTS:-3}"
+    --max-confirmatory-attempts "${ALPACA_FACTORY_MAX_CONFIRMATORY_ATTEMPTS:-3}" \
+    ${diagnostic_flag:+$diagnostic_flag}
   local status=$?
   set -e
   if [ "$status" -eq 0 ]; then
@@ -1182,6 +1307,15 @@ for vehicle in $vehicles; do
       finish "failed" "unsupported research vehicle: $vehicle" 3
       ;;
   esac
+  if [ "${ALPACA_FACTORY_DIAGNOSTIC_ONLY:-0}" = "1" ]; then
+    # Historical/backfill epochs are a model-assisted reachability laboratory,
+    # never a lifecycle lane. They do not review trials, run authorizing
+    # discovery, or ingest shadow evidence.
+    if [ "${ALPACA_FACTORY_ENABLED:-1}" = "1" ]; then
+      run_factory "$vehicle"
+    fi
+    continue
+  fi
   if [ "${ALPACA_TRIAL_REVIEW_ENABLED:-1}" = "1" ]; then
     review_trials "$vehicle"
   fi

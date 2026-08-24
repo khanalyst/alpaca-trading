@@ -38,6 +38,7 @@ from research.proof import write_proof
 from research.strategy_factory import (DEFAULT_STRATEGIES, DEFAULT_WORKERS,
                                        factory_status, run_factory)
 from research.llm_strategy import RuleProposalAdapter, _safe_error
+from research.paper_epoch_cli import add_paper_epoch_parser
 from agent.config import load_config as load_agent_config
 
 
@@ -836,6 +837,20 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
     stalled = _report_unevaluable(
         result, [item.get("gate") for item in result.get("results", [])
                  if isinstance(item, Mapping)])
+    configured = os.getenv("ALPACA_FACTORY_DIAGNOSTIC_REPORT")
+    if diagnostic_only and configured:
+        if "%s" in configured:
+            configured = configured % args.vehicle
+        target = Path(configured)
+        if not target.is_absolute():
+            target = REPO / target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        result["report"] = str(target)
+        temporary = target.with_name(target.name + ".tmp")
+        temporary.write_text(
+            json.dumps(result, sort_keys=True, default=str) + "\n",
+            encoding="utf-8")
+        os.replace(temporary, target)
     print(json.dumps(result, sort_keys=True, default=str))
     if proofs:
         # A proof is the authorizing result.  It takes precedence over a
@@ -1123,6 +1138,7 @@ def build_parser() -> argparse.ArgumentParser:
     llm_preflight.add_argument("--agent-config", default=None,
                                help="validated agent config (default: config.yaml)")
     llm_preflight.set_defaults(func=cmd_llm_preflight)
+    add_paper_epoch_parser(sub)
     calibrate = sub.add_parser(
         "calibrate", help="compare modelled fill costs against journaled fills")
     calibrate.add_argument("journal")

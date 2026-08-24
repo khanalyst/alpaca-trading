@@ -87,6 +87,26 @@ of more API requests and a slower stale-corpus catch-up. A legacy single-file
 audited, and partitioned in place on the first run after upgrade, then kept
 beside the corpus as `market.csv.migrated`.
 
+Rows first seen more than
+`ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES` after their point-in-time
+availability (15 minutes by default) are durably marked
+`historical_backfill` at the partition boundary before append. They remain
+usable by the explicit diagnostic replay policy, but cannot count as
+forward-shadow or paper authorization evidence.
+
+Existing corpora can be classified with the same rule using an explicit,
+streaming maintenance pass:
+
+```sh
+docker compose run --rm --no-deps recorder \
+  python deploy/recorder.py --out runtime/research/recorded --repair-provenance
+```
+
+The operation takes the corpus lock, writes a partition marker before changing
+the index, is idempotent, and never turns a historical partition back into a
+forward-observed one. Review its machine-readable report before using the
+result in a diagnostic cycle.
+
 Option sampling takes `ALPACA_RECORDER_OPTION_LIMIT` contracts per side per
 sample (default 10, capped at 25) and keeps every contract it has sampled in
 the sample for `ALPACA_RECORDER_OPTION_HOLD_MINUTES` (default 180) so a trade
@@ -132,6 +152,28 @@ execution remains the single `shares` profile. Set
 vehicles independently; their calibration and authorization evidence stays
 per vehicle. Capacity is configurable through the
 `ALPACA_FACTORY_*` environment variables.
+
+Deterministic preprocessing can be reused across repeated experiments by
+setting `ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY` to an audited digest that
+covers every selected partition byte plus the recorder calendar and partition-
+source sidecars. Path, size, and modification time are intentionally
+insufficient. `ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT` selects the immutable
+content-addressed store. Every hit re-hashes every member of the normalized,
+bar, quote, option, replay, and report bundle; corruption becomes a quarantined
+miss and is rebuilt atomically. Leaving the source identity unset disables the
+cache, which is the safe mode for the actively changing recorder corpus.
+
+Historical catch-up may run Terra without contaminating authorization by
+setting `ALPACA_FACTORY_DIAGNOSTIC_ONLY=1`. The cycle then writes a separate
+`ALPACA_FACTORY_DIAGNOSTIC_REPORT`, runs model discovery and bounded tuning on
+the diagnostic view, and skips EdgeLedger proof emission, trial review, and
+shadow ingestion. It exits non-authorizing even when a hypothesis looks good.
+Use `python -m research.cost_counterfactual` against the resulting frozen
+specifications to compare `0.30` with a preregistered alternative such as
+`0.60`; the report is reachability evidence only and cannot alter the shipped
+threshold or promote an edge. It compares cost-veto refusals, admitted trades,
+and ordinary diagnostic replay P&L; it does not relabel that replay P&L as a
+separate stressed-expectancy estimator.
 
 The shipped/default universe is 24 liquid ETFs spanning broad-market, size,
 sector, international, rates/credit, metals, and semiconductor exposures (the

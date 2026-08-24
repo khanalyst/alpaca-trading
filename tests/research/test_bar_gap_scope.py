@@ -78,6 +78,12 @@ def _trade(drop_bar: int | None = None):
     return trade
 
 
+def _outcome(drop_bar: int | None = None):
+    """Return the replay's terminal disposition, including explicit refusals."""
+    return _simulate_trade(_bars(drop_bar), SPEC, [], "equity", quotes=None,
+                           policy=BAR_FALLBACK)
+
+
 class FeatureWindowTests(unittest.TestCase):
     def test_session_accumulating_families_have_no_bounded_window(self):
         for family in ("vwap_reversion", "vwap_trend"):
@@ -117,13 +123,23 @@ class SessionGapScopeTests(unittest.TestCase):
     def test_a_gap_inside_the_feature_window_refuses_the_signal(self):
         # Bar 14 is the last minute of the opening range: dropping it changes
         # the range the breakout is measured against.
-        self.assertIsNone(_trade(drop_bar=14))
+        outcome = _outcome(drop_bar=14)
+        self.assertEqual(outcome["execution_disposition"], "refused")
+        self.assertFalse(outcome["signal_opportunity"])
+        self.assertEqual(outcome["unpriced_reason"],
+                         "no_contiguous_feature_window")
+        self.assertEqual(outcome["reject_stage"], "data_validation")
+        self.assertGreater(outcome["reject_detail"]["gapped_prefixes"], 0)
 
     def test_a_gap_between_signal_and_entry_refuses_the_signal(self):
         # Bar 16 is the entry bar for the breakout completed on bar 15.
         # Carrying the signal to the next recorded minute would enter on a
         # stale breakout.
-        self.assertIsNone(_trade(drop_bar=16))
+        outcome = _outcome(drop_bar=16)
+        self.assertEqual(outcome["execution_disposition"], "refused")
+        self.assertTrue(outcome["signal_opportunity"])
+        self.assertEqual(outcome["unpriced_reason"], "entry_bar_not_adjacent")
+        self.assertEqual(outcome["reject_stage"], "entry_causality")
 
     def test_a_gap_after_the_exit_does_not_move_the_exit(self):
         # This trade reaches its target on bar 18.  A minute missing at bar 22

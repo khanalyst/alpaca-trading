@@ -615,6 +615,44 @@ attempts before it is reported, because a "trend" drawn from one is worse than
 no trend. Nothing in the digest is derived from a held-out, sealed, or
 later-forward observation, so sharing it adds no information about unseen data.
 
+## The isolated paper-research epoch
+
+`research.paper_epoch` is a separate operational experiment from both the
+authorizing EdgeLedger and the existing paper-account trial below. It freezes
+exactly one primary connected to a separately fingerprinted Alpaca paper
+account/runtime and at least one broker-free shadow sibling. Every member must
+attest the same realtime-stream, data-window, config, code, cost, risk, and
+manifest digests before the epoch starts. Runtime LLM adaptation is required to
+be false both in the manifest and at start.
+
+The epoch writes only its dedicated SQLite store (default
+`runtime/research/paper_epochs.sqlite3`). A complete observation batch contains
+the primary and every sibling for the same stream event. It records paper
+fills, slippage, rejections, and paper/shadow operational parity. A mismatch or
+runtime failure may stop the epoch; a favorable paper outcome contributes zero
+alpha evidence and has no promotion authority. The database is append-only,
+uses immutable triggers, row digests, and an audit hash chain, and refuses to
+share a namespace with an EdgeLedger or runtime journal.
+
+Lifecycle operations use bounded JSON documents and never accept or persist
+broker secrets:
+
+```bash
+python research.py paper-epoch create --db runtime/research/paper_epochs.sqlite3 --input create.json
+python research.py paper-epoch start --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH --input attestation.json
+python research.py paper-epoch record --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH --input paired-outcome.json
+python research.py paper-epoch complete --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH
+python research.py paper-epoch seal --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH --input lessons.json
+python research.py paper-epoch verify --db runtime/research/paper_epochs.sqlite3
+```
+
+Lessons are invisible to their source epoch. A successor may consume only the
+immediately preceding sealed batch, and only after attesting a clean runtime
+restart and a different unseen data-window digest. It therefore restarts
+confirmation rather than tuning the running cohort. Broker order wiring must be
+hosted in its own paper-only process with its own credentials; the control
+plane deliberately cannot fall back to the trader's account or credentials.
+
 ## The paper-account trial lane
 
 `research.trial` closes the loop between the book and the search.
@@ -728,7 +766,26 @@ python research.py factory report [--slot N] [--format text|markdown|json] [--wr
 The standalone factory preflight requires readable normalized JSONL with
 explicit provider/feed provenance; the default equity lane requires IEX.
 `--diagnostic-only` is an explicit non-authorizing mode for partial or
-non-IEX input, marks the result diagnostic, and emits no proofs.
+non-IEX input, marks the result diagnostic, and emits no proofs. In this mode
+the configured strategy model may still perform bounded discovery and tuning;
+its hypotheses, variants, call evidence, and aggregate refusal diagnostics are
+written to `ALPACA_FACTORY_DIAGNOSTIC_REPORT`, never to either authorizing
+ledger. Scheduled diagnostic cycles skip trial review and shadow ingestion.
+
+For a preregistered reachability check, freeze the exact diagnostic report and
+run the same specifications and data under two cost-risk limits:
+
+```bash
+python -m research.cost_counterfactual \
+  --data market.jsonl --specs diagnostic-report.json \
+  --agent-config config.yaml --baseline 0.30 --alternative 0.60 \
+  --output cost-counterfactual.json
+```
+
+Only that one risk-policy field changes. The output measures refusal rate,
+executed trades, and ordinary diagnostic replay P&L, is explicitly
+non-authorizing, and cannot select or update the production threshold from its
+own result. It does not claim a separate stressed-expectancy estimator.
 
 `factory run` archives the Markdown narrative under `research/results/factory/`
 on every cycle, including a cycle that proved nothing, so the read-only

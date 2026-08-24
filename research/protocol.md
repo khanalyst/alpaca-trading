@@ -183,6 +183,24 @@ missing or ambiguous context fails closed. Shadow quarantine is not an auto-skip
 an unresolved session blocks watermark/FDR advancement until source correction
 and a bounded parity replay complete.
 
+## Isolated paper-research epochs
+
+A paper-research experiment is operational instrumentation, not a deployment
+state and not alpha evidence. It freezes one primary and one or more broker-free
+shadow siblings on the same realtime-stream, data-window, config, code, cost,
+and risk digests. Creation requires non-secret attestations proving that the
+primary Alpaca paper account and runtime differ from the deployed trader, and
+the epoch writes a separate append-only outcome store. Runtime LLM adaptation
+is false. Complete paired batches measure fills, slippage, rejections, and
+operational parity; paper success has zero promotion authority, while an
+operational mismatch may stop the epoch.
+
+Lessons may be sealed only after the epoch is terminal and are invisible to
+that epoch. Only its immediate successor may read them, after attesting a clean
+runtime restart and a different unseen data window. The successor restarts
+confirmation from the beginning. No paper observation can be copied into a
+held-out, shadow, FDR, or proof statistic.
+
 ## Deployment states
 
 Four states, one of which no automatic process may enter.

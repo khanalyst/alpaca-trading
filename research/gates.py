@@ -104,6 +104,13 @@ QUALIFICATION_MAX_ROWS = 10_000
 QUALIFICATION_MAX_BYTES = 2_000_000
 COST_STRESS_SCENARIOS_BPS = (9.0, 15.0, 25.0, 50.0)
 COST_STRESS_REQUIRED_BPS = 25.0
+# New gate envelopes use the single preregistered held-out paired statistic
+# for both the named significance and falsification checks.  The falsification
+# gate still has independent positive-effect, null-degeneracy, and scale
+# guards; this marker lets old envelopes that recorded a second empirical
+# null-tail p-value remain replayable without giving new runs two chances at
+# significance.
+FALSIFICATION_P_VALUE_SOURCE = "heldout_paired_cluster_sign_flip"
 
 # A gate's booleans often share one underlying source statistic.  Keeping this
 # map explicit makes that overlap visible to reports without changing any
@@ -120,7 +127,12 @@ _GATE_SOURCE_STATISTICS = {
         "online_fdr.p_value", "online_fdr.allocated_alpha"),
     "heldout_net_pnl_positive": ("performance.heldout_net_pnl",),
     "heldout_expectancy_positive": ("performance.heldout_expectancy",),
-    "falsification": ("falsification.p_value", "falsification.alpha"),
+    "falsification": (
+        "statistics.p_value", "statistics.alpha",
+        "falsification.observed_mean", "falsification.zero_placebo",
+        "falsification.distinct", "falsification.ratio",
+        "falsification.minimum_ratio",
+    ),
     "separated": ("separation.overlap_sessions", "separation.passes"),
     "walk_forward_available": ("walk_forward.available",),
     "walk_forward_adequate": ("walk_forward.adequate",),
@@ -138,6 +150,12 @@ _GATE_SOURCE_STATISTICS = {
     "fill_quality_adequate": ("fill_quality.adequate",),
     "cost_stress_adequate": ("cost_stress.adequate",),
 }
+_LEGACY_FALSIFICATION_SOURCE_STATISTICS = (
+    "falsification.p_value", "falsification.alpha",
+    "falsification.observed_mean", "falsification.zero_placebo",
+    "falsification.distinct", "falsification.ratio",
+    "falsification.minimum_ratio",
+)
 
 # A replay row is useful diagnostic evidence even when it cannot authorize a
 # statistical conclusion.  Keep the projection schema deliberately small and
@@ -993,7 +1011,8 @@ def heldout_separation(fit: Sequence[Mapping], heldout: Sequence[Mapping]) -> di
 
 
 def falsification_gate(observed: Sequence[float], placebo: Sequence[float], *,
-                       alpha: float = .05, minimum_ratio: float = 1.0) -> dict:
+                       alpha: float = .05, minimum_ratio: float = 1.0,
+                       preregistered_p_value: float | None = None) -> dict:
     """Place the observed mean delta inside a genuine null distribution.
 
     ``placebo`` is a sample of null mean deltas.  The decision is an empirical
@@ -1009,15 +1028,36 @@ def falsification_gate(observed: Sequence[float], placebo: Sequence[float], *,
     degenerate = bool(draws and max(draws) - min(draws) <= 1e-15)
     tolerance = 1e-15 * max(1.0, abs(observed_mean))
     extreme = sum(1 for value in draws if value >= observed_mean - tolerance)
-    p_value = (extreme + 1) / (len(draws) + 1) if draws else 1.0
+    empirical_p_value = (extreme + 1) / (len(draws) + 1) if draws else 1.0
+    if preregistered_p_value is None:
+        p_value = empirical_p_value
+        p_value_source = "empirical_null_tail"
+    else:
+        if isinstance(preregistered_p_value, bool):
+            raise ValueError("preregistered_p_value must be a finite probability")
+        try:
+            p_value = float(preregistered_p_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "preregistered_p_value must be a finite probability") from exc
+        if not math.isfinite(p_value) or not 0.0 <= p_value <= 1.0:
+            raise ValueError("preregistered_p_value must be in [0,1]")
+        p_value_source = FALSIFICATION_P_VALUE_SOURCE
+    positive_mean = observed_mean > 0
+    ratio_adequate = ratio is not None and ratio >= minimum_ratio
+    p_significant = p_value <= float(alpha)
     return {"observed_mean": observed_mean, "placebo_mean": placebo_mean,
             "ratio": ratio, "available": bool(draws),
             "draws": len(draws), "p_value": p_value, "alpha": float(alpha),
+            "p_value_source": p_value_source,
+            "minimum_ratio": float(minimum_ratio),
+            "positive_mean": positive_mean,
+            "ratio_adequate": ratio_adequate,
+            "p_significant": p_significant,
             "zero_placebo": zero_placebo,
             "distinct": not degenerate,
             "passes": bool(draws) and not zero_placebo and not degenerate and
-            observed_mean > 0 and p_value <= float(alpha) and
-            ratio is not None and ratio >= minimum_ratio}
+            positive_mean and p_significant and ratio_adequate}
 
 
 def sample_counts(rows: Iterable[Mapping], *, vehicle: str,
@@ -1404,6 +1444,21 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
         raise ValueError("equity_feed must be iex, sip, or delayed_sip")
     local = [row for row in rows if row.get("vehicle", vehicle) == vehicle]
     executed = [row for row in local if row.get("no_trade") is not True]
+    no_trade = [row for row in local if row.get("no_trade") is True]
+    no_signal = [row for row in no_trade
+                 if row.get("execution_disposition") == "no_signal"]
+    refused = [row for row in no_trade
+               if (row.get("execution_disposition") == "refused" or
+                   (not row.get("execution_disposition") and
+                    row.get("reject_reason")))]
+    # Legacy no-trade rows with neither a disposition nor a reason remain
+    # fail-closed. New factory rows never enter this bucket because the replay
+    # contract requires an explicit terminal disposition.
+    unclassified = [row for row in no_trade
+                    if (row.get("execution_disposition") not in {
+                            "no_signal", "refused"} and
+                        not row.get("reject_reason"))]
+    execution_opportunities = len(executed) + len(refused) + len(unclassified)
     sources: dict[str, int] = {}
     for row in executed:
         name = str(row.get("entry_fill_source") or "unknown")
@@ -1458,6 +1513,10 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
     return {
         "vehicle": vehicle,
         "opportunities": len(local),
+        "execution_opportunities": execution_opportunities,
+        "no_signal": len(no_signal),
+        "refused": len(refused),
+        "unclassified_refusals": len(unclassified),
         "executed": len(executed),
         "sources": dict(sorted(sources.items())),
         "quoted_fraction": (quoted / len(executed)) if executed else None,
@@ -1465,7 +1524,7 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
         "dominant_reject_reason": dominant,
         # Nothing priced, and every refusal shares one cause: this is a
         # data-shape mismatch, not an edgeless corpus.
-        "priced_nothing": bool(local and not executed),
+        "priced_nothing": bool(execution_opportunities and not executed),
         "adequate": quality_adequate,
     }
 
@@ -1715,6 +1774,10 @@ def gate_dependence_report(envelope: Mapping | None = None, *,
     source_usage: dict[str, list[str]] = {}
     for name in sorted(str(key) for key in reported_checks):
         paths = tuple(_GATE_SOURCE_STATISTICS.get(name, ()))
+        if (name == "falsification" and
+                lookup("falsification.p_value_source") !=
+                FALSIFICATION_P_VALUE_SOURCE):
+            paths = _LEGACY_FALSIFICATION_SOURCE_STATISTICS
         if not paths:
             # Unknown/additional checks are still represented, but are not
             # assigned an invented statistic or policy meaning.
@@ -1820,7 +1883,12 @@ def unevaluable_reason(gates: Iterable[Mapping]) -> str | None:
             summary = quality.get(partition)
             if not isinstance(summary, Mapping):
                 continue
-            if int(summary.get("opportunities") or 0) <= 0:
+            raw_execution_opportunities = summary.get("execution_opportunities")
+            execution_opportunities = (
+                int(summary.get("opportunities") or 0)
+                if raw_execution_opportunities is None else
+                int(raw_execution_opportunities or 0))
+            if execution_opportunities <= 0:
                 continue
             saw_opportunity = True
             if int(summary.get("executed") or 0) > 0:
@@ -2778,7 +2846,11 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             expected_falsification = {
                 **falsification_gate(
                     placebo["observed"], placebo["placebo"],
-                    alpha=float(falsification.get("alpha", .05))),
+                    alpha=float(falsification.get("alpha", .05)),
+                    preregistered_p_value=(
+                        control.get("p_value")
+                        if falsification.get("p_value_source") ==
+                        FALSIFICATION_P_VALUE_SOURCE else None)),
                 "method": placebo["method"],
                 "assignments_hash": placebo["assignments_hash"],
                 "observations": len(placebo["observed"]),
@@ -2912,12 +2984,17 @@ def recompute_gate_statistics(envelope: Mapping) -> dict:
         values, [str(cluster) for cluster in clusters], confidence=confidence,
         draws=bootstrap_draws, seed=bootstrap_seed,
         block_length=bootstrap_block_length)
+    shared_preregistered_p = bool(
+        isinstance(falsification, Mapping) and
+        falsification.get("p_value_source") == FALSIFICATION_P_VALUE_SOURCE)
     decision = falsification_gate(
         values, null["statistics"],
         alpha=float(falsification.get("alpha", .05))
         if isinstance(falsification, Mapping) and
         isinstance(falsification.get("alpha"), (int, float)) and
-        not isinstance(falsification.get("alpha"), bool) else .05)
+        not isinstance(falsification.get("alpha"), bool) else .05,
+        preregistered_p_value=(float(sign_flip["p_value"])
+                               if shared_preregistered_p else None))
     return {
         "available": True,
         "matched": len(values),
@@ -2947,6 +3024,7 @@ def _close_number(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
 
 __all__ = ["AcceptanceFloor", "ARM_EVIDENCE_SCHEMA", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
            "GATE_REQUIRED_CHECKS", "AUTHORIZATION_PROJECTION_SCHEMA",
+           "FALSIFICATION_P_VALUE_SOURCE",
            "authorization_projection", "arm_evidence_report", "gate_dependence_report",
            "gate_source_statistic_report", "source_statistic_report",
            "gate_source_dependence_report", "source_statistic_dependence_report",

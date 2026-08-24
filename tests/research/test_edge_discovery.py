@@ -2015,6 +2015,11 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         # Identical corpus and identical p-value; only the threshold moved.
         self.assertEqual(strict_gate["falsification"]["p_value"],
                          lenient_gate["falsification"]["p_value"])
+        self.assertEqual(
+            lenient_gate["falsification"]["p_value_source"],
+            "heldout_paired_cluster_sign_flip")
+        self.assertEqual(lenient_gate["falsification"]["p_value"],
+                         lenient_gate["heldout_paired_baseline"]["p_value"])
         self.assertTrue(lenient_gate["checks_without_family"]["falsification"])
         self.assertFalse(strict_gate["checks_without_family"]["falsification"])
 

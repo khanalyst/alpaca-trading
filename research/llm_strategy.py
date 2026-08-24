@@ -226,11 +226,64 @@ def _finite(value: Any, *, path: str = "value") -> Any:
     raise ValueError(f"{path} must contain JSON-compatible values")
 
 
+_DIAGNOSIS_COUNT_KEYS = frozenset({
+    "rows", "executed_rows", "no_trade_rows", "no_signal_rows",
+    "unclassified_no_trade_rows",
+})
+
+
+def _finite_diagnosis(value: Any, *, path: str,
+                      parents: tuple[str, ...] = ()) -> Any:
+    """Validate aggregate model context with one narrow count exception.
+
+    Raw ``rows`` are forbidden everywhere.  Fit diagnostics nevertheless use
+    that word for three scalar counters under ``execution_rejections``.  The
+    factory projection already permits those counters; accepting the exact
+    same closed path here keeps the provider boundary consistent without
+    admitting a market-row collection or an arbitrary similarly named field.
+    """
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            normalized = re.sub(
+                r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
+            count_path = (
+                len(parents) >= 2 and
+                parents[-2:] == ("fit_diagnostics", "execution_rejections") and
+                normalized in _DIAGNOSIS_COUNT_KEYS
+            )
+            if count_path:
+                if (isinstance(item, bool) or not isinstance(item, int) or
+                        item < 0):
+                    raise ValueError(
+                        f"{path}.{key} must be a non-negative integer count")
+                result[key] = item
+                continue
+            # Preserve the generic fail-closed key policy at every other path.
+            if (normalized in _FORBIDDEN_KEYS or
+                    any(token in normalized.split("_") for token in (
+                        "source", "code", "python", "javascript", "shell",
+                        "exec", "execute", "eval", "command", "rows",
+                        "ohlcv", "secret", "token", "password",
+                        "credential", "credentials")) or
+                    normalized in {"api_key", "market_data", "raw_rows"}):
+                raise ValueError(f"{path}.{key} is not permitted")
+            result[key] = _finite_diagnosis(
+                item, path=f"{path}.{key}", parents=(*parents, normalized))
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_finite_diagnosis(
+            item, path=f"{path}[{index}]", parents=parents)
+                for index, item in enumerate(value)]
+    return _finite(value, path=path)
+
+
 def _safe_diagnosis(value: Mapping[str, Any], *,
                     label: str = "diagnosis") -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{label} must be an aggregate mapping")
-    result = _finite(value, path=label)
+    result = _finite_diagnosis(value, path=label)
     # A bounded aggregate diagnosis should not become an unbounded prompt.
     encoded = canonical_json(result).encode("utf-8")
     if len(encoded) > 8_192:

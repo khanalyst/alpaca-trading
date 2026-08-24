@@ -8,8 +8,10 @@ from agent.contracts.rule import evaluate_rule_signal_metadata
 from research.edge_lab import _read_discovery_rows
 from research.costs import CostModel, diagnostic_backfill_policy
 from research.fit_diagnostics import (
-    collapse_behavior_aliases, measure_fit_diagnostics,
+    FIT_BEHAVIOR_ALIAS_DECIMALS, FIT_BEHAVIOR_ALIAS_SCHEMA,
+    _planned_vector, collapse_behavior_aliases, measure_fit_diagnostics,
 )
+from research.strategy_factory import initial_hypotheses
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 
 
@@ -141,6 +143,85 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["intended_variant_count"],
                          result["kept_variant_count"])
 
+    def test_fit_only_freeze_collapses_cross_family_alias_but_not_zero_signal(self):
+        left, right, zero_left, zero_right = [
+            item.rule_spec for item in initial_hypotheses(4)]
+
+        def diagnostic(key, *, signals):
+            return {
+                "scope": "fit_only",
+                "behavior_fingerprint": {
+                    "fit_evidence_key": "sealed-fit-corpus",
+                    "entry_alias_key": f"entry-{key}",
+                    "full_alias_key": f"full-{key}",
+                    "alias_schema": FIT_BEHAVIOR_ALIAS_SCHEMA,
+                    "alias_numeric_decimals": FIT_BEHAVIOR_ALIAS_DECIMALS,
+                    "signal_count": signals,
+                    "planned_vector_count": signals,
+                },
+            }
+
+        records = [
+            {"candidate_key": "left", "rule_spec": left, "source": "llm",
+             "fit_diagnostics": diagnostic("shared", signals=3)},
+            {"candidate_key": "right", "rule_spec": right,
+             "source": "deterministic",
+             "fit_diagnostics": diagnostic("shared", signals=3)},
+            {"candidate_key": "zero-left", "rule_spec": zero_left,
+             "source": "llm",
+             "fit_diagnostics": diagnostic("zero", signals=0)},
+            {"candidate_key": "zero-right", "rule_spec": zero_right,
+             "source": "deterministic",
+             "fit_diagnostics": diagnostic("zero", signals=0)},
+        ]
+        frozen = collapse_behavior_aliases(records, freeze=True)
+        self.assertEqual(frozen["dedup_status"], "fit_preregistered_frozen")
+        self.assertFalse(frozen["requires_operator_review"])
+        self.assertEqual(frozen["intended_variant_count"], 4)
+        self.assertEqual(frozen["kept_variant_count"], 3)
+        self.assertEqual(
+            {item["candidate_key"] for item in frozen["kept"]},
+            {"right", "zero-left", "zero-right"})
+        self.assertEqual(frozen["excluded"][0]["candidate_key"], "left")
+        self.assertEqual(
+            frozen["excluded"][0]["canonical_candidate_key"], "right")
+        self.assertEqual(
+            set(frozen["full_aliases"][0]["families"]),
+            {left["family"], right["family"]})
+
+        # Freeze mode fails open if the diagnostic is not explicitly fit-only.
+        unscoped = [{**record,
+                     "fit_diagnostics": {
+                         "behavior_fingerprint": record["fit_diagnostics"]
+                         ["behavior_fingerprint"]}}
+                    for record in records[:2]]
+        retained = collapse_behavior_aliases(unscoped, freeze=True)
+        self.assertEqual(retained["kept_variant_count"], 2)
+        self.assertEqual(retained["excluded"], [])
+
+    def test_near_exact_alias_quantization_only_removes_numeric_noise(self):
+        metadata = {
+            "session_date": "2026-01-05", "symbol": "SPY",
+            "direction": "long", "signal_timestamp": "2026-01-05T14:45:00Z",
+            "entry_price": 100.0, "planned_stop_distance": 1.0,
+            "planned_target_distance": 2.0, "target_r": 2.0,
+            "planned_hold_bars": 30,
+        }
+        noisy = {**metadata, "planned_stop_distance": 1.000000001}
+        material = {**metadata, "planned_stop_distance": 1.000001}
+        self.assertNotEqual(_planned_vector(metadata, full=True),
+                            _planned_vector(noisy, full=True))
+        self.assertEqual(
+            _planned_vector(metadata, full=True,
+                            decimals=FIT_BEHAVIOR_ALIAS_DECIMALS),
+            _planned_vector(noisy, full=True,
+                            decimals=FIT_BEHAVIOR_ALIAS_DECIMALS))
+        self.assertNotEqual(
+            _planned_vector(metadata, full=True,
+                            decimals=FIT_BEHAVIOR_ALIAS_DECIMALS),
+            _planned_vector(material, full=True,
+                            decimals=FIT_BEHAVIOR_ALIAS_DECIMALS))
+
     def test_stress_costs_are_bps_not_multipliers_and_include_option_fees(self):
         equity = measure_fit_diagnostics(
             [], ROOT_SPEC, vehicle="equity", costs=CostModel(), account_rows=[{
@@ -218,6 +299,19 @@ class FitDiagnosticsTests(unittest.TestCase):
             "entry_slippage_exceeds_limit": 1,
             "stressed_cost_risk_limit": 1,
         })
+        self.assertFalse(summary["execution_blocked"])
+
+    def test_non_opportunity_data_refusal_is_not_execution_blocked(self):
+        diagnostic = measure_fit_diagnostics(
+            [], ROOT_SPEC,
+            account_rows=[{
+                "vehicle": "equity", "no_trade": True,
+                "execution_disposition": "refused",
+                "signal_opportunity": False,
+                "reject_reason": "invalid_session_bars",
+            }])
+        summary = diagnostic["execution_rejections"]
+        self.assertEqual(summary["explicit_rejections"], 1)
         self.assertFalse(summary["execution_blocked"])
 
 
