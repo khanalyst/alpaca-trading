@@ -2226,6 +2226,31 @@ class DeployTests(unittest.TestCase):
             self.assertFalse(result["fresh"])
             self.assertEqual(result["status"], "stale_or_empty")
 
+    def test_recorder_health_accepts_progress_after_a_retry_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "market.csv"
+            csv_path.write_text("event_key\n", encoding="utf-8")
+            index_path = root / ".recorder-index.json"
+            index_path.write_text("{}", encoding="utf-8")
+            status_path = root / ".recorder-status.json"
+            status_path.write_text(json.dumps({
+                "schema": "recorder-status.v1",
+                "status": "failed",
+                "updated_ts": 800,
+                "failure_kind": "market_data_request_failed",
+                "retryable": True,
+                "error": "older retry failed",
+            }), encoding="utf-8")
+            os.utime(csv_path, (700, 700))
+            os.utime(index_path, (900, 900))
+
+            result = health.recorder(root, max_age=300, now=1000)
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["fresh"])
+            self.assertEqual(result["status"], "recording")
+
     def test_recorder_health_requires_a_csv_corpus_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

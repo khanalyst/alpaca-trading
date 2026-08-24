@@ -117,7 +117,19 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
         index_path.stat().st_size > MAX_RECORDER_INDEX_BYTES)
     index = {} if index_oversized else _read_json(index_path)
     attempt = _read_json(path / ".recorder-status.json")
-    attempt_failed = attempt.get("status") == "failed"
+    try:
+        attempt_ts = float(attempt.get("updated_ts"))
+    except (TypeError, ValueError):
+        attempt_ts = None
+    # A stale retry failure must not mask later durable catch-up progress.  The
+    # recorder writes its compact index after each successful chunk; a failure
+    # in the current attempt is written afterwards and therefore remains newer.
+    failure_superseded = bool(
+        attempt.get("status") == "failed" and
+        attempt_ts is not None and index_write is not None and
+        index_write > attempt_ts)
+    attempt_failed = (
+        attempt.get("status") == "failed" and not failure_superseded)
     raw_coverage = index.get("bar_coverage")
     coverage = ({str(symbol): dict(value)
                  for symbol, value in raw_coverage.items()
