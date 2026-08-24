@@ -547,10 +547,15 @@ class RecentKeyIndex:
         }
 
 
-def _remove_sqlite_artifacts(path: Path) -> None:
-    for candidate in (path, Path(str(path) + "-journal"),
+def _remove_sqlite_sidecars(path: Path) -> None:
+    for candidate in (Path(str(path) + "-journal"),
                       Path(str(path) + "-wal"), Path(str(path) + "-shm")):
         candidate.unlink(missing_ok=True)
+
+
+def _remove_sqlite_artifacts(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    _remove_sqlite_sidecars(path)
 
 
 def _build_recent_key_index(output: Path, entries, *, watermark: object,
@@ -571,6 +576,13 @@ def _build_recent_key_index(output: Path, entries, *, watermark: object,
                     batch.clear()
             store.add_many(batch)
             metadata = store.bind(signature=signature)
+        # A killed writer can leave a hot rollback journal beside the old
+        # target.  If it survives the database replacement, SQLite may replay
+        # that old journal against the new file and corrupt an otherwise valid
+        # rebuild.  Remove and durably forget old sidecars first; the CSV corpus
+        # remains authoritative if the host dies before the following replace.
+        _remove_sqlite_sidecars(target)
+        _fsync_directory(target.parent)
         os.replace(temporary, target)
         _fsync_directory(target.parent)
         return metadata

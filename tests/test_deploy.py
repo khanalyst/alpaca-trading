@@ -1431,6 +1431,35 @@ class DeployTests(unittest.TestCase):
                     read_only=True) as recent:
                 self.assertEqual(recent.count(), metadata["count"])
 
+    def test_recorder_rebuild_removes_stale_target_sqlite_sidecars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            target = root / recorder.RECENT_KEY_INDEX_NAME
+            stamp = "2026-08-08T13:30:00+00:00"
+            recorder._build_recent_key_index(
+                path, [("old", stamp)], watermark=stamp,
+                partitions={}, fingerprints={})
+            sidecars = [Path(str(target) + suffix)
+                        for suffix in ("-journal", "-wal", "-shm")]
+            for sidecar in sidecars:
+                sidecar.write_bytes(b"stale rollback state")
+
+            with patch.object(recorder, "_fsync_directory") as fsync:
+                metadata = recorder._build_recent_key_index(
+                    path, [("new", stamp)], watermark=stamp,
+                    partitions={}, fingerprints={})
+
+            self.assertEqual(fsync.call_args_list, [call(root), call(root)])
+            self.assertTrue(all(not sidecar.exists() for sidecar in sidecars))
+            with recorder.RecentKeyIndex(target, read_only=True) as recent:
+                self.assertEqual(recent.count(), metadata["count"])
+                self.assertTrue(recent.contains("new"))
+                self.assertFalse(recent.contains("old"))
+                self.assertEqual(
+                    recent.db.execute("PRAGMA integrity_check").fetchone()[0],
+                    "ok")
+
     def test_recorder_high_rate_window_keeps_json_index_small(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
