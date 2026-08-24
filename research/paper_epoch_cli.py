@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .paper_epoch import DEFAULT_DB_PATH, PaperEpochStore
+from .paper_epoch_export import DEFAULT_OUTPUT_ROOT, write_paper_epoch_export
 
 
 def _document(path: str | Path) -> dict[str, Any]:
@@ -33,6 +34,22 @@ def _without_schema(value: Any, expected: str) -> dict[str, Any]:
 
 def cmd_paper_epoch(args: argparse.Namespace) -> int:
     """Execute one bounded lifecycle operation and print structured JSON."""
+    if args.action == "export":
+        if not args.epoch:
+            raise ValueError("export requires --epoch")
+        # Export is explicitly a read path.  The writer also opens a supplied
+        # path read-only, but constructing the store here keeps the CLI
+        # contract obvious and prevents accidental lifecycle writes.
+        store = PaperEpochStore(args.db, readonly=True)
+        result = write_paper_epoch_export(
+            store,
+            args.epoch,
+            getattr(args, "output_root", DEFAULT_OUTPUT_ROOT),
+            webhook_url=getattr(args, "webhook_url", None),
+            webhook_timeout_seconds=getattr(args, "webhook_timeout_seconds", 5.0),
+        )
+        print(json.dumps(result.as_dict(), sort_keys=True, default=str))
+        return 0
     needs_epoch = args.action in {"start", "record", "stop", "complete", "seal"}
     needs_input = args.action in {"create", "start", "record", "seal"}
     if needs_epoch and not args.epoch:
@@ -118,13 +135,22 @@ def add_paper_epoch_parser(sub: argparse._SubParsersAction) -> argparse.Argument
     parser.add_argument(
         "action",
         choices=("create", "start", "record", "stop", "complete", "seal",
-                 "status", "verify"))
+                 "status", "verify", "export"))
     parser.add_argument(
         "--db", default=str(DEFAULT_DB_PATH),
         help="separate paper-epoch SQLite outcome store")
     parser.add_argument("--epoch", default=None)
     parser.add_argument("--input", default=None, help="bounded JSON input")
     parser.add_argument("--reason", default=None)
+    parser.add_argument(
+        "--output-root", default=str(DEFAULT_OUTPUT_ROOT),
+        help="root directory for immutable canonical JSONL exports")
+    parser.add_argument(
+        "--webhook-url", default=None,
+        help="optional HTTPS metadata notification URL (best effort)")
+    parser.add_argument(
+        "--webhook-timeout-seconds", type=float, default=5.0,
+        help="HTTPS webhook timeout in seconds (default: 5)")
     parser.set_defaults(func=cmd_paper_epoch)
     return parser
 

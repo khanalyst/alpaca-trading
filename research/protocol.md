@@ -201,6 +201,16 @@ runtime restart and a different unseen data window. The successor restarts
 confirmation from the beginning. No paper observation can be copied into a
 held-out, shadow, FDR, or proof statistic.
 
+The read-only `paper-epoch export` operation is an operational handoff format,
+not a full observer/signal feed. It serializes only the currently stored epoch
+manifest/cohort digests, status and policy, operational summary, outcome rows,
+and integrity/audit head as canonical JSONL. It must not invent session dates,
+signal times, symbols, sides, stop/target brackets, quote provenance, exits,
+or R fields; account/runtime fingerprints and local store paths are excluded
+from public metadata. Artifacts are content-addressed and atomically created
+with no-overwrite byte checks. The export has zero alpha evidence and zero
+promotion authority, regardless of paper outcome or operational parity.
+
 ## Deployment states
 
 Four states, one of which no automatic process may enter.

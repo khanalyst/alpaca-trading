@@ -55,7 +55,11 @@ def send_webhook(url: str, metadata: Mapping[str, Any], *,
     parsed = urlparse(str(url))
     if parsed.scheme != "https" or not parsed.netloc:
         return {"ok": False, "error": "webhook URL must use HTTPS"}
-    if not math.isfinite(float(timeout_seconds)) or not 0 < float(timeout_seconds) <= 30:
+    try:
+        timeout = float(timeout_seconds)
+    except (TypeError, ValueError, OverflowError):
+        return {"ok": False, "error": "webhook timeout must be in (0, 30] seconds"}
+    if not math.isfinite(timeout) or not 0 < timeout <= 30:
         return {"ok": False, "error": "webhook timeout must be in (0, 30] seconds"}
     safe = {key: str(metadata[key]) for key in ("candidate_id", "vehicle", "status", "payload_hash", "artifact")
             if metadata.get(key) is not None}
@@ -95,7 +99,7 @@ def send_webhook(url: str, metadata: Mapping[str, Any], *,
 
         worker = Thread(target=invoke, daemon=True, name="proof-webhook")
         worker.start()
-        worker.join(float(timeout_seconds))
+        worker.join(timeout)
         if worker.is_alive():
             return {"ok": False, "error": "TimeoutError: webhook sender timed out"}
         try:

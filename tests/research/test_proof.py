@@ -7,7 +7,8 @@ import unittest
 from agent.contracts.rule import DEFAULT_RULE_SPEC
 import research.proof_payload as proof_payload
 from research.proof import (PROOF_SCHEMA, build_proof_payload, payload_hash,
-                             canonical_json, render_markdown, write_proof)
+                             canonical_json, render_markdown, send_webhook,
+                             write_proof)
 
 
 class FakeLedger:
@@ -228,6 +229,13 @@ class ProofTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid proof session date"):
             build_proof_payload(FakeLedger(), "candidate-1", {
                 "session_date": "2024-01-02T12:00:00+00:00"})
+
+        for timeout in (None, "bad"):
+            with self.subTest(timeout=timeout):
+                result = send_webhook(
+                    "https://example.test/hook", {}, timeout_seconds=timeout)
+                self.assertFalse(result["ok"])
+                self.assertIn("webhook timeout", result["error"])
 
 
 if __name__ == "__main__":

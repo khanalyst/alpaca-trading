@@ -646,6 +646,27 @@ python research.py paper-epoch seal --db runtime/research/paper_epochs.sqlite3 -
 python research.py paper-epoch verify --db runtime/research/paper_epochs.sqlite3
 ```
 
+An immutable, public-safe operational snapshot can be emitted without opening
+the store for writes:
+
+```bash
+python research.py paper-epoch export \
+  --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH \
+  --output-root research/results/paper-epochs
+```
+
+The writer verifies the audit chain, then produces deterministic canonical
+JSONL with an epoch manifest/cohort digest, current status and policy,
+operational summary, one record for each outcome currently stored, and the
+integrity/audit head. The filename contains the full content SHA-256 digest;
+creation is atomic and repeats are byte-identity checked. Account/runtime
+fingerprints and the local SQLite path are intentionally omitted. This is an
+operational export, not a complete observer or signal feed: it does not fill
+in session dates, signal times, symbols, sides, brackets, quote provenance,
+exits, or R values. It is descriptive instrumentation with zero alpha or
+promotion authority. An optional HTTPS metadata notification is available via
+`--webhook-url`; delivery is best effort and never changes the artifact.
+
 Lessons are invisible to their source epoch. A successor may consume only the
 immediately preceding sealed batch, and only after attesting a clean runtime
 restart and a different unseen data-window digest. It therefore restarts
