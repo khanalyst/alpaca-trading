@@ -1982,6 +1982,53 @@ class DeployTests(unittest.TestCase):
         self.assertTrue(recorder._inside_recorded_session(index, regular))
         self.assertFalse(recorder._inside_recorded_session(index, extended))
 
+    def test_recorder_exact_calendar_discards_known_extended_hours(self):
+        index = {"session_calendar": {"2026-08-07": {
+            "open": "2026-08-07T13:30:00+00:00",
+            "close": "2026-08-07T17:00:00+00:00",
+            "source": "alpaca_calendar",
+        }}}
+        extended = {
+            "event_type": "quote", "timestamp": "2026-08-07T17:00:01+00:00",
+        }
+        self.assertTrue(recorder._has_exact_recorded_session(index, extended))
+        self.assertEqual(recorder._recorded_session_rows(
+            index, [extended], require_exact_calendar=True), [])
+
+    def test_recorder_exact_calendar_still_fails_when_metadata_is_missing(self):
+        row = {
+            "event_type": "quote", "timestamp": "2026-08-07T16:00:00+00:00",
+        }
+        with self.assertRaisesRegex(
+                RuntimeError, "exact broker calendar metadata missing or invalid"):
+            recorder._recorded_session_rows(
+                {"session_calendar": {}}, [row], require_exact_calendar=True)
+
+    def test_recorder_exact_calendar_rejects_invalid_in_session_bar(self):
+        index = {"session_calendar": {"2026-08-07": {
+            "open": "2026-08-07T13:30:00+00:00",
+            "close": "2026-08-07T17:00:00+00:00",
+            "source": "alpaca_calendar",
+        }}}
+        row = {
+            "event_type": "bar_1m", "timestamp": "2026-08-07T16:59:00+00:00",
+            "as_of": "2026-08-07T17:01:00+00:00",
+        }
+        with self.assertRaisesRegex(
+                RuntimeError, "invalid within exact broker session"):
+            recorder._recorded_session_rows(
+                index, [row], require_exact_calendar=True)
+
+    def test_recorder_exact_catchup_skips_closed_intervals(self):
+        calendar = recorder.CalendarCache(_CalendarFake())
+        cursor = datetime(2026, 8, 4, 20, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 8, 6, 14, 0, tzinfo=timezone.utc)
+        request = recorder._next_exact_session_window(
+            cursor, end, timedelta(minutes=1), calendar)
+        self.assertEqual(request, (
+            datetime(2026, 8, 6, 13, 30, tzinfo=timezone.utc),
+            datetime(2026, 8, 6, 13, 31, tzinfo=timezone.utc)))
+
     def test_recorder_keeps_pinned_option_contracts_in_the_sample(self):
         from deploy import recorder_market
         fake = _OptionFake()

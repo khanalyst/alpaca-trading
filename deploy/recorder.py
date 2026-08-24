@@ -1088,6 +1088,92 @@ def _inside_recorded_session(index: dict, row: dict, *,
     return True
 
 
+def _exact_recorded_session_bounds(
+        index: dict, row: dict) -> tuple[datetime, datetime] | None:
+    """Return valid persisted broker boundaries for the row's local day.
+
+    A row can be outside those boundaries without the calendar being absent.
+    Keeping that distinction explicit lets production recording discard known
+    extended-hours observations while still failing closed when exact session
+    metadata is genuinely unavailable.
+    """
+    stamp = _timestamp(row.get("timestamp"))
+    if stamp is None:
+        return None
+    session = stamp.astimezone(NEW_YORK).date().isoformat()
+    calendar = index.get("session_calendar")
+    value = calendar.get(session) if isinstance(calendar, dict) else None
+    if (not isinstance(value, dict) or
+            value.get("source") != "alpaca_calendar"):
+        return None
+    opened = _timestamp(value.get("open"))
+    closed = _timestamp(value.get("close"))
+    if (opened is None or closed is None or opened >= closed or
+            opened.astimezone(NEW_YORK).date().isoformat() != session or
+            closed.astimezone(NEW_YORK).date().isoformat() != session):
+        return None
+    return opened, closed
+
+
+def _has_exact_recorded_session(index: dict, row: dict) -> bool:
+    return _exact_recorded_session_bounds(index, row) is not None
+
+
+def _recorded_session_rows(index: dict, fetched_rows: list[dict], *,
+                           require_exact_calendar: bool) -> list[dict]:
+    """Keep regular-session rows and reject only absent exact provenance."""
+    rows: list[dict] = []
+    for row in fetched_rows:
+        if _inside_recorded_session(
+                index, row, require_exact_calendar=require_exact_calendar):
+            rows.append(row)
+            continue
+        if require_exact_calendar:
+            parsed = _timestamp(row.get("timestamp"))
+            session = (_session_date(parsed) if parsed is not None else "unknown")
+            bounds = _exact_recorded_session_bounds(index, row)
+            if parsed is None or bounds is None:
+                raise RuntimeError(
+                    f"exact broker calendar metadata missing or invalid: {session}")
+            opened, closed = bounds
+            if opened <= parsed < closed:
+                raise RuntimeError(
+                    f"recorder row is invalid within exact broker session: {session}")
+    return rows
+
+
+def _next_exact_session_window(cursor: datetime, end: datetime,
+                               maximum: timedelta,
+                               calendar: CalendarCache) -> tuple[datetime, datetime] | None:
+    """Return the next bounded RTH request, skipping nights and closed days."""
+    probe = cursor
+    while probe < end:
+        day = probe.astimezone(NEW_YORK).date()
+        if not calendar.known(day):
+            raise RuntimeError(
+                f"exact broker calendar metadata unavailable: {day.isoformat()}")
+        session = calendar.session(day)
+        if session is None:
+            probe = datetime.combine(
+                day + timedelta(days=1), datetime.min.time(),
+                tzinfo=NEW_YORK).astimezone(timezone.utc)
+            continue
+        opened = session.open.astimezone(timezone.utc)
+        closed = session.close.astimezone(timezone.utc)
+        if probe < opened:
+            probe = opened
+        if probe >= closed:
+            probe = datetime.combine(
+                day + timedelta(days=1), datetime.min.time(),
+                tzinfo=NEW_YORK).astimezone(timezone.utc)
+            continue
+        window_end = min(probe + maximum, closed, end)
+        if window_end > probe:
+            return probe, window_end
+        break
+    return None
+
+
 def _regular_session_gap(previous: datetime, current: datetime,
                          calendar: CalendarCache | None = None,
                          maximum: timedelta = timedelta(
@@ -1577,7 +1663,14 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
     total_rows = 0
     total_unique = 0
     while True:
-        window_end = min(cursor + window, now)
+        if require_exact_calendar:
+            request_window = _next_exact_session_window(
+                cursor, now, window, calendar)
+            if request_window is None:
+                break
+            cursor, window_end = request_window
+        else:
+            window_end = min(cursor + window, now)
         fetched_rows = list(_rows(
             provider, symbols, window_end, feed=resolved_feed, config=config,
             # Option-chain snapshots are observations made now, not historical
@@ -1590,17 +1683,9 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             option_limit=option_limit,
             start=cursor, option_pins=frozenset(pins), observed_at=now))
         total_rows += len(fetched_rows)
-        rows = []
-        for row in fetched_rows:
-            inside = _inside_recorded_session(
-                index, row, require_exact_calendar=require_exact_calendar)
-            if require_exact_calendar and not inside:
-                session = _session_date(parsed) if (parsed := _timestamp(
-                    row.get("timestamp"))) is not None else "unknown"
-                raise RuntimeError(
-                    f"exact broker calendar metadata missing or row outside session: {session}")
-            if inside:
-                rows.append(row)
+        rows = _recorded_session_rows(
+            index, fetched_rows,
+            require_exact_calendar=require_exact_calendar)
         index, watermark, latest_bars, pins, unique = _ingest_chunk(
             output, index, recent_store, watermark, latest_bars, pins, rows, symbols,
             window_end, now, option_hold, horizon, calendar,
