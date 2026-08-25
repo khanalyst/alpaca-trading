@@ -175,6 +175,31 @@ threshold or promote an edge. It compares cost-veto refusals, admitted trades,
 and ordinary diagnostic replay P&L; it does not relabel that replay P&L as a
 separate stressed-expectancy estimator.
 
+The current v2 contract verifies the exact changed config path
+`risk.max_stressed_cost_to_risk_ratio` and records baseline/alternative/runtime
+config hashes. It pairs opportunities exactly by `variant_id + opportunity_id`,
+excluding malformed terminal/numeric/identity rows and duplicate keys from
+valid pairing. Identity/duplicate exclusions also apply to empirical
+summaries; incomplete, ambiguous, or path-dependent pairs fail the controlled
+change invariant and are not causally interpretable.
+Each arm records empirical R (`r_multiple`, including mean and sample sigma),
+trades per session, target hits, costs, stressed-cost-to-risk values, entry
+slippage, and fill sources. The diagnostic Section 0.5 report provides a 95%
+moving-block session-cluster interval and clustered MDE/power at alpha .05 for
+`.05R`; it derives uncertainty from the data and assumes no fixed `0.38R`
+width.
+
+Source-report, measurement-code, dataset, frozen-cohort, run-settings, and
+final-result content digests are retained. A bound source report must include
+its dataset hash, strict diagnostic/non-authorizing flags, and an explicit
+empty proof list or the controlled-change invariant fails. The funnel lists fit, heldout,
+qualification, `shadow_selection`, and `shadow_confirmation`, with nominal
+floors of 100/100/100/150/150 trades (30 sessions/clusters each; 600 total);
+every window is `measurement_available: false` without sealed/live
+assignments. Readiness context is 150 offline + 60 shadow = 210 sessions. All
+output remains diagnostic-only with descriptive P&L and no threshold-selection
+or promotion authority.
+
 The shipped/default universe is 24 liquid ETFs spanning broad-market, size,
 sector, international, rates/credit, metals, and semiconductor exposures (the
 exact list is in `config.yaml`), improving opportunity capacity. Authorizing floors

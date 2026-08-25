@@ -808,6 +808,36 @@ executed trades, and ordinary diagnostic replay P&L, is explicitly
 non-authorizing, and cannot select or update the production threshold from its
 own result. It does not claim a separate stressed-expectancy estimator.
 
+The v2 contract verifies that the only changed config path is exactly
+`risk.max_stressed_cost_to_risk_ratio` and persists baseline, alternative, and
+runtime config hashes. Pairing is exact on `variant_id + opportunity_id`;
+malformed terminal/numeric/identity rows and duplicate keys are excluded from
+pairing, and identity/duplicate exclusions also apply to the empirical
+summaries. Incomplete, ambiguous, or path-dependent pairs fail the top-level
+controlled-change invariant and cannot support a direct causal interpretation.
+Each arm reports empirical `r_multiple` (R) distributions,
+including mean and sample sigma, trades per session, target definition/hit
+counts, costs, stressed-cost-to-risk values, entry slippage, and fill sources.
+The diagnostic Section 0.5 measurement includes a 95% moving-block
+session-cluster bootstrap interval and clustered MDE/power at alpha .05 for a
+`.05R` effect; uncertainty is data-derived and no fixed `0.38R` width is
+assumed.
+
+Provenance records the source-report, measurement-code, dataset, frozen-cohort,
+run-settings, and final result content digests (`source_report_hash`,
+`measurement_code_hash`, `dataset_hash`, `frozen_cohort_hash`,
+`run_settings_hash`, and `content_hash`). A bound source report must also carry
+its dataset hash, strict diagnostic/non-authorizing flags, and an explicit
+empty proof list; omissions fail the controlled-change invariant. The evidence
+funnel lists five
+protocol windows—`fit`, `heldout`, `qualification`, `shadow_selection`, and
+`shadow_confirmation`—with nominal floors of 100, 100, 100, 150, and 150
+trades (30 sessions/clusters each; 600 trades in total); each is marked
+`measurement_available: false` until sealed/live window assignments exist. Its
+readiness context is 150 offline sessions plus 60 shadow sessions (210 total).
+These measurements remain diagnostic-only: P&L is descriptive, and the result
+cannot select a threshold or promote an edge.
+
 `factory run` archives the Markdown narrative under `research/results/factory/`
 on every cycle, including a cycle that proved nothing, so the read-only
 dashboard lists it without anyone running a command. `--write` does the same
