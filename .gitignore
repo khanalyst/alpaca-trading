@@ -1,4 +1,7 @@
 .env
+# Separate research provider dotenv. Compose requires a readable path
+# here, so the file is easy to create in the workspace by accident.
+research-llm.env
 runtime/
 
 # Agent tooling scratch: throwaway git worktrees, not project content.

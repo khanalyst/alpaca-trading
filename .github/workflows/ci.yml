@@ -10,7 +10,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,6 +28,14 @@ jobs:
         run: |
           cp .env.example .env
           chmod 600 .env
+          # compose.yaml deliberately declares the research provider secret as a
+          # required variable with no default, so an operator cannot start the
+          # autonomous lane with an unreadable key file. Validation therefore
+          # has to supply one the way a real deployment does; the placeholder
+          # is never used to reach a provider.
+          printf 'OPENAI_API_KEY=ci-compose-validation-placeholder\n' > research-llm.env
+          chmod 600 research-llm.env
+          export ALPACA_RESEARCH_LLM_SECRET_FILE="$PWD/research-llm.env"
           docker compose config --quiet
           docker compose --profile research config --quiet
           docker compose build
