@@ -8,13 +8,202 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from research.cost_counterfactual import (load_frozen_specs, main,
+from research.cost_counterfactual import (_opportunity_evidence, _outcome_signature,
+                                          _summarize, load_frozen_specs, main,
                                           run_counterfactual)
 from research.edge_lab import content_hash
 from research.factory_core import initial_hypotheses
 
 
 class CostCounterfactualTests(unittest.TestCase):
+    def test_opportunity_evidence_is_sorted_hashed_and_excludes_no_signal(self):
+        rows = [{
+            "_counterfactual_variant_id": "variant-b",
+            "opportunity_id": "executed",
+            "session_date": "2026-01-03",
+            "symbol": "SPY",
+            "vehicle": "equity",
+            "direction": "long",
+            "execution_disposition": "executed",
+            "signal_opportunity": True,
+            "no_trade": False,
+            "entry_reference": 100.0,
+            "exit_reference": 102.0,
+            "entry_price": 100.1,
+            "exit_price": 101.9,
+            "plan_entry": 100.0,
+            "underlying_entry": 100.0,
+            "stop_price": 99.0,
+            "initial_stop_price": 99.0,
+            "active_stop_price": 100.0,
+            "stop_distance": 1.0,
+            "target_price": 103.0,
+            "breakeven_r": 1.0,
+            "breakeven_armed_at": "2026-01-03T10:00:00+00:00",
+            "breakeven_armed_epoch": 1,
+            "exit_reason": "target",
+            "tie_broken": False,
+            "entry_gap_fill": False,
+            "exit_gap_fill": False,
+            "entry_fill_source": "quote",
+            "exit_fill_source": "bar",
+            "entry_feed": "iex",
+            "exit_feed": "iex",
+            "entry_provider": "alpaca",
+            "exit_provider": "alpaca",
+            "quantity": 10,
+            "contract_multiplier": 1,
+            "gross_pnl": 18.0,
+            "costs": 1.5,
+            "net_pnl": 16.5,
+            "risk_usd": 10.0,
+            "stop_distance": 1.0,
+            "r_multiple": 1.65,
+        }, {
+            "_counterfactual_variant_id": "variant-a",
+            "opportunity_id": "refused",
+            "session_date": "2026-01-02",
+            "execution_disposition": "refused",
+            "signal_opportunity": True,
+            "no_trade": True,
+            "reject_stage": "cost_stress",
+            "reject_reason": "stressed_cost_risk_limit",
+            "direction": "long",
+            "entry_reference": 100.0,
+            "exit_reference": 102.0,
+            "quantity": 10,
+            "contract_multiplier": 1,
+            "gross_pnl": float("nan"),
+            "costs": float("inf"),
+            "stop_distance": float("nan"),
+        }, {
+            "_counterfactual_variant_id": "variant-a",
+            "opportunity_id": "not-an-opportunity",
+            "execution_disposition": "no_signal",
+            "signal_opportunity": False,
+            "no_trade": True,
+        }]
+
+        evidence = _opportunity_evidence(rows)
+        reversed_evidence = _opportunity_evidence(list(reversed(rows)))
+        self.assertEqual(evidence["schema"],
+                         "counterfactual-opportunity-evidence.v1")
+        self.assertTrue(evidence["diagnostic_only"])
+        self.assertFalse(evidence["authorizing"])
+        self.assertEqual(evidence["count"], 2)
+        self.assertEqual(
+            [item["identity"]["opportunity_id"] for item in evidence["rows"]],
+            ["refused", "executed"])
+        self.assertEqual(evidence["collection_hash"],
+                         reversed_evidence["collection_hash"])
+        self.assertEqual(evidence["rows"], reversed_evidence["rows"])
+        executed = evidence["rows"][1]
+        decomposition = executed["cost_decomposition"]
+        self.assertEqual(decomposition["reference_gross"]["value"], 20.0)
+        self.assertEqual(decomposition["execution_drag"]["currency"]["value"], 2.0)
+        self.assertEqual(decomposition["fee_cost"]["currency"]["value"], 1.5)
+        self.assertEqual(decomposition["total_modeled_drag"]["currency"]["value"], 3.5)
+        self.assertEqual(decomposition["total_modeled_drag"]["r"]["value"], .35)
+        self.assertEqual(decomposition["stop_distance_bps"]["value"], 100.0)
+        self.assertEqual(executed["levels"]["active_stop_price"], 100.0)
+        self.assertEqual(executed["levels"]["breakeven_r"], 1.0)
+        self.assertFalse(executed["levels"]["entry_gap_fill"])
+        manifest = {
+            key: evidence[key] for key in (
+                "schema", "diagnostic_only", "authorizing",
+                "terminal_dispositions", "excluded_dispositions", "count",
+                "collection_hash")}
+        self.assertEqual(evidence["manifest_hash"], content_hash(manifest))
+        refused = evidence["rows"][0]
+        self.assertFalse(refused["cost_decomposition"]["execution_drag"][
+            "currency"]["available"])
+        json.dumps(evidence, allow_nan=False)
+
+        tampered = json.loads(json.dumps(evidence))
+        tampered["rows"][1]["economics"]["net_pnl"] = 999.0
+        self.assertNotEqual(tampered["rows"][1]["row_hash"],
+                            content_hash({key: value for key, value in
+                                          tampered["rows"][1].items()
+                                          if key != "row_hash"}))
+        self.assertNotEqual(tampered["collection_hash"],
+                            content_hash(tampered["rows"]))
+        tampered["authorizing"] = True
+        self.assertNotEqual(tampered["manifest_hash"], content_hash({
+            key: tampered[key] for key in manifest}))
+
+    def test_summarize_adds_gross_exit_stop_and_modeled_cost_measurements(self):
+        row = {
+            "_counterfactual_variant_id": "variant",
+            "opportunity_id": "one",
+            "session_date": "2026-01-02",
+            "execution_disposition": "executed",
+            "signal_opportunity": True,
+            "no_trade": False,
+            "direction": "short",
+            "entry_reference": 100.0,
+            "exit_reference": 98.0,
+            "quantity": 2,
+            "contract_multiplier": 1,
+            "gross_pnl": 3.0,
+            "costs": .5,
+            "net_pnl": 2.5,
+            "risk_usd": 5.0,
+            "stop_price": 102.0,
+            "exit_reason": "stop",
+        }
+        summary = _summarize([row])
+        self.assertEqual(summary["gross_pnl"], 3.0)
+        self.assertEqual(summary["exit_reasons"], {"stop": 1})
+        self.assertEqual(summary["stop_bps"]["count"], 1)
+        self.assertEqual(summary["stop_bps"]["mean"], 200.0)
+        self.assertEqual(summary["modeled_costs"]["total_modeled_drag"][
+            "currency"]["mean"], 1.5)
+        self.assertEqual(summary["modeled_costs"]["total_modeled_drag"][
+            "r"]["mean"], .3)
+
+    def test_option_stop_bps_uses_underlying_entry_not_option_premium(self):
+        row = {
+            "_counterfactual_variant_id": "option-variant",
+            "opportunity_id": "option-one",
+            "session_date": "2026-01-02",
+            "vehicle": "option",
+            "direction": "short",
+            "execution_disposition": "executed",
+            "signal_opportunity": True,
+            "no_trade": False,
+            "entry_reference": 2.0,
+            "exit_reference": 2.5,
+            "underlying_entry": 100.0,
+            "stop_distance": 1.0,
+            "stop_price": 99.0,
+            "quantity": 1,
+            "contract_multiplier": 100,
+            "gross_pnl": 50.0,
+            "costs": 1.30,
+            "net_pnl": 48.70,
+            "risk_usd": 200.0,
+        }
+        evidence = _opportunity_evidence([row])["rows"][0]
+        decomposition = evidence["cost_decomposition"]
+        self.assertEqual(decomposition["stop_distance_basis"]["field"],
+                         "underlying_entry")
+        self.assertEqual(decomposition["stop_distance_basis"]["value"], 100.0)
+        self.assertEqual(decomposition["stop_distance_bps"]["value"], 100.0)
+        # Listed options always execute as long premium positions even when
+        # the underlying signal direction is short.
+        self.assertEqual(decomposition["reference_gross"]["value"], 50.0)
+
+    def test_outcome_signature_includes_stop_and_fill_evidence(self):
+        base = {"execution_disposition": "executed", "gross_pnl": 1.0,
+                "stop_price": 99.0, "entry_fill_source": "quote",
+                "entry_feed": "iex"}
+        self.assertNotEqual(_outcome_signature(base), _outcome_signature(
+            {**base, "stop_price": 98.0}))
+        self.assertNotEqual(_outcome_signature(base), _outcome_signature(
+            {**base, "active_stop_price": 99.5}))
+        self.assertNotEqual(_outcome_signature(base), _outcome_signature(
+            {**base, "entry_fill_source": "bar"}))
+
     def test_same_frozen_variant_is_measured_without_authorization(self):
         spec = initial_hypotheses(1)[0].rule_spec
         seen = []

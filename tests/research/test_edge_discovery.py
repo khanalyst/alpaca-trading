@@ -1336,7 +1336,7 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertEqual(result["rolling_outcomes"], 1)
             self.assertEqual(result["rolling_r"], .1)
 
-    def test_paper_outcomes_demote_a_champion_that_breaks_the_rolling_guard(self):
+    def test_paper_outcomes_keep_a_champion_deployed_on_rolling_guard_warning(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
             candidate = ledger.register_candidate(
@@ -1361,7 +1361,10 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
                     "session_date": f"2024-02-{index + 1:02d}",
                     "net_pnl": -1, "risk_usd": 10, "r_multiple": 999,
                 })
-            self.assertEqual(outcome["status"], "demoted")
+            self.assertTrue(outcome["rolling_guard_breached"])
+            self.assertIsNone(outcome["guard_breach"])
+            self.assertEqual(outcome["status"], "champion")
+            self.assertEqual(ledger.candidate(candidate_id)["status"], "champion")
 
     def _deployed_candidate(self, ledger, *, r_multiples=None):
         candidate = ledger.register_candidate(
@@ -1376,35 +1379,37 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
         ledger.transition(candidate_id, "validated", reason="shadow gates passed")
         return candidate_id
 
-    def _ingest(self, ledger, candidate_id, values, *, prefix="paper"):
+    def _ingest(self, ledger, candidate_id, values, *, prefix="paper",
+                frozen=False, pin_context=None):
         result = {}
         for index, r_multiple in enumerate(values):
             result = ledger.ingest_paper_outcome(candidate_id, {
                 "vehicle": "equity", "opportunity_id": f"{prefix}-{index}",
                 "session_date": f"2024-02-{index + 1:02d}",
                 "net_pnl": r_multiple * 10, "risk_usd": 10,
-            })
+            }, frozen=frozen, pin_context=pin_context)
         return result
 
-    def test_rolling_guard_demotes_a_losing_validated_non_champion(self):
+    def test_rolling_guard_warning_keeps_a_losing_validated_non_champion_deployed(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
             candidate_id = self._deployed_candidate(ledger)
             result = self._ingest(ledger, candidate_id, [-0.1] * 20)
-            self.assertEqual(result["status"], "demoted")
+            self.assertTrue(result["rolling_guard_breached"])
+            self.assertIsNone(result["guard_breach"])
+            self.assertEqual(result["status"], "validated")
+            self.assertEqual(ledger.candidate(candidate_id)["status"], "validated")
             transitions = [(row["from_status"], row["to_status"])
                            for row in ledger.history(candidate_id)
                            if row["event_type"] == "safety_demotion"]
-            self.assertEqual(transitions, [("validated", "demoted")])
+            self.assertEqual(transitions, [])
 
     def test_repeated_ingestion_of_one_opportunity_is_a_single_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
-            candidate = ledger.register_candidate(
-                "ibr.target.1_5r", vehicle="equity", hypothesis="idempotent",
-                config={})
-            candidate_id = candidate["candidate_id"]
-            outcome = {"vehicle": "equity", "opportunity_id": "paper-1",
+            candidate_id = self._deployed_candidate(ledger)
+            self._ingest(ledger, candidate_id, [-0.1] * 20)
+            outcome = {"vehicle": "equity", "opportunity_id": "paper-repeat",
                        "net_pnl": -1, "risk_usd": 10}
             first = ledger.ingest_paper_outcome(candidate_id, outcome)
             repeats = [ledger.ingest_paper_outcome(candidate_id, outcome)
@@ -1413,10 +1418,16 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertTrue(all(row["duplicate"] for row in repeats))
             self.assertEqual({row["outcome_id"] for row in repeats},
                              {first["outcome_id"]})
-            self.assertEqual([row["rolling_r"] for row in repeats], [-.1] * 3)
+            self.assertTrue(first["rolling_guard_breached"])
+            self.assertIsNone(first["guard_breach"])
+            self.assertTrue(all(row["rolling_guard_breached"] for row in repeats))
+            self.assertTrue(all(row["guard_breach"] is None for row in repeats))
+            # The fixed-size window drops the oldest of the 21 observations.
+            self.assertEqual([row["rolling_r"] for row in repeats], [-2.0] * 3)
+            self.assertEqual(ledger.candidate(candidate_id)["status"], "validated")
             with closing(sqlite3.connect(ledger.path)) as db:
                 self.assertEqual(db.execute(
-                    "SELECT COUNT(*) FROM paper_outcomes").fetchone()[0], 1)
+                    "SELECT COUNT(*) FROM paper_outcomes").fetchone()[0], 21)
 
     def test_drift_demotes_a_deployed_candidate_whose_paper_r_collapses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1430,7 +1441,28 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertGreater(result["rolling_r"], -2.0)
             self.assertTrue(result["drift"]["degraded"])
             self.assertGreaterEqual(result["drift"]["statistic"], 4.0)
+            self.assertFalse(result["rolling_guard_breached"])
+            self.assertEqual(result["guard_breach"], "heldout_drift")
             self.assertEqual(result["status"], "demoted")
+
+    def test_pinned_heldout_drift_preserves_the_demote_and_pause_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate_id = self._deployed_candidate(
+                ledger, r_multiples=[.5, 1.5] * 10)
+            pin_context = {"variant_id": "ibr.target.1_5r",
+                           "vehicle": "equity", "note": "operator pin"}
+            result = self._ingest(ledger, candidate_id, [-0.05] * 20,
+                                  frozen=True, pin_context=pin_context)
+            self.assertEqual(result["guard_breach"], "heldout_drift")
+            self.assertEqual(result["status"], "demoted")
+            demotions = [json.loads(event["payload_json"])
+                         for event in ledger.history(candidate_id)
+                         if event["event_type"] == "safety_demotion"]
+            self.assertTrue(demotions)
+            self.assertTrue(demotions[-1]["pinned"])
+            self.assertEqual(demotions[-1]["pin_context"], pin_context)
+            self.assertEqual(demotions[-1]["action"], "demote_and_pause")
 
     def test_drift_stays_quiet_while_paper_r_wobbles_around_the_validated_mean(self):
         with tempfile.TemporaryDirectory() as directory:

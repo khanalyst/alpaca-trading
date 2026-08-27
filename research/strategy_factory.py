@@ -1,9 +1,10 @@
 """Autonomous, parallel strategy research with isolated simulated accounts.
 
-Seven bounded hypotheses are evaluated in separate worker processes by
-default.  A worker may mutate only the audited rule grammar; it cannot write
-or execute source code.  Mutations are diagnosed from the chronological fit
-partition and judged on untouched held-out or later forward data.
+Configured bounded hypotheses are evaluated in an isolated worker pool, which
+defaults to two processes. A worker may mutate only the audited rule grammar;
+it cannot write or execute source code. Mutations are diagnosed from the
+chronological fit partition and judged on untouched held-out or later forward
+data.
 """
 
 from __future__ import annotations
@@ -20,13 +21,15 @@ import time
 from typing import Any, Mapping, Sequence
 import uuid
 
-from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V1, RULE_SCHEMA_V2,
+from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
+                                  RULE_SCHEMA_V1, RULE_SCHEMA_V2,
                                   V2_DEFAULT_EXTENSIONS, EXECUTABLE_RULE_FIELDS,
                                   hold_deadline,
                                   rule_semantic_distance,
                                   rule_semantic_signature, rule_variant_id,
                                   validate_rule_spec)
-from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
+from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
+                    CostModel, ReplayPolicy, SQLiteQuoteIndex,
                     diagnostic_backfill_policy, index_quotes, quote_fill,
                     replay_policy_for_mode)
 from .edge_lab import (
@@ -180,6 +183,22 @@ _FIT_SELECTION_REJECTION_KEYS = frozenset({
     "explicit_rejections", "reject_reason_counts",
     "execution_blocked", "diagnostic_only", "authorizing",
 })
+_FIT_EXECUTION_GEOMETRY_KEYS = frozenset({
+    "schema", "vehicle", "diagnostic_only", "authorizing",
+    "stressed_cost_schema", "stressed_cost_basis",
+    "stressed_cost_scenario_bps", "scenario_bps",
+    "max_stressed_cost_to_risk_ratio", "max_cost_to_risk_ratio",
+    "required_stop_distance_bps", "grammar_stop_floor_bps",
+    "grammar_stop_floor_admissible", "stop_distance_formula_available",
+    "stop_distance_formula_unavailable_reason",
+    "expected_symmetric_bar_round_trip_bps",
+    "expected_executable_quote_round_trip_bps",
+    "expected_cost_calibration_independent_of_stress",
+    "expected_cost_calibration_is_independent",
+    "expected_cost_calibration_note",
+})
+_FIT_EXECUTION_GEOMETRY_BASIS_KEYS = frozenset(
+    {"notional", "notional_charge", "option_fees"})
 _FIT_SELECTION_LESSON_KEYS = frozenset({
     "id", "family", "tried", "changed", "fit_delta", "reason",
     "proposed_by", "verdict", "novel_tuning",
@@ -260,6 +279,10 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
         # Machine-readable replay reason labels are dynamic; their values are
         # still finite scalar counts and pass the global denied-key filter.
         allowed = None
+    elif context == "execution_geometry":
+        allowed = _FIT_EXECUTION_GEOMETRY_KEYS
+    elif context == "execution_geometry_basis":
+        allowed = _FIT_EXECUTION_GEOMETRY_BASIS_KEYS
     elif context == "lesson":
         allowed = _FIT_SELECTION_LESSON_KEYS
     elif context == "shared_learning":
@@ -277,7 +300,7 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
             "tried_families", "proved_families", "available_families",
             "already_seeded_this_cycle", "last_diagnosis", "lessons",
             "shared_learning", "previous_family", "reason", "slot",
-            "family",
+            "family", "execution_geometry",
         }))
     else:
         allowed = _FIT_SELECTION_AGGREGATE_KEYS
@@ -290,7 +313,10 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
         safe_rejection_count = (context == "rejections" and key in {
             "rows", "executed_rows", "no_trade_rows", "no_signal_rows",
             "unclassified_no_trade_rows"})
-        if _selection_denied(key) and not safe_rejection_count:
+        safe_geometry_key = (context == "execution_geometry" and
+                             key in _FIT_EXECUTION_GEOMETRY_KEYS)
+        if (_selection_denied(key) and not safe_rejection_count and
+                not safe_geometry_key):
             continue
         # ``tried`` and ``changed`` are coordinate maps, so their keys are
         # dynamic but must still name an executable rule parameter.
@@ -319,6 +345,11 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
                 child_context = "shared_families"
             elif key == "live_trials" and context == "shared_learning":
                 child_context = "live_trials"
+            elif key == "execution_geometry":
+                child_context = "execution_geometry"
+            elif (key == "stressed_cost_basis" and
+                  context == "execution_geometry"):
+                child_context = "execution_geometry_basis"
             elif key in {"tried", "changed"} and context == "lesson":
                 child_context = key
             elif context == "fit_diagnostics" or key in {
@@ -332,7 +363,10 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
                 child_context = context
         cleaned = _sanitize_fit_selection(item, label=f"{label}.{key}",
                                            context=child_context)
-        if cleaned is not None:
+        preserve_geometry_none = (
+            context == "execution_geometry" and
+            key in _FIT_EXECUTION_GEOMETRY_KEYS and item is None)
+        if cleaned is not None or preserve_geometry_none:
             result[key] = cleaned
     return result
 
@@ -404,12 +438,98 @@ def _proved_families(edge: EdgeLedger, vehicle: str) -> list[str]:
     return sorted(families)
 
 
+def _execution_geometry_context(*, vehicle: str, costs: CostModel,
+                                policy: ReplayPolicy) -> dict[str, Any]:
+    """Build finite, configuration-only execution geometry for discovery.
+
+    This is descriptive context for a proposal, not a sizing or authorization
+    decision.  The stop-distance calculation is meaningful for equity because
+    the stressed-cost shock and risk ratio share an entry-notional basis.  An
+    option stop cannot be reduced to one static bps value: premium and
+    per-contract fees make its admissibility plan-dependent.
+    """
+    if vehicle not in {"equity", "option"}:
+        raise ValueError("vehicle must be equity or option")
+    if not isinstance(costs, CostModel):
+        raise TypeError("costs must be a CostModel")
+    if not isinstance(policy, ReplayPolicy):
+        raise TypeError("policy must be a ReplayPolicy")
+
+    scenario = policy.stressed_cost_scenario_bps
+    ratio = policy.max_stressed_cost_to_risk_ratio
+    scenario_value = (float(scenario) if scenario is not None else None)
+    ratio_value = float(ratio) if ratio is not None else None
+    valid_controls = (
+        scenario_value is not None and math.isfinite(scenario_value) and
+        ratio_value is not None and math.isfinite(ratio_value) and
+        ratio_value > 0.0)
+    required_stop = (scenario_value / ratio_value
+                     if valid_controls else None)
+
+    geometry: dict[str, Any] = {
+        "schema": "execution-geometry.v1",
+        "vehicle": vehicle,
+        # These markers are deliberate: discovery receives no authorizing
+        # evidence and the geometry never changes a submitted plan.
+        "diagnostic_only": True,
+        "authorizing": False,
+        "stressed_cost_schema": STRESSED_COST_SCHEMA,
+        "stressed_cost_basis": dict(STRESSED_COST_BASIS),
+        "stressed_cost_scenario_bps": scenario_value,
+        "scenario_bps": scenario_value,
+        "max_stressed_cost_to_risk_ratio": ratio_value,
+        "max_cost_to_risk_ratio": ratio_value,
+        "grammar_stop_floor_bps": float(MIN_STOP_DISTANCE_BPS),
+        "expected_cost_calibration_independent_of_stress": True,
+        "expected_cost_calibration_is_independent": True,
+        "expected_cost_calibration_note": (
+            "configured expected cost is independent of the stressed-cost "
+            "scenario and risk ratio"),
+    }
+    if vehicle == "option":
+        geometry.update({
+            "required_stop_distance_bps": None,
+            "grammar_stop_floor_admissible": None,
+            "stop_distance_formula_available": False,
+            "stop_distance_formula_unavailable_reason": (
+                "option fees and premium risk make stop distance "
+                "plan-dependent"),
+            "expected_symmetric_bar_round_trip_bps": None,
+            "expected_executable_quote_round_trip_bps": None,
+        })
+        return geometry
+
+    def _round_trip_bps(*, executable_quotes: bool) -> float:
+        # Unit entry/exit prices make the returned USD cost directly equal to
+        # the round-trip fraction of entry notional.  CostModel owns the
+        # spread, slippage, and both-side fee arithmetic.
+        return float(costs.round_trip_cost(
+            1.0, 1.0, 1.0, 1.0, vehicle="equity",
+            executable_quotes=executable_quotes) * 10_000.0)
+
+    geometry.update({
+        "required_stop_distance_bps": required_stop,
+        "grammar_stop_floor_admissible": (
+            None if required_stop is None else
+            float(MIN_STOP_DISTANCE_BPS) >= required_stop),
+        "stop_distance_formula_available": valid_controls,
+        "stop_distance_formula_unavailable_reason": (
+            None if valid_controls else
+            "stressed-cost scenario and positive risk ratio are required"),
+        "expected_symmetric_bar_round_trip_bps": _round_trip_bps(
+            executable_quotes=False),
+        "expected_executable_quote_round_trip_bps": _round_trip_bps(
+            executable_quotes=True),
+    })
+    return geometry
+
 def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
                        tried_families: set[str], proved_families: Sequence[str],
                        diagnostic: Mapping[str, Any] | None = None,
                        seeded_this_cycle: Sequence[Mapping[str, Any]] = (),
                        lessons: Sequence[Mapping[str, Any]] = (),
-                       shared: Mapping[str, Any] | None = None) -> dict:
+                       shared: Mapping[str, Any] | None = None,
+                       execution_geometry: Mapping[str, Any] | None = None) -> dict:
     """Build the small aggregate brief a discovery proposal is given."""
     context: dict[str, Any] = {
         "slot": int(slot),
@@ -422,6 +542,10 @@ def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
     if diagnostic:
         context["last_diagnosis"] = _sanitize_fit_selection(
             diagnostic, label="last_diagnosis", context="diagnostic")
+    if execution_geometry is not None:
+        context["execution_geometry"] = _sanitize_fit_selection(
+            execution_geometry, label="execution_geometry",
+            context="execution_geometry")
     # Slots are seeded one after another inside a single cycle.  Without this
     # every slot of a fresh ledger receives an identical brief, so a model that
     # answers consistently returns the same hypothesis every time and all but
@@ -1517,6 +1641,7 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                   adapter: RuleProposalAdapter | None,
                   existing_specs: Sequence[Mapping[str, Any]] | None = None,
                   llm_observations: list[dict[str, Any]] | None = None,
+                  execution_geometry: Mapping[str, Any] | None = None,
                   ) -> tuple[list[dict], list[dict]]:
     """Give every configured slot an active hypothesis before scheduling.
 
@@ -1591,7 +1716,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                             str(item["family"]) for item in latest.values()},
                         proved_families=_proved_families(edge, vehicle),
                         seeded_this_cycle=cycle_seeds, lessons=lessons,
-                        shared=shared),
+                        shared=shared,
+                        execution_geometry=execution_geometry),
                     llm_enabled=True, config=llm_config, adapter=adapter,
                     llm_observations=llm_observations)
                 if (proposed is not None and
@@ -1617,7 +1743,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                     previous=previous, tried_families=tried,
                     proved_families=_proved_families(edge, vehicle),
                     seeded_this_cycle=cycle_seeds, lessons=lessons,
-                    shared=shared),
+                    shared=shared,
+                    execution_geometry=execution_geometry),
                 llm_enabled=llm_enabled, config=llm_config, adapter=adapter,
                 llm_observations=llm_observations)
             if seed is None:
@@ -2463,6 +2590,8 @@ def _run_diagnostic_factory(
     model = costs or CostModel.from_config(runtime_config, vehicle=vehicle)
     base_policy = ReplayPolicy.from_config(runtime_config)
     policy = diagnostic_backfill_policy(base_policy)
+    execution_geometry = _execution_geometry_context(
+        vehicle=vehicle, costs=model, policy=policy)
     llm_config = dict(strategy_llm or {})
     llm_config.setdefault("near_duplicate_distance", NEAR_DUPLICATE_DISTANCE)
     llm_enabled = bool(llm_config.get("enabled", False))
@@ -2515,7 +2644,8 @@ def _run_diagnostic_factory(
                 slot=template.slot, reason="diagnostic_backfill_epoch",
                 previous=previous, tried_families={template.family},
                 proved_families=(), diagnostic=root_diagnostic,
-                seeded_this_cycle=seeded_this_cycle)
+                seeded_this_cycle=seeded_this_cycle,
+                execution_geometry=execution_geometry)
             discovered, discovery, source = _seed_slot(
                 previous, generation=1, not_before=None,
                 existing_variant_ids=existing_variant_ids,
@@ -2818,6 +2948,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     identity_runtime_config = dict(runtime_config or {})
     identity_runtime_config["costs"] = identity_costs
     policy = ReplayPolicy.from_config(runtime_config)
+    execution_geometry = _execution_geometry_context(
+        vehicle=vehicle, costs=model, policy=policy)
     backtest_policy = replay_policy_for_mode(
         policy, "backtest", backtest_bar_fallback=backtest_bar_fallback)
     shadow_policy = replay_policy_for_mode(
@@ -2989,7 +3121,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         existing_variant_ids=existing_variant_ids, llm_enabled=llm_enabled,
         llm_config=llm_config, adapter=llm_adapter,
         existing_specs=existing_specs,
-        llm_observations=llm_observations)
+        llm_observations=llm_observations,
+        execution_geometry=execution_geometry)
     active = factory.active(vehicle)[:int(strategies)]
     if not active:
         return {"schema": FACTORY_SCHEMA, "status": "exhausted", "dataset_hash": dataset_hash,
@@ -4161,7 +4294,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                             proved_families=_proved_families(edge, vehicle),
                             diagnostic=aggregate,
                             lessons=_lesson_brief(factory, vehicle=vehicle),
-                            shared=shared),
+                            shared=shared,
+                            execution_geometry=execution_geometry),
                         llm_enabled=llm_enabled, config=llm_config,
                         adapter=llm_adapter,
                         llm_observations=llm_observations)

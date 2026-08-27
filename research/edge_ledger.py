@@ -701,15 +701,48 @@ class EdgeLedger(EdgeLedgerProofMixin):
             raise ValueError("paper outcome proof_run_id does not authorize this candidate")
         return str(run["run_id"])
 
-    def _paper_summary(self, candidate_id: str, outcome_id: str,
-                       *, duplicate: bool = False) -> dict:
+    def _paper_guard_state(self, candidate_id: str) -> tuple[bool, dict, str | None]:
+        """Return rolling telemetry and the currently authoritative guard.
+
+        The rolling-R calculation remains a useful overlapping fixed-window
+        early-warning signal, but it is deliberately not a lifecycle
+        authority.  Only the validated held-out SPRT can return an
+        authoritative breach here.
+        Keeping both values together prevents duplicate deliveries and the
+        normal ingestion path from reporting different guard semantics.
+        """
         r_values = [value for _created_at, value in self._paper_r_history(candidate_id)]
         recent_r = r_values[-PAPER_DEMOTION_MIN_OUTCOMES:]
-        return {"outcome_id": outcome_id, "candidate_id": candidate_id,
-                "status": (self.candidate(candidate_id) or {}).get("status"),
-                "rolling_outcomes": len(recent_r),
-                "rolling_r": sum(recent_r) if recent_r else None,
-                "duplicate": duplicate}
+        rolling_guard_breached = (
+            len(recent_r) >= PAPER_DEMOTION_MIN_OUTCOMES and
+            sum(recent_r) <= PAPER_DEMOTION_R_FLOOR)
+        drift = self.paper_drift(candidate_id)
+        guard_breach = "heldout_drift" if drift.get("degraded") else None
+        return bool(rolling_guard_breached), drift, guard_breach
+
+    def _paper_summary(self, candidate_id: str, outcome_id: str,
+                       *, duplicate: bool = False,
+                       frozen: bool = False) -> dict:
+        rolling_guard_breached, drift, guard_breach = self._paper_guard_state(
+            candidate_id)
+        r_values = [value for _created_at, value in self._paper_r_history(candidate_id)]
+        recent_r = r_values[-PAPER_DEMOTION_MIN_OUTCOMES:]
+        return {
+            "outcome_id": outcome_id,
+            "candidate_id": candidate_id,
+            "status": (self.candidate(candidate_id) or {}).get("status"),
+            "rolling_outcomes": len(recent_r),
+            "rolling_r": sum(recent_r) if recent_r else None,
+            "rolling_guard_breached": rolling_guard_breached,
+            # ``guard_breach`` is lifecycle-authoritative.  A rolling breach
+            # is intentionally represented only by the explicit advisory
+            # field above, including on duplicate/retried deliveries.
+            "guard_breach": guard_breach,
+            "frozen": bool(frozen),
+            "drift": {key: drift[key] for key in
+                       ("applicable", "degraded", "outcomes", "statistic", "threshold")},
+            "duplicate": duplicate,
+        }
 
     def ingest_paper_outcome(self, candidate_id: str, outcome: Mapping, *,
                              frozen: bool = False,
@@ -717,9 +750,11 @@ class EdgeLedger(EdgeLedgerProofMixin):
         """Append one observed paper outcome and return the resulting status.
 
         ``frozen`` records that a candidate was operator-pinned in
-        configuration.  Pinning selects an identity, but it cannot bypass a
-        hard paper safety guard: a rolling-R or held-out-drift breach demotes
-        the edge and records the pin context so runtime selection fails closed.
+        configuration.  Pinning selects an identity, but it cannot bypass the
+        authoritative held-out-drift safety guard: a degraded validated
+        held-out SPRT demotes the edge and records the pin context so runtime
+        selection fails closed.  The fixed-window rolling-R threshold remains
+        visible as advisory telemetry and does not change lifecycle state.
         Runtime risk limits remain independent safety controls.
         """
         candidate = self.candidate(candidate_id)
@@ -782,9 +817,11 @@ class EdgeLedger(EdgeLedgerProofMixin):
             # both immutable observations under epoch-scoped internal keys;
             # retries within the same epoch remain idempotent.
             if prior["proof_run_id"] == proof_run_id:
-                return self._paper_summary(candidate_id, prior["outcome_id"], duplicate=True)
+                return self._paper_summary(candidate_id, prior["outcome_id"],
+                                           duplicate=True, frozen=frozen)
             if proof_run_id is None:
-                return self._paper_summary(candidate_id, prior["outcome_id"], duplicate=True)
+                return self._paper_summary(candidate_id, prior["outcome_id"],
+                                           duplicate=True, frozen=frozen)
             opportunity = epoch_opportunity
         oid = uuid.uuid4().hex
         with closing(_connect(self.path)) as db, db:
@@ -799,22 +836,14 @@ class EdgeLedger(EdgeLedgerProofMixin):
                 VALUES(?,?,?,?,?,?,?,?,?)""",
                 (uuid.uuid4().hex, candidate_id, "paper_outcome", candidate["status"],
                  candidate["status"], "paper", "paper outcome ingested", _json(normalized), _utc()))
-        r_values = [value for _created_at, value in self._paper_r_history(candidate_id)]
-        recent_r = r_values[-PAPER_DEMOTION_MIN_OUTCOMES:]
-        automatic_guard = (
-            len(recent_r) >= PAPER_DEMOTION_MIN_OUTCOMES and
-            sum(recent_r) <= PAPER_DEMOTION_R_FLOOR)
-        drift = self.paper_drift(candidate_id)
-        # Every deployed candidate is guarded, not only the champion: paper
+        rolling_guard_breached, drift, authoritative_breach = self._paper_guard_state(
+            candidate_id)
+        # Every deployed candidate is monitored, not only the champion: paper
         # ``all_proved`` selection may trade one validated candidate per
-        # verified frozen dependence cluster, and an unguarded validated loser
-        # would trade indefinitely.
+        # verified frozen-dependence cluster.  The rolling signal is advisory;
+        # held-out drift remains the immediate lifecycle safety authority.
         breach = None
-        if automatic_guard:
-            breach = ("rolling_r_guard",
-                      "paper outcomes failed the registered rolling R guard",
-                      {"outcomes": len(recent_r), "rolling_r": sum(recent_r)})
-        elif drift.get("degraded"):
+        if authoritative_breach == "heldout_drift":
             breach = ("heldout_drift",
                       "paper R degraded against the validated held-out distribution",
                       {"outcomes": drift.get("outcomes"),
@@ -829,6 +858,10 @@ class EdgeLedger(EdgeLedgerProofMixin):
             self.transition(candidate_id, "demoted", reason=reason,
                             actor="paper", payload=payload)
         summary = self._paper_summary(candidate_id, oid)
+        # Re-read the summary after any transition so status and authoritative
+        # telemetry describe the committed outcome.  Rolling remains advisory
+        # even when its 20-observation/-2R threshold is crossed.
+        summary["rolling_guard_breached"] = bool(rolling_guard_breached)
         summary["guard_breach"] = breach[0] if breach else None
         summary["frozen"] = bool(frozen)
         summary["drift"] = {key: drift[key] for key in
@@ -838,9 +871,10 @@ class EdgeLedger(EdgeLedgerProofMixin):
     def paper_performance(self, candidate_id: str) -> dict:
         """Summarize one candidate's live paper record.
 
-        The demotion guards already consume these outcomes; this is the same
-        append-only data made readable, so an operator can see how a deployed
-        edge is actually doing rather than only how strong its proof was.
+        The safety surveillance already consumes these outcomes; this is the
+        same append-only data made readable, so an operator can see how a
+        deployed edge is actually doing rather than only how strong its proof
+        was.
         Every field is derived, never stored, so it cannot drift from the
         outcomes it summarizes.
         """
@@ -898,9 +932,9 @@ class EdgeLedger(EdgeLedgerProofMixin):
             "total_r": sum(r_values) if r_values else None,
             "mean_r": (sum(r_values) / len(r_values)) if r_values else None,
             "win_rate": (len(wins) / len(r_values)) if r_values else None,
-            # The registered rolling-R guard, exactly as the demotion path
-            # evaluates it, so a live edge's distance from retirement is visible
-            # before it retires rather than only in the event log afterwards.
+            # The registered rolling-R warning, exactly as the ingestion path
+            # evaluates it, remains visible as early-warning telemetry without
+            # implying that this advisory threshold retires the edge.
             "rolling": {
                 "outcomes": len(recent),
                 "required": PAPER_DEMOTION_MIN_OUTCOMES,
@@ -909,6 +943,8 @@ class EdgeLedger(EdgeLedgerProofMixin):
                 "armed": len(recent) >= PAPER_DEMOTION_MIN_OUTCOMES,
                 "breached": bool(len(recent) >= PAPER_DEMOTION_MIN_OUTCOMES and
                                  sum(recent) <= PAPER_DEMOTION_R_FLOOR),
+                "authoritative": False,
+                "action": "warning_only",
             },
             "drift": {
                 "applicable": bool(drift.get("applicable")),

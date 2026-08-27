@@ -690,15 +690,15 @@ Monte Carlo resolution enough for the batch-adjusted p-value grid to cross that
 allocation. A two-million-draw cap turns an unresolvable test into an explicit
 no-op rather than a false failure or spent decision.
 
-Retirement guards every deployed candidate, not only the champion, because
+Retirement surveillance covers every deployed candidate, not only the champion, because
 `all_proved` selection trades one validated candidate per verified frozen
 dependence cluster (with the held-out correlation fallback for unclustered
-families). Two
-independent signals demote: the registered rolling-R floor, and a one-sided
-sequential likelihood test of live paper R against the held-out R distribution
-the candidate's re-verified shadow proof was computed over. The sequential
-boundary bounds the probability of retiring an undegraded candidate at
-`exp(-4)`, about 1.8% per deployment.
+families). The registered 20-outcome rolling-R floor is advisory telemetry: its
+overlapping repeated looks do not change lifecycle state. Immediate paper
+demotion is reserved for the one-sided sequential likelihood test of live paper
+R against the held-out R distribution attached to the candidate's re-verified
+shadow proof. The separate trial review can still park a candidate after its
+configured evidence window closes below the registered trial floor.
 
 Generation exhaustion in the strategy factory is recoverable but still
 bounded. A slot whose family has spent its mutation budget may be reseeded
@@ -735,9 +735,10 @@ stable per vehicle: the ledgers are the durable record, this file is a view.
 ### Deployed-edge observability
 
 `EdgeLedger.paper_performance` and `paper_report` read back the append-only
-`paper_outcomes` the demotion guards already consume: per-edge trade and
-session counts, total and mean R, win rate, net P&L, the rolling-R guard with
-its floor and armed/breached state, and the sequential drift statistic against
+`paper_outcomes` used by surveillance and trial review: per-edge trade and
+session counts, total and mean R, win rate, net P&L, the advisory rolling-R
+monitor with its floor and armed/breached state, and the authoritative
+sequential drift statistic against
 the validated held-out distribution. Each outcome is attributed to the exact
 passing shadow `proof_run_id` captured when the trade entered. Reads and trial
 verdicts use only the latest passing proof epoch; a demoted, re-proved candidate
@@ -746,7 +747,7 @@ proof. A failed or unverifiable latest shadow proof quarantines the history
 instead of falling back to lifetime outcomes. `research.py edge paper` and the
 dashboard's "Live paper results by edge" card are the two read surfaces. They
 are derived on every read, never stored, so they cannot drift from the
-outcomes they summarize or from the guard that acts on them. Neither surface
+outcomes they summarize or the surveillance calculation. Neither surface
 can change a lifecycle state.
 
 ### Trial, promotion, and the freeze
@@ -768,10 +769,11 @@ through the same `_eligible` gate every other path uses — pinning selects, it
 never authorizes — and `unresolved_promotions` reports any pin that cannot
 trade, because a promotion that quietly resolves to nothing is the failure
 worth surfacing. A pinned candidate remains subject to hard lifecycle stops:
-`ingest_paper_outcome` evaluates rolling-R and drift guards, and
-`review_trials` still judges the trial. A breach parks or demotes the candidate,
-carrying the operator's promotion fields as audit context; the pin does not
-bypass safety or cause a silent replacement.
+`ingest_paper_outcome` evaluates the sequential drift guard, and
+`review_trials` still judges the trial. The rolling-R monitor remains visible
+but advisory. An authoritative breach parks or demotes the candidate, carrying
+the operator's promotion fields as audit context; the pin does not bypass
+safety or cause a silent replacement.
 
 The scheduled cycle reviews trials *before* discovery and tuning, so a trial
 that just closed below its floor is already a lesson by the time this cycle

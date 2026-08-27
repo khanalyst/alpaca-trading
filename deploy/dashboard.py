@@ -145,9 +145,10 @@ def _performance(path: Path) -> dict:
         return {"available": False, "reason": type(exc).__name__}
 
 
-# Mirrors research.edge_ledger.PAPER_DEMOTION_* .  The dashboard deliberately
-# does not import the research package, so the guard thresholds it displays are
-# restated here and pinned to the ledger's constants by test_deploy.
+# Mirrors research.edge_ledger.PAPER_DEMOTION_* for compatibility. The dashboard
+# deliberately does not import the research package, so the advisory rolling
+# thresholds it displays are restated here and pinned to the ledger constants by
+# test_deploy. A breach is an alert; it is not a lifecycle transition.
 PAPER_ROLLING_WINDOW = 20
 PAPER_ROLLING_FLOOR = -2.0
 
@@ -203,6 +204,8 @@ def _live_paper(connection: sqlite3.Connection) -> list[dict]:
             "win_rate": round(len(wins) / len(r_values), 4) if r_values else None,
             "rolling_r": round(sum(recent), 4) if recent else None,
             "rolling_floor": PAPER_ROLLING_FLOOR,
+            "rolling_authoritative": False,
+            "rolling_action": "warning_only",
             "guard": ("breached" if len(recent) >= PAPER_ROLLING_WINDOW and
                       sum(recent) <= PAPER_ROLLING_FLOOR else
                       "armed" if len(recent) >= PAPER_ROLLING_WINDOW else
@@ -783,7 +786,7 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  c=card('Execution journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
  c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);row(c,'tradeable vehicle',d.research.tradeable_vehicle);row(c,'proved but untradeable',d.research.untradeable_proved_edges,d.research.untradeable_proved_edges?'warn':'ok');c.append(el('p',d.research.note||'No research status.','muted'));
  c=card('Proved edges — evidence at promotion',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
- c=card('Live paper results by edge',true);const lp=d.edge.live_paper||[];if(!lp.length){c.append(el('p','No paper outcomes recorded yet. Results appear once a deployed edge closes its first trade.','muted'))}else{table(c,lp,['status','vehicle','variant_id','outcomes','sessions','last_session','total_r','mean_r','win_rate','net_pnl','rolling_r','guard'])};
+ c=card('Live paper results by edge',true);const lp=d.edge.live_paper||[];if(!lp.length){c.append(el('p','No paper outcomes recorded yet. Results appear once a deployed edge closes its first trade.','muted'))}else{table(c,lp,['status','vehicle','variant_id','outcomes','sessions','last_session','total_r','mean_r','win_rate','net_pnl','rolling_r','guard','rolling_action'])};
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','intended_risk_usd','delivered_risk_usd','risk_delivery_ratio','risk_shortfall_usd','opened_at','setup_type']);
 
  const tr=d.trial||{};

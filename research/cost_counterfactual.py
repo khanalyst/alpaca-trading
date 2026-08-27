@@ -135,6 +135,450 @@ def _entry_slippage_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             "unit": "basis_points"}
 
 
+def _safe_json(value: Any) -> Any:
+    """Return a bounded JSON-safe representation for persisted evidence.
+
+    Counterfactual rows normally contain only primitives, but test fixtures and
+    adapters can supply ``Decimal``, timestamps, mappings, or non-finite
+    numbers.  The evidence projection must never make the complete report
+    unserialisable.  Invalid/non-finite scalar numbers intentionally become
+    ``None``; the cost decomposition carries the corresponding availability
+    reason explicitly.
+    """
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {str(key): _safe_json(item) for key, item in sorted(
+            value.items(), key=lambda pair: str(pair[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_safe_json(item) for item in value]
+    number = _finite(value)
+    return number if number is not None else str(value)
+
+
+def _number_field(row: Mapping[str, Any], *names: str) -> tuple[float | None, str]:
+    """Read the first finite numeric alias and retain missing/invalid state."""
+    present = False
+    invalid = False
+    for name in names:
+        if name not in row or row.get(name) is None:
+            continue
+        present = True
+        value = _finite(row.get(name))
+        if value is not None:
+            return value, "available"
+        invalid = True
+    if invalid or present:
+        return None, "invalid"
+    return None, "missing"
+
+
+def _named_number_field(
+        row: Mapping[str, Any], *names: str) -> tuple[float | None, str, str | None]:
+    """Return a numeric alias together with the field that supplied it."""
+    saw_invalid: str | None = None
+    for name in names:
+        if name not in row or row.get(name) is None:
+            continue
+        value = _finite(row.get(name))
+        if value is not None:
+            return value, "available", name
+        if saw_invalid is None:
+            saw_invalid = name
+    if saw_invalid is not None:
+        return None, "invalid", saw_invalid
+    return None, "missing", None
+
+
+def _measurement(value: float | None, *, unit: str,
+                 reason: str | None = None) -> dict[str, Any]:
+    finite = _finite(value)
+    return {
+        "value": finite,
+        "unit": unit,
+        "available": finite is not None,
+        "reason": None if finite is not None else (reason or "unavailable"),
+    }
+
+
+def _cost_decomposition(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive descriptive model-cost components from one terminal row.
+
+    This deliberately does not replay or infer a missing leg.  A component is
+    available only when the row has finite references, quantity, direction,
+    multiplier, and economics sufficient to calculate it.
+    """
+    entry_reference, entry_status = _number_field(row, "entry_reference")
+    exit_reference, exit_status = _number_field(row, "exit_reference")
+    quantity, quantity_status = _number_field(row, "quantity", "contracts")
+    multiplier, multiplier_status = _number_field(
+        row, "contract_multiplier", "multiplier")
+    direction_raw = row.get("direction")
+    direction = (str(direction_raw).strip().lower()
+                 if direction_raw is not None else "")
+    direction_status = ("available" if direction in {"long", "short"}
+                        else "invalid" if direction else "missing")
+    vehicle = str(row.get("vehicle") or "").strip().lower()
+    execution_direction = "long" if vehicle == "option" else direction
+    gross, gross_status = _number_field(row, "gross_pnl")
+    fee_cost, fee_status = _number_field(row, "fee_cost", "fees", "costs")
+    risk, risk_status = _number_field(
+        row, "risk_usd", "realized_risk_usd", "nominal_risk_usd")
+    if risk_status == "available" and (risk is None or risk <= 0):
+        risk = None
+        risk_status = "invalid"
+
+    reference_reason = None
+    reference_gross: float | None = None
+    if entry_status != "available":
+        reference_reason = f"{entry_status}_entry_reference"
+    elif exit_status != "available":
+        reference_reason = f"{exit_status}_exit_reference"
+    elif entry_reference <= 0:
+        reference_reason = "invalid_entry_reference"
+    elif exit_reference <= 0:
+        reference_reason = "invalid_exit_reference"
+    elif quantity_status != "available":
+        reference_reason = f"{quantity_status}_quantity"
+    elif quantity <= 0:
+        reference_reason = "invalid_quantity"
+    elif multiplier_status != "available":
+        reference_reason = f"{multiplier_status}_multiplier"
+    elif multiplier <= 0:
+        reference_reason = "invalid_multiplier"
+    elif direction_status != "available":
+        reference_reason = f"{direction_status}_direction"
+    else:
+        reference_gross = ((exit_reference - entry_reference)
+                           if execution_direction == "long" else
+                           (entry_reference - exit_reference)) * quantity * multiplier
+
+    reference = _measurement(reference_gross, unit="currency",
+                             reason=reference_reason)
+    drag: float | None = None
+    drag_reason = None
+    actual_gross = gross
+    actual_gross_status = gross_status
+    if gross_status == "missing":
+        actual_entry, actual_entry_status = _number_field(row, "entry_price")
+        actual_exit, actual_exit_status = _number_field(row, "exit_price")
+        if (actual_entry_status == "available" and
+                actual_exit_status == "available" and
+                quantity_status == "available" and
+                multiplier_status == "available" and
+                direction_status == "available"):
+            actual_gross = ((actual_exit - actual_entry)
+                            if execution_direction == "long" else
+                            (actual_entry - actual_exit)) * quantity * multiplier
+            actual_gross_status = "available"
+    if reference_gross is None:
+        drag_reason = "reference_gross_unavailable"
+    elif actual_gross_status != "available":
+        drag_reason = f"{actual_gross_status}_gross_pnl_or_fill_prices"
+    else:
+        drag = reference_gross - actual_gross
+    execution_drag = {
+        "currency": _measurement(drag, unit="currency", reason=drag_reason),
+        "r": _measurement(
+            drag / risk if drag is not None and risk is not None else None,
+            unit="R",
+            reason=(None if drag is not None and risk is not None else
+                    "missing_or_invalid_risk_usd" if risk_status != "available"
+                    else "execution_drag_unavailable")),
+    }
+
+    fee_valid = fee_status == "available" and fee_cost >= 0
+    fee = _measurement(fee_cost if fee_valid else None, unit="currency",
+                       reason=(None if fee_valid else
+                               "invalid_fee_cost" if fee_status == "available"
+                               else f"{fee_status}_fee_cost"))
+    fee_r = _measurement(
+        fee_cost / risk if fee_valid and risk is not None else None,
+        unit="R",
+        reason=(None if fee_valid and risk is not None else
+                "missing_or_invalid_risk_usd" if risk_status != "available"
+                else "fee_cost_unavailable"))
+    fee_cost_component = {"currency": fee, "r": fee_r}
+
+    total = (drag + fee_cost if drag is not None and fee_valid
+             else None)
+    total_reason = (None if total is not None else
+                    "execution_drag_unavailable" if drag is None else
+                    "fee_cost_unavailable")
+    total_component = {
+        "currency": _measurement(total, unit="currency", reason=total_reason),
+        "r": _measurement(
+            total / risk if total is not None and risk is not None else None,
+            unit="R",
+            reason=(None if total is not None and risk is not None else
+                    "missing_or_invalid_risk_usd" if risk_status != "available"
+                    else "total_modeled_drag_unavailable")),
+    }
+
+    stop_distance, stop_status = _number_field(row, "stop_distance")
+    stop_price, stop_price_status = _number_field(row, "stop_price")
+    if vehicle == "option":
+        stop_basis, stop_basis_status, resolved_stop_basis = _named_number_field(
+            row, "underlying_entry", "plan_entry")
+        stop_basis_field = resolved_stop_basis or "underlying_entry_or_plan_entry"
+    else:
+        stop_basis, stop_basis_status = entry_reference, entry_status
+        stop_basis_field = "entry_reference"
+    stop_bps: float | None = None
+    stop_reason = None
+    if stop_basis_status != "available" or stop_basis <= 0:
+        stop_reason = (f"{stop_basis_status}_{stop_basis_field}"
+                       if stop_basis_status != "available" else
+                       f"invalid_{stop_basis_field}")
+    elif stop_status == "available":
+        stop_bps = abs(stop_distance) / abs(stop_basis) * 10_000.0
+    elif stop_status == "invalid":
+        stop_reason = "invalid_stop_distance"
+    elif stop_price_status == "available":
+        stop_bps = abs(stop_price - stop_basis) / abs(stop_basis) * 10_000.0
+    else:
+        stop_reason = ("invalid_stop_price" if stop_price_status == "invalid"
+                       else "missing_stop_distance")
+
+    return {
+        "reference_gross": reference,
+        "execution_drag": execution_drag,
+        "fee_cost": fee_cost_component,
+        "total_modeled_drag": total_component,
+        "stop_distance_basis": {
+            "field": stop_basis_field,
+            **_measurement(
+                stop_basis, unit="price",
+                reason=(None if stop_basis_status == "available" else
+                        f"{stop_basis_status}_{stop_basis_field}")),
+        },
+        "stop_distance_bps": _measurement(
+            stop_bps, unit="basis_points", reason=stop_reason),
+    }
+
+
+def _derived_distribution(rows: Sequence[Mapping[str, Any]], *, component: str,
+                          unit: str, dimension: str = "value") -> dict[str, Any]:
+    values: list[float] = []
+    missing = invalid = 0
+    for row in rows:
+        decomposition = _cost_decomposition(row)
+        current: Any = decomposition.get(component)
+        if dimension != "value":
+            current = current.get(dimension) if isinstance(current, Mapping) else None
+        if not isinstance(current, Mapping):
+            missing += 1
+            continue
+        value = _finite(current.get("value"))
+        if value is not None:
+            values.append(value)
+        elif (str(current.get("reason") or "").startswith("invalid") or
+              "invalid" in str(current.get("reason") or "")):
+            invalid += 1
+        else:
+            missing += 1
+    return {**_distribution(values), "missing": missing, "invalid": invalid,
+            "unit": unit}
+
+
+def _modeled_cost_distributions(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "reference_gross": _derived_distribution(
+            rows, component="reference_gross", unit="currency"),
+        "execution_drag": {
+            "currency": _derived_distribution(
+                rows, component="execution_drag", dimension="currency",
+                unit="currency"),
+            "r": _derived_distribution(
+                rows, component="execution_drag", dimension="r", unit="R"),
+        },
+        "fee_cost": {
+            "currency": _derived_distribution(
+                rows, component="fee_cost", dimension="currency",
+                unit="currency"),
+            "r": _derived_distribution(
+                rows, component="fee_cost", dimension="r", unit="R"),
+        },
+        "total_modeled_drag": {
+            "currency": _derived_distribution(
+                rows, component="total_modeled_drag", dimension="currency",
+                unit="currency"),
+            "r": _derived_distribution(
+                rows, component="total_modeled_drag", dimension="r", unit="R"),
+        },
+    }
+
+
+def _opportunity_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Build a deterministic, tamper-evident projection of signal outcomes."""
+    projected: list[dict[str, Any]] = []
+    for row in rows:
+        disposition = str(row.get("execution_disposition") or "").strip()
+        if disposition not in {"executed", "refused"} or \
+                row.get("signal_opportunity") is not True:
+            continue
+
+        def text(name: str) -> str | None:
+            value = row.get(name)
+            return None if value is None else str(value)
+
+        def number(name: str, *aliases: str) -> float | None:
+            value, _status = _number_field(row, name, *aliases)
+            return value
+
+        record: dict[str, Any] = {
+            "identity": {
+                "variant_id": text("_counterfactual_variant_id"),
+                "opportunity_id": text("opportunity_id"),
+                "session_date": text("session_date"),
+                "symbol": text("symbol"),
+                "vehicle": text("vehicle"),
+                "direction": text("direction"),
+                "contract": text("contract"),
+            },
+            "terminal": {
+                "execution_disposition": disposition,
+                "signal_opportunity": True,
+                "no_trade": row.get("no_trade")
+                if isinstance(row.get("no_trade"), bool) else None,
+                "reject_stage": text("reject_stage"),
+                "reject_reason": text("reject_reason"),
+            },
+            "levels": {
+                "entry_reference": number("entry_reference"),
+                "exit_reference": number("exit_reference"),
+                "entry_price": number("entry_price"),
+                "exit_price": number("exit_price"),
+                "plan_entry": number("plan_entry"),
+                "underlying_entry": number("underlying_entry"),
+                "stop_price": number("stop_price"),
+                "initial_stop_price": number("initial_stop_price"),
+                "active_stop_price": number("active_stop_price"),
+                "stop_distance": number("stop_distance"),
+                "target_price": number("target_price"),
+                "breakeven_r": number("breakeven_r"),
+                "breakeven_armed_at": text("breakeven_armed_at"),
+                "breakeven_armed_epoch": number("breakeven_armed_epoch"),
+                "exit_reason": text("exit_reason"),
+                "tie_broken": row.get("tie_broken")
+                if isinstance(row.get("tie_broken"), bool) else None,
+                "entry_gap_fill": row.get("entry_gap_fill")
+                if isinstance(row.get("entry_gap_fill"), bool) else None,
+                "exit_gap_fill": row.get("exit_gap_fill")
+                if isinstance(row.get("exit_gap_fill"), bool) else None,
+                "entry_timestamp": text("entry_timestamp"),
+                "exit_timestamp": text("exit_timestamp"),
+            },
+            "fill_provenance": {
+                "entry": {
+                    "source": text("entry_fill_source"),
+                    "feed": text("entry_feed"),
+                    "provider": text("entry_provider"),
+                    "quote_age_seconds": number("entry_quote_age_seconds"),
+                },
+                "exit": {
+                    "source": text("exit_fill_source"),
+                    "feed": text("exit_feed"),
+                    "provider": text("exit_provider"),
+                    "quote_age_seconds": number("exit_quote_age_seconds"),
+                },
+                "signal_bar": {
+                    "feed": text("signal_bar_feed"),
+                    "provider": text("signal_bar_provider"),
+                },
+                "entry_bar": {
+                    "feed": text("entry_bar_feed"),
+                    "provider": text("entry_bar_provider"),
+                },
+                "exit_bar": {
+                    "feed": text("exit_bar_feed"),
+                    "provider": text("exit_bar_provider"),
+                },
+                "evidence_mode": text("evidence_mode"),
+            },
+            "economics": {
+                "quantity": number("quantity", "contracts"),
+                "contract_multiplier": number("contract_multiplier", "multiplier"),
+                "gross_pnl": number("gross_pnl"),
+                "fee_cost": number("fee_cost", "fees", "costs"),
+                "costs": number("costs"),
+                "net_pnl": number("net_pnl"),
+                "risk_usd": number("risk_usd"),
+                "nominal_risk_usd": number("nominal_risk_usd"),
+                "realized_risk_usd": number("realized_risk_usd"),
+                "risk_per_unit": number("risk_per_unit"),
+                "realized_risk_per_unit": number("realized_risk_per_unit"),
+                "risk_budget": number("risk_budget"),
+                "entry_notional": number("entry_notional"),
+                "r_multiple": number("r_multiple"),
+                "return_value": number("return_value"),
+            },
+            "cost_decomposition": _cost_decomposition(row),
+            "terminal_validation": _terminal_error(row),
+        }
+        safe = _safe_json(record)
+        projected.append(safe)
+
+    projected.sort(key=lambda item: (
+        str(item["identity"].get("variant_id") or ""),
+        str(item["identity"].get("opportunity_id") or ""),
+        str(item["identity"].get("session_date") or ""),
+        content_hash(item),
+    ))
+    rows_with_hash: list[dict[str, Any]] = []
+    for item in projected:
+        row_hash = content_hash(item)
+        rows_with_hash.append({**item, "row_hash": row_hash})
+    rows_with_hash = _safe_json(rows_with_hash)
+    manifest = {
+        "schema": "counterfactual-opportunity-evidence.v1",
+        "diagnostic_only": True,
+        "authorizing": False,
+        "terminal_dispositions": ["executed", "refused"],
+        "excluded_dispositions": ["no_signal"],
+        "count": len(rows_with_hash),
+        "collection_hash": content_hash(rows_with_hash),
+    }
+    return {
+        "schema": "counterfactual-opportunity-evidence.v1",
+        "diagnostic_only": True,
+        "authorizing": False,
+        "terminal_dispositions": ["executed", "refused"],
+        "excluded_dispositions": ["no_signal"],
+        "rows": rows_with_hash,
+        "count": len(rows_with_hash),
+        "collection_hash": manifest["collection_hash"],
+        "manifest_hash": content_hash(manifest),
+    }
+
+
+def _counterfactual_scope() -> dict[str, Any]:
+    return {
+        "schema": "counterfactual-scope.v1",
+        "diagnostic_only": True,
+        "authorizing": False,
+        "stateful": True,
+        "stateful_replay": True,
+        "path_dependent": True,
+        "same_corpus_two_arm_replay": True,
+        "per_opportunity_isolated_replay_available": False,
+        "randomized_null_available": False,
+        "per_opportunity_isolated_replay": {
+            "available": False,
+            "reason": "deferred; replay state is shared across the opportunity path",
+        },
+        "randomized_null": {
+            "available": False,
+            "reason": "deferred; this report does not randomize opportunity assignment",
+        },
+        "limitation": (
+            "arm outcomes are stateful and path-dependent; evidence is descriptive "
+            "and cannot establish an isolated per-opportunity causal effect"),
+    }
+
+
 def _terminal_error(row: Mapping[str, Any]) -> str | None:
     disposition = str(row.get("execution_disposition") or "").strip()
     if disposition not in TERMINAL_DISPOSITIONS:
@@ -342,8 +786,10 @@ def _summarize(rows: Sequence[Mapping[str, Any]], *,
     reasons = Counter()
     malformed = Counter()
     signal_opportunities = 0
+    gross_pnl = 0.0
     net_pnl = 0.0
     returns: list[float] = []
+    gross_values: list[float] = []
     valid_rows: list[Mapping[str, Any]] = []
     keys = Counter(
         (str(row.get("_counterfactual_variant_id") or "").strip(),
@@ -380,6 +826,10 @@ def _summarize(rows: Sequence[Mapping[str, Any]], *,
     executed = [row for row in valid_rows
                 if row.get("execution_disposition") == "executed"]
     for row in executed:
+        pnl = _finite(row.get("gross_pnl"))
+        if pnl is not None:
+            gross_pnl += pnl
+            gross_values.append(pnl)
         pnl = _finite(row.get("net_pnl"))
         if pnl is not None:
             net_pnl += pnl
@@ -412,6 +862,12 @@ def _summarize(rows: Sequence[Mapping[str, Any]], *,
     exit_sources = Counter(str(row.get("exit_fill_source") or "").strip()
                            for row in executed
                            if str(row.get("exit_fill_source") or "").strip())
+    exit_reasons = Counter(str(row.get("exit_reason") or "").strip()
+                           for row in executed
+                           if str(row.get("exit_reason") or "").strip())
+    opportunity_rows = [row for row in valid_rows
+                        if row.get("signal_opportunity") is True and
+                        row.get("execution_disposition") in {"executed", "refused"}]
     stressed = int(reasons.get("stressed_cost_risk_limit", 0))
     denominator = signal_opportunities
     return {
@@ -432,6 +888,15 @@ def _summarize(rows: Sequence[Mapping[str, Any]], *,
         "trades": len(executed),
         "execution_admission_rate": (len(executed) / denominator
                                      if denominator else None),
+        "gross_pnl": gross_pnl,
+        "gross_pnl_measurement": {**_distribution(gross_values),
+                                   "missing": sum(
+                                       row.get("gross_pnl") is None
+                                       for row in executed),
+                                   "invalid": sum(
+                                       row.get("gross_pnl") is not None and
+                                       _finite(row.get("gross_pnl")) is None
+                                       for row in executed)},
         "net_pnl": net_pnl,
         "mean_return_value": (sum(returns) / len(returns) if returns else None),
         "net_pnl_measurement": _numeric_summary(executed, "net_pnl"),
@@ -445,6 +910,10 @@ def _summarize(rows: Sequence[Mapping[str, Any]], *,
             "entry": dict(sorted(entry_sources.items())),
             "exit": dict(sorted(exit_sources.items())),
         },
+        "exit_reasons": dict(sorted(exit_reasons.items())),
+        "stop_bps": _derived_distribution(
+            opportunity_rows, component="stop_distance_bps", unit="basis_points"),
+        "modeled_costs": _modeled_cost_distributions(opportunity_rows),
         "target_reach": {
             "executed_trades": len(executed),
             "target_defined_trades": target_defined,
@@ -509,16 +978,31 @@ def _transition_state(row: Mapping[str, Any]) -> str:
 
 
 def _outcome_signature(row: Mapping[str, Any]) -> str:
-    """Hash economically relevant output while excluding the changed limit."""
+    """Hash output and stop/fill evidence while excluding the changed limit."""
     keys = (
-        "execution_disposition", "reject_stage", "reject_reason", "quantity",
-        "entry_price", "exit_price", "gross_pnl", "costs", "net_pnl",
-        "risk_usd", "nominal_risk_usd", "realized_risk_usd", "r_multiple",
-        "return_value", "exit_reason",
+        "execution_disposition", "reject_stage", "reject_reason", "vehicle",
+        "symbol", "direction", "contract", "quantity", "contract_multiplier",
+        "entry_reference", "exit_reference", "entry_price", "exit_price",
+        "plan_entry", "underlying_entry", "stop_price", "initial_stop_price",
+        "active_stop_price", "stop_distance", "target_price", "breakeven_r",
+        "breakeven_armed_at", "gross_pnl", "costs", "net_pnl", "risk_usd",
+        "nominal_risk_usd", "realized_risk_usd", "risk_per_unit",
+        "realized_risk_per_unit", "r_multiple", "return_value",
+        "exit_reason", "entry_fill_source", "exit_fill_source", "entry_feed",
+        "exit_feed", "entry_provider", "exit_provider", "entry_option_feed",
+        "exit_option_feed", "entry_quote_age_seconds", "exit_quote_age_seconds",
+        "entry_slippage_reference", "entry_slippage", "entry_gap_fill",
+        "exit_gap_fill", "entry_timestamp", "exit_timestamp", "tie_broken",
+        "evidence_mode",
     )
     def sanitized(value: Any) -> Any:
-        if value is None or isinstance(value, (bool, str)):
+        if value is None or isinstance(value, (bool, str, int)):
             return value
+        if isinstance(value, Mapping):
+            return {str(key): sanitized(item) for key, item in sorted(
+                value.items(), key=lambda pair: str(pair[0]))}
+        if isinstance(value, (list, tuple)):
+            return [sanitized(item) for item in value]
         number = _finite(value)
         return number if number is not None else {"invalid": type(value).__name__}
 
@@ -841,6 +1325,7 @@ def run_counterfactual(
                 "production_mutation": False,
                 "summary": _summarize(
                     combined, observation_unit="variant_trade"),
+                "opportunity_evidence": _opportunity_evidence(combined),
                 "section_05_measurement": _clustered_section_05(
                     combined, draws=draws, min_clusters=minimum_clusters,
                     block_length=block_length,
@@ -929,6 +1414,7 @@ def run_counterfactual(
         "promotion_allowed": False,
         "production_mutation": False,
         "proofs": [],
+        "scope": _counterfactual_scope(),
         "primary_endpoint": "stressed_cost_risk_limit refusal rate",
         "dataset_hash": dataset_hash,
         "frozen_variant_ids": variant_ids,

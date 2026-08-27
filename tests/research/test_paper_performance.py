@@ -1,10 +1,8 @@
 """Live paper results per edge, readable rather than only actionable.
 
-The ledger already consumed paper outcomes to *demote* a degraded edge, but
-nothing could read them back, so "which of my edges is working" could only be
-answered with the confidence its proof had at promotion time.  These tests pin
-the read surface, and pin it to the same numbers the demotion guards use — a
-report that disagreed with the guard would be worse than no report.
+The ledger consumes paper outcomes for held-out drift safety and exposes the
+overlapping fixed-window rolling-R signal as advisory telemetry.  These tests
+pin the read surface to the same numbers the surveillance uses.
 """
 
 from contextlib import closing
@@ -79,6 +77,8 @@ class PaperPerformanceTests(unittest.TestCase):
             self.assertIsNone(report["mean_r"])
             self.assertIsNone(report["win_rate"])
             self.assertFalse(report["rolling"]["armed"])
+            self.assertFalse(report["rolling"]["authoritative"])
+            self.assertEqual(report["rolling"]["action"], "warning_only")
             self.assertFalse(report["drift"]["applicable"])
 
     def test_unknown_candidate_raises(self):
@@ -116,17 +116,21 @@ class PaperPerformanceTests(unittest.TestCase):
             report = ledger.paper_performance(candidate)
             self.assertTrue(report["rolling"]["armed"])
             self.assertTrue(report["rolling"]["breached"])
+            self.assertFalse(report["rolling"]["authoritative"])
+            self.assertEqual(report["rolling"]["action"], "warning_only")
 
-    def test_a_deployed_edge_that_breaches_is_reported_as_demoted(self):
-        """The report and the guard must agree about what happened."""
+    def test_a_deployed_edge_that_breaches_is_reported_as_warning_only(self):
+        """The report preserves the threshold without claiming authority."""
         with tempfile.TemporaryDirectory() as directory:
             ledger = _ledger(directory)
             candidate = _candidate(ledger, status="validated")
             _outcomes(ledger, candidate, [-0.5] * PAPER_DEMOTION_MIN_OUTCOMES)
             report = ledger.paper_performance(candidate)
             self.assertTrue(report["rolling"]["breached"])
-            self.assertEqual(report["status"], "demoted")
-            self.assertFalse(report["deployed"])
+            self.assertFalse(report["rolling"]["authoritative"])
+            self.assertEqual(report["rolling"]["action"], "warning_only")
+            self.assertEqual(report["status"], "validated")
+            self.assertTrue(report["deployed"])
 
     def test_drift_reports_its_own_prerequisites(self):
         with tempfile.TemporaryDirectory() as directory:

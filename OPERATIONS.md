@@ -330,8 +330,9 @@ substituting something else.
 
 **What changes once an edge is pinned.** The pin records the operator-selected
 identity and promotion context; it does not disable lifecycle stops. The
-rolling-R guard, sequential drift test, and trial review still run, and a
-breach parks or demotes the edge so runtime selection fails closed. The pin
+sequential drift test and trial review still run, and an authoritative breach
+parks or demotes the edge so runtime selection fails closed. The rolling-R
+monitor remains visible but advisory. The pin
 context remains in the transition/audit record. Removing a pinned edge is an
 edit to `config.yaml` and a restart — the same route in and out. Runtime risk
 limits (daily loss limit, open risk, position caps) are unaffected: those are
@@ -654,7 +655,7 @@ python research.py edge paper --vehicle equity --deployed
 ```
 
 This reports per-edge trade and session counts, total and mean R, win rate, net
-P&L, the rolling-R demotion guard with its floor, and the sequential drift
+P&L, the advisory rolling-R monitor with its floor, and the sequential drift
 statistic against the held-out distribution the edge was validated on. It is
 the forward counterpart to `edge status`, which reports only lifecycle state
 and the confidence an edge was promoted with. The command is read-only and

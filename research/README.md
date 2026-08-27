@@ -680,10 +680,10 @@ plane deliberately cannot fall back to the trader's account or credentials.
 
 A proved edge that is not pinned trades the same Alpaca paper account, and its real fills
 accumulate as `paper_outcomes`, each carrying the exact passing shadow
-`proof_run_id` that authorized entry. After the trial window —
-`research.trial` config, default 30 sessions and 100 trades — that proof epoch
-is judged against an explicit floor (total R and mean R both positive by
-default):
+`proof_run_id` that authorized entry. After the trial window — the standalone
+module fallback is 30 sessions/100 trades, while the shipped validated runtime
+configuration supplies 20 sessions/20 trades — that proof epoch is judged
+against an explicit floor (total R and mean R both positive by default):
 
 - **Clears it** → the edge keeps trading and becomes *promotable*. Nothing is
   promoted; `edge promotable` hands the operator the config block.
@@ -694,11 +694,12 @@ default):
 - **Window still open, or outcomes carry no usable R** → nothing happens.
   Underpowered is not failure here either.
 
-A pinned edge is still judged. The rolling-R guard, sequential drift stop, and
-trial review run for pinned identities just as they do for automatic selections;
-a failed guard parks or demotes the edge and records the pin context for audit.
-Pinning selects an identity and prevents silent substitution, but never bypasses
-authorization or a hard lifecycle stop.
+A pinned edge is still judged. The sequential drift stop and trial review run
+for pinned identities just as they do for automatic selections; an authoritative
+failure parks or demotes the edge and records the pin context for audit. The
+20-outcome rolling-R calculation remains visible as advisory telemetry but does
+not itself change lifecycle state. Pinning selects an identity and prevents
+silent substitution, but never bypasses authorization or a hard lifecycle stop.
 
 ```bash
 python research.py edge trials --dry-run   # verdicts, changing nothing
@@ -817,7 +818,12 @@ summaries. Incomplete, ambiguous, or path-dependent pairs fail the top-level
 controlled-change invariant and cannot support a direct causal interpretation.
 Each arm reports empirical `r_multiple` (R) distributions,
 including mean and sample sigma, trades per session, target definition/hit
-counts, costs, stressed-cost-to-risk values, entry slippage, and fill sources.
+counts, gross/fee/net economics, modeled execution-drag decomposition when the
+references permit it, stop geometry, exit reasons, stressed-cost-to-risk values,
+entry slippage, and fill sources. Compact signal-opportunity evidence is sorted,
+JSON-safe, content-addressed per row, and bound by a collection hash. This makes
+the replay reproducible without making its stateful account path a causal or
+authorizing result.
 The diagnostic Section 0.5 measurement includes a 95% moving-block
 session-cluster bootstrap interval and clustered MDE/power at alpha .05 for a
 `.05R` effect; uncertainty is data-derived and no fixed `0.38R` width is
@@ -865,8 +871,8 @@ python research.py edge paper --vehicle equity --deployed
 
 `edge status` reports lifecycle state; `edge paper` reports how each edge is
 actually doing on live paper outcomes — trade and session counts, total and
-mean R, win rate, net P&L, the registered rolling-R guard with its floor, and
-the sequential drift statistic against the held-out distribution the edge was
+mean R, win rate, net P&L, the advisory rolling-R monitor with its floor, and
+the authoritative sequential drift statistic against the held-out distribution the edge was
 validated on. The live view is limited to the latest passing shadow proof epoch,
 so “what it has done since” means since the proof currently authorizing it, not
 the candidate's lifetime. Both matter: the first is the evidence an edge was

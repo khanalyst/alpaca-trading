@@ -78,6 +78,9 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
             plan, cfg=self.config)
         self.assertIsNotNone(runtime)
         self.assertIsNone(runtime_reason)
+        self.assertLessEqual(
+            row["stressed_cost_to_risk_ratio"],
+            self.policy.max_stressed_cost_to_risk_ratio)
 
         # The factory row carries the canonical runtime telemetry, not a local
         # description or an independently rounded stress calculation.
@@ -107,6 +110,9 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
         self.assertTrue(candidate_row["no_trade"])
         self.assertEqual(candidate_row["reject_reason"],
                          "stressed_cost_risk_limit")
+        self.assertGreater(
+            candidate_row["stressed_cost_to_risk_ratio"],
+            self.policy.max_stressed_cost_to_risk_ratio)
 
         # A rejected row intentionally carries only rejection telemetry, not a
         # submit-ready quantity.  The no-stress reference is the sized plan

@@ -2724,9 +2724,11 @@ class DeployTests(unittest.TestCase):
             self.assertAlmostEqual(winner["total_r"], 2.5)
             self.assertAlmostEqual(winner["net_pnl"], 250.0)
             self.assertEqual(winner["guard"], "3/20")
+            self.assertFalse(winner["rolling_authoritative"])
+            self.assertEqual(winner["rolling_action"], "warning_only")
 
     def test_dashboard_paper_guard_thresholds_track_the_ledger(self):
-        """The dashboard restates the guard rather than importing it."""
+        """The dashboard restates the advisory monitor without importing it."""
         from research.edge_ledger import (PAPER_DEMOTION_MIN_OUTCOMES,
                                           PAPER_DEMOTION_R_FLOOR)
         self.assertEqual(dashboard.PAPER_ROLLING_WINDOW,

@@ -817,8 +817,8 @@ python research.py edge paper --deployed
 ```
 
 This reports, per edge: trades, sessions, total and mean R, win rate, net P&L,
-the rolling-R demotion guard with its floor and whether it is armed, and the
-sequential drift statistic measured against the held-out distribution the edge
+the advisory rolling-R monitor with its floor and whether it is armed, and the
+authoritative sequential drift statistic measured against the held-out distribution the edge
 was validated on. An edge that stops working shows up here before it is
 retired.
 
@@ -862,8 +862,9 @@ When a candidate finally earns a live-shadow proof:
    itself is frozen and never re-tuned; the slot goes back to searching.
 
 A deployed edge can still be **retired** — not re-tuned — if live paper results
-degrade past the rolling-R floor or the sequential drift boundary. `edge paper`
-is where you see that coming.
+cross the sequential drift boundary or fail the configured trial review. A
+rolling-R floor breach is an early warning, not a lifecycle transition. `edge
+paper` is where you see all three.
 
 ## 16. Daily operation
 

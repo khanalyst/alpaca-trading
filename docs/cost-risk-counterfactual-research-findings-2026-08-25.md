@@ -1,5 +1,10 @@
 # Cost-risk counterfactual and research-learning findings
 
+> Subsequent independent validation and the bounded remediation are recorded in
+> [research-findings-validation-and-remediation-2026-08-26.md](research-findings-validation-and-remediation-2026-08-26.md).
+> That note corrects unsupported cost/random-null/rolling-guard interpretations
+> without changing this report's historical artifact measurements.
+
 - **Report date:** 2026-08-25
 - **Vehicle/feed:** US equity / Alpaca IEX
 - **Measurement code commit:** `5644388c7ad0ca57583a438df0761457a5e0ad5e`

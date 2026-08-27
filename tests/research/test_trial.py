@@ -3,7 +3,8 @@
 Backtests say what would have worked; only a live paper book says what does.
 These tests pin three things: that a trial window is judged on a real sample
 and not on noise, that a failed trial teaches the search something rather than
-only changing a status, and that a pinned edge still fails closed on safety.
+only changing a status, and that trial review remains independent from the
+rolling paper warning.
 """
 
 from contextlib import closing
@@ -71,8 +72,8 @@ class TrialPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ledger, _factory, _hypothesis = _ledgers(directory)
             candidate = _candidate(ledger, "rule.a.1")
-            # Losing, but gently enough that the separate rolling-R guard does
-            # not fire: this test is about the trial lane, not that guard.
+            # Losing, but gently enough that the separate rolling-R monitor
+            # does not warn: this test is about the trial lane, not telemetry.
             _outcomes(ledger, candidate, [-0.05] * 30)
             result = review_trials(
                 ledger.path,
@@ -163,7 +164,7 @@ class PinnedEdgeTests(unittest.TestCase):
                          if item["event_type"] == "safety_demotion")
             self.assertTrue(json.loads(event["payload_json"])["pinned"])
 
-    def test_a_guard_breach_on_a_pinned_edge_demotes_and_records_pin(self):
+    def test_a_rolling_guard_breach_on_a_pinned_edge_is_advisory(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger, _factory, _hypothesis = _ledgers(directory)
             candidate = _candidate(ledger, "rule.pinned.2")
@@ -173,26 +174,27 @@ class PinnedEdgeTests(unittest.TestCase):
                     "session_date": f"2026-05-{index % 28 + 1:02d}",
                     "net_pnl": -100.0, "risk_usd": 100.0}, frozen=True)
             self.assertTrue(summary["frozen"])
-            self.assertEqual(summary["guard_breach"], "rolling_r_guard")
-            self.assertEqual(ledger.candidate(candidate)["status"], "demoted")
+            self.assertTrue(summary["rolling_guard_breached"])
+            self.assertIsNone(summary["guard_breach"])
+            self.assertEqual(ledger.candidate(candidate)["status"], "validated")
             demotions = [json.loads(event["payload_json"])
                          for event in ledger.history(candidate)
                          if event["event_type"] == "safety_demotion"]
-            self.assertTrue(demotions)
-            self.assertTrue(demotions[-1]["pinned"])
-            self.assertEqual(demotions[-1]["action"], "demote_and_pause")
+            self.assertEqual(demotions, [])
 
-    def test_the_same_breach_demotes_an_unpinned_edge(self):
-        """The guard is unchanged; only who acts on it moves."""
+    def test_the_same_rolling_breach_is_advisory_for_an_unpinned_edge(self):
+        """Pinning does not change the rolling signal's authority."""
         with tempfile.TemporaryDirectory() as directory:
             ledger, _factory, _hypothesis = _ledgers(directory)
             candidate = _candidate(ledger, "rule.auto.1")
             for index in range(25):
-                ledger.ingest_paper_outcome(candidate, {
+                summary = ledger.ingest_paper_outcome(candidate, {
                     "opportunity_id": f"op{index}",
                     "session_date": f"2026-05-{index % 28 + 1:02d}",
                     "net_pnl": -100.0, "risk_usd": 100.0})
-            self.assertEqual(ledger.candidate(candidate)["status"], "demoted")
+            self.assertTrue(summary["rolling_guard_breached"])
+            self.assertIsNone(summary["guard_breach"])
+            self.assertEqual(ledger.candidate(candidate)["status"], "validated")
 
 
 class LiveLessonTests(unittest.TestCase):

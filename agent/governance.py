@@ -8,9 +8,10 @@ down: a list of entries, each carrying an id the operator assigns, naming an
 exact ``variant_id`` and vehicle.  Pinning selects; it never authorizes — a
 pinned entry still has to resolve to a ``validated``/``champion`` ledger record
 with a re-verified passing proof, so writing an id into a file cannot conjure
-an edge that never earned one.  Pinning also cannot override hard safety
-guards: rolling-R, drift, and trial failures demote the edge and record the
-promotion context so runtime selection fails closed.  It only prevents an
+an edge that never earned one.  Pinning also cannot override hard lifecycle
+stops: sequential drift and trial failures demote the edge and record the
+promotion context so runtime selection fails closed.  Rolling-R remains
+advisory telemetry.  Pinning only prevents an
 automatic selector from silently substituting a different proved edge.
 
 *What the configuration said.*  Every distinct configuration the runtime loads

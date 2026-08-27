@@ -12,9 +12,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
+from agent.config import validate_config
+from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
+                                  RULE_SCHEMA_V2, RULE_SCHEMA_V3,
                                   rule_variant_id)
 from research.edge_lab import EdgeLedger
+from research.costs import CostModel, ReplayPolicy
 from research.factory_core import (
     MAX_DISCOVERY_ATTEMPTS, discovery_hypothesis, discovery_spec,
     initial_hypotheses, template_hypothesis,
@@ -22,8 +25,8 @@ from research.factory_core import (
 from research.factory_ledger import ACTIVE_HYPOTHESIS_STATES, FactoryLedger
 from research.llm_strategy import DISCOVERY_SCHEMA, ProposalResult
 from research.strategy_factory import (
-    _discovery_context, _ensure_slots, _proved_families, _seed_slot,
-    _slot_reseeds,
+    _discovery_context, _ensure_slots, _execution_geometry_context,
+    _proved_families, _seed_slot, _slot_reseeds,
 )
 
 STRATEGIES = 7
@@ -55,6 +58,65 @@ def _prove_every_active_slot(factory, vehicle="equity"):
 
 
 class SlotStateTests(unittest.TestCase):
+    def test_discovery_context_exposes_configuration_only_execution_geometry(self):
+        config = validate_config({})
+        geometry = _execution_geometry_context(
+            vehicle="equity",
+            costs=CostModel.from_config(config, vehicle="equity"),
+            policy=ReplayPolicy.from_config(config),
+        )
+        context = _discovery_context(
+            slot=0, reason="fresh_slot", previous={}, tried_families=set(),
+            proved_families=(), execution_geometry=geometry)
+
+        self.assertEqual(context["execution_geometry"]["scenario_bps"], 25.0)
+        self.assertEqual(
+            context["execution_geometry"]["max_stressed_cost_to_risk_ratio"],
+            0.30)
+        self.assertAlmostEqual(
+            context["execution_geometry"]["required_stop_distance_bps"],
+            25.0 / 0.30)
+        self.assertEqual(
+            context["execution_geometry"]["grammar_stop_floor_bps"],
+            MIN_STOP_DISTANCE_BPS)
+        self.assertFalse(
+            context["execution_geometry"]["grammar_stop_floor_admissible"])
+        self.assertEqual(
+            context["execution_geometry"]["expected_symmetric_bar_round_trip_bps"],
+            17.0)
+        self.assertEqual(
+            context["execution_geometry"]["expected_executable_quote_round_trip_bps"],
+            13.0)
+        self.assertTrue(context["execution_geometry"]["diagnostic_only"])
+        self.assertFalse(context["execution_geometry"]["authorizing"])
+        self.assertTrue(
+            context["execution_geometry"][
+                "expected_cost_calibration_independent_of_stress"])
+        self.assertNotIn("outcomes", context["execution_geometry"])
+        self.assertNotIn("heldout", context["execution_geometry"])
+
+    def test_option_geometry_marks_stop_formula_unavailable(self):
+        config = validate_config({})
+        geometry = _execution_geometry_context(
+            vehicle="option",
+            costs=CostModel.from_config(config, vehicle="option"),
+            policy=ReplayPolicy.from_config(config),
+        )
+        context = _discovery_context(
+            slot=0, reason="fresh_slot", previous={}, tried_families=set(),
+            proved_families=(), execution_geometry=geometry)
+        option_geometry = context["execution_geometry"]
+
+        self.assertFalse(option_geometry["stop_distance_formula_available"])
+        self.assertIsNone(option_geometry["required_stop_distance_bps"])
+        self.assertIsNone(option_geometry["grammar_stop_floor_admissible"])
+        self.assertIn("plan-dependent", option_geometry[
+            "stop_distance_formula_unavailable_reason"])
+        self.assertIsNone(option_geometry[
+            "expected_symmetric_bar_round_trip_bps"])
+        self.assertIsNone(option_geometry[
+            "expected_executable_quote_round_trip_bps"])
+
     def test_validated_is_not_an_active_state(self):
         """The regression's root cause, stated directly."""
         self.assertNotIn("validated", ACTIVE_HYPOTHESIS_STATES)
@@ -341,6 +403,12 @@ class LLMDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             factory, edge = _ledgers(directory)
             briefs = []
+            config = validate_config({})
+            execution_geometry = _execution_geometry_context(
+                vehicle="equity",
+                costs=CostModel.from_config(config, vehicle="equity"),
+                policy=ReplayPolicy.from_config(config),
+            )
 
             class Adapter:
                 def discover(inner, *, vehicle, slot, context):
@@ -363,7 +431,8 @@ class LLMDiscoveryTests(unittest.TestCase):
             seeded, revived = _ensure_slots(
                 factory, edge, vehicle="equity", strategies=3,
                 existing_variant_ids=set(), llm_enabled=True,
-                llm_config={"model": "gpt-5"}, adapter=Adapter())
+                llm_config={"model": "gpt-5"}, adapter=Adapter(),
+                execution_geometry=execution_geometry)
             self.assertEqual(revived, [])
             self.assertEqual(len(seeded), 3)
             self.assertEqual({item["source"] for item in seeded},
@@ -372,6 +441,9 @@ class LLMDiscoveryTests(unittest.TestCase):
                              {"vwap_reversion"})
             self.assertEqual([brief["reason"] for brief in briefs],
                              ["fresh_slot"] * 3)
+            self.assertEqual(
+                [brief["execution_geometry"] for brief in briefs],
+                [execution_geometry] * 3)
             self.assertEqual(len(factory.active("equity")), 3)
 
     def test_each_genesis_slot_is_told_what_its_siblings_just_took(self):

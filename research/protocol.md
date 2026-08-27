@@ -241,10 +241,11 @@ rather than being substituted. It is the preferred live route because the
 operator-assigned id makes the promotion explicit and auditable; the legacy
 `selection_mode: specific` route remains supported for one exact proved
 variant. A pinned candidate is not exempt from automatic lifecycle stops: the
-rolling-R guard, sequential drift test, and trial review still evaluate it and a
-breach parks or demotes it. The operator-assigned pin identity and promotion
-fields are carried into the transition as audit context, while runtime risk
-limits remain independent safety controls.
+sequential drift test and trial review still evaluate it and an authoritative
+breach parks or demotes it. The overlapping rolling-R calculation remains an
+advisory monitor and cannot itself change lifecycle state. The operator-assigned
+pin identity and promotion fields are carried into any transition as audit
+context, while runtime risk limits remain independent safety controls.
 
 No automatic process may add, remove, or rewrite the operator's configuration
 pin. Lifecycle guards may nevertheless demote a pinned candidate and remove it

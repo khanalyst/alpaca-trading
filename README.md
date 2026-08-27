@@ -297,7 +297,7 @@ Four states, and only one transition a machine cannot make.
 | **Research** — hypotheses, variants, gates | the factory | yes, continuously |
 | **Proved** — `validated`/`champion` plus a live-shadow marker | the gates and live ingestion | yes, on evidence |
 | **Trial** — trading the same Alpaca paper account, with outcomes scoped to its authorizing shadow proof | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
-| **Pinned** — an id you wrote into `config.yaml` | **you only** | **yes, on a hard rolling-R, drift, or trial stop; the pin context is retained and no replacement is auto-selected** |
+| **Pinned** — an id you wrote into `config.yaml` | **you only** | **yes, on a sequential drift or trial stop; rolling-R is advisory, the pin context is retained, and no replacement is auto-selected** |
 
 Promotion is the one step that is never automatic. When an edge clears its
 trial, `research.py edge promotable` names the variant, shows what it actually
@@ -318,9 +318,10 @@ returned on the book, and prints the exact configuration block:
 
 Paste it, restart the trader, and the pin records the operator's selected
 identity and promotion context. Pinning does not exempt the edge from the
-rolling-R guard, sequential drift stop, or trial review: a breach still parks
-or demotes it and runtime selection fails closed, with the pin context retained
-for audit. Pinning selects, it never authorizes — a pinned entry still has to
+sequential drift stop or trial review: an authoritative breach still parks or
+demotes it and runtime selection fails closed, with the pin context retained
+for audit. The rolling-R monitor remains visible but advisory. Pinning selects,
+it never authorizes — a pinned entry still has to
 resolve to a proved ledger record with a re-verified passing proof, so an id in
 a file cannot put an unproved variant on the book. A pin that cannot resolve is
 reported rather than silently substituted.
@@ -480,7 +481,7 @@ lifecycle state:
   dashboard's "Proved edges" table.
 - **What has it done since?** `research.py edge paper` and the dashboard's
   "Live paper results by edge" table — trades, sessions, total and mean R, win
-  rate, net P&L, the rolling-R demotion guard, and the sequential drift
+  rate, net P&L, the advisory rolling-R monitor, and the sequential drift
   statistic against its validated held-out distribution.
 
 ## Quick start

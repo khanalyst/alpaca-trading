@@ -444,9 +444,10 @@ def record_paper_outcome(outcome: Mapping, *, candidate_id: str | None = None,
     """Append an observed paper outcome and return the resulting status.
 
     When ``config`` pins this variant, the outcome carries the promotion
-    context into the hard guard.  Pinning selects an identity but does not
-    exempt it from safety demotion; a breached pinned edge is removed from
-    runtime selection and the operator's promotion remains auditable.
+    context into the authoritative lifecycle guard. Pinning selects an identity
+    but does not exempt it from sequential-drift or trial demotion; a demoted
+    pinned edge is removed from runtime selection and the operator's promotion
+    remains auditable. Rolling-R telemetry is advisory.
     """
     ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
     cid = candidate_id or outcome.get("candidate_id")

@@ -2,8 +2,8 @@
 
 Backtests answer "would this have worked". Only a live paper book answers "does
 this work now", and until this existed that answer went nowhere: paper outcomes
-drove the demotion guards and were never read by the thing that proposes what
-to try next.
+drove surveillance and were never read by the thing that proposes what to try
+next.
 
 A trial is the window in which an auto-lane edge trades the same Alpaca paper
 account as the runtime and its real results are collected. When the window
