@@ -158,10 +158,19 @@ setting `ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY` to an audited digest that
 covers every selected partition byte plus the recorder calendar and partition-
 source sidecars. Path, size, and modification time are intentionally
 insufficient. `ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT` selects the immutable
-content-addressed store. Every hit re-hashes every member of the normalized,
-bar, quote, option, replay, and report bundle; corruption becomes a quarantined
-miss and is rebuilt atomically. Leaving the source identity unset disables the
-cache, which is the safe mode for the actively changing recorder corpus.
+content-addressed store. Recorder session partitions are streamed directly in
+filename order; the cycle does not build a merged CSV. Quarantine, vehicle
+selection, exact-calendar/provenance checks, option availability correction,
+and final view routing happen in that same pass. The canonical normalized file
+also supplies quote rows to backtest, so no corpus-sized quote-only copy is
+stored. Every cache hit re-hashes each normalized, bar, option, replay, and
+report artifact; corruption becomes a quarantined miss and is rebuilt
+atomically. On a miss, disposable outputs are moved into cache staging on the
+shared research-cache filesystem instead of being copied. Leaving the source
+identity unset disables the cache, which is the safe mode for the actively
+changing recorder corpus. If either cache path is overridden, keep `TMPDIR`
+and `ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT` on the same filesystem; the
+low-space publisher fails closed rather than falling back to a full copy.
 
 Historical catch-up may run Terra without contaminating authorization by
 setting `ALPACA_FACTORY_DIAGNOSTIC_ONLY=1`. The cycle then writes a separate

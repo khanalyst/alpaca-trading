@@ -332,6 +332,12 @@ class ScheduledResearchTests(unittest.TestCase):
         script = (Path(__file__).parents[2] / "deploy" / "research-cycle.sh").read_text()
         self.assertNotRegex(script, r"(?m)^\s*mapfile\b")
         self.assertNotIn('"${quote_flags[@]}"', script)
+        self.assertNotIn("merge_partitions", script)
+        self.assertNotIn("market-vehicles.jsonl", script)
+        self.assertNotIn("market-point-in-time.jsonl", script)
+        self.assertIn("--partition-root", script)
+        self.assertIn("--quotes-from-mixed", script)
+        self.assertIn("--consume-artifacts", script)
         # Bash 3.2 still supports the rest of this script's syntax.
         import subprocess
         result = subprocess.run(["bash", "-n", str(Path(__file__).parents[2] /

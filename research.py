@@ -224,6 +224,9 @@ def _quotes(args: argparse.Namespace):
     if not path:
         return None
     source = Path(path)
+    mixed_source = bool(getattr(args, "quotes_from_mixed", False))
+    quote_kinds = {"quote", "quote_snapshot", "equity_quote",
+                   "underlying_quote"}
     index = SQLiteQuoteIndex()
     try:
         with source.open(encoding="utf-8") as handle:
@@ -235,8 +238,11 @@ def _quotes(args: argparse.Namespace):
                     row = json.loads(line)
                     if not isinstance(row, dict):
                         raise ValueError("expected an object")
+                    kind = str(row.get("kind", "quote")).lower()
+                    if mixed_source and kind not in quote_kinds:
+                        continue
                     provider, feed = _validated_row_provenance(
-                        row, kind=str(row.get("kind", "quote")).lower(),
+                        row, kind=kind,
                         configured_provider=getattr(args, "provider", None),
                         configured_feed=getattr(args, "feed", None) or "iex")
                     index.add(normalize_quote(
@@ -1107,6 +1113,10 @@ def build_parser() -> argparse.ArgumentParser:
     ibr.add_argument("--symbol", default=None)
     ibr.add_argument("--quotes", default=None,
                      help="normalized quote JSONL used for boundary fills")
+    ibr.add_argument(
+        "--quotes-from-mixed", action="store_true",
+        help=("read only quote rows from --quotes, allowing the canonical "
+              "mixed market JSONL to replace a duplicate quote-only file"))
     ibr.add_argument("--provider", default=None)
     ibr.add_argument("--feed", default=None)
     ibr.add_argument("--vehicle", choices=("equity", "option", "both"), default="equity")

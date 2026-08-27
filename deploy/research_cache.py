@@ -10,6 +10,8 @@ form the cache key.
 Entries are published as complete directories under a per-key filesystem lock.
 Every lookup re-hashes every artifact before reporting a hit.  Invalid or
 partial entries are misses and, by default, are moved aside for inspection.
+Publication copies sources by default; callers handling disposable sources may
+explicitly opt into consuming them with ``consume_artifacts``.
 """
 
 from __future__ import annotations
@@ -253,6 +255,39 @@ def _copy_and_hash(source: Path, target: Path) -> tuple[str, int]:
         return digest.hexdigest(), total
     finally:
         os.close(source_descriptor)
+
+
+def _consume_and_hash(source: Path, target: Path) -> tuple[str, int]:
+    """Move one disposable source into staging, then hash its stable bytes.
+
+    ``os.replace`` is deliberately used instead of a copy fallback.  This
+    keeps the opt-in mode useful for low-space workflows and makes a
+    cross-filesystem invocation fail explicitly rather than silently defeating
+    its purpose.
+    """
+
+    try:
+        source_stat = source.lstat()
+    except OSError as exc:
+        raise CacheArtifactError(
+            f"cannot consume artifact source {source}: {exc}") from exc
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise CacheArtifactError(
+            f"artifact source is not a regular non-symlink file: {source}")
+    try:
+        os.replace(source, target)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            raise CacheArtifactError(
+                "cannot consume artifact across filesystems: "
+                f"cross-filesystem move is unavailable (EXDEV): {source}") from exc
+        raise CacheArtifactError(
+            f"cannot move consumed artifact {source}: {exc}") from exc
+    try:
+        return _sha256_regular_file(target)
+    except OSError as exc:
+        raise CacheArtifactError(
+            f"cannot hash consumed artifact {source}: {exc}") from exc
 
 
 def _remove_staging_tree(path: Path) -> None:
@@ -574,8 +609,15 @@ class ResearchArtifactCache:
         config_identity: Any = None,
         code_identity: Any = None,
         context_identity: Any = None,
+        consume_artifacts: bool = False,
     ) -> dict[str, Any]:
-        """Atomically publish a complete entry; never overwrite a valid one."""
+        """Atomically publish a complete entry; never overwrite a valid one.
+
+        By default sources are copied and remain available to the caller.  If
+        ``consume_artifacts`` is true, regular non-symlink sources are moved
+        into cache staging with ``os.replace`` while the key lock is held.
+        Consumed sources may be gone if publication later fails.
+        """
 
         identity, key = self._identity_and_key(
             source_identity=source_identity,
@@ -613,10 +655,14 @@ class ResearchArtifactCache:
                 for name, source in sorted(sources.items()):
                     destination = artifacts_path / name
                     try:
-                        digest, size = _copy_and_hash(source, destination)
+                        if consume_artifacts:
+                            digest, size = _consume_and_hash(source, destination)
+                        else:
+                            digest, size = _copy_and_hash(source, destination)
                     except OSError as exc:
+                        operation = "consume" if consume_artifacts else "copy"
                         raise CacheArtifactError(
-                            f"cannot copy artifact {name!r}: {exc}") from exc
+                            f"cannot {operation} artifact {name!r}: {exc}") from exc
                     os.chmod(destination, 0o444)
                     records[name] = {
                         "path": f"artifacts/{name}",
@@ -644,8 +690,14 @@ class ResearchArtifactCache:
                 # readers cannot observe it because publication and lookup
                 # share the per-key lock.
                 os.replace(staging_path, entry)
-                os.chmod(entry, 0o555)
-                _fsync_directory(self.entries)
+                try:
+                    os.chmod(entry, 0o555)
+                    _fsync_directory(self.entries)
+                except Exception:
+                    # A post-rename durability failure must not leave a
+                    # seemingly complete entry visible as a cache hit.
+                    _remove_staging_tree(entry)
+                    raise
             except Exception:
                 _remove_staging_tree(staging_path)
                 raise
@@ -687,6 +739,7 @@ def publish(
     config_identity: Any = None,
     code_identity: Any = None,
     context_identity: Any = None,
+    consume_artifacts: bool = False,
 ) -> dict[str, Any]:
     """Functional wrapper for :class:`ResearchArtifactCache.publish`."""
 
@@ -695,7 +748,8 @@ def publish(
         source_identity=source_identity,
         config_identity=config_identity,
         code_identity=code_identity,
-        context_identity=context_identity)
+        context_identity=context_identity,
+        consume_artifacts=consume_artifacts)
 
 
 def _add_identity_arguments(parser: argparse.ArgumentParser) -> None:
@@ -725,6 +779,9 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_identity_arguments(publish_parser)
     publish_parser.add_argument(
         "--artifact", action="append", default=[], metavar="NAME=PATH")
+    publish_parser.add_argument(
+        "--consume-artifacts", action="store_true",
+        help="move regular artifact sources into the cache instead of copying")
     return parser
 
 
@@ -789,7 +846,9 @@ def main(argv: list[str] | None = None) -> int:
                     quarantine_corrupt=not args.no_quarantine)
             else:
                 artifacts = _assignments(args.artifact, "--artifact")
-                result = cache.publish(artifacts, **identity_arguments)
+                result = cache.publish(
+                    artifacts, **identity_arguments,
+                    consume_artifacts=args.consume_artifacts)
         print(_canonical_json(result), flush=True)
         return 1 if result.get("status") == "miss" else 0
     except (ResearchCacheError, OSError, ValueError, TypeError) as exc:

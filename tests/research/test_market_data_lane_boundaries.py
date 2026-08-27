@@ -87,6 +87,31 @@ class BacktestFallbackConfigTests(unittest.TestCase):
         self.assertTrue(IBRConfig().policy.strict_market_data)
         self.assertTrue(ReplayPolicy().strict_market_data)
 
+    def test_mixed_quote_source_streams_only_quote_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "market.jsonl"
+            source.write_text("\n".join((
+                '{"kind":"bar","provider":"alpaca","feed":"iex",'
+                '"symbol":"SPY","timestamp":"2026-01-05T14:30:00+00:00",'
+                '"as_of":"2026-01-05T14:30:00+00:00",'
+                '"observed_at":"2026-01-05T14:30:00+00:00",'
+                '"open":100,"high":101,"low":99,"close":100,"volume":10}',
+                '{"kind":"quote","provider":"alpaca","feed":"iex",'
+                '"symbol":"SPY","timestamp":"2026-01-05T14:30:00+00:00",'
+                '"as_of":"2026-01-05T14:30:00+00:00",'
+                '"observed_at":"2026-01-05T14:30:00+00:00",'
+                '"bid":99.9,"ask":100.1}',
+            )) + "\n", encoding="utf-8")
+            args = Namespace(
+                quotes=str(source), quotes_from_mixed=True,
+                provider="alpaca", feed="iex")
+            index = research_cli._quotes(args)
+            self.assertIsNotNone(index)
+            try:
+                self.assertEqual(index.count, 1)
+            finally:
+                index.close()
+
 
 class ResearchCommandLaneConfigTests(unittest.TestCase):
     """CLI callers must forward the validated lane policy explicitly."""

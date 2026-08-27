@@ -280,41 +280,23 @@ fi
 
 dataset="${ALPACA_RESEARCH_DATASET:-}"
 dataset_from_recorder=0
+partition_root=""
 recorded_root="${ALPACA_RECORDED_DATASET_ROOT:-$repo_root/runtime/research/recorded}"
 if [[ "$recorded_root" != /* ]]; then
   recorded_root="$repo_root/$recorded_root"
 fi
 
+session_window="${ALPACA_RESEARCH_SESSION_WINDOW:-0}"
+case "$session_window" in
+  ''|*[!0-9]*)
+    finish "failed" "ALPACA_RESEARCH_SESSION_WINDOW must be a nonnegative integer" 3
+    ;;
+esac
+
 tmp_root="${TMPDIR:-/tmp}"
 mkdir -p "$tmp_root"
 tmp_dir="$(mktemp -d "$tmp_root/alpaca-research.XXXXXX")"
 emit_progress "preparing" 0 1 "steps" "both"
-
-# The recorder partitions its corpus by session date. Concatenate the requested
-# window of partitions once, in order, instead of keeping an unbounded file.
-merge_partitions() {
-  local root="$1"
-  local window="${ALPACA_RESEARCH_SESSION_WINDOW:-0}"
-  local merged="$tmp_dir/market.csv"
-  local -a files
-  files=()
-  # macOS ships Bash 3.2, which has no mapfile/readarray.  Read the sorted
-  # partition list with the POSIX-compatible read loop instead.
-  local listed_file
-  while IFS= read -r listed_file; do
-    [ -n "$listed_file" ] && files[${#files[@]}]="$listed_file"
-  done < <(ls -1 "$root"/market-*.csv 2>/dev/null | sort)
-  [ "${#files[@]}" -gt 0 ] || return 1
-  if [ "$window" -gt 0 ] && [ "${#files[@]}" -gt "$window" ]; then
-    files=("${files[@]: -$window}")
-  fi
-  head -n 1 "${files[0]}" > "$merged"
-  local file
-  for file in "${files[@]}"; do
-    tail -n +2 "$file" >> "$merged"
-  done
-  printf '%s' "$merged"
-}
 
 if [ -z "$dataset" ]; then
   dataset_from_recorder=1
@@ -324,26 +306,45 @@ if [ -z "$dataset" ]; then
       break
     fi
   done
+  if [ -z "$dataset" ] && [ -d "$recorded_root/sessions" ]; then
+    partition_root="$recorded_root/sessions"
+    dataset="$partition_root"
+  fi
+else
+  if [ "$dataset" != "-" ] && [[ "$dataset" != /* ]]; then
+    dataset="$repo_root/$dataset"
+  fi
+  if [ -d "$dataset/sessions" ]; then
+    partition_root="$dataset/sessions"
+    dataset="$partition_root"
+  elif [ -d "$dataset" ]; then
+    directory="$dataset"
+    dataset=""
+    for candidate in "$directory/market.jsonl" "$directory/market.csv"; do
+      if [ -s "$candidate" ]; then
+        dataset="$candidate"
+        break
+      fi
+    done
+  fi
 fi
-if [ -z "$dataset" ] && [ -d "$recorded_root/sessions" ]; then
-  dataset_from_recorder=1
-  dataset="$(merge_partitions "$recorded_root/sessions" || true)"
-fi
-if [ -n "$dataset" ] && [ -d "$dataset/sessions" ]; then
-  dataset="$(merge_partitions "$dataset/sessions" || true)"
-fi
-if [ -n "$dataset" ] && [ "$dataset" != "-" ] && [[ "$dataset" != /* ]]; then
-  dataset="$repo_root/$dataset"
-fi
-if [ -d "$dataset" ]; then
-  for candidate in "$dataset/market.jsonl" "$dataset/market.csv"; do
-    if [ -s "$candidate" ]; then
-      dataset="$candidate"
-      break
-    fi
-  done
-fi
-if [ -z "$dataset" ] || { [ "$dataset" != "-" ] && { [ -d "$dataset" ] || [ ! -s "$dataset" ]; }; }; then
+
+if [ -n "$partition_root" ]; then
+  partition_count="$($python_bin - "$partition_root" <<'PY'
+from pathlib import Path
+import re
+import sys
+root = Path(sys.argv[1])
+pattern = re.compile(r"market-\d{4}-\d{2}-\d{2}\.csv")
+print(sum(1 for item in root.iterdir()
+          if item.is_file() and item.stat().st_size > 0
+          and pattern.fullmatch(item.name)))
+PY
+)"
+  if [ "$partition_count" -eq 0 ]; then
+    finish "no_data" "recorded dataset unavailable" 2
+  fi
+elif [ -z "$dataset" ] || { [ "$dataset" != "-" ] && { [ -d "$dataset" ] || [ ! -s "$dataset" ]; }; }; then
   finish "no_data" "recorded dataset unavailable" 2
 fi
 
@@ -352,51 +353,21 @@ if [ "$dataset" = "-" ]; then
   validated_input="$tmp_dir/input.jsonl"
   cat > "$validated_input"
 fi
-if [ ! -s "$validated_input" ] || ! grep -q '[^[:space:]]' "$validated_input"; then
+if [ -z "$partition_root" ] && { [ ! -s "$validated_input" ] || ! grep -q '[^[:space:]]' "$validated_input"; }; then
   finish "no_data" "recorded dataset is empty" 2
 fi
 bars_input="$tmp_dir/bars.jsonl"
 options_input="$tmp_dir/options.jsonl"
-# Quotes are the executable price at a boundary fill instant. Routing them
-# into their own view keeps the bars-only replay input valid while letting the
-# shared cost/fill model use recorded quotes instead of bar prices.
-quotes_input="$tmp_dir/quotes.jsonl"
 replay_input="$tmp_dir/replay.jsonl"
 
 source_format="jsonl"
-[[ "$validated_input" == *.csv ]] && source_format="csv"
-# ``research_dataset.py`` intentionally normalizes recorder CSV columns. For
-# an explicitly external CSV, preserve exact calendar fields by first making a
-# temporary JSONL view; otherwise those fields would be discarded before the
-# production calendar gate could verify them.
-if [ "$source_format" = "csv" ] && [ "$dataset_from_recorder" -eq 0 ]; then
-  external_jsonl="$tmp_dir/external.jsonl"
-  "$python_bin" - "$validated_input" "$external_jsonl" <<'PY'
-import csv
-import json
-import sys
-source, target = sys.argv[1:]
-kinds = {"bar": "bar", "bar_1m": "bar", "quote": "quote",
-         "quote_snapshot": "quote", "option": "option_snapshot",
-         "option_snapshot": "option_snapshot", "option_quote": "option_snapshot"}
-with open(source, newline="", encoding="utf-8") as source_file, \
-        open(target, "w", encoding="utf-8") as target_file:
-    # Preserve CSV's one-line header offset in quarantine diagnostics.
-    target_file.write("\n")
-    for row in csv.DictReader(source_file):
-        # DictReader stores overflow CSV columns under a ``None`` key. Drop
-        # that malformed-column bucket here; validate-data still receives the
-        # named fields and can report semantic errors without JSON key sorting
-        # crashing first.
-        item = {key: value for key, value in row.items()
-                if key is not None and value not in (None, "")}
-        item["kind"] = kinds.get(str(row.get("event_type") or "").lower(),
-                                  str(row.get("event_type") or "").lower())
-        target_file.write(json.dumps(item, sort_keys=True) + "\n")
-PY
-  validated_input="$external_jsonl"
-  source_format="jsonl"
+if [ -n "$partition_root" ] || [[ "$validated_input" == *.csv ]]; then
+  source_format="csv"
 fi
+csv_mode="external"
+[ "$dataset_from_recorder" -eq 1 ] && csv_mode="recorder"
+partitioned=0
+[ -n "$partition_root" ] && partitioned=1
 
 # Reuse preprocessing only when the caller supplies an immutable source
 # identity that covers the selected partition bytes *and* recorder provenance
@@ -436,7 +407,7 @@ for name in sys.argv[1:]:
 print("sha256:" + digest.hexdigest())
 PY
 )"
-  cache_context_identity="format=$source_format;recorder=$dataset_from_recorder;vehicles=$vehicles;session_window=${ALPACA_RESEARCH_SESSION_WINDOW:-0};equity_feed=$configured_feed;option_feed=$configured_option_feed;bundle=normalized-bars-quotes-options-replay-v1"
+  cache_context_identity="format=$source_format;csv_mode=$csv_mode;recorder=$dataset_from_recorder;partitioned=$partitioned;vehicles=$vehicles;session_window=$session_window;equity_feed=$configured_feed;option_feed=$configured_option_feed;bundle=normalized-bars-options-replay-v2-stream"
   set +e
   cache_lookup_output="$($python_bin "$repo_root/deploy/research_cache.py" lookup \
     --cache-root "$cache_root" \
@@ -457,7 +428,7 @@ else
 fi
 
 cache_artifact_path() {
-  "$python_bin" - "$cache_lookup_output" "$1" <<'PY'
+  "$python_bin" - "$1" "$2" <<'PY'
 import json
 import sys
 payload = json.loads(sys.argv[1])
@@ -470,254 +441,75 @@ PY
 }
 
 if [ "$preprocess_cache_hit" -eq 1 ]; then
-  validated_input="$(cache_artifact_path validated)" || \
+  validated_input="$(cache_artifact_path "$cache_lookup_output" validated)" || \
     finish "failed" "preprocessing cache has no validated artifact" 3
-  bars_input="$(cache_artifact_path bars)" || \
+  bars_input="$(cache_artifact_path "$cache_lookup_output" bars)" || \
     finish "failed" "preprocessing cache has no bars artifact" 3
-  quotes_input="$(cache_artifact_path quotes)" || \
-    finish "failed" "preprocessing cache has no quotes artifact" 3
-  options_input="$(cache_artifact_path options)" || \
+  options_input="$(cache_artifact_path "$cache_lookup_output" options)" || \
     finish "failed" "preprocessing cache has no options artifact" 3
-  replay_input="$(cache_artifact_path replay)" || \
+  replay_input="$(cache_artifact_path "$cache_lookup_output" replay)" || \
     finish "failed" "preprocessing cache has no replay artifact" 3
-  cache_dataset_report="$(cache_artifact_path dataset_report)" || \
+  cache_dataset_report="$(cache_artifact_path "$cache_lookup_output" dataset_report)" || \
     finish "failed" "preprocessing cache has no dataset report" 3
-  cache_vehicle_report="$(cache_artifact_path vehicle_report)" || \
+  cache_vehicle_report="$(cache_artifact_path "$cache_lookup_output" vehicle_report)" || \
     finish "failed" "preprocessing cache has no vehicle report" 3
   dataset_report="$(cat "$cache_dataset_report")"
   vehicle_filter_status="$(cat "$cache_vehicle_report")"
   printf '%s\n' "$vehicle_filter_status" >&2
 else
-normalized_input="$tmp_dir/market.jsonl"
-# Preserve the append-only recorder corpus byte-for-byte. Only the temporary
-# research view quarantines the known legacy point-in-time inversion; malformed
-# timestamps, symbols, values, and event kinds remain for validate-data to
-# reject as hard integrity failures.
-dataset_report="$("$python_bin" "$repo_root/deploy/research_dataset.py" "$validated_input" \
-  --format "$source_format" --normalized "$normalized_input" \
-  --bars "$bars_input" --quotes "$quotes_input" --options "$options_input" \
-  --replay "$replay_input")"
-validated_input="$normalized_input"
-
-# Scope the normalized stream to the selected research lanes without mutating
-# the append-only source corpus.  In an equity-only cycle, option rows are
-# diagnostic context only and must not reach calendar/provenance validation,
-# replay, or factory workers.  Option/all retains them for strict OPRA checks.
-vehicle_input="$tmp_dir/market-vehicles.jsonl"
-set +e
-vehicle_filter_status="$("$python_bin" - "$validated_input" "$vehicle_input" "$vehicles" <<'PY'
+  normalized_input="$tmp_dir/market.jsonl"
+  # Read recorder partitions in filename order and apply quarantine, vehicle
+  # selection, calendar/provenance checks, point-in-time correction, and final
+  # view routing in one pass. The append-only source remains byte-for-byte
+  # untouched and no merged CSV or intermediate full-stream JSONL is created.
+  preprocess_args=(
+    --format "$source_format"
+    --csv-mode "$csv_mode"
+    --normalized "$normalized_input"
+    --bars "$bars_input"
+    --options "$options_input"
+    --replay "$replay_input"
+    --selected-vehicles "$vehicles"
+    --agent-config "$agent_config"
+    --recorded-root "$recorded_root"
+  )
+  if [ "$dataset_from_recorder" -eq 1 ]; then
+    preprocess_args+=(--from-recorder)
+  fi
+  set +e
+  if [ -n "$partition_root" ]; then
+    preprocess_result="$("$python_bin" "$repo_root/deploy/research_dataset.py" \
+      --partition-root "$partition_root" --session-window "$session_window" \
+      "${preprocess_args[@]}" 2>&1)"
+  else
+    preprocess_result="$("$python_bin" "$repo_root/deploy/research_dataset.py" \
+      "$validated_input" "${preprocess_args[@]}" 2>&1)"
+  fi
+  preprocess_status=$?
+  set -e
+  if [ "$preprocess_status" -ne 0 ]; then
+    finish "failed" "research stream preprocessing failed: ${preprocess_result:-unknown error}" 3
+  fi
+  dataset_report="$("$python_bin" - "$preprocess_result" <<'PY'
 import json
 import sys
-
-source, target, raw_vehicles = sys.argv[1:]
-selected = {item for item in raw_vehicles.split() if item}
-option_kinds = {"option", "option_snapshot", "option_quote"}
-excluded = 0
-with open(source, encoding="utf-8") as source_file, \
-        open(target, "w", encoding="utf-8") as target_file:
-    for line in source_file:
-        if not line.strip():
-            continue
-        payload = json.loads(line)
-        if (str(payload.get("kind", "")).lower() in option_kinds
-                and "option" not in selected):
-            excluded += 1
-            continue
-        target_file.write(json.dumps(payload, sort_keys=True) + "\n")
-print(json.dumps({
-    "schema": "research-cycle-vehicle-filter.v1",
-    "status": "filtered" if excluded else "unchanged",
-    "selected_vehicles": sorted(selected),
-    "excluded_option_rows": excluded,
-    "source_unchanged": True,
-}, sort_keys=True))
+payload = json.loads(sys.argv[1])
+payload.pop("vehicle_filter", None)
+print(json.dumps(payload, sort_keys=True))
 PY
 )"
-vehicle_filter_exit=$?
-set -e
-if [ "$vehicle_filter_exit" -ne 0 ]; then
-  finish "failed" "research vehicle stream filtering failed" 3
-fi
-printf '%s\n' "$vehicle_filter_status" >&2
-validated_input="$vehicle_input"
-
-# Add exact broker calendar boundaries to the temporary research view. The
-# recorder corpus remains append-only; external inputs must already carry both
-# fields. Production config fails closed on missing/malformed metadata or
-# extended-hours rows.
-set +e
-calendar_view_status="$($python_bin - "$validated_input" "$dataset" "$recorded_root" "$agent_config" "$dataset_from_recorder" "$repo_root" <<'PY'
-from datetime import datetime, timezone
+  vehicle_filter_status="$("$python_bin" - "$preprocess_result" <<'PY'
 import json
-from pathlib import Path
 import sys
-from zoneinfo import ZoneInfo
-sys.path.insert(0, sys.argv[6])
-from deploy.research_dataset import apply_partition_source
-
-view, source, recorded_root, config_path = map(Path, sys.argv[1:5])
-from_recorder = sys.argv[5] == "1"
-ny = ZoneInfo("America/New_York")
-def parse(value):
-    if value in (None, ""):
-        return None
-    try:
-        raw = str(value)
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(raw)
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            return None
-        return parsed.astimezone(timezone.utc)
-    except (TypeError, ValueError, OverflowError):
-        return None
-try:
-    from agent.config import load_config
-    config = load_config(str(config_path))
-except Exception as exc:
-    print(f"configuration validation failed: {exc}")
+payload = json.loads(sys.argv[1])
+report = payload.get("vehicle_filter")
+if not isinstance(report, dict):
     raise SystemExit(1)
-session = config.get("session") if isinstance(config, dict) else {}
-required = bool(session.get("require_exact_calendar", True)) if isinstance(session, dict) else True
-sidecar = recorded_root / ".recorder-index.json" if from_recorder else Path("-")
-if not sidecar.is_file() and source != Path("-") and from_recorder:
-    candidate = source.parent / ".recorder-index.json"
-    if candidate.is_file():
-        sidecar = candidate
-calendar = None
-partition_sources = None
-if sidecar.is_file():
-    try:
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
-        calendar = payload.get("session_calendar") if isinstance(payload, dict) else None
-        if not isinstance(calendar, dict):
-            calendar = None
-        partition_sources = payload.get("partition_sources") if isinstance(payload, dict) else None
-        if not isinstance(partition_sources, dict):
-            partition_sources = None
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        calendar = None
-def boundaries(item, day, number):
-    opened = parse(item.get("session_open"))
-    closed = parse(item.get("session_close"))
-    if (opened is None) != (closed is None):
-        raise ValueError(f"row {number} has only one exact session boundary")
-    side = calendar.get(day) if isinstance(calendar, dict) else None
-    side_open = parse(side.get("open")) if isinstance(side, dict) else None
-    side_close = parse(side.get("close")) if isinstance(side, dict) else None
-    if side is not None and (side_open is None or side_close is None):
-        raise ValueError(f"calendar metadata for {day} is malformed")
-    if opened is None and side_open is not None:
-        opened, closed = side_open, side_close
-        item["session_open"], item["session_close"] = opened.isoformat(), closed.isoformat()
-    if opened is None:
-        if required:
-            raise ValueError(f"exact broker calendar metadata missing for {day}")
-        return None, None
-    if opened >= closed or opened.astimezone(ny).date().isoformat() != day or closed.astimezone(ny).date().isoformat() != day:
-        raise ValueError(f"conflicting exact broker calendar metadata for {day}")
-    if side_open is not None and (opened != side_open or closed != side_close):
-        raise ValueError(f"row {number} conflicts with recorder calendar for {day}")
-    return opened, closed
-temporary = view.with_suffix(view.suffix + ".calendar")
-with view.open(encoding="utf-8") as source_file, temporary.open("w", encoding="utf-8") as target:
-    for number, line in enumerate(source_file, 1):
-        if not line.strip():
-            continue
-        item = json.loads(line)
-        stamp = parse(item.get("timestamp"))
-        if stamp is not None:
-            day = stamp.astimezone(ny).date().isoformat()
-            apply_partition_source(
-                item, day, partition_sources, row_number=number)
-            opened, closed = boundaries(item, day, number)
-            if opened is not None and not opened <= stamp < closed:
-                raise ValueError(f"row {number} is outside exact broker session {day}")
-        elif required:
-            raise ValueError(f"row {number} has no timestamp for exact calendar validation")
-        target.write(json.dumps(item, sort_keys=True) + "\n")
-temporary.replace(view)
+print(json.dumps(report, sort_keys=True))
 PY
-)"
-calendar_view_exit=$?
-set -e
-if [ "$calendar_view_exit" -ne 0 ]; then
-  finish "failed" "exact session calendar validation failed: ${calendar_view_status:-unknown error}" 3
-fi
-
-# Option rows are executable evidence only when they carry OPRA provenance.
-# Pin their availability to the fetch observation boundary too: a stale quote
-# generated at 10:00 but first observed at 10:05 must not be visible to a
-# 10:01 replay decision. The source corpus remains append-only; this correction
-# applies only to the temporary research view.
-point_in_time_options="$tmp_dir/market-point-in-time.jsonl"
-set +e
-point_in_time_status="$($python_bin - "$validated_input" "$point_in_time_options" <<'PY'
-from datetime import datetime
-import json
-import sys
-
-source, target = sys.argv[1:]
-option_kinds = {"option", "option_snapshot", "option_quote"}
-
-def parse(value):
-    if value in (None, ""):
-        return None
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-
-with open(source, encoding="utf-8") as source_file, open(target, "w", encoding="utf-8") as target_file:
-    for number, line in enumerate(source_file, 1):
-        if not line.strip():
-            continue
-        payload = json.loads(line)
-        if str(payload.get("kind", "")).lower() in option_kinds:
-            feed = str(payload.get("feed") or "").strip().lower()
-            if feed != "opra":
-                print(
-                    f"option row {number} has non-executable feed {feed or '[missing]'}; OPRA is required")
-                raise SystemExit(1)
-            observed = parse(payload.get("observed_at"))
-            as_of = parse(payload.get("as_of"))
-            if observed is not None and (as_of is None or as_of < observed):
-                payload["as_of"] = payload["observed_at"]
-        target_file.write(json.dumps(payload, sort_keys=True) + "\n")
-PY
-)"
-point_in_time_exit=$?
-set -e
-if [ "$point_in_time_exit" -ne 0 ]; then
-  finish "failed" "option evidence/feed validation failed: ${point_in_time_status:-unknown error}" 3
-fi
-validated_input="$point_in_time_options"
-
-# Keep the option and replay views in lockstep with the corrected normalized
-# stream. Without this rewrite a factory worker could still consume the
-# legacy timestamp while discovery saw the safe availability boundary.
-"$python_bin" - "$validated_input" "$options_input" "$replay_input" <<'PY'
-import json
-import sys
-
-source, options_path, replay_path = sys.argv[1:]
-bar_kinds = {"bar", "bar_1m", "underlying", "underlying_bar"}
-option_kinds = {"option", "option_snapshot", "option_quote"}
-with open(options_path, "w", encoding="utf-8") as options, \
-        open(replay_path, "w", encoding="utf-8") as replay, \
-        open(source, encoding="utf-8") as source_file:
-    for line in source_file:
-        if not line.strip():
-            continue
-        payload = json.loads(line)
-        serialized = json.dumps(payload, sort_keys=True) + "\n"
-        kind = str(payload.get("kind", "")).lower()
-        if kind in option_kinds:
-            options.write(serialized)
-            replay.write(serialized)
-        elif kind in bar_kinds:
-            replay.write(serialized)
-PY
+)" || finish "failed" "stream preprocessor omitted its vehicle report" 3
+  printf '%s\n' "$vehicle_filter_status" >&2
+  validated_input="$normalized_input"
 
   if [ "$preprocess_cache_enabled" -eq 1 ]; then
     printf '%s\n' "$dataset_report" > "$cache_dataset_report"
@@ -729,9 +521,9 @@ PY
       --config-identity "$cache_config_identity" \
       --code-identity "$cache_code_identity" \
       --context-identity "$cache_context_identity" \
+      --consume-artifacts \
       --artifact "validated=$validated_input" \
       --artifact "bars=$bars_input" \
-      --artifact "quotes=$quotes_input" \
       --artifact "options=$options_input" \
       --artifact "replay=$replay_input" \
       --artifact "dataset_report=$cache_dataset_report" \
@@ -742,8 +534,20 @@ PY
     if [ "$cache_publish_status" -ne 0 ]; then
       finish "failed" "research preprocessing cache publish failed" 3
     fi
+    validated_input="$(cache_artifact_path "$cache_publish_output" validated)" || \
+      finish "failed" "published preprocessing cache has no validated artifact" 3
+    bars_input="$(cache_artifact_path "$cache_publish_output" bars)" || \
+      finish "failed" "published preprocessing cache has no bars artifact" 3
+    options_input="$(cache_artifact_path "$cache_publish_output" options)" || \
+      finish "failed" "published preprocessing cache has no options artifact" 3
+    replay_input="$(cache_artifact_path "$cache_publish_output" replay)" || \
+      finish "failed" "published preprocessing cache has no replay artifact" 3
   fi
 fi
+
+# Backtest extracts quote rows directly from the canonical mixed stream. This
+# retains strict quote validation without a second, corpus-sized JSONL copy.
+quotes_input="$validated_input"
 
 # Preserve the quarantine record and report view sizes without rescanning the
 # generated files. ``research_dataset.py`` counted them during its source pass.
@@ -752,11 +556,8 @@ import json
 import sys
 
 report = json.loads(sys.argv[1])
-vehicle_filter = json.loads(sys.argv[2])
+json.loads(sys.argv[2])
 counts = report.pop("view_counts", {})
-excluded_options = int(vehicle_filter.get("excluded_option_rows", 0))
-counts["options"] = max(0, int(counts.get("options", 0)) - excluded_options)
-counts["replay"] = max(0, int(counts.get("replay", 0)) - excluded_options)
 print(json.dumps(report, sort_keys=True))
 print(json.dumps({
     "schema": "research-cycle-views.v1",
@@ -912,16 +713,9 @@ PY
 if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
   emit_progress "backtest" 0 1 "steps" "equity"
   set +e
-  if [ -s "$quotes_input" ]; then
-    "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
-      --provider alpaca --feed "$feed" --vehicle equity \
-      --quotes "$quotes_input"
-  else
-    # Avoid expanding an empty array under ``set -u``; Bash 3.2 treats that
-    # expansion as an unbound variable.
-    "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
-      --provider alpaca --feed "$feed" --vehicle equity
-  fi
+  "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
+    --provider alpaca --feed "$feed" --vehicle equity \
+    --quotes "$quotes_input" --quotes-from-mixed
   backtest_status=$?
   set -e
   if [ "$backtest_status" -ne 0 ]; then
