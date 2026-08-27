@@ -1423,7 +1423,12 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertTrue(all(row["rolling_guard_breached"] for row in repeats))
             self.assertTrue(all(row["guard_breach"] is None for row in repeats))
             # The fixed-size window drops the oldest of the 21 observations.
-            self.assertEqual([row["rolling_r"] for row in repeats], [-2.0] * 3)
+            # ``rolling_r`` is a running float sum, so twenty -0.1R rows land
+            # one unit in the last place away from -2.0. Compare on the
+            # telemetry's own tolerance rather than on exact float equality.
+            self.assertEqual(len({row["rolling_r"] for row in repeats}), 1)
+            for row in repeats:
+                self.assertAlmostEqual(row["rolling_r"], -2.0, places=9)
             self.assertEqual(ledger.candidate(candidate_id)["status"], "validated")
             with closing(sqlite3.connect(ledger.path)) as db:
                 self.assertEqual(db.execute(
