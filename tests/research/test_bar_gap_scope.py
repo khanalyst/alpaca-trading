@@ -132,6 +132,24 @@ class SessionGapScopeTests(unittest.TestCase):
         self.assertEqual(outcome["reject_stage"], "data_validation")
         self.assertGreater(outcome["reject_detail"]["gapped_prefixes"], 0)
 
+    def test_valid_prefixes_plus_an_unrelated_gap_are_a_no_signal_day(self):
+        # A late outage cannot relabel earlier, fully evaluated flat prefixes
+        # as if the strategy never had a usable feature window.
+        bars = [replace(row, open=100.0, high=100.01, low=99.99,
+                        close=100.0, volume=1000.0)
+                for row in _bars(drop_bar=27)]
+        quiet = validate_rule_spec({
+            "family": "momentum_continuation", "lookback": 10,
+            "slow_lookback": 20, "atr_period": 5,
+            "threshold_bps": 500.0, "confirmation": "none",
+        })
+        outcome = _simulate_trade(
+            bars, quiet, [], "equity", quotes=None, policy=BAR_FALLBACK)
+        self.assertEqual(outcome["execution_disposition"], "no_signal")
+        self.assertEqual(outcome["prefix_status"], "valid_prefix_no_signal")
+        self.assertGreater(outcome["prefix_detail"]["evaluated_prefixes"], 0)
+        self.assertGreater(outcome["prefix_detail"]["gapped_prefixes"], 0)
+
     def test_a_gap_between_signal_and_entry_refuses_the_signal(self):
         # Bar 16 is the entry bar for the breakout completed on bar 15.
         # Carrying the signal to the next recorded minute would enter on a

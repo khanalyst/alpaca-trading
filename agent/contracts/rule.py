@@ -151,6 +151,13 @@ _FAMILY_EXECUTABLE_FIELDS = {
 # anywhere earlier in the session changes what they compute, so their feature
 # window is the whole session prefix rather than a bounded trailing count.
 SESSION_ACCUMULATING_FAMILIES = frozenset(("vwap_reversion", "vwap_trend"))
+# Opening-range and opening-drive predicates retain a fixed session-open
+# anchor even after their trailing ATR/confirmation window has rolled onward.
+# Treating them as an ordinary trailing-only statistic can silently compute an
+# opening range across a missing early minute.  The current continuity API is
+# a single interval, so the safe representation is the full session prefix.
+OPENING_ANCHORED_FAMILIES = frozenset((
+    "opening_range_breakout", "opening_range_fade", "opening_drive"))
 # Trailing completed bars each remaining family reads, beyond the prefix
 # ``evaluate_rule_signal`` always consumes.  Opening-anchored families are
 # absent on purpose: their window is selected by clock time and is already
@@ -173,8 +180,8 @@ _CONFIRMATION_FEATURE_BARS = {
 def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     """Trailing completed bars :func:`evaluate_rule_signal` reads for a spec.
 
-    ``None`` means the family accumulates from the session open and has no
-    bounded trailing window.
+    ``None`` means the family retains a session-open anchor and cannot be
+    represented by one bounded trailing window.
 
     Replay uses this to require adjacency over exactly the bars a signal is
     computed from.  A fixed lookback silently stretched across an outage is a
@@ -184,7 +191,7 @@ def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     """
     spec = validate_rule_spec(value)
     family = str(spec["family"])
-    if family in SESSION_ACCUMULATING_FAMILIES:
+    if family in SESSION_ACCUMULATING_FAMILIES | OPENING_ANCHORED_FAMILIES:
         return None
     # The prefix ``evaluate_rule_signal`` consumes before dispatching a family.
     needed = max(spec["lookback"] + 1, spec["atr_period"] + 1)
@@ -895,36 +902,31 @@ def _vwap(bars: Sequence[Any]) -> float | None:
     return result if result > 0 and math.isfinite(result) else None
 
 
-def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict | None:
-    """Evaluate one completed-bar prefix and return a deterministic signal."""
-    spec = validate_rule_spec(value)
-    bars = list(rows)
-    needed = max(spec["lookback"] + 1, spec["atr_period"] + 1)
-    if len(bars) < needed:
-        return None
+def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
+                      close: float, opened: float) -> tuple[str | None, str]:
+    """Evaluate only the family predicate shared by execution and diagnostics."""
     current = bars[-1]
-    close = _number(current, "close")
-    opened = _number(current, "open", close)
-    if close <= 0:
-        return None
     closes = [_number(row, "close") for row in bars]
     threshold = spec["threshold_bps"] / 10_000.0
     direction: str | None = None
     family = spec["family"]
+    reason = "family_predicate_not_met"
 
     if family.startswith("opening_range_"):
         zone = ZoneInfo("America/New_York")
         stamp = _timestamp(current)
         if stamp is None:
-            return None
+            return None, "timestamp_unavailable"
         local_day = stamp.astimezone(zone).date()
         start = datetime.combine(local_day, time(9, 30), tzinfo=zone)
         end = start.timestamp() + spec["range_minutes"] * 60
         opening = [row for row in bars if (ts := _timestamp(row)) is not None and
                    ts.astimezone(zone).date() == local_day and
                    start.timestamp() <= ts.timestamp() < end]
-        if stamp.timestamp() < end or len(opening) < max(2, spec["range_minutes"] // 2):
-            return None
+        if stamp.timestamp() < end:
+            return None, "opening_window_incomplete"
+        if len(opening) < max(2, spec["range_minutes"] // 2):
+            return None, "opening_window_undercovered"
         high = max(_number(row, "high") for row in opening)
         low = min(_number(row, "low") for row in opening)
         if family == "opening_range_breakout":
@@ -955,7 +957,7 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
             direction = "short"
     elif family == "trend_pullback":
         if len(closes) < spec["slow_lookback"]:
-            return None
+            return None, "slow_lookback_unavailable"
         fast = _sma(closes, spec["lookback"])
         slow = _sma(closes, spec["slow_lookback"])
         near_fast = abs(close - fast) / fast <= max(threshold, .0005)
@@ -973,6 +975,8 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
                 direction = "long"
             elif close < low * (1 - threshold):
                 direction = "short"
+        else:
+            reason = "compression_filter_failed"
     elif family == "volume_breakout":
         previous = bars[-spec["lookback"] - 1:-1]
         high = max(_number(row, "high") for row in previous)
@@ -984,28 +988,25 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
             direction = "long"
         elif volume_ok and close < low * (1 - threshold):
             direction = "short"
+        elif not volume_ok:
+            reason = "family_volume_filter_failed"
     elif family in {"vwap_reversion", "vwap_trend"}:
         session = _session_prefix(bars, current)
         if len(session) < spec["lookback"] + 1:
-            return None
+            return None, "session_lookback_unavailable"
         vwap = _vwap(session)
         if vwap is None:
-            return None
+            return None, "vwap_unavailable"
         deviation = close / vwap - 1
         if family == "vwap_reversion":
-            # Stretched away from the session's own average price, expected to
-            # revert toward it.
             if deviation <= -max(threshold, 1e-9):
                 direction = "long"
             elif deviation >= max(threshold, 1e-9):
                 direction = "short"
         else:
-            # Trading with a session average that is itself advancing: the
-            # trend statistic is the session's fair value, not a moving average
-            # of price, so this is not `trend_pullback` under another name.
             earlier = _vwap(session[:-spec["lookback"]])
             if earlier is None:
-                return None
+                return None, "earlier_vwap_unavailable"
             if close > vwap and vwap > earlier * (1 + threshold):
                 direction = "long"
             elif close < vwap and vwap < earlier * (1 - threshold):
@@ -1015,19 +1016,19 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
         ranges = [_number(row, "high") - _number(row, "low") for row in previous]
         average_range = mean(ranges) if ranges else 0.0
         current_range = _number(current, "high") - _number(current, "low")
-        # `volume_multiplier` is the bounded expansion factor here: the same
-        # "multiple of a rolling average" parameter, applied to range.
         if (average_range > 0 and
                 current_range >= average_range * spec["volume_multiplier"]):
             if close > opened * (1 + threshold):
                 direction = "long"
             elif close < opened * (1 - threshold):
                 direction = "short"
+        else:
+            reason = "range_expansion_filter_failed"
     elif family == "opening_drive":
         zone = ZoneInfo("America/New_York")
         stamp = _timestamp(current)
         if stamp is None:
-            return None
+            return None, "timestamp_unavailable"
         session = _session_prefix(bars, current)
         start = datetime.combine(stamp.astimezone(zone).date(), time(9, 30),
                                  tzinfo=zone)
@@ -1035,48 +1036,85 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
         opening = [row for row in session
                    if (ts := _timestamp(row)) is not None and
                    start.timestamp() <= ts.timestamp() < end]
-        if (stamp.timestamp() < end or
-                len(opening) < max(2, spec["range_minutes"] // 2)):
-            return None
+        if stamp.timestamp() < end:
+            return None, "opening_window_incomplete"
+        if len(opening) < max(2, spec["range_minutes"] // 2):
+            return None, "opening_window_undercovered"
         first = _number(opening[0], "open", _number(opening[0], "close"))
         last = _number(opening[-1], "close")
-        # Net displacement over the opening window, continued rather than
-        # faded. Unlike the opening-range families this needs no level break:
-        # a session can drive without ever printing a clean range.
         drive = last / first - 1 if first > 0 else 0.0
         if drive > threshold and close > opened:
             direction = "long"
         elif drive < -threshold and close < opened:
             direction = "short"
+    return direction, "passed" if direction is not None else reason
 
-    if direction is None or not _allowed(direction, spec) or not _confirmations_pass(
-            direction, bars, spec):
-        return None
+
+def _evaluate_rule_signal_staged(rows: Sequence[Any], value: Mapping[str, Any],
+                                 *, trace: bool) -> tuple[dict | None, list[dict[str, Any]]]:
+    """One evaluator for executable signals and non-authorizing stage traces."""
+    spec = validate_rule_spec(value)
+    bars = list(rows)
+    stages: list[dict[str, Any]] = []
+
+    def stage(name: str, passed: bool, reason: str) -> bool:
+        if trace:
+            stages.append({"stage": name, "tested": True,
+                           "passed": bool(passed), "reason": str(reason)})
+        return passed
+
+    needed = max(spec["lookback"] + 1, spec["atr_period"] + 1)
+    if not stage("minimum_prefix", len(bars) >= needed,
+                 "passed" if len(bars) >= needed else "insufficient_prefix"):
+        return None, stages
+    current = bars[-1]
+    close = _number(current, "close")
+    opened = _number(current, "open", close)
+    if not stage("positive_close", close > 0,
+                 "passed" if close > 0 else "nonpositive_close"):
+        return None, stages
+    direction, family_reason = _family_direction(
+        bars, spec, close=close, opened=opened)
+    if not stage("family_predicate", direction is not None, family_reason):
+        return None, stages
+    assert direction is not None
+    if not stage("side", _allowed(direction, spec),
+                 "passed" if _allowed(direction, spec) else "direction_not_allowed"):
+        return None, stages
+    confirmations = [str(spec["confirmation"]),
+                     *(str(item) for item in spec.get("confirmations") or ())]
+    for kind in confirmations:
+        passed = _confirmation(direction, bars, spec, kind)
+        if not stage(f"confirmation:{kind}", passed,
+                     "passed" if passed else "confirmation_failed"):
+            return None, stages
     atr = _atr(bars, spec["atr_period"])
-    if atr is None:
-        return None
-    # The v2 entry window and volatility band are the last entry-side gates.
-    # They are evaluated from the same completed-bar prefix as the signal, so a
-    # spec that passes here in research passes here at runtime.
-    if not _within_volatility_band(spec, atr, close):
-        return None
-    # The historical 5 bps safety floor was below the normal round-trip cost
-    # of the configured universe.  Apply the audited 30 bps floor only to the
-    # derived executable signal; never add it to the authored spec so legacy
-    # content hashes remain byte-for-byte stable.
+    if not stage("atr", atr is not None,
+                 "passed" if atr is not None else "atr_unavailable"):
+        return None, stages
+    assert atr is not None
+    volatility_ok = _within_volatility_band(spec, atr, close)
+    if not stage("volatility_band", volatility_ok,
+                 "passed" if volatility_ok else "volatility_band_failed"):
+        return None, stages
     distance = max(atr * spec["stop_atr"],
                    close * MIN_STOP_DISTANCE_FRACTION)
     stop = close - distance if direction == "long" else close + distance
-    target = close + distance * spec["target_r"] if direction == "long" else close - distance * spec["target_r"]
+    target = (close + distance * spec["target_r"] if direction == "long" else
+              close - distance * spec["target_r"])
     stamp = _timestamp(current)
-    if stamp is None:
-        return None
-    if not _within_entry_window(spec, stamp):
-        return None
+    if not stage("timestamp", stamp is not None,
+                 "passed" if stamp is not None else "timestamp_unavailable"):
+        return None, stages
+    assert stamp is not None
+    window_ok = _within_entry_window(spec, stamp)
+    if not stage("entry_window", window_ok,
+                 "passed" if window_ok else "entry_window_failed"):
+        return None, stages
     result = {
         "direction": direction,
-        "setup_type": f"rule_{family}",
-        "family": family,
+        "setup_type": f"rule_{spec['family']}",
+        "family": spec["family"],
         "signal_ts": stamp.timestamp(),
         "signal_timestamp": stamp.isoformat(),
         "entry_price": close,
@@ -1089,11 +1127,29 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
         "confidence": 1.0,
     }
     if spec["schema"] == RULE_SCHEMA_V3:
-        result.update({
-            "rule_schema": RULE_SCHEMA_V3,
-            "breakeven_r": spec.get("breakeven_r"),
-        })
-    return result
+        result.update({"rule_schema": RULE_SCHEMA_V3,
+                       "breakeven_r": spec.get("breakeven_r")})
+    stage("signal", True, "emitted")
+    return result, stages
+
+
+def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict | None:
+    """Evaluate one completed-bar prefix and return a deterministic signal."""
+    return _evaluate_rule_signal_staged(rows, value, trace=False)[0]
+
+
+def evaluate_rule_signal_trace(rows: Sequence[Any],
+                               value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return compact, non-authorizing predicate telemetry for one prefix."""
+    signal, stages = _evaluate_rule_signal_staged(rows, value, trace=True)
+    return {
+        "schema": "rule-signal-trace.v1",
+        "authorizing": False,
+        "diagnostic_only": True,
+        "signal": signal,
+        "terminal_stage": stages[-1]["stage"] if stages else None,
+        "stages": stages,
+    }
 
 
 def evaluate_rule_signal_metadata(rows: Sequence[Any],
@@ -1180,10 +1236,11 @@ __all__ = [
            "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "SESSION_MINUTES",
            "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS",
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
+           "OPENING_ANCHORED_FAMILIES",
            "feature_window_bars", "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",
     "RuleSpecError", "breakeven_stop_price", "completed_bar_exit_transition",
-    "evaluate_rule_signal",
+    "evaluate_rule_signal", "evaluate_rule_signal_trace",
     "evaluate_rule_signal_metadata", "initialize_exit_state",
     "rule_signal_metadata",
     "generate_rule_signal", "hold_deadline", "rule_spec_hash",

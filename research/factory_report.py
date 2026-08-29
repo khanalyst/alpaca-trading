@@ -139,6 +139,31 @@ def _fit_risk_metrics(
                              "delivered/configured")}
 
 
+def _fit_signal_quality_metrics(
+        fit_diagnostics: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Return compact conditional-return horizons for narrative rendering."""
+    if not isinstance(fit_diagnostics, Mapping):
+        return []
+    quality = fit_diagnostics.get("signal_quality")
+    metrics = quality.get("horizon_metrics") if isinstance(quality, Mapping) else None
+    if not isinstance(metrics, Mapping):
+        return []
+    result = []
+    for label, item in metrics.items():
+        if not isinstance(item, Mapping):
+            continue
+        count = _number(item.get("candidate_count"))
+        if count is None or count <= 0:
+            continue
+        result.append({
+            "horizon": str(label), "count": int(count),
+            "mean_bps": _number(item.get("mean_forward_return_bps")),
+            "control_delta_bps": _number(item.get("candidate_minus_control_bps")),
+            "after_cost_bps": _number(item.get("mean_after_hurdle_bps")),
+        })
+    return result
+
+
 def _dependence_policy_row(row: Mapping[str, Any]) -> dict:
     """Decode and hash-check one frozen policy without opening a writable ledger."""
     try:
@@ -912,6 +937,15 @@ def render_text(report: Mapping[str, Any]) -> str:
                                  f" | {risk_metrics['ratio_label']} "
                                  f"{_fmt(risk_metrics['ratio'])}")
                         add(line)
+                    signal_quality = _fit_signal_quality_metrics(fit_diagnostics)
+                    if signal_quality:
+                        rendered = ", ".join(
+                            f"{item['horizon']} n={item['count']} mean "
+                            f"{_fmt(item['mean_bps'], 2)}bps vs-null "
+                            f"{_fmt(item['control_delta_bps'], 2)}bps after-cost "
+                            f"{_fmt(item['after_cost_bps'], 2)}bps"
+                            for item in signal_quality)
+                        add(f"      fit conditional forward returns {rendered}")
                 for variant in item["variants"]:
                     verdict = _variant_classification(variant)
                     add(f"        - {variant['variant_id']}  [{verdict}]"
@@ -1052,6 +1086,15 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                                  f"{risk_metrics['ratio_label']}: "
                                  f"{_fmt(risk_metrics['ratio'])}")
                         out.append(line)
+                    signal_quality = _fit_signal_quality_metrics(fit_diagnostics)
+                    if signal_quality:
+                        rendered = "; ".join(
+                            f"{item['horizon']} n={item['count']}, mean "
+                            f"{_fmt(item['mean_bps'], 2)} bps, vs-null "
+                            f"{_fmt(item['control_delta_bps'], 2)} bps, after-cost "
+                            f"{_fmt(item['after_cost_bps'], 2)} bps"
+                            for item in signal_quality)
+                        out.append(f"- Fit conditional forward returns: {rendered}")
                 outcome = item["outcome"]
                 out += ["", f"**Outcome:** {outcome['kind'].replace('_', ' ')}"
                             f" — {outcome.get('reason') or ''}"]

@@ -82,13 +82,53 @@ def _thesis(spec: Mapping[str, Any]) -> str:
     family = str(spec["family"]).replace("_", " ")
     confirmation = str(spec.get("confirmation", "none")).replace("_", " ")
     suffix = "" if confirmation == "none" else f" confirmed by {confirmation}"
-    return f"A completed-bar {family}{suffix} has positive expectancy after executable costs."
+    mechanisms = {
+        "opening_range_breakout": (
+            "overnight and opening-auction inventory imbalance persists after "
+            "price escapes the initial price-discovery range"),
+        "opening_range_fade": (
+            "an opening liquidity overshoot reverses after the initial auction "
+            "imbalance is exhausted"),
+        "momentum_continuation": (
+            "slow institutional execution causes an initial intraday displacement "
+            "to continue rather than clear immediately"),
+        "mean_reversion": (
+            "a short-lived liquidity shock mean-reverts when it is not supported "
+            "by persistent directional flow"),
+        "trend_pullback": (
+            "persistent order flow survives temporary profit-taking near the "
+            "fast trend and resumes in the prevailing direction"),
+        "volatility_breakout": (
+            "compressed trading stores latent orders whose release creates "
+            "directional follow-through"),
+        "volume_breakout": (
+            "price displacement backed by abnormal participation reflects "
+            "information-bearing flow rather than thin-market noise"),
+        "vwap_reversion": (
+            "temporary price impact away from the session's volume-weighted fair "
+            "value decays as liquidity replenishes"),
+        "vwap_trend": (
+            "an advancing volume-weighted fair value reveals persistent "
+            "institutional accumulation or distribution"),
+        "range_expansion": (
+            "an abnormal realized-range expansion marks a volatility-regime "
+            "transition with short-horizon directional persistence"),
+        "opening_drive": (
+            "a one-sided opening auction establishes a directional inventory "
+            "transfer that continues after the opening window"),
+    }
+    mechanism = mechanisms.get(str(spec["family"]),
+                               "the specified completed-bar condition captures persistent flow")
+    return (f"{family.title()}{suffix} tests whether {mechanism}, producing "
+            "positive expectancy after executable costs.")
 
 
 def _falsification(spec: Mapping[str, Any]) -> str:
     return (
-        f"The {str(spec['family']).replace('_', ' ')} rule has no positive "
-        "held-out and forward expectancy after costs and multiple-test correction."
+        f"Reject the {str(spec['family']).replace('_', ' ')} mechanism if its "
+        "fit-only conditional forward returns do not beat deterministic "
+        "same-symbol/session random entries across useful horizons, or if "
+        "held-out expectancy fails executable costs and multiple-test correction."
     )
 
 
@@ -281,10 +321,12 @@ def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
 
 
 def _no_signal(session_bars: Sequence[UnderlyingBar], *,
-               reason: str = "rule_not_triggered") -> dict:
+               reason: str = "rule_not_triggered",
+               prefix_status: str | None = None,
+               detail: Mapping[str, Any] | None = None) -> dict:
     """Return the explicit terminal disposition for a valid zero-signal day."""
     first = session_bars[0]
-    return {
+    result = {
         "execution_disposition": "no_signal",
         "signal_opportunity": False,
         "no_signal_reason": str(reason),
@@ -292,6 +334,11 @@ def _no_signal(session_bars: Sequence[UnderlyingBar], *,
         "signal_bar_feed": first.feed,
         "signal_bar_provider": first.provider,
     }
+    if prefix_status is not None:
+        result["prefix_status"] = str(prefix_status)
+    if detail is not None:
+        result["prefix_detail"] = dict(detail)
+    return result
 
 
 def _coerce_policy(policy: ReplayPolicy | Mapping[str, Any] | None) -> ReplayPolicy:
@@ -376,13 +423,17 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                              session_bars[0].session_date, "unknown",
                              "bar_outside_exact_session",
                              stage="data_validation", signal_opportunity=False)
-    # ``None`` means the family accumulates from the session open, so its
-    # window starts at the session's first bar rather than a trailing offset.
+    # ``None`` means the family retains a session-open anchor, so its window
+    # starts at the session's first bar rather than a trailing offset.
     window = feature_window_bars(spec)
+    minimum_prefix = max(int(spec["lookback"]) + 1,
+                         int(spec["atr_period"]) + 1)
     last_refusal: dict | None = None
     evaluated_prefixes = 0
     gapped_prefixes = 0
     for index in range(1, len(session_bars) - 1):
+        if index + 1 < minimum_prefix:
+            continue
         signal_bar = session_bars[index]
         # The bars a signal is computed from must be consecutive: a gap inside
         # the feature window stretches a fixed lookback across an outage and
@@ -802,12 +853,18 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         return trade_row
     if last_refusal is not None:
         return last_refusal
+    if evaluated_prefixes:
+        return _no_signal(
+            session_bars, prefix_status="valid_prefix_no_signal",
+            detail={"gapped_prefixes": gapped_prefixes,
+                    "evaluated_prefixes": evaluated_prefixes})
     if gapped_prefixes:
         return _unpriced(
             session_bars[0], session_bars[0], session_bars[0].session_date,
             "unknown", "no_contiguous_feature_window",
             stage="data_validation", signal_opportunity=False,
-            detail={"gapped_prefixes": gapped_prefixes,
+            detail={"prefix_status": "no_contiguous_feature_window",
+                    "gapped_prefixes": gapped_prefixes,
                     "evaluated_prefixes": evaluated_prefixes})
     return _no_signal(session_bars)
 
@@ -976,18 +1033,29 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         effective_risk_pct = float(resolved_policy.risk_per_trade_pct)
         risk_budget = max(0.0, current_equity * effective_risk_pct / 100.0)
         per_unit = max(float(raw["risk_per_unit"]), 1e-9)
-        quantity = math.floor(risk_budget / per_unit)
+        risk_sized_quantity = math.floor(risk_budget / per_unit)
+        quantity = risk_sized_quantity
+        notional_cap_quantity: int | None = None
+        position_notional_cap_usd: float | None = None
         if vehicle == "equity":
             notional_pct = (NOTIONAL_CAP_PCT if
                             resolved_policy.max_position_notional_pct is None else
                             resolved_policy.max_position_notional_pct)
-            quantity = min(quantity, math.floor(
-                max(0.0, current_equity * float(notional_pct) / 100.0) /
-                max(float(raw["plan_entry"]), 1e-9)))
+            position_notional_cap_usd = max(
+                0.0, current_equity * float(notional_pct) / 100.0)
+            notional_cap_quantity = math.floor(
+                position_notional_cap_usd /
+                max(float(raw["plan_entry"]), 1e-9))
+            quantity = min(quantity, notional_cap_quantity)
         elif resolved_policy.max_position_notional_pct is not None:
-            quantity = min(quantity, math.floor(
-                max(0.0, current_equity * float(resolved_policy.max_position_notional_pct) / 100.0) /
-                max(float(raw["entry_reference"]) * int(raw["contract_multiplier"]), 1e-9)))
+            position_notional_cap_usd = max(
+                0.0, current_equity *
+                float(resolved_policy.max_position_notional_pct) / 100.0)
+            notional_cap_quantity = math.floor(
+                position_notional_cap_usd /
+                max(float(raw["entry_reference"]) *
+                    int(raw["contract_multiplier"]), 1e-9))
+            quantity = min(quantity, notional_cap_quantity)
         multiplier = int(raw["contract_multiplier"])
         nominal_risk_usd = quantity * float(raw["risk_per_unit"])
         realized_risk_usd = quantity * float(raw["realized_risk_per_unit"])
@@ -1004,6 +1072,21 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         # controls are omitted, while validated runtime policies expose the
         # nominal risk unit used by RiskEngine.
         risk_usd = nominal_risk_usd if stress_enabled else realized_risk_usd
+        sizing_telemetry = {
+            "risk_budget": float(risk_budget),
+            "risk_sized_quantity": int(risk_sized_quantity),
+            "notional_cap_quantity": notional_cap_quantity,
+            "notional_cap_usd": position_notional_cap_usd,
+            "notional_cap_binding": bool(
+                notional_cap_quantity is not None and
+                notional_cap_quantity < risk_sized_quantity),
+            "planned_risk_usd": float(nominal_risk_usd),
+            "realized_risk_usd": float(realized_risk_usd),
+            "risk_budget_utilization": (
+                float(nominal_risk_usd / risk_budget)
+                if risk_budget > 0 else None),
+            "planned_notional": float(entry_notional),
+        }
         reject_reason = None
         reject_stage = None
         if (resolved_policy.max_concurrent_positions is not None and
@@ -1085,6 +1168,7 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                          "signal_opportunity": True,
                          "reject_stage": reject_stage or "account_policy",
                          "reject_reason": reject_reason,
+                         **sizing_telemetry,
                          **stress_telemetry})
             continue
         # An executable quote is already the selected fill price, but the
@@ -1130,14 +1214,14 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         row = {key: value for key, value in raw.items() if not key.startswith("_")}
         row.update({"quantity": quantity, "entry_price": entry, "exit_price": exit_price,
                     "gross_pnl": gross, "costs": fees, "net_pnl": net,
-                    "risk_budget": risk_budget, "risk_usd": risk_usd,
+                    "risk_usd": risk_usd,
                     "nominal_risk_usd": nominal_risk_usd,
-                    "realized_risk_usd": realized_risk_usd,
                     "r_multiple": net / risk_usd if risk_usd > 0 else None,
                     "return_value": net / cash if cash > 0 else 0.0,
                     "no_trade": False, "entry_notional": entry_notional,
                     "execution_disposition": "executed",
-                    "signal_opportunity": True})
+                    "signal_opportunity": True,
+                    **sizing_telemetry})
         if slippage_telemetry is not None:
             row["entry_slippage"] = slippage_telemetry
         if stress_enabled:

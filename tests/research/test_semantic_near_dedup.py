@@ -152,6 +152,20 @@ class SemanticNearDuplicateTests(unittest.TestCase):
         self.assertNotEqual(chosen[0].rule_spec, prior)
         self.assertEqual(chosen[0].source, "deterministic")
 
+    def test_broad_model_threshold_cannot_delete_deterministic_coordinates(self):
+        root = validate_rule_spec(family_template("momentum_continuation"))
+        expected = [spec for spec, _reason in mutate_with_reasons(
+            root, {"primary_failure": "negative_expectancy"}, 4)]
+        chosen, _proposal = _tuned_variants(
+            {"rule_spec": root, "slot": 0},
+            {"primary_failure": "negative_expectancy"}, count=4,
+            vehicle="equity", llm_enabled=True,
+            config={"model": "test", "near_duplicate_distance": 1.0},
+            adapter=_TuningAdapter([]),
+            existing_specs=[root])
+        self.assertEqual([item.rule_spec for item in chosen], expected)
+        self.assertEqual({item.source for item in chosen}, {"deterministic"})
+
     def test_config_exposes_bounded_default(self):
         cfg = validate_config({})
         self.assertEqual(NEAR_DUPLICATE_DISTANCE, 0.001)

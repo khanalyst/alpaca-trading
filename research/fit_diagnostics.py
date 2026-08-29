@@ -18,8 +18,9 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    MIN_STOP_DISTANCE_BPS, evaluate_rule_signal_metadata, feature_window_bars,
-    rule_variant_id, validate_rule_spec, SESSION_MINUTES,
+    MIN_STOP_DISTANCE_BPS, evaluate_rule_signal_metadata,
+    evaluate_rule_signal_trace, feature_window_bars, rule_variant_id,
+    validate_rule_spec, SESSION_MINUTES,
 )
 from .costs import (STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     stressed_cost_usd)
@@ -27,6 +28,7 @@ from .market_data import (historical_backfill_record, record_available_at,
                            record_is_available, replay_available_at,
                            replay_record_is_available)
 from .stats import clustered_mde_power_report
+from .signal_quality import measure_signal_quality
 
 
 FIT_DIAGNOSTICS_SCHEMA = "fit-diagnostics.v1"
@@ -543,7 +545,7 @@ def _diagnostic_backfill_enabled(policy: Any | None) -> bool:
 
 def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                   policy: Any | None = None) -> dict[str, Any]:
-    """Collect only first-signal metadata from the fit bars."""
+    """Collect first-signal metadata and a compact all-prefix predicate funnel."""
     allow_backfill = _diagnostic_backfill_enabled(policy)
     grouped: dict[tuple[str, str], list[Any]] = {}
     for row in bars:
@@ -560,9 +562,15 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
     total_prefixes = eligible_prefixes = 0
     first_signals: list[dict[str, Any]] = []
     eligible_sessions = 0
+    prefix_status: Counter[str] = Counter()
+    stage_counts: dict[str, Counter[str]] = {}
+    terminal_stages: Counter[str] = Counter()
+    terminal_reasons: Counter[str] = Counter()
+    signal_prefixes = 0
     for (day, symbol), rows in sorted(grouped.items()):
         if not _session_bars_valid(rows) or not _session_metadata_valid(rows):
             total_prefixes += max(0, len(rows) - 2)
+            prefix_status["invalid_session"] += max(0, len(rows) - 2)
             continue
         rows = sorted(rows, key=lambda item: _timestamp(item) or datetime.min.replace(tzinfo=timezone.utc))
         first = None
@@ -573,9 +581,11 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
         for index in range(1, max(1, len(rows) - 1)):
             total_prefixes += 1
             if index + 1 < int(needed):
+                prefix_status["insufficient_history"] += 1
                 continue
             signal_end = _bar_end(rows[index])
             if signal_end is None:
+                prefix_status["signal_end_unavailable"] += 1
                 continue
             feature_start = (0 if feature_window is None else
                              max(0, index + 1 - int(feature_window)))
@@ -589,24 +599,44 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                              allow_historical_backfill_diagnostics=allow_backfill)
                          is not None]
             if len(available) != len(feature_rows):
+                prefix_status["feature_unavailable"] += 1
                 continue
             decision_timestamp = max([signal_end, *available])
             if not _contiguous(rows, feature_start, index + 1):
+                prefix_status["feature_gap"] += 1
                 continue
             entry = rows[index + 1]
             if _timestamp(entry) != signal_end and decision_timestamp <= signal_end:
+                prefix_status["entry_not_adjacent"] += 1
                 continue
             entry_at = signal_end if decision_timestamp <= signal_end else decision_timestamp
             entry_index = next((probe for probe in range(index + 1, len(rows))
                                 if (_timestamp(rows[probe]) is not None and
                                     _timestamp(rows[probe]) >= entry_at)), None)
             if entry_index is None:
+                prefix_status["entry_bar_unavailable"] += 1
                 continue
             entry = rows[entry_index]
             eligible_prefixes += 1
+            prefix_status["eligible"] += 1
             session_had_eligible_prefix = True
-            metadata = evaluate_rule_signal_metadata(rows[:index + 1], spec)
-            if metadata is not None and first is None:
+            trace = evaluate_rule_signal_trace(rows[:index + 1], spec)
+            stages = trace.get("stages") or []
+            for item in stages:
+                name = str(item.get("stage") or "unknown")
+                counts = stage_counts.setdefault(name, Counter())
+                counts["tested"] += 1
+                counts["passed" if item.get("passed") is True else "failed"] += 1
+            if stages:
+                terminal = stages[-1]
+                terminal_stages[str(terminal.get("stage") or "unknown")] += 1
+                terminal_reasons[str(terminal.get("reason") or "unknown")] += 1
+            if trace.get("signal") is not None:
+                signal_prefixes += 1
+            metadata = (evaluate_rule_signal_metadata(rows[:index + 1], spec)
+                        if trace.get("signal") is not None and first is None
+                        else None)
+            if metadata is not None:
                 first = {**metadata, "session_date": day, "symbol": symbol,
                          "decision_timestamp": decision_timestamp.isoformat(),
                          "entry_timestamp": entry_at.isoformat(),
@@ -625,11 +655,24 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             first_signals.append(first)
         if session_had_eligible_prefix:
             eligible_sessions += 1
+    funnel = {
+        name: {"tested": int(counts["tested"]),
+               "passed": int(counts["passed"]),
+               "failed": int(counts["failed"]),
+               "pass_rate": (counts["passed"] / counts["tested"]
+                             if counts["tested"] else None)}
+        for name, counts in stage_counts.items()
+    }
     return {"total_prefixes": total_prefixes,
             "eligible_prefixes": eligible_prefixes,
             "eligible_sessions": eligible_sessions,
             "first_signals": first_signals,
-            "needed_prefix_bars": int(needed)}
+            "needed_prefix_bars": int(needed),
+            "signal_prefixes": signal_prefixes,
+            "prefix_status_counts": dict(sorted(prefix_status.items())),
+            "predicate_funnel": funnel,
+            "terminal_stage_counts": dict(sorted(terminal_stages.items())),
+            "terminal_reason_counts": dict(sorted(terminal_reasons.items()))}
 
 
 def _risk_value(row: Mapping[str, Any]) -> float | None:
@@ -724,6 +767,95 @@ def _entry_pricing_summary(signals: Sequence[Mapping[str, Any]]) -> dict[str, An
     }
 
 
+def _realized_fill_pricing(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Describe how replayed trades were actually priced.
+
+    Planned signal metadata can only say whether a boundary bar was visible or
+    whether an executable quote would be required.  Account rows carry the
+    realized fill source for each leg.  Keeping those two concepts separate
+    prevents a bar-priced intrabar stop (where OHLC has no exact trigger time)
+    from being mistaken for a failed quote lookup.
+    """
+    executed = [row for row in rows if row.get("no_trade") is not True]
+    entry_sources: Counter[str] = Counter()
+    exit_sources: Counter[str] = Counter()
+    source_pairs: Counter[str] = Counter()
+    entry_feeds: Counter[str] = Counter()
+    exit_feeds: Counter[str] = Counter()
+    entry_providers: Counter[str] = Counter()
+    exit_providers: Counter[str] = Counter()
+    pnl_by_pair: dict[str, float] = {}
+    entry_ages: list[float] = []
+    exit_ages: list[float] = []
+    for row in executed:
+        entry = str(row.get("entry_fill_source") or "unknown").strip().lower()
+        exit_source = str(row.get("exit_fill_source") or "unknown").strip().lower()
+        entry = entry if entry in {"bar", "quote"} else "unknown"
+        exit_source = exit_source if exit_source in {"bar", "quote"} else "unknown"
+        pair = f"{entry}->{exit_source}"
+        entry_sources[entry] += 1
+        exit_sources[exit_source] += 1
+        source_pairs[pair] += 1
+        pnl = _number(row.get("net_pnl"))
+        if pnl is not None:
+            pnl_by_pair[pair] = pnl_by_pair.get(pair, 0.0) + pnl
+        for counter, raw in (
+                (entry_feeds, row.get("entry_feed", row.get("entry_option_feed"))),
+                (exit_feeds, row.get("exit_feed", row.get("exit_option_feed"))),
+                (entry_providers, row.get("entry_provider")),
+                (exit_providers, row.get("exit_provider"))):
+            if raw not in (None, ""):
+                counter[str(raw)] += 1
+        entry_age = _number(row.get("entry_quote_age_seconds"))
+        exit_age = _number(row.get("exit_quote_age_seconds"))
+        if entry == "quote" and entry_age is not None:
+            entry_ages.append(entry_age)
+        if exit_source == "quote" and exit_age is not None:
+            exit_ages.append(exit_age)
+    both_quote = source_pairs.get("quote->quote", 0)
+    both_bar = source_pairs.get("bar->bar", 0)
+    mixed = sum(count for pair, count in source_pairs.items()
+                if pair in {"quote->bar", "bar->quote"})
+    return {
+        "executed_rows": len(executed),
+        "entry_source_counts": dict(sorted(entry_sources.items())),
+        "exit_source_counts": dict(sorted(exit_sources.items())),
+        "source_pair_counts": dict(sorted(source_pairs.items())),
+        "both_quote": both_quote,
+        "both_bar": both_bar,
+        "mixed": mixed,
+        "entry_quote_age_seconds": _quantiles(entry_ages),
+        "exit_quote_age_seconds": _quantiles(exit_ages),
+        "entry_feed_counts": dict(sorted(entry_feeds.items())),
+        "exit_feed_counts": dict(sorted(exit_feeds.items())),
+        "entry_provider_counts": dict(sorted(entry_providers.items())),
+        "exit_provider_counts": dict(sorted(exit_providers.items())),
+        "net_pnl_by_source_pair": dict(sorted(pnl_by_pair.items())),
+        "intrabar_bar_exit_caveat": (
+            "bar exits can be intentional for intrabar stop/target events "
+            "whose exact quote trigger time is unavailable"),
+        "authorizing": False,
+        "diagnostic_only": True,
+    }
+
+
+def _expected_cost_hurdle_bps(costs: Any, *, vehicle: str,
+                              executable_quotes: bool = False) -> float | None:
+    """Return the configured symmetric bar-reference hurdle when meaningful."""
+    if vehicle != "equity" or costs is None:
+        return None
+    round_trip = getattr(costs, "round_trip_cost", None)
+    if not callable(round_trip):
+        return None
+    try:
+        value = float(round_trip(
+            1.0, 1.0, 1.0, 1.0, vehicle="equity",
+            executable_quotes=bool(executable_quotes)) * 10_000.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
 def _stress_controls(risk_config: Mapping[str, Any] | None) -> tuple[float | None, float | None]:
     """Resolve configured stress controls while retaining fail-closed unknowns."""
     source = risk_config if isinstance(risk_config, Mapping) else {}
@@ -799,39 +931,91 @@ def _stressed_cost_summary(rows: Sequence[Mapping[str, Any]], scenario_bps: floa
 
 def _risk_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     intended: list[float] = []
+    planned_risk: list[float] = []
     delivered: list[float] = []
-    paired: list[float] = []
+    planned_to_budget: list[float] = []
+    delivered_to_planned: list[float] = []
+    opportunity_budgets: list[float] = []
+    opportunity_planned: list[float] = []
+    opportunity_utilization: list[float] = []
+    cap_binding = cap_evaluated = 0
+    risk_sized_quantities: list[float] = []
+    cap_quantities: list[float] = []
     for row in rows:
-        if row.get("no_trade") is True:
-            continue
-        planned = _number(row.get("risk_budget", row.get(
+        budget = _number(row.get("risk_budget", row.get(
             "intended_risk_usd", row.get("intended_risk"))))
         actual = _number(row.get("risk_usd", row.get(
             "delivered_risk_usd", row.get("delivered_risk"))))
+        planned = _number(row.get("planned_risk_usd", row.get(
+            "nominal_risk_usd", actual)))
+        if budget is not None and budget >= 0:
+            opportunity_budgets.append(budget)
         if planned is not None and planned >= 0:
-            intended.append(planned)
+            opportunity_planned.append(planned)
+        utilization = _number(row.get("risk_budget_utilization"))
+        if utilization is None and planned is not None and budget not in {None, 0.0}:
+            utilization = planned / float(budget)
+        if utilization is not None and utilization >= 0:
+            opportunity_utilization.append(utilization)
+        if row.get("notional_cap_quantity") is not None:
+            cap_evaluated += 1
+            cap_binding += int(row.get("notional_cap_binding") is True)
+        risk_quantity = _number(row.get("risk_sized_quantity"))
+        cap_quantity = _number(row.get("notional_cap_quantity"))
+        if risk_quantity is not None:
+            risk_sized_quantities.append(risk_quantity)
+        if cap_quantity is not None:
+            cap_quantities.append(cap_quantity)
+        if row.get("no_trade") is True:
+            continue
+        if budget is not None and budget >= 0:
+            intended.append(budget)
         if actual is not None and actual >= 0:
             delivered.append(actual)
-        if (planned is not None and planned > 0 and actual is not None
-                and actual >= 0):
-            paired.append(actual / planned)
+        if planned is not None and planned >= 0:
+            planned_risk.append(planned)
+        if planned is not None and planned >= 0 and budget not in {None, 0.0}:
+            planned_to_budget.append(planned / float(budget))
+        if planned is not None and planned > 0 and actual is not None and actual >= 0:
+            delivered_to_planned.append(actual / planned)
     configured_summary = _ratio_summary(intended, unit="risk_usd")
+    planned_summary = _ratio_summary(planned_risk, unit="risk_usd")
     capped_summary = _ratio_summary(delivered, unit="risk_usd")
     result = {
         # Explicit current names make the notional-cap interaction readable.
         # Keep the older aliases because the fit-diagnostics schema is
         # append-only and existing report consumers already understand them.
         "configured": configured_summary,
+        "planned": planned_summary,
         "capped_delivered": capped_summary,
         "intended": configured_summary,
         "delivered": capped_summary,
     }
-    if intended and delivered:
-        ratio = _ratio_summary(paired, unit="ratio")
-    else:
-        ratio = _ratio_summary([], unit="ratio")
-    result["delivered_to_configured"] = ratio
-    result["delivered_to_intended"] = ratio
+    configured_ratio = _ratio_summary(planned_to_budget, unit="ratio")
+    delivered_ratio = _ratio_summary(delivered_to_planned, unit="ratio")
+    result["planned_to_configured"] = configured_ratio
+    result["delivered_to_configured"] = configured_ratio
+    result["delivered_to_intended"] = configured_ratio
+    result["delivered_to_planned"] = delivered_ratio
+    result["notional_cap"] = {
+        "evaluated_rows": cap_evaluated,
+        "binding_rows": cap_binding,
+        "binding_rate": cap_binding / cap_evaluated if cap_evaluated else None,
+        "risk_sized_quantity": _quantiles(risk_sized_quantities),
+        "cap_quantity": _quantiles(cap_quantities),
+        "diagnostic_only": True,
+        "authorizing": False,
+    }
+    result["sizing_opportunities"] = {
+        "rows": len(opportunity_planned),
+        "configured_budget": _ratio_summary(
+            opportunity_budgets, unit="risk_usd"),
+        "planned_risk": _ratio_summary(opportunity_planned, unit="risk_usd"),
+        "planned_to_budget": _ratio_summary(
+            opportunity_utilization, unit="ratio"),
+        "diagnostic_only": True,
+        "authorizing": False,
+    }
     return result
 
 
@@ -954,7 +1138,8 @@ def measure_fit_diagnostics(
     callers own that boundary.
     """
     normalized = validate_rule_spec(spec)
-    prefix = _fit_prefixes(list(bars), normalized, policy=policy)
+    bar_rows = list(bars)
+    prefix = _fit_prefixes(bar_rows, normalized, policy=policy)
     signals = prefix["first_signals"]
     entry_vectors = [_planned_vector(item, full=False) for item in signals]
     full_vectors = [_planned_vector(item, full=True) for item in signals]
@@ -989,15 +1174,34 @@ def measure_fit_diagnostics(
         rows, scenario_bps, vehicle=resolved_vehicle, costs=costs,
         configured_limit=stress_limit)
                 for scenario_bps in COST_STRESS_MULTIPLIERS}
-    provenance = _provenance_summary(bars)
+    provenance = _provenance_summary(bar_rows)
     if rows:
         provenance["fills"] = _provenance_summary(rows, fill_rows=True)
     pricing = _entry_pricing_summary(signals)
+    realized_pricing = _realized_fill_pricing(rows)
     execution_rejections = _execution_rejection_summary(rows)
+    signal_quality = measure_signal_quality(
+        bar_rows, normalized, policy=policy,
+        cost_hurdle_bps=_expected_cost_hurdle_bps(
+            costs, vehicle=resolved_vehicle))
+    expected_cost = {
+        "bar_reference_round_trip_bps": _expected_cost_hurdle_bps(
+            costs, vehicle=resolved_vehicle, executable_quotes=False),
+        "executable_quote_round_trip_bps": _expected_cost_hurdle_bps(
+            costs, vehicle=resolved_vehicle, executable_quotes=True),
+        "stress_scenario_bps": stress_scenario,
+        "expected_cost_independent_of_stress": True,
+        "authorizing": False,
+        "diagnostic_only": True,
+    }
     configured_stress = (stressed.get(str(int(stress_scenario)), {})
                          if stress_scenario is not None else {})
     configured_status = configured_stress.get(
         "row_status", {"pass": 0, "fail": 0, "unknown": len(rows)})
+    required_stop_bps = (
+        float(stress_scenario) / float(stress_limit)
+        if (resolved_vehicle == "equity" and stress_scenario is not None and
+            stress_limit is not None and stress_limit > 0) else None)
     fit_diagnostics = {
         "schema": FIT_DIAGNOSTICS_SCHEMA,
         "scope": "fit_only",
@@ -1008,6 +1212,7 @@ def measure_fit_diagnostics(
             "eligible": eligible, "total": total,
             "rate": eligible / total if total else 0.0,
             "needed_prefix_bars": prefix["needed_prefix_bars"],
+            "status_counts": prefix["prefix_status_counts"],
         },
         "first_signal": {
             "signals": len(signals),
@@ -1017,8 +1222,20 @@ def measure_fit_diagnostics(
             "session_rate": (len(signals) / int(prefix["eligible_sessions"])
                               if prefix["eligible_sessions"] else 0.0),
             "prefix_rate": (len(signals) / eligible if eligible else 0.0),
-            "session_count": len({_session(row) for row in bars if _session(row)}),
+            "session_count": len({_session(row) for row in bar_rows if _session(row)}),
+            "signal_prefixes": int(prefix["signal_prefixes"]),
         },
+        "predicate_funnel": {
+            "schema": "rule-predicate-funnel.v1",
+            "scope": "eligible_fit_prefixes",
+            "stages": prefix["predicate_funnel"],
+            "terminal_stage_counts": prefix["terminal_stage_counts"],
+            "terminal_reason_counts": prefix["terminal_reason_counts"],
+            "authorizing": False,
+            "diagnostic_only": True,
+        },
+        "signal_quality": signal_quality,
+        "expected_cost": expected_cost,
         "atr_bps": _quantiles(atr_values),
         "floor_30bps": {
             "bps": float(MIN_STOP_DISTANCE_BPS),
@@ -1029,12 +1246,20 @@ def measure_fit_diagnostics(
         "vehicle": resolved_vehicle,
         "provenance": provenance,
         "entry_pricing": pricing,
-        "pricing": {"entry": dict(pricing), "diagnostic_only": True},
+        "realized_fill_pricing": realized_pricing,
+        "pricing": {"entry": dict(pricing),
+                    "realized": dict(realized_pricing),
+                    "diagnostic_only": True},
         "risk_controls": {
             "stressed_cost_scenario_bps": stress_scenario,
             "max_stressed_cost_to_risk_ratio": stress_limit,
             "scenario_bps": stress_scenario,
             "limit": stress_limit,
+            "required_static_stop_distance_bps": required_stop_bps,
+            "grammar_stop_floor_bps": float(MIN_STOP_DISTANCE_BPS),
+            "grammar_stop_floor_admissible": (
+                None if required_stop_bps is None else
+                float(MIN_STOP_DISTANCE_BPS) >= required_stop_bps),
             "configured_stress": {
                 "scenario_bps": stress_scenario,
                 "max_cost_to_risk_ratio": stress_limit,
@@ -1060,7 +1285,7 @@ def measure_fit_diagnostics(
         "mde_power": _mde(rows),
         "behavior_fingerprint": {
             "fit_evidence_key": _fit_evidence_key(
-                bars, policy=policy),
+                bar_rows, policy=policy),
             "entry": _digest(entry_vectors),
             "full": _digest(full_vectors),
             "entry_alias_key": _digest(alias_entry_vectors),
@@ -1074,7 +1299,7 @@ def measure_fit_diagnostics(
     # Historical backfill can be inspected only through the explicit policy
     # above. Keep that provenance visible and permanently non-authorizing so a
     # diagnostic prefix cannot advance a proof or emit an authorization.
-    backfill_rows = [row for row in bars if historical_backfill_record(row)]
+    backfill_rows = [row for row in bar_rows if historical_backfill_record(row)]
     fit_diagnostics["historical_backfill"] = {
         "rows": len(backfill_rows),
         "diagnostic_policy": bool(_diagnostic_backfill_enabled(policy)),

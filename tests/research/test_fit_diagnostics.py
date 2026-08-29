@@ -320,6 +320,51 @@ class FitDiagnosticsTests(unittest.TestCase):
         })
         self.assertFalse(summary["execution_blocked"])
 
+    def test_fit_output_includes_predicate_and_forward_return_diagnostics(self):
+        bars, _snapshots, _quotes = self._fit()
+        diagnostic = measure_fit_diagnostics(
+            bars, ROOT_SPEC, costs=CostModel(), vehicle="equity")
+        funnel = diagnostic["predicate_funnel"]
+        self.assertEqual(funnel["schema"], "rule-predicate-funnel.v1")
+        self.assertFalse(funnel["authorizing"])
+        self.assertIn("family_predicate", funnel["stages"])
+        self.assertGreater(
+            funnel["stages"]["family_predicate"]["tested"], 0)
+        quality = diagnostic["signal_quality"]
+        self.assertEqual(quality["schema"], "signal-quality.v1")
+        self.assertFalse(quality["authorizing"])
+        self.assertGreater(quality["event_count"], 0)
+        self.assertEqual(
+            quality["horizon_metrics"]["5m"]["cost_hurdle_bps"], 17.0)
+        self.assertEqual(
+            diagnostic["expected_cost"]["bar_reference_round_trip_bps"], 17.0)
+        self.assertEqual(
+            diagnostic["expected_cost"]["executable_quote_round_trip_bps"], 13.0)
+        controls = diagnostic["risk_controls"]
+        self.assertAlmostEqual(
+            controls["required_static_stop_distance_bps"], 25.0 / 0.30)
+        self.assertFalse(controls["grammar_stop_floor_admissible"])
+
+    def test_realized_fill_pricing_separates_mixed_and_bar_exit_paths(self):
+        diagnostic = measure_fit_diagnostics(
+            [], ROOT_SPEC, costs=CostModel(), vehicle="equity",
+            account_rows=[
+                {"vehicle": "equity", "no_trade": False,
+                 "entry_fill_source": "quote", "exit_fill_source": "bar",
+                 "entry_quote_age_seconds": 1.5, "entry_feed": "iex",
+                 "entry_provider": "alpaca", "net_pnl": 10.0},
+                {"vehicle": "equity", "no_trade": False,
+                 "entry_fill_source": "bar", "exit_fill_source": "bar",
+                 "net_pnl": -4.0},
+            ])
+        pricing = diagnostic["realized_fill_pricing"]
+        self.assertEqual(pricing["source_pair_counts"], {
+            "bar->bar": 1, "quote->bar": 1})
+        self.assertEqual(pricing["mixed"], 1)
+        self.assertEqual(pricing["both_bar"], 1)
+        self.assertEqual(pricing["entry_quote_age_seconds"]["median"], 1.5)
+        self.assertIn("intrabar", pricing["intrabar_bar_exit_caveat"])
+
     def test_non_opportunity_data_refusal_is_not_execution_blocked(self):
         diagnostic = measure_fit_diagnostics(
             [], ROOT_SPEC,

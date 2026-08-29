@@ -157,7 +157,8 @@ _FIT_DIAGNOSTIC_KEYS = frozenset({
     "atr_bps", "floor_30bps", "planned", "vehicle", "cost_to_risk",
     "risk", "exits", "exit_grammar", "mde_power", "behavior_fingerprint",
     "30bps_floor_binding", "planned_effective", "cost_to_risk_stressed",
-    "execution_rejections", "historical_backfill",
+    "execution_rejections", "historical_backfill", "predicate_funnel",
+    "signal_quality", "expected_cost",
 })
 _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "eligible", "total", "rate", "needed_prefix_bars", "signals",
@@ -180,6 +181,34 @@ _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "no_signal_rows", "unclassified_no_trade_rows",
     "explicit_rejections", "reject_reason_counts", "execution_blocked",
     "diagnostic_policy", "included",
+    "status_counts", "signal_prefixes",
+    "notional_cap", "sizing_opportunities", "evaluated_rows", "binding_rows",
+    "binding_rate", "risk_sized_quantity", "cap_quantity",
+    "configured_budget", "planned_risk", "planned_to_budget",
+    "bar_reference_round_trip_bps", "executable_quote_round_trip_bps",
+    "stress_scenario_bps", "expected_cost_independent_of_stress",
+})
+_FIT_SELECTION_FUNNEL_KEYS = frozenset({
+    "schema", "scope", "stages", "terminal_stage_counts",
+    "terminal_reason_counts", "authorizing", "diagnostic_only",
+})
+_FIT_SELECTION_FUNNEL_STAGE_KEYS = frozenset({
+    "tested", "passed", "failed", "pass_rate",
+})
+_FIT_SELECTION_SIGNAL_QUALITY_KEYS = frozenset({
+    "schema", "scope", "metric", "canonical_cross_sectional_ic",
+    "event_policy", "return_basis", "control_policy", "variant_id",
+    "horizons", "event_count", "session_count", "symbol_count",
+    "event_rejection_counts", "event_time_bucket_counts",
+    "horizon_metrics",
+    "authorizing", "diagnostic_only",
+})
+_FIT_SELECTION_HORIZON_KEYS = frozenset({
+    "horizon_minutes", "candidate_count", "matched_count",
+    "mean_forward_return_bps", "candidate_minus_control_bps",
+    "cost_hurdle_bps", "mean_after_hurdle_bps", "hurdle_exceedance_rate",
+    "unavailable_count", "unavailable_reason_counts", "session_clusters",
+    "symbol_clusters", "session_symbol_cells",
 })
 _FIT_SELECTION_REJECTION_KEYS = frozenset({
     "rows", "executed_rows", "no_trade_rows",
@@ -279,6 +308,16 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
         allowed = _FIT_SELECTION_AGGREGATE_KEYS
     elif context == "rejections":
         allowed = _FIT_SELECTION_REJECTION_KEYS
+    elif context == "predicate_funnel":
+        allowed = _FIT_SELECTION_FUNNEL_KEYS
+    elif context == "funnel_stage":
+        allowed = _FIT_SELECTION_FUNNEL_STAGE_KEYS
+    elif context == "signal_quality":
+        allowed = _FIT_SELECTION_SIGNAL_QUALITY_KEYS
+    elif context == "signal_quality_horizon":
+        allowed = _FIT_SELECTION_HORIZON_KEYS
+    elif context in {"funnel_stages", "signal_quality_horizons"}:
+        allowed = None
     elif context == "reason_counts":
         # Machine-readable replay reason labels are dynamic; their values are
         # still finite scalar counts and pass the global denied-key filter.
@@ -335,6 +374,31 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
                 child_context = "fit_diagnostics"
             elif key == "execution_rejections":
                 child_context = "rejections"
+            elif key == "predicate_funnel":
+                child_context = "predicate_funnel"
+            elif key == "stages" and context == "predicate_funnel":
+                child_context = "funnel_stages"
+            elif context == "funnel_stages":
+                child_context = "funnel_stage"
+            elif key in {"terminal_stage_counts", "terminal_reason_counts"} and \
+                    context == "predicate_funnel":
+                child_context = "reason_counts"
+            elif key == "signal_quality":
+                child_context = "signal_quality"
+            elif key == "horizon_metrics" and context == "signal_quality":
+                child_context = "signal_quality_horizons"
+            elif context == "signal_quality_horizons":
+                if not (key.endswith("m") and key[:-1].isdigit()):
+                    continue
+                # Keep provider context compact and focused on actionable
+                # intraday decay.  The persisted diagnostic retains every
+                # configured horizon, including 120/390-minute censoring.
+                if int(key[:-1]) > 60:
+                    continue
+                child_context = "signal_quality_horizon"
+            elif key in {"event_rejection_counts", "event_time_bucket_counts",
+                         "unavailable_reason_counts"}:
+                child_context = "reason_counts"
             elif key == "reject_reason_counts":
                 child_context = "reason_counts"
             elif key in {"last_diagnosis"}:
@@ -1475,13 +1539,13 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
             break
         if _failed_variant(spec, failed) or _variant_seen(spec, seen):
             continue
-        # Deterministic tuning is also subject to the same bounded semantic
-        # neighborhood when a prior cycle (or an earlier accepted member in
-        # this cycle) already tested the point.  IDs are never rewritten: the
-        # exact member is simply skipped and the ladder supplies its next
-        # deterministic fallback.
+        # The deterministic ladder is the pre-registered local experiment.
+        # A broad model near-duplicate threshold must not silently delete its
+        # coordinate points; only exact executable aliases are redundant here.
+        # Discovery/replacement and genuinely novel model proposals retain the
+        # configured semantic-neighborhood suppression.
         prior_specs = list(existing_specs)
-        if _semantic_duplicate(spec, prior_specs, near_distance=near_distance):
+        if _semantic_duplicate(spec, prior_specs, near_distance=0.0):
             continue
         # The deterministic ladder is an explicit bounded search space; keep
         # its non-redundant neighboring points as coverage.
