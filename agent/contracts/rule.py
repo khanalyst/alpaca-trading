@@ -814,6 +814,27 @@ def _within_entry_window(spec: Mapping[str, Any], stamp: datetime) -> bool:
             float(spec["entry_before_minutes"]))
 
 
+def session_minutes(stamp: datetime) -> float:
+    """Minutes from the 09:30 New York open to *stamp*, on its own local day."""
+
+    return _session_minutes(stamp)
+
+
+def entry_window_bounds(value: Mapping[str, Any]) -> tuple[float, float]:
+    """The minutes-from-open interval in which *value* may emit a signal.
+
+    Diagnostics that need a matched null draw must restrict themselves to the
+    bars a rule was actually allowed to enter on.  Exposing the same bounds
+    ``_within_entry_window`` enforces keeps that null tied to the executable
+    predicate instead of a copy that can drift away from it.
+    """
+    spec = validate_rule_spec(value)
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
+        return 0.0, float(SESSION_MINUTES)
+    return (float(spec["entry_after_minutes"]),
+            float(spec["entry_before_minutes"]))
+
+
 def _within_volatility_band(spec: Mapping[str, Any], atr: float,
                             close: float) -> bool:
     if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
@@ -1237,6 +1258,7 @@ __all__ = [
            "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS",
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "OPENING_ANCHORED_FAMILIES",
+           "entry_window_bounds", "session_minutes",
            "feature_window_bars", "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",
     "RuleSpecError", "breakeven_stop_price", "completed_bar_exit_transition",

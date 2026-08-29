@@ -159,7 +159,11 @@ def _fit_signal_quality_metrics(
             "horizon": str(label), "count": int(count),
             "mean_bps": _number(item.get("mean_forward_return_bps")),
             "control_delta_bps": _number(item.get("candidate_minus_control_bps")),
+            # A mean with no error term is what let a 47-trade replay read as a
+            # finding.  Never render one of these numbers without its t.
+            "control_delta_t": _number(item.get("candidate_minus_control_t_stat")),
             "after_cost_bps": _number(item.get("mean_after_hurdle_bps")),
+            "after_cost_t": _number(item.get("after_hurdle_t_stat")),
         })
     return result
 
@@ -942,8 +946,10 @@ def render_text(report: Mapping[str, Any]) -> str:
                         rendered = ", ".join(
                             f"{item['horizon']} n={item['count']} mean "
                             f"{_fmt(item['mean_bps'], 2)}bps vs-null "
-                            f"{_fmt(item['control_delta_bps'], 2)}bps after-cost "
-                            f"{_fmt(item['after_cost_bps'], 2)}bps"
+                            f"{_fmt(item['control_delta_bps'], 2)}bps "
+                            f"(t {_fmt(item['control_delta_t'], 2)}) after-cost "
+                            f"{_fmt(item['after_cost_bps'], 2)}bps "
+                            f"(t {_fmt(item['after_cost_t'], 2)})"
                             for item in signal_quality)
                         add(f"      fit conditional forward returns {rendered}")
                 for variant in item["variants"]:
@@ -1091,8 +1097,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                         rendered = "; ".join(
                             f"{item['horizon']} n={item['count']}, mean "
                             f"{_fmt(item['mean_bps'], 2)} bps, vs-null "
-                            f"{_fmt(item['control_delta_bps'], 2)} bps, after-cost "
-                            f"{_fmt(item['after_cost_bps'], 2)} bps"
+                            f"{_fmt(item['control_delta_bps'], 2)} bps "
+                            f"(t {_fmt(item['control_delta_t'], 2)}), after-cost "
+                            f"{_fmt(item['after_cost_bps'], 2)} bps "
+                            f"(t {_fmt(item['after_cost_t'], 2)})"
                             for item in signal_quality)
                         out.append(f"- Fit conditional forward returns: {rendered}")
                 outcome = item["outcome"]

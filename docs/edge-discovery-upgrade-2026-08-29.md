@@ -28,7 +28,10 @@ Every variant now receives a fit-only `signal_quality` diagnostic at 5, 15,
 30, 60, 120, and 390 minutes. It reports:
 
 - directional forward return from the completed signal close;
-- a deterministic random-entry control in the same symbol and session;
+- a deterministic random-entry control in the same symbol and session
+  (superseded — see `docs/signal-quality-null-control-2026-08-30.md`, which
+  replaces this control after measuring that it reports a large edge on a
+  corpus with no predictive structure);
 - candidate-minus-control return;
 - the configured bar-reference cost hurdle and return after that hurdle;
 - censored horizons and exact reasons such as insufficient future bars or an

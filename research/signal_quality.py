@@ -13,20 +13,45 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import math
-from statistics import mean, median
+from statistics import mean, median, stdev
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    evaluate_rule_signal, feature_window_bars, rule_variant_id,
-    validate_rule_spec,
+    entry_window_bounds, evaluate_rule_signal, feature_window_bars,
+    rule_variant_id, session_minutes, validate_rule_spec,
 )
 from .market_data import replay_available_at, replay_record_is_available
 
 
-SIGNAL_QUALITY_SCHEMA = "signal-quality.v1"
+SIGNAL_QUALITY_SCHEMA = "signal-quality.v2"
 DEFAULT_HORIZONS = (5, 15, 30, 60, 120, 390)
 _NY = ZoneInfo("America/New_York")
+# Intraday returns carry strong time-of-day structure, and every family in the
+# catalog fires on a concentrated part of the session: opening-anchored rules
+# cannot signal before their range completes, the VWAP families need a session
+# prefix, and every discovery variant sets an explicit entry window.  A null
+# drawn uniformly across the session therefore measures the difference between
+# two clocks rather than the value of the predicate, and reports the gap as an
+# edge.  The null is matched on the clock instead: the same instrument, at the
+# same session minute, on every other session in the corpus.
+#
+# The tiers below only exist for corpora too small to supply a cross-session
+# match.  They are ordered tightest-first and still cannot fully remove the
+# gap, because a rule that fires as early as its window allows sits ahead of
+# any same-session draw spread across that window; whichever tier is used,
+# ``control_mean_session_minute`` reports the residual clock gap so it stays
+# visible rather than being absorbed into the result.
+_TIME_BUCKETS = ((60.0, "opening_0_60m"), (300.0, "midday_60_300m"))
+_LAST_BUCKET = "close_300m_plus"
+_CONTROL_MINUTE_BAND = 20.0
+
+
+def _time_bucket(minutes: float) -> str:
+    for edge, name in _TIME_BUCKETS:
+        if minutes < edge:
+            return name
+    return _LAST_BUCKET
 
 
 def _value(row: Any, name: str, default: Any = None) -> Any:
@@ -185,10 +210,47 @@ def _forward_return(rows: Sequence[Any], *, entry_index: int, horizon: int,
     return sign * (future_close / entry_price - 1.0) * 10_000.0, None
 
 
-def _control_indices(rows: Sequence[Any], *, horizon: int,
-                     allow_backfill: bool) -> list[int]:
-    eligible: list[int] = []
+class _ControlPolicy:
+    """The bars a rule was admissible to enter on, reused across candidates.
+
+    Admissibility mirrors the executable evaluator: a mature prefix, a
+    contiguous feature window, and a timestamp inside the spec's own entry
+    window.  Anything outside that set is a bar the rule could never have
+    traded, so including it in the null measures the session's clock instead
+    of the predicate.
+    """
+
+    __slots__ = ("minimum_prefix", "window", "after", "before")
+
+    def __init__(self, spec: Mapping[str, Any]) -> None:
+        self.minimum_prefix = max(int(spec["lookback"]) + 1,
+                                  int(spec["atr_period"]) + 1)
+        self.window = feature_window_bars(spec)
+        self.after, self.before = entry_window_bounds(spec)
+
+    def admissible(self, rows: Sequence[Any], index: int) -> float | None:
+        """Return the bar's session minute when the rule could enter on it."""
+        if index + 1 < self.minimum_prefix:
+            return None
+        feature_start = (0 if self.window is None
+                         else max(0, index + 1 - int(self.window)))
+        if not _contiguous(rows, feature_start, index + 1):
+            return None
+        stamp = _timestamp(rows[index])
+        if stamp is None:
+            return None
+        minutes = session_minutes(stamp)
+        return minutes if self.after <= minutes < self.before else None
+
+
+def _control_indices(rows: Sequence[Any], policy: _ControlPolicy, *,
+                     horizon: int, allow_backfill: bool) -> list[tuple[int, float]]:
+    """Admissible null-draw indices and their session minutes."""
+    eligible: list[tuple[int, float]] = []
     for signal_index in range(0, len(rows)):
+        minutes = policy.admissible(rows, signal_index)
+        if minutes is None:
+            continue
         future_index = signal_index + int(horizon)
         if future_index >= len(rows) or not _contiguous(
                 rows, signal_index, future_index + 1):
@@ -207,27 +269,82 @@ def _control_indices(rows: Sequence[Any], *, horizon: int,
         future_price = _number(_value(rows[future_index], "close"))
         if (entry_price is not None and entry_price > 0 and
                 future_price is not None and future_price > 0):
-            eligible.append(signal_index)
+            eligible.append((signal_index, minutes))
     return eligible
 
 
-def _control_return(rows: Sequence[Any], *, candidate_index: int,
-                    direction: str, horizon: int, seed_key: str,
-                    allow_backfill: bool) -> tuple[float | None, str | None, int | None]:
-    choices = _control_indices(rows, horizon=horizon,
-                               allow_backfill=allow_backfill)
-    alternatives = [index for index in choices if index != candidate_index]
-    if alternatives:
-        choices = alternatives
+def _eligible_by_minute(rows: Sequence[Any], policy: _ControlPolicy, *,
+                        horizon: int, allow_backfill: bool) -> dict[int, tuple[int, float]]:
+    """Admissible null-draw bars for one session, keyed by session minute."""
+    eligible: dict[int, tuple[int, float]] = {}
+    for index, minutes in _control_indices(rows, policy, horizon=horizon,
+                                           allow_backfill=allow_backfill):
+        eligible.setdefault(int(round(minutes)), (index, minutes))
+    return eligible
+
+
+def _control_return(candidate_cell: tuple[str, str], candidate_minutes: float, *,
+                    eligible: Mapping[tuple[str, str], dict[int, tuple[int, float]]],
+                    session_rows: Mapping[tuple[str, str], Sequence[Any]],
+                    candidate_index: int, direction: str, horizon: int,
+                    allow_backfill: bool
+                    ) -> tuple[float | None, str | None, dict[str, Any]]:
+    """Average every admissible null draw whose clock matches the candidate.
+
+    The null has to answer "does the predicate beat entering at a comparable
+    time?", so the comparable time is matched exactly: the same instrument, at
+    the same minute of the session, on every *other* session in the corpus.  A
+    same-session draw cannot do this — a rule that fires at the earliest bar
+    its own window allows sits systematically ahead of any draw spread across
+    that window, and intraday drift over that gap alone reads as an edge.
+    Same-session tiers remain as a fallback for corpora too small to supply a
+    cross-session match, and the tier used is reported.
+
+    Averaging the whole pool rather than selecting one member keeps the null
+    deterministic without spending sample: a single draw carries the same
+    variance as the candidate itself and inflates the paired standard error by
+    roughly the square root of two.
+    """
+    symbol, session = candidate_cell
+    minute_key = int(round(candidate_minutes))
+    choices: list[tuple[tuple[str, str], int, float]] = []
+    for cell, minute_map in eligible.items():
+        if cell[0] != symbol or cell[1] == session:
+            continue
+        found = minute_map.get(minute_key)
+        if found is not None:
+            choices.append((cell, found[0], found[1]))
+    matching = "cross_session_same_session_minute"
     if not choices:
-        return None, "no_matched_control", None
-    selector = int(_digest({"seed": seed_key, "horizon": horizon})[:16], 16)
-    index = choices[selector % len(choices)]
-    entry_price = float(_value(rows[index], "close"))
-    value, reason = _forward_return(
-        rows, entry_index=index + 1, horizon=horizon, entry_price=entry_price,
-        direction=direction, allow_backfill=allow_backfill)
-    return value, reason, index
+        # Fallbacks stay inside the candidate's own session, tightest first.
+        own = [item for item in eligible.get(candidate_cell, {}).values()
+               if item[0] != candidate_index]
+        near = [item for item in own
+                if abs(item[1] - candidate_minutes) <= _CONTROL_MINUTE_BAND]
+        bucket = _time_bucket(candidate_minutes)
+        same_bucket = [item for item in own
+                       if _time_bucket(item[1]) == bucket]
+        picked, matching = ((near, "same_session_minute_band") if near else
+                            (same_bucket, "same_session_time_bucket")
+                            if same_bucket else (own, "same_session_entry_window"))
+        choices = [(candidate_cell, index, minutes) for index, minutes in picked]
+    if not choices:
+        return None, "no_matched_control", {"matching": "none", "pool": 0}
+    values: list[float] = []
+    minutes_used: list[float] = []
+    for cell, index, item_minutes in choices:
+        rows = session_rows[cell]
+        value, _reason = _forward_return(
+            rows, entry_index=index + 1, horizon=horizon,
+            entry_price=float(_value(rows[index], "close")),
+            direction=direction, allow_backfill=allow_backfill)
+        if value is not None:
+            values.append(value)
+            minutes_used.append(item_minutes)
+    if not values:
+        return None, "no_matched_control", {"matching": matching, "pool": 0}
+    return mean(values), None, {"matching": matching, "pool": len(values),
+                                "mean_session_minute": mean(minutes_used)}
 
 
 def _summary(values: Sequence[float]) -> tuple[float | None, float | None, float | None]:
@@ -235,6 +352,26 @@ def _summary(values: Sequence[float]) -> tuple[float | None, float | None, float
     if not clean:
         return None, None, None
     return mean(clean), median(clean), sum(value > 0 for value in clean) / len(clean)
+
+
+def _dispersion(values: Sequence[float], *, shift: float = 0.0) -> dict[str, Any]:
+    """Sample dispersion for one aggregate, so a mean can be read with its error.
+
+    A point estimate with no error term is what let a 47-trade replay read as
+    a finding.  Every mean this screen reports therefore carries the standard
+    deviation, standard error, and t-statistic that say how much of it is
+    distinguishable from zero.
+    """
+    clean = [float(value) for value in values if math.isfinite(float(value))]
+    count = len(clean)
+    if not count:
+        return {"stdev_bps": None, "stderr_bps": None, "t_stat": None}
+    deviation = stdev(clean) if count > 1 else None
+    error = (deviation / math.sqrt(count)
+             if deviation is not None and deviation > 0 else None)
+    centre = mean(clean) - float(shift)
+    return {"stdev_bps": deviation, "stderr_bps": error,
+            "t_stat": (centre / error) if error else None}
 
 
 def _event_index(value: Any) -> int | None:
@@ -404,16 +541,26 @@ def measure_signal_quality(
                   "midday_60_300m" if minutes < 300 else "close_300m_plus")
         event_time_buckets[bucket] += 1
 
+    control_policy = _ControlPolicy(normalized)
     horizon_metrics: dict[str, Any] = {}
     event_vectors: list[dict[str, Any]] = []
     for horizon in requested:
         candidates: list[float] = []
         controls: list[float] = []
         paired_deltas: list[float] = []
+        candidate_minutes: list[float] = []
+        control_minutes: list[float] = []
+        pool_sizes: list[int] = []
+        matching_counts: Counter[str] = Counter()
         unavailable: Counter[str] = Counter()
         sessions: set[str] = set()
         symbols: set[str] = set()
         cells: set[str] = set()
+        # Built once per horizon rather than once per candidate: the null pool
+        # for a session does not depend on which candidate is asking for it.
+        eligible = {cell: _eligible_by_minute(
+            rows, control_policy, horizon=horizon, allow_backfill=allow_backfill)
+            for cell, rows in grouped.items()}
         for symbol, session, rows, event in events:
             direction = str(event["signal"]["direction"])
             candidate, reason = _forward_return(
@@ -427,30 +574,38 @@ def measure_signal_quality(
             sessions.add(session)
             symbols.add(symbol)
             cells.add(f"{session}:{symbol}")
-            seed_key = _digest({
-                "variant_id": rule_variant_id(normalized), "symbol": symbol,
-                "session": session, "signal_index": event["signal_index"],
-            })
-            control, control_reason, control_index = _control_return(
-                rows, candidate_index=int(event["signal_index"]),
-                direction=direction, horizon=horizon, seed_key=seed_key,
+            signal_stamp = _timestamp(rows[int(event["signal_index"])])
+            minutes = (session_minutes(signal_stamp)
+                       if signal_stamp is not None else 0.0)
+            candidate_minutes.append(minutes)
+            control, control_reason, control_meta = _control_return(
+                (symbol, session), minutes, eligible=eligible,
+                session_rows=grouped,
+                candidate_index=int(event["signal_index"]),
+                direction=direction, horizon=horizon,
                 allow_backfill=allow_backfill)
+            matching_counts[str(control_meta["matching"])] += 1
             if control is None:
                 unavailable[str(control_reason or "control_unavailable")] += 1
             else:
                 controls.append(control)
                 paired_deltas.append(candidate - control)
+                pool_sizes.append(int(control_meta["pool"]))
+                control_minutes.append(float(control_meta["mean_session_minute"]))
             event_vectors.append({
                 "symbol": symbol, "session": session, "horizon": horizon,
                 "direction": direction, "signal_index": event["signal_index"],
                 "entry_index": event["entry_index"],
-                "control_index": control_index,
+                "control_matching": control_meta["matching"],
+                "control_pool": control_meta["pool"],
             })
         candidate_mean, candidate_median, positive_rate = _summary(candidates)
         control_mean, _control_median, _control_positive = _summary(controls)
         hurdle = cost_hurdle_bps
         after_hurdle = ([value - hurdle for value in candidates]
                         if hurdle is not None else [])
+        candidate_dispersion = _dispersion(candidates)
+        delta_dispersion = _dispersion(paired_deltas)
         horizon_metrics[f"{horizon}m"] = {
             "horizon_minutes": horizon,
             "candidate_count": len(candidates),
@@ -458,12 +613,27 @@ def measure_signal_quality(
             "mean_forward_return_bps": candidate_mean,
             "median_forward_return_bps": candidate_median,
             "positive_rate": positive_rate,
+            "forward_return_stdev_bps": candidate_dispersion["stdev_bps"],
+            "forward_return_stderr_bps": candidate_dispersion["stderr_bps"],
+            "forward_return_t_stat": candidate_dispersion["t_stat"],
             "control_mean_forward_return_bps": control_mean,
             "candidate_minus_control_bps": (
                 mean(paired_deltas) if paired_deltas else None),
+            "candidate_minus_control_stdev_bps": delta_dispersion["stdev_bps"],
+            "candidate_minus_control_stderr_bps": delta_dispersion["stderr_bps"],
+            "candidate_minus_control_t_stat": delta_dispersion["t_stat"],
+            "control_matching_counts": dict(sorted(matching_counts.items())),
+            "control_pool_mean": mean(pool_sizes) if pool_sizes else None,
+            "candidate_mean_session_minute": (
+                mean(candidate_minutes) if candidate_minutes else None),
+            "control_mean_session_minute": (
+                mean(control_minutes) if control_minutes else None),
             "cost_hurdle_bps": hurdle,
             "mean_after_hurdle_bps": (
                 mean(after_hurdle) if after_hurdle else None),
+            "after_hurdle_t_stat": (
+                _dispersion(candidates, shift=hurdle)["t_stat"]
+                if hurdle is not None else None),
             "hurdle_exceedance_rate": (
                 sum(value > hurdle for value in candidates) / len(candidates)
                 if candidates and hurdle is not None else None),
@@ -482,7 +652,9 @@ def measure_signal_quality(
         "canonical_cross_sectional_ic": False,
         "event_policy": "first_actionable_signal_per_symbol_session",
         "return_basis": "signal_bar_close_to_horizon_close_with_next_bar_lag",
-        "control_policy": "deterministic_same_symbol_session_random_entry",
+        "control_policy": (
+            "same_symbol_admissible_entry_bars_at_the_same_session_minute"
+            "_across_other_sessions_averaged_over_pool"),
         "variant_id": rule_variant_id(normalized),
         "horizons": list(requested),
         "event_count": len(events),

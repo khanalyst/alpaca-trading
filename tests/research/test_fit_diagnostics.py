@@ -331,7 +331,7 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertGreater(
             funnel["stages"]["family_predicate"]["tested"], 0)
         quality = diagnostic["signal_quality"]
-        self.assertEqual(quality["schema"], "signal-quality.v1")
+        self.assertEqual(quality["schema"], "signal-quality.v2")
         self.assertFalse(quality["authorizing"])
         self.assertGreater(quality["event_count"], 0)
         self.assertEqual(

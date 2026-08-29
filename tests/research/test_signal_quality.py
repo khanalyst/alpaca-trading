@@ -54,7 +54,7 @@ class ConditionalForwardReturnTests(unittest.TestCase):
             list(reversed(self.bars)), ROOT_SPEC, policy=self.policy,
             cost_hurdle_bps=17.0)
         self.assertEqual(first, reordered)
-        self.assertEqual(first["schema"], "signal-quality.v1")
+        self.assertEqual(first["schema"], "signal-quality.v2")
         self.assertFalse(first["authorizing"])
         self.assertTrue(first["diagnostic_only"])
         self.assertFalse(first["canonical_cross_sectional_ic"])
