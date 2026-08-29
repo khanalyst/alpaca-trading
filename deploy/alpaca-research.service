@@ -15,6 +15,9 @@ Environment=ALPACA_STOCK_FEED=iex
 Environment=ALPACA_OPTIONS_FEED=indicative
 Environment=ALPACA_RESEARCH_VEHICLES=equity
 Environment=ALPACA_RESEARCH_LLM_SECRETS_FILE=/etc/alpaca-agent-trading/research-llm.env
+# Keep disposable preprocessing output on the same durable mount as the
+# content-addressed cache.  The cycle consumes artifacts with os.replace.
+Environment=TMPDIR=/opt/alpaca-agent-trading/research/cache/tmp
 Environment=PYTHON=/opt/alpaca-agent-trading/.venv/bin/python
 ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/deploy/scheduler.py --once --root /opt/alpaca-agent-trading --config /opt/alpaca-agent-trading/config.yaml --script /opt/alpaca-agent-trading/deploy/research-cycle.sh --status-file /opt/alpaca-agent-trading/runtime/health/research.json --hour 3 --minute 0 --timeout-seconds 14400
 Nice=10

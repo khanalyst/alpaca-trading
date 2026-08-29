@@ -569,13 +569,15 @@ complete, parity-matched rows with prior qualification and matching
 source/config/code/provenance/replay/gate hashes; family and global BH plus the
 frozen-dependence-cluster veto and durable online-FDR are applied before an
 immutable `lane=shadow` proof and
-live-ingestion marker are appended. The unchanged `shadow-confirmation-v4`
+live-ingestion marker are appended. The `shadow-confirmation-v5`
 ingester first splits the tail into
 older chronological selection sessions and a newer disjoint confirmatory
 window: BH uses selection raw p-values, while only the selected candidate's raw
-confirmatory p-value is sent to LORD. Legacy same-tail v3 rows remain auditable
-but quarantined. Epoch-5 verification also binds the proof to the durable FDR
-allocation (scope/test id, p-value, alpha, allocation, and decision). The
+confirmatory p-value is sent to LORD++. Its preregistered `W0=alpha` makes the
+first-discovery reward zero; later discoveries receive the standard `alpha`
+reward stream. Legacy v2/v3/v4 rows remain auditable but quarantined. Epoch-5
+verification also binds the proof to the durable FDR allocation (scope/test id,
+method/version, p-value, alpha, allocation, and decision). The
 confirmatory p-value resolution scales
 to the next allocation; if the bounded simulation cap cannot resolve it, the
 ingester reports `confirmatory_resolution_exhausted` without spending alpha or

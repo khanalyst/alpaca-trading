@@ -60,6 +60,8 @@ class DiagnosticLLMEpochTests(unittest.TestCase):
         self.assertFalse(ledger.exists())
         self.assertTrue(result["diagnostic_only"])
         self.assertFalse(result["authorizing"])
+        self.assertEqual(result["bar_coverage"]["schema"], "bar-coverage.v1")
+        self.assertIn("by_symbol_session", result["bar_coverage"])
         self.assertEqual(result["strategy_llm"]["model"], "gpt-5.6-terra")
         self.assertEqual(result["strategy_llm"]["calls_used"], 2)
         self.assertEqual(result["llm_call_evidence"]["attempted"], 2)
@@ -68,6 +70,10 @@ class DiagnosticLLMEpochTests(unittest.TestCase):
                          "llm_discovery")
         self.assertEqual(result["reports"][0]["rule_spec"], discovered)
         self.assertEqual(len(result["reports"][0]["variants"]), 2)
+        self.assertNotIn("bar_coverage", result["reports"][0]["account"])
+        self.assertNotIn(
+            "bar_coverage",
+            result["reports"][0]["diagnostic"]["fit_diagnostics"])
         self.assertTrue(all(
             report["diagnostic_only"] and not report["authorizing"]
             for report in result["reports"]))

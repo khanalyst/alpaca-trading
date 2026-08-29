@@ -6,8 +6,8 @@ requires a complete replay tail (including the paired control and null
 sources), splits it into disjoint chronological selection and confirmatory
 windows, rebuilds the existing verified-gate envelope, and only then appends
 an immutable ``lane='shadow'`` run to EdgeLedger. Batch family/global BH
-q-values select the candidate; the v4 LORD scope uses the raw-p v3 method and
-receives only the newer confirmatory gate's raw p-value. A missing, mismatched,
+q-values select the candidate; the v5 LORD++ scope receives only the newer
+confirmatory gate's raw p-value. A missing, mismatched,
 or already-consumed session is a no-op.
 """
 
@@ -32,7 +32,7 @@ from .live_shadow import (
     _opportunity_capacity,
 )
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
-from .factory_ledger import FDR_METHOD, FactoryLedger
+from .factory_ledger import CONFIRMATORY_SCOPE_VERSION, FactoryLedger
 from .stats import benjamini_hochberg
 
 
@@ -47,10 +47,8 @@ MAX_CONFIRMATORY_ITERATIONS = 2_000_000
 # tail is a diagnostic/no-op and must be replayed in smaller chronological
 # cycles rather than silently truncating the selection source.
 MAX_SELECTION_SOURCE_ROWS = 100_000
-# v4 starts a fresh durable LORD sequence.  The prior v2 sequence spent
-# family/global BH q-values; those rows remain readable for audit but must not
-# be reused for raw-p confirmatory spending.
-CONFIRMATORY_SCOPE_VERSION = "shadow-confirmation-v4"
+# v5 starts a fresh durable LORD++ sequence.  Prior v2/v3/v4 sequences remain
+# readable for audit but must not be reused for raw-p confirmatory spending.
 CONFIRMATORY_P_VALUE_SOURCE = "live_shadow_confirmatory_gate"
 
 

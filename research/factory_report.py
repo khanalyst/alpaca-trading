@@ -84,6 +84,61 @@ def _number(value: Any) -> float | None:
     return number if number == number and abs(number) != float("inf") else None
 
 
+def _risk_summary_value(section: Any) -> float | None:
+    """Read the representative value from a structured fit-risk summary."""
+    if isinstance(section, Mapping):
+        # ``median`` is stable and resistant to one unusually large plan.  A
+        # mean-only summary is still supported for older/compact diagnostics.
+        for key in ("median", "mean", "p50", "value"):
+            value = _number(section.get(key))
+            if value is not None:
+                return value
+        return None
+    return _number(section)
+
+
+def _fit_risk_metrics(
+        fit_diagnostics: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize the versioned fit risk summary for human-readable output.
+
+    Current diagnostics name the configured pre-cap budget explicitly and
+    retain ``intended`` / ``delivered_to_intended`` as compatibility aliases.
+    Accept both shapes without inventing a planned value when it is not
+    persisted.
+    """
+    if not isinstance(fit_diagnostics, Mapping):
+        return None
+    risk = fit_diagnostics.get("risk")
+    if not isinstance(risk, Mapping):
+        return None
+
+    def first(*names: str) -> Any:
+        for name in names:
+            if name in risk and risk.get(name) is not None:
+                return risk.get(name)
+        return None
+
+    configured = first("configured", "configured_budget", "risk_budget",
+                       "budget", "intended")
+    planned = first("planned", "effective")
+    delivered = first("capped_delivered", "delivered", "actual",
+                      "effective_delivered")
+    ratio_name = next((name for name in (
+        "delivered_to_planned", "delivered_to_configured",
+        "delivered_to_intended", "delivery_ratio")
+                       if name in risk and risk.get(name) is not None), None)
+    ratio = risk.get(ratio_name) if ratio_name is not None else None
+    if configured is None and planned is None and delivered is None and ratio is None:
+        return None
+    return {"configured": _risk_summary_value(configured),
+            "planned": _risk_summary_value(planned),
+            "delivered": _risk_summary_value(delivered),
+            "ratio": _risk_summary_value(ratio),
+            "ratio_label": ("delivered/planned"
+                             if ratio_name == "delivered_to_planned" else
+                             "delivered/configured")}
+
+
 def _dependence_policy_row(row: Mapping[str, Any]) -> dict:
     """Decode and hash-check one frozen policy without opening a writable ledger."""
     try:
@@ -556,6 +611,9 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                                   int(item["generation"])),
                 "variants": variants,
                 "fit_diagnostics": fit_audit["diagnostics"],
+                "risk_summary": (
+                    fit_audit["diagnostics"].get("risk")
+                    if isinstance(fit_audit["diagnostics"], Mapping) else None),
                 "behavior_aliases": fit_audit["behavior_aliases"],
                 "excluded_behavior_aliases": fit_audit[
                     "excluded_behavior_aliases"],
@@ -841,6 +899,19 @@ def render_text(report: Mapping[str, Any]) -> str:
                     add(f"      fit behavior aliases {len(aliases.get('full_aliases') or ())}"
                         f" | proposed canonicalization {len(proposed)}"
                         f" | excluded before replay {len(excluded)}")
+                    risk_metrics = _fit_risk_metrics(fit_diagnostics)
+                    if risk_metrics:
+                        line = (
+                            "      fit risk configured pre-cap budget median USD "
+                            f"{_fmt(risk_metrics['configured'], 2)}")
+                        if risk_metrics["planned"] is not None:
+                            line += (" | planned median USD "
+                                     f"{_fmt(risk_metrics['planned'], 2)}")
+                        line += (" | capped delivered median USD "
+                                 f"{_fmt(risk_metrics['delivered'], 2)}"
+                                 f" | {risk_metrics['ratio_label']} "
+                                 f"{_fmt(risk_metrics['ratio'])}")
+                        add(line)
                 for variant in item["variants"]:
                     verdict = _variant_classification(variant)
                     add(f"        - {variant['variant_id']}  [{verdict}]"
@@ -968,6 +1039,19 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                         f"full aliases: {len(aliases.get('full_aliases') or ())}; "
                         f"proposed canonicalization: {len(proposed)}; "
                         f"excluded before replay: {len(excluded)}")
+                    risk_metrics = _fit_risk_metrics(fit_diagnostics)
+                    if risk_metrics:
+                        line = (
+                            "- Fit risk configured pre-cap budget median USD: "
+                            f"{_fmt(risk_metrics['configured'], 2)}")
+                        if risk_metrics["planned"] is not None:
+                            line += ("; planned median USD: "
+                                     f"{_fmt(risk_metrics['planned'], 2)}")
+                        line += ("; capped delivered median USD: "
+                                 f"{_fmt(risk_metrics['delivered'], 2)}; "
+                                 f"{risk_metrics['ratio_label']}: "
+                                 f"{_fmt(risk_metrics['ratio'])}")
+                        out.append(line)
                 outcome = item["outcome"]
                 out += ["", f"**Outcome:** {outcome['kind'].replace('_', ' ')}"
                             f" — {outcome.get('reason') or ''}"]

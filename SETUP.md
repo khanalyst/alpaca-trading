@@ -634,11 +634,13 @@ Gate envelopes retain per-arm candidate, baseline, and randomized-null counts,
 fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
 and directional/pair coverage. Quote density can change null/control evidence
 even when the candidate count is unchanged.
-The unchanged `shadow-confirmation-v4` ingestion scope uses independent
+The `shadow-confirmation-v5` ingestion scope uses independent
 chronological selection and confirmatory windows: BH uses selection p-values,
-only the selected candidate's raw confirmatory p reaches LORD, and same-tail v3
-scopes remain audit-only. Epoch-5 verification binds the live proof to the
-durable FDR allocation rather than trusting caller-supplied fields.
+only the selected candidate's raw confirmatory p reaches LORD++, and legacy
+v2/v3/v4 scopes remain audit-only. With `W0=alpha`, the first-discovery reward
+is zero and later discoveries receive the standard `alpha` stream. Epoch-5
+verification binds the live proof to the durable FDR method/version and
+allocation rather than trusting caller-supplied fields.
 
 Authorizing fill quality is point-in-time and provenance-bound: required records
 become actionable at the maximum of event timestamp, `as_of`, and `observed_at`.

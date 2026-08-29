@@ -43,8 +43,8 @@ from .edge_discovery_core import (corpus_slice, null_control_account,
                                   validate_worker_projection)
 from .factory_ledger import (
     ACTIVE_HYPOTHESIS_STATES, FACTORY_SCHEMA, FACTORY_STATUSES, FactoryError,
-    FactoryLedger, deferred_fdr, dependence_policy_digest, experiment_identity,
-    experiment_provenance,
+    CONFIRMATORY_SCOPE_VERSION, FactoryLedger, deferred_fdr,
+    dependence_policy_digest, experiment_identity, experiment_provenance,
 )
 from .gates import (chronological_split, heldout_separation,
                     expectancy_rejection_report,
@@ -63,7 +63,8 @@ from .llm_strategy import (DISCOVERY_SCHEMA, LESSON_REF_CHARS, PROPOSAL_SCHEMA,
                            TUNING_SCHEMA, ProposalResult, RuleProposalAdapter,
                            _tuning_reason_check)
 from .stats import benjamini_hochberg, stable_seed
-from .fit_diagnostics import (collapse_behavior_aliases,
+from .fit_diagnostics import (bar_coverage_telemetry,
+                               collapse_behavior_aliases,
                                measure_fit_diagnostics)
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
@@ -164,8 +165,11 @@ _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "count", "min", "p25", "median", "p75", "max", "mean", "unit",
     "bps", "binding", "stop_distance", "target_distance", "target_r",
     "hold_bars", "configured", "stressed", "total_cost", "mean_cost",
-    "cost_to_risk_ratio", "eligible_rows", "intended", "delivered",
-    "delivered_to_intended", "trades", "reasons", "reason_rates", "ties",
+    "cost_to_risk_ratio", "eligible_rows", "configured", "planned",
+    "capped_delivered", "intended", "delivered",
+    "planned_to_configured", "delivered_to_configured",
+    "delivered_to_planned", "delivered_to_intended", "trades", "reasons",
+    "reason_rates", "ties",
     "tie_rate", "entry_gaps", "entry_gap_rate", "exit_gaps", "exit_gap_rate",
     "bracket", "target", "hold_cap", "diagnostic_only", "effect_unit",
     "cluster_unit", "available", "reason", "entry", "full", "entry_alias_key",
@@ -356,7 +360,9 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
                     "eligible_prefix", "first_signal", "atr_bps", "floor_30bps",
                     "planned", "cost_to_risk", "risk", "exits", "exit_grammar",
                     "mde_power", "behavior_fingerprint", "configured", "stressed",
-                    "intended", "delivered", "delivered_to_intended",
+                    "planned", "capped_delivered", "intended", "delivered",
+                    "planned_to_configured", "delivered_to_configured",
+                    "delivered_to_planned", "delivered_to_intended",
                     "reason_rates"}:
                 child_context = "aggregate"
             else:
@@ -2606,6 +2612,7 @@ def _run_diagnostic_factory(
     raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
         data, require_provenance=False,
         expected_equity_feed=policy.equity_feed)
+    bar_coverage = bar_coverage_telemetry(bars)
     quotes = quote_rows if callable(getattr(quote_rows, "quote_fill", None)) \
         else list(quote_rows)
     snapshots = list(snapshot_map.values())
@@ -2778,6 +2785,7 @@ def _run_diagnostic_factory(
         "proofs": [],
         "raw_rows": len(raw_rows),
         "dataset_hash": content_hash(raw_rows),
+        "bar_coverage": bar_coverage,
         "reports": reports,
         "tuning": tuning_proposals,
         "llm_call_evidence": {
@@ -2998,6 +3006,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             data, force_quote_index=isinstance(data, (str, Path)),
             require_provenance=True,
             expected_equity_feed=policy.equity_feed)
+    bar_coverage = bar_coverage_telemetry(bars)
     parent_quote_index = (quote_rows if isinstance(quote_rows, SQLiteQuoteIndex)
                           else None)
     if parent_quote_index is not None:
@@ -3080,7 +3089,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     factory = FactoryLedger(db_path)
     duplicate = factory.existing_cycle(dataset_hash, vehicle, identity)
     if duplicate is not None:
-        return {**duplicate, "duplicate": True}
+        return {**duplicate, "duplicate": True,
+                "bar_coverage": duplicate.get("bar_coverage", bar_coverage)}
     # Freeze the dependence map before any current-cycle diagnosis, tuning, or
     # replay.  The ledger method reads only completed cycles before this
     # cutoff; the current cycle id is not inserted until the entire cycle
@@ -3128,7 +3138,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         return {"schema": FACTORY_SCHEMA, "status": "exhausted", "dataset_hash": dataset_hash,
                 "vehicle": vehicle, "strategies": 0, "variants": 0, "accounts": 0,
                 "seeded": seeded, "revived": revived,
-                "cycle_id": cycle_id, "dependence_policy": dependence_policy}
+                "cycle_id": cycle_id, "dependence_policy": dependence_policy,
+                "bar_coverage": bar_coverage}
     tasks = []
     sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
@@ -3232,7 +3243,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         return {"schema": FACTORY_SCHEMA, "status": "waiting_for_new_data",
                 "dataset_hash": dataset_hash, "vehicle": vehicle,
                 "strategies": len(active), "variants": 0, "accounts": 0,
-                "cycle_id": cycle_id, "dependence_policy": dependence_policy}
+                "cycle_id": cycle_id, "dependence_policy": dependence_policy,
+                "bar_coverage": bar_coverage}
 
     max_workers = min(int(workers), len(tasks))
     worker_results = []
@@ -3595,7 +3607,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     selected_test_key = (None if selected_test is None else
                          f"{selected_test[0]['hypothesis']['hypothesis_id']}:"
                          f"{selected_test[1]['variant_id']}")
-    confirmatory_scope = f"shadow-confirmation-v4:{vehicle}"
+    confirmatory_scope = f"{CONFIRMATORY_SCOPE_VERSION}:{vehicle}"
     cumulative = deferred_fdr(
         confirmatory_scope,
         (f"{identity['identity_hash']}:{selected_test_key}:live-shadow"
@@ -4440,6 +4452,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "dependence_policy": dependence_policy,
         "dependence_constraint": dependence_constraint,
         "dataset_hash": dataset_hash, "vehicle": vehicle,
+        "bar_coverage": bar_coverage,
         "experiment_identity": identity,
         "experiment_provenance": experiment_provenance_body,
         "parallel_workers": max_workers,

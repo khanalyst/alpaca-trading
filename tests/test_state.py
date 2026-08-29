@@ -247,11 +247,19 @@ class StateSafetyTests(unittest.TestCase):
                          "account_fingerprint", "setup_id", "execution_profile",
                          "vehicle", "reference_price", "entry_reference",
                          "exit_reference", "requested_qty", "planned_qty",
-                         "fill_fraction"}.issubset(columns["orders"]))
+                         "fill_fraction", "configured_risk_budget_usd",
+                         "planned_risk_usd",
+                         "planned_to_configured_risk_ratio",
+                         "delivered_to_configured_risk_ratio"}.issubset(
+                             columns["orders"]))
         self.assertTrue({"run_id", "cycle_id", "runtime_mode",
                          "account_fingerprint", "execution_profile", "vehicle",
                          "reference_price", "entry_reference", "exit_reference",
-                         "requested_qty", "planned_qty", "fill_fraction"}.issubset(columns["trades"]))
+                         "requested_qty", "planned_qty", "fill_fraction",
+                         "configured_risk_budget_usd", "planned_risk_usd",
+                         "planned_to_configured_risk_ratio",
+                         "delivered_to_configured_risk_ratio"}.issubset(
+                             columns["trades"]))
         self.assertTrue({"run_id", "cycle_id", "runtime_mode",
                          "account_fingerprint"}.issubset(columns["equity"]))
 
@@ -347,6 +355,27 @@ class StateSafetyTests(unittest.TestCase):
         self.assertEqual(payloads["trades"]["trade_id"], "trade-1")
         # Event/trade mirrors are attempted only after the journal call.
         self.assertEqual(append.call_count, 2)
+
+    def test_log_risk_payload_keeps_budget_aliases_and_post_cap_values_distinct(self):
+        with patch.object(state, "_journal_insert") as insert, \
+                patch.object(state, "_append"):
+            state.log_order(
+                SimpleNamespace(id="order-risk", symbol="SPY", side="buy",
+                                qty=25, type="market", time_in_force="day"),
+                configured_risk_budget_usd=200.0, planned_risk_usd=12.5,
+                risk_usd=12.5, delivered_risk_usd=12.5)
+            state.log_trade(
+                "SPY", "buy", "open", 25, risk_budget_usd=200.0,
+                planned_risk_usd=12.5, risk_usd=12.5,
+                delivered_risk_usd=12.5)
+
+        order_payload, trade_payload = [call.args[1]
+                                        for call in insert.call_args_list]
+        for payload in (order_payload, trade_payload):
+            self.assertEqual(payload["configured_risk_budget_usd"], 200.0)
+            self.assertEqual(payload["risk_budget_usd"], 200.0)
+            self.assertEqual(payload["risk_usd"], 12.5)
+            self.assertEqual(payload["delivered_risk_usd"], 12.5)
 
     def test_sqlite_failure_prevents_event_and_trade_jsonl_mirrors(self):
         failure = state.JournalNotReady("journal unavailable")

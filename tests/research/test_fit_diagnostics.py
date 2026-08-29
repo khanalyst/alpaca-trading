@@ -3,13 +3,16 @@
 from dataclasses import replace
 from datetime import datetime, timedelta
 import unittest
+from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import evaluate_rule_signal_metadata
 from research.edge_lab import _read_discovery_rows
 from research.costs import CostModel, diagnostic_backfill_policy
 from research.fit_diagnostics import (
-    FIT_BEHAVIOR_ALIAS_DECIMALS, FIT_BEHAVIOR_ALIAS_SCHEMA,
-    _planned_vector, collapse_behavior_aliases, measure_fit_diagnostics,
+    BAR_COVERAGE_SCHEMA, FIT_BEHAVIOR_ALIAS_DECIMALS, FIT_BEHAVIOR_ALIAS_SCHEMA,
+    _planned_vector, bar_coverage_telemetry,
+    collapse_behavior_aliases,
+    measure_fit_diagnostics,
 )
 from research.strategy_factory import initial_hypotheses
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
@@ -282,6 +285,22 @@ class FitDiagnosticsTests(unittest.TestCase):
         statuses = diagnostic["cost_to_risk"]["stressed"]["25"]["row_status"]
         self.assertEqual(statuses, {"pass": 0, "fail": 1, "unknown": 1})
 
+    def test_fit_risk_names_configured_budget_and_capped_delivery(self):
+        diagnostic = measure_fit_diagnostics(
+            [], ROOT_SPEC,
+            account_rows=[{
+                "vehicle": "equity", "no_trade": False,
+                "risk_budget": 500.0, "risk_usd": 117.5,
+            }])
+        risk = diagnostic["risk"]
+        self.assertEqual(risk["configured"]["median"], 500.0)
+        self.assertEqual(risk["capped_delivered"]["median"], 117.5)
+        self.assertEqual(
+            risk["delivered_to_configured"]["median"], 0.235)
+        # Existing machine consumers retain their original aliases.
+        self.assertEqual(risk["intended"], risk["configured"])
+        self.assertEqual(risk["delivered"], risk["capped_delivered"])
+
     def test_fit_output_keeps_no_trade_rejection_counts(self):
         diagnostic = measure_fit_diagnostics(
             [], ROOT_SPEC,
@@ -313,6 +332,77 @@ class FitDiagnosticsTests(unittest.TestCase):
         summary = diagnostic["execution_rejections"]
         self.assertEqual(summary["explicit_rejections"], 1)
         self.assertFalse(summary["execution_blocked"])
+
+    def test_bar_coverage_reports_sparse_sessions_without_false_calendar_precision(self):
+        bars, _snapshots, _quotes = self._fit()
+        sparse = [row for row in bars if row.timestamp.minute % 5 != 0]
+        coverage = bar_coverage_telemetry(sparse)
+        self.assertEqual(coverage["schema"], BAR_COVERAGE_SCHEMA)
+        expected_sessions = len({(row.symbol, row.session_date) for row in bars})
+        self.assertEqual(coverage["session_count"], expected_sessions)
+        self.assertEqual(coverage["unknown_expected_sessions"],
+                         coverage["session_count"])
+        self.assertIsNone(coverage["expected_minutes"])
+        self.assertIsNone(coverage["coverage_ratio"])
+        self.assertIn("early_close_unknown", coverage["caveats"])
+        self.assertIn("exact_session_calendar_missing", coverage["caveats"])
+        for symbol_sessions in coverage["by_symbol_session"].values():
+            for record in symbol_sessions.values():
+                self.assertEqual(record["status"], "unknown_expected")
+                self.assertIsNone(record["expected_minutes"])
+
+        # Keep behavior fingerprints independent of this corpus-level
+        # reporting aggregate.
+        diagnostic = measure_fit_diagnostics(sparse, ROOT_SPEC)
+        # Coverage belongs to the input corpus.  The factory persists one
+        # detailed record instead of repeating it in every fit result.
+        self.assertNotIn("bar_coverage", diagnostic)
+
+    def test_bar_coverage_uses_exact_regular_and_early_close_bounds(self):
+        bars, _snapshots, _quotes = self._fit()
+        expected_sessions = len({(row.symbol, row.session_date) for row in bars})
+        regular = []
+        for row in bars:
+            opened = row.timestamp.astimezone(ZoneInfo("America/New_York")).replace(
+                hour=9, minute=30, second=0, microsecond=0)
+            regular.append(replace(
+                row, session_open=opened,
+                session_close=opened + timedelta(minutes=390)))
+        exact = bar_coverage_telemetry(regular)
+        self.assertEqual(exact["expected_minutes"], expected_sessions * 390)
+        self.assertTrue(exact["expected_minutes_complete"])
+        self.assertAlmostEqual(exact["coverage_ratio"],
+                               exact["observed_minutes"] /
+                               (expected_sessions * 390))
+        self.assertFalse(exact["by_symbol_session"]["AAA"]
+                         ["2026-01-05"]["early_close"])
+
+        early = []
+        for row in bars:
+            opened = row.timestamp.astimezone(ZoneInfo("America/New_York")).replace(
+                hour=9, minute=30, second=0, microsecond=0)
+            early.append(replace(
+                row, session_open=opened,
+                session_close=opened + timedelta(minutes=210)))
+        early_coverage = bar_coverage_telemetry(early)
+        self.assertEqual(early_coverage["expected_minutes"], expected_sessions * 210)
+        self.assertTrue(early_coverage["by_symbol_session"]["AAA"]
+                        ["2026-01-05"]["early_close"])
+        self.assertIn("early_close_exact_calendar",
+                      early_coverage["caveats"])
+
+        delayed = []
+        for row in bars:
+            opened = row.timestamp.astimezone(ZoneInfo("America/New_York")).replace(
+                hour=10, minute=0, second=0, microsecond=0)
+            delayed.append(replace(
+                row, session_open=opened,
+                session_close=opened.replace(hour=16)))
+        delayed_coverage = bar_coverage_telemetry(delayed)
+        delayed_record = delayed_coverage["by_symbol_session"]["AAA"]["2026-01-05"]
+        self.assertEqual(delayed_record["expected_minutes"], 360)
+        self.assertFalse(delayed_record["early_close"])
+        self.assertIn("non_standard_session_open", delayed_record["caveats"])
 
 
 if __name__ == "__main__":

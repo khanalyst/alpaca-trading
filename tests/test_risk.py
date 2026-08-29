@@ -116,6 +116,54 @@ class RiskProfileTests(unittest.TestCase):
         self.assertEqual(result["shares"], 50)  # 50% notional cap binds
         self.assertEqual(result["notional"], 5_000)
 
+    def test_notional_cap_keeps_the_pre_cap_budget_separate_from_planned_risk(self):
+        risk = RiskEngine({"risk": {"max_position_notional_pct": 25}})
+        result = risk.size_shares(equity=10_000, entry_price=100,
+                                  stop_distance=1.50, risk_usd=200,
+                                  symbol_data={})
+        # 150 bps is below the 200 bps threshold; the $2,500 notional cap,
+        # rather than the $200 configured budget, binds at 25 shares.
+        self.assertEqual(result["shares"], 25)
+        self.assertEqual(result["configured_risk_budget_usd"], 200.0)
+        self.assertEqual(result["risk_budget_usd"], 200.0)
+        self.assertEqual(result["planned_risk_usd"], 37.5)
+        self.assertEqual(result["risk_usd"], 37.5)
+
+    def test_shipped_notional_cap_delivery_curve_is_explicit(self):
+        risk = RiskEngine({"risk": {"max_position_notional_pct": 25}})
+        for stop_bps, expected_risk, expected_ratio in (
+                (47.0, 117.50, 0.235),
+                (83.34, 208.35, 0.4167),
+                (200.0, 500.00, 1.0)):
+            with self.subTest(stop_bps=stop_bps):
+                result = risk.size_shares(
+                    equity=100_000, entry_price=100,
+                    stop_distance=100 * stop_bps / 10_000,
+                    risk_usd=500, symbol_data={})
+                self.assertEqual(result["configured_risk_budget_usd"], 500.0)
+                self.assertAlmostEqual(result["planned_risk_usd"], expected_risk)
+                self.assertAlmostEqual(
+                    result["planned_risk_usd"] /
+                    result["configured_risk_budget_usd"], expected_ratio)
+
+    def test_vet_open_carries_the_configured_budget_into_the_runtime_plan(self):
+        risk = RiskEngine({
+            "risk": {"risk_per_trade_pct": 2.0,
+                     "max_position_notional_pct": 25,
+                     "max_concurrent_positions": 1,
+                     "max_stressed_cost_to_risk_ratio": 1.0},
+            "execution": {},
+        })
+        plan, reason = risk.vet_open(
+            {"symbol": "SPY", "direction": "long", "entry_price": 100,
+             "stop_price": 99.5, "target_price": 101},
+            10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
+        self.assertIsNone(reason)
+        self.assertEqual(plan["configured_risk_budget_usd"], 200.0)
+        self.assertEqual(plan["risk_budget_usd"], 200.0)
+        self.assertEqual(plan["planned_risk_usd"], 12.5)
+        self.assertEqual(plan["risk_usd"], 12.5)
+
     def test_liquidity_cap_reduces_share_size(self):
         result = size_shares(equity=10_000, entry_price=100,
                              stop_distance=2, risk_usd=100,

@@ -38,6 +38,7 @@ import uuid
 IDENTITY_SCHEMA = "research-preprocessing-cache-identity.v1"
 ENTRY_SCHEMA = "research-preprocessing-cache-entry.v1"
 RESULT_SCHEMA = "research-preprocessing-cache-result.v1"
+TOPOLOGY_SCHEMA = "research-preprocessing-cache-topology.v1"
 KEY_ALGORITHM = "sha256"
 _KEY_DOMAIN = b"alpaca-research-preprocessing-cache-key.v1\0"
 _KEY_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -64,6 +65,10 @@ class CacheArtifactError(ResearchCacheError):
 
 class CacheCorruptionError(ResearchCacheError):
     code = "cache_corruption"
+
+
+class CacheTopologyError(ResearchCacheError):
+    code = "cache_topology"
 
 
 class _CliUsageError(ResearchCacheError):
@@ -160,6 +165,62 @@ cache_key = make_cache_key
 
 def _absolute(path: os.PathLike[str] | str) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
+
+
+def probe_rename_domain(
+    tmp_root: os.PathLike[str] | str,
+    staging_root: os.PathLike[str] | str,
+) -> dict[str, Any]:
+    """Prove disposable output can be moved into cache staging atomically.
+
+    Cache publication consumes preprocessing artifacts with ``os.replace``.
+    A device-number comparison is insufficient for bind mounts, so this probe
+    executes the same rename operation against the actual temporary and
+    staging directories. Probe files are removed on every outcome.
+    """
+
+    tmp_root = _absolute(tmp_root)
+    staging_root = _absolute(staging_root)
+    source_path: Path | None = None
+    target_path: Path | None = None
+    try:
+        # Match the cache layout's restrictive mode when this is the first
+        # operation against a new cache root.
+        staging_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        source_fd, source_name = tempfile.mkstemp(
+            prefix=".alpaca-research-topology-", dir=tmp_root)
+        os.close(source_fd)
+        source_path = Path(source_name)
+        target_fd, target_name = tempfile.mkstemp(
+            prefix=".alpaca-research-topology-", dir=staging_root)
+        os.close(target_fd)
+        target_path = Path(target_name)
+        target_path.unlink()
+        os.replace(source_path, target_path)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            reason = (
+                "tmpdir and preprocessing cache staging are not in the same "
+                "rename-capable mount (EXDEV)")
+        else:
+            reason = f"cache topology rename probe failed: {exc}"
+        raise CacheTopologyError(reason) from exc
+    finally:
+        for path in (source_path, target_path):
+            if path is not None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+    return {
+        "schema": TOPOLOGY_SCHEMA,
+        "operation": "rename_probe",
+        "status": "ok",
+        "tmp_root": str(tmp_root),
+        "cache_staging": str(staging_root),
+    }
 
 
 def _lexists(path: Path) -> bool:
@@ -782,6 +843,10 @@ def _build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument(
         "--consume-artifacts", action="store_true",
         help="move regular artifact sources into the cache instead of copying")
+
+    topology_parser = subparsers.add_parser("topology")
+    topology_parser.add_argument("--tmp-root", required=True)
+    topology_parser.add_argument("--staging-root", required=True)
     return parser
 
 
@@ -817,15 +882,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _build_parser().parse_args(argv)
         operation = args.operation
-        if operation not in {"key", "lookup", "publish"}:
-            raise _CliUsageError("an operation is required: key, lookup, or publish")
-        identity_arguments = {
-            "source_identity": args.source_identity,
-            "config_identity": args.config_identity,
-            "code_identity": args.code_identity,
-            "context_identity": args.context_identity,
-        }
+        if operation not in {"key", "lookup", "publish", "topology"}:
+            raise _CliUsageError(
+                "an operation is required: key, lookup, publish, or topology")
         if operation == "key":
+            identity_arguments = {
+                "source_identity": args.source_identity,
+                "config_identity": args.config_identity,
+                "code_identity": args.code_identity,
+                "context_identity": args.context_identity,
+            }
             identity = identity_document(**identity_arguments)
             result = {
                 "schema": RESULT_SCHEMA, "operation": "key",
@@ -834,7 +900,15 @@ def main(argv: list[str] | None = None) -> int:
                     _KEY_DOMAIN
                     + _canonical_json(identity).encode("utf-8")).hexdigest(),
             }
+        elif operation == "topology":
+            result = probe_rename_domain(args.tmp_root, args.staging_root)
         else:
+            identity_arguments = {
+                "source_identity": args.source_identity,
+                "config_identity": args.config_identity,
+                "code_identity": args.code_identity,
+                "context_identity": args.context_identity,
+            }
             if not args.cache_root:
                 raise _CliUsageError("--cache-root is required")
             cache = ResearchArtifactCache(args.cache_root)

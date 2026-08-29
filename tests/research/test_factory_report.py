@@ -307,6 +307,31 @@ class ReportRenderingTests(unittest.TestCase):
             self.assertIn("| variant | lane | trades |", markdown)
             self.assertIn(f"> {THESIS}", markdown)
 
+    def test_human_reports_render_structured_fit_risk_budget_and_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = build_report(_run(directory))
+            generation = report["vehicles"][0]["slots"][0]["generations"][0]
+            generation["fit_diagnostics"] = {
+                "risk": {
+                    "configured": {"median": 500.0},
+                    "capped_delivered": {"median": 117.5},
+                    "delivered_to_configured": {"median": 0.235},
+                }
+            }
+            text = render_text(report)
+            markdown = render_markdown(report)
+
+        self.assertIn("fit risk configured pre-cap budget median USD 500", text)
+        self.assertIn("capped delivered median USD 117.5", text)
+        self.assertIn("delivered/configured 0.235", text)
+        self.assertNotIn("planned median USD", text)
+        self.assertIn(
+            "Fit risk configured pre-cap budget median USD: 500; "
+            "capped delivered median USD: 117.5",
+            markdown)
+        self.assertIn("delivered/configured: 0.235", markdown)
+        self.assertNotIn("planned median USD", markdown)
+
 
 class ReportCommandTests(unittest.TestCase):
     def _run_cli(self, db, *arguments):

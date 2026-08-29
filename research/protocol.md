@@ -325,9 +325,9 @@ isolated simulated account.
 Before variant replay, the factory records compact fit-only diagnostics: the
 eligible-prefix and first-signal rates, ATR-in-basis-points and 30-bps-floor
 binding, signal-anchored planned stop/target/hold distributions, configured
-and stressed cost-to-risk (9/15/25/50 bps) summaries, delivered versus intended
-risk, realized exit reasons/ties/gaps, and a diagnostic clustered MDE/power
-report whose effect and cluster units are explicit. It also records
+and stressed cost-to-risk (9/15/25/50 bps) summaries, configured pre-cap risk
+versus capped delivered risk, realized exit reasons/ties/gaps, and a diagnostic
+clustered MDE/power report whose effect and cluster units are explicit. It also records
 provider/feed provenance, entry-pricing source, configured limits, and
 pass/fail/unknown row counts. The current fixed exit grammar is machine-readable
 as `fixed-atr-floor-bracket-r-target-bar-cap.v1`; its only supported modes are
@@ -339,6 +339,15 @@ other unsupported exit field is flagged as
 research result. Planned signal/exit geometry may be counted even when
 executable quote pricing is absent, but is marked quote-required and remains
 non-authorizing.
+
+The factory persists one `bar-coverage.v1` record per input corpus rather than
+recomputing it per variant. It reports per-symbol/session observed minutes,
+exact-calendar expected minutes when available, early-close caveats, internal
+gaps, and bounded gap samples. A hold that terminates at an internal gap or at
+the end of observed data is distinguished from ordinary configured time
+expiry. Coverage and discontinuity are censoring telemetry only; the protocol
+does not infer the sign or magnitude of their effect on R without a separate
+matched analysis.
 
 The execution-rejection portion of fit diagnostics exposes only aggregate
 counts and reason labels to proposal generation; it remains diagnostic and
@@ -446,28 +455,54 @@ normal result for a marginal candidate, and proof verification must compare
 each decision flag with its own q-value.
 
 The post-selection test also consumes a durable cumulative online-FDR
-allocation. Its LORD-style state is stored per scope in the factory ledger and
-persists across cycles, so alpha allocation and discoveries are not reset by a
-new run. LORD receives the raw confirmatory p-value; family/global BH and the
-frozen-cluster veto select or reject the candidate but are not spent as online
-p-values. Formal
-LORD validity still requires that confirmatory p-value to be based on evidence
-not reused for the adaptive selection step (the in-process replay remains
-diagnostic unless that independence boundary is established).
+allocation. The active `shadow-confirmation-v5` scope uses the standard LORD++
+construction of [Ramdas, Yang, Wainwright, and Jordan (2017)](https://proceedings.neurips.cc/paper_files/paper/2017/hash/7f018eb7b301a66658931cb8a93fd6e8-Abstract.html), with
+an explicit initial wealth `W0` and the balanced sequence
+`gamma_k = 1/(k*(k+1))` for `k >= 1`. If `tau_j` is the test index of the
+`j`-th previous discovery, test `t` receives
 
-Live-shadow ingestion establishes that boundary chronologically. The unchanged
-`shadow-confirmation-v4` scope handles each complete new tail by splitting it
-deterministically into an older selection window and a newer, disjoint
-confirmatory window; both windows must independently meet the configured
-trade/session floors before any online allocation is spent. Family/global BH and
-the frozen-cluster veto use only the selection-window raw p-values. At most the
-selected, preflight-ready
-candidate is recomputed on the confirmatory window, and only that gate's raw p is
-sent to LORD. The source and provenance persist both session lists, their
-digests, the disjointness marker, and the confirmatory p-value source. Legacy
-same-tail v3 records remain auditable but cannot authorize under epoch 5. The
-persisted live proof must match the durable FDR allocation for its vehicle scope
-and test id; caller-supplied p/alpha/allocation fields are not authority.
+`alpha_t = W0*gamma_t + (alpha-W0)*gamma_(t-tau_1) +
+alpha*sum_(j>=2, tau_j<t) gamma_(t-tau_j)`,
+
+where the first reward term is included only when `tau_1 < t` (and each
+`gamma` index is therefore positive). This deployment preregisters `W0=alpha`
+(`0.05` at the default level): before a discovery `alpha_t=alpha*gamma_t`, the
+first-discovery reward is explicitly `alpha-W0=0`, and every later discovery
+starts an `alpha` reward stream. The state is append-only per scope and
+persists across cycles; v2/v3/v4 rows retain their legacy method identifiers
+and are never reused to seed v5. LORD++ receives the raw confirmatory p-value;
+family/global BH and the frozen-cluster veto select or reject the candidate but
+are not spent as online p-values.
+
+The v5 guarantee is scope-local. Legacy epochs remain auditable but their
+discoveries and v5 discoveries must not be pooled and described as one
+cumulative LORD++ guarantee.
+
+The cited LORD++ result controls mFDR when null p-values are conditionally
+super-uniform given the online history. Its full FDR guarantee additionally
+requires independent null p-values and predictable test levels that are
+monotone in prior discoveries. The implementation fixes and tests that
+predictable monotone schedule; it cannot establish a distributional property
+of market-data p-values. A chronological split into disjoint sessions prevents
+reuse of adaptive selection observations, but it does not, by itself, prove
+conditional super-uniformity or independence. The p-value construction,
+session dependence policy, and source provenance must therefore identify
+which guarantee is claimed and support its assumptions.
+
+Live-shadow ingestion establishes the intended temporal boundary
+chronologically. The `shadow-confirmation-v5` scope handles each complete new
+tail by splitting it deterministically into an older selection window and a
+newer, disjoint confirmatory window; both windows must independently meet the
+configured trade/session floors before any online allocation is spent.
+Family/global BH and the frozen-cluster veto use only the selection-window raw
+p-values. At most the selected, preflight-ready candidate is recomputed on the
+confirmatory window, and only that gate's raw p is sent to LORD++. The source
+and provenance persist both session lists, their digests, the disjointness
+marker, and the confirmatory p-value source. Legacy same-tail v3 and v4 records
+(`lord_balanced_raw_p_v3`) and v2 records (`lord_balanced_v2`) remain auditable
+but cannot authorize under epoch 5. The persisted live proof
+must match the durable FDR allocation for its vehicle scope and test id;
+caller-supplied p/alpha/allocation fields are not authority.
 
 Beating a control is necessary but never sufficient. A variant must also show
 absolute after-cost profitability on unseen data (positive net P&L and

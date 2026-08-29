@@ -362,6 +362,56 @@ class ExecutionLifecycleTests(unittest.TestCase):
                 "WHERE action='open'").fetchone()
         self.assertEqual(row, (3.0, 100.0, 300.0, 3.0))
 
+    def test_cap_binding_fill_keeps_configured_budget_in_order_and_trade_telemetry(self):
+        self._bind_engine(runtime_name="runtime-cap-telemetry")
+        request = OrderRequest("SPY", Decimal("25"), "buy",
+                               client_order_id="entry-cap-telemetry")
+        entry = self.provider.submit_order(request)
+        plan = {
+            "execution_profile": "shares", "direction": "long",
+            "entry_price": 100, "stop_price": 99.5, "target_price": 101,
+            "underlying_stop_price": 99.5, "underlying_target_price": 101,
+            "underlying_symbol": "SPY", "contract_multiplier": 1,
+            "setup_id": "entry-cap-telemetry", "setup_type": "ibr",
+            # A 25% notional cap reduced a $200 configured budget to $12.50
+            # for the immutable 25-share plan at a 50-bps stop.
+            "configured_risk_budget_usd": 200.0,
+            "risk_budget_usd": 200.0,
+            "planned_risk_usd": 12.5,
+            "risk_usd": 12.5, "notional": 2500.0,
+        }
+        self.engine._record_open_order(request, entry, plan)
+        self.provider.set_order(entry.id, status="filled", filled_qty=25,
+                                filled_avg_price=100)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("25"), "long", avg_entry_price=Decimal("100"),
+            current_price=Decimal("100"))]
+        self.engine.reconcile()
+
+        runtime = state.load_state()
+        order = runtime["orders"][entry.id]
+        trade = runtime["active_trades"]["SPY"]
+        for row in (order, trade):
+            self.assertEqual(row["configured_risk_budget_usd"], 200.0)
+            self.assertEqual(row["risk_budget_usd"], 200.0)
+            self.assertEqual(row["planned_risk_usd"], 12.5)
+            self.assertEqual(row["delivered_risk_usd"], 12.5)
+            self.assertEqual(row["planned_to_configured_risk_ratio"], .0625)
+            self.assertEqual(row["delivered_to_configured_risk_ratio"], .0625)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            order_row = db.execute(
+                "SELECT configured_risk_budget_usd, planned_risk_usd, "
+                "delivered_risk_usd, planned_to_configured_risk_ratio, "
+                "delivered_to_configured_risk_ratio FROM orders "
+                "WHERE action='reconcile' ORDER BY id DESC LIMIT 1").fetchone()
+            trade_row = db.execute(
+                "SELECT configured_risk_budget_usd, planned_risk_usd, "
+                "delivered_risk_usd, planned_to_configured_risk_ratio, "
+                "delivered_to_configured_risk_ratio FROM trades "
+                "WHERE action='open' ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(order_row, (200.0, 12.5, 12.5, .0625, .0625))
+        self.assertEqual(trade_row, (200.0, 12.5, 12.5, .0625, .0625))
+
     def test_incremental_fill_journal_uses_implied_weighted_price(self):
         self._bind_engine(runtime_name="runtime-weighted-accounting")
         request = OrderRequest("SPY", Decimal("5"), "buy",

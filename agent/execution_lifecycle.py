@@ -133,6 +133,39 @@ def _value(obj: Any, name: str, default=None):
 
 
 class ExecutionLifecycleMixin:
+    def _configured_risk_budget(self, plan: Mapping | None,
+                                fallback: float | None = None) -> float | None:
+        """Read the immutable pre-cap risk budget from a plan/state row.
+
+        ``configured_risk_budget_usd`` is canonical.  ``risk_budget_usd`` is
+        retained as an explicit alias because research rows historically use
+        the shorter budget name.  Neither field is reconstructed from a fill:
+        the notional cap is precisely why that distinction matters.
+        """
+        source = plan if isinstance(plan, Mapping) else {}
+        for name in ("configured_risk_budget_usd", "risk_budget_usd"):
+            value = self._number(source.get(name))
+            if value is not None:
+                return round(value, 12)
+        return self._number(fallback)
+
+    def _planned_risk(self, plan: Mapping | None,
+                      fallback: float | None = None) -> float | None:
+        """Read the full post-cap planned risk for an immutable sizing plan."""
+        source = plan if isinstance(plan, Mapping) else {}
+        for name in ("planned_risk_usd", "risk_usd", "intended_risk_usd"):
+            value = self._number(source.get(name))
+            if value is not None:
+                return round(value, 12)
+        return self._number(fallback)
+
+    @staticmethod
+    def _risk_ratio(numerator: float | None,
+                    denominator: float | None) -> float | None:
+        if numerator is None or denominator is None or denominator <= 0:
+            return None
+        return round(numerator / denominator, 12)
+
     def _risk_telemetry(self, plan: Mapping, profile: str,
                         requested_qty: float | None, planned_qty: float | None,
                         multiplier: float, filled_qty: float,
@@ -154,6 +187,8 @@ class ExecutionLifecycleMixin:
         multiplier = abs(self._number(multiplier) or 1.0)
 
         intended = self._number(plan.get("risk_usd"))
+        if intended is None:
+            intended = self._number(plan.get("planned_risk_usd"))
         if intended is not None and requested and planned and planned > 0:
             # A plan's risk is normally already sized to the request.  Scale
             # only when the durable planned/requested quantities differ.
@@ -247,6 +282,11 @@ class ExecutionLifecycleMixin:
         intended_risk, delivered_risk, risk_ratio, risk_shortfall = \
             self._risk_telemetry(risk_plan, profile, requested_qty, planned_qty,
                                  multiplier, filled_qty, fill_price)
+        configured_budget = self._configured_risk_budget(risk_plan)
+        # Keep planned risk at the full immutable sizing quantity.  The
+        # existing intended value may be scaled to requested/planned quantity
+        # for rolling-state compatibility and is tracked separately.
+        planned_risk = self._planned_risk(risk_plan, fallback=intended_risk)
         order_state = {
             "order_id": order_id, "symbol": symbol, "status": status,
             "client_order_id": request.client_order_id, "qty": str(request.qty),
@@ -267,6 +307,13 @@ class ExecutionLifecycleMixin:
             "delivered_risk_usd": delivered_risk,
             "risk_delivery_ratio": risk_ratio,
             "risk_shortfall_usd": risk_shortfall,
+            "configured_risk_budget_usd": configured_budget,
+            "risk_budget_usd": configured_budget,
+            "planned_risk_usd": planned_risk,
+            "planned_to_configured_risk_ratio": self._risk_ratio(
+                planned_risk, configured_budget),
+            "delivered_to_configured_risk_ratio": self._risk_ratio(
+                delivered_risk, configured_budget),
             "protective_legs": _protective_legs(getattr(order, "legs", ())),
             "risk_plan": _plain(risk_plan), "fill_logged": False,
             "logged_filled_qty": 0.0, "logged_filled_avg_price": None,
@@ -299,7 +346,15 @@ class ExecutionLifecycleMixin:
                         intended_risk_usd=persisted_order.get("intended_risk_usd"),
                         delivered_risk_usd=persisted_order.get("delivered_risk_usd"),
                         risk_delivery_ratio=persisted_order.get("risk_delivery_ratio"),
-                        risk_shortfall_usd=persisted_order.get("risk_shortfall_usd"))
+                        risk_shortfall_usd=persisted_order.get("risk_shortfall_usd"),
+                        configured_risk_budget_usd=persisted_order.get(
+                            "configured_risk_budget_usd"),
+                        risk_budget_usd=persisted_order.get("risk_budget_usd"),
+                        planned_risk_usd=persisted_order.get("planned_risk_usd"),
+                        planned_to_configured_risk_ratio=persisted_order.get(
+                            "planned_to_configured_risk_ratio"),
+                        delivered_to_configured_risk_ratio=persisted_order.get(
+                            "delivered_to_configured_risk_ratio"))
         self._event("order_submitted", {"symbol": request.symbol, "qty": str(request.qty),
                                          "status": status, "filled_qty": filled_qty,
                                          "client_order_id": request.client_order_id,
@@ -437,6 +492,14 @@ class ExecutionLifecycleMixin:
             risk_ratio = round(risk_ratio, 12)
         if risk_shortfall is not None:
             risk_shortfall = round(risk_shortfall, 12)
+        configured_budget = self._configured_risk_budget(
+            plan, fallback=order_state.get("configured_risk_budget_usd"))
+        # ``planned_risk_usd`` is the full post-cap sizing risk.  Do not use
+        # the requested-quantity-scaled intended value here.
+        planned_risk = self._planned_risk(
+            plan, fallback=order_state.get("planned_risk_usd", intended_risk))
+        planned_to_configured = self._risk_ratio(planned_risk, configured_budget)
+        delivered_to_configured = self._risk_ratio(delivered_risk, configured_budget)
         # ``risk_usd`` historically represented the cumulative open-position
         # risk. Keep it as a compatibility alias for delivered risk.
         order_state.update({
@@ -445,6 +508,11 @@ class ExecutionLifecycleMixin:
             "delivered_risk_usd": delivered_risk,
             "risk_delivery_ratio": risk_ratio,
             "risk_shortfall_usd": risk_shortfall,
+            "configured_risk_budget_usd": configured_budget,
+            "risk_budget_usd": configured_budget,
+            "planned_risk_usd": planned_risk,
+            "planned_to_configured_risk_ratio": planned_to_configured,
+            "delivered_to_configured_risk_ratio": delivered_to_configured,
         })
         trade = {
             "symbol": symbol, "underlying_symbol": underlying,
@@ -476,6 +544,11 @@ class ExecutionLifecycleMixin:
             "delivered_risk_usd": delivered_risk,
             "risk_delivery_ratio": risk_ratio,
             "risk_shortfall_usd": risk_shortfall,
+            "configured_risk_budget_usd": configured_budget,
+            "risk_budget_usd": configured_budget,
+            "planned_risk_usd": planned_risk,
+            "planned_to_configured_risk_ratio": planned_to_configured,
+            "delivered_to_configured_risk_ratio": delivered_to_configured,
             "notional": cumulative_notional, "variant_id": plan.get("variant_id"),
             "candidate_id": plan.get("candidate_id"),
             "proof_run_id": plan.get("proof_run_id"),
@@ -559,6 +632,11 @@ class ExecutionLifecycleMixin:
                 delivered_risk_usd=delivered_risk,
                 risk_delivery_ratio=risk_ratio,
                 risk_shortfall_usd=risk_shortfall,
+                configured_risk_budget_usd=configured_budget,
+                risk_budget_usd=configured_budget,
+                planned_risk_usd=planned_risk,
+                planned_to_configured_risk_ratio=planned_to_configured,
+                delivered_to_configured_risk_ratio=delivered_to_configured,
                 runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
                 run_id=self.run_id)
             order_state["fill_logged"] = True
@@ -1501,6 +1579,16 @@ class ExecutionLifecycleMixin:
                                       or self._number(saved.get("qty")))
                 evidence_planned = (self._number(saved.get("planned_qty"))
                                     or evidence_requested)
+                evidence_configured = self._configured_risk_budget(
+                    evidence_plan,
+                    fallback=saved.get("configured_risk_budget_usd",
+                                       saved.get("risk_budget_usd")))
+                evidence_planned_risk = self._planned_risk(
+                    evidence_plan,
+                    fallback=(saved.get("planned_risk_usd") or
+                              saved.get("intended_risk_usd")))
+                evidence_delivered_risk = self._number(
+                    saved.get("delivered_risk_usd", saved.get("risk_usd")))
                 evidence_reference = (self._number(saved.get("reference_price"))
                                       or self._number(saved.get("entry_reference"))
                                       or self._number(evidence_plan.get("entry_price")))
@@ -1524,7 +1612,16 @@ class ExecutionLifecycleMixin:
                     intended_risk_usd=saved.get("intended_risk_usd"),
                     delivered_risk_usd=saved.get("delivered_risk_usd"),
                     risk_delivery_ratio=saved.get("risk_delivery_ratio"),
-                    risk_shortfall_usd=saved.get("risk_shortfall_usd"))
+                    risk_shortfall_usd=saved.get("risk_shortfall_usd"),
+                    configured_risk_budget_usd=evidence_configured,
+                    risk_budget_usd=evidence_configured,
+                    planned_risk_usd=evidence_planned_risk,
+                    planned_to_configured_risk_ratio=(
+                        self._risk_ratio(evidence_planned_risk,
+                                         evidence_configured)),
+                    delivered_to_configured_risk_ratio=(
+                        self._risk_ratio(evidence_delivered_risk,
+                                         evidence_configured)))
 
         pending_by_symbol: dict[str, list[dict]] = {}
         for saved in order_state.values():
@@ -1740,6 +1837,22 @@ class ExecutionLifecycleMixin:
                 mid_price=trade.get("mid_price"), requested_qty=close_requested,
                 planned_qty=close_requested, cumulative_filled_qty=close_filled,
                 fill_fraction=close_fraction, filled_fraction=close_fraction,
+                risk_usd=trade.get("delivered_risk_usd", trade.get("risk_usd")),
+                intended_risk_usd=trade.get("intended_risk_usd"),
+                delivered_risk_usd=trade.get(
+                    "delivered_risk_usd", trade.get("risk_usd")),
+                risk_delivery_ratio=trade.get("risk_delivery_ratio"),
+                risk_shortfall_usd=trade.get("risk_shortfall_usd"),
+                configured_risk_budget_usd=trade.get(
+                    "configured_risk_budget_usd", trade.get("risk_budget_usd")),
+                risk_budget_usd=trade.get(
+                    "configured_risk_budget_usd", trade.get("risk_budget_usd")),
+                planned_risk_usd=trade.get(
+                    "planned_risk_usd", trade.get("intended_risk_usd")),
+                planned_to_configured_risk_ratio=trade.get(
+                    "planned_to_configured_risk_ratio"),
+                delivered_to_configured_risk_ratio=trade.get(
+                    "delivered_to_configured_risk_ratio"),
                 runtime_mode=self.mode,
                 account_fingerprint=current.get("account_fingerprint"), run_id=self.run_id)
             self._record_edge_outcome(trade, realized, pnl_pct, exit_price)

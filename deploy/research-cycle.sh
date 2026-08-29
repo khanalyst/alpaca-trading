@@ -384,6 +384,23 @@ cache_dataset_report="$tmp_dir/cache-dataset-report.json"
 cache_vehicle_report="$tmp_dir/cache-vehicle-report.json"
 if [ -n "$cache_source_identity" ] && [ "$dataset" != "-" ]; then
   preprocess_cache_enabled=1
+  # ``publish --consume-artifacts`` moves the disposable preprocessing output
+  # into cache staging with os.replace. Probe that exact rename domain before
+  # preprocessing, so a split TMPDIR/cache mount fails closed without wasting
+  # a corpus-sized preprocessing pass. The probe creates no persistent files.
+  cache_topology_preflight() {
+    local topology_output topology_status
+    set +e
+    topology_output="$($python_bin "$repo_root/deploy/research_cache.py" topology \
+      --tmp-root "$tmp_dir" --staging-root "$cache_root/staging")"
+    topology_status=$?
+    set -e
+    printf '%s\n' "$topology_output" >&2
+    if [ "$topology_status" -ne 0 ]; then
+      finish "failed" "research preprocessing cache topology preflight failed; keep TMPDIR and ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT on the same rename-capable mount" 3
+    fi
+  }
+  cache_topology_preflight
   cache_config_identity="$($python_bin - "$agent_config" <<'PY'
 import hashlib
 import sys

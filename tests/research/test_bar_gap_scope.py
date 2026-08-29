@@ -8,6 +8,7 @@ a gap inside the bars a signal reads, or between the signal and its entry, or
 inside the hold, still refuses; a gap after the position is resolved does not.
 """
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import unittest
 from zoneinfo import ZoneInfo
@@ -15,7 +16,7 @@ from zoneinfo import ZoneInfo
 from agent.contracts.rule import feature_window_bars, validate_rule_spec
 from research.costs import ReplayPolicy
 from research.edge_lab import _read_discovery_rows
-from research.factory_core import _simulate_trade, _session_bars_valid
+from research.factory_core import _simulate_trade, _session_bars_valid, simulate_account
 
 # These fixtures carry bars but no quotes, so the replay is told explicitly
 # that bar fallback is acceptable.  Pricing is not what is under test here;
@@ -143,9 +144,17 @@ class SessionGapScopeTests(unittest.TestCase):
 
     def test_a_gap_after_the_exit_does_not_move_the_exit(self):
         # This trade reaches its target on bar 18.  A minute missing at bar 22
-        # is downstream of everything the position depended on.
-        self.assertEqual(_trade(drop_bar=22)["exit_timestamp"],
-                         _trade()["exit_timestamp"])
+        # is visible in the nominal hold horizon but is downstream of the
+        # actual target exit.
+        trade = _trade(drop_bar=22)
+        self.assertEqual(trade["exit_timestamp"], _trade()["exit_timestamp"])
+        self.assertEqual(trade["exit_reason"], "target")
+        # The pre-scan can see a later gap in the nominal hold horizon, but it
+        # must not report a discontinuity for a position already closed.
+        self.assertFalse(trade["hold_discontinuity"])
+        self.assertFalse(trade["hold_discontinuity_exit"])
+        self.assertIsNone(trade["hold_discontinuity_kind"])
+        self.assertEqual(trade["hold_exit_reason"], "target")
 
     def test_a_gap_inside_the_hold_stops_the_walk_instead_of_crossing_it(self):
         # Bar 17 sits between the entry (bar 16) and the target hit (bar 18).
@@ -157,6 +166,95 @@ class SessionGapScopeTests(unittest.TestCase):
         self.assertLess(datetime.fromisoformat(trade["exit_timestamp"]),
                         datetime.fromisoformat(_trade()["exit_timestamp"]))
         self.assertNotEqual(trade["exit_reason"], "target")
+
+    def test_a_hold_gap_is_distinguished_from_normal_time_expiry(self):
+        gapped = _trade(drop_bar=17)
+        self.assertTrue(gapped["hold_discontinuity"])
+        self.assertTrue(gapped["hold_discontinuity_exit"])
+        self.assertEqual(gapped["exit_reason"], "time")
+        self.assertEqual(gapped["hold_exit_reason"], "discontinuity")
+        self.assertEqual(gapped["exit_reason_detail"], "discontinuity")
+        self.assertEqual(gapped["hold_discontinuity_kind"], "internal_gap")
+        self.assertEqual(gapped["hold_discontinuity_gap_minutes"], 1.0)
+        self.assertIsNotNone(gapped["hold_discontinuity_from"])
+        self.assertIsNotNone(gapped["hold_discontinuity_to"])
+
+        short_hold = validate_rule_spec({**SPEC, "max_hold_bars": 1})
+        normal = _simulate_trade(_bars(), short_hold, [], "equity",
+                                 quotes=None, policy=BAR_FALLBACK)
+        self.assertEqual(normal["exit_reason"], "time")
+        self.assertFalse(normal["hold_discontinuity_exit"])
+        self.assertEqual(normal["hold_exit_reason"], "time_expiry")
+
+        # The first observed bar after a gap can be beyond a one-bar deadline;
+        # the prior bar still ended inside the hold, so this remains an
+        # explicit discontinuity rather than a normal cap expiry.
+        spanning = _simulate_trade(_bars(drop_bar=17), short_hold, [], "equity",
+                                   quotes=None, policy=BAR_FALLBACK)
+        self.assertEqual(spanning["exit_reason"], "time")
+        self.assertTrue(spanning["hold_discontinuity_exit"])
+        self.assertEqual(spanning["hold_exit_reason"], "discontinuity")
+
+    def test_observed_data_end_is_not_reported_as_normal_time_expiry(self):
+        shortened = _bars()[:18]
+        truncated = _simulate_trade(
+            shortened, SPEC, [], "equity", quotes=None,
+            policy=BAR_FALLBACK)
+        self.assertEqual(truncated["exit_reason"], "time")
+        self.assertTrue(truncated["hold_discontinuity_exit"])
+        self.assertEqual(
+            truncated["hold_discontinuity_kind"], "observed_data_end")
+        self.assertIsNone(truncated["hold_discontinuity_to"])
+        self.assertIsNone(truncated["hold_discontinuity_gap_minutes"])
+
+        # An exact calendar close at the same terminal bar is observed session
+        # completion, not right-censoring, even when the nominal hold cap would
+        # otherwise extend farther.
+        calendar_closed = [replace(
+            row, session_open=shortened[0].timestamp,
+            session_close=shortened[-1].end) for row in shortened]
+        closed = _simulate_trade(
+            calendar_closed, SPEC, [], "equity", quotes=None,
+            # Keep this mechanics fixture open through the exact close.  The
+            # production policy's separate pre-close flatten buffer is tested
+            # elsewhere and would deliberately prevent reaching this branch.
+            policy=replace(
+                BAR_FALLBACK, force_flat_minutes_before_close=0))
+        self.assertEqual(closed["exit_reason"], "time")
+        self.assertFalse(closed["hold_discontinuity_exit"])
+        self.assertEqual(closed["hold_exit_reason"], "time_expiry")
+
+    def test_gap_telemetry_is_direction_neutral_when_gap_changes_returns(self):
+        # Missing the target bar worsens an otherwise profitable hold.
+        clean_winner = simulate_account(
+            _bars(), [], SPEC, vehicle="equity", account_id="clean-winner",
+            policy=BAR_FALLBACK)
+        gapped_winner = simulate_account(
+            _bars(drop_bar=17), [], SPEC, vehicle="equity",
+            account_id="gapped-winner", policy=BAR_FALLBACK)
+        self.assertLess(gapped_winner["realized_pnl"],
+                        clean_winner["realized_pnl"])
+        self.assertTrue(gapped_winner["rows"][0]["hold_discontinuity_exit"])
+
+        # In a stop-loss path, the same missing bar can improve the result by
+        # preventing a stop on the first observed bar after the gap.  The
+        # telemetry records only the data discontinuity, never its P&L sign.
+        stop_index = next(index for index, row in enumerate(_bars())
+                          if row.timestamp.strftime("%H:%M") == "14:47")
+        stop_bar = _bars()[stop_index]
+        stop_bars = (_bars()[:stop_index] + [replace(
+            stop_bar, open=100.85, high=100.90, low=100.45, close=100.50)] +
+                     _bars()[stop_index + 1:])
+        clean_loser = simulate_account(
+            stop_bars, [], SPEC, vehicle="equity", account_id="clean-loser",
+            policy=BAR_FALLBACK)
+        gapped_loser = simulate_account(
+            stop_bars[:stop_index] + stop_bars[stop_index + 1:], [], SPEC,
+            vehicle="equity", account_id="gapped-loser", policy=BAR_FALLBACK)
+        self.assertGreater(gapped_loser["realized_pnl"],
+                           clean_loser["realized_pnl"])
+        self.assertTrue(gapped_loser["rows"][0]["hold_discontinuity_exit"])
+        self.assertNotIn("pnl", gapped_loser["rows"][0]["hold_exit_reason"])
 
 
 if __name__ == "__main__":

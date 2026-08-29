@@ -554,6 +554,16 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                         else stop - entry_underlying)
         deadline = hold_deadline(entry_at, spec)
         last_index = entry_index
+        # The existing replay intentionally resolves a hold on the last
+        # observed bar when the next bar is non-adjacent.  Keep that P&L path
+        # unchanged, but retain why the time-like exit happened so sparse
+        # corpora are not mistaken for ordinary hold expiry.
+        hold_discontinuity = False
+        hold_discontinuity_kind: str | None = None
+        hold_discontinuity_from: datetime | None = None
+        hold_discontinuity_to: datetime | None = None
+        hold_discontinuity_gap_minutes: float | None = None
+        hold_discontinuity_gap_seconds: float | None = None
         for probe in range(entry_index + 1, len(session_bars)):
             # The hold never crosses an outage.  Treating the next recorded
             # minute as adjacent would let a stop or target "trigger" on a bar
@@ -561,6 +571,33 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # resolved on the last observed bar instead.
             if (session_bars[probe].timestamp -
                     session_bars[probe - 1].timestamp != timedelta(minutes=1)):
+                gap_seconds = (session_bars[probe].timestamp -
+                               session_bars[probe - 1].timestamp).total_seconds()
+                # A gap wholly after the configured hold/close boundary
+                # cannot have changed the hold.  Conversely, the next bar may
+                # be beyond the deadline when the missing interval spans the
+                # terminal boundary; the previous bar's end below is the
+                # relevant causal reference.
+                previous_end = session_bars[probe - 1].end
+                # The missing interval affects the hold when the last
+                # contiguous bar still ended before its deadline.  The next
+                # observed bar may itself be beyond that deadline — that is
+                # precisely how a gap spanning the terminal boundary is
+                # observed.  Use the same strict force-flat boundary for the
+                # previous bar's end so a trailing post-close gap is not
+                # misclassified as a hold discontinuity.
+                gap_affects_hold = (
+                    gap_seconds > 60.0 and
+                    (deadline is None or previous_end.timestamp() < deadline) and
+                    _at_or_before_force_flat(previous_end, resolved_policy))
+                if gap_affects_hold:
+                    hold_discontinuity = True
+                    hold_discontinuity_kind = "internal_gap"
+                    hold_discontinuity_from = session_bars[probe - 1].end
+                    hold_discontinuity_to = session_bars[probe].timestamp
+                    hold_discontinuity_gap_seconds = gap_seconds - 60.0
+                    hold_discontinuity_gap_minutes = max(
+                        0.0, hold_discontinuity_gap_seconds / 60.0)
                 break
             if session_bars[probe].end.timestamp() > deadline:
                 break
@@ -568,6 +605,23 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                             resolved_policy):
                 break
             last_index = probe
+        # If the observed symbol/session simply ends while the configured hold
+        # is still live, the terminal bar is right-censored data, not an
+        # ordinary time-cap expiry.  There is no following timestamp from
+        # which to infer a gap duration, so keep that duration explicitly
+        # unknown and distinguish it from an observed internal gap.
+        terminal_end = session_bars[last_index].end
+        terminal_session_close = session_bars[last_index].session_close
+        terminal_is_calendar_close = (
+            terminal_session_close is not None and
+            terminal_end >= terminal_session_close)
+        if (not hold_discontinuity and last_index == len(session_bars) - 1 and
+                not terminal_is_calendar_close and
+                terminal_end.timestamp() < deadline and
+                _at_or_before_force_flat(terminal_end, resolved_policy)):
+            hold_discontinuity = True
+            hold_discontinuity_kind = "observed_data_end"
+            hold_discontinuity_from = terminal_end
         exit_bar = session_bars[last_index]
         exit_ref = float(exit_bar.close)
         exit_at = exit_bar.end
@@ -599,6 +653,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             exit_at = bar.end
             pricing_cutoff = bar.timestamp
             break
+        hold_discontinuity_exit = hold_discontinuity and reason == "time"
         day = signal_bar.session_date
         multiplier = 1
         contract = None
@@ -679,6 +734,34 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "entry_slippage_reference": entry_slippage_reference,
             "underlying_entry": entry_underlying, "stop_price": stop,
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
+            # ``exit_reason`` is a long-standing consumer field and remains
+            # ``time`` for both cases.  These additive fields distinguish a
+            # sparse-hold termination from a normal configured expiry without
+            # changing the selected bar, fill, or P&L.
+            "hold_discontinuity": hold_discontinuity_exit,
+            "hold_discontinuity_exit": hold_discontinuity_exit,
+            "hold_discontinuity_kind": (
+                hold_discontinuity_kind if hold_discontinuity_exit else None),
+            "hold_discontinuity_from": (
+                hold_discontinuity_from.isoformat()
+                if hold_discontinuity_exit and
+                hold_discontinuity_from is not None else None),
+            "hold_discontinuity_to": (
+                hold_discontinuity_to.isoformat()
+                if hold_discontinuity_exit and
+                hold_discontinuity_to is not None else None),
+            "hold_discontinuity_gap_seconds": (
+                hold_discontinuity_gap_seconds
+                if hold_discontinuity_exit else None),
+            "hold_discontinuity_gap_minutes": (
+                hold_discontinuity_gap_minutes
+                if hold_discontinuity_exit else None),
+            "hold_exit_reason": ("discontinuity"
+                                 if hold_discontinuity_exit else
+                                 "time_expiry" if reason == "time" else reason),
+            "exit_reason_detail": ("discontinuity"
+                                   if hold_discontinuity_exit else
+                                   "time_expiry" if reason == "time" else reason),
             "contract": contract, "contract_multiplier": multiplier,
             "stop_distance": distance, "entry_gap_fill": gapped,
             "exit_gap_fill": exit_gapped,
@@ -1139,6 +1222,11 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
         failure = "excess_drawdown"
     else:
         failure = "none"
+    discontinuity_exits = sum(
+        bool(row.get("hold_discontinuity_exit", row.get("hold_discontinuity")))
+        for row in trades)
+    time_expiry_exits = sum(
+        row.get("hold_exit_reason") == "time_expiry" for row in trades)
     return {
         "primary_failure": failure, "trades": len(trades),
         "sessions": len(sessions), "net_pnl": sum(pnl), "expectancy": expectancy,
@@ -1153,6 +1241,16 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
                       if trades else 0.0),
         "target_rate": (sum(row.get("exit_reason") == "target" for row in trades) / len(trades)
                         if trades else 0.0),
+        "hold_telemetry": {
+            "discontinuity_exits": discontinuity_exits,
+            "discontinuity_exit_rate": (discontinuity_exits / len(trades)
+                                         if trades else 0.0),
+            "time_expiry_exits": time_expiry_exits,
+            "time_expiry_rate": (time_expiry_exits / len(trades)
+                                  if trades else 0.0),
+            "diagnostic_only": True,
+            "authorizing": False,
+        },
     }
 
 

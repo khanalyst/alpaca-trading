@@ -202,7 +202,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
             "confirmatory_raw_p_value": control["p_value"],
         })
     fdr_record = (FactoryLedger(ledger.path).record_fdr_decision(
-        "shadow-confirmation-v4:equity", f"{candidate_id}:shadow",
+        "shadow-confirmation-v5:equity", f"{candidate_id}:shadow",
         control["p_value"], alpha=.05) if lane == "shadow" else None)
     gate = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
@@ -227,7 +227,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
                       "mean_delta": control["mean_delta"],
                       "mean_delta_lcb": control["mean_delta_lcb"],
                       "p_value": control["p_value"]},
-        online_fdr={"scope": ("shadow-confirmation-v4:equity" if lane == "shadow"
+        online_fdr={"scope": ("shadow-confirmation-v5:equity" if lane == "shadow"
                               else "test"),
                     "test_id": f"{candidate_id}:{lane}",
                     "p_value": control["p_value"], "raw_p_value": control["p_value"],
@@ -241,6 +241,9 @@ def persist_rule_gate(ledger, candidate_id, lane):
                     "decision": True,
                     "required": True, "tested": True,
                     "p_value_kind": "raw_confirmatory",
+                    **({"method": fdr_record.get("method"),
+                        "method_version": fdr_record.get("method_version")}
+                       if lane == "shadow" and fdr_record is not None else {}),
                     "p_value_source": "live_shadow_confirmatory_gate",
                     "independent_confirmatory": lane == "shadow",
                     "disjoint_sessions": lane == "shadow",

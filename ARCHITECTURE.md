@@ -606,17 +606,19 @@ explicit, non-authorizing deferral after family/global BH and the frozen-cluster
 veto, then uses the
 sealed window only for qualification. The strictly newer parity-matched
 live-shadow tail receives the one durable cumulative online-FDR test per
-vehicle scope. Its balanced LORD-style state is persisted in the factory
+vehicle scope. Its standard LORD++ state is persisted in the factory
 ledger across cycles, so a new cycle cannot reset allocated alpha or discovery
-history. The base allocation is `alpha / (n(n+1))`; each prior discovery starts
-the same telescoping reward stream. This preserves an infinite testing horizon
+history. The active `shadow-confirmation-v5` scope uses
+`gamma_n=1/(n(n+1))` and `W0=alpha`: its base allocation is
+`alpha*gamma_n`, the first-discovery reward is zero, and each later discovery
+starts an `alpha*gamma` stream. This preserves an infinite testing horizon
 without allowing offline candidate churn to exhaust it.
 
-The unchanged `shadow-confirmation-v4` scope splits each complete tail into older
+The v5 scope splits each complete tail into older
 chronological selection sessions and a newer disjoint confirmatory window. BH
 selection uses only the former; the selected candidate is recomputed on the
-latter and only that raw confirmatory p-value is sent to LORD. Same-tail v3
-evidence remains auditable but cannot authorize under epoch 5. The current
+latter and only that raw confirmatory p-value is sent to LORD++. Legacy
+v2/v3/v4 evidence remains auditable but cannot authorize under v5. The current
 `REPLAY_ENGINE_EPOCH` is 5: epoch 5 also seals paired synthetic root-control
 shadow decisions/replays, diagnostic historical-backfill provenance with exact
 calendar metadata, chronological paired inference, finite BH input validation,

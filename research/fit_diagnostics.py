@@ -9,7 +9,7 @@ identical parameter sets visible before the expensive full replay.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 import math
@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     MIN_STOP_DISTANCE_BPS, evaluate_rule_signal_metadata, feature_window_bars,
-    rule_variant_id, validate_rule_spec,
+    rule_variant_id, validate_rule_spec, SESSION_MINUTES,
 )
 from .costs import (STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     stressed_cost_usd)
@@ -38,6 +38,305 @@ FIT_BEHAVIOR_ALIAS_SCHEMA = "fit-behavior-alias.v1"
 FIT_BEHAVIOR_ALIAS_DECIMALS = 8
 COST_STRESS_MULTIPLIERS = (9, 15, 25, 50)
 _NY = ZoneInfo("America/New_York")
+BAR_COVERAGE_SCHEMA = "bar-coverage.v1"
+_MAX_GAP_SAMPLES = 8
+
+
+def _row_value(row: Any, name: str, default: Any = None) -> Any:
+    """Read a normalized field from either a dataclass or a mapping."""
+    if isinstance(row, Mapping):
+        return row.get(name, default)
+    return getattr(row, name, default)
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if value is None:
+        return None
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coverage_timestamp(row: Any) -> datetime | None:
+    return _coerce_datetime(_row_value(row, "timestamp",
+                                        _row_value(row, "ts")))
+
+
+def _coverage_session(row: Any) -> str:
+    supplied = _row_value(row, "session_date")
+    if supplied is not None:
+        if isinstance(supplied, date):
+            return supplied.isoformat()
+        text = str(supplied).strip()
+        if text:
+            return text[:10]
+    return _session(row)
+
+
+def _coverage_end(row: Any, stamp: datetime | None) -> datetime | None:
+    explicit = _coerce_datetime(_row_value(row, "end"))
+    if explicit is not None:
+        return explicit
+    interval = _row_value(row, "interval_seconds", 60)
+    try:
+        return stamp + timedelta(seconds=int(interval or 60)) if stamp else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _coverage_distribution(values: Sequence[float | int]) -> dict[str, Any]:
+    clean = sorted(float(value) for value in values
+                   if _number(value) is not None)
+    if not clean:
+        return {"count": 0, "min": None, "p25": None, "median": None,
+                "p75": None, "max": None, "mean": None}
+
+    def percentile(fraction: float) -> float:
+        index = (len(clean) - 1) * fraction
+        lower, upper = math.floor(index), math.ceil(index)
+        if lower == upper:
+            return clean[lower]
+        return clean[lower] + (clean[upper] - clean[lower]) * (index - lower)
+
+    return {"count": len(clean), "min": clean[0],
+            "p25": percentile(.25), "median": percentile(.5),
+            "p75": percentile(.75), "max": clean[-1],
+            "mean": sum(clean) / len(clean)}
+
+
+def _coverage_session_record(rows: Sequence[Any], *, symbol: str,
+                             session: str) -> dict[str, Any]:
+    """Describe one symbol/session without inferring missing edge bars."""
+    ordered = sorted(rows, key=lambda row: _coverage_timestamp(row) or
+                     datetime.min.replace(tzinfo=timezone.utc))
+    stamps = [_coverage_timestamp(row) for row in ordered]
+    valid_stamps = [stamp for stamp in stamps if stamp is not None]
+    valid_ends = [_coverage_end(row, stamp) for row, stamp in zip(ordered, stamps)
+                  if stamp is not None and _coverage_end(row, stamp) is not None]
+    unique_stamps = sorted(set(valid_stamps))
+    duplicate_bars = len(valid_stamps) - len(unique_stamps)
+    interval_values = []
+    for row in ordered:
+        try:
+            interval_values.append(int(_row_value(row, "interval_seconds", 60) or 60))
+        except (TypeError, ValueError, OverflowError):
+            interval_values.append(None)
+    non_minute_bars = sum(value != 60 for value in interval_values)
+
+    gap_intervals_sample: list[dict[str, Any]] = []
+    gap_count = 0
+    gap_minutes = 0.0
+    max_gap = 0.0
+    for previous, current in zip(unique_stamps, unique_stamps[1:]):
+        seconds = (current - previous).total_seconds()
+        if seconds <= 60:
+            continue
+        missing = max(0.0, seconds / 60.0 - 1.0)
+        gap_count += 1
+        gap_minutes += missing
+        max_gap = max(max_gap, missing)
+        if len(gap_intervals_sample) < _MAX_GAP_SAMPLES:
+            gap_intervals_sample.append({
+                "from": previous.isoformat(),
+                "to": current.isoformat(),
+                "elapsed_minutes": seconds / 60.0,
+                "missing_minutes": missing,
+            })
+
+    metadata = []
+    for row in ordered:
+        opened = _coerce_datetime(_row_value(row, "session_open"))
+        closed = _coerce_datetime(_row_value(row, "session_close"))
+        metadata.append((opened, closed))
+    exact_metadata = (bool(metadata) and
+                      all(opened is not None and closed is not None
+                          for opened, closed in metadata) and
+                      len(set(metadata)) == 1)
+    metadata_conflict = len(set(metadata)) > 1
+    opened, closed = metadata[0] if metadata else (None, None)
+    expected_minutes: int | None = None
+    expected_source = "unknown"
+    early_close: bool | None = None
+    caveats: set[str] = set()
+    if exact_metadata and opened is not None and closed is not None:
+        duration = (closed - opened).total_seconds()
+        if duration > 0 and duration % 60 == 0:
+            expected_minutes = int(duration / 60)
+            expected_source = "exact_session_calendar"
+            local_open = opened.astimezone(_NY)
+            local_close = closed.astimezone(_NY)
+            # A shorter duration is not by itself an early close: a delayed
+            # open can also shorten a session.  Exact close time is the
+            # authoritative distinction, with non-standard opens called out
+            # separately instead of being mislabeled.
+            early_close = local_close.time().replace(tzinfo=None) < time(16, 0)
+            if local_open.time().replace(tzinfo=None) != time(9, 30):
+                caveats.add("non_standard_session_open")
+            if early_close:
+                caveats.add("early_close_exact_calendar")
+            elif local_close.time().replace(tzinfo=None) != time(16, 0):
+                caveats.add("non_standard_session_close")
+        else:
+            caveats.add("exact_session_calendar_malformed")
+            caveats.add("early_close_unknown")
+    else:
+        caveats.add("exact_session_calendar_conflict" if metadata_conflict else
+                    "exact_session_calendar_missing")
+        caveats.add("early_close_unknown")
+    if non_minute_bars:
+        caveats.add("non_minute_bars")
+    if duplicate_bars:
+        caveats.add("duplicate_timestamps")
+    if gap_count:
+        caveats.add("internal_bar_gaps")
+
+    observed = len(unique_stamps)
+    if expected_minutes is None:
+        status = "unknown_expected"
+    elif gap_count:
+        status = "gapped"
+    elif observed < expected_minutes:
+        status = "sparse"
+    elif observed > expected_minutes:
+        status = "overfull"
+    else:
+        status = "covered"
+    coverage_ratio = (observed / expected_minutes
+                      if expected_minutes is not None and expected_minutes > 0
+                      else None)
+    first = valid_stamps[0].isoformat() if valid_stamps else None
+    last = valid_stamps[-1].isoformat() if valid_stamps else None
+    span = 0.0
+    if valid_stamps and valid_ends:
+        span = max(valid_ends).timestamp() - min(valid_stamps).timestamp()
+        span = max(0.0, span / 60.0)
+    return {
+        "schema": BAR_COVERAGE_SCHEMA,
+        "symbol": symbol,
+        "session_date": session,
+        "status": status,
+        "observed_bars": len(rows),
+        "observed_minutes": observed,
+        "duplicate_timestamps": duplicate_bars,
+        "expected_minutes": expected_minutes,
+        "expected_minutes_source": expected_source,
+        "regular_session_minutes": SESSION_MINUTES,
+        "early_close": early_close,
+        "coverage_ratio": coverage_ratio,
+        "observed_minus_expected_minutes": (
+            observed - expected_minutes if expected_minutes is not None else None),
+        "first_bar": first,
+        "last_bar": last,
+        "span_minutes": span,
+        "gap_count": gap_count,
+        "gap_minutes": gap_minutes,
+        "max_gap_minutes": max_gap,
+        # Keep detail bounded: totals/counts above retain the complete signal,
+        # while a deterministic prefix of intervals makes a sparse corpus
+        # inspectable without repeating potentially hundreds of rows.
+        "gap_intervals_sample": gap_intervals_sample,
+        "feeds": sorted({str(_row_value(row, "feed", "unknown"))
+                          for row in ordered}),
+        "providers": sorted({str(_row_value(row, "provider", "unknown"))
+                              for row in ordered}),
+        "caveats": sorted(caveats),
+    }
+
+
+def bar_coverage_telemetry(bars: Sequence[Any]) -> dict[str, Any]:
+    """Return deterministic per-symbol/session sparse-bar telemetry.
+
+    Exact ``session_open``/``session_close`` metadata is the only source used
+    for an authoritative expected count.  Legacy or mixed metadata therefore
+    reports an unknown expected count and an explicit early-close caveat rather
+    than treating a 390-minute regular day as fact.
+    """
+    grouped: dict[tuple[str, str], list[Any]] = {}
+    for row in bars:
+        stamp = _coverage_timestamp(row)
+        symbol = str(_row_value(row, "symbol", "")).upper()
+        session = _coverage_session(row)
+        if symbol and session and stamp is not None:
+            grouped.setdefault((symbol, session), []).append(row)
+    records = [
+        _coverage_session_record(rows, symbol=symbol, session=session)
+        for (symbol, session), rows in sorted(grouped.items())
+    ]
+    nested: dict[str, dict[str, dict[str, Any]]] = {}
+    for record in records:
+        nested.setdefault(record["symbol"], {})[record["session_date"]] = record
+    by_symbol: dict[str, dict[str, Any]] = {}
+    for symbol in sorted(nested):
+        symbol_records = [nested[symbol][session]
+                          for session in sorted(nested[symbol])]
+        expected = [item["expected_minutes"] for item in symbol_records
+                    if item["expected_minutes"] is not None]
+        known_records = [item for item in symbol_records
+                         if item["expected_minutes"] is not None]
+        observed = sum(int(item["observed_minutes"]) for item in symbol_records)
+        observed_known = sum(int(item["observed_minutes"]) for item in known_records)
+        expected_total = sum(expected) if expected else None
+        by_symbol[symbol] = {
+            "symbol": symbol,
+            "session_count": len(symbol_records),
+            "observed_bars": sum(int(item["observed_bars"]) for item in symbol_records),
+            "observed_minutes": observed,
+            "observed_minutes_known_sessions": observed_known,
+            "expected_minutes": expected_total,
+            "expected_minutes_known_sessions": len(expected),
+            # Unknown-calendar sessions are not silently treated as complete
+            # or incomplete against a guessed 390-minute day.
+            "coverage_ratio": (observed_known / expected_total
+                                if expected_total else None),
+            "gap_sessions": sum(bool(item["gap_count"]) for item in symbol_records),
+            "unknown_expected_sessions": sum(
+                item["expected_minutes"] is None for item in symbol_records),
+            "bar_count_distribution": _coverage_distribution(
+                [item["observed_bars"] for item in symbol_records]),
+            "minute_count_distribution": _coverage_distribution(
+                [item["observed_minutes"] for item in symbol_records]),
+        }
+    known_expected = [item["expected_minutes"] for item in records
+                      if item["expected_minutes"] is not None]
+    known_records = [item for item in records
+                     if item["expected_minutes"] is not None]
+    observed_all = sum(int(item["observed_minutes"]) for item in records)
+    observed_total = sum(int(item["observed_minutes"]) for item in known_records)
+    expected_total = sum(known_expected) if known_expected else None
+    caveats = sorted({caveat for item in records for caveat in item["caveats"]})
+    return {
+        "schema": BAR_COVERAGE_SCHEMA,
+        "scope": "input_bars",
+        "session_count": len(records),
+        "symbol_count": len(nested),
+        "observed_bars": sum(int(item["observed_bars"]) for item in records),
+        "observed_minutes": observed_all,
+        "observed_minutes_known_sessions": observed_total,
+        "expected_minutes": expected_total,
+        "expected_minutes_known_sessions": len(known_expected),
+        "expected_minutes_complete": bool(records) and len(known_expected) == len(records),
+        "coverage_ratio": (observed_total / expected_total
+                            if expected_total else None),
+        "gap_sessions": sum(bool(item["gap_count"]) for item in records),
+        "unknown_expected_sessions": sum(
+            item["expected_minutes"] is None for item in records),
+        "bar_count_distribution": _coverage_distribution(
+            [item["observed_bars"] for item in records]),
+        "minute_count_distribution": _coverage_distribution(
+            [item["observed_minutes"] for item in records]),
+        "gap_minutes_distribution": _coverage_distribution(
+            [item["gap_minutes"] for item in records]),
+        "by_symbol_session": nested,
+        "by_symbol": by_symbol,
+        "caveats": caveats,
+    }
 
 
 def _number(value: Any) -> float | None:
@@ -516,12 +815,23 @@ def _risk_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if (planned is not None and planned > 0 and actual is not None
                 and actual >= 0):
             paired.append(actual / planned)
-    result = {"intended": _ratio_summary(intended, unit="risk_usd"),
-              "delivered": _ratio_summary(delivered, unit="risk_usd")}
+    configured_summary = _ratio_summary(intended, unit="risk_usd")
+    capped_summary = _ratio_summary(delivered, unit="risk_usd")
+    result = {
+        # Explicit current names make the notional-cap interaction readable.
+        # Keep the older aliases because the fit-diagnostics schema is
+        # append-only and existing report consumers already understand them.
+        "configured": configured_summary,
+        "capped_delivered": capped_summary,
+        "intended": configured_summary,
+        "delivered": capped_summary,
+    }
     if intended and delivered:
-        result["delivered_to_intended"] = _ratio_summary(paired, unit="ratio")
+        ratio = _ratio_summary(paired, unit="ratio")
     else:
-        result["delivered_to_intended"] = _ratio_summary([], unit="ratio")
+        ratio = _ratio_summary([], unit="ratio")
+    result["delivered_to_configured"] = ratio
+    result["delivered_to_intended"] = ratio
     return result
 
 
@@ -531,6 +841,12 @@ def _exit_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     ties = sum(_flag(row.get("tie_broken")) for row in trades)
     entry_gaps = sum(_flag(row.get("entry_gap_fill")) for row in trades)
     exit_gaps = sum(_flag(row.get("exit_gap_fill")) for row in trades)
+    discontinuity_exits = sum(
+        _flag(row.get("hold_discontinuity_exit",
+                    row.get("hold_discontinuity"))) for row in trades)
+    time_expiry_exits = sum(
+        str(row.get("hold_exit_reason") or "") == "time_expiry"
+        for row in trades)
     count = len(trades)
     return {
         "trades": count,
@@ -542,6 +858,19 @@ def _exit_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "entry_gap_rate": entry_gaps / count if count else 0.0,
         "exit_gaps": exit_gaps,
         "exit_gap_rate": exit_gaps / count if count else 0.0,
+        # ``exit_reason`` remains the compatibility field.  These additive
+        # counters make a time-like exit caused by a sparse hold explicit.
+        "hold_discontinuity_exits": discontinuity_exits,
+        "hold_discontinuity_exit_rate": (discontinuity_exits / count
+                                          if count else 0.0),
+        "time_expiry_exits": time_expiry_exits,
+        "time_expiry_rate": time_expiry_exits / count if count else 0.0,
+        "hold_termination_counts": {
+            "discontinuity": discontinuity_exits,
+            "time_expiry": time_expiry_exits,
+        },
+        "diagnostic_only": True,
+        "authorizing": False,
     }
 
 
@@ -993,10 +1322,10 @@ fit_behavior_diagnostics = measure_fit_diagnostics
 
 
 __all__ = [
-    "COST_STRESS_MULTIPLIERS", "FIT_BEHAVIOR_ALIAS_DECIMALS",
+    "BAR_COVERAGE_SCHEMA", "COST_STRESS_MULTIPLIERS", "FIT_BEHAVIOR_ALIAS_DECIMALS",
     "FIT_BEHAVIOR_ALIAS_SCHEMA", "FIT_DIAGNOSTICS_SCHEMA",
     "audit_exit_grammar", "build_fit_diagnostics", "collapse_aliases",
     "collapse_behavior_aliases", "diagnose_fit", "filter_behavior_aliases",
     "fit_behavior_diagnostics", "fit_behavior_fingerprint",
-    "fit_only_diagnostics", "measure_fit_diagnostics",
+    "fit_only_diagnostics", "measure_fit_diagnostics", "bar_coverage_telemetry",
 ]

@@ -353,6 +353,15 @@ def log_order(order=None, request=None, *, action: str = "submit",
         detail["delivered_risk_usd"] = detail["risk_usd"]
     if "risk_usd" not in detail and "delivered_risk_usd" in detail:
         detail["risk_usd"] = detail["delivered_risk_usd"]
+    # The configured budget is intentionally distinct from capped planned and
+    # delivered risk.  Keep both spellings available to callers while the
+    # journal stores the canonical name.
+    if ("configured_risk_budget_usd" not in detail and
+            "risk_budget_usd" in detail):
+        detail["configured_risk_budget_usd"] = detail["risk_budget_usd"]
+    if ("risk_budget_usd" not in detail and
+            "configured_risk_budget_usd" in detail):
+        detail["risk_budget_usd"] = detail["configured_risk_budget_usd"]
     row = {
         "ts": time.time(), "order_id": getattr(source, "id", None),
         "client_order_id": getattr(source, "client_order_id", None),
@@ -413,6 +422,12 @@ def log_trade(symbol, side, action, qty, price=None, notional=None,
         detail["delivered_risk_usd"] = detail["risk_usd"]
     if "risk_usd" not in detail and "delivered_risk_usd" in detail:
         detail["risk_usd"] = detail["delivered_risk_usd"]
+    if ("configured_risk_budget_usd" not in detail and
+            "risk_budget_usd" in detail):
+        detail["configured_risk_budget_usd"] = detail["risk_budget_usd"]
+    if ("risk_budget_usd" not in detail and
+            "configured_risk_budget_usd" in detail):
+        detail["risk_budget_usd"] = detail["configured_risk_budget_usd"]
     row = {"ts": time.time(), "symbol": symbol, "side": side,
            "action": action, "qty": float(qty) if qty is not None else None,
            "price": float(price) if price is not None else None,

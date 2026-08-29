@@ -261,10 +261,23 @@ with a cycle-global failure is a normal marginal result; only a candidate that
 also clears the frozen-cluster veto can authorize cross-family selection. The
 gates are applied per vehicle and per
 session rather than to a pooled equity/options series. Rolling-origin uses the
-same fixed rule in every fold. The cumulative
-online-FDR allocation is durable per vehicle scope and persists across cycles;
-the sealed qualification window is released once by one preselected candidate
-alone, while other variants remain diagnostic.
+same fixed rule in every fold. The cumulative online-FDR allocation is durable
+per vehicle scope and persists across cycles. The active
+`shadow-confirmation-v5` scope implements the LORD++ construction of
+[Ramdas, Yang, Wainwright, and Jordan (2017)](https://proceedings.neurips.cc/paper_files/paper/2017/hash/7f018eb7b301a66658931cb8a93fd6e8-Abstract.html): with
+`gamma_k=1/(k*(k+1))`, explicit `W0=alpha`, and discovery indices `tau_j`, the
+allocation at test `t` is `W0*gamma_t + (alpha-W0)*gamma_(t-tau_1) +
+alpha*sum_(j>=2, tau_j<t) gamma_(t-tau_j)`. Thus pre-discovery spending is
+`alpha*gamma_t`, the first-discovery reward is the explicitly recorded
+`alpha-W0=0`, and subsequent rewards are `alpha`. The cited result controls
+mFDR under conditionally super-uniform null p-values; its full FDR guarantee
+additionally assumes independent null p-values and predictable test levels
+that are monotone in prior discoveries. The implementation fixes that
+predictable monotone schedule, but only the confirmatory design can justify
+the p-value and dependence assumptions. Disjoint chronological tails prevent
+selection-row reuse; they do not establish either assumption. The sealed
+qualification window is released once by
+one preselected candidate alone, while other variants remain diagnostic.
 
 Serial inference is deterministic: paired deltas are grouped by chronological
 session/day clusters and the persisted lower bound uses a seeded moving-block
@@ -362,13 +375,15 @@ appending the immutable `lane=shadow` proof and live marker. Semantic or
 mid-tail incompleteness fails closed but is repairable: correct the source and
 run the bounded complete parity replay before retrying ingestion. There is no
 unsafe auto-skip: unresolved quarantine blocks the watermark and FDR boundary.
-The unchanged `shadow-confirmation-v4` scope splits each tail into older
+The `shadow-confirmation-v5` scope splits each tail into older
 chronological selection sessions and a newer disjoint confirmatory window; BH
 uses the selection p-values, and only the selected candidate's raw confirmatory
-p-value reaches LORD. Same-tail v3 scopes remain audit-only and cannot
-authorize. Under epoch 5, the persisted live proof must match the durable FDR
-allocation (scope/test id, p-value, alpha, allocation, and decision), not merely
-repeat those fields in a caller-supplied envelope.
+p-value reaches LORD++. Same-tail v3 scopes remain audit-only and cannot
+authorize. Legacy v2/v3/v4 sequences (`lord_balanced_v2` and
+`lord_balanced_raw_p_v3`) remain audit-readable and isolated from v5. Under
+epoch 5, the persisted live proof must match the durable FDR
+allocation (scope/test id, method/version, p-value, alpha, allocation, and
+decision), not merely repeat those fields in a caller-supplied envelope.
 
 ## Autonomous strategy factory
 
@@ -452,8 +467,9 @@ still pass strictly later forward data before runtime can select them.
 
 Before full variant replay, `research.fit_diagnostics` records fit-only
 eligible-prefix and first-signal rates, ATR and 30-bps-floor binding, planned
-stop/target/hold distributions, configured/stressed cost-to-risk, intended
-versus delivered risk, exit reason/tie/gap counts, clustered MDE/power,
+stop/target/hold distributions, configured/stressed cost-to-risk, configured
+pre-cap risk versus capped delivered risk, exit reason/tie/gap counts, and
+clustered MDE/power,
 provider/feed provenance, entry-pricing sources, configured limits,
 pass/fail/unknown row counts, behavioral alias fingerprints, and an execution-
 rejection section that passes only aggregate fit-partition counts/reasons to
@@ -464,6 +480,15 @@ When every fit opportunity is explicitly rejected at execution, the fit is
 classified as `execution_blocked`, distinct from sparse/underpowered data. It
 may close after the bounded attempt cap only to progress and observe search
 exhaustion; it is not a powered negative edge conclusion.
+
+Each factory result also persists one `bar-coverage.v1` record for the input
+corpus, with per-symbol/session observed minutes, exact-calendar expected
+minutes when those boundaries are present, early-close caveats, internal gaps,
+and bounded gap samples. It is not repeated in every account or variant. A
+time-like trade exit records `internal_gap` or `observed_data_end` separately
+from normal `time_expiry`. These fields describe censoring only: neither a gap
+nor a coverage ratio is assigned a positive or negative R effect without a
+separate matched analysis.
 
 A worker is given a corpus descriptor — the session window it needs — rather
 than a copy of the corpus, and re-reads that window itself. The predicates are

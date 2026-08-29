@@ -494,8 +494,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     selected_test_id = ranked_ids[0] if ranked_ids else None
     # Imported lazily because factory_ledger imports this module's public
     # facades. Historical discovery defers cumulative testing to live shadow.
-    from .factory_ledger import deferred_fdr
-    confirmatory_scope = f"shadow-confirmation-v4:{vehicle}"
+    from .factory_ledger import CONFIRMATORY_SCOPE_VERSION, deferred_fdr
+    confirmatory_scope = f"{CONFIRMATORY_SCOPE_VERSION}:{vehicle}"
     cumulative = deferred_fdr(
         confirmatory_scope,
         (f"{data_hash}:{lane}:{selected_test_id}:live-shadow"

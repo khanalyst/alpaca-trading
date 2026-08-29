@@ -106,7 +106,14 @@ class RiskEngine:
                 value = math.floor(candidate / entry)
                 liquidity_cap = value if liquidity_cap is None else min(liquidity_cap, value)
         shares = max(0, min(raw, cap_shares, liquidity_cap if liquidity_cap is not None else raw))
-        return {"shares": shares, "risk_usd": shares * distance,
+        planned_risk = shares * distance
+        return {"shares": shares, "risk_usd": planned_risk,
+                # ``risk_usd`` is the post-cap planned risk.  Keep the
+                # configured budget separate so a notional cap does not make
+                # the authored risk appetite look smaller than it was.
+                "configured_risk_budget_usd": budget,
+                "risk_budget_usd": budget,
+                "planned_risk_usd": planned_risk,
                 "notional": shares * entry, "stop_distance": distance,
                 "notional_cap": notional_cap,
                 "liquidity_cap_shares": liquidity_cap}
@@ -509,6 +516,12 @@ class RiskEngine:
             raise ValueError("option debit exceeds risk budget")
         contract["max_loss"] = contracts * max_loss
         contract["risk_usd"] = contract["max_loss"]
+        # ``risk_usd`` is the post-cap planned risk for the selected contract
+        # count.  Preserve the pre-cap configured budget for runtime and
+        # research telemetry instead of inferring it from that count.
+        contract["configured_risk_budget_usd"] = risk_value
+        contract["risk_budget_usd"] = risk_value
+        contract["planned_risk_usd"] = contract["risk_usd"]
         return contract
 
     def vet_open(self, decision: Mapping, equity: float, positions: list[Mapping],
@@ -591,7 +604,10 @@ class RiskEngine:
                 if sized["shares"] <= 0: return None, "risk budget cannot buy one share"
                 contracts = sized["shares"]
                 plan = {"execution_profile": "shares", "shares": contracts, "contracts": contracts,
-                        "notional": sized["notional"], "risk_usd": sized["risk_usd"]}
+                        "notional": sized["notional"], "risk_usd": sized["risk_usd"],
+                        "configured_risk_budget_usd": budget,
+                        "risk_budget_usd": budget,
+                        "planned_risk_usd": sized["risk_usd"]}
             elif profile in {"options", "option", "defined_risk_options", "options_defined_risk"}:
                 candidates = decision.get("option_chain") or market.get("option_chain") or market.get("options") or []
                 option = self.size_options(equity=equity, risk_usd=budget, candidates=candidates,
@@ -600,6 +616,9 @@ class RiskEngine:
                 plan = {"execution_profile": "options", "contracts": option["contracts"],
                         "option": option, "contract_multiplier": option["multiplier"],
                         "max_loss": option["max_loss"], "risk_usd": option["risk_usd"],
+                        "configured_risk_budget_usd": budget,
+                        "risk_budget_usd": budget,
+                        "planned_risk_usd": option["risk_usd"],
                         "notional": option["debit"] * option["multiplier"] * option["contracts"]}
             else:
                 return None, "unknown execution profile"

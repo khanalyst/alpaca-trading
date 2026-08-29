@@ -643,6 +643,32 @@ class DeployTests(unittest.TestCase):
         self.assertLess(fatal, vehicles)
         self.assertIn('research-llm-preflight-warning.v1', script)
 
+    def test_systemd_research_cache_topology_is_explicit_and_preflighted(self):
+        unit = Path("deploy/alpaca-research.service").read_text(
+            encoding="utf-8")
+        env = Path("deploy/research.env.example").read_text(encoding="utf-8")
+        self.assertIn(
+            "Environment=TMPDIR=/opt/alpaca-agent-trading/research/cache/tmp",
+            unit)
+        self.assertIn(
+            "ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT=/opt/alpaca-agent-trading/research/cache/preprocessing",
+            env)
+        self.assertIn(
+            "TMPDIR=/opt/alpaca-agent-trading/research/cache/tmp", env)
+        self.assertNotIn("/app/", env)
+        self.assertIn(
+            "ReadWritePaths=/opt/alpaca-agent-trading/runtime /opt/alpaca-agent-trading/research/cache /opt/alpaca-agent-trading/research/results",
+            unit)
+
+        script = Path("deploy/research-cycle.sh").read_text(encoding="utf-8")
+        temp_parent = script.index('mkdir -p "$tmp_root"')
+        temp_create = script.index('mktemp -d "$tmp_root/')
+        self.assertLess(temp_parent, temp_create)
+        guard = script.index("cache_topology_preflight()")
+        preprocessing = script.index('research_dataset.py"')
+        self.assertLess(guard, preprocessing)
+        self.assertIn('research_cache.py" topology', script)
+
     def test_scheduler_persists_explicit_factory_terminal_statuses(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2522,6 +2548,9 @@ class DeployTests(unittest.TestCase):
         self.assertIn("d.research.untradeable_proved_edges", dashboard.HTML)
         self.assertIn("cycle outcome", dashboard.HTML)
         self.assertIn("Execution journal", dashboard.HTML)
+        self.assertIn("configured_risk_budget_usd", dashboard.HTML)
+        self.assertIn("planned_to_configured_risk_ratio", dashboard.HTML)
+        self.assertIn("delivered_to_configured_risk_ratio", dashboard.HTML)
         self.assertIn("Paper-account trials", dashboard.HTML)
         self.assertNotIn("d.research_feed_version", dashboard.HTML)
         self.assertNotIn("d.research.optional", dashboard.HTML)

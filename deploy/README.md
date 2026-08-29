@@ -166,11 +166,22 @@ also supplies quote rows to backtest, so no corpus-sized quote-only copy is
 stored. Every cache hit re-hashes each normalized, bar, option, replay, and
 report artifact; corruption becomes a quarantined miss and is rebuilt
 atomically. On a miss, disposable outputs are moved into cache staging on the
-shared research-cache filesystem instead of being copied. Leaving the source
+shared research-cache rename domain instead of being copied. Leaving the source
 identity unset disables the cache, which is the safe mode for the actively
 changing recorder corpus. If either cache path is overridden, keep `TMPDIR`
-and `ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT` on the same filesystem; the
-low-space publisher fails closed rather than falling back to a full copy.
+and `ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT` on the same rename-capable
+mount (the rename domain); the low-space publisher fails closed rather than
+falling back to a full copy. The systemd unit sets `TMPDIR` to
+`/opt/alpaca-agent-trading/research/cache/tmp`, and the systemd example sets
+the same `TMPDIR` plus the cache root
+`/opt/alpaca-agent-trading/research/cache/preprocessing`, so both paths remain
+under the durable research-cache mount. When immutable cache reuse is enabled,
+the cycle performs a real `os.replace` probe from its
+temporary working directory into cache staging before preprocessing. A
+cross-domain `EXDEV` result is reported as a topology-preflight failure and
+stops the cycle before it can spend time preprocessing; probe files are cleaned
+up on both success and failure. Compose keeps its `/app/research/cache` paths
+from `compose.yaml`.
 
 Historical catch-up may run Terra without contaminating authorization by
 setting `ALPACA_FACTORY_DIAGNOSTIC_ONLY=1`. The cycle then writes a separate
@@ -444,12 +455,13 @@ parity-matched rows, prior qualification, source/config/code/provenance/replay/
 gate hashes, family/global BH plus the frozen-dependence-cluster veto and
 durable online FDR, then appends the
 immutable `lane=shadow` proof and live marker. Underpowered, mismatched, or
-incomplete shadow data advances no boundary and is reconsidered. The unchanged
-`shadow-confirmation-v4` ingestion scope splits each tail into older
+incomplete shadow data advances no boundary and is reconsidered. The
+`shadow-confirmation-v5` ingestion scope splits each tail into older
 chronological selection sessions and a newer disjoint confirmatory window; BH
 uses selection raw p-values, while only the selected candidate's raw
-confirmatory p-value reaches LORD. Same-tail v3
-rows remain auditable but quarantined; there is no unsafe auto-skip, so an
+confirmatory p-value reaches LORD++. With `W0=alpha`, its first-discovery reward
+is zero and later discoveries receive the standard `alpha` stream. Legacy
+v2/v3/v4 rows remain auditable but quarantined; there is no unsafe auto-skip, so an
 unresolved quarantine blocks watermark/FDR advancement until a bounded parity
 replay repairs it. Simulation resolution scales to the next
 online allocation and stops without spending at its bounded cap. Legacy

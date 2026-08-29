@@ -52,7 +52,10 @@ _JOURNAL_TABLES = {
         planned_qty REAL, cumulative_filled_qty REAL, fill_fraction REAL,
         filled_fraction REAL, risk_usd REAL, intended_risk_usd REAL,
         delivered_risk_usd REAL, risk_delivery_ratio REAL,
-        risk_shortfall_usd REAL
+        risk_shortfall_usd REAL, configured_risk_budget_usd REAL,
+        planned_risk_usd REAL,
+        planned_to_configured_risk_ratio REAL,
+        delivered_to_configured_risk_ratio REAL
     )""",
     "trades": """CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
@@ -73,7 +76,10 @@ _JOURNAL_TABLES = {
         mid_price REAL, requested_qty REAL, planned_qty REAL,
         cumulative_filled_qty REAL, fill_fraction REAL, filled_fraction REAL,
         intended_risk_usd REAL, delivered_risk_usd REAL,
-        risk_delivery_ratio REAL, risk_shortfall_usd REAL
+        risk_delivery_ratio REAL, risk_shortfall_usd REAL,
+        configured_risk_budget_usd REAL,
+        planned_risk_usd REAL, planned_to_configured_risk_ratio REAL,
+        delivered_to_configured_risk_ratio REAL
     )""",
     "equity": """CREATE TABLE IF NOT EXISTS equity (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
@@ -207,6 +213,10 @@ def initialize_journal(
                     "delivered_risk_usd": "REAL",
                     "risk_delivery_ratio": "REAL",
                     "risk_shortfall_usd": "REAL",
+                    "configured_risk_budget_usd": "REAL",
+                    "planned_risk_usd": "REAL",
+                    "planned_to_configured_risk_ratio": "REAL",
+                    "delivered_to_configured_risk_ratio": "REAL",
                 },
                 "trades": {
                     "run_id": "TEXT", "cycle_id": "TEXT",
@@ -221,6 +231,10 @@ def initialize_journal(
                     "intended_risk_usd": "REAL", "delivered_risk_usd": "REAL",
                     "risk_delivery_ratio": "REAL",
                     "risk_shortfall_usd": "REAL",
+                    "configured_risk_budget_usd": "REAL",
+                    "planned_risk_usd": "REAL",
+                    "planned_to_configured_risk_ratio": "REAL",
+                    "delivered_to_configured_risk_ratio": "REAL",
                 },
                 "equity": {
                     "run_id": "TEXT", "cycle_id": "TEXT",

@@ -71,11 +71,16 @@ is reserved for the later parity-matched live-shadow tail.
 The exit grammar remains fixed: an ATR-derived bracket (with the 30 bps minimum
 stop floor), configured R target, and bounded bar-cap time exit. Factory
 fit-only measurement reports eligible prefixes/first signals, 30-bps floor
-binding, planned exits, configured/stressed economics, power,
-delivered-versus-intended risk, provider/feed provenance, pricing source,
+binding, planned exits, configured/stressed economics, power, configured
+pre-cap risk versus capped delivered risk, provider/feed provenance, pricing source,
 configured limits, pass/fail/unknown row counts, behavioral aliases, and
-aggregate fit-partition execution-rejection counts/reasons for operator review;
-it is diagnostic only, does not expand exits, and cannot authorize a candidate.
+aggregate fit-partition execution-rejection counts/reasons for operator review.
+The cycle also records per-symbol/session bar coverage once per corpus and
+distinguishes hold discontinuities from ordinary time expiry without assigning
+a directional R effect; it is diagnostic only, does not expand exits, and
+cannot authorize a candidate. Runtime order/trade state, the SQLite journal,
+and the read-only dashboard separately retain configured pre-cap, full
+post-cap planned, and fill-delivered risk plus their configured-budget ratios.
 If every fit opportunity is explicitly execution-rejected, the fit is
 `execution_blocked`, distinct from sparse/underpowered data; bounded budget
 closure only progresses search exhaustion and is not a powered negative edge.
@@ -117,12 +122,13 @@ loss; correct the source and run the bounded replay repair before retrying
 ingestion. There is no unsafe auto-skip: unresolved quarantine blocks watermark
 and FDR advancement until the repair completes.
 
-The `shadow-confirmation-v4` live-shadow scope is independent and chronological:
+The `shadow-confirmation-v5` live-shadow scope is independent and chronological:
 each complete tail is split into an older selection window and a newer disjoint
 confirmatory window. Batch BH uses selection p-values; only the selected
-candidate's raw confirmatory p-value is sent to LORD. Same-tail v3 scopes remain
-audit-only and cannot authorize. This v4 scope remains unchanged under replay
-epoch 5.
+candidate's raw confirmatory p-value is sent to LORD++. With `W0=alpha`, its
+first-discovery reward is zero and later discoveries receive the standard
+`alpha` reward stream. Legacy v2/v3/v4 scopes remain audit-only and cannot
+authorize under v5.
 
 Within a hypothesis, refinement first changes exactly one executable field at
 a time. Only after that coordinate neighborhood is measured can it combine two

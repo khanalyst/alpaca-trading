@@ -1138,6 +1138,13 @@ class FitSelectionSanitizerTests(unittest.TestCase):
             "fit_diagnostics": {
                 "scope": "fit_only",
                 "eligible_prefix": {"eligible": 4, "heldout": 99},
+                "risk": {
+                    "configured": {"median": 500.0},
+                    "planned": {"median": 117.5},
+                    "capped_delivered": {"median": 117.5},
+                    "delivered_to_configured": {"median": .235},
+                    "raw_rows": [{"risk": 9999}],
+                },
                 "gate": {"passes": True},
                 "raw_rows": [{"close": 1}],
             },
@@ -1149,6 +1156,11 @@ class FitSelectionSanitizerTests(unittest.TestCase):
                       "raw_rows", "close"):
             self.assertNotIn(token, encoded)
         self.assertEqual(projected["fit_diagnostics"]["eligible_prefix"]["eligible"], 4)
+        risk = projected["fit_diagnostics"]["risk"]
+        self.assertEqual(risk["configured"]["median"], 500.0)
+        self.assertEqual(risk["planned"]["median"], 117.5)
+        self.assertEqual(risk["capped_delivered"]["median"], 117.5)
+        self.assertEqual(risk["delivered_to_configured"]["median"], .235)
 
     def test_unsafe_lesson_fields_do_not_reach_tuner_or_change_choices(self):
         captured = []

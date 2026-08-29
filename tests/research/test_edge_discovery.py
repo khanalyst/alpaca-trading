@@ -300,7 +300,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     if lane == "shadow":
         factory = FactoryLedger(ledger.path)
         test_id = f"{candidate_id}:shadow"
-        state = factory.fdr_state("shadow-confirmation-v4:equity")
+        state = factory.fdr_state("shadow-confirmation-v5:equity")
         fdr_record = next((
             {**item, "tests": index}
             for index, item in enumerate(state["decisions"], start=1)
@@ -308,10 +308,10 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
         ), None)
         if fdr_record is None:
             fdr_record = (factory.record_fdr_decision(
-                "shadow-confirmation-v4:equity", test_id,
+                "shadow-confirmation-v5:equity", test_id,
                 control["p_value"], alpha=.05) if record else
                 factory.next_fdr_allocation(
-                    "shadow-confirmation-v4:equity", alpha=.05))
+                    "shadow-confirmation-v5:equity", alpha=.05))
     envelope = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         fit_baseline=fit_baseline, heldout_baseline=baseline,
@@ -332,7 +332,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                       "mean_delta": control["mean_delta"],
                       "mean_delta_lcb": control["mean_delta_lcb"],
                       "p_value": control["p_value"]},
-        online_fdr={"scope": "shadow-confirmation-v4:equity" if lane == "shadow" else "test",
+        online_fdr={"scope": "shadow-confirmation-v5:equity" if lane == "shadow" else "test",
                     "test_id": f"{candidate_id}:{lane}",
                     "p_value": (control["p_value"] if lane == "shadow" else
                                 (.02 if passes else 1.0)),
@@ -353,6 +353,9 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                     "decision": passes,
                     "required": True, "tested": True,
                     "p_value_kind": "raw_confirmatory",
+                    **({"method": fdr_record.get("method"),
+                        "method_version": fdr_record.get("method_version")}
+                       if lane == "shadow" and fdr_record is not None else {}),
                     "p_value_source": "live_shadow_confirmatory_gate",
                     "independent_confirmatory": lane == "shadow",
                     "disjoint_sessions": lane == "shadow",
@@ -1983,7 +1986,7 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
                 _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20),
                 directory)
             fdr_state = FactoryLedger(database).fdr_state(
-                "shadow-confirmation-v4:equity")
+                "shadow-confirmation-v5:equity")
         gate = result["variants"][0]["gate"]
         for name in ("null_control_available", "null_control_delta_positive",
                      "qualification_net_positive", "qualification_delta_positive"):

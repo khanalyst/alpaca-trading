@@ -168,7 +168,7 @@ class LiveShadowIngestTests(unittest.TestCase):
             source["confirmatory_sessions"]), set())
         self.assertEqual(online["p_value_source"], "live_shadow_confirmatory_gate")
         state = FactoryLedger(self.edge_path).fdr_state(
-            "shadow-confirmation-v4:equity")
+            "shadow-confirmation-v5:equity")
         self.assertEqual(state["tests"], 1)
         self.assertAlmostEqual(state["decisions"][0]["p_value"],
                                online["p_value"])
@@ -221,9 +221,9 @@ class LiveShadowIngestTests(unittest.TestCase):
                          "underpowered_confirmatory_split")
         self.assertFalse(result["candidates"][0]["online_allocation_spent"])
         self.assertEqual(FactoryLedger(self.edge_path).fdr_state(
-            "shadow-confirmation-v4:equity")["tests"], 0)
+            "shadow-confirmation-v5:equity")["tests"], 0)
 
-    def test_v3_lord_state_is_readable_but_v4_starts_a_fresh_sequence(self):
+    def test_v3_lord_state_is_readable_but_v5_starts_a_fresh_sequence(self):
         FactoryLedger(self.edge_path).record_fdr_decision(
             "shadow-confirmation-v3:equity", "legacy-same-tail", .001)
         cid = self.candidate["candidate_id"]
@@ -235,7 +235,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(result["ingested"], 1, result)
         ledger = FactoryLedger(self.edge_path)
         self.assertEqual(ledger.fdr_state("shadow-confirmation-v3:equity")["tests"], 1)
-        self.assertEqual(ledger.fdr_state("shadow-confirmation-v4:equity")["tests"], 1)
+        self.assertEqual(ledger.fdr_state("shadow-confirmation-v5:equity")["tests"], 1)
 
     def test_mismatch_and_incomplete_tails_do_not_write(self):
         cid = self.candidate["candidate_id"]
@@ -264,7 +264,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertIn("session 2024-04-17", row["reason"])
         self.assertEqual(row["boundary"], "2024-02-01")
         self.assertEqual(FactoryLedger(self.edge_path).fdr_state(
-            "shadow-confirmation-v4:equity")["tests"], 0)
+            "shadow-confirmation-v5:equity")["tests"], 0)
 
     def test_retention_gap_is_explicit_and_does_not_advance_boundary(self):
         cid = self.candidate["candidate_id"]
@@ -283,7 +283,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertTrue(row["retention_gap"])
         self.assertEqual(row["boundary"], "2024-02-01")
         self.assertEqual(FactoryLedger(self.edge_path).fdr_state(
-            "shadow-confirmation-v4:equity")["tests"], 0)
+            "shadow-confirmation-v5:equity")["tests"], 0)
 
     def test_repeated_ingestion_is_idempotent(self):
         cid = self.candidate["candidate_id"]
@@ -296,7 +296,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(ingest_shadow(config)["ingested"], 0)
         self.assertEqual(len(self.ledger.runs(cid, lane="shadow")), 1)
 
-    def test_crash_retry_reuses_v4_fdr_decision_when_resolution_changes(self):
+    def test_crash_retry_reuses_v5_fdr_decision_when_resolution_changes(self):
         cid = self.candidate["candidate_id"]
         self._rows(cid, [2.0] * 8)
         self._rows(self.baseline["candidate_id"], [0.0] * 8)
@@ -310,7 +310,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         def record_then_crash(ledger, scope, test_id, p_value, *, alpha=.05):
             result = original_record(ledger, scope, test_id, p_value,
                                      alpha=alpha)
-            if str(scope) == "shadow-confirmation-v4:equity" and not crashed["value"]:
+            if str(scope) == "shadow-confirmation-v5:equity" and not crashed["value"]:
                 crashed["value"] = True
                 raise RuntimeError("simulated crash after FDR commit")
             return result
@@ -326,10 +326,10 @@ class LiveShadowIngestTests(unittest.TestCase):
 
         # The first attempt spent the 20k-resolution allocation but did not
         # append its run.  The retry sees the discovery and therefore resolves
-        # at 30k; the immutable tail key must still reuse the one v4 row.
+        # at 30k; the immutable tail key must still reuse the one v5 row.
         self.assertEqual(result["ingested"], 1, result)
         state = FactoryLedger(self.edge_path).fdr_state(
-            "shadow-confirmation-v4:equity")
+            "shadow-confirmation-v5:equity")
         self.assertEqual(state["tests"], 1)
         self.assertEqual(len(state["decisions"]), 1)
         run = self.ledger.runs(cid, lane="shadow")[0]
@@ -554,7 +554,7 @@ class LiveShadowIngestTests(unittest.TestCase):
             db.execute(
                 "UPDATE factory_fdr SET allocated_alpha=? "
                 "WHERE scope=? AND test_id=(SELECT json_extract(metrics_json, '$.gate.verified_gate.online_fdr.test_id') "
-                "FROM runs WHERE run_id=?)", (0.5, "shadow-confirmation-v4:equity", run_id))
+                "FROM runs WHERE run_id=?)", (0.5, "shadow-confirmation-v5:equity", run_id))
         self.assertFalse(self.ledger.eligibility(cid)["eligible"])
 
     def test_manual_offline_promotion_is_rejected_without_live_marker(self):

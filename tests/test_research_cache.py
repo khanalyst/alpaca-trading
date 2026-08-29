@@ -160,6 +160,55 @@ class ResearchCacheTests(unittest.TestCase):
         self.assertFalse((self.cache.entries / key).exists())
         self.assertEqual(list(self.cache.staging.iterdir()), [])
 
+    def test_rename_domain_probe_succeeds_and_cleans_probe_files(self):
+        tmp_root = self.base / "tmp"
+        tmp_root.mkdir()
+        staging_root = self.cache_root / "staging"
+
+        result = research_cache.probe_rename_domain(tmp_root, staging_root)
+
+        self.assertEqual(result["schema"],
+                         "research-preprocessing-cache-topology.v1")
+        self.assertEqual(result["operation"], "rename_probe")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(list(tmp_root.iterdir()), [])
+        self.assertEqual(list(staging_root.iterdir()), [])
+
+    def test_rename_domain_probe_exdev_is_explicit_and_cleans_probe_files(self):
+        tmp_root = self.base / "tmp"
+        tmp_root.mkdir()
+        staging_root = self.cache_root / "staging"
+
+        def raise_cross_device(*_args, **_kwargs):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        with mock.patch.object(
+                research_cache.os, "replace", side_effect=raise_cross_device):
+            with self.assertRaisesRegex(
+                    research_cache.CacheTopologyError,
+                    r"rename-capable mount \(EXDEV\)"):
+                research_cache.probe_rename_domain(tmp_root, staging_root)
+
+        self.assertEqual(list(tmp_root.iterdir()), [])
+        self.assertEqual(list(staging_root.iterdir()), [])
+
+    def test_cli_topology_probe_emits_structured_result(self):
+        tmp_root = self.base / "tmp"
+        tmp_root.mkdir()
+        staging_root = self.cache_root / "staging"
+        script = Path(research_cache.__file__).resolve()
+
+        result = subprocess.run(
+            [sys.executable, str(script), "topology",
+             "--tmp-root", str(tmp_root),
+             "--staging-root", str(staging_root)],
+            text=True, capture_output=True, check=False)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "ok")
+        self.assertEqual(list(tmp_root.iterdir()), [])
+        self.assertEqual(list(staging_root.iterdir()), [])
+
     def test_valid_entry_is_immutable_and_publish_never_overwrites_it(self):
         artifact = self._artifact("view.jsonl", b"first\n")
         first = self.cache.publish({"view": artifact}, **_identities())

@@ -774,19 +774,22 @@ class EdgeLedgerProofMixin:
         if not isinstance(gate, Mapping) or gate_hash != gate.get("content_hash"):
             return False
         online = gate.get("online_fdr")
+        # Import lazily: factory_ledger depends on the EdgeLedger facade, so
+        # importing it at module load would create a cycle.
+        from .factory_ledger import CONFIRMATORY_SCOPE_VERSION
         if (not isinstance(online, Mapping) or
                 online.get("required", True) is False or
                 online.get("tested", True) is not True or
                 online.get("decision") is not True or
                 online.get("scope") !=
-                    f"shadow-confirmation-v4:{run.get('vehicle')}"):
+                    f"{CONFIRMATORY_SCOPE_VERSION}:{run.get('vehicle')}"):
             return False
         # The envelope's online-FDR fields are claims, not authority.  The
         # ingester must have spent the exact immutable allocation recorded in
         # the co-located factory ledger before this run can authorize.  This
         # closes the former convention-only path where a caller could rewrite
         # ``online_fdr`` and append a marker without consuming LORD state.
-        scope = f"shadow-confirmation-v4:{run.get('vehicle')}"
+        scope = f"{CONFIRMATORY_SCOPE_VERSION}:{run.get('vehicle')}"
         test_id = online.get("test_id")
         confirmatory_test_id = confirmatory.get("test_id") if isinstance(
             confirmatory, Mapping) else None
@@ -809,9 +812,16 @@ class EdgeLedgerProofMixin:
         if len(matching) != 1:
             return False
         test_index, durable_fdr = matching[0]
+        durable_keys = durable_fdr.keys()
+        durable_method = (str(durable_fdr["method"] or "")
+                          if "method" in durable_keys else "")
+        durable_method_version = (str(durable_fdr["method_version"] or "")
+                                  if "method_version" in durable_keys else "")
         if (online.get("tests") != test_index or
                 str(durable_fdr["scope"]) != scope or
                 str(durable_fdr["test_id"]) != test_id or
+                online.get("method") != durable_method or
+                online.get("method_version") != durable_method_version or
                 not _close(online.get("p_value"), durable_fdr["p_value"]) or
                 not _close(online.get("alpha"), durable_fdr["alpha"]) or
                 not _close(online.get("allocated_alpha"),

@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from research.factory_ledger import FactoryLedger
+from research.factory_ledger import CONFIRMATORY_SCOPE_VERSION, FactoryLedger
 from research.gates import gate_dependence_report
 from research.stats import cross_family_dependence_report
 
@@ -13,7 +13,7 @@ class ObservabilityTests(unittest.TestCase):
     def test_fdr_state_reports_locked_budget_and_non_mutating_preview(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
-            scope = "shadow-confirmation-v4:equity"
+            scope = f"{CONFIRMATORY_SCOPE_VERSION}:equity"
             state = ledger.fdr_state(scope)
             self.assertEqual(state["alpha"], .05)
             self.assertEqual(state["tests"], 0)
@@ -28,7 +28,7 @@ class ObservabilityTests(unittest.TestCase):
             self.assertEqual(state["discoveries"], 1)
             self.assertAlmostEqual(state["alpha_spent"], .025)
             self.assertAlmostEqual(state["next_preview"]["allocated_alpha"],
-                                   .025 + .05 / 6)
+                                   .05 / 6)
 
     def test_gate_dependence_groups_shared_statistics_without_redeciding(self):
         report = gate_dependence_report({
