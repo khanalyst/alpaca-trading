@@ -237,11 +237,96 @@ def _summary(values: Sequence[float]) -> tuple[float | None, float | None, float
     return mean(clean), median(clean), sum(value > 0 for value in clean) / len(clean)
 
 
+def _event_index(value: Any) -> int | None:
+    """Return a strict non-negative row index from precomputed metadata."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _precomputed_event(
+        rows: Sequence[Any], item: Any, *, symbol: str, session: str,
+        ) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate one internal first-signal hand-off without re-evaluating it.
+
+    ``_fit_prefixes`` owns signal evaluation and supplies only compact
+    metadata. The row/index checks below make the optional fast path fail
+    closed if a caller passes stale or fabricated metadata; direct callers
+    continue to use :func:`_first_event` when the argument is omitted.
+    """
+    if not isinstance(item, Mapping):
+        return None, "precomputed_event_invalid"
+    item_symbol = _symbol(item)
+    item_session = str(item.get("session", item.get("session_date", "")))[:10]
+    if item_symbol != symbol or item_session != session:
+        return None, "precomputed_event_invalid"
+    signal_index = _event_index(item.get("signal_index"))
+    entry_index = _event_index(item.get("entry_index"))
+    if (signal_index is None or entry_index is None or
+            signal_index >= len(rows) or entry_index >= len(rows) or
+            signal_index < 1 or entry_index <= signal_index):
+        return None, "precomputed_event_invalid"
+
+    signal_ts = _number(item.get("signal_ts"))
+    signal_stamp = _timestamp(rows[signal_index])
+    if signal_ts is None or signal_stamp is None:
+        return None, "precomputed_event_invalid"
+    try:
+        supplied_stamp = datetime.fromtimestamp(signal_ts, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None, "precomputed_event_invalid"
+    if supplied_stamp != signal_stamp:
+        return None, "precomputed_event_invalid"
+
+    direction = str(item.get("direction", "")).strip().lower()
+    if direction not in {"long", "short"}:
+        return None, "precomputed_event_invalid"
+    entry_price = _number(item.get("entry_price"))
+    signal_close = _number(_value(rows[signal_index], "close"))
+    if (entry_price is None or entry_price <= 0 or signal_close is None or
+            signal_close <= 0 or not math.isclose(
+                entry_price, signal_close, rel_tol=0.0, abs_tol=1e-12)):
+        return None, "precomputed_event_invalid"
+
+    # ``entry_timestamp`` is emitted by _fit_prefixes as the decision-time
+    # boundary. Validate it when present, while allowing the compact shape
+    # (which needs only the required index fields) for internal callers.
+    entry_at = None
+    raw_entry_timestamp = item.get("entry_timestamp")
+    if raw_entry_timestamp not in (None, ""):
+        entry_at = _timestamp({"timestamp": raw_entry_timestamp})
+        entry_stamp = _timestamp(rows[entry_index])
+        if entry_at is None or entry_stamp is None or entry_stamp < entry_at:
+            return None, "precomputed_event_invalid"
+    if entry_at is None:
+        entry_at = _timestamp(rows[entry_index])
+
+    # Keep the event shape used by the scanned path. Only signal metadata is
+    # retained; raw bars never cross this diagnostic hand-off.
+    signal = {
+        "direction": direction,
+        "signal_ts": signal_ts,
+        "entry_price": entry_price,
+    }
+    return ({"signal": signal, "signal_index": signal_index,
+             "entry_index": entry_index, "entry_at": entry_at,
+             "entry_price": entry_price}, None)
+
+
 def measure_signal_quality(
         bars: Sequence[Any], spec: Mapping[str, Any], *, policy: Any | None = None,
         horizons: Sequence[int] = DEFAULT_HORIZONS,
-        cost_hurdle_bps: float | None = None) -> dict[str, Any]:
-    """Measure conditional forward returns and a matched random-entry control."""
+        cost_hurdle_bps: float | None = None,
+        precomputed_first_signals: Sequence[Mapping[str, Any]] | None = None,
+        ) -> dict[str, Any]:
+    """Measure conditional forward returns and a matched random-entry control.
+
+    ``precomputed_first_signals`` is an optional internal hand-off from
+    :func:`research.fit_diagnostics._fit_prefixes`. When omitted, the
+    historical prefix scan remains authoritative. When supplied, every
+    event is validated against its sorted symbol/session rows and malformed
+    metadata is rejected rather than silently falling back to a scan.
+    """
     normalized = validate_rule_spec(spec)
     requested = tuple(int(value) for value in horizons)
     if not requested or any(value <= 0 for value in requested) or \
@@ -264,9 +349,50 @@ def measure_signal_quality(
     events: list[tuple[str, str, Sequence[Any], dict[str, Any]]] = []
     event_reasons: Counter[str] = Counter()
     event_time_buckets: Counter[str] = Counter()
+    precomputed_by_cell: dict[tuple[str, str], dict[str, Any]] = {}
+    precomputed_invalid_cells: set[tuple[str, str]] = set()
+    if precomputed_first_signals is not None:
+        if isinstance(precomputed_first_signals, Mapping):
+            # A mapping is not a supported event sequence. Treating each
+            # mapping key as an event could make malformed data look valid.
+            precomputed_items: Sequence[Any] = ()
+            event_reasons["precomputed_event_invalid"] += 1
+        else:
+            try:
+                precomputed_items = tuple(precomputed_first_signals)
+            except TypeError:
+                precomputed_items = ()
+                event_reasons["precomputed_event_invalid"] += 1
+        for item in precomputed_items:
+            if isinstance(item, Mapping):
+                item_symbol = _symbol(item)
+                item_session = str(
+                    item.get("session", item.get("session_date", "")))[:10]
+                cell = (item_symbol, item_session)
+            else:
+                cell = ("", "")
+            rows = grouped.get(cell)
+            if not rows:
+                event_reasons["precomputed_event_invalid"] += 1
+                continue
+            event, reason = _precomputed_event(
+                rows, item, symbol=cell[0], session=cell[1])
+            if event is None or cell in precomputed_by_cell:
+                precomputed_invalid_cells.add(cell)
+                if cell in precomputed_by_cell:
+                    precomputed_by_cell.pop(cell, None)
+                continue
+            precomputed_by_cell[cell] = event
+
     for (symbol, session), rows in sorted(grouped.items()):
-        event, reason = _first_event(
-            rows, normalized, allow_backfill=allow_backfill)
+        if precomputed_first_signals is None:
+            event, reason = _first_event(
+                rows, normalized, allow_backfill=allow_backfill)
+        elif (symbol, session) in precomputed_invalid_cells:
+            event, reason = None, "precomputed_event_invalid"
+        else:
+            event = precomputed_by_cell.get((symbol, session))
+            reason = None if event is not None else "no_actionable_signal"
         if event is None:
             event_reasons[str(reason or "unknown")] += 1
             continue

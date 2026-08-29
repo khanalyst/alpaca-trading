@@ -1,12 +1,14 @@
 """Conditional forward-return diagnostics stay causal and non-authorizing."""
 
 import unittest
+from unittest.mock import patch
 
 from agent.contracts.rule import (
     evaluate_rule_signal, evaluate_rule_signal_trace,
 )
 from research.costs import diagnostic_backfill_policy
 from research.edge_lab import _read_discovery_rows
+from research.fit_diagnostics import _fit_prefixes
 from research.signal_quality import _forward_return, measure_signal_quality
 from research.strategy_factory import _sanitize_fit_selection
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
@@ -122,6 +124,48 @@ class ConditionalForwardReturnTests(unittest.TestCase):
         self.assertEqual(retained["event_count"], quality["event_count"])
         self.assertIn("5m", retained["horizon_metrics"])
         self.assertNotIn("raw_rows", retained)
+
+    def test_fit_prefix_events_reuse_exactly_without_rescanning(self):
+        prefix = _fit_prefixes(self.bars, ROOT_SPEC, policy=self.policy)
+        scanned = measure_signal_quality(
+            self.bars, ROOT_SPEC, policy=self.policy, cost_hurdle_bps=17.0)
+        with patch("research.signal_quality._first_event",
+                   side_effect=AssertionError("unexpected prefix scan")):
+            reused = measure_signal_quality(
+                self.bars, ROOT_SPEC, policy=self.policy,
+                cost_hurdle_bps=17.0,
+                precomputed_first_signals=prefix["first_signals"])
+        self.assertEqual(scanned, reused)
+        self.assertEqual(scanned["event_digest"], reused["event_digest"])
+
+    def test_precomputed_no_signal_sessions_keep_rejection_counts(self):
+        no_signal_spec = dict(ROOT_SPEC, threshold_bps=500.0)
+        prefix = _fit_prefixes(
+            self.bars, no_signal_spec, policy=self.policy)
+        scanned = measure_signal_quality(
+            self.bars, no_signal_spec, policy=self.policy)
+        with patch("research.signal_quality._first_event",
+                   side_effect=AssertionError("unexpected prefix scan")):
+            reused = measure_signal_quality(
+                self.bars, no_signal_spec, policy=self.policy,
+                precomputed_first_signals=prefix["first_signals"])
+        self.assertEqual(scanned, reused)
+        self.assertEqual(scanned["event_rejection_counts"],
+                         {"no_actionable_signal": 16})
+
+    def test_malformed_precomputed_event_is_rejected_closed(self):
+        prefix = _fit_prefixes(self.bars, ROOT_SPEC, policy=self.policy)
+        malformed = dict(prefix["first_signals"][0])
+        malformed["entry_index"] = len(self.bars) + 1
+        result = measure_signal_quality(
+            self.bars, ROOT_SPEC, policy=self.policy,
+            precomputed_first_signals=[malformed])
+        self.assertEqual(result["event_count"], 0)
+        self.assertEqual(
+            result["event_rejection_counts"],
+            {"precomputed_event_invalid": 1,
+             "no_actionable_signal": len(prefix["first_signals"]) - 1},
+        )
 
 
 if __name__ == "__main__":

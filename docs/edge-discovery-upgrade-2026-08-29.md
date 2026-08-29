@@ -96,6 +96,23 @@ Per-variant diagnostics now distinguish:
   to model-assisted ordering. Raw market rows, held-out evidence, proof fields,
   and long-horizon prompt bulk remain excluded.
 
+### 6. Full-corpus runtime reuse
+
+- The predicate funnel's already-validated first signal for each
+  symbol/session is reused by the conditional-forward-return diagnostic.
+  Symbol, session, row indices, timestamp, direction, entry price, and entry
+  boundary are checked against the sorted bar slice before reuse; malformed or
+  duplicate hand-offs fail closed. Direct signal-quality callers retain the
+  original independent scan.
+- When the exact selected root variant is one of a strategy's four variants,
+  its completed diagnostic replay and fit summary are reused under the
+  variant's normal account identifier. The cache key is the exact executable
+  variant ID; every non-root variant still receives an independent replay and
+  fit measurement.
+
+These two reductions remove duplicate work only. They do not alter the corpus,
+rule evaluation, proposal ordering, costs, metrics, or authorization state.
+
 ## Controls deliberately unchanged
 
 - IEX remains the authorizing equity feed.

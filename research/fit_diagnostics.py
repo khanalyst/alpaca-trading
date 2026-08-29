@@ -638,6 +638,14 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                         else None)
             if metadata is not None:
                 first = {**metadata, "session_date": day, "symbol": symbol,
+                         # These indices are an internal hand-off to the
+                         # signal-quality diagnostic. They refer to this
+                         # sorted symbol/session slice and avoid evaluating
+                         # every prefix a second time. No bar rows are
+                         # retained in the metadata contract.
+                         "session": day,
+                         "signal_index": index,
+                         "entry_index": entry_index,
                          "decision_timestamp": decision_timestamp.isoformat(),
                          "entry_timestamp": entry_at.isoformat(),
                          # Fit probes carry no executable quote index.  Keep
@@ -1183,7 +1191,8 @@ def measure_fit_diagnostics(
     signal_quality = measure_signal_quality(
         bar_rows, normalized, policy=policy,
         cost_hurdle_bps=_expected_cost_hurdle_bps(
-            costs, vehicle=resolved_vehicle))
+            costs, vehicle=resolved_vehicle),
+        precomputed_first_signals=signals)
     expected_cost = {
         "bar_reference_round_trip_bps": _expected_cost_hurdle_bps(
             costs, vehicle=resolved_vehicle, executable_quotes=False),

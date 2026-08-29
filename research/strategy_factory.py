@@ -2752,6 +2752,7 @@ def _run_diagnostic_factory(
             "authorizing": False,
             "diagnostic_only": True,
         }
+        root_variant_id = rule_variant_id(hypothesis.rule_spec)
         chosen, tuning = _tuned_variants(
             asdict(hypothesis), diagnosis,
             count=int(variants_per_strategy), vehicle=vehicle,
@@ -2776,18 +2777,31 @@ def _run_diagnostic_factory(
             })
         variants: list[dict[str, Any]] = []
         for selected in chosen:
-            account = simulate_account(
-                bars, snapshots, selected.rule_spec, vehicle=vehicle,
-                account_id=(f"diagnostic:{hypothesis.hypothesis_id}:"
-                            f"{rule_variant_id(selected.rule_spec)}"),
-                starting_cash=float(starting_cash), costs=model, quotes=quotes,
-                policy=policy)
-            fit = measure_fit_diagnostics(
-                bars, selected.rule_spec, account_rows=account["rows"],
-                costs=model, vehicle=vehicle, risk_config=risk_config,
-                policy=policy)
+            variant_id = rule_variant_id(selected.rule_spec)
+            account_id = (f"diagnostic:{hypothesis.hypothesis_id}:"
+                          f"{variant_id}")
+            if variant_id == root_variant_id:
+                # The selected root was already replayed and measured above.
+                # Keep the root account's rows/metrics exactly intact, while
+                # copying its envelope so the variant retains its established
+                # account-id contract.  Nothing in this diagnostic path
+                # mutates nested account data after construction.
+                account = {**root_account, "account_id": account_id}
+                fit = root_fit
+            else:
+                # Every non-root variant remains an independent replay and
+                # fit measurement; exact variant IDs are the only reuse key.
+                account = simulate_account(
+                    bars, snapshots, selected.rule_spec, vehicle=vehicle,
+                    account_id=account_id,
+                    starting_cash=float(starting_cash), costs=model, quotes=quotes,
+                    policy=policy)
+                fit = measure_fit_diagnostics(
+                    bars, selected.rule_spec, account_rows=account["rows"],
+                    costs=model, vehicle=vehicle, risk_config=risk_config,
+                    policy=policy)
             variants.append({
-                "variant_id": rule_variant_id(selected.rule_spec),
+                "variant_id": variant_id,
                 "rule_spec": selected.rule_spec,
                 "selection_source": selected.source,
                 "selection_reason": selected.reason,
@@ -2802,7 +2816,7 @@ def _run_diagnostic_factory(
             })
         reports.append({
             "hypothesis_id": hypothesis.hypothesis_id,
-            "variant_id": rule_variant_id(hypothesis.rule_spec),
+            "variant_id": root_variant_id,
             "vehicle": vehicle,
             "family": hypothesis.family,
             "hypothesis_source": source,
