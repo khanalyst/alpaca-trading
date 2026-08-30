@@ -354,6 +354,96 @@ class DeployTests(unittest.TestCase):
                 input=body, text=True, capture_output=True, check=False)
         return result
 
+    def _run_update_compose(self, *, commit, dirty="", declared=None):
+        """Run the VM helper against tiny fake git/docker/systemd commands."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            fake_bin = root / "bin"
+            app.mkdir()
+            fake_bin.mkdir()
+            (app / "compose.yaml").write_text("services: {}\n",
+                                               encoding="utf-8")
+            secret = root / "agent.env"
+            secret.write_text("PAPER=true\n", encoding="utf-8")
+            docker_log = root / "docker.log"
+            (fake_bin / "uname").write_text(
+                "#!/bin/sh\nprintf '%s\\n' Linux\n", encoding="utf-8")
+            (fake_bin / "systemctl").write_text(
+                "#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (fake_bin / "git").write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = rev-parse ]; then\n"
+                "  printf '%s\\n' \"$FAKE_GIT_COMMIT\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ \"$1\" = status ]; then\n"
+                "  if [ -n \"$FAKE_GIT_DIRTY\" ]; then\n"
+                "    printf '%s\\n' \"$FAKE_GIT_DIRTY\"\n"
+                "  fi\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n", encoding="utf-8")
+            (fake_bin / "docker").write_text(
+                "#!/bin/sh\n"
+                "printf 'commit=%s args=%s\\n' \"$ALPACA_DEPLOYMENT_COMMIT\" \"$*\" >> \"$DOCKER_LOG\"\n"
+                "exit 0\n", encoding="utf-8")
+            for command in fake_bin.iterdir():
+                command.chmod(0o755)
+            environment = dict(os.environ)
+            environment.update({
+                "APP_DIR": str(app),
+                "ALPACA_AGENT_SECRET_FILE": str(secret),
+                "DOCKER_LOG": str(docker_log),
+                "FAKE_GIT_COMMIT": commit,
+                "FAKE_GIT_DIRTY": dirty,
+                "PATH": str(fake_bin) + os.pathsep + environment.get("PATH", ""),
+            })
+            environment.pop("ALPACA_EXTERNAL_BACKUP_PATH", None)
+            if declared is None:
+                environment.pop("ALPACA_DEPLOYMENT_COMMIT", None)
+            else:
+                environment["ALPACA_DEPLOYMENT_COMMIT"] = declared
+            script = (Path(__file__).resolve().parents[1] /
+                      "deploy/update-compose.sh")
+            result = subprocess.run(
+                ["bash", str(script)], env=environment,
+                capture_output=True, text=True, check=False)
+            return result, docker_log.read_text(encoding="utf-8") \
+                if docker_log.exists() else ""
+
+    def test_compose_update_exports_clean_full_head_before_mutations(self):
+        commit = "a" * 40
+        result, log = self._run_update_compose(commit=commit)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = log.splitlines()
+        self.assertGreaterEqual(len(lines), 7)
+        self.assertIn("args=compose version", lines[0])
+        for operation in ("config --quiet", "build trader", "run --rm",
+                          "up -d", "exec -T", "ps"):
+            with self.subTest(operation=operation):
+                line = next(item for item in lines if operation in item)
+                self.assertIn(f"commit={commit}", line)
+
+    def test_compose_update_rejects_declared_commit_mismatch_before_compose(self):
+        result, log = self._run_update_compose(
+            commit="a" * 40, declared="b" * 40)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("disagrees with checked-out Git HEAD", result.stderr)
+        self.assertEqual(log, "")
+        self.assertNotIn("config --quiet", log)
+        self.assertNotIn("build trader", log)
+
+    def test_compose_update_rejects_dirty_checkout_before_compose(self):
+        result, log = self._run_update_compose(
+            commit="a" * 40, dirty=" M deploy/update-compose.sh")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("checkout", result.stderr)
+        self.assertIn("dirty", result.stderr)
+        self.assertEqual(log, "")
+        self.assertNotIn("config --quiet", log)
+        self.assertNotIn("build trader", log)
+
     def test_calibration_bootstrap_unknown_is_opt_in_and_fail_closed(self):
         empty = {"authorization_verdict": "insufficient_data",
                  "authorization_exit_code": 2, "journal_fills": 0,
