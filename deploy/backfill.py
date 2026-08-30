@@ -42,6 +42,7 @@ import argparse
 from datetime import date, datetime, time, timedelta, timezone
 import os
 from pathlib import Path
+import re
 import sys
 from zoneinfo import ZoneInfo
 
@@ -60,6 +61,7 @@ from deploy.recorder import (  # noqa: E402
     _partition_path,
     _partition_source_path,
     _prepare_index,
+    _load_index,
     _save_partition_calendar,
     _save_index,
     _save_partition_source,
@@ -117,6 +119,99 @@ def completed_sessions(provider, start: date, end: date) -> list[date]:
     every downstream statistic is computed from.
     """
     return list(_calendar_sessions(provider, start, end))
+
+
+_PARTITION_NAME = re.compile(r"market-(\d{4}-\d{2}-\d{2})\.csv\Z")
+
+
+def _partition_dates(output: Path) -> list[date]:
+    """Return every session date encoded by an existing partition filename.
+
+    Calendar repair must not inspect the (potentially multi-gigabyte) CSV
+    corpus.  Partition names are the only bounded source of session dates, so
+    reject anything that is not exactly ``market-YYYY-MM-DD.csv`` and require
+    a canonical ISO date.
+    """
+    paths = corpus_partitions(output)
+    if not paths:
+        raise BackfillError("calendar repair requires at least one session partition")
+    days: list[date] = []
+    for path in paths:
+        match = _PARTITION_NAME.fullmatch(path.name)
+        if match is None:
+            raise BackfillError(
+                f"invalid recorder session partition name: {path.name}")
+        try:
+            day = date.fromisoformat(match.group(1))
+        except ValueError as exc:
+            raise BackfillError(
+                f"invalid recorder session partition date: {path.name}") from exc
+        if day.isoformat() != match.group(1):
+            raise BackfillError(
+                f"invalid recorder session partition date: {path.name}")
+        days.append(day)
+    return days
+
+
+def _calendar_entry(session) -> dict[str, str]:
+    """Serialize one normalized Alpaca session for recorder metadata."""
+    return {
+        "open": session.open.astimezone(timezone.utc).isoformat(),
+        "close": session.close.astimezone(timezone.utc).isoformat(),
+        "source": "alpaca_calendar",
+    }
+
+
+def repair_calendar(provider, output: Path) -> dict:
+    """Repair exact calendar metadata without scanning or relabelling a corpus.
+
+    This is intentionally separate from :func:`backfill`: it only reads the
+    already validated recorder index and bounded partition filenames, obtains
+    the authoritative Alpaca calendar for their date window, then writes
+    calendar markers and the aggregate cache.  Every date is validated before
+    any marker is touched, so a non-session partition fails closed atomically.
+    """
+    with corpus_write_lock(output):
+        # ``_prepare_index`` may rebuild a large corpus.  A repair is only
+        # safe when the existing bounded index is already validated.
+        index = _load_index(output)
+        if index is None:
+            raise BackfillError(
+                "calendar repair requires an existing validated recorder index")
+        days = _partition_dates(output)
+        start, end = min(days), max(days)
+        calendar = _calendar_sessions(provider, start, end)
+        missing = sorted(set(days) - set(calendar))
+        if missing:
+            rendered = ", ".join(day.isoformat() for day in missing)
+            raise BackfillError(
+                f"partition dates are not authoritative trading sessions: {rendered}")
+
+        existing_markers = sum(
+            _partition_calendar_path(output, day).is_file() for day in days)
+        existing_calendar = dict(index.get("session_calendar") or {})
+        merged_calendar = dict(existing_calendar)
+        for day in days:
+            merged_calendar[day.isoformat()] = _calendar_entry(calendar[day])
+        index["session_calendar"] = merged_calendar
+        # Commit the aggregate first.  If marker persistence is interrupted,
+        # the validated index still contains the complete exact calendar while
+        # the already-written marker subset remains consistent with it.
+        _save_index(output, index)
+        for day in days:
+            _save_partition_calendar(output, day, calendar[day])
+
+    return {
+        "schema": "recorder-calendar-repair.v1",
+        "status": "ok",
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "partitions": len(days),
+        "calendar_sessions": len(calendar),
+        "markers_written": len(days),
+        "markers_repaired": len(days) - existing_markers,
+        "calendar_entries_added": len(
+            set(day.isoformat() for day in days) - set(existing_calendar)),
+    }
 
 
 def last_completed_session(now: datetime) -> date:
@@ -333,6 +428,9 @@ def parser() -> argparse.ArgumentParser:
         description="seed the research corpus from Alpaca historical bars")
     p.add_argument("--out", default="runtime/research/recorded")
     p.add_argument("--config", default="config.yaml")
+    p.add_argument("--repair-calendar", action="store_true",
+                   help="repair exact Alpaca calendar metadata for existing "
+                   "session partitions without reading or fetching market data")
     p.add_argument("--days", type=int, default=DEFAULT_BACKFILL_DAYS,
                    help=f"calendar days back from the last completed session "
                         f"(max {MAX_BACKFILL_DAYS})")
@@ -358,17 +456,20 @@ def main(argv=None) -> int:
     from agent.alpaca_provider import AlpacaProvider
 
     cfg = load_cfg(args.config)
-    symbols = list(cfg.get("universe", {}).get("symbols") or [])
-    if not symbols:
-        raise SystemExit("config.universe.symbols is empty")
     provider = AlpacaProvider(cfg)
     output = Path(args.out) / "market.csv"
     try:
-        result = backfill(
-            provider, symbols, output, days=args.days,
-            include_quotes=bool(args.quotes), overwrite=bool(args.overwrite),
-            progress=lambda day, count: print(
-                f"backfilled {count} rows for {day.isoformat()}", flush=True))
+        if args.repair_calendar:
+            result = repair_calendar(provider, output)
+        else:
+            symbols = list(cfg.get("universe", {}).get("symbols") or [])
+            if not symbols:
+                raise SystemExit("config.universe.symbols is empty")
+            result = backfill(
+                provider, symbols, output, days=args.days,
+                include_quotes=bool(args.quotes), overwrite=bool(args.overwrite),
+                progress=lambda day, count: print(
+                    f"backfilled {count} rows for {day.isoformat()}", flush=True))
     except BackfillError as exc:
         print(json.dumps({"schema": "recorder-backfill.v1", "status": "failed",
                           "error": str(exc)}, sort_keys=True), file=sys.stderr)

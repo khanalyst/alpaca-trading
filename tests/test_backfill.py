@@ -20,10 +20,12 @@ from zoneinfo import ZoneInfo
 
 from deploy.backfill import (
     BackfillError, DEFAULT_BACKFILL_DAYS, MAX_BACKFILL_DAYS, backfill,
-    completed_sessions, last_completed_session,
+    _save_partition_calendar, completed_sessions, last_completed_session,
+    repair_calendar,
 )
 from deploy.recorder import (
-    _load_index, _partition_calendar_path, _partition_path, _scan_corpus,
+    _load_index, _partition_calendar_path, _partition_path, _save_index,
+    _scan_corpus,
     corpus_partitions,
     iter_corpus_rows,
 )
@@ -456,6 +458,136 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(
                 {path.name: path.read_bytes()
                  for path in corpus_partitions(output)}, before)
+
+
+class CalendarRepairTests(unittest.TestCase):
+    def test_repair_restores_missing_metadata_without_market_scan(self):
+        provider = FakeProvider(bars_per_session=1)
+        with tempfile.TemporaryDirectory() as directory:
+            output = _corpus(directory)
+            backfill(provider, ["SPY"], output, days=3,
+                     now=FRIDAY_EVENING)
+            target = date(2026, 3, 19)
+            _partition_calendar_path(output, target).unlink()
+            index_path = output.parent / ".recorder-index.json"
+            index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+            index_payload["session_calendar"].pop(target.isoformat())
+            index_path.write_text(json.dumps(index_payload, sort_keys=True),
+                                  encoding="utf-8")
+            bars_before = len(provider.bar_windows)
+            quotes_before = len(provider.quote_windows)
+
+            with patch("deploy.backfill._prepare_index",
+                       side_effect=AssertionError("repair must not prepare")), \
+                    patch("deploy.backfill._scan_corpus",
+                          side_effect=AssertionError("repair must not scan")), \
+                    patch("deploy.backfill.audit_corpus",
+                          side_effect=AssertionError("repair must not audit")), \
+                    patch.object(provider, "bars",
+                                 side_effect=AssertionError("unexpected bars")), \
+                    patch.object(provider, "quotes",
+                                 side_effect=AssertionError("unexpected quotes")):
+                result = repair_calendar(provider, output)
+
+            self.assertEqual(result["window"], {
+                "start": "2026-03-17", "end": "2026-03-19"})
+            self.assertEqual(result["partitions"], 3)
+            self.assertEqual(result["markers_repaired"], 1)
+            self.assertEqual(result["calendar_entries_added"], 1)
+            self.assertEqual(len(provider.bar_windows), bars_before)
+            self.assertEqual(len(provider.quote_windows), quotes_before)
+            marker = json.loads(_partition_calendar_path(
+                output, target).read_text(encoding="utf-8"))
+            self.assertEqual(marker["source"], "alpaca_calendar")
+            self.assertEqual(_load_index(output)["session_calendar"][
+                target.isoformat()], {
+                    "open": "2026-03-19T13:30:00+00:00",
+                    "close": "2026-03-19T20:00:00+00:00",
+                    "source": "alpaca_calendar",
+                })
+
+            repeated = repair_calendar(provider, output)
+            self.assertEqual(repeated["markers_repaired"], 0)
+            self.assertEqual(repeated["calendar_entries_added"], 0)
+            self.assertEqual(len(provider.bar_windows), bars_before)
+            self.assertEqual(len(provider.quote_windows), quotes_before)
+
+    def test_non_calendar_partition_fails_before_any_metadata_mutation(self):
+        provider = FakeProvider(bars_per_session=1,
+                                holidays=("2026-03-20",))
+        with tempfile.TemporaryDirectory() as directory:
+            output = _corpus(directory)
+            backfill(provider, ["SPY"], output, days=3,
+                     now=FRIDAY_EVENING)
+            good = _partition_path(output, date(2026, 3, 19))
+            bad = _partition_path(output, date(2026, 3, 20))
+            index = _load_index(output)
+            bad.write_bytes(good.read_bytes())
+            _save_index(output, index)
+            index_path = output.parent / ".recorder-index.json"
+            before_index = index_path.read_bytes()
+            before_markers = {
+                path.name: path.read_bytes()
+                for path in output.parent.joinpath("sessions").glob(
+                    "*.calendar.json")
+            }
+
+            with patch("deploy.backfill._prepare_index",
+                       side_effect=AssertionError("repair must not prepare")), \
+                    patch("deploy.backfill._scan_corpus",
+                          side_effect=AssertionError("repair must not scan")), \
+                    patch("deploy.backfill.audit_corpus",
+                          side_effect=AssertionError("repair must not audit")):
+                with self.assertRaisesRegex(
+                        BackfillError, "not authoritative trading sessions"):
+                    repair_calendar(provider, output)
+
+            self.assertEqual(index_path.read_bytes(), before_index)
+            self.assertEqual({
+                path.name: path.read_bytes()
+                for path in output.parent.joinpath("sessions").glob(
+                    "*.calendar.json")}, before_markers)
+            self.assertFalse(_partition_calendar_path(output,
+                                                      date(2026, 3, 20)).exists())
+
+    def test_marker_write_crash_leaves_the_aggregate_index_valid(self):
+        provider = FakeProvider(bars_per_session=1)
+        with tempfile.TemporaryDirectory() as directory:
+            output = _corpus(directory)
+            backfill(provider, ["SPY"], output, days=3,
+                     now=FRIDAY_EVENING)
+            target = date(2026, 3, 19)
+            _partition_calendar_path(output, target).unlink()
+            index_path = output.parent / ".recorder-index.json"
+            index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+            index_payload["session_calendar"].pop(target.isoformat())
+            index_path.write_text(json.dumps(index_payload, sort_keys=True),
+                                  encoding="utf-8")
+            original = _save_partition_calendar
+            calls = 0
+
+            def flaky_marker(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("simulated marker crash")
+                return original(*args, **kwargs)
+
+            with patch("deploy.backfill._scan_corpus",
+                       side_effect=AssertionError("repair must not scan")), \
+                    patch("deploy.backfill.audit_corpus",
+                          side_effect=AssertionError("repair must not audit")), \
+                    patch("deploy.backfill._save_partition_calendar",
+                          side_effect=flaky_marker):
+                with self.assertRaisesRegex(RuntimeError, "marker crash"):
+                    repair_calendar(provider, output)
+
+            recovered = _load_index(output)
+            self.assertIsNotNone(recovered)
+            self.assertEqual(
+                set(recovered["session_calendar"]),
+                {"2026-03-17", "2026-03-18", "2026-03-19"},
+            )
 
 
 if __name__ == "__main__":
