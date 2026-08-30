@@ -190,6 +190,8 @@ class ResearchProgressTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             result = health.research(path, 60, now=100)
         self.assertTrue(result["ok"])
+        self.assertEqual(result["research_status"], "degraded")
+        self.assertEqual(result["research_readiness"]["state"], "unknown")
         self.assertEqual(result["research_progress"], payload["research_progress"])
 
     def test_health_drops_malformed_nested_progress(self):

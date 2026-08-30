@@ -66,10 +66,12 @@ from .stats import benjamini_hochberg, stable_seed
 from .fit_diagnostics import (bar_coverage_telemetry,
                                collapse_behavior_aliases,
                                measure_fit_diagnostics)
+from .signal_quality import measure_signal_quality
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
-    _session, _simulate_trade, _thesis, _visible, diagnose, discovery_hypothesis,
+    _session, _simulate_trade, _target_hold_geometry_pair, _thesis, _visible,
+    diagnose, discovery_hypothesis,
     coordinate_mutation_pool, initial_hypotheses, interaction_mutation_pool,
     mutate_from_diagnosis, mutate_with_reasons, mutation_reason,
     replacement_hypothesis, simulate_account, spec_delta, template_hypothesis,
@@ -158,7 +160,7 @@ _FIT_DIAGNOSTIC_KEYS = frozenset({
     "risk", "exits", "exit_grammar", "mde_power", "behavior_fingerprint",
     "30bps_floor_binding", "planned_effective", "cost_to_risk_stressed",
     "execution_rejections", "historical_backfill", "predicate_funnel",
-    "signal_quality", "expected_cost",
+    "signal_quality", "expected_cost", "target_hold_reachability",
 })
 _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "eligible", "total", "rate", "needed_prefix_bars", "signals",
@@ -187,6 +189,18 @@ _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "configured_budget", "planned_risk", "planned_to_budget",
     "bar_reference_round_trip_bps", "executable_quote_round_trip_bps",
     "stress_scenario_bps", "expected_cost_independent_of_stress",
+    "target_r", "max_hold_bars", "target_ladder", "hold_ladder",
+    "matrix", "recommendation", "reach_rate", "reached", "unreached",
+    "adequate", "genuine_mismatch",
+    "unreachable_count", "unreachable_rate", "expiry_count", "unavailable",
+    "min_usable", "status", "censored", "usable",
+})
+_FIT_TARGET_HOLD_KEYS = frozenset({
+    "schema", "scope", "diagnostic_only", "authorizing", "configured",
+    "total", "usable", "censored", "unavailable", "counts", "min_usable",
+    "adequate", "expiry_count", "unreachable_count", "unreachable_rate",
+    "genuine_mismatch", "status", "target_ladder", "hold_ladder", "matrix",
+    "recommendation",
 })
 _FIT_SELECTION_FUNNEL_KEYS = frozenset({
     "schema", "scope", "stages", "terminal_stage_counts",
@@ -326,6 +340,8 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
         allowed = _FIT_EXECUTION_GEOMETRY_KEYS
     elif context == "execution_geometry_basis":
         allowed = _FIT_EXECUTION_GEOMETRY_BASIS_KEYS
+    elif context == "target_hold_reachability":
+        allowed = _FIT_TARGET_HOLD_KEYS
     elif context == "lesson":
         allowed = _FIT_SELECTION_LESSON_KEYS
     elif context == "shared_learning":
@@ -415,6 +431,11 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
                 child_context = "live_trials"
             elif key == "execution_geometry":
                 child_context = "execution_geometry"
+            elif key == "target_hold_reachability":
+                child_context = "target_hold_reachability"
+            elif context == "target_hold_reachability" and key in {
+                    "configured", "counts", "recommendation", "matrix"}:
+                child_context = "aggregate"
             elif (key == "stressed_cost_basis" and
                   context == "execution_geometry"):
                 child_context = "execution_geometry_basis"
@@ -1859,7 +1880,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
     return seeded_slots, revived
 
 
-def _task_corpus(payload: Mapping[str, Any]) -> tuple[list, list, list]:
+def _task_corpus(payload: Mapping[str, Any], *,
+                 include_quotes: bool = True) -> tuple[list, list, list]:
     """Resolve one task's books, re-reading the corpus where it has a path.
 
     A recorded corpus is re-read by the worker that needs it instead of being
@@ -1871,7 +1893,7 @@ def _task_corpus(payload: Mapping[str, Any]) -> tuple[list, list, list]:
     corpus = payload.get("corpus")
     if corpus is None:
         return (list(payload["bars"]), list(payload["snapshots"]),
-                list(payload["quotes"]))
+                list(payload["quotes"]) if include_quotes else [])
     options = {
         "after": corpus["after"], "until": corpus["until"],
         "exclude": corpus["exclude"],
@@ -1880,6 +1902,7 @@ def _task_corpus(payload: Mapping[str, Any]) -> tuple[list, list, list]:
     }
     if corpus.get("projection_digest") is not None:
         options["expected_digest"] = corpus["projection_digest"]
+    options["include_quotes"] = bool(include_quotes)
     if corpus.get("quote_descriptor") is None:
         return corpus_slice(corpus["source"], **options)
     return corpus_slice(corpus["source"],
@@ -1892,6 +1915,344 @@ def _close_task_quotes(quotes: Any) -> None:
     close = getattr(quotes, "close", None)
     if callable(close) and isinstance(quotes, SQLiteQuoteIndex):
         close()
+
+
+def _fit_partition(bars: Sequence[Any]) -> tuple[list[Any], list[str], int]:
+    """Return the deterministic fit prefix used by every fit-only worker.
+
+    The development window is already stripped of its sealed tail by the
+    orchestrator.  This second, chronological 70% cut is the historical fit
+    partition used by diagnosis and fit diagnostics; keeping it in one helper
+    prevents a pre-replay screen from accidentally observing a different
+    prefix.  The returned session list is also useful for completeness checks
+    without leaking market rows into durable screen metadata.
+    """
+    sessions = sorted({_session(bar) for bar in bars if _session(bar)})
+    cut = (max(1, min(len(sessions) - 1, int(len(sessions) * .7)))
+           if len(sessions) > 1 else len(sessions))
+    fit_sessions = sessions[:cut]
+    fit_set = set(fit_sessions)
+    return ([bar for bar in bars if _session(bar) in fit_set],
+            fit_sessions, len(sessions))
+
+
+def _screen_bar_cells(bars: Sequence[Any]) -> int:
+    """Count symbol/session cells represented by a fit partition."""
+    cells: set[tuple[str, str]] = set()
+    for bar in bars:
+        if isinstance(bar, Mapping):
+            symbol = bar.get("symbol")
+        else:
+            symbol = getattr(bar, "symbol", None)
+        session = _session(bar)
+        if symbol and session:
+            cells.add((str(symbol), str(session)))
+    return len(cells)
+
+
+def _screen_primary_horizon(spec: Mapping[str, Any], quality: Mapping[str, Any]) -> int | None:
+    """Choose the deterministic quality horizon nearest the configured hold."""
+    metrics = quality.get("horizon_metrics")
+    if not isinstance(metrics, Mapping):
+        return None
+    horizons: list[int] = []
+    for key in metrics:
+        text = str(key)
+        if not text.endswith("m"):
+            continue
+        try:
+            value = int(text[:-1])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if value > 0:
+            horizons.append(value)
+    if not horizons:
+        return None
+    try:
+        hold = int(spec.get("max_hold_bars"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if hold <= 0:
+        return None
+    # Minimize distance; ties choose the shorter horizon so a hold cap is
+    # never silently rounded beyond the observed finite quality ladder.
+    return min(sorted(set(horizons)), key=lambda value: (abs(value - hold), value))
+
+
+def _signal_quality_screen_record(
+        quality: Any, *, variant_id: str, fit_cells: int,
+        primary_horizon: int | None = None) -> dict[str, Any]:
+    """Project one signal-quality result to a deterministic screen record.
+
+    Only a complete all-cell ``no_actionable_signal`` or adequately powered
+    nonpositive-control outcome can suppress replay.  Everything else is
+    deliberately fail-open: malformed, partial, underpowered, and unknown
+    values remain scheduled for the normal worker.
+    The digest covers the complete API result but the durable record carries
+    only status/reason/counts, keeping this hand-off non-authorizing and
+    compact.
+    """
+    record: dict[str, Any] = {
+        "schema": "signal-quality-screen.v1",
+        "scope": "fit_only",
+        "authorizing": False,
+        "diagnostic_only": True,
+        "variant_id": str(variant_id),
+        "status": "unknown",
+        "reason": "malformed_result",
+        "event_count": None,
+        "fit_cells": int(fit_cells),
+        "digest": None,
+    }
+    if not isinstance(quality, Mapping):
+        return record
+    # The API markers are part of the contract.  A result that omits one or
+    # changes scope is not allowed to make an execution decision.
+    if (quality.get("scope") != "fit_only" or
+            quality.get("authorizing") is not False or
+            quality.get("diagnostic_only") is not True or
+            str(quality.get("variant_id") or "") != str(variant_id)):
+        return record
+    try:
+        raw_event_count = quality.get("event_count")
+        if isinstance(raw_event_count, bool):
+            return record
+        event_count = int(raw_event_count)
+    except (TypeError, ValueError, OverflowError):
+        return record
+    if event_count < 0 or float(event_count) != float(raw_event_count):
+        return record
+    rejection_counts = quality.get("event_rejection_counts")
+    if not isinstance(rejection_counts, Mapping):
+        return record
+    normalized_rejections: dict[str, int] = {}
+    for raw_key, raw_count in rejection_counts.items():
+        try:
+            if isinstance(raw_count, bool):
+                return record
+            count = int(raw_count)
+        except (TypeError, ValueError, OverflowError):
+            return record
+        if count < 0 or float(count) != float(raw_count):
+            return record
+        normalized_rejections[str(raw_key)] = count
+    total_observations = event_count + sum(normalized_rejections.values())
+    if fit_cells <= 0 or total_observations != int(fit_cells):
+        # Empty/short fit data is underpowered rather than evidence of no
+        # signal.  Keep it fail-open even when event_count happens to be zero.
+        record.update({"event_count": event_count,
+                       "status": "underpowered",
+                       "reason": "fit_partition_incomplete"})
+        return record
+    digest = content_hash(quality)
+    record.update({
+        "event_count": event_count,
+        "event_rejection_counts": dict(sorted(normalized_rejections.items())),
+        "digest": digest,
+    })
+    market_context = quality.get("market_context")
+    if market_context is not None:
+        # Cross-sectional quality carries an explicit context status.  Only a
+        # fully usable context may support a fit-only skip; partial, unknown,
+        # or malformed context must remain fail-open so missing benchmark or
+        # subject bars cannot masquerade as a negative result.
+        if not isinstance(market_context, Mapping):
+            record.update({"status": "unknown",
+                           "reason": "market_context_malformed"})
+            return record
+        context_status = str(market_context.get("status") or "").strip().lower()
+        if context_status not in {"complete", "usable"}:
+            record.update({"status": "unknown",
+                           "reason": str(market_context.get("reason") or
+                                         "market_context_incomplete")})
+            return record
+    if (event_count == 0 and
+            normalized_rejections == {"no_actionable_signal": int(fit_cells)}):
+        record.update({"status": "complete_zero_actionable_signal",
+                       "reason": "no_actionable_signal"})
+    elif event_count > 0:
+        metrics = quality.get("horizon_metrics")
+        selected = (metrics.get(f"{int(primary_horizon)}m")
+                    if isinstance(metrics, Mapping) and
+                    primary_horizon is not None else None)
+        if not isinstance(selected, Mapping):
+            # A positive-actionable result with no usable primary horizon is
+            # retained as the historical fail-open status; it can never pass
+            # ``_screen_record_can_skip`` without the compact evidence.
+            record.update({"status": "complete_actionable_signal",
+                           "reason": "actionable_signal_present"})
+            return record
+        try:
+            candidate_count = selected.get("candidate_count")
+            matched_count = selected.get("matched_count")
+            if (isinstance(candidate_count, bool) or
+                    isinstance(matched_count, bool)):
+                raise ValueError("boolean count")
+            candidate_count = int(candidate_count)
+            matched_count = int(matched_count)
+            if (candidate_count < 0 or matched_count < 0 or
+                    matched_count > candidate_count or
+                    float(candidate_count) != float(selected.get("candidate_count")) or
+                    float(matched_count) != float(selected.get("matched_count"))):
+                raise ValueError("invalid count")
+            coverage = (matched_count / candidate_count
+                        if candidate_count else None)
+            delta = selected.get("candidate_minus_control_bps")
+            delta_value = float(delta)
+            if not math.isfinite(delta_value):
+                raise ValueError("non-finite control delta")
+        except (TypeError, ValueError, OverflowError):
+            record.update({"status": "complete_actionable_signal",
+                           "reason": "actionable_signal_present"})
+            return record
+        record["primary_horizon"] = {
+            "horizon_minutes": int(primary_horizon),
+            "candidate_count": candidate_count,
+            "matched_count": matched_count,
+            "matched_coverage": coverage,
+            "candidate_minus_control_bps": delta_value,
+            "candidate_minus_control_stderr_bps": selected.get(
+                "candidate_minus_control_stderr_bps"),
+            "candidate_minus_control_t_stat": selected.get(
+                "candidate_minus_control_t_stat"),
+        }
+        if (candidate_count >= 30 and matched_count >= 30 and
+                coverage is not None and coverage >= .80 and delta_value <= 0.0):
+            record.update({"status": "complete_nonpositive_control",
+                           "reason": "nonpositive_fit_control_delta"})
+        elif matched_count < 30 or coverage is None or coverage < .80:
+            record.update({"status": "underpowered_control",
+                           "reason": "primary_horizon_underpowered"})
+        else:
+            record.update({"status": "complete_actionable_signal",
+                           "reason": "actionable_signal_present"})
+    else:
+        record.update({"status": "unknown", "reason": "unexpected_rejections"})
+    return record
+
+
+def _screen_record_can_skip(record: Any, *, variant_id: str) -> bool:
+    """Require a complete fit-only zero-signal or negative-control contract."""
+    if not isinstance(record, Mapping):
+        return False
+    if (record.get("schema") != "signal-quality-screen.v1" or
+            record.get("scope") != "fit_only" or
+            record.get("authorizing") is not False or
+            record.get("diagnostic_only") is not True or
+            str(record.get("variant_id") or "") != str(variant_id) or
+            not isinstance(record.get("digest"), str) or
+            not record.get("digest")):
+        return False
+    status = str(record.get("status") or "")
+    reason = str(record.get("reason") or "")
+    zero_signal = (status == "complete_zero_actionable_signal" and
+                   reason == "no_actionable_signal")
+    nonpositive = (status == "complete_nonpositive_control" and
+                   reason == "nonpositive_fit_control_delta")
+    if not (zero_signal or nonpositive):
+        return False
+    try:
+        raw_event_count = record.get("event_count")
+        raw_fit_cells = record.get("fit_cells")
+        if isinstance(raw_event_count, bool) or isinstance(raw_fit_cells, bool):
+            return False
+        event_count = int(raw_event_count)
+        fit_cells = int(raw_fit_cells)
+        if (float(event_count) != float(raw_event_count) or
+                float(fit_cells) != float(raw_fit_cells)):
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if fit_cells <= 0:
+        return False
+    if nonpositive:
+        primary = record.get("primary_horizon")
+        if not isinstance(primary, Mapping):
+            return False
+        try:
+            candidate_count = primary.get("candidate_count")
+            matched_count = primary.get("matched_count")
+            coverage = float(primary.get("matched_coverage"))
+            delta = float(primary.get("candidate_minus_control_bps"))
+            horizon = int(primary.get("horizon_minutes"))
+            if (isinstance(candidate_count, bool) or
+                    isinstance(matched_count, bool) or
+                    candidate_count is None or matched_count is None or
+                    int(candidate_count) != float(candidate_count) or
+                    int(matched_count) != float(matched_count) or
+                    int(candidate_count) < 30 or int(matched_count) < 30 or
+                    int(matched_count) > int(candidate_count) or
+                    not math.isfinite(coverage) or coverage < .80 or
+                    not math.isfinite(delta) or delta > 0.0 or horizon <= 0):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return True
+    if event_count != 0:
+        return False
+    rejection_counts = record.get("event_rejection_counts")
+    if not isinstance(rejection_counts, Mapping):
+        return False
+    try:
+        normalized: dict[str, int] = {}
+        for key, value in rejection_counts.items():
+            if isinstance(value, bool):
+                return False
+            count = int(value)
+            if count < 0 or float(count) != float(value):
+                return False
+            normalized[str(key)] = count
+        return normalized == {"no_actionable_signal": fit_cells}
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _signal_quality_screen_worker(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Run the fit-only signal-quality pre-screen in a bounded worker.
+
+    This worker never simulates an account and never sees the sealed window.
+    It returns one record per requested variant in deterministic variant-id
+    order; an API failure for one variant becomes an unknown record so the
+    orchestrator can fail open without suppressing siblings.
+    """
+    bars, _snapshots, _quotes = _task_corpus(payload, include_quotes=False)
+    try:
+        fit_bars, _fit_sessions, _total_sessions = _fit_partition(bars)
+        fit_cells = _screen_bar_cells(fit_bars)
+        output: dict[str, dict[str, Any]] = {}
+        specs = sorted(payload.get("specs", ()),
+                       key=lambda item: rule_variant_id(validate_rule_spec(item)))
+        for raw_spec in specs:
+            spec = validate_rule_spec(raw_spec)
+            variant_id = rule_variant_id(spec)
+            try:
+                quality = measure_signal_quality(
+                    fit_bars, spec, policy=payload.get("policy"))
+                record = _signal_quality_screen_record(
+                    quality, variant_id=variant_id, fit_cells=fit_cells,
+                    primary_horizon=_screen_primary_horizon(spec, quality))
+            except Exception as exc:
+                # Per-variant API failures are diagnostic unknowns.  The
+                # orchestrator keeps that candidate scheduled.
+                record = {
+                    "schema": "signal-quality-screen.v1",
+                    "scope": "fit_only",
+                    "authorizing": False,
+                    "diagnostic_only": True,
+                    "variant_id": variant_id,
+                    "status": "unknown",
+                    "reason": "worker_failure",
+                    "event_count": None,
+                    "fit_cells": int(fit_cells),
+                    "digest": None,
+                    "error_type": type(exc).__name__,
+                }
+            output[variant_id] = record
+        return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
+                "screens": dict(sorted(output.items())),
+                "worker_pid": os.getpid()}
+    finally:
+        _close_task_quotes(_quotes)
 
 
 def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
@@ -1909,11 +2270,7 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
         hypothesis = dict(payload["hypothesis"])
         vehicle = str(payload["vehicle"])
         starting_cash = float(payload["starting_cash"])
-        sessions = sorted({_session(bar) for bar in bars})
-        cut = (max(1, min(len(sessions) - 1, int(len(sessions) * .7)))
-               if len(sessions) > 1 else len(sessions))
-        fit_sessions = set(sessions[:cut])
-        fit_bars = [bar for bar in bars if _session(bar) in fit_sessions]
+        fit_bars, _fit_sessions, _total_sessions = _fit_partition(bars)
         root_account = simulate_account(
             fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
             account_id=f"diagnostic:{hypothesis['hypothesis_id']}",
@@ -1943,11 +2300,7 @@ def _fit_variants_worker(payload: Mapping[str, Any]) -> dict:
     """
     bars, snapshots, quotes = _task_corpus(payload)
     try:
-        sessions = sorted({_session(bar) for bar in bars})
-        cut = (max(1, min(len(sessions) - 1, int(len(sessions) * .7)))
-               if len(sessions) > 1 else len(sessions))
-        fit_sessions = set(sessions[:cut])
-        fit_bars = [bar for bar in bars if _session(bar) in fit_sessions]
+        fit_bars, _fit_sessions, _total_sessions = _fit_partition(bars)
         hypothesis = dict(payload["hypothesis"])
         output: dict[str, dict] = {}
         for raw_spec in payload.get("specs", ()):
@@ -2126,6 +2479,8 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         return {"hypothesis": hypothesis, "mode": mode, "diagnostic": diagnostic,
                 "refinement": dict(payload.get("refinement") or {}),
                 "fit_diagnostics": dict(payload.get("fit_diagnostics") or {}),
+                "signal_quality_screen": dict(
+                    payload.get("signal_quality_screen") or {}),
                 "behavior_aliases": dict(payload.get("behavior_aliases") or {}),
                 "excluded_behavior_aliases": list(
                     payload.get("excluded_behavior_aliases") or ()),
@@ -2136,7 +2491,9 @@ def _worker(payload: Mapping[str, Any]) -> dict:
                 "evaluation_end": sessions[-1] if sessions else None,
                 "variants": sorted(variants, key=lambda item: item["variant_id"]),
                 "control_rows": control_account["rows"], "null_rows": null_rows,
-                "expected_variants": len(specs), "worker_pid": os.getpid()}
+                "expected_variants": (
+                    len(specs) + len(payload.get("screened_out_variant_ids") or ())),
+                "worker_pid": os.getpid()}
     finally:
         _close_task_quotes(quotes)
 
@@ -3327,6 +3684,12 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     max_workers = min(int(workers), len(tasks))
     worker_results = []
     fit_behavior_canonicalization: dict[str, Any] = {}
+    signal_quality_screens: dict[str, dict[str, Any]] = {}
+    # Screened-out zero-signal variants retain a deterministic p=1 placeholder
+    # in the existing multiple-testing families. They have no gate or
+    # promotion result, but BH/FDR membership stays unchanged.
+    screened_out_candidate_keys: set[str] = set()
+    screened_out_candidate_families: dict[str, str] = {}
     worker_failures = []
     tuning_proposals: list[dict] = []
     # variant_id -> (reason, source), per hypothesis: what the orchestrator
@@ -3480,6 +3843,161 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     pass
             scheduled.append(task)
 
+        # A cheap, fit-only signal-quality screen runs before fit diagnostics
+        # and before any full replay.  It is intentionally narrower than a
+        # gate: only a complete zero-event result where every fit cell was
+        # explicitly classified ``no_actionable_signal`` or an adequately
+        # powered nonpositive-control result may skip replay.
+        # Unknown, malformed, partial, underpowered, and worker-failure
+        # outcomes all fail open and retain their candidate in ``specs``.
+        screen_tasks = [task for task in scheduled
+                        if task["mode"] == "backtest" and task.get("specs")]
+        screen_results: dict[str, dict[str, Any]] = {}
+        if screen_tasks:
+            futures = {pool.submit(_signal_quality_screen_worker, task): task
+                       for task in screen_tasks}
+            for future in as_completed(futures):
+                task = futures[future]
+                hypothesis_id = str(task["hypothesis"]["hypothesis_id"])
+                try:
+                    result = future.result()
+                    screens = result.get("screens")
+                    if isinstance(screens, Mapping):
+                        screen_results[hypothesis_id] = dict(screens)
+                except Exception:
+                    # A failed screen is diagnostic only.  Leave every spec
+                    # scheduled and record an explicit unknown below.
+                    screen_results[hypothesis_id] = {}
+        for task in sorted(screen_tasks, key=lambda item: (
+                int(item["hypothesis"]["slot"]),
+                str(item["hypothesis"]["hypothesis_id"]))):
+            hypothesis_id = str(task["hypothesis"]["hypothesis_id"])
+            by_variant = screen_results.get(hypothesis_id, {})
+            records: dict[str, dict[str, Any]] = {}
+            original_specs = [validate_rule_spec(item)
+                              for item in task.get("specs", ())]
+            kept_specs: list[Mapping[str, Any]] = []
+            for raw_spec in sorted(
+                    task.get("specs", ()),
+                    key=lambda item: rule_variant_id(validate_rule_spec(item))):
+                spec = validate_rule_spec(raw_spec)
+                variant_id = rule_variant_id(spec)
+                raw_record = by_variant.get(variant_id)
+                if isinstance(raw_record, Mapping):
+                    record = dict(raw_record)
+                else:
+                    record = {
+                        "schema": "signal-quality-screen.v1",
+                        "scope": "fit_only", "authorizing": False,
+                        "diagnostic_only": True, "variant_id": variant_id,
+                        "status": "unknown", "reason": "worker_failure",
+                        "event_count": None, "fit_cells": None,
+                        "digest": None,
+                    }
+                # A record that does not satisfy an explicit complete
+                # zero-signal or adequately powered nonpositive-control
+                # contract remains in the expensive replay queue.
+                can_skip = _screen_record_can_skip(
+                    record, variant_id=variant_id)
+                if not can_skip:
+                    kept_specs.append(spec)
+                else:
+                    candidate_key = f"{hypothesis_id}:{variant_id}"
+                    screened_out_candidate_keys.add(candidate_key)
+                    screened_out_candidate_families[candidate_key] = str(
+                        spec.get("family") or task["hypothesis"]["family"])
+                records[variant_id] = record
+            task["screened_out_variant_ids"] = sorted(
+                variant_id for variant_id, record in records.items()
+                if _screen_record_can_skip(record, variant_id=variant_id))
+            task["signal_quality_screen"] = dict(sorted(records.items()))
+            screen_digest = content_hash([
+                {"variant_id": variant_id, **records[variant_id]}
+                for variant_id in sorted(records)])
+            screen_statuses = {str(item.get("status") or "")
+                               for item in records.values()}
+            all_screened = bool(records and not kept_specs)
+            skipped_status = (
+                "complete_zero_actionable_signal"
+                if screen_statuses == {"complete_zero_actionable_signal"}
+                else "complete_nonpositive_control"
+                if screen_statuses == {"complete_nonpositive_control"}
+                else "complete")
+            task["signal_quality_screen_digest"] = screen_digest
+            task["signal_quality_screen_status"] = (
+                skipped_status if all_screened
+                else "complete" if records else "unknown")
+            task["signal_quality_screen_zero"] = all_screened
+            task["signal_quality_screen_reason"] = (
+                "no_actionable_signal" if all_screened and
+                skipped_status == "complete_zero_actionable_signal" else
+                "nonpositive_fit_control_delta" if all_screened and
+                skipped_status == "complete_nonpositive_control" else
+                "complete_fit_screen_no_edge" if all_screened
+                else "actionable_signal_or_fail_open")
+            task["specs"] = kept_specs
+            signal_quality_screens[hypothesis_id] = {
+                "schema": "signal-quality-screen.v1",
+                "scope": "fit_only",
+                "authorizing": False,
+                "diagnostic_only": True,
+                "status": task["signal_quality_screen_status"],
+                "reason": task["signal_quality_screen_reason"],
+                "digest": screen_digest,
+                "variants": task["signal_quality_screen"],
+            }
+            # A complete screen that excludes every requested variant has no
+            # replay account to drive the ordinary lifecycle loop.  Persist a
+            # non-authorizing terminal status on the same event so this
+            # hypothesis cannot remain ``testing`` forever and be re-screened
+            # on every cycle.  The p=1 placeholder keys above still enter all
+            # multiplicity corrections; this terminal event does not invent a
+            # gate, account, or held-out result.
+            # Every retained record passed the same explicit skip contract;
+            # this includes a deterministic mixture of zero-signal and
+            # nonpositive-control statuses.  Treat that complete set as one
+            # terminal no-edge outcome rather than leaving the hypothesis in
+            # ``testing`` with no replay work to advance it.  A changed corpus
+            # still creates a new identity and lets normal slot reseeding run.
+            screen_terminal = all_screened
+            event_status = ("bounded_space_exhausted" if screen_terminal
+                            else "testing")
+            event_reason = (
+                "fit signal-quality screen established terminal no-edge; "
+                "no replay or gate was authorized"
+                if screen_terminal else
+                ("fit signal-quality screen skipped full replay" if not kept_specs
+                 else "fit signal-quality screen completed before full replay"))
+            try:
+                factory.event(
+                    hypothesis_id, event_status, event_reason,
+                    signal_quality_screens[hypothesis_id])
+            except Exception:
+                # An unaudited exclusion is never allowed to change research
+                # behavior. Restore every original spec and fail open; the
+                # normal replay then supplies the candidate's evidence while
+                # this cycle records no screen exclusion.
+                for variant_id in task.get("screened_out_variant_ids", ()):
+                    candidate_key = f"{hypothesis_id}:{variant_id}"
+                    screened_out_candidate_keys.discard(candidate_key)
+                    screened_out_candidate_families.pop(candidate_key, None)
+                task["specs"] = original_specs
+                task["screened_out_variant_ids"] = []
+                task["signal_quality_screen_zero"] = False
+                task["signal_quality_screen_status"] = "unknown"
+                task["signal_quality_screen_reason"] = "persistence_failure"
+                persisted = signal_quality_screens[hypothesis_id]
+                persisted.update({"status": "unknown",
+                                  "reason": "persistence_failure",
+                                  "digest": None})
+                for variant_id, record in list(records.items()):
+                    if record.get("status") == "complete_zero_actionable_signal":
+                        records[variant_id] = {
+                            **record, "status": "unknown",
+                            "reason": "persistence_failure", "digest": None}
+                task["signal_quality_screen"] = dict(sorted(records.items()))
+                persisted["variants"] = task["signal_quality_screen"]
+
         # Before any full replay or multiple-testing correction, measure each
         # backtest candidate on the same fit prefix used for diagnosis.  Full
         # behavioral aliases receive one deterministic representative across
@@ -3522,8 +4040,13 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                      "proposed_behavior_aliases"]})
 
         # Phase two: replay every chosen variant in its own isolated account.
-        futures = {pool.submit(_worker, task): task for task in scheduled}
-        _progress("evaluating", 0, len(scheduled))
+        # Tasks whose complete screen proved no actionable fit signal have no
+        # specs and are intentionally absent; all fail-open tasks remain.
+        replay_tasks = [task for task in scheduled
+                        if task.get("specs") or
+                        not task.get("signal_quality_screen_zero", False)]
+        futures = {pool.submit(_worker, task): task for task in replay_tasks}
+        _progress("evaluating", 0, len(replay_tasks))
         evaluation_done = 0
         for future in as_completed(futures):
             task = futures[future]
@@ -3532,7 +4055,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             except Exception as exc:
                 _requeue(task, exc, "worker")
             evaluation_done += 1
-            _progress("evaluating", evaluation_done, len(scheduled))
+            _progress("evaluating", evaluation_done, len(replay_tasks))
     worker_results.sort(key=lambda item: (int(item["hypothesis"]["slot"]),
                                           str(item["hypothesis"]["hypothesis_id"])))
     for worker in worker_results:
@@ -3567,9 +4090,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     # entry null. It is therefore a tested candidate and consumes multiplicity
     # exactly like a mutation; excluding it would grant a free hypothesis.
     candidate_rows = list(variant_rows)
-    global_correction = benjamini_hochberg(
-        {f"{owner['hypothesis']['hypothesis_id']}:{variant['variant_id']}": gate["p_raw"]
-         for owner, variant, gate in candidate_rows}, alpha=alpha)
+    global_p_values = {
+        f"{owner['hypothesis']['hypothesis_id']}:{variant['variant_id']}": gate["p_raw"]
+        for owner, variant, gate in candidate_rows}
+    global_p_values.update({key: 1.0 for key in screened_out_candidate_keys})
+    global_correction = benjamini_hochberg(global_p_values, alpha=alpha)
     family_rows: dict[str, list[tuple[Mapping, Mapping]]] = {}
     for owner, variant, gate in variant_rows:
         rule_family = str((variant.get("rule_spec") or {}).get(
@@ -3577,15 +4102,23 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         family_rows.setdefault(rule_family, []).append(
             (variant, gate))
     family_corrections: dict[str, dict] = {}
-    for family_name in family_rows:
-            family_corrections[family_name] = benjamini_hochberg(
-            {
-                f"{family_name}|{owner['hypothesis']['hypothesis_id']}|"
-                f"{variant['variant_id']}": gate["p_raw"]
-                for owner, variant, gate in variant_rows
-                if str((variant.get("rule_spec") or {}).get("family") or
-                       owner["hypothesis"]["family"]) == family_name
-            }, alpha=alpha)
+    family_names = set(family_rows)
+    family_names.update(screened_out_candidate_families.values())
+    for family_name in sorted(family_names):
+        family_p_values = {
+            f"{family_name}|{owner['hypothesis']['hypothesis_id']}|"
+            f"{variant['variant_id']}": gate["p_raw"]
+            for owner, variant, gate in variant_rows
+            if str((variant.get("rule_spec") or {}).get("family") or
+                   owner["hypothesis"]["family"]) == family_name
+        }
+        family_p_values.update({
+            f"{family_name}|{candidate_key}": 1.0
+            for candidate_key, candidate_family in
+            screened_out_candidate_families.items()
+            if candidate_family == family_name})
+        family_corrections[family_name] = benjamini_hochberg(
+            family_p_values, alpha=alpha)
     # A second, conservative multiplicity layer groups current-cycle tests by
     # the frozen *prior-cycle* dependence map.  The existing global BH remains
     # mandatory; this correction can only veto a candidate that global/family
@@ -3602,6 +4135,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                            f"legacy-singleton:{candidate_key}")
         cluster_for_key[candidate_key] = cluster_name
         cluster_rows.setdefault(cluster_name, {})[candidate_key] = gate["p_raw"]
+    for candidate_key, family_name in screened_out_candidate_families.items():
+        cluster_name = str(frozen_clusters.get(family_name) or
+                           f"legacy-singleton:{candidate_key}")
+        cluster_for_key[candidate_key] = cluster_name
+        cluster_rows.setdefault(cluster_name, {})[candidate_key] = 1.0
     cluster_corrections: dict[str, dict] = {}
     for cluster_name in sorted(cluster_rows):
         correction = benjamini_hochberg(cluster_rows[cluster_name], alpha=alpha)
@@ -3981,9 +4519,12 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             reason, origin = proposals.get(
                 str(hypothesis["hypothesis_id"]), {}).get(
                     variant["variant_id"], (None, None))
+            screen_record = (worker.get("signal_quality_screen") or {}).get(
+                str(variant["variant_id"]))
             result = {**variant, "evaluation_start": worker["evaluation_start"],
                       "evaluation_end": worker["evaluation_end"], "mode": worker["mode"],
                       "gate": gate, "reason": reason, "proposed_by": origin,
+                      "signal_quality_screen": screen_record,
                       "classification": _gate_classification(gate)}
             factory.add_account(cycle_id, hypothesis["hypothesis_id"], result)
             # The reason was fixed before this gate existed; now it is graded
@@ -4535,6 +5076,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "experiment_provenance": experiment_provenance_body,
         "parallel_workers": max_workers,
         "parallel_backend": backend,
+        "signal_quality_screens": signal_quality_screens,
         "fit_behavior_canonicalization": fit_behavior_canonicalization,
         "worker_pids": sorted({row["worker_pid"] for row in summaries}),
         "strategies": len(worker_results), "variants": len(summaries),

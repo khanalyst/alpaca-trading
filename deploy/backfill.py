@@ -56,8 +56,11 @@ from deploy.recorder import (  # noqa: E402
     NEW_YORK,
     _append_partitions,
     _corpus_data_feed,
+    _partition_calendar_path,
     _partition_path,
+    _partition_source_path,
     _prepare_index,
+    _save_partition_calendar,
     _save_index,
     _save_partition_source,
     _scan_corpus,
@@ -262,6 +265,10 @@ def _backfill_locked(provider, symbols, output: Path, *,
             # Partitions are append-only, so overwriting means replacing the
             # file. Appending instead would duplicate every event key and make
             # the corpus unreadable at the recorder's next scan.
+            # Remove metadata first: a crash after the CSV unlink must never
+            # leave an orphan marker that research could mistake for evidence.
+            _partition_source_path(output, day).unlink(missing_ok=True)
+            _partition_calendar_path(output, day).unlink(missing_ok=True)
             partition.unlink()
         rows = list(_bar_rows(provider, symbols, day, session=calendar[day],
                               feed=resolved_feed, observed=observed))
@@ -284,6 +291,7 @@ def _backfill_locked(provider, symbols, output: Path, *,
         # reconstructs the label from this marker instead of treating the CSV
         # as forward-observed evidence.
         _save_partition_source(output, day, "historical_backfill")
+        _save_partition_calendar(output, day, calendar[day])
         _append_partitions(output, list(unique.values()))
         written_rows += len(unique)
         written_sessions.append(day.isoformat())

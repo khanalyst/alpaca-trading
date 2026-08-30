@@ -838,6 +838,41 @@ class VariantSelectionTests(unittest.TestCase):
         self.assertEqual(len(pair), 1)
         self.assertEqual((pair[0]["min_atr_bps"], pair[0]["stop_atr"]), (5.0, 2.0))
 
+    def test_target_hold_geometry_pair_is_bounded_and_coordinate_deferred(self):
+        diagnostic = {
+            "fit_diagnostics": {"target_hold_reachability": {
+                "diagnostic_only": True, "authorizing": False,
+                "genuine_mismatch": True, "adequate": True, "usable": 30,
+                "recommendation": {"target_r": 1.0, "max_hold_bars": 90},
+            }}}
+        early = interaction_mutation_pool(
+            ROOT, [], diagnostic=diagnostic, coordinate_exhausted=False)
+        self.assertFalse(any(set(spec_delta(ROOT, spec)) <= {
+            "target_r", "max_hold_bars"} for spec, _reason in early))
+        late = interaction_mutation_pool(
+            ROOT, [], diagnostic=diagnostic, coordinate_exhausted=True)
+        pairs = [(spec, reason) for spec, reason in late
+                 if set(spec_delta(ROOT, spec)) <= {
+                     "target_r", "max_hold_bars"}]
+        self.assertEqual(len(pairs), 1)
+        spec, reason = pairs[0]
+        self.assertEqual(spec["target_r"], 1.0)
+        self.assertEqual(spec["max_hold_bars"], 90)
+        self.assertNotEqual(rule_variant_id(spec), rule_variant_id(ROOT))
+        self.assertIn("time-expiry", reason)
+
+    def test_target_hold_geometry_pair_is_underpowered_or_ambiguous_safe(self):
+        diagnostic = {
+            "fit_diagnostics": {"target_hold_reachability": {
+                "diagnostic_only": True, "authorizing": False,
+                "genuine_mismatch": True, "adequate": False, "usable": 29,
+                "recommendation": {"target_r": 1.0, "max_hold_bars": 90},
+            }}}
+        pool = interaction_mutation_pool(
+            ROOT, [], diagnostic=diagnostic, coordinate_exhausted=True)
+        self.assertFalse(any(set(spec_delta(ROOT, spec)) <= {
+            "target_r", "max_hold_bars"} for spec, _reason in pool))
+
     def test_generic_interaction_ties_use_failure_priority_and_numeric_values(self):
         lessons = [
             {"id": "threshold-high", "changed": {"threshold_bps": {

@@ -187,6 +187,13 @@ class ReplayPolicy:
     # shipped equity authorization identity; legacy SIP envelopes select their
     # historical semantics explicitly during verification.
     equity_feed: str = "iex"
+    # Empirical stress selection is an operator-activated overlay.  The
+    # scalar scenario above remains the fail-closed fallback and shipped
+    # default; an artifact can only narrow/widen it after held-out checks.
+    stressed_cost_calibration_enabled: bool = False
+    stressed_cost_calibration_path: str | None = None
+    stressed_cost_calibration_artifact: Mapping[str, Any] | None = None
+    equity_provider: str = "alpaca"
 
     def __post_init__(self) -> None:
         age = float(self.max_market_data_age_seconds)
@@ -231,6 +238,15 @@ class ReplayPolicy:
             raise CostError(
                 "equity_feed must be iex, sip, or delayed_sip")
         object.__setattr__(self, "equity_feed", feed)
+        if not isinstance(self.stressed_cost_calibration_enabled, bool):
+            raise CostError("stressed_cost_calibration_enabled must be true or false")
+        if self.stressed_cost_calibration_path is not None and not isinstance(
+                self.stressed_cost_calibration_path, str):
+            raise CostError("stressed_cost_calibration_path must be a string")
+        provider = str(self.equity_provider or "").strip().lower()
+        if not provider:
+            raise CostError("equity_provider must be non-empty")
+        object.__setattr__(self, "equity_provider", provider)
         if not isinstance(self.strict_market_data, bool):
             raise CostError("strict_market_data must be true or false")
         if not isinstance(self.require_exact_calendar, bool):
@@ -259,6 +275,14 @@ class ReplayPolicy:
             "max_stressed_cost_to_risk_ratio": (
                 None if self.max_stressed_cost_to_risk_ratio is None else
                 float(self.max_stressed_cost_to_risk_ratio)),
+            "stressed_cost_calibration_enabled": bool(
+                self.stressed_cost_calibration_enabled),
+            "stressed_cost_calibration_path": self.stressed_cost_calibration_path,
+            "stressed_cost_calibration_content_hash": (
+                self.stressed_cost_calibration_artifact.get("content_hash")
+                if isinstance(self.stressed_cost_calibration_artifact, Mapping)
+                else None),
+            "equity_provider": self.equity_provider,
             "latest_entry_time": (None if self.latest_entry_time is None else
                                    self.latest_entry_time.isoformat()),
             "force_flat_time": (None if self.force_flat_time is None else
@@ -289,6 +313,18 @@ class ReplayPolicy:
         if not all(isinstance(block, Mapping) for block in (
                 execution, risk, strategy, session, broker, data)):
             raise CostError("runtime policy blocks must be mappings")
+        calibration_enabled = risk.get("stressed_cost_calibration_enabled", False)
+        if not isinstance(calibration_enabled, bool):
+            raise CostError("risk.stressed_cost_calibration_enabled must be true or false")
+        calibration_path = risk.get("stressed_cost_calibration_path")
+        if calibration_path is not None and not isinstance(calibration_path, str):
+            raise CostError("risk.stressed_cost_calibration_path must be a string")
+        artifact = None
+        if calibration_enabled:
+            from .stressed_cost_calibration import load_stress_calibration_artifact
+            artifact, _ = load_stress_calibration_artifact(calibration_path)
+        provider = (broker.get("provider") if "provider" in broker else
+                    data.get("provider") if "provider" in data else "alpaca")
         equity_feed = (broker.get("data_feed") if "data_feed" in broker else
                        data.get("feed") if "feed" in data else "iex")
         latest = strategy.get("latest_entry_time")
@@ -336,6 +372,10 @@ class ReplayPolicy:
             max_stressed_cost_to_risk_ratio=(
                 None if risk.get("max_stressed_cost_to_risk_ratio") is None else
                 float(risk["max_stressed_cost_to_risk_ratio"])),
+            stressed_cost_calibration_enabled=calibration_enabled,
+            stressed_cost_calibration_path=calibration_path,
+            stressed_cost_calibration_artifact=artifact,
+            equity_provider=str(provider),
             latest_entry_time=latest,
             force_flat_time=force,
             max_concurrent_positions=(None if risk.get("max_concurrent_positions") is None else int(risk["max_concurrent_positions"])),
@@ -356,6 +396,49 @@ class ReplayPolicy:
             force_flat_minutes_before_close=flat_offset,
             reject_new_entries_minutes_before_close=reject_offset,
         )
+
+    def resolve_stress_scenario(self, symbol: str | None = None,
+                                timestamp: Any = None,
+                                *, bucket: str | None = None,
+                                vehicle: str = "equity") -> tuple[float | None, str | None]:
+        """Resolve an empirical stress cell with the configured scalar fallback."""
+        if self.stressed_cost_scenario_bps is None and not self.stressed_cost_calibration_enabled:
+            return None, "stressed_cost_scenario_missing"
+        fallback = (25.0 if self.stressed_cost_scenario_bps is None else
+                    float(self.stressed_cost_scenario_bps))
+        normalized_vehicle = str(vehicle or "equity").strip().lower()
+        if normalized_vehicle in {"option", "options",
+                                  "defined_risk_options",
+                                  "options_defined_risk"}:
+            return (float(fallback),
+                    "calibration_equity_only"
+                    if self.stressed_cost_calibration_enabled
+                    else "activation_disabled")
+        observation_session = None
+        if timestamp not in (None, ""):
+            try:
+                text = str(timestamp).replace("Z", "+00:00")
+                stamp = datetime.fromisoformat(text)
+                if stamp.tzinfo is None or stamp.utcoffset() is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                from .quote_costs import bucket_label
+                local = stamp.astimezone(ZoneInfo("America/New_York"))
+                observation_session = local.date().isoformat()
+                if bucket is None:
+                    minutes = ((local.hour * 60 + local.minute + local.second / 60.0)
+                               - 9 * 60 - 30)
+                    bucket = bucket_label(minutes)
+            except (TypeError, ValueError, OverflowError):
+                bucket = None
+                observation_session = "__invalid__"
+        from .stressed_cost_calibration import resolve_stress_scenario
+        return resolve_stress_scenario(
+            self.stressed_cost_calibration_artifact,
+            symbol=symbol, bucket=bucket, fallback_scenario_bps=fallback,
+            operator_enabled=self.stressed_cost_calibration_enabled,
+            expected_provider=self.equity_provider,
+            expected_feed=self.equity_feed,
+            observation_session=observation_session)
 
 
 def replay_policy_for_session(
@@ -810,6 +893,22 @@ def check_stressed_cost_plan(
     that retain legacy fixture behaviour should skip this helper only when both
     controls are ``None``.
     """
+    vehicle = ("option" if isinstance(plan, Mapping) and
+               str(plan.get("execution_profile", "shares")).lower()
+               in {"option", "options", "defined_risk_options",
+                   "options_defined_risk"} else "equity")
+    activation_reason = "activation_disabled"
+    if isinstance(config, Mapping):
+        try:
+            policy = ReplayPolicy.from_config(config)
+            if policy.stressed_cost_calibration_enabled:
+                scenario_bps, activation_reason = policy.resolve_stress_scenario(
+                    plan.get("symbol") if isinstance(plan, Mapping) else None,
+                    plan.get("entry_timestamp", plan.get("timestamp"))
+                    if isinstance(plan, Mapping) else None,
+                    vehicle=vehicle)
+        except (CostError, TypeError, ValueError, OverflowError):
+            return None, "stressed_cost_invalid"
     if scenario_bps is None or max_ratio is None:
         return None, "stressed_cost_invalid"
     if isinstance(scenario_bps, bool) or isinstance(max_ratio, bool):
@@ -824,9 +923,6 @@ def check_stressed_cost_plan(
         return None, "stressed_cost_invalid"
     if not isinstance(plan, Mapping):
         return None, "stressed_cost_invalid"
-    vehicle = ("option" if str(plan.get("execution_profile", "shares")).lower()
-               in {"option", "options", "defined_risk_options",
-                   "options_defined_risk"} else "equity")
     if any(isinstance(plan.get(name), bool) for name in
            ("notional", "risk_usd",
             "contracts" if vehicle == "option" else "shares")):
@@ -863,6 +959,7 @@ def check_stressed_cost_plan(
         "stressed_cost_usd": float(stressed),
         "stressed_cost_to_risk_ratio": float(ratio),
         "max_stressed_cost_to_risk_ratio": float(limit),
+        "stressed_cost_activation_reason": activation_reason,
     })
     return enriched, None
 

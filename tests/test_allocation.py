@@ -142,6 +142,22 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual([item["variant_id"] for item in result["admitted"]], ["a"])
         self.assertEqual(result["rejected"][0]["reason"], "frozen dependence cluster")
 
+    def test_injected_ledger_loads_frozen_policy_without_explicit_db_path(self):
+        left = {"candidate_id": "a", "variant_id": "a", "family": "alpha",
+                "vehicle": "equity",
+                "latest_proof": {"verified_gate": _gate(lcb=.20)}}
+        right = {"candidate_id": "b", "variant_id": "b", "family": "beta",
+                 "vehicle": "equity",
+                 "latest_proof": {"verified_gate": _gate(lcb=.10)}}
+        policy = {"verified_persisted": True, "policy_hash": "p" * 64,
+                  "cluster_map": {"alpha": "dependence-0001",
+                                  "beta": "dependence-0001"}}
+        with patch("agent.allocation.FactoryLedger") as factory:
+            factory.return_value.latest_dependence_policy.return_value = policy
+            result = allocate([right, left], free_slots=2, ledger=self.ledger)
+        factory.assert_called_once_with(self.ledger.path)
+        self.assertEqual([item["variant_id"] for item in result["admitted"]], ["a"])
+
     def test_unassigned_legacy_family_keeps_safe_existing_behavior(self):
         left = {"candidate_id": "a", "variant_id": "a", "family": "legacy-a",
                 "latest_proof": {"verified_gate": _gate(lcb=.20)}}

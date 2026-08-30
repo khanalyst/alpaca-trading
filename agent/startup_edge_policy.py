@@ -98,18 +98,28 @@ class StartupEdgePolicyMixin:
                 "provider options feed does not match configured feed "
                 f"{configured_options!r} (provider={options_feed!r})")
 
-        # Research and validated-equity lanes use the exact shipped IEX view;
-        # option execution/research remains bound to OPRA.  Missing provider
-        # metadata is not evidence of the configured identity.
+        # Research and validated-equity lanes use the exact configured
+        # real-time equity view.  The shipped/default identity is IEX, while
+        # SIP is valid only when it is configured and reported consistently.
+        # Delayed SIP remains diagnostic-only.  Missing provider metadata is
+        # not evidence of the configured identity.
         if equity_lane:
+            expected_data = configured_data or "iex"
+            if expected_data not in {"iex", "sip"}:
+                raise AlpacaError(
+                    "research/validated-equity runtime requires a configured "
+                    "real-time equity feed (iex or sip); delayed_sip is "
+                    "diagnostic-only")
             if data_feed_missing:
                 raise AlpacaError(
                     "provider equity feed metadata is unavailable; "
-                    "research requires the IEX feed")
-            if data_feed != "iex":
+                    f"research/validated-equity runtime requires configured "
+                    f"feed {expected_data!r}")
+            if data_feed != expected_data:
                 raise AlpacaError(
-                    "research/validated-equity runtime requires the IEX "
-                    f"equity feed (provider={data_feed!r})")
+                    "research/validated-equity runtime requires the exact "
+                    f"configured equity feed {expected_data!r} "
+                    f"(provider={data_feed!r})")
         if option_lane:
             if options_feed_missing:
                 raise AlpacaError(

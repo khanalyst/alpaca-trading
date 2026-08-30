@@ -66,6 +66,8 @@ class MeasurementTests(unittest.TestCase):
         buckets = measure_quote_costs(wide + tight)["symbols"]["SPY"]["buckets"]
         self.assertGreater(buckets["m000_030"]["spread_bps"]["mean"], 5.0)
         self.assertLess(buckets["m030_060"]["spread_bps"]["mean"], 1.0)
+        self.assertEqual(len(buckets["m000_030"]["sessions"]), 40)
+        self.assertEqual(buckets["m000_030"]["sessions"][0], "2026-01-05")
 
     def test_malformed_quotes_are_rejected_not_absorbed(self):
         rows = _quotes("SPY", spread_bps=1.0, minutes=10)
@@ -86,6 +88,12 @@ class MeasurementTests(unittest.TestCase):
         with self.assertRaises(QuoteCostError):
             measure_quote_costs(_quotes("SPY", spread_bps=1.0, feed="sip"),
                                 feed="iex")
+
+    def test_a_usable_quote_without_provider_is_refused(self):
+        rows = _quotes("SPY", spread_bps=1.0)
+        rows[0].pop("provider")
+        with self.assertRaises(QuoteCostError):
+            measure_quote_costs(rows)
 
     def test_sparse_buckets_are_excluded_and_counted(self):
         schedule = measure_quote_costs(

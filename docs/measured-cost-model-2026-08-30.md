@@ -1,5 +1,14 @@
 # Measured execution-cost model — 2026-08-30
 
+> **Supersession note (2026-08-29 remediation):** This file name is a
+> pre-existing `2026-08-30` historical artifact; its measurements are retained
+> unchanged. Current remediation requires per-symbol/session 9/15/25/50-bps
+> stress calibration to remain disabled by default, operator-activated, and
+> bound to exact feed/provenance, disjoint held-out sessions, content hashes,
+> and an artifact-wide effective-after boundary. See [the remediation
+> record](trading-edge-remediation-2026-08-29.md). No calibration result here
+> authorizes a candidate.
+
 The shipped cost model applies two constants to every symbol at every minute of
 the session: a 4 bps quoted spread and a 6 bps adverse-slippage charge, giving
 a 17 bps round trip on bar references and 13 bps on quote references. They are

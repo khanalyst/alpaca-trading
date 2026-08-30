@@ -34,6 +34,11 @@ from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
 from .stats import stable_seed
 
 MIN_PROMOTION_CLUSTERS = 30
+# A randomized-entry null is only useful when it covers nearly all of the
+# candidate opportunities.  Keep this local to the discovery/null boundary;
+# fit-only diagnostics must not be able to lower an authorizing control floor.
+MIN_NULL_CONTROL_MATCHED = 30
+MIN_NULL_CONTROL_COVERAGE = 0.80
 
 
 def _facade_dependency(name: str):
@@ -94,6 +99,10 @@ def paired_delta(*args, **kwargs):
 
 def matched_cluster_test(*args, **kwargs):
     return _facade_dependency("matched_cluster_test")(*args, **kwargs)
+
+
+def paired_control_adequacy(*args, **kwargs):
+    return _facade_dependency("paired_control_adequacy")(*args, **kwargs)
 
 
 def deterministic_placebo_deltas(*args, **kwargs):
@@ -217,9 +226,10 @@ def _row_provenance(row: Mapping[str, Any], *, kind: str,
 
     Recorder rows carry these fields at write time.  An explicitly supplied
     external corpus must do the same: passing the CLI's provider/feed as
-    normalizer overrides used to make an unlabelled (or IEX) row look like SIP
-    evidence.  Non-strict callers retain the legacy diagnostic projection, but
-    strict authorizing callers get a hard error before replay can create gates.
+    normalizer overrides must not make an unlabelled or differently sourced
+    row look like configured evidence.  Non-strict callers retain the legacy
+    diagnostic projection, but strict authorizing callers get a hard error
+    before replay can create gates.
     """
     equity = kind in {"bar", "underlying", "underlying_bar",
                       "quote", "quote_snapshot", "equity_quote",
@@ -227,7 +237,10 @@ def _row_provenance(row: Mapping[str, Any], *, kind: str,
     raw_provider = row.get("provider")
     raw_feed = row.get("feed", row.get("feed_id"))
     provider = None if raw_provider is None else str(raw_provider).strip()
-    feed = None if raw_feed is None else str(raw_feed).strip().lower()
+    feed = (None if raw_feed is None else
+            str(raw_feed).strip().lower().replace("-", "_"))
+    if feed == "delayed":
+        feed = "delayed_sip"
     if require and not provider:
         raise DiscoveryError(
             f"{kind} research requires explicit provider provenance")
@@ -235,13 +248,22 @@ def _row_provenance(row: Mapping[str, Any], *, kind: str,
         if not feed:
             raise DiscoveryError(
                 f"{kind} research requires explicit feed provenance")
-        expected = str(expected_equity_feed or "iex").strip().lower()
-        if expected != "iex":
+        expected = (str(expected_equity_feed or "iex").strip().lower()
+                    .replace("-", "_"))
+        if expected == "delayed":
+            expected = "delayed_sip"
+        if expected not in {"iex", "sip"}:
             raise DiscoveryError(
-                f"equity research requires configured IEX feed, got {expected or '[missing]'}")
+                "equity research requires a configured real-time feed "
+                f"(iex or sip); {expected or '[missing]'} is diagnostic-only")
+        if feed == "delayed":
+            feed = "delayed_sip"
         if feed != expected:
+            qualifier = ("; delayed_sip is diagnostic-only"
+                         if feed == "delayed_sip" else "")
             raise DiscoveryError(
-                f"{kind} row feed {feed!r} is not executable; expected {expected!r}")
+                f"{kind} row feed {feed!r} does not match configured "
+                f"executable feed {expected!r}{qualifier}")
         if expected_provider and provider != str(expected_provider).strip():
             raise DiscoveryError(
                 f"{kind} row provider {provider!r} does not match configured provider")
@@ -249,6 +271,7 @@ def _row_provenance(row: Mapping[str, Any], *, kind: str,
 
 
 def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None = None,
+                      include_quotes: bool = True,
                       require_provenance: bool = False,
                       expected_equity_feed: str = "iex",
                       expected_provider: str | None = None) -> tuple[
@@ -306,7 +329,8 @@ def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None =
                 # else still falls back to the bar and says so.
                 quote = normalize_quote(
                     row, provider=provider or "alpaca", feed=feed or "iex")
-                if keep is None or keep(quote.session_date.isoformat()):
+                if (include_quotes and
+                        (keep is None or keep(quote.session_date.isoformat()))):
                     if quote_index is None:
                         quotes.append(quote)
                     elif not getattr(quote_index, "_read_only", False):
@@ -467,6 +491,7 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
                  until: str | None = None,
                  exclude: Sequence[str] = (),
                  quote_descriptor: SQLiteQuoteIndexDescriptor | None = None,
+                 include_quotes: bool = True,
                  expected_digest: str | None = None,
                  expected_equity_feed: str = "iex") -> tuple[
                      list[UnderlyingBar], list[OptionSnapshot], list[QuoteSnapshot]]:
@@ -487,7 +512,7 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
                 session not in dropped)
 
     source_path = Path(source)
-    supplied = quote_descriptor
+    supplied = quote_descriptor if include_quotes else None
     owns_quote_index = False
     if supplied is not None:
         quote_index = SQLiteQuoteIndex.open_read_only(supplied)
@@ -515,6 +540,7 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
     try:
         bars, snapshots, quotes = _normalize_corpus(
             rows(), keep=keep, quote_index=quote_index,
+            include_quotes=include_quotes,
             require_provenance=True,
             expected_equity_feed=expected_equity_feed)
         if (digest is not None and
@@ -645,6 +671,127 @@ def _null_row(symbol: str, day: str, opportunity: str, vehicle: str,
     return row
 
 
+def _rule_mature_prefix(spec: Mapping[str, Any], window: int | None) -> int:
+    """Return the executable rule's causal prefix without inactive fields."""
+    required = max(int(spec["lookback"]) + 1,
+                   int(spec["atr_period"]) + 1,
+                   int(window or 0))
+    confirmations = {str(spec.get("confirmation") or "none")}
+    confirmations.update(str(item) for item in spec.get("confirmations") or ())
+    if "trend" in confirmations:
+        required = max(required, int(spec["slow_lookback"]))
+    if "volume" in confirmations:
+        required = max(required, int(spec["lookback"]) + 1)
+    if "volatility" in confirmations:
+        required = max(required, int(spec["atr_period"]) + 1)
+    return required
+
+
+def _null_admissible_entry_indices(session_bars: Sequence[Any], spec: Mapping,
+                                   *, direction: str, policy: ReplayPolicy,
+                                   vehicle: str, snapshots: Sequence[Any],
+                                   quote_index: Any) -> list[tuple[int, datetime]]:
+    """Return entries the candidate could actually have admitted.
+
+    Sampling a raw bar index gives the null access to bars before the rule's
+    mature prefix, outside its entry clock, across feature gaps, or after a
+    force-flat boundary.  Those bars are impossible candidate opportunities
+    and make the null artificially weak.  This helper mirrors the executable
+    rule eligibility checks and is deliberately shared only by the
+    authorizing null path, not by fit diagnostics.
+    """
+    if not session_bars:
+        return []
+    # ``feature_window_bars`` is the executable rule's dependency declaration.
+    # It activates ``slow_lookback`` only for families/confirmations that read
+    # it.  Do not make every normalized spec wait for that field, and do not
+    # silently fall back to a shorter prefix if a declared dependency cannot
+    # be resolved: an underpowered corpus has no admissible controls.
+    declared_rule = all(name in spec for name in ("family", "lookback",
+                                                  "atr_period"))
+    if declared_rule:
+        try:
+            window = _simulation_dependency("feature_window_bars")(spec)
+            minimum_prefix = _rule_mature_prefix(spec, window)
+        except (KeyError, TypeError, ValueError):
+            return []
+    else:
+        # Opening-range nulls use a compact spec by design; no rule feature
+        # dependency was declared.  The preceding bar is the causal clock
+        # anchor and the following bar is the entry; exit eligibility below
+        # separately requires a later observable mark.  Starting at one (not
+        # two) therefore admits the smallest valid three-bar fixture without
+        # inventing a feature maturity requirement.
+        window = None
+        minimum_prefix = 1
+    contiguous = _simulation_dependency("_contiguous")
+    available = _simulation_dependency("_available")
+    entries: list[tuple[int, datetime]] = []
+    for signal_index in range(0, max(0, len(session_bars) - 1)):
+        if signal_index + 1 < minimum_prefix:
+            continue
+        feature_start = (0 if window is None else
+                         max(0, signal_index + 1 - int(window)))
+        if not contiguous(session_bars, feature_start, signal_index + 1):
+            continue
+        signal_bar = session_bars[signal_index]
+        entry_bar = session_bars[signal_index + 1]
+        available_times = [available(item, policy) for item in
+                           session_bars[feature_start:signal_index + 1]]
+        available_times = [item for item in available_times if item is not None]
+        signal_ready = max([signal_bar.end, *available_times], default=None)
+        if signal_ready is None:
+            continue
+        entry_at = signal_bar.end if signal_ready <= signal_bar.end else signal_ready
+        if entry_bar.timestamp != signal_bar.end and signal_ready <= signal_bar.end:
+            continue
+        entry_index = next((probe for probe in range(signal_index + 1,
+                                                      len(session_bars))
+                            if session_bars[probe].timestamp >= entry_at), None)
+        if entry_index is None:
+            continue
+        entry_bar = session_bars[entry_index]
+        local = entry_at.astimezone(ZoneInfo("America/New_York"))
+        if (policy.latest_entry_time is not None and
+                local.time() > policy.latest_entry_time):
+            continue
+        if (policy.force_flat_time is not None and
+                local.time() >= policy.force_flat_time):
+            continue
+        if vehicle == "equity":
+            side = "buy" if direction == "long" else "sell"
+            quoted = quote_fill_record(
+                quote_index, symbol=entry_bar.symbol, at=entry_at, side=side,
+                max_age_seconds=policy.max_market_data_age_seconds,
+                session_date=entry_bar.session_date)
+            if quoted is None and policy.strict_market_data:
+                continue
+            if quoted is None and replay_open_is_available(
+                    entry_bar, entry_bar.timestamp,
+                    allow_historical_backfill_diagnostics=(
+                        policy.allow_historical_backfill_diagnostics)) is False:
+                continue
+        elif vehicle == "option":
+            if _option_at(snapshots, symbol=entry_bar.symbol,
+                          day=entry_bar.session_date, direction=direction,
+                          cutoff=entry_at, policy=policy) is None:
+                continue
+        # A null position must have at least one observable mark after entry;
+        # otherwise the eventual exit would be right-censored rather than an
+        # admissible candidate hold.
+        deadline = hold_deadline(entry_at, spec)
+        if not any(bar.timestamp > entry_at and
+                   bar.end.timestamp() <= deadline and
+                   replay_available_at(
+                       bar,
+                       allow_historical_backfill_diagnostics=(
+                           policy.allow_historical_backfill_diagnostics))
+                   is not None for bar in session_bars[entry_index + 1:]):
+            continue
+        entries.append((entry_index, entry_at))
+    return entries
+
+
 def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                          spec: Mapping[str, Any], *, vehicle: str,
                          reference_rows: Sequence[Mapping], account_id: str,
@@ -664,6 +811,10 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
     whose own replay trades a fixed size.  A delta between books sized
     differently would measure position size, not timing.
     """
+    # Preserve whether this is a compact IBR null specification.  Validation
+    # fills rule defaults, which would otherwise make the helper invent a
+    # momentum predicate that the IBR candidate never used.
+    raw_spec = dict(spec)
     spec = validate_rule_spec(spec)
     unsupported_vehicle = not rule_vehicle_executable(spec, vehicle)
     model = costs or CostModel()
@@ -709,7 +860,14 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             rows.append(_null_row(symbol, day, opportunity, vehicle,
                                   "reference trade lacks null-control geometry"))
             continue
-        entry_index = rng.randrange(1, len(session_bars) - 1)
+        admissible = _null_admissible_entry_indices(
+            session_bars, raw_spec, direction=direction, policy=policy,
+            vehicle=vehicle, snapshots=snapshots, quote_index=quote_index)
+        if not admissible:
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "no_admissible_null_entry"))
+            continue
+        entry_index, sampled_entry_at = rng.choice(admissible)
         source_entry_bar = session_bars[entry_index]
         source_ready = replay_available_at(
             source_entry_bar,
@@ -720,7 +878,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             rows.append(_null_row(symbol, day, opportunity, vehicle,
                                   "entry_bar_not_visible"))
             continue
-        entry_at = max(source_entry_bar.timestamp, source_ready)
+        entry_at = max(sampled_entry_at, source_entry_bar.timestamp, source_ready)
         entry_index = next((probe for probe in range(entry_index, len(session_bars))
                             if session_bars[probe].timestamp >= entry_at), None)
         if entry_index is None:
@@ -1237,8 +1395,18 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     null_test = matched_cluster_test(
         heldout, null_heldout, vehicle=vehicle, iterations=test_iterations,
         equity_feed=equity_feed)
+    null_adequacy = paired_control_adequacy(
+        heldout, null_heldout, vehicle=vehicle,
+        min_matched=max(1, int(min_trades)),
+        equity_feed=equity_feed)
     null_control = {**null_test, "kind": "randomized_entry_null",
-                    "available": bool(null_test["available"]),
+                    "available": bool(null_test["available"] and
+                                      null_adequacy["adequate"]),
+                    "raw_available": bool(null_test["available"]),
+                    "adequate": bool(null_adequacy["adequate"]),
+                    "paired_adequacy": null_adequacy,
+                    "minimum_matched": null_adequacy["minimum_matched"],
+                    "minimum_coverage": null_adequacy["minimum_coverage"],
                     "p_value": float(null_test["p_value"])}
     final = dict(qualification or {
         "available": False, "sessions": [], "net_positive": False,
@@ -1259,7 +1427,7 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "falsification": bool(falsification["passes"]),
         "null_control_available": bool(null_control["available"]),
         "null_control_delta_positive": bool(
-            null_control["mean_delta"] is not None and
+            null_control["available"] and null_control["mean_delta"] is not None and
             float(null_control["mean_delta"]) > 0 and
             float(null_control["p_value"]) <= float(alpha)),
         "qualification_net_positive": bool(final.get("available") and

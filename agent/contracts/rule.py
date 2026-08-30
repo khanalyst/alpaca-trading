@@ -7,7 +7,7 @@ every signal is evaluated from completed bars only.
 
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import hashlib
 import json
@@ -45,10 +45,12 @@ RULE_FAMILIES = (
     "vwap_trend",
     "range_expansion",
     "opening_drive",
+    "cross_sectional_residual",
 )
 CONFIRMATIONS = ("none", "trend", "volume", "volatility")
 SIDES = ("both", "long", "short")
 BAR_SECONDS = 60.0
+CROSS_SECTIONAL_BENCHMARK = "SPY"
 # A bracket that is tighter than the configured minimum can be consumed by
 # ordinary spread/slippage before it has a chance to express the strategy's
 # thesis.  This is deliberately an execution-time floor, not a grammar field:
@@ -144,6 +146,7 @@ _FAMILY_EXECUTABLE_FIELDS = {
     "vwap_trend": ("lookback", "threshold_bps"),
     "range_expansion": ("lookback", "threshold_bps", "volume_multiplier"),
     "opening_drive": ("range_minutes", "threshold_bps"),
+    "cross_sectional_residual": ("lookback", "threshold_bps"),
 }
 
 
@@ -169,6 +172,7 @@ _FAMILY_FEATURE_BARS = {
     "volatility_breakout": lambda spec: spec["lookback"] + 1,
     "volume_breakout": lambda spec: spec["lookback"] + 1,
     "range_expansion": lambda spec: spec["lookback"] + 1,
+    "cross_sectional_residual": lambda spec: spec["lookback"] + 1,
 }
 _CONFIRMATION_FEATURE_BARS = {
     "trend": lambda spec: spec["slow_lookback"],
@@ -733,6 +737,8 @@ def completed_bar_exit_transition(state: Mapping[str, Any], bar: Any) -> dict[st
 def rule_vehicle_executable(spec: Mapping[str, Any], vehicle: str) -> bool:
     """Whether research/runtime possess a parity-safe execution path."""
     normalized = validate_rule_spec(spec)
+    if normalized["family"] == "cross_sectional_residual":
+        return str(vehicle or "").lower() in {"equity", "share", "shares"}
     return not (normalized["schema"] == RULE_SCHEMA_V3 and
                 str(vehicle or "").lower() in {"option", "options"})
 
@@ -774,6 +780,157 @@ def _timestamp(row: Any) -> datetime | None:
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return None
+
+
+def _row_symbol(row: Any) -> str | None:
+    raw = _value(row, "symbol")
+    if raw in (None, ""):
+        return None
+    return str(raw).strip().upper() or None
+
+
+def _bar_session(stamp: datetime) -> str:
+    return stamp.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def _context_rows(bars_by_symbol: Mapping[str, Sequence[Any]] | None,
+                  symbol: str) -> tuple[Any, ...] | None:
+    if not isinstance(bars_by_symbol, Mapping):
+        return None
+    matches = [value for key, value in bars_by_symbol.items()
+               if str(key).strip().upper() == symbol]
+    if len(matches) != 1:
+        return None
+    rows = matches[0]
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
+        return None
+    return tuple(rows)
+
+
+def _context_digest(benchmark_rows: Sequence[Any]) -> str:
+    payload = {
+        "schema": "cross-sectional-market-context.v1",
+        "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+        "bars": [[
+            _timestamp(row).astimezone(timezone.utc).isoformat(),
+            _number(row, "close"),
+        ] for row in benchmark_rows],
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def rule_behavior_identity(value: Mapping[str, Any], *,
+                           market_context_digest: str | None = None) -> str:
+    """Return executable identity, including context for relative rules."""
+    spec = validate_rule_spec(value)
+    if spec["family"] != "cross_sectional_residual":
+        return rule_variant_id(spec)
+    payload = {
+        "schema": "rule-behavior.v1",
+        "rule": json.loads(rule_semantic_signature(spec)),
+        "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+        "market_context_digest": str(market_context_digest or "missing"),
+    }
+    digest = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    return f"rule.cross-sectional-residual.behavior.{digest[:24]}"
+
+
+def _cross_sectional_direction(
+        bars: Sequence[Any], spec: Mapping[str, Any], *,
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None,
+        symbol: str | None) -> tuple[str | None, str, dict[str, Any]]:
+    """Evaluate one exact, synchronized symbol/SPY completed-bar window."""
+    metadata: dict[str, Any] = {
+        "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+    }
+    needed = int(spec["lookback"]) + 1
+    subject = list(bars[-needed:])
+    subject_symbol = str(symbol or _row_symbol(subject[-1]) or "").strip().upper()
+    if not subject_symbol:
+        return None, "subject_symbol_missing", metadata
+    if any(row_symbol not in (None, subject_symbol)
+           for row_symbol in (_row_symbol(row) for row in subject)):
+        return None, "subject_context_misaligned", metadata
+    if any(_number(row, "interval_seconds", 60) != 60.0
+           for row in subject):
+        return None, "subject_context_misaligned", metadata
+    subject_stamps = [_timestamp(row) for row in subject]
+    if any(stamp is None for stamp in subject_stamps):
+        return None, "subject_context_misaligned", metadata
+    stamps = [stamp.astimezone(timezone.utc) for stamp in subject_stamps
+              if stamp is not None]
+    if (len(stamps) != needed or
+            len({_bar_session(stamp) for stamp in stamps}) != 1 or
+            any(right - left != timedelta(minutes=1)
+                for left, right in zip(stamps, stamps[1:]))):
+        return None, "subject_context_misaligned", metadata
+
+    benchmark_source = (tuple(subject)
+                        if subject_symbol == CROSS_SECTIONAL_BENCHMARK else
+                        _context_rows(bars_by_symbol,
+                                      CROSS_SECTIONAL_BENCHMARK))
+    if not benchmark_source:
+        return None, "benchmark_context_missing", metadata
+    parsed: list[tuple[datetime, Any]] = []
+    for row in benchmark_source:
+        stamp = _timestamp(row)
+        if stamp is None:
+            return None, "benchmark_context_misaligned", metadata
+        row_symbol = _row_symbol(row)
+        if row_symbol not in (None, CROSS_SECTIONAL_BENCHMARK):
+            return None, "benchmark_context_misaligned", metadata
+        if _number(row, "interval_seconds", 60) != 60.0:
+            return None, "benchmark_context_misaligned", metadata
+        parsed.append((stamp.astimezone(timezone.utc), row))
+    current_stamp = stamps[-1]
+    eligible = [(stamp, row) for stamp, row in parsed if stamp <= current_stamp]
+    same_session = [(stamp, row) for stamp, row in eligible
+                    if _bar_session(stamp) == _bar_session(current_stamp)]
+    if not same_session:
+        return None, "benchmark_context_stale", metadata
+    if any(right[0] <= left[0]
+           for left, right in zip(same_session, same_session[1:])):
+        return None, "benchmark_context_misaligned", metadata
+    by_timestamp = {stamp: row for stamp, row in same_session}
+    if len(by_timestamp) != len(same_session):
+        return None, "benchmark_context_misaligned", metadata
+    if same_session[-1][0] < current_stamp:
+        return None, "benchmark_context_stale", metadata
+    if any(stamp not in by_timestamp for stamp in stamps):
+        return None, "benchmark_context_misaligned", metadata
+    benchmark = [by_timestamp[stamp] for stamp in stamps]
+    subject_start = _number(subject[0], "close")
+    subject_end = _number(subject[-1], "close")
+    benchmark_start = _number(benchmark[0], "close")
+    benchmark_end = _number(benchmark[-1], "close")
+    prices = (subject_start, subject_end, benchmark_start, benchmark_end)
+    if any(price is None or price <= 0 for price in prices):
+        return None, "cross_sectional_price_unavailable", metadata
+    symbol_return = subject_end / subject_start - 1.0
+    benchmark_return = benchmark_end / benchmark_start - 1.0
+    residual = symbol_return - benchmark_return
+    context_digest = _context_digest(benchmark)
+    metadata.update({
+        "subject_symbol": subject_symbol,
+        "symbol_return": symbol_return,
+        "benchmark_return": benchmark_return,
+        "residual_return": residual,
+        "market_context_digest": context_digest,
+        "candidate_behavior_identity": rule_behavior_identity(
+            spec, market_context_digest=context_digest),
+    })
+    threshold = float(spec["threshold_bps"]) / 10_000.0
+    if residual > threshold:
+        return "long", "passed", metadata
+    if residual < -threshold:
+        return "short", "passed", metadata
+    return None, "residual_threshold_not_met", metadata
 
 
 def _sma(values: Sequence[float], length: int) -> float:
@@ -923,6 +1080,34 @@ def _vwap(bars: Sequence[Any]) -> float | None:
     return result if result > 0 and math.isfinite(result) else None
 
 
+def _complete_opening_window(bars: Sequence[Any], current: Any,
+                             range_minutes: int) -> list[Any] | None:
+    """Return the exact 09:30 one-minute opening window, or fail closed."""
+    stamp = _timestamp(current)
+    if stamp is None:
+        return None
+    zone = ZoneInfo("America/New_York")
+    local_day = stamp.astimezone(zone).date()
+    start = datetime.combine(local_day, time(9, 30), tzinfo=zone)
+    minutes = int(range_minutes)
+    if minutes < 1:
+        return None
+    expected = [start + timedelta(minutes=index) for index in range(minutes)]
+    by_minute: dict[datetime, Any] = {}
+    for row in bars:
+        row_stamp = _timestamp(row)
+        if row_stamp is None:
+            continue
+        local = row_stamp.astimezone(zone)
+        if local.second or local.microsecond:
+            continue
+        if start <= local < start + timedelta(minutes=minutes):
+            by_minute.setdefault(local, row)
+    if any(point not in by_minute for point in expected):
+        return None
+    return [by_minute[point] for point in expected]
+
+
 def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
                       close: float, opened: float) -> tuple[str | None, str]:
     """Evaluate only the family predicate shared by execution and diagnostics."""
@@ -941,12 +1126,11 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
         local_day = stamp.astimezone(zone).date()
         start = datetime.combine(local_day, time(9, 30), tzinfo=zone)
         end = start.timestamp() + spec["range_minutes"] * 60
-        opening = [row for row in bars if (ts := _timestamp(row)) is not None and
-                   ts.astimezone(zone).date() == local_day and
-                   start.timestamp() <= ts.timestamp() < end]
         if stamp.timestamp() < end:
             return None, "opening_window_incomplete"
-        if len(opening) < max(2, spec["range_minutes"] // 2):
+        opening = _complete_opening_window(
+            bars, current, int(spec["range_minutes"]))
+        if opening is None:
             return None, "opening_window_undercovered"
         high = max(_number(row, "high") for row in opening)
         low = min(_number(row, "low") for row in opening)
@@ -1054,12 +1238,11 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
         start = datetime.combine(stamp.astimezone(zone).date(), time(9, 30),
                                  tzinfo=zone)
         end = start.timestamp() + spec["range_minutes"] * 60
-        opening = [row for row in session
-                   if (ts := _timestamp(row)) is not None and
-                   start.timestamp() <= ts.timestamp() < end]
         if stamp.timestamp() < end:
             return None, "opening_window_incomplete"
-        if len(opening) < max(2, spec["range_minutes"] // 2):
+        opening = _complete_opening_window(
+            session, current, int(spec["range_minutes"]))
+        if opening is None:
             return None, "opening_window_undercovered"
         first = _number(opening[0], "open", _number(opening[0], "close"))
         last = _number(opening[-1], "close")
@@ -1071,12 +1254,16 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
     return direction, "passed" if direction is not None else reason
 
 
-def _evaluate_rule_signal_staged(rows: Sequence[Any], value: Mapping[str, Any],
-                                 *, trace: bool) -> tuple[dict | None, list[dict[str, Any]]]:
+def _evaluate_rule_signal_staged(
+        rows: Sequence[Any], value: Mapping[str, Any], *, trace: bool,
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+        symbol: str | None = None,
+) -> tuple[dict | None, list[dict[str, Any]], dict[str, Any]]:
     """One evaluator for executable signals and non-authorizing stage traces."""
     spec = validate_rule_spec(value)
     bars = list(rows)
     stages: list[dict[str, Any]] = []
+    family_metadata: dict[str, Any] = {}
 
     def stage(name: str, passed: bool, reason: str) -> bool:
         if trace:
@@ -1087,37 +1274,41 @@ def _evaluate_rule_signal_staged(rows: Sequence[Any], value: Mapping[str, Any],
     needed = max(spec["lookback"] + 1, spec["atr_period"] + 1)
     if not stage("minimum_prefix", len(bars) >= needed,
                  "passed" if len(bars) >= needed else "insufficient_prefix"):
-        return None, stages
+        return None, stages, family_metadata
     current = bars[-1]
     close = _number(current, "close")
     opened = _number(current, "open", close)
     if not stage("positive_close", close > 0,
                  "passed" if close > 0 else "nonpositive_close"):
-        return None, stages
-    direction, family_reason = _family_direction(
-        bars, spec, close=close, opened=opened)
+        return None, stages, family_metadata
+    if spec["family"] == "cross_sectional_residual":
+        direction, family_reason, family_metadata = _cross_sectional_direction(
+            bars, spec, bars_by_symbol=bars_by_symbol, symbol=symbol)
+    else:
+        direction, family_reason = _family_direction(
+            bars, spec, close=close, opened=opened)
     if not stage("family_predicate", direction is not None, family_reason):
-        return None, stages
+        return None, stages, family_metadata
     assert direction is not None
     if not stage("side", _allowed(direction, spec),
                  "passed" if _allowed(direction, spec) else "direction_not_allowed"):
-        return None, stages
+        return None, stages, family_metadata
     confirmations = [str(spec["confirmation"]),
                      *(str(item) for item in spec.get("confirmations") or ())]
     for kind in confirmations:
         passed = _confirmation(direction, bars, spec, kind)
         if not stage(f"confirmation:{kind}", passed,
                      "passed" if passed else "confirmation_failed"):
-            return None, stages
+            return None, stages, family_metadata
     atr = _atr(bars, spec["atr_period"])
     if not stage("atr", atr is not None,
                  "passed" if atr is not None else "atr_unavailable"):
-        return None, stages
+        return None, stages, family_metadata
     assert atr is not None
     volatility_ok = _within_volatility_band(spec, atr, close)
     if not stage("volatility_band", volatility_ok,
                  "passed" if volatility_ok else "volatility_band_failed"):
-        return None, stages
+        return None, stages, family_metadata
     distance = max(atr * spec["stop_atr"],
                    close * MIN_STOP_DISTANCE_FRACTION)
     stop = close - distance if direction == "long" else close + distance
@@ -1126,12 +1317,12 @@ def _evaluate_rule_signal_staged(rows: Sequence[Any], value: Mapping[str, Any],
     stamp = _timestamp(current)
     if not stage("timestamp", stamp is not None,
                  "passed" if stamp is not None else "timestamp_unavailable"):
-        return None, stages
+        return None, stages, family_metadata
     assert stamp is not None
     window_ok = _within_entry_window(spec, stamp)
     if not stage("entry_window", window_ok,
                  "passed" if window_ok else "entry_window_failed"):
-        return None, stages
+        return None, stages, family_metadata
     result = {
         "direction": direction,
         "setup_type": f"rule_{spec['family']}",
@@ -1150,20 +1341,30 @@ def _evaluate_rule_signal_staged(rows: Sequence[Any], value: Mapping[str, Any],
     if spec["schema"] == RULE_SCHEMA_V3:
         result.update({"rule_schema": RULE_SCHEMA_V3,
                        "breakeven_r": spec.get("breakeven_r")})
+    if spec["family"] == "cross_sectional_residual":
+        result.update(family_metadata)
     stage("signal", True, "emitted")
-    return result, stages
+    return result, stages, family_metadata
 
 
-def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict | None:
+def evaluate_rule_signal(
+        rows: Sequence[Any], value: Mapping[str, Any], *,
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+        symbol: str | None = None) -> dict | None:
     """Evaluate one completed-bar prefix and return a deterministic signal."""
-    return _evaluate_rule_signal_staged(rows, value, trace=False)[0]
+    return _evaluate_rule_signal_staged(
+        rows, value, trace=False, bars_by_symbol=bars_by_symbol,
+        symbol=symbol)[0]
 
 
 def evaluate_rule_signal_trace(rows: Sequence[Any],
-                               value: Mapping[str, Any]) -> dict[str, Any]:
+                               value: Mapping[str, Any], *,
+                               bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+                               symbol: str | None = None) -> dict[str, Any]:
     """Return compact, non-authorizing predicate telemetry for one prefix."""
-    signal, stages = _evaluate_rule_signal_staged(rows, value, trace=True)
-    return {
+    signal, stages, family_metadata = _evaluate_rule_signal_staged(
+        rows, value, trace=True, bars_by_symbol=bars_by_symbol, symbol=symbol)
+    result = {
         "schema": "rule-signal-trace.v1",
         "authorizing": False,
         "diagnostic_only": True,
@@ -1171,10 +1372,15 @@ def evaluate_rule_signal_trace(rows: Sequence[Any],
         "terminal_stage": stages[-1]["stage"] if stages else None,
         "stages": stages,
     }
+    if validate_rule_spec(value)["family"] == "cross_sectional_residual":
+        result["market_context"] = family_metadata
+    return result
 
 
 def evaluate_rule_signal_metadata(rows: Sequence[Any],
-                                 value: Mapping[str, Any]) -> dict | None:
+                                 value: Mapping[str, Any], *,
+                                 bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+                                 symbol: str | None = None) -> dict | None:
     """Return non-authorizing metadata for one evaluated signal.
 
     This deliberately delegates signal authorization to
@@ -1183,7 +1389,8 @@ def evaluate_rule_signal_metadata(rows: Sequence[Any],
     30-bps floor decision without changing the authored rule or runtime
     signal contract.
     """
-    signal = evaluate_rule_signal(rows, value)
+    signal = evaluate_rule_signal(
+        rows, value, bars_by_symbol=bars_by_symbol, symbol=symbol)
     if signal is None:
         return None
     spec = validate_rule_spec(value)
@@ -1217,13 +1424,21 @@ def evaluate_rule_signal_metadata(rows: Sequence[Any],
 rule_signal_metadata = evaluate_rule_signal_metadata
 
 
-def generate_rule_signal(symbol: str, bars: Sequence[Any], *, config: Mapping[str, Any],
-                         now: datetime | None = None) -> dict | None:
+def generate_rule_signal(
+        symbol: str, bars: Sequence[Any], *, config: Mapping[str, Any],
+        now: datetime | None = None,
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None = None) -> dict | None:
     strategy = config.get("strategy", config) if isinstance(config, Mapping) else {}
     spec = strategy.get("rule_spec") if isinstance(strategy, Mapping) else None
     if not isinstance(spec, Mapping):
         return None
-    signal = evaluate_rule_signal(bars, spec)
+    normalized = validate_rule_spec(spec)
+    if (normalized["family"] == "cross_sectional_residual" and
+            str(strategy.get("execution_mode") or "").lower() not in
+            {"share", "shares", "equity"}):
+        return None
+    signal = evaluate_rule_signal(
+        bars, normalized, bars_by_symbol=bars_by_symbol, symbol=symbol)
     if signal is None:
         return None
     stamp = datetime.fromtimestamp(float(signal["signal_ts"]), timezone.utc)
@@ -1239,7 +1454,7 @@ def generate_rule_signal(symbol: str, bars: Sequence[Any], *, config: Mapping[st
 def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> dict:
     strategy = config.get("strategy", config) if isinstance(config, Mapping) else {}
     spec = validate_rule_spec(strategy.get("rule_spec") or {})
-    return {
+    evidence = {
         "schema": spec["schema"],
         "family": spec["family"],
         "rule_spec_hash": rule_spec_hash(spec),
@@ -1248,10 +1463,20 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
         "stop_price": snapshot.get("stop_price"),
         "target_price": snapshot.get("target_price"),
     }
+    if spec["family"] == "cross_sectional_residual":
+        evidence.update({
+            "benchmark_symbol": snapshot.get(
+                "benchmark_symbol", CROSS_SECTIONAL_BENCHMARK),
+            "market_context_digest": snapshot.get("market_context_digest"),
+            "candidate_behavior_identity": snapshot.get(
+                "candidate_behavior_identity"),
+        })
+    return evidence
 
 
 __all__ = [
-    "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
+    "BAR_SECONDS", "CONFIRMATIONS", "CROSS_SECTIONAL_BENCHMARK",
+    "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
     "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
            "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "SESSION_MINUTES",
@@ -1259,7 +1484,8 @@ __all__ = [
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "OPENING_ANCHORED_FAMILIES",
            "entry_window_bounds", "session_minutes",
-           "feature_window_bars", "rule_semantic_signature",
+           "feature_window_bars", "rule_behavior_identity",
+           "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",
     "RuleSpecError", "breakeven_stop_price", "completed_bar_exit_transition",
     "evaluate_rule_signal", "evaluate_rule_signal_trace",

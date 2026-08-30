@@ -303,6 +303,16 @@ class SessionAnchoredFamilyTests(unittest.TestCase):
                 self.assertIsNone(
                     evaluate_rule_signal(flat, self._template(family)))
 
+    def test_opening_families_require_every_minute_from_the_calendar_open(self):
+        rows = ohlc_bars(80, lambda i: .0008 if i < 30 else .0004,
+                         volume=SURGE)
+        missing_open = rows[8:]
+        for family in ("opening_range_breakout", "opening_range_fade",
+                       "opening_drive"):
+            with self.subTest(family=family):
+                self.assertIsNone(evaluate_rule_signal(
+                    missing_open, self._template(family)))
+
     def test_session_statistics_cannot_leak_across_days(self):
         """A longer history must not change today's VWAP or opening drive."""
         today = ohlc_bars(80, lambda index: .0006, volume=SURGE)

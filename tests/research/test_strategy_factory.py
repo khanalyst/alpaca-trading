@@ -113,6 +113,118 @@ def fake_adequate_worker(payload):
             "expected_variants": len(specs), "worker_pid": int(hypothesis["slot"]) + 100}
 
 
+def fake_signal_quality_screen_worker(payload):
+    """Keep legacy worker-fixture tests focused on their gate behavior."""
+    screens = {}
+    for raw_spec in payload.get("specs", ()):
+        spec = validate_rule_spec(raw_spec)
+        variant_id = rule_variant_id(spec)
+        screens[variant_id] = {
+            "schema": "signal-quality-screen.v1", "scope": "fit_only",
+            "authorizing": False, "diagnostic_only": True,
+            "variant_id": variant_id, "status": "complete_actionable_signal",
+            "reason": "actionable_signal_present", "event_count": 1,
+            "fit_cells": 1, "event_rejection_counts": {},
+            "digest": "fixture-screen-digest",
+        }
+    return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
+            "screens": dict(sorted(screens.items())), "worker_pid": 1}
+
+
+def zero_signal_quality_screen_worker(payload):
+    screens = {}
+    for raw_spec in payload.get("specs", ()):
+        spec = validate_rule_spec(raw_spec)
+        variant_id = rule_variant_id(spec)
+        screens[variant_id] = {
+            "schema": "signal-quality-screen.v1", "scope": "fit_only",
+            "authorizing": False, "diagnostic_only": True,
+            "variant_id": variant_id,
+            "status": "complete_zero_actionable_signal",
+            "reason": "no_actionable_signal", "event_count": 0,
+            "fit_cells": 1,
+            "event_rejection_counts": {"no_actionable_signal": 1},
+            "digest": "fixture-zero-screen-digest",
+        }
+    return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
+            "screens": dict(sorted(screens.items())), "worker_pid": 1}
+
+
+def nonpositive_signal_quality_screen_worker(payload):
+    screens = {}
+    for raw_spec in payload.get("specs", ()):
+        spec = validate_rule_spec(raw_spec)
+        variant_id = rule_variant_id(spec)
+        screens[variant_id] = {
+            "schema": "signal-quality-screen.v1", "scope": "fit_only",
+            "authorizing": False, "diagnostic_only": True,
+            "variant_id": variant_id,
+            "status": "complete_nonpositive_control",
+            "reason": "nonpositive_fit_control_delta", "event_count": 32,
+            "fit_cells": 32, "event_rejection_counts": {},
+            "primary_horizon": {
+                "horizon_minutes": 60, "candidate_count": 32,
+                "matched_count": 32, "matched_coverage": 1.0,
+                "candidate_minus_control_bps": -1.0,
+            },
+            "digest": "fixture-nonpositive-screen-digest",
+        }
+    return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
+            "screens": dict(sorted(screens.items())), "worker_pid": 1}
+
+
+def mixed_signal_quality_screen_worker(payload):
+    """Return individually skippable zero and nonpositive screen records."""
+    screens = {}
+    for index, raw_spec in enumerate(payload.get("specs", ())):
+        spec = validate_rule_spec(raw_spec)
+        variant_id = rule_variant_id(spec)
+        if index == 0:
+            screens[variant_id] = {
+                "schema": "signal-quality-screen.v1", "scope": "fit_only",
+                "authorizing": False, "diagnostic_only": True,
+                "variant_id": variant_id,
+                "status": "complete_zero_actionable_signal",
+                "reason": "no_actionable_signal", "event_count": 0,
+                "fit_cells": 1,
+                "event_rejection_counts": {"no_actionable_signal": 1},
+                "digest": "fixture-mixed-zero-screen-digest",
+            }
+        else:
+            screens[variant_id] = {
+                "schema": "signal-quality-screen.v1", "scope": "fit_only",
+                "authorizing": False, "diagnostic_only": True,
+                "variant_id": variant_id,
+                "status": "complete_nonpositive_control",
+                "reason": "nonpositive_fit_control_delta", "event_count": 32,
+                "fit_cells": 32, "event_rejection_counts": {},
+                "primary_horizon": {
+                    "horizon_minutes": 60, "candidate_count": 32,
+                    "matched_count": 32, "matched_coverage": 1.0,
+                    "candidate_minus_control_bps": -1.0,
+                },
+                "digest": "fixture-mixed-nonpositive-screen-digest",
+            }
+    return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
+            "screens": dict(sorted(screens.items())), "worker_pid": 1}
+
+
+def unknown_signal_quality_screen_worker(payload):
+    screens = {}
+    for raw_spec in payload.get("specs", ()):
+        spec = validate_rule_spec(raw_spec)
+        variant_id = rule_variant_id(spec)
+        screens[variant_id] = {
+            "schema": "signal-quality-screen.v1", "scope": "fit_only",
+            "authorizing": False, "diagnostic_only": True,
+            "variant_id": variant_id, "status": "unknown",
+            "reason": "worker_failure", "event_count": None,
+            "fit_cells": 1, "digest": None,
+        }
+    return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
+            "screens": dict(sorted(screens.items())), "worker_pid": 1}
+
+
 def persist_rule_gate(ledger, candidate_id, lane):
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
@@ -378,7 +490,7 @@ class StrategyFactoryTests(unittest.TestCase):
             with self.subTest(row=row), tempfile.TemporaryDirectory() as directory:
                 with self.assertRaisesRegex(
                         DiscoveryError,
-                        "explicit feed provenance|expected 'iex'"):
+                        "explicit feed provenance|configured executable feed 'iex'|expected 'iex'"):
                     run_factory(
                         [row], db_path=Path(directory) / f"edge-{index}.sqlite3",
                         strategies=1, variants_per_strategy=2, workers=1,
@@ -492,6 +604,245 @@ class StrategyFactoryTests(unittest.TestCase):
             ["canonical_family"], second.family)
         self.assertEqual(
             scheduled[0]["behavior_aliases"]["selection_scope"], "fit_only")
+
+    def test_signal_quality_screen_is_fit_only_and_deterministically_ordered(self):
+        rows = losing_breakouts(sessions=8)
+        _, bars, snapshot_map, quotes = factory_module._read_discovery_rows(rows)
+        hypotheses = initial_hypotheses(2)
+        payload = {
+            "bars": bars, "snapshots": list(snapshot_map.values()),
+            "quotes": quotes, "vehicle": "equity", "specs": [
+                hypotheses[1].rule_spec, hypotheses[0].rule_spec],
+            "hypothesis": vars(hypotheses[0]),
+        }
+        first = factory_module._signal_quality_screen_worker(payload)
+        second = factory_module._signal_quality_screen_worker(payload)
+        self.assertEqual(first["screens"], second["screens"])
+        self.assertEqual(list(first["screens"]), sorted(first["screens"]))
+        self.assertTrue(all(item["scope"] == "fit_only" and
+                            item["authorizing"] is False and
+                            item["diagnostic_only"] is True
+                            for item in first["screens"].values()))
+
+    def test_complete_zero_signal_screen_avoids_replay_but_unknown_fails_open(self):
+        rows = losing_breakouts(sessions=12)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=zero_signal_quality_screen_worker), \
+                patch.object(factory_module, "_worker") as replay:
+            result = run_factory(
+                rows, db_path=Path(directory) / "zero.sqlite3", strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0)
+            self.assertEqual(replay.call_count, 0)
+            screen = next(iter(result["signal_quality_screens"].values()))
+            self.assertEqual(screen["status"],
+                             "complete_zero_actionable_signal")
+            self.assertEqual(screen["reason"], "no_actionable_signal")
+            self.assertTrue(screen["digest"])
+            hypothesis = FactoryLedger(Path(directory) / "zero.sqlite3").hypotheses(
+                vehicle="equity")[0]
+            self.assertEqual(hypothesis["status"], "bounded_space_exhausted")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=unknown_signal_quality_screen_worker), \
+                patch.object(factory_module, "_worker",
+                             side_effect=fake_adequate_worker) as replay:
+            result = run_factory(
+                rows, db_path=Path(directory) / "unknown.sqlite3", strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0)
+            self.assertGreater(replay.call_count, 0)
+            self.assertGreater(result["variants"], 0)
+            screen = next(iter(result["signal_quality_screens"].values()))
+            self.assertEqual(screen["status"], "complete")
+            self.assertEqual(screen["reason"], "actionable_signal_or_fail_open")
+
+    def test_complete_nonpositive_screen_closes_hypothesis_without_replay(self):
+        rows = losing_breakouts(sessions=12)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=nonpositive_signal_quality_screen_worker), \
+                patch.object(factory_module, "_worker") as replay:
+            db = Path(directory) / "nonpositive.sqlite3"
+            result = run_factory(
+                rows, db_path=db, strategies=1, variants_per_strategy=2,
+                workers=1, min_trades=1, min_sessions=1, alpha=1.0)
+            self.assertEqual(replay.call_count, 0)
+            self.assertEqual(result["variants"], 0)
+            screen = next(iter(result["signal_quality_screens"].values()))
+            self.assertEqual(screen["status"], "complete_nonpositive_control")
+            self.assertEqual(screen["reason"],
+                             "nonpositive_fit_control_delta")
+            hypothesis = FactoryLedger(db).hypotheses(vehicle="equity")[0]
+            self.assertEqual(hypothesis["status"], "bounded_space_exhausted")
+            event = FactoryLedger(db).events(hypothesis["hypothesis_id"])[-1]
+            self.assertEqual(event["status"], "bounded_space_exhausted")
+            self.assertIn("no replay or gate was authorized", event["reason"])
+            self.assertFalse(event["payload"]["authorizing"])
+            self.assertTrue(event["payload"]["diagnostic_only"])
+
+    def test_mixed_complete_screen_closes_without_replay_and_reseeds_on_new_corpus(self):
+        """All individually skippable statuses share one terminal no-edge result."""
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=mixed_signal_quality_screen_worker), \
+                patch.object(factory_module, "_worker") as replay:
+            db = Path(directory) / "mixed-screen.sqlite3"
+            first = run_factory(
+                losing_breakouts(sessions=12), db_path=db, strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0)
+            self.assertEqual(replay.call_count, 0)
+            screen = next(iter(first["signal_quality_screens"].values()))
+            self.assertEqual(screen["status"], "complete")
+            self.assertEqual(screen["reason"], "complete_fit_screen_no_edge")
+            self.assertEqual(first["active_slots"], 0)
+            ledger = FactoryLedger(db)
+            self.assertEqual(ledger.hypotheses(vehicle="equity")[0]["status"],
+                             "bounded_space_exhausted")
+            first_id = ledger.hypotheses(vehicle="equity")[0]["hypothesis_id"]
+
+            # A changed corpus gets a new experiment identity and lets the
+            # normal slot-reseed path evaluate the next current hypothesis.
+            second = run_factory(
+                losing_breakouts(sessions=13), db_path=db, strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0)
+            self.assertEqual(replay.call_count, 0)
+            self.assertEqual(second["active_slots"], 0)
+            hypotheses = ledger.hypotheses(vehicle="equity")
+            self.assertEqual(len(hypotheses), 2)
+            self.assertNotEqual(hypotheses[-1]["hypothesis_id"], first_id)
+            self.assertEqual(hypotheses[-1]["status"], "bounded_space_exhausted")
+
+    def test_screen_terminal_reseed_waits_for_new_corpus(self):
+        """A later corpus can rotate the closed screen hypothesis normally."""
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=zero_signal_quality_screen_worker), \
+                patch.object(factory_module, "_worker") as replay:
+            db = Path(directory) / "screen-reseed.sqlite3"
+            first = run_factory(
+                losing_breakouts(sessions=12), db_path=db, strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0)
+            second = run_factory(
+                losing_breakouts(sessions=13), db_path=db, strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0)
+            self.assertEqual(first["active_slots"], 0)
+            self.assertEqual(second["active_slots"], 0)
+            self.assertEqual(replay.call_count, 0)
+            hypotheses = FactoryLedger(db).hypotheses(vehicle="equity")
+            self.assertEqual([item["generation"] for item in hypotheses], [0, 1])
+            self.assertNotEqual(hypotheses[0]["family"], hypotheses[1]["family"])
+
+    def test_complete_nonpositive_control_screen_skips_only_with_adequate_match(self):
+        quality = {
+            "scope": "fit_only", "authorizing": False,
+            "diagnostic_only": True, "variant_id": "variant",
+            "event_count": 32, "event_rejection_counts": {},
+            "horizon_metrics": {
+                "60m": {"candidate_count": 32, "matched_count": 30,
+                        "candidate_minus_control_bps": 0.0,
+                        "candidate_minus_control_stderr_bps": 1.0,
+                        "candidate_minus_control_t_stat": 0.0},
+            },
+        }
+        record = factory_module._signal_quality_screen_record(
+            quality, variant_id="variant", fit_cells=32,
+            primary_horizon=60)
+        self.assertEqual(record["status"], "complete_nonpositive_control")
+        self.assertEqual(record["primary_horizon"]["matched_count"], 30)
+        self.assertAlmostEqual(record["primary_horizon"]["matched_coverage"],
+                               30 / 32)
+        self.assertTrue(factory_module._screen_record_can_skip(
+            record, variant_id="variant"))
+
+        underpowered = dict(quality)
+        underpowered["horizon_metrics"] = {
+            "60m": {"candidate_count": 32, "matched_count": 29,
+                    "candidate_minus_control_bps": -1.0}}
+        record = factory_module._signal_quality_screen_record(
+            underpowered, variant_id="variant", fit_cells=32,
+            primary_horizon=60)
+        self.assertEqual(record["status"], "underpowered_control")
+        self.assertFalse(factory_module._screen_record_can_skip(
+            record, variant_id="variant"))
+
+    def test_partial_market_context_screen_fails_open(self):
+        quality = {
+            "scope": "fit_only", "authorizing": False,
+            "diagnostic_only": True, "variant_id": "variant",
+            "event_count": 32, "event_rejection_counts": {},
+            "market_context": {
+                "status": "partial",
+                "reason": "benchmark_context_missing",
+            },
+            "horizon_metrics": {
+                "60m": {"candidate_count": 32, "matched_count": 32,
+                        "candidate_minus_control_bps": -1.0},
+            },
+        }
+        record = factory_module._signal_quality_screen_record(
+            quality, variant_id="variant", fit_cells=32,
+            primary_horizon=60)
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["reason"], "benchmark_context_missing")
+        self.assertFalse(factory_module._screen_record_can_skip(
+            record, variant_id="variant"))
+
+    def test_nonpositive_control_screen_fails_open_for_missing_or_positive_control(self):
+        for delta in (None, 1.0):
+            with self.subTest(delta=delta):
+                quality = {
+                    "scope": "fit_only", "authorizing": False,
+                    "diagnostic_only": True, "variant_id": "variant",
+                    "event_count": 30, "event_rejection_counts": {},
+                    "horizon_metrics": {
+                        "60m": {"candidate_count": 30, "matched_count": 30,
+                                "candidate_minus_control_bps": delta},
+                    },
+                }
+                record = factory_module._signal_quality_screen_record(
+                    quality, variant_id="variant", fit_cells=30,
+                    primary_horizon=60)
+                self.assertFalse(factory_module._screen_record_can_skip(
+                    record, variant_id="variant"))
+
+    def test_screen_persistence_failure_restores_replay(self):
+        rows = losing_breakouts(sessions=12)
+        real_event = FactoryLedger.event
+
+        def fail_screen_event(ledger, hypothesis_id, status, reason, payload=None):
+            if reason.startswith("fit signal-quality screen"):
+                raise FactoryError("screen event unavailable")
+            return real_event(ledger, hypothesis_id, status, reason, payload)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=zero_signal_quality_screen_worker), \
+                patch.object(factory_module, "_worker",
+                             side_effect=fake_adequate_worker) as replay, \
+                patch.object(FactoryLedger, "event", new=fail_screen_event):
+            result = run_factory(
+                rows, db_path=Path(directory) / "event-failure.sqlite3",
+                strategies=1, variants_per_strategy=2, workers=1,
+                min_trades=1, min_sessions=1, alpha=1.0)
+            self.assertGreater(replay.call_count, 0)
+            screen = next(iter(result["signal_quality_screens"].values()))
+            self.assertEqual(screen["status"], "unknown")
+            self.assertEqual(screen["reason"], "persistence_failure")
+            self.assertTrue(all(item["status"] == "unknown"
+                                for item in screen["variants"].values()))
 
     def test_fit_execution_rejections_are_distinct_from_sparse_signals(self):
         blocked = core_module.diagnose([
@@ -713,13 +1064,14 @@ class StrategyFactoryTests(unittest.TestCase):
         with self.assertRaises(RuleSpecError):
             validate_rule_spec({"family": "invented_alpha"})
 
-    def test_initial_catalog_covers_all_eleven_rule_families(self):
+    def test_initial_catalog_covers_all_twelve_rule_families(self):
         hypotheses = initial_hypotheses()
-        self.assertEqual(len(hypotheses), 11)
-        self.assertEqual(len({item.family for item in hypotheses}), 11)
-        self.assertEqual(len({item.hypothesis_id for item in hypotheses}), 11)
-        with self.assertRaisesRegex(FactoryError, "between 1 and 11"):
-            initial_hypotheses(12)
+        self.assertEqual(len(hypotheses), 12)
+        self.assertEqual(len({item.family for item in hypotheses}), 12)
+        self.assertEqual(len({item.hypothesis_id for item in hypotheses}), 12)
+        self.assertEqual(hypotheses[-1].family, "cross_sectional_residual")
+        with self.assertRaisesRegex(FactoryError, "between 1 and 12"):
+            initial_hypotheses(13)
 
     def test_generation_budget_must_be_positive(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -767,7 +1119,9 @@ class StrategyFactoryTests(unittest.TestCase):
     def test_all_adequate_variants_replace_deterministically_and_generation_cap_stays_pending(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
-                patch.object(factory_module, "_worker", side_effect=fake_adequate_worker):
+                patch.object(factory_module, "_worker", side_effect=fake_adequate_worker), \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=fake_signal_quality_screen_worker):
             db = Path(directory) / "edge.sqlite3"
             result = run_factory(
                 losing_breakouts(), db_path=db, strategies=2,
@@ -783,7 +1137,9 @@ class StrategyFactoryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
-                patch.object(factory_module, "_worker", side_effect=fake_adequate_worker):
+                patch.object(factory_module, "_worker", side_effect=fake_adequate_worker), \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=fake_signal_quality_screen_worker):
             db = Path(directory) / "edge.sqlite3"
             pending = run_factory(
                 losing_breakouts(), db_path=db, strategies=1,
@@ -796,13 +1152,15 @@ class StrategyFactoryTests(unittest.TestCase):
 
     def _exhausted_slots(self, db, **kwargs):
         """Run one cycle that mutates, then one that hits the generation cap."""
-        run_factory(losing_breakouts(), db_path=db, strategies=2,
-                    variants_per_strategy=2, workers=2, min_trades=1,
-                    min_sessions=1, alpha=1.0, max_generations=2)
-        return run_factory(losing_breakouts(sessions=30), db_path=db,
-                           strategies=2, variants_per_strategy=2, workers=2,
-                           min_trades=1, min_sessions=1, alpha=1.0,
-                           max_generations=2, **kwargs)
+        with patch.object(factory_module, "_signal_quality_screen_worker",
+                          side_effect=fake_signal_quality_screen_worker):
+            run_factory(losing_breakouts(), db_path=db, strategies=2,
+                        variants_per_strategy=2, workers=2, min_trades=1,
+                        min_sessions=1, alpha=1.0, max_generations=2)
+            return run_factory(losing_breakouts(sessions=30), db_path=db,
+                               strategies=2, variants_per_strategy=2, workers=2,
+                               min_trades=1, min_sessions=1, alpha=1.0,
+                               max_generations=2, **kwargs)
 
     def test_false_discovery_correction_spans_every_family_in_the_cycle(self):
         # Selection compares candidates across families, so the correction that
@@ -981,7 +1339,9 @@ class StrategyFactoryTests(unittest.TestCase):
                 ledger.event(parent["hypothesis_id"], "retired", "manual")
 
     def test_configured_seven_strategy_shape_freezes_fit_aliases_before_arms(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "_signal_quality_screen_worker",
+                             side_effect=fake_signal_quality_screen_worker):
             result = run_factory(
                 losing_breakouts(3), db_path=Path(directory) / "edge.sqlite3",
                 strategies=7, variants_per_strategy=2, workers=7,

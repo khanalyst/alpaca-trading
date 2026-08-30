@@ -70,8 +70,33 @@ class Adapter:
 def _run(directory, *, llm=True):
     """One real cycle whose single family fails and is replaced."""
     db = Path(directory) / "edge.sqlite3"
+
+    def actionable_signal_screen_worker(payload):
+        """Keep the fixture's real persisted screen visible without skipping."""
+        screens = {}
+        for raw_spec in payload.get("specs", ()):
+            spec = validate_rule_spec(raw_spec)
+            variant_id = rule_variant_id(spec)
+            screens[variant_id] = {
+                "schema": "signal-quality-screen.v1",
+                "scope": "fit_only",
+                "authorizing": False,
+                "diagnostic_only": True,
+                "variant_id": variant_id,
+                "status": "complete_actionable_signal",
+                "reason": "actionable_signal_present",
+                "event_count": 1,
+                "fit_cells": 1,
+                "event_rejection_counts": {},
+                "digest": "screen-" + variant_id,
+            }
+        return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
+                "screens": dict(sorted(screens.items()))}
+
     with patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
             patch.object(factory_module, "_worker", side_effect=fake_adequate_worker), \
+            patch.object(factory_module, "_signal_quality_screen_worker",
+                         side_effect=actionable_signal_screen_worker), \
             patch.multiple(
                 gates,
                 PROTOCOL_BACKTEST_MIN_TRADES=1,
@@ -112,6 +137,21 @@ class ReportContentTests(unittest.TestCase):
             self.assertEqual(first["origin"]["llm"]["model"], "gpt-5")
             self.assertEqual(first["origin"]["llm"]["request_hash"], "q" * 64)
             self.assertEqual(first["rule_schema"], "rule-strategy.v2")
+
+            # The fit-only pre-screen is persisted and reported separately
+            # from replay variants.  It is diagnostic evidence, never a gate.
+            screen = first["signal_quality_screen"]
+            self.assertEqual(screen["status"], "complete")
+            self.assertEqual(screen["reason"],
+                             "actionable_signal_or_fail_open")
+            self.assertTrue(screen["diagnostic_only"])
+            self.assertFalse(screen["authorizing"])
+            self.assertEqual(screen["variant_count"], 2)
+            self.assertEqual(screen["skipped_count"], 0)
+            self.assertEqual(first["screened_variant_count"], 2)
+            self.assertEqual(first["screened_out_variant_count"], 0)
+            self.assertTrue(first["tested_for_signal_quality"])
+            self.assertNotIn("raw_rows", json.dumps(screen))
 
             # Each variant and how it did.
             self.assertEqual(first["variants_tested"], 2)
@@ -294,6 +334,8 @@ class ReportRenderingTests(unittest.TestCase):
             for fragment in (
                     "VEHICLE: equity", "SLOT 0", "via llm discovery", THESIS,
                     "proposed by openai/gpt-5", "variants tested: 2",
+                    "fit signal-quality screen only",
+                    "skipped full replay 0",
                     "outcome: retired",
                     "after 2 of 2 intended variants failed",
                     "dominant failure mode: negative_expectancy",
@@ -306,6 +348,8 @@ class ReportRenderingTests(unittest.TestCase):
             self.assertIn("# Autonomous research report", markdown)
             self.assertIn("| variant | lane | trades |", markdown)
             self.assertIn(f"> {THESIS}", markdown)
+            self.assertIn("Fit signal-quality screen only", markdown)
+            self.assertIn("skipped full replay 0", markdown)
 
     def test_human_reports_render_structured_fit_risk_budget_and_delivery(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -168,6 +168,68 @@ def _fit_signal_quality_metrics(
     return result
 
 
+def _fit_path_telemetry_metrics(
+        fit_diagnostics: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Return compact grouped MFE/MAE diagnostics for report rendering."""
+    if not isinstance(fit_diagnostics, Mapping):
+        return []
+    section = fit_diagnostics.get("path_telemetry")
+    groups = section.get("groups") if isinstance(section, Mapping) else None
+    if not isinstance(groups, Sequence):
+        return []
+    result: list[dict[str, Any]] = []
+    for group in groups:
+        if not isinstance(group, Mapping) or not group.get("count"):
+            continue
+        def median_value(name: str) -> float | None:
+            metric = group.get(name)
+            if not isinstance(metric, Mapping):
+                return _number(metric)
+            return _number(metric.get("median"))
+        result.append({
+            "target_r": _number(group.get("target_r")),
+            "max_hold_bars": group.get("max_hold_bars"),
+            "exit_reason": str(group.get("exit_reason") or "unknown"),
+            "count": int(group.get("count") or 0),
+            "censored": int(group.get("right_censored") or 0),
+            "gapped": int(group.get("gapped") or 0),
+            "mfe_bps": median_value("mfe_bps"),
+            "mae_bps": median_value("mae_bps"),
+            "mfe_r": median_value("mfe_r"),
+            "mae_r": median_value("mae_r"),
+        })
+    return result
+
+
+def _fit_target_hold_reachability(
+        fit_diagnostics: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return the compact fit-only target/hold diagnostic for rendering."""
+    if not isinstance(fit_diagnostics, Mapping):
+        return None
+    section = fit_diagnostics.get("target_hold_reachability")
+    if not isinstance(section, Mapping):
+        return None
+    configured = section.get("configured")
+    configured = configured if isinstance(configured, Mapping) else {}
+    recommendation = section.get("recommendation")
+    recommendation = recommendation if isinstance(recommendation, Mapping) else None
+    return {
+        "total": int(section.get("total") or 0),
+        "usable": int(section.get("usable") or 0),
+        "censored": int(section.get("censored") or 0),
+        "expiry_count": int(section.get("expiry_count") or 0),
+        "unreachable_count": int(section.get("unreachable_count") or 0),
+        "unreachable_rate": _number(section.get("unreachable_rate")),
+        "status": str(section.get("status") or "unknown"),
+        "target_r": _number(configured.get("target_r")),
+        "max_hold_bars": configured.get("max_hold_bars"),
+        "recommendation": ({
+            "target_r": _number(recommendation.get("target_r")),
+            "max_hold_bars": recommendation.get("max_hold_bars"),
+        } if recommendation is not None else None),
+    }
+
+
 def _dependence_policy_row(row: Mapping[str, Any]) -> dict:
     """Decode and hash-check one frozen policy without opening a writable ledger."""
     try:
@@ -453,6 +515,108 @@ def _fit_events(events: Sequence[Mapping[str, Any]]) -> dict:
             "excluded_behavior_aliases": [], "proposed_behavior_aliases": []}
 
 
+def _screen_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Return the latest compact fit-only signal-quality screen audit.
+
+    Screened variants intentionally have no account/gate row.  Keep their
+    status visible without treating them as replayed work or an edge result.
+    The projection accepts only aggregate counts, the primary horizon summary,
+    and content digests; raw observations and held-out fields never enter the
+    report.
+    """
+    for event in reversed(events):
+        payload = event.get("payload") or {}
+        section = payload.get("signal_quality_screen") \
+            if isinstance(payload, Mapping) else None
+        # The factory event writer stores the compact section as the payload
+        # itself.  Accept the nested form as a compatibility path for callers
+        # that wrap event results before persistence, but never inspect raw
+        # worker rows here.
+        if (section is None and isinstance(payload, Mapping) and
+                payload.get("schema") == "signal-quality-screen.v1"):
+            section = payload
+        if not isinstance(section, Mapping):
+            continue
+        variants = section.get("variants")
+        if not isinstance(variants, Mapping):
+            variants = {}
+        compact: list[dict[str, Any]] = []
+        primary_rows: list[dict[str, Any]] = []
+        for raw_id, raw in sorted(variants.items(), key=lambda item: str(item[0])):
+            if not isinstance(raw, Mapping):
+                continue
+            item: dict[str, Any] = {
+                "variant_id": str(raw_id),
+                "status": str(raw.get("status") or "unknown"),
+                "reason": str(raw.get("reason") or ""),
+                "digest": (str(raw.get("digest"))
+                           if raw.get("digest") else None),
+            }
+            primary = raw.get("primary_horizon")
+            if isinstance(primary, Mapping):
+                try:
+                    horizon = int(primary.get("horizon_minutes"))
+                    candidate_count = int(primary.get("candidate_count"))
+                    matched_count = int(primary.get("matched_count"))
+                    coverage = float(primary.get("matched_coverage"))
+                    delta = float(primary.get("candidate_minus_control_bps"))
+                except (TypeError, ValueError, OverflowError):
+                    primary = None
+                else:
+                    if (horizon <= 0 or candidate_count < 0 or matched_count < 0 or
+                            matched_count > candidate_count or
+                            not math.isfinite(coverage) or
+                            not math.isfinite(delta)):
+                        primary = None
+            if isinstance(primary, Mapping):
+                item["primary_horizon"] = {
+                    "horizon_minutes": horizon,
+                    "candidate_count": candidate_count,
+                    "matched_count": matched_count,
+                    "matched_coverage": coverage,
+                    "candidate_minus_control_bps": delta,
+                }
+                primary_rows.append(item["primary_horizon"])
+            compact.append(item)
+        skipped_statuses = {"complete_zero_actionable_signal",
+                            "complete_nonpositive_control"}
+        skipped = sum(item["status"] in skipped_statuses for item in compact)
+        aggregate_primary: dict[str, Any] | None = None
+        if primary_rows:
+            horizons = sorted({item["horizon_minutes"] for item in primary_rows})
+            candidate_count = sum(item["candidate_count"] for item in primary_rows)
+            matched_count = sum(item["matched_count"] for item in primary_rows)
+            weighted_delta = sum(
+                item["candidate_minus_control_bps"] * item["candidate_count"]
+                for item in primary_rows)
+            aggregate_primary = {
+                "horizon_minutes": horizons[0] if len(horizons) == 1 else None,
+                "horizons": horizons,
+                "candidate_count": candidate_count,
+                "matched_count": matched_count,
+                "matched_coverage": (matched_count / candidate_count
+                                      if candidate_count else None),
+                "candidate_minus_control_bps": (
+                    weighted_delta / candidate_count if candidate_count else None),
+                "variant_count": len(primary_rows),
+            }
+        return {
+            "schema": str(section.get("schema") or "signal-quality-screen.v1"),
+            "scope": str(section.get("scope") or "fit_only"),
+            "diagnostic_only": section.get("diagnostic_only") is True,
+            "authorizing": section.get("authorizing") is True,
+            "status": str(section.get("status") or "unknown"),
+            "reason": str(section.get("reason") or ""),
+            "variant_count": len(compact),
+            "skipped_count": skipped,
+            "digest": (str(section.get("digest"))
+                       if section.get("digest") else None),
+            "primary_horizon": aggregate_primary,
+            "variants": compact,
+        }
+    return {}
+
+
 def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                  vehicle: str | None = None, slot: int | None = None) -> dict:
     """Assemble the full discovery narrative from the two ledgers."""
@@ -619,6 +783,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             variants = accounts.get(hypothesis_id, [])
             own_closures = closures.get(hypothesis_id, [])
             fit_audit = _fit_events(own)
+            screen_audit = _screen_events(own)
             for row in variants:
                 row["ledger_status"] = deployed.get(
                     (str(row["variant_id"]), name))
@@ -640,6 +805,14 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                                   int(item["generation"])),
                 "variants": variants,
                 "fit_diagnostics": fit_audit["diagnostics"],
+                # A signal-quality screen is fit-only, non-authorizing work;
+                # keep it distinct from replay variants and their gates.
+                "signal_quality_screen": screen_audit,
+                "screened_variant_count": int(screen_audit.get(
+                    "variant_count", 0)),
+                "screened_out_variant_count": int(screen_audit.get(
+                    "skipped_count", 0)),
+                "tested_for_signal_quality": bool(screen_audit),
                 "risk_summary": (
                     fit_audit["diagnostics"].get("risk")
                     if isinstance(fit_audit["diagnostics"], Mapping) else None),
@@ -671,7 +844,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
         graded = [item for item in local_lessons if item["graded"]]
         tested_families = {str(item["family"])
                            for rows in slots.values() for item in rows
-                           if item["variants"]}
+                           if item["variants"] or item.get("signal_quality_screen")}
         cross_family = cross_family_dependence_report(family_vectors.get(name, ()))
         vehicle_search_state = {
             str(slot_id): entry["search_state"]
@@ -696,6 +869,12 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 "variants_tested": sum(len(item["variants"])
                                        for rows in slots.values()
                                        for item in rows),
+                "screened_variants": sum(int(item.get(
+                    "screened_variant_count", 0))
+                    for rows in slots.values() for item in rows),
+                "screened_out_variants": sum(int(item.get(
+                    "screened_out_variant_count", 0))
+                    for rows in slots.values() for item in rows),
                 "families_explored": sorted(tested_families),
                 "families_untested": [family for family in RULE_FAMILIES
                                       if family not in tested_families],
@@ -917,6 +1096,24 @@ def render_text(report: Mapping[str, Any]) -> str:
                     add(f"      LLM proposal rejected: {origin['llm_error']}")
                 if item["variants"]:
                     add(f"      variants tested: {item['variants_tested']}")
+                screen = item.get("signal_quality_screen") or {}
+                if screen:
+                    primary = screen.get("primary_horizon") or {}
+                    primary_text = ""
+                    if primary:
+                        primary_text = (
+                            f"; primary horizon {primary.get('horizon_minutes') or
+                            primary.get('horizons')}m n={primary.get('candidate_count')}"
+                            f" matched={primary.get('matched_count')}"
+                            f" coverage {_fmt(primary.get('matched_coverage'))}"
+                            f" vs-null {_fmt(primary.get('candidate_minus_control_bps'), 2)}bps")
+                    add(
+                        "      fit signal-quality screen only: "
+                        f"{screen.get('status')} ({screen.get('reason')}); "
+                        f"variants {screen.get('variant_count', 0)}, "
+                        f"skipped full replay {screen.get('skipped_count', 0)}"
+                        f"{primary_text}; digest "
+                        f"{str(screen.get('digest') or '')[:16]}…")
                 fit_diagnostics = item.get("fit_diagnostics") or {}
                 if fit_diagnostics:
                     first = fit_diagnostics.get("first_signal") or {}
@@ -952,6 +1149,33 @@ def render_text(report: Mapping[str, Any]) -> str:
                             f"(t {_fmt(item['after_cost_t'], 2)})"
                             for item in signal_quality)
                         add(f"      fit conditional forward returns {rendered}")
+                    path_metrics = _fit_path_telemetry_metrics(fit_diagnostics)
+                    if path_metrics:
+                        rendered = "; ".join(
+                            f"{item['target_r']}R/{item['max_hold_bars']}b/{item['exit_reason']} "
+                            f"n={item['count']} MFE {_fmt(item['mfe_bps'], 2)}bps "
+                            f"MAE {_fmt(item['mae_bps'], 2)}bps "
+                            f"({_fmt(item['mfe_r'], 2)}R/{_fmt(item['mae_r'], 2)}R), "
+                            f"censored {item['censored']} gaps {item['gapped']}"
+                            for item in path_metrics)
+                        add(f"      fit path excursions {rendered}")
+                    reachability = _fit_target_hold_reachability(fit_diagnostics)
+                    if reachability:
+                        recommendation = reachability.get("recommendation")
+                        suffix = (f" -> propose {recommendation['target_r']}R/"
+                                  f"{recommendation['max_hold_bars']}b"
+                                  if recommendation else "")
+                        add(
+                            "      fit target/hold reachability "
+                            f"{reachability['target_r']}R/"
+                            f"{reachability['max_hold_bars']}b: "
+                            f"usable {reachability['usable']}/"
+                            f"{reachability['total']}, censored "
+                            f"{reachability['censored']}, expiry "
+                            f"{reachability['expiry_count']}, unreachable "
+                            f"{reachability['unreachable_count']} "
+                            f"({_fmt(reachability['unreachable_rate'])}); "
+                            f"status {reachability['status']}{suffix}")
                 for variant in item["variants"]:
                     verdict = _variant_classification(variant)
                     add(f"        - {variant['variant_id']}  [{verdict}]"
@@ -1067,6 +1291,23 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                             f" {variant['trades']} | {_fmt(variant['heldout_delta'])} |"
                             f" {_fmt(variant['heldout_delta_lcb'])} |"
                             f" {_fmt(variant['q_value'])} | {verdict} |")
+                screen = item.get("signal_quality_screen") or {}
+                if screen:
+                    primary = screen.get("primary_horizon") or {}
+                    primary_text = ""
+                    if primary:
+                        primary_text = (
+                            f"; primary horizon {primary.get('horizon_minutes') or
+                            primary.get('horizons')}m, n={primary.get('candidate_count')}, "
+                            f"matched={primary.get('matched_count')}, coverage "
+                            f"{_fmt(primary.get('matched_coverage'))}, vs-null "
+                            f"{_fmt(primary.get('candidate_minus_control_bps'), 2)} bps")
+                    out.append(
+                        "- Fit signal-quality screen only: "
+                        f"{screen.get('status')} ({screen.get('reason')}); "
+                        f"variants {screen.get('variant_count', 0)}, skipped full replay "
+                        f"{screen.get('skipped_count', 0)}{primary_text}; digest "
+                        f"`{str(screen.get('digest') or '')[:16]}…`")
                 fit_diagnostics = item.get("fit_diagnostics") or {}
                 if fit_diagnostics:
                     first = fit_diagnostics.get("first_signal") or {}
@@ -1103,6 +1344,32 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                             f"(t {_fmt(item['after_cost_t'], 2)})"
                             for item in signal_quality)
                         out.append(f"- Fit conditional forward returns: {rendered}")
+                    path_metrics = _fit_path_telemetry_metrics(fit_diagnostics)
+                    if path_metrics:
+                        rendered = "; ".join(
+                            f"{item['target_r']}R/{item['max_hold_bars']}b/{item['exit_reason']} "
+                            f"n={item['count']}, MFE {_fmt(item['mfe_bps'], 2)} bps, "
+                            f"MAE {_fmt(item['mae_bps'], 2)} bps "
+                            f"({_fmt(item['mfe_r'], 2)}R/{_fmt(item['mae_r'], 2)}R), "
+                            f"censored {item['censored']}, gaps {item['gapped']}"
+                            for item in path_metrics)
+                        out.append(f"- Fit path excursions: {rendered}")
+                    reachability = _fit_target_hold_reachability(fit_diagnostics)
+                    if reachability:
+                        recommendation = reachability.get("recommendation")
+                        suffix = (f"; propose {recommendation['target_r']}R/"
+                                  f"{recommendation['max_hold_bars']}b"
+                                  if recommendation else "")
+                        out.append(
+                            "- Fit target/hold reachability: "
+                            f"{reachability['target_r']}R/"
+                            f"{reachability['max_hold_bars']}b; usable "
+                            f"{reachability['usable']}/{reachability['total']}; "
+                            f"censored {reachability['censored']}; expiry "
+                            f"{reachability['expiry_count']}; unreachable "
+                            f"{reachability['unreachable_count']} "
+                            f"({_fmt(reachability['unreachable_rate'])}); "
+                            f"status {reachability['status']}{suffix}")
                 outcome = item["outcome"]
                 out += ["", f"**Outcome:** {outcome['kind'].replace('_', ' ')}"
                             f" — {outcome.get('reason') or ''}"]

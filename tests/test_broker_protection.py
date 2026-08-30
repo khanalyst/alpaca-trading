@@ -501,6 +501,40 @@ class BrokerProtectionTests(ProtectionHarness):
         self.assertEqual(
             runtime["protection"]["SPY"]["active_stop_price"], 101.5)
 
+    def test_v3_local_exit_uses_triggering_bar_price_and_provenance(self):
+        self._bind_engine(runtime_name="runtime-v3-bar-source")
+        self._open_bracketed_position(plan_updates={
+            "rule_schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
+            "signal_ts": (self.NOW - timedelta(minutes=2)).timestamp(),
+        })
+
+        def remove_broker_protection(current):
+            current["active_trades"]["SPY"]["protective_legs"] = []
+            current["protection"]["SPY"]["protective_legs"] = []
+            return current
+
+        state.update_state(remove_broker_protection)
+        bar = {
+            "symbol": "SPY", "timestamp": self.NOW - timedelta(minutes=1),
+            "open": 101.5, "high": 102.0, "low": 98.5, "close": 100.0,
+            "volume": 1000, "feed": "sip", "provider": "alpaca",
+            "bar_age_seconds": 0.0,
+        }
+        monitored = self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live),
+            market_rows={"SPY": {"bars": [bar], "quote": {
+                "symbol": "SPY", "timestamp": self.NOW,
+                "bid": 109, "ask": 111,
+            }}})
+        self.assertEqual(monitored["closed"],
+                         [{"symbol": "SPY", "reason": "stop"}])
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["closing_trigger_price"], 99.0)
+        self.assertEqual(trade["exit_fill_source"], "bar")
+        self.assertEqual(trade["exit_feed"], "sip")
+        self.assertEqual(trade["exit_provider"], "alpaca")
+        self.assertEqual(trade["exit_bar_age_seconds"], 0.0)
+
     def test_v3_waits_for_the_entry_fill_before_amending_protection(self):
         self._bind_engine(runtime_name="runtime-v3-partial-entry")
         self._open_bracketed_position(
@@ -702,6 +736,32 @@ class BrokerProtectionTests(ProtectionHarness):
         self.assertEqual(self.provider.cancelled, [])
         self.assertEqual([row[1] for row in self._journal_trades()], ["open"])
 
+    def test_equity_local_exit_labels_broker_position_price_not_snapshot_quote(self):
+        self._bind_engine(runtime_name="runtime-poller-broker-position-source")
+        self._open_bracketed_position()
+
+        def remove_broker_protection(current):
+            current["active_trades"]["SPY"]["protective_legs"] = []
+            current["protection"]["SPY"]["protective_legs"] = []
+            return current
+
+        state.update_state(remove_broker_protection)
+        monitored = self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live), market_rows={
+                "SPY": {"quote": {
+                    "symbol": "SPY", "timestamp": self.NOW,
+                    "bid": 109, "ask": 111, "feed": "sip",
+                    "provider": "alpaca",
+                }},
+            })
+        self.assertEqual(monitored["closed"],
+                         [{"symbol": "SPY", "reason": "stop"}])
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["closing_trigger_price"], 98.5)
+        self.assertEqual(trade["exit_fill_source"], "broker_position")
+        self.assertIsNone(trade["exit_feed"])
+        self.assertEqual(trade["exit_provider"], "alpaca")
+
     def test_poller_cancels_legs_before_a_force_flat_close(self):
         self._bind_engine(runtime_name="runtime-poller-force-flat")
         order = self._open_bracketed_position()
@@ -886,6 +946,29 @@ class OptionTakeProfitTests(ProtectionHarness):
                          [{"symbol": self.OPTION, "reason": "stop"}])
         self.assertEqual(self.provider.cancelled, [leg_id])
         self.assertEqual(len(self.provider.close_requests), 1)
+
+    def test_option_poller_reuses_snapshot_quote_and_records_exact_source(self):
+        self._bind_engine(profile="options", runtime_name="runtime-option-snapshot")
+        self._open_option_position()
+        with mock.patch.object(
+                self.engine.market, "stock_quotes",
+                side_effect=AssertionError("snapshot quote must be reused")):
+            monitored = self.engine._monitor_positions(
+                self.NOW, list(self.provider.positions_live), market_rows={
+                    "SPY": {"quote": {
+                        "symbol": "SPY", "timestamp": self.NOW,
+                        "bid": 98, "ask": 99, "feed": "sip",
+                        "provider": "alpaca",
+                    }},
+                })
+        self.assertEqual(monitored["closed"],
+                         [{"symbol": self.OPTION, "reason": "stop"}])
+        trade = state.load_state()["active_trades"][self.OPTION]
+        self.assertEqual(trade["closing_trigger_price"], 98.5)
+        self.assertEqual(trade["exit_fill_source"], "quote")
+        self.assertEqual(trade["exit_feed"], "sip")
+        self.assertEqual(trade["exit_provider"], "alpaca")
+        self.assertEqual(trade["exit_quote_age_seconds"], 0.0)
 
     def test_a_lone_resting_leg_is_not_treated_as_lost_protection(self):
         self._bind_engine(profile="options", runtime_name="runtime-option-lone")

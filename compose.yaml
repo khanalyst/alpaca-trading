@@ -6,6 +6,7 @@ x-app: &app
     context: .
     args:
       PYTHON_IMAGE: ${ALPACA_PYTHON_IMAGE:-python:3.13.5-slim-bookworm}
+      ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
   user: "10001:10001"
   working_dir: /app
   read_only: true
@@ -32,7 +33,7 @@ services:
       - --out
       - runtime/research/recorded
       - --interval
-      - ${ALPACA_RECORDER_INTERVAL_SECONDS:-60}
+      - ${ALPACA_RECORDER_INTERVAL_SECONDS:-30}
     environment:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
@@ -46,6 +47,9 @@ services:
       ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES: ${ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES:-15}
       ALPACA_RECORDER_BAR_GAP_MINUTES: ${ALPACA_RECORDER_BAR_GAP_MINUTES:-5}
       ALPACA_RECORDER_STRICT_BAR_FEEDS: "${ALPACA_RECORDER_STRICT_BAR_FEEDS:-}"
+      ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
+      ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
+      ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
     secrets:
       - source: agent_credentials
         target: agent_credentials
@@ -59,7 +63,7 @@ services:
         target: /app/config.yaml
         mode: 0444
     healthcheck:
-      test: ["CMD", "python", "deploy/health.py", "recorder", "--max-age", "300"]
+      test: ["CMD", "python", "deploy/health.py", "recorder", "--config", "config.yaml", "--max-age", "300"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -80,6 +84,9 @@ services:
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
       ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
       ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
+      ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
+      ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
     secrets:
       - source: agent_credentials
         target: agent_credentials
@@ -129,6 +136,9 @@ services:
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
       ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
       ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
+      ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
+      ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
     secrets:
       - source: agent_credentials
         target: agent_credentials
@@ -185,7 +195,7 @@ services:
       ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN: ${ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN:-1}
       ALPACA_RESEARCH_BACKTEST: ${ALPACA_RESEARCH_BACKTEST:-1}
       ALPACA_FACTORY_ENABLED: ${ALPACA_FACTORY_ENABLED:-1}
-      ALPACA_FACTORY_STRATEGIES: ${ALPACA_FACTORY_STRATEGIES:-11}
+      ALPACA_FACTORY_STRATEGIES: ${ALPACA_FACTORY_STRATEGIES:-12}
       ALPACA_FACTORY_VARIANTS: ${ALPACA_FACTORY_VARIANTS:-4}
       ALPACA_FACTORY_WORKERS: ${ALPACA_FACTORY_WORKERS:-2}
       ALPACA_FACTORY_STARTING_CASH: ${ALPACA_FACTORY_STARTING_CASH:-100000}
@@ -209,6 +219,9 @@ services:
       ALPACA_SHADOW_MIN_TRADES: ${ALPACA_SHADOW_MIN_TRADES:-150}
       ALPACA_SHADOW_MIN_SESSIONS: ${ALPACA_SHADOW_MIN_SESSIONS:-30}
       PYTHON: /usr/local/bin/python
+      ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
+      ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
+      ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
     secrets:
       - source: research_llm_credentials
         target: research_llm_credentials
@@ -250,6 +263,10 @@ services:
       - DAC_OVERRIDE
     network_mode: none
     restart: "no"
+    environment:
+      ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
+      ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
+      ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
     command:
       - sh
       - -ec
@@ -285,6 +302,9 @@ services:
       - ${ALPACA_SHADOW_RETENTION_DAYS:-180}
     environment:
       ALPACA_SHADOW_RETENTION_DAYS: ${ALPACA_SHADOW_RETENTION_DAYS:-180}
+      ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
+      ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
+      ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
     volumes:
       - runtime-data:/app/runtime:ro
       - shadow-data:/app/shadow
@@ -307,6 +327,9 @@ services:
       ALPACA_PAPER: "true"
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
       ALPACA_EDGE_DB: ${ALPACA_EDGE_DB:-runtime/research/edge_lab.sqlite3}
+      ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
+      ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
+      ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
     ports:
       - "127.0.0.1:${ALPACA_DASHBOARD_PORT:-8080}:8080"
     configs:

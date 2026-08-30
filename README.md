@@ -9,6 +9,9 @@ Options are single-leg long calls or puts
 (buy-to-open, sell-to-close); multi-leg and naked/short option structures are
 unsupported. No performance claim is made.
 
+The current remediation state and evidence boundary are recorded in
+[docs/trading-edge-remediation-2026-08-29.md](docs/trading-edge-remediation-2026-08-29.md).
+
 ## What this repository does
 
 This is not an LLM that watches prices and improvises orders. It is a set of
@@ -50,10 +53,15 @@ flowchart LR
 
 ### How edge discovery works
 
-The strategy factory normally runs eleven logical research slots, so a fresh
+The strategy factory normally runs twelve logical research slots, so a fresh
 cycle can cover every bounded rule family. Each slot holds one hypothesis and
 evaluates four isolated-account variants. It diagnoses only chronological fit
 data, then judges the variants on untouched held-out data.
+The twelfth family is `cross_sectional_residual`: a shares-only residual signal
+against SPY built from synchronized one-minute context. It remains inside the
+finite grammar and does not replace the shipped 24-ETF universe; any future
+family or universe change must be justified by fit-only screen and
+cross-sectional results.
 Candidates are de-duplicated by their family-specific executable semantic
 signature (including v1/v2/v3 no-op aliases). Continuous numeric axes use
 relative/local scaling for semantic novelty, while integer/topology axes use
@@ -71,10 +79,15 @@ is reserved for the later parity-matched live-shadow tail.
 The exit grammar remains fixed: an ATR-derived bracket (with the 30 bps minimum
 stop floor), configured R target, and bounded bar-cap time exit. Factory
 fit-only measurement reports eligible prefixes/first signals, 30-bps floor
-binding, planned exits, configured/stressed economics, power, configured
-pre-cap risk versus capped delivered risk, provider/feed provenance, pricing source,
+binding, planned exits, gross/net/fees/slippage economics, power, configured
+pre-cap versus fill-delivered risk, provider/feed provenance for each leg, pricing source,
 configured limits, pass/fail/unknown row counts, behavioral aliases, and
 aggregate fit-partition execution-rejection counts/reasons for operator review.
+Before replay, the fit-only signal screen reports forward-return/control rows,
+including `p=1` placeholders when a comparison is unavailable. A terminal
+current-hypothesis no-edge result is explicit and reseeds when the corpus
+changes. Target/hold path telemetry measures reachability only; lower-target and
+hold proposals stay on a bounded ladder and cannot authorize an edge.
 The cycle also records per-symbol/session bar coverage once per corpus and
 distinguishes hold discontinuities from ordinary time expiry without assigning
 a directional R effect; it is diagnostic only, does not expand exits, and
@@ -162,8 +175,9 @@ decide the new trial.
 Every cycle begins with broker reconciliation and fresh clock, calendar, quote,
 account, and position checks. The selected proved rule produces a deterministic
 setup. The risk engine then decides whether it fits daily loss, open-risk,
-gross-exposure, position, liquidity, spread, and buying-power limits. Only after
-those checks does the provider submit an idempotently named day order.
+position, liquidity, spread, buying-power, and marketable-limit constraints,
+including the account-wide gross-exposure cap. Only after those checks does the
+provider submit an idempotently named day order.
 
 Equities use broker-side brackets. Long options are paper-only because Alpaca
 does not provide an option stop order: the runtime rests a broker-side
@@ -187,17 +201,27 @@ gross/open risk, and daily loss) are all enforced rather than relaxed for
 simulation. Point-in-time required records become actionable at the maximum of
 their event timestamp, `as_of`, and `observed_at`. A delayed recorder bar can
 signal when it is observed; execution enters at that decision/observation time
-using fresh IEX (equity) or OPRA (option) evidence. Delayed full OHLC never
+using fresh exact IEX or SIP (equity) or OPRA (option) evidence. Delayed full OHLC never
 backfills an earlier entry, and partial pre-entry bar ranges are excluded.
 Fit diagnostics may still count planned signal/exit geometry as
 quote-required, non-authorizing measurement. Historical bar fallback remains
 diagnostic and cannot authorize proof.
 Authorizing fills retain provider/feed/age/source for both legs:
-IEX for equity entry and exit, OPRA for option entry and exit, each no older
-than 30 seconds. Feed provenance is request-bound: an explicit provider-row
-feed label is retained when present, otherwise the configured/requested feed
-label is used; it is not an independent venue attestation. Bar-only,
+the equity lane must use the exact IEX or SIP feed for entry and exit, while
+options require exact OPRA evidence, each no older than 30 seconds.
+`delayed_sip` is diagnostic only and cannot authorize. Feed provenance is
+request-bound: an explicit provider-row feed label is retained when present,
+otherwise the configured/requested feed label is used; it is not an independent
+venue attestation. Bar-only,
 partial-feed, or stale legs cannot authorize proof.
+
+The recorder runs on a fixed 30-second cadence and durably records per-symbol
+quote and completed-bar watermarks. Readiness requires both watermarks to be no
+older than 30 seconds for every required symbol; quote and bar readiness are not
+substituted for one another. Exact Alpaca calendar metadata records holidays and
+early closes explicitly. Scheduler service liveness is reported separately from
+research evidence and readiness, so an alive scheduler does not imply a ready
+corpus or a validated edge.
 
 ### Where the LLM is used
 
@@ -285,6 +309,12 @@ pooled. Runtime risk applies the configured stressed-cost scenario (25 bps by
 default) and abstains when `stressed_cost_to_risk_ratio` exceeds
 `max_stressed_cost_to_risk_ratio`; intended,
 delivered, ratio, and shortfall telemetry are persisted with orders and fills.
+The scheduled calibration-only pass measures each symbol/session on the
+9/15/25/50-bps ladder. It is disabled by default and can affect runtime only
+through an explicit operator-enabled path whose artifact carries the exact
+provider/feed, content hash, disjoint chronological held-out sessions, and an
+artifact-wide effective-after boundary. Missing or unusable cells use the
+configured scalar fallback; calibration never self-authorizes.
 Shadow authorization fails closed when the journal is
 missing or stale, the sample is insufficient, costs are optimistic, a terminal
 fill is materially underfilled (<80% of requested quantity), or the
@@ -428,7 +458,7 @@ which is written one append-only partition per New York session date under
 concatenates those partitions in session order.
 `ALPACA_RESEARCH_SESSION_WINDOW` limits it to the most recent N sessions and
 `ALPACA_RESEARCH_DATASET` overrides the source with normalized JSONL. By default
-each cycle schedules eleven logical strategy slots and four isolated accounts
+each cycle schedules twelve logical strategy slots and four isolated accounts
 per strategy. Each isolated book is processed by one bounded worker. Its
 edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
@@ -468,8 +498,9 @@ python research.py factory report           # the full discovery narrative
 ```
 
 The standalone `research.py factory run` (or `factory-run`) preflight requires
-readable normalized JSONL with explicit provenance; the default equity lane
-requires IEX. `--diagnostic-only` is the explicit non-authorizing escape hatch:
+readable normalized JSONL with explicit provenance; the equity lane requires
+exact IEX or SIP. `delayed_sip` is diagnostic-only. `--diagnostic-only` is the
+explicit non-authorizing escape hatch:
 it records the source as diagnostic and emits no proofs.
 
 Three read-only views answer three different questions, and none can change a

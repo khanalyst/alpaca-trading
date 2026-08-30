@@ -41,6 +41,17 @@ def _normalized_status(value: Any) -> str:
     return str(raw or "").split(".")[-1].strip().lower()
 
 
+def _aligned_cycle_delay(now: float, interval: float) -> float:
+    """Return the delay to the next shared wall-clock interval boundary."""
+    cadence = float(interval)
+    if cadence <= 0:
+        return 0.0
+    remainder = float(now) % cadence
+    if remainder <= 1e-9:
+        return cadence
+    return cadence - remainder
+
+
 class RuntimeControlMixin:
     def flatten_all(self, reason: str = "operator") -> bool:
         temporary = False
@@ -588,6 +599,7 @@ class RuntimeControlMixin:
         except Exception:  # noqa: BLE001
             pass
 
+
     def run(self, *, max_cycles: int | None = None) -> None:
         if not self._acquire_lock(persistent=True):
             raise AlpacaError(f"another {self.mode} runtime process already holds the run lock")
@@ -646,7 +658,7 @@ class RuntimeControlMixin:
                     raise
                 cycles += 1
                 if self.running and (max_cycles is None or cycles < max_cycles):
-                    time.sleep(interval)
+                    time.sleep(_aligned_cycle_delay(time.time(), interval))
         except BaseException as exc:
             run_failure = exc
             raise

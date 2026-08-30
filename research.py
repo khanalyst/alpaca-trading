@@ -78,13 +78,17 @@ def _validated_row_provenance(row: Mapping[str, Any], *, kind: str,
 
     CLI provider/feed values describe the configured adapter; they are not
     permission to rewrite an external row's identity.  Equity evidence is
-    authorizable only from the shipped IEX feed, while option evidence keeps
-    its independent OPRA requirement.
+    authorizable only from the exact configured real-time feed (IEX or SIP),
+    while delayed SIP remains diagnostic-only and options keep their
+    independent OPRA requirement.
     """
     provider_value = row.get("provider")
     feed_value = row.get("feed", row.get("feed_id"))
     provider = "" if provider_value is None else str(provider_value).strip()
-    feed = "" if feed_value is None else str(feed_value).strip().lower()
+    feed = ("" if feed_value is None else
+            str(feed_value).strip().lower().replace("-", "_"))
+    if feed == "delayed":
+        feed = "delayed_sip"
     if not provider:
         raise NormalizationError(f"{kind} row requires explicit provider provenance")
     expected_provider = (None if configured_provider in (None, "")
@@ -97,17 +101,23 @@ def _validated_row_provenance(row: Mapping[str, Any], *, kind: str,
             raise NormalizationError(
                 f"{kind} row feed {feed or '[missing]'!r} is not executable; OPRA is required")
         return provider, feed
-    expected_feed = (None if configured_feed in (None, "")
-                     else str(configured_feed).strip().lower())
+    expected_feed = ("iex" if configured_feed in (None, "") else
+                     str(configured_feed).strip().lower().replace("-", "_"))
+    if expected_feed == "delayed":
+        expected_feed = "delayed_sip"
     # ``validate-data`` is the research authorization preflight.  Keep the
     # exact equity requirement explicit even when a caller supplies a
-    # SIP/delayed CLI hint for diagnostics.
-    if expected_feed != "iex":
+    # delayed-SIP hint for diagnostics.
+    if expected_feed not in {"iex", "sip"}:
         raise NormalizationError(
-            f"equity research requires configured IEX feed, got {expected_feed or '[missing]'}")
+            "equity research requires configured real-time feed (iex or sip); "
+            f"{expected_feed or '[missing]'} is diagnostic-only")
     if feed != expected_feed:
+        qualifier = ("; delayed_sip is diagnostic-only"
+                     if feed == "delayed_sip" else "")
         raise NormalizationError(
-            f"{kind} row feed {feed or '[missing]'!r} is not executable; expected 'iex'")
+            f"{kind} row feed {feed or '[missing]'!r} does not match configured "
+            f"executable feed {expected_feed!r}{qualifier}")
     return provider, feed
 
 
@@ -147,7 +157,7 @@ def cmd_validate_data(args: argparse.Namespace) -> int:
             continue
         # Run structural normalization against the row's own metadata first,
         # so diagnostics retain useful symbol/value errors even when a second
-        # provenance check also rejects an IEX or missing-feed row.  Missing
+        # provenance check also rejects a mismatched or missing-feed row. Missing
         # fields use CLI values only for this diagnostic attempt; a row cannot
         # count as valid unless the explicit check below succeeds.
         raw_provider = row.get("provider")
@@ -383,7 +393,10 @@ def _factory_feed_contract(config: Mapping[str, Any]) -> tuple[str, str | None]:
     feed = (broker.get("data_feed") or data.get("feed") or "iex")
     provider = (broker.get("provider") or data.get("provider") or
                 config.get("provider") or os.getenv("ALPACA_DATA_PROVIDER"))
-    return str(feed).strip().lower(), (
+    feed = str(feed).strip().lower().replace("-", "_")
+    if feed == "delayed":
+        feed = "delayed_sip"
+    return feed, (
         str(provider).strip() if provider not in (None, "") else None)
 
 
@@ -392,8 +405,8 @@ def _factory_dataset_preflight(
     """Check CLI factory input provenance before invoking ``run_factory``.
 
     Both the public factory API and this CLI require row-owned provenance for
-    authorizing corpora.  Command-line metadata must never relabel a SIP or
-    unlabelled row as IEX evidence.
+    authorizing corpora.  Command-line metadata must never relabel a
+    differently sourced or unlabelled row as configured evidence.
 
     The returned context is suitable for a diagnostic result.  File-backed
     factory runs fail closed when the source cannot be inspected; callers that
@@ -441,25 +454,32 @@ def _factory_dataset_preflight(
                 if kind in _EQUITY_FACTORY_KINDS:
                     equity_rows += 1
                     provider = str(row.get("provider") or "").strip()
-                    feed = str(row.get("feed", row.get("feed_id")) or "").strip().lower()
+                    feed = (str(row.get("feed", row.get("feed_id")) or "")
+                            .strip().lower().replace("-", "_"))
+                    if feed == "delayed":
+                        feed = "delayed_sip"
                     if not provider:
                         errors.append(f"row {number}: {kind} requires explicit provider provenance")
                     elif expected_provider and provider != expected_provider:
                         errors.append(
                             f"row {number}: {kind} provider {provider!r} does not match "
                             f"configured provider {expected_provider!r}")
-                    if expected_feed != "iex":
+                    if expected_feed not in {"iex", "sip"}:
                         errors.append(
-                            "configured equity research feed must be IEX; "
-                            f"got {expected_feed or '[missing]'}")
-                    elif feed != "iex":
+                            "configured equity research feed must be real-time "
+                            "(iex or sip); "
+                            f"{expected_feed or '[missing]'} is diagnostic-only")
+                    elif feed != expected_feed:
+                        qualifier = ("; delayed_sip is diagnostic-only"
+                                     if feed == "delayed_sip" else "")
                         errors.append(
                             f"row {number}: {kind} feed {feed or '[missing]'!r} "
-                            "is not executable; expected 'iex'")
+                            f"does not match configured executable feed "
+                            f"{expected_feed!r}{qualifier}")
                 elif kind in _OPTION_FACTORY_KINDS:
                     # A mixed corpus may carry option evidence while an equity
                     # factory lane is running.  Keep that evidence explicit as
-                    # well, without allowing OPRA rows to satisfy the IEX gate.
+                    # well, without allowing OPRA rows to satisfy the equity gate.
                     provider = str(row.get("provider") or "").strip()
                     feed = str(row.get("feed", row.get("feed_id")) or "").strip().lower()
                     if not provider:
@@ -810,7 +830,7 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"),
         # A worker projection is itself a strict, authorizing view.  Do not
         # let it turn the explicit diagnostic escape hatch back into a hard
-        # provenance failure when the source carries IEX/missing metadata.
+        # provenance failure when the source carries mismatched/missing metadata.
         worker_data=(None if diagnostic_only else
                      getattr(args, "worker_data", None)),
         progress_callback=_research_progress,

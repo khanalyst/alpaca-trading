@@ -31,6 +31,7 @@ from deploy.scheduler_output import (  # noqa: E402
     structured_research_cycle,
     structured_research_preflight,
 )
+from deploy.provenance import deployment_provenance  # noqa: E402
 
 
 _running = True
@@ -60,7 +61,7 @@ def write_status(path: Path, status: str, **detail) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": 2, "status": status, "updated_ts": time.time(),
-        "pid": os.getpid(), **detail,
+        "pid": os.getpid(), "provenance": deployment_provenance(), **detail,
     }
     temp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:

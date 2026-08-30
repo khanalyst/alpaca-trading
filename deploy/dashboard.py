@@ -24,6 +24,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from deploy import health, load_config
+from deploy.provenance import deployment_provenance
 from deploy.scheduler_output import (derive_research_readiness,
                                      structured_research_preflight,
                                      structured_research_progress,
@@ -637,6 +638,7 @@ def _safe_heartbeat(path: Path) -> dict:
         "structured_failures", "stdout_chars", "stderr_chars",
         "stdout_truncated", "stderr_truncated", "cycle_status",
         "research_cycle", "research_preflight",
+        "provenance", "evidence_available",
     }
     result = {key: value for key, value in raw.items() if key in allowed}
     # Progress is the one nested heartbeat object intentionally exposed.  It
@@ -680,6 +682,7 @@ def snapshot(root: Path) -> dict:
                       if str(row.get("vehicle")) != tradeable)
     return {
         "schema": 1,
+        "provenance": deployment_provenance(),
         "generated_ts": time.time(),
         "mode": mode,
         "strategy": {
@@ -697,6 +700,8 @@ def snapshot(root: Path) -> dict:
         },
         "recorder": health.recorder(
             recorder_path, 900,
+            configured_symbols=((config.get("universe") or {}).get("symbols")
+                                or []),
             configured_data_feed=((config.get("broker") or {}).get("data_feed")
                                   or "iex"),
             configured_options_feed=((config.get("broker") or {}).get(
@@ -865,7 +870,8 @@ class Handler(BaseHTTPRequestHandler):
                        "text/html; charset=utf-8")
             return
         if parsed.path == "/healthz":
-            self._json(HTTPStatus.OK, {"ok": True, "component": "dashboard"})
+            self._json(HTTPStatus.OK, {"ok": True, "component": "dashboard",
+                                       "provenance": deployment_provenance()})
             return
         if parsed.path == "/readyz":
             ok = all((
@@ -874,7 +880,8 @@ class Handler(BaseHTTPRequestHandler):
                 (self.root / "research" / "cache").is_dir(),
             ))
             self._json(HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE,
-                       {"ok": ok, "component": "dashboard"})
+                       {"ok": ok, "component": "dashboard",
+                        "provenance": deployment_provenance()})
             return
         if parsed.path == "/api/status":
             try:

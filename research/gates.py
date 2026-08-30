@@ -85,6 +85,11 @@ PROTOCOL_SHADOW_MIN_CLUSTERS = 30
 PROTOCOL_QUALIFICATION_MIN_TRADES = 100
 PROTOCOL_QUALIFICATION_MIN_SESSIONS = 30
 PROTOCOL_QUALIFICATION_MIN_CLUSTERS = 30
+# A null comparison cannot authorize from one or two lucky matches.  These
+# floors are intentionally stricter than a mere ``available`` flag and are
+# checked against both paired coverage and absolute count.
+NULL_CONTROL_MIN_MATCHED = 30
+NULL_CONTROL_MIN_COVERAGE = 0.80
 # Readable aliases for callers that want to display the protocol without
 # depending on the internal naming scheme.  Enforcement uses ``PROTOCOL_*``
 # directly so these compatibility names cannot weaken a durable check.
@@ -791,6 +796,43 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
     return result
 
 
+def paired_control_adequacy(candidate: Iterable[Mapping], control: Iterable[Mapping], *,
+                            vehicle: str, min_matched: int = NULL_CONTROL_MIN_MATCHED,
+                            min_coverage: float = NULL_CONTROL_MIN_COVERAGE,
+                            equity_feed: str = "iex") -> dict:
+    """Check minimum paired count and coverage for a control arm.
+
+    ``matched_cluster_test`` remains a descriptive statistic.  This separate
+    authorizing predicate prevents a positive null delta from passing on a
+    tiny, selectively matched subset of candidate opportunities.
+    """
+    pairs = matched_pairs(candidate, control, vehicle=vehicle,
+                          equity_feed=equity_feed)
+    candidate_rows = [row for row in _authorizing_rows(
+        candidate, vehicle=vehicle, equity_feed=equity_feed)
+                      if row.get("vehicle", vehicle) == vehicle and
+                      row.get("no_trade") is not True]
+    control_rows = [row for row in _authorizing_rows(
+        control, vehicle=vehicle, equity_feed=equity_feed)
+                    if row.get("vehicle", vehicle) == vehicle and
+                    row.get("no_trade") is not True]
+    denominator = max(len(candidate_rows), len(control_rows))
+    coverage = pairs["matched"] / denominator if denominator else 0.0
+    count_ok = pairs["matched"] >= int(min_matched)
+    coverage_ok = coverage >= float(min_coverage)
+    return {
+        "matched": int(pairs["matched"]),
+        "candidate_count": len(candidate_rows),
+        "control_count": len(control_rows),
+        "coverage": coverage,
+        "minimum_matched": int(min_matched),
+        "minimum_coverage": float(min_coverage),
+        "count_adequate": bool(count_ok),
+        "coverage_adequate": bool(coverage_ok),
+        "adequate": bool(count_ok and coverage_ok),
+    }
+
+
 def matched_effective_breadth(candidate: Iterable[Mapping],
                               baseline: Iterable[Mapping], *,
                               vehicle: str,
@@ -1487,8 +1529,9 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
                     0 <= float(age) <= OPTION_MAX_QUOTE_AGE_SECONDS)
 
         # Equity evidence is bound to the envelope's explicit feed identity.
-        # Current authorizing envelopes require IEX; the SIP path exists only
-        # so pre-field historical envelopes can be re-verified faithfully.
+        # The envelope identity is checked against every executable leg, so
+        # either configured real-time feed may authorize; delayed SIP remains
+        # diagnostic-only.
         quality_adequate = bool(
             executed and all(_equity_quote_leg(row, leg)
                              for row in executed for leg in ("entry", "exit")))
@@ -1707,7 +1750,7 @@ def arm_evidence_report(*, candidate: Iterable[Mapping],
             "fill_source_pairs": dict(sorted(pairs.items())),
             "quote_age_seconds": age_summaries,
             # ``totals`` describes every executed replay row, including
-            # diagnostic-only bar/IEX fills.  The explicit eligible totals
+            # diagnostic-only bar/delayed fills.  The explicit eligible totals
             # keep authorizing economics separate for downstream consumers.
             "totals": {name: total(executed_raw, name)
                        for name in ("gross_pnl", "costs", "net_pnl")},
@@ -2024,11 +2067,21 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     derived["walk_forward_adequate"] = bool(walk.get("adequate"))
     derived["walk_forward_majority_positive"] = bool(walk.get("majority_positive"))
     null = dict(null_control or {})
+    null_adequacy = paired_control_adequacy(
+        heldout, null_source, vehicle=vehicle,
+        min_matched=int(null.get("minimum_matched", NULL_CONTROL_MIN_MATCHED)),
+        min_coverage=float(null.get("minimum_coverage", NULL_CONTROL_MIN_COVERAGE)),
+        equity_feed=equity_feed)
+    # Persisted adequacy is recomputed from source rows; a forged summary flag
+    # cannot turn a thin null arm into an authorizing control.
+    null["paired_adequacy"] = null_adequacy
     derived["null_control_available"] = bool(
-        null.get("available", null.get("actual_control", False)))
+        null.get("available", null.get("actual_control", False)) and
+        null_adequacy["adequate"])
     null_delta = null.get("mean_delta")
     null_p = null.get("p_value")
     derived["null_control_delta_positive"] = bool(
+        derived["null_control_available"] and
         null_delta is not None and null_p is not None and
         float(null_delta) > 0 and float(null_p) <= float(alpha))
     # A caller-supplied ``adequate`` flag is not authoritative.  The persisted
@@ -2175,7 +2228,10 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     # verification does.
     effective_passes = bool(
         passes and
-        (vehicle != "equity" or equity_feed == "iex") and
+        # Equity proofs may authorize either configured real-time feed.  The
+        # row projections above enforce exact entry/exit feed parity; delayed
+        # SIP remains diagnostic-only and therefore cannot pass this boundary.
+        (vehicle != "equity" or equity_feed in {"iex", "sip"}) and
         all(derived.get(key, False) for key in GATE_REQUIRED_CHECKS) and
         all(derived.values())
     )
@@ -2384,7 +2440,7 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             return False
         vehicle = str(envelope.get("vehicle") or "")
         if (has_equity_feed and envelope.get("passes") and
-                vehicle == "equity" and equity_feed != "iex"):
+                vehicle == "equity" and equity_feed not in {"iex", "sip"}):
             return False
         projection_payload = envelope.get("authorization_projection")
         if not isinstance(projection_payload, Mapping):
@@ -2739,8 +2795,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             rebuilt_passes = rebuilt.get("passes")
             if not has_equity_feed:
                 # The pre-binding schema authorized the historical SIP view.
-                # Rebuild its exact decision without applying the new IEX-only
-                # veto; omission is compatibility, never an IEX inference.
+                # Rebuild its exact pre-feed-binding decision; omission is
+                # compatibility, never an inference of the shipped feed.
                 rebuilt_checks = rebuilt.get("checks") or {}
                 rebuilt_passes = bool(
                     envelope.get("passes") and
@@ -3048,6 +3104,8 @@ __all__ = ["AcceptanceFloor", "ARM_EVIDENCE_SCHEMA", "CLUSTER_SECONDS", "GATE_EN
            "SealedWindowError", "chronological_split", "cost_stress_report",
            "deterministic_placebo_deltas", "falsification_gate",
            "heldout_separation", "matched_cluster_test", "matched_effective_breadth",
+           "paired_control_adequacy", "NULL_CONTROL_MIN_MATCHED",
+           "NULL_CONTROL_MIN_COVERAGE",
            "clustered_mde_power_report", "clustered_mde_power",
            "matched_pairs",
            "max_drawdown_of", "paired_delta", "performance_floor",

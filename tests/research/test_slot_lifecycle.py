@@ -11,6 +11,7 @@ hypothesis and its deployed candidate are never touched again.
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from agent.config import validate_config
 from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
@@ -30,6 +31,12 @@ from research.strategy_factory import (
 )
 
 STRATEGIES = 7
+
+
+def _fail_open_signal_quality_screen(payload):
+    """Keep slot-capacity tests independent of the optional fit-only screen."""
+    return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
+            "screens": {}}
 
 
 def _ledgers(directory):
@@ -584,9 +591,18 @@ class RunFactoryRecoveryTests(unittest.TestCase):
             _prove_every_active_slot(factory)
             self.assertEqual(factory.active("equity"), [])
 
-            result = run_factory(losing_breakouts(), db_path=path,
-                                 vehicle="equity", strategies=STRATEGIES,
-                                 variants_per_strategy=2, workers=2)
+            # This test asserts proved-slot recovery, not signal-quality
+            # classification.  Make the diagnostic screen fail open so its
+            # optional no-edge terminal path cannot consume the capacity under
+            # test; complete/adequately-powered screen behavior is covered by
+            # the strategy-factory screen regressions.
+            with patch("research.strategy_factory.ProcessPoolExecutor",
+                       side_effect=OSError), \
+                    patch("research.strategy_factory._signal_quality_screen_worker",
+                          side_effect=_fail_open_signal_quality_screen):
+                result = run_factory(losing_breakouts(), db_path=path,
+                                     vehicle="equity", strategies=STRATEGIES,
+                                     variants_per_strategy=2, workers=2)
             self.assertNotEqual(result["status"], "exhausted")
             self.assertEqual(len(result["revived"]), STRATEGIES)
             self.assertEqual(result["active_slots"], STRATEGIES)
@@ -596,9 +612,15 @@ class RunFactoryRecoveryTests(unittest.TestCase):
         from research.strategy_factory import run_factory
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "edge_lab.sqlite3"
-            result = run_factory(losing_breakouts(), db_path=path,
-                                 vehicle="equity", strategies=STRATEGIES,
-                                 variants_per_strategy=2, workers=2)
+            # Keep this capacity invariant independent of fit-only screen
+            # outcomes; unknown screen evidence must remain fail-open.
+            with patch("research.strategy_factory.ProcessPoolExecutor",
+                       side_effect=OSError), \
+                    patch("research.strategy_factory._signal_quality_screen_worker",
+                          side_effect=_fail_open_signal_quality_screen):
+                result = run_factory(losing_breakouts(), db_path=path,
+                                     vehicle="equity", strategies=STRATEGIES,
+                                     variants_per_strategy=2, workers=2)
             self.assertEqual(result["revived"], [])
             self.assertEqual(result["reseeds"], [])
             self.assertEqual(result["active_slots"], STRATEGIES)

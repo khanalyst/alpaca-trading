@@ -14,11 +14,13 @@ import hashlib
 import json
 import math
 from statistics import mean, median
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    MIN_STOP_DISTANCE_BPS, evaluate_rule_signal_metadata,
+    CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS,
+    evaluate_rule_signal_metadata,
     evaluate_rule_signal_trace, feature_window_bars, rule_variant_id,
     validate_rule_spec, SESSION_MINUTES,
 )
@@ -29,6 +31,8 @@ from .market_data import (historical_backfill_record, record_available_at,
                            replay_record_is_available)
 from .stats import clustered_mde_power_report
 from .signal_quality import measure_signal_quality
+from .path_telemetry import (aggregate_path_telemetry, compute_path_telemetry,
+                             target_hold_reachability)
 
 
 FIT_DIAGNOSTICS_SCHEMA = "fit-diagnostics.v1"
@@ -522,6 +526,13 @@ def _planned_vector(metadata: Mapping[str, Any], *, full: bool,
         "signal_timestamp": metadata.get("signal_timestamp"),
         "entry_price": rounded(metadata.get("entry_price")),
     }
+    if metadata.get("candidate_behavior_identity") is not None:
+        vector.update({
+            "benchmark_symbol": metadata.get("benchmark_symbol"),
+            "market_context_digest": metadata.get("market_context_digest"),
+            "candidate_behavior_identity": metadata.get(
+                "candidate_behavior_identity"),
+        })
     if full:
         vector.update({
             "stop_distance": rounded(metadata.get("planned_stop_distance",
@@ -543,10 +554,41 @@ def _diagnostic_backfill_enabled(policy: Any | None) -> bool:
     return bool(getattr(policy, "allow_historical_backfill_diagnostics", False))
 
 
+def _immutable_market_context(
+        bars: Sequence[Any],
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None,
+        ) -> Mapping[str, tuple[Any, ...]]:
+    """Freeze supplied market context, or derive it from the fit corpus."""
+    if bars_by_symbol is None:
+        derived: dict[str, list[Any]] = {}
+        for row in bars:
+            symbol = str(_row_value(row, "symbol", "")).strip().upper()
+            if symbol:
+                derived.setdefault(symbol, []).append(row)
+        source: Mapping[str, Sequence[Any]] = derived
+    elif isinstance(bars_by_symbol, Mapping):
+        source = bars_by_symbol
+    else:
+        return MappingProxyType({})
+    frozen: dict[str, tuple[Any, ...]] = {}
+    for raw_symbol, raw_rows in source.items():
+        symbol = str(raw_symbol).strip().upper()
+        if (not symbol or symbol in frozen or isinstance(raw_rows, (str, bytes)) or
+                not isinstance(raw_rows, Sequence)):
+            if symbol:
+                frozen[symbol] = ()
+            continue
+        frozen[symbol] = tuple(raw_rows)
+    return MappingProxyType(frozen)
+
+
 def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
-                  policy: Any | None = None) -> dict[str, Any]:
+                  policy: Any | None = None,
+                  bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+                  ) -> dict[str, Any]:
     """Collect first-signal metadata and a compact all-prefix predicate funnel."""
     allow_backfill = _diagnostic_backfill_enabled(policy)
+    market_context = _immutable_market_context(bars, bars_by_symbol)
     grouped: dict[tuple[str, str], list[Any]] = {}
     for row in bars:
         day = _session(row)
@@ -620,7 +662,12 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             eligible_prefixes += 1
             prefix_status["eligible"] += 1
             session_had_eligible_prefix = True
-            trace = evaluate_rule_signal_trace(rows[:index + 1], spec)
+            if spec["family"] == "cross_sectional_residual":
+                trace = evaluate_rule_signal_trace(
+                    rows[:index + 1], spec, bars_by_symbol=market_context,
+                    symbol=symbol)
+            else:
+                trace = evaluate_rule_signal_trace(rows[:index + 1], spec)
             stages = trace.get("stages") or []
             for item in stages:
                 name = str(item.get("stage") or "unknown")
@@ -633,9 +680,14 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 terminal_reasons[str(terminal.get("reason") or "unknown")] += 1
             if trace.get("signal") is not None:
                 signal_prefixes += 1
-            metadata = (evaluate_rule_signal_metadata(rows[:index + 1], spec)
-                        if trace.get("signal") is not None and first is None
-                        else None)
+            if trace.get("signal") is not None and first is None:
+                metadata = (evaluate_rule_signal_metadata(
+                    rows[:index + 1], spec, bars_by_symbol=market_context,
+                    symbol=symbol)
+                    if spec["family"] == "cross_sectional_residual" else
+                    evaluate_rule_signal_metadata(rows[:index + 1], spec))
+            else:
+                metadata = None
             if metadata is not None:
                 first = {**metadata, "session_date": day, "symbol": symbol,
                          # These indices are an internal hand-off to the
@@ -1138,7 +1190,9 @@ def measure_fit_diagnostics(
         costs: Any | None = None, vehicle: str | None = None,
         risk_config: Mapping[str, Any] | None = None,
         config: Mapping[str, Any] | None = None,
-        policy: Any | None = None) -> dict[str, Any]:
+        policy: Any | None = None,
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+        ) -> dict[str, Any]:
     """Measure compact fit-only behavior and execution summaries.
 
     ``bars`` and ``account_rows`` must already be the fit/development slice.
@@ -1147,7 +1201,9 @@ def measure_fit_diagnostics(
     """
     normalized = validate_rule_spec(spec)
     bar_rows = list(bars)
-    prefix = _fit_prefixes(bar_rows, normalized, policy=policy)
+    market_context = _immutable_market_context(bar_rows, bars_by_symbol)
+    prefix = _fit_prefixes(
+        bar_rows, normalized, policy=policy, bars_by_symbol=market_context)
     signals = prefix["first_signals"]
     entry_vectors = [_planned_vector(item, full=False) for item in signals]
     full_vectors = [_planned_vector(item, full=True) for item in signals]
@@ -1172,6 +1228,24 @@ def measure_fit_diagnostics(
     if normalized.get("breakeven_r") is not None:
         planned["breakeven_r"] = normalized["breakeven_r"]
     rows = [dict(row) for row in account_rows if isinstance(row, Mapping)]
+    # ``simulate_account`` attaches path telemetry to executed rows.  Keep
+    # this aggregate compact and fit-only; callers supplying legacy rows get
+    # an empty diagnostic rather than an inferred path.
+    path_rows: list[Mapping[str, Any]] = []
+    for row in rows:
+        nested = row.get("path_telemetry")
+        if isinstance(nested, Mapping):
+            path_rows.append(nested)
+        elif row.get("entry_timestamp") is not None:
+            measured = compute_path_telemetry(row, bar_rows)
+            if measured.get("available"):
+                path_rows.append(measured)
+    path_telemetry = aggregate_path_telemetry(path_rows)
+    target_hold = target_hold_reachability(
+        path_rows,
+        target_r=normalized.get("target_r"),
+        max_hold_bars=normalized.get("max_hold_bars"),
+    )
     controls_input = risk_config if risk_config is not None else config
     stress_scenario, stress_limit = _stress_controls(controls_input)
     resolved_vehicle = vehicle or next(
@@ -1192,7 +1266,10 @@ def measure_fit_diagnostics(
         bar_rows, normalized, policy=policy,
         cost_hurdle_bps=_expected_cost_hurdle_bps(
             costs, vehicle=resolved_vehicle),
-        precomputed_first_signals=signals)
+        precomputed_first_signals=(
+            None if normalized["family"] == "cross_sectional_residual" else
+            signals),
+        bars_by_symbol=market_context)
     expected_cost = {
         "bar_reference_round_trip_bps": _expected_cost_hurdle_bps(
             costs, vehicle=resolved_vehicle, executable_quotes=False),
@@ -1290,6 +1367,11 @@ def measure_fit_diagnostics(
         "cost_to_risk": {"configured": configured, "stressed": stressed},
         "risk": _risk_summary(rows),
         "exits": _exit_summary(rows),
+        "path_telemetry": path_telemetry,
+        # This is a compact, fit-only projection of path telemetry.  It
+        # contains no rows and is descriptive only; mutation code may use it
+        # solely after coordinate exhaustion and all normal gates still run.
+        "target_hold_reachability": target_hold,
         "exit_grammar": audit_exit_grammar(normalized),
         "mde_power": _mde(rows),
         "behavior_fingerprint": {
@@ -1305,6 +1387,23 @@ def measure_fit_diagnostics(
             "planned_vector_count": len(full_vectors),
         },
     }
+    if normalized["family"] == "cross_sectional_residual":
+        context_rejections = {
+            reason: int(count)
+            for reason, count in prefix["terminal_reason_counts"].items()
+            if str(reason).startswith(("benchmark_context_",
+                                       "subject_context_"))
+        }
+        reason = (max(sorted(context_rejections),
+                      key=context_rejections.get)
+                  if context_rejections else "synchronized_context")
+        fit_diagnostics["market_context"] = {
+            "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+            "status": ("unknown" if not signals and context_rejections else
+                       "partial" if context_rejections else "complete"),
+            "reason": reason,
+            "rejection_counts": dict(sorted(context_rejections.items())),
+        }
     # Historical backfill can be inspected only through the explicit policy
     # above. Keep that provenance visible and permanently non-authorizing so a
     # diagnostic prefix cannot advance a proof or emit an authorization.

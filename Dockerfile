@@ -1,10 +1,16 @@
 ARG PYTHON_IMAGE=python:3.13.5-slim-bookworm
+ARG ALPACA_DEPLOYMENT_COMMIT=unknown
 FROM ${PYTHON_IMAGE}
+
+ARG ALPACA_DEPLOYMENT_COMMIT
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
+    ALPACA_BUILD_COMMIT=${ALPACA_DEPLOYMENT_COMMIT} \
     TZ=UTC
+
+LABEL org.opencontainers.image.revision=${ALPACA_DEPLOYMENT_COMMIT}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates tini \

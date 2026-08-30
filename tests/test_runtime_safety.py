@@ -24,7 +24,7 @@ from agent.variants import apply as apply_registered_variant, load_registry
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from agent.market import MarketData
 from agent.risk import RiskEngine
-from agent.runtime_control import RuntimeControlMixin
+from agent.runtime_control import RuntimeControlMixin, _aligned_cycle_delay
 from agent.startup_edge_policy import StartupEdgePolicyMixin
 from agent.market_entry_risk import MarketEntryRiskMixin
 from agent import engine_cycle as engine_cycle_module
@@ -115,6 +115,11 @@ class BrainFake:
 
 
 class RuntimeControlFacadeTests(unittest.TestCase):
+    def test_cycle_delay_aligns_to_shared_wall_clock_boundaries(self):
+        self.assertEqual(_aligned_cycle_delay(120.0, 60.0), 60.0)
+        self.assertEqual(_aligned_cycle_delay(130.25, 60.0), 49.75)
+        self.assertEqual(_aligned_cycle_delay(130.25, 0.0), 0.0)
+
     def test_engine_reexports_runtime_control_facade_by_identity(self):
         self.assertIs(engine_module.RuntimeControlMixin, RuntimeControlMixin)
         self.assertTrue(issubclass(Engine, RuntimeControlMixin))
@@ -744,7 +749,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(AlpacaError, "provider equity feed"):
             engine.preflight()
 
-    def test_preflight_requires_iex_for_loaded_validated_equity_edge(self):
+    def test_preflight_accepts_exact_configured_sip_for_loaded_equity_edge(self):
         class SipProvider(FakeProvider):
             data_feed = "sip"
 
@@ -755,8 +760,20 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.addCleanup(engine.close)
         engine._edge_records = [{"vehicle": "equity", "status": "validated"}]
         engine._edge_record = engine._edge_records[0]
-        with self.assertRaisesRegex(
-                AlpacaError, "validated-equity runtime requires the IEX"):
+        self.assertEqual(engine.preflight()["data_feed"], "sip")
+
+    def test_preflight_rejects_delayed_sip_for_loaded_validated_equity_edge(self):
+        class DelayedProvider(FakeProvider):
+            data_feed = "delayed_sip"
+
+        cfg = _cfg()
+        cfg["broker"]["data_feed"] = "delayed_sip"
+        cfg["research"] = {"enabled": False}
+        engine = Engine(cfg, light=True, provider=DelayedProvider())
+        self.addCleanup(engine.close)
+        engine._edge_records = [{"vehicle": "equity", "status": "validated"}]
+        engine._edge_record = engine._edge_records[0]
+        with self.assertRaisesRegex(AlpacaError, "real-time.*delayed_sip"):
             engine.preflight()
 
     def test_preflight_rejects_option_execution_without_opra_provider(self):
@@ -818,7 +835,11 @@ class RuntimeSafetyTests(unittest.TestCase):
                                "quote": {"timestamp": now,
                                          "bid": 1, "ask": 1.1}},
         }
-        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        cfg = _cfg()
+        # This fixture intentionally replays historical opening-range bars;
+        # keep the production freshness default strict and opt this test in.
+        cfg["strategy"]["stale_minutes"] = 60
+        engine = Engine(cfg, provider=provider, brain=BrainFake())
         engine._wall_clock = lambda: provider.now
         result = engine.run_once(snapshot)
         self.assertEqual([order.symbol for order in provider.orders_sent],
@@ -858,6 +879,93 @@ class RuntimeSafetyTests(unittest.TestCase):
         rows = engine._collect(["SPY"], now,
                                {"SPY": {"bars": [], "quotes": [latest, older]}})
         self.assertEqual(rows["SPY"]["quote"]["bid"], Decimal("101"))
+
+    def test_collect_measures_bar_age_from_completion_boundary(self):
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        now = provider.now
+        rows = engine._collect(["SPY"], now, {"SPY": {
+            "bars": [
+                {"symbol": "SPY", "timestamp": now - timedelta(seconds=151),
+                 "interval_seconds": 120, "open": 99, "high": 101,
+                 "low": 98, "close": 100, "volume": 10},
+                {"symbol": "SPY", "timestamp": now - timedelta(seconds=60),
+                 "open": 100, "high": 102, "low": 99, "close": 101,
+                 "volume": 20},
+            ],
+            "quote": {"symbol": "SPY", "timestamp": now,
+                      "bid": 101, "ask": 101.1},
+        }})
+        older, latest = rows["SPY"]["bars"]
+        self.assertEqual(older["bar_age_seconds"], 31.0)
+        self.assertEqual(older["timestamp_age_seconds"], 151.0)
+        self.assertEqual(older["data_age_seconds"], 31.0)
+        self.assertEqual(latest["bar_age_seconds"], 0.0)
+        self.assertEqual(latest["timestamp_age_seconds"], 60.0)
+        self.assertEqual(latest["data_age_seconds"], 0.0)
+
+    def test_ibr_accepts_freshly_completed_bar_and_rejects_stale_completion(self):
+        from agent.contracts.ibr import generate_ibr_signal
+
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        opening = datetime(2026, 8, 7, 13, 30, tzinfo=timezone.utc)
+        bars = [{
+            "symbol": "SPY", "timestamp": opening + timedelta(minutes=index),
+            "open": 100, "high": 100.5, "low": 99.5, "close": 100,
+            "volume": 10,
+        } for index in range(15)]
+        bars.append({
+            "symbol": "SPY", "timestamp": opening + timedelta(minutes=15),
+            "open": 100, "high": 102, "low": 100, "close": 101.5,
+            "volume": 20,
+        })
+        strategy = dict(_cfg()["strategy"])
+        strategy["stale_minutes"] = 0.5
+
+        fresh_now = opening + timedelta(minutes=16, seconds=30)
+        fresh = engine._collect(["SPY"], fresh_now, {"SPY": {
+            "bars": bars, "quote": {"symbol": "SPY", "timestamp": fresh_now,
+                                      "bid": 101.4, "ask": 101.5},
+        }})
+        self.assertIsNotNone(generate_ibr_signal(
+            "SPY", fresh["SPY"]["bars"], config=strategy, now=fresh_now))
+
+        stale_now = fresh_now + timedelta(seconds=1)
+        stale = engine._collect(["SPY"], stale_now, {"SPY": {
+            "bars": bars, "quote": {"symbol": "SPY", "timestamp": stale_now,
+                                      "bid": 101.4, "ask": 101.5},
+        }})
+        self.assertIsNone(generate_ibr_signal(
+            "SPY", stale["SPY"]["bars"], config=strategy, now=stale_now))
+
+    def test_run_once_passes_one_collected_snapshot_to_position_monitor(self):
+        provider = FakeProvider()
+        position = Position("SPY", Decimal("1"), "long",
+                            market_value=Decimal("100"),
+                            current_price=Decimal("100"))
+        provider.positions_live = [position]
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.now
+        normalized = {"SPY": {"quote": {
+            "symbol": "SPY", "timestamp": provider.now,
+            "bid": 99.9, "ask": 100.1}, "bars": []}}
+        supplied = {"SPY": {"quote": normalized["SPY"]["quote"], "bars": []}}
+        with patch.object(engine, "_ensure_order_ready", return_value=True), \
+                patch.object(engine, "reconcile",
+                             return_value={"positions": [position], "orders": []}), \
+                patch.object(engine, "_collect", return_value=normalized) as collect, \
+                patch.object(engine, "_monitor_positions", return_value={
+                    "closed": [{"symbol": "SPY", "reason": "stop"}],
+                    "failed": [],
+                }) as monitor:
+            result = engine.run_once(supplied)
+        self.assertEqual(result["action"], "close")
+        collect.assert_called_once_with(["SPY"], provider.now, supplied)
+        self.assertIs(monitor.call_args.kwargs["market_rows"], normalized)
 
     def test_collect_rejects_naive_timestamp_and_non_boolean_freshness(self):
         provider = FakeProvider()
@@ -1080,7 +1188,9 @@ class RuntimeSafetyTests(unittest.TestCase):
             "SPY": {"bars": bars, "quote": {"timestamp": provider.now,
                                                "bid": 101.4, "ask": 101.5}},
         }
-        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        cfg = _cfg()
+        cfg["strategy"]["stale_minutes"] = 60
+        engine = Engine(cfg, provider=provider, brain=BrainFake())
         engine._wall_clock = lambda: provider.now
         result = engine.run_once(snapshot)
         self.assertTrue(result["signals"])
@@ -1853,6 +1963,11 @@ class RuntimeSafetyTests(unittest.TestCase):
             return rows
 
         self.assertIsNotNone(_rule_runtime_bars(bars(), spec, now))
+        self.assertIsNotNone(_rule_runtime_bars(
+            bars(), spec, now, max_age_seconds=30))
+        self.assertIsNone(_rule_runtime_bars(
+            bars(), spec, now + timedelta(microseconds=1),
+            max_age_seconds=30))
         self.assertIsNone(_rule_runtime_bars(bars(drop=3), spec, now))
         self.assertIsNone(_rule_runtime_bars(bars(partial=True), spec, now))
 
@@ -1885,7 +2000,9 @@ class RuntimeSafetyTests(unittest.TestCase):
                          "volume": 10 if index < 15 else 20, "atr": 1})
         snapshot = {"SPY": {"bars": bars, "quote": {
             "timestamp": now, "bid": 101.4, "ask": 101.5}}}
-        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        cfg = _cfg()
+        cfg["strategy"]["stale_minutes"] = 60
+        engine = Engine(cfg, provider=provider, brain=BrainFake())
         self.addCleanup(engine.close)
         engine._wall_clock = lambda: provider.now
         with patch.object(engine, "_record_open_order",

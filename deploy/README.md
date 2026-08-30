@@ -10,7 +10,8 @@ Every shipped deployment is paper-only (`ALPACA_PAPER=true`, live disabled),
 uses the free Basic IEX feed for its equity-only universe, and keeps the
 trader's runtime execution profile at `shares`. Options acquisition/research
 is disabled by default; `indicative` is a non-executable placeholder. An
-explicit option lane requires OPRA and separate review.
+explicit option lane requires OPRA and separate review. Authorizing equity
+evidence must use the exact IEX or SIP feed; `delayed_sip` is diagnostic only.
 
 ## Docker Compose (recommended)
 
@@ -20,7 +21,7 @@ explicit option lane requires OPRA and separate review.
 | --- | --- | --- |
 | `recorder` | Alpaca bars, quotes, and session observations (paper by default) | `runtime-data` |
 | `trader` | Exactly one paper intraday loop in the shipped `shares` execution profile and broker reconciliation | `runtime-data`, `research-cache` |
-| `research` | Scheduled eleven-slot offline factory/replay and shadow-WAL ingestion; no broker authority | `runtime-data`, research volumes |
+| `research` | Scheduled twelve-slot offline factory/replay and shadow-WAL ingestion; no broker authority | `runtime-data`, research volumes |
 | `watchdog` | Independent stale-trader flatten; cancel and close only, never entries | `runtime-data` |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 | `shadow` | Broker-free incremental shadow evaluation and semantic replay parity; no broker authority | Read-only recorder/EdgeLedger mounts, isolated shadow WAL |
@@ -47,10 +48,12 @@ is `degraded` with residual risk and fails health checks. It cannot help when
 the broker or the network is unreachable, or while a wedged trader still owns
 the lock.
 
-The recorder writes its mixed bars/quotes/options corpus partitioned by New
+The recorder runs on a fixed 30-second cadence and writes its mixed
+bars/quotes/options corpus partitioned by New
 York session date under `runtime/research/recorded/sessions/market-<date>.csv`,
 with a compact `.recorder-index.json` sidecar holding the watermark, per-symbol
-last bar, bounded coverage evidence, corpus equity feed, and option contracts
+last bar, durable per-symbol quote and completed-bar watermarks, bounded
+coverage evidence, corpus equity feed, and option contracts
 held open for continued sampling. Exact keys for the fifteen-minute dedup
 window live in `.recorder-recent-keys.sqlite3`, so high-rate quote bursts do not
 expand a large JSON object in recorder memory. Both caches are bound to the
@@ -76,8 +79,10 @@ entitlement failure (`iex_entitlement_required` or
 `.recorder-status.json`, so health and the dashboard distinguish a permanent
 subscription failure from an empty or temporarily stale corpus. IEX is a
 limited venue view rather than consolidated SIP; sparse coverage is expected
-and is never repaired by relabeling another feed. New IEX evidence needs a
-fresh research/shadow proof epoch.
+and is never repaired by relabeling another feed. New exact-feed evidence needs
+a fresh research/shadow proof epoch. Readiness requires both quote and completed
+bar watermarks to be no older than 30 seconds for every required symbol; an
+alive recorder or scheduler is not evidence of readiness or research quality.
 
 Catch-up requests are split into `ALPACA_RECORDER_FETCH_WINDOW_MINUTES`
 windows (1 minute by default), so a long outage cannot materialize the whole
@@ -143,15 +148,23 @@ read-only from the dashboard. Research cannot place orders or mutate broker
 state. Paper `selection_mode: all_proved` runs one strongest proven variant per
 verified frozen prior-cycle dependence cluster under one global risk book;
 families without a verified assignment use the held-out correlation-safe
-fallback. Defaults are eleven logical
-strategy slots over all eleven bounded rule families and four isolated variant
+fallback. Defaults are twelve logical
+strategy slots over all twelve bounded rule families and four isolated variant
 accounts per strategy; each isolated book is processed by one bounded worker.
+The twelfth family, `cross_sectional_residual`, is shares-only, uses SPY as its
+benchmark, and requires synchronized one-minute context. It does not replace
+the 24-ETF universe; future family or universe changes require evidence from
+the screen and cross-sectional report.
 Scheduled research evaluates the equity vehicle only by default because runtime
 execution remains the single `shares` profile. Set
 `ALPACA_RESEARCH_VEHICLES=all` explicitly to evaluate both equity and option
 vehicles independently; their calibration and authorization evidence stays
 per vehicle. Capacity is configurable through the
 `ALPACA_FACTORY_*` environment variables.
+Scheduler liveness, recorder service liveness, and research evidence/readiness
+are separate health dimensions. A live scheduler can report a pending or
+blocked corpus, and a market holiday is an explicit closed state rather than a
+missing-data failure.
 
 Deterministic preprocessing can be reused across repeated experiments by
 setting `ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY` to an audited digest that
@@ -277,6 +290,9 @@ that already reached the old 20,000-event ceiling, ShadowRunner preserves its
 existing evidence, baselines the current recorder file ends, and resumes only
 from subsequently committed rows. This is intentionally forward-only: a large
 recorder recovery is research input, not a synthetic live-shadow window.
+Concurrent shadow workers bind each poll to a content-addressed manifest;
+readers re-verify the manifest digest before consuming it. A manifest mismatch
+or unreadable artifact is quarantined and cannot advance the shadow boundary.
 
 Replay-diff metadata is retained for 180 days by default so a complete
 confirmatory tail remains inspectable; set `ALPACA_SHADOW_RETENTION_DAYS` only
@@ -333,11 +349,12 @@ carries the parity-matched live-ingestion marker.
 Authorizing fill quality retains provider/feed/source and quote age for both
 legs: required records become actionable at the maximum of event timestamp,
 `as_of`, and `observed_at`. A delayed recorder bar may signal when observed;
-execution enters at that decision/observation time using fresh IEX (equity) or
-OPRA (option) evidence. Delayed full OHLC never backfills an earlier entry, and
-partial pre-entry bar ranges are excluded. IEX is required for shipped equity
-entry and exit, while OPRA is required for an option lane, each no older than
-30 seconds. Feed provenance is request-bound: an explicit provider-row feed
+execution enters at that decision/observation time using fresh exact IEX or SIP
+(equity) or OPRA (option) evidence. Delayed full OHLC never backfills an earlier
+entry, and partial pre-entry bar ranges are excluded. Equity entry and exit
+require exact IEX or SIP, while OPRA is required for an option lane, each no
+older than 30 seconds. `delayed_sip` is diagnostic only. Feed provenance is
+request-bound: an explicit provider-row feed
 label is retained when present, otherwise the configured/requested feed label is
 used; it is not an independent venue attestation.
 The shipped `execution.strict_market_data` default is `true`; historical bar
@@ -375,6 +392,14 @@ calibration must exist before shadow ingestion. Thin, existing, mixed-vehicle,
 stale, or optimistic history remains blocked until normal measured
 calibration is authorized.
 
+The scheduled calibration-only pass measures per-symbol/session stress on the
+9/15/25/50-bps ladder. It is disabled by default and can be activated only by
+an operator-controlled path. The artifact must bind the exact provider/feed,
+content hash, sufficient disjoint chronological held-out sessions, and one
+artifact-wide effective-after boundary; unusable cells use the configured
+scalar fallback. Calibration remains diagnostic unless that explicit path is
+enabled and never self-authorizes.
+
 ShadowRunner records a durable `replay_quarantine` entry for every incomplete
 or mismatched candidate/session replay. Its health result reports
 `stale_tail.status=blocked`, the session, and the exact source/shadow/replay
@@ -392,13 +417,19 @@ advancement occurs until the repair is complete. A missing or stale recorder cal
 
 The executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
 configured R target, and bar-cap time exit. Fit-only factory diagnostics expose
-signal-prefix/floor binding, planned exits, cost/risk, power, behavior aliases,
-provider/feed provenance, pricing source, configured limits,
+signal-prefix/floor binding, planned exits, gross/net/fees/slippage cost/risk,
+planned versus fill-delivered risk, per-leg provider/feed provenance, power,
+behavior aliases, pricing source, configured limits,
 pass/fail/unknown row counts, and aggregate fit-partition execution-rejection
 counts/reasons for operator review; they are non-authorizing and do not expand
 exits. A fit whose opportunities are all explicitly execution-rejected is
 `execution_blocked`, distinct from sparse/underpowered data; bounded budget
 closure only progresses search exhaustion and is not a powered negative edge.
+The pre-replay signal screen records forward-return/control rows and uses
+explicit `p=1` placeholders when a comparison is unavailable. Its terminal
+current-hypothesis no-edge result reseeds on a changed corpus. Target/hold path
+telemetry is reachability-only; bounded lower-target/hold proposals cannot
+authorize a candidate.
 
 Research never rewrites the append-only recorder corpus. A temporary cycle view
 explicitly quarantines legacy rows whose `as_of` is later than `observed_at`,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 import dataclasses
 from dataclasses import dataclass
@@ -23,12 +24,18 @@ from dataclasses import replace
 import math
 from pathlib import Path
 import sqlite3
+import threading
 import time
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.ibr import generate_ibr_signal
-from agent.contracts.rule import generate_rule_signal, rule_variant_id, validate_rule_spec
+from agent.contracts.rule import (
+    CROSS_SECTIONAL_BENCHMARK, evaluate_rule_signal_trace,
+    generate_rule_signal, rule_variant_id, rule_vehicle_executable,
+    validate_rule_spec,
+)
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
 from deploy.recorder import INDEX_NAME as RECORDER_INDEX_NAME, corpus_partitions
@@ -54,6 +61,10 @@ DEFAULT_EQUITY = 100_000.0
 DEFAULT_MAX_CANDIDATES = 32
 DEFAULT_MAX_EVENTS = 20_000
 DEFAULT_MAX_DECISIONS = 100_000
+# Candidate evaluation is CPU-heavy but deliberately bounded.  SQLite/WAL
+# mutation remains parent-owned; workers only inspect the frozen snapshot.
+DEFAULT_MAX_WORKERS = 4
+MAX_MAX_WORKERS = 32
 # Shadow replay metadata must survive the longest supported confirmatory tail
 # (and enough time for an operator to diagnose/replay a delayed session).
 # Keep this as the single source of truth for the library and operations CLI.
@@ -69,6 +80,8 @@ SESSION_CATALOG_META_KEY = "session_catalog"
 MAX_REPLAY_REPAIR_HISTORY = 32
 MAX_ACTIVE_REPLAY_QUARANTINE = 1024
 REPLAY_QUARANTINE_OVERFLOW_KEY = "__replay_quarantine_overflow__"
+SHADOW_MANIFEST_META_PREFIX = "shadow-manifest.v1:"
+SHADOW_MANIFEST_LATEST_KEY = "shadow-manifest.v1:latest"
 
 
 class ShadowError(RuntimeError):
@@ -86,6 +99,29 @@ def _json(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _validated_shadow_manifest(
+        value: Any, *, requested_digest: str | None = None) -> dict[str, Any]:
+    """Validate one persisted manifest before exposing it to callers.
+
+    Manifest rows are immutable evidence, so a syntactically valid JSON value
+    is not sufficient: the body must reproduce its stored content digest.  A
+    digest-addressed lookup also verifies that the requested key names that
+    same digest.  The latest pointer has no digest-bearing key of its own, but
+    still goes through the body/self-digest check.
+    """
+    if not isinstance(value, Mapping) or value.get("schema") != "shadow-manifest.v1":
+        raise ShadowError("shadow manifest metadata is invalid")
+    stored_digest = value.get("manifest_digest")
+    body = dict(value)
+    body.pop("manifest_digest", None)
+    computed_digest = _digest(body)
+    if not isinstance(stored_digest, str) or stored_digest != computed_digest:
+        raise ShadowError("shadow manifest metadata digest mismatch")
+    if requested_digest is not None and stored_digest != requested_digest:
+        raise ShadowError("shadow manifest metadata key mismatch")
+    return dict(value)
 
 
 def _finite(value: Any) -> float | None:
@@ -614,15 +650,19 @@ class ShadowConfig:
     max_candidates: int = DEFAULT_MAX_CANDIDATES
     max_events: int = DEFAULT_MAX_EVENTS
     max_decisions: int = DEFAULT_MAX_DECISIONS
+    max_workers: int = DEFAULT_MAX_WORKERS
     retention_days: int = DEFAULT_RETENTION_DAYS
     equity: float = DEFAULT_EQUITY
     poll_seconds: float = 60.0
 
     def __post_init__(self) -> None:
-        for name in ("max_candidates", "max_events", "max_decisions", "retention_days"):
+        for name in ("max_candidates", "max_events", "max_decisions", "max_workers",
+                     "retention_days"):
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value or int(value) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if int(self.max_workers) > MAX_MAX_WORKERS:
+            raise ValueError(f"max_workers must be <= {MAX_MAX_WORKERS}")
         if _finite(self.equity) is None or float(self.equity) <= 0:
             raise ValueError("equity must be positive and finite")
 
@@ -810,6 +850,46 @@ class ShadowStore:
         with self._connection() as db:
             db.execute("""INSERT INTO meta(key,value) VALUES('corpus_source_offsets',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (payload,))
+
+    def save_manifest(self, manifest: Mapping[str, Any]) -> str:
+        """Persist one immutable content-addressed poll manifest.
+
+        The manifest is written by the parent after ingestion and before any
+        worker starts.  Its digest is derived from the manifest body (not
+        wall-clock metadata), so retries over the same candidate/event
+        snapshot address the same evidence.  A mutable latest pointer is only
+        an operational convenience; the digest-keyed copy is the audit source.
+        """
+        if self.readonly:
+            raise ShadowError("cannot update manifest on a read-only WAL")
+        body = dict(manifest)
+        body.pop("manifest_digest", None)
+        body.setdefault("schema", "shadow-manifest.v1")
+        digest = _digest(body)
+        encoded = _json({**body, "manifest_digest": digest})
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value) VALUES(?,?)
+                ON CONFLICT(key) DO NOTHING""",
+                       (f"{SHADOW_MANIFEST_META_PREFIX}{digest}", encoded))
+            db.execute("""INSERT INTO meta(key,value) VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                       (SHADOW_MANIFEST_LATEST_KEY, encoded))
+        return digest
+
+    def manifest(self, digest: str | None = None) -> dict[str, Any] | None:
+        """Read a digest-addressed manifest, or the latest poll manifest."""
+        requested_digest = None if digest is None else str(digest)
+        key = SHADOW_MANIFEST_LATEST_KEY if requested_digest is None else (
+            f"{SHADOW_MANIFEST_META_PREFIX}{requested_digest}")
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("shadow manifest metadata is invalid") from exc
+        return _validated_shadow_manifest(value, requested_digest=requested_digest)
 
     def forward_event_floor(self) -> float | None:
         with self._connection() as db:
@@ -1519,6 +1599,11 @@ class ShadowRunner:
         self.config = config
         self.store = ShadowStore(config.shadow_db, retention_days=config.retention_days)
         self._factory_roots = _read_factory_rule_roots(config.edge_db)
+        # Workers install an in-memory portfolio projection for their arm.
+        # Thread-local state keeps the existing ``_evaluate`` call contract
+        # (and test seams) while ensuring no worker mutates or observes a
+        # sibling candidate's virtual book.
+        self._worker_state = threading.local()
 
     def _rule_root_control(self, candidate: Mapping[str, Any]) -> dict[str, Any] | None:
         """Build the exact-window root control for a tuned rule candidate.
@@ -1651,16 +1736,67 @@ class ShadowRunner:
         if len(stream) < 2:
             return "no_data", "insufficient bars", {"session_date": session}, None
         strategy_id = str(candidate.get("strategy_id") or strategy.get("id") or "ibr")
+        rule_context = None
+        rule_spec = None
+        if strategy_id == "rule":
+            raw_spec = strategy.get("rule_spec") if isinstance(strategy, Mapping) else None
+            try:
+                rule_spec = validate_rule_spec(raw_spec or {})
+            except (TypeError, ValueError) as exc:
+                return "reject", "invalid rule specification", {
+                    "session_date": session, "error": str(exc)[:240]}, None
+            if (rule_spec["family"] == "cross_sectional_residual" and
+                    not rule_vehicle_executable(
+                        rule_spec, str(candidate.get("vehicle") or "equity"))):
+                return ("reject", "cross_sectional_requires_equity_shares",
+                        {"session_date": session,
+                         "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK}, None)
+            if rule_spec["family"] == "cross_sectional_residual":
+                # Relative signals may consume only completed SPY bars that
+                # were observable at the same decision instant as the subject.
+                stream = [row for row in stream
+                          if (_event_end(row) or event_at) <= event_at]
+                benchmark = tuple(
+                    row for row in bars.get(CROSS_SECTIONAL_BENCHMARK, ())
+                    if (_canonical_equity_feed(row.get("feed")) ==
+                        expected_equity_feed)
+                    and _row_visible(row, event_at)
+                    and (_event_end(row) or event_at) <= event_at
+                    and ((_timestamp(row.get("timestamp")) or market_at)
+                         .astimezone(NEW_YORK).date().isoformat() == session)
+                )
+                rule_context = MappingProxyType({
+                    CROSS_SECTIONAL_BENCHMARK: benchmark,
+                })
         try:
-            signal = (generate_rule_signal(symbol, stream, config=cfg, now=event_at)
-                      if strategy_id == "rule" else
-                      generate_ibr_signal(symbol, stream, config=cfg, now=event_at))
+            if strategy_id == "rule":
+                signal = (generate_rule_signal(
+                              symbol, stream, config=cfg, now=event_at)
+                          if rule_context is None else
+                          generate_rule_signal(
+                              symbol, stream, config=cfg, now=event_at,
+                              bars_by_symbol=rule_context))
+            else:
+                signal = generate_ibr_signal(
+                    symbol, stream, config=cfg, now=event_at)
         except Exception as exc:
             return "reject", f"signal exception: {type(exc).__name__}", {"error": str(exc)[:240]}, None
         base = {"session_date": session, "strategy_id": strategy_id,
                 "equity_feed": expected_equity_feed,
                 "variant_id": candidate.get("variant_id"), "signal": signal}
         if signal is None:
+            if (rule_spec is not None and
+                    rule_spec["family"] == "cross_sectional_residual"):
+                trace = evaluate_rule_signal_trace(
+                    stream, rule_spec, bars_by_symbol=rule_context,
+                    symbol=symbol)
+                stages = trace.get("stages") or []
+                trace_reason = (str(stages[-1].get("reason") or "")
+                                if stages else "")
+                base["signal_trace"] = trace
+                if trace_reason.startswith(("benchmark_context_",
+                                            "subject_context_")):
+                    return "no_data", trace_reason, base, None
             return "no_trade", "no signal", base, None
         # Runtime decisions are made when the completed feature prefix is
         # actually observed.  Persist that causal instant and use it as the
@@ -1751,6 +1887,10 @@ class ShadowRunner:
 
     def _portfolio_state(self, candidate_id: str) -> tuple[list[dict], dict[str, dict], float]:
         """Build risk admission state from one candidate's open books."""
+        overrides = getattr(self._worker_state, "portfolios", None)
+        if isinstance(overrides, Mapping) and candidate_id in overrides:
+            positions, active_trades, gross_notional = overrides[candidate_id]
+            return (list(positions), dict(active_trades), float(gross_notional))
         positions: list[dict] = []
         active_trades: dict[str, dict] = {}
         gross_notional = 0.0
@@ -2064,6 +2204,92 @@ class ShadowRunner:
             self.store.close_session_books(candidate_id, session)
         return complete
 
+    @staticmethod
+    def _append_worker_open(state: tuple[list[dict], dict[str, dict], float],
+                            plan: Mapping[str, Any], symbol: str
+                            ) -> tuple[list[dict], dict[str, dict], float]:
+        """Advance one worker's private portfolio projection after an open."""
+        positions, active_trades, gross_notional = state
+        position = dict(plan)
+        position["symbol"] = str(position.get("symbol") or symbol)
+        risk_usd = _finite(position.get("risk_usd")) or 0.0
+        notional = _finite(position.get("notional")) or 0.0
+        active = dict(position)
+        active["risk_usd"] = risk_usd
+        positions.append(position)
+        active_trades[str(symbol)] = active
+        return positions, active_trades, gross_notional + notional
+
+    def _evaluate_arm_snapshot(self, arm: Mapping[str, Any],
+                               session_events: Mapping[str, Sequence[Mapping]],
+                               session_inputs: Mapping[str, tuple[Sequence[Mapping],
+                                                                   Sequence[Mapping],
+                                                                   Sequence[Mapping]]],
+                               bars: Mapping[str, Sequence[Mapping]],
+                               quotes: Mapping[str, Sequence[Mapping]],
+                               options: Mapping[str, Sequence[Mapping]],
+                               initial_state: tuple[list[dict], dict[str, dict], float]
+                               ) -> dict[str, Any]:
+        """Evaluate one immutable arm without touching the shadow WAL.
+
+        Every worker receives the same tuple-backed event snapshot.  The
+        private portfolio projection reproduces within-arm admission for
+        multiple events while keeping SQLite reads/writes out of the worker.
+        """
+        candidate_id = str(arm["candidate_id"])
+        state = (list(initial_state[0]), dict(initial_state[1]),
+                 float(initial_state[2]))
+        self._worker_state.portfolios = {candidate_id: state}
+        decisions: list[dict[str, Any]] = []
+        try:
+            for session in sorted(session_events):
+                session_bars, session_quotes, session_options = session_inputs[session]
+                for event in session_events[session]:
+                    symbol = str(event.get("symbol") or "")
+                    event_key = str(event.get("event_key") or "")
+                    if any(str(row.get("symbol") or "") == symbol
+                           for row in state[0]):
+                        kind, reason, payload, plan = (
+                            "no_trade", "virtual book has an incomplete open",
+                            {"session_date": session,
+                             "strategy_id": arm.get("strategy_id"),
+                             "variant_id": arm.get("variant_id")}, None)
+                    else:
+                        kind, reason, payload, plan = self._evaluate(
+                            arm, event, bars, quotes, options)
+                    decisions.append({
+                        "candidate_id": candidate_id,
+                        "event_key": event_key,
+                        "session_date": session,
+                        "symbol": symbol,
+                        "kind": kind,
+                        "reason": reason,
+                        "payload": payload,
+                        "plan": plan,
+                    })
+                    if plan is not None:
+                        state = self._append_worker_open(state, plan, symbol)
+                        self._worker_state.portfolios[candidate_id] = state
+                # Session replay is parent-owned and normally closes complete
+                # virtual books before the next session.  Reset the private
+                # projection at this boundary; an incomplete replay remains
+                # durable in SQLite and blocks the next poll conservatively.
+                state = ([], {}, 0.0)
+                self._worker_state.portfolios[candidate_id] = state
+        except Exception as exc:
+            # The parent records the bounded diagnostic in its poll result and
+            # continues sibling arms.  No partial worker output is committed,
+            # so a retry can deterministically recompute this candidate.
+            return {"candidate_id": candidate_id, "decisions": [],
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
+        finally:
+            try:
+                del self._worker_state.portfolios
+            except AttributeError:
+                pass
+        return {"candidate_id": candidate_id, "decisions": decisions,
+                "error": None}
+
     def run_once(self) -> dict[str, Any]:
         # Factory hypotheses can be registered by the research cycle between
         # shadow polls; refresh the read-only root catalog for every pass.
@@ -2269,60 +2495,161 @@ class ShadowRunner:
                  if row_session(row) == session],
             )
 
+        # Freeze both arm definitions and event inputs before dispatch.  A
+        # research poll that registers a candidate or appends a recorder row
+        # while workers run therefore affects only the next poll.
+        arms: list[dict[str, Any]] = []
         for candidate in candidates:
             if str(candidate.get("vehicle") or "equity") not in {"equity", "option"}:
                 continue
-            # Tuned rule descendants are paired with a synthetic namespace for
-            # the immutable factory root.  The control is a first-class shadow
-            # candidate: it must consume the same event stream, maintain its
-            # own virtual books, and produce its own replay evidence.  It is
-            # deliberately persisted only in the isolated shadow WAL; the
-            # EdgeLedger remains a read-only source for this worker.
+            arms.append(dict(candidate))
             root_control = self._rule_root_control(candidate)
-            paired_candidates: tuple[Mapping[str, Any], ...] = (
-                (candidate, root_control) if root_control is not None
-                else (candidate,))
             if root_control is not None:
-                # Real candidates were persisted in the source-catalog pass
-                # above; only the synthetic arm needs a new WAL row here.
-                self.store.upsert_candidate(root_control)
-            for session in sorted(session_events):
-                session_bars, session_quotes, session_options = session_inputs[session]
-                for event in session_events[session]:
-                    symbol = str(event.get("symbol"))
-                    event_key = str(event["event_key"])
-                    # Evaluate candidate and paired control against this exact
-                    # event before advancing to the next event.  Each id has a
-                    # separate decision/book namespace, so admission in one
-                    # arm cannot create cross-arm contention.
-                    for paired in paired_candidates:
-                        paired_id = str(paired["candidate_id"])
-                        if self.store.has_open(paired_id, symbol):
-                            kind, reason, payload, plan = (
-                                "no_trade", "virtual book has an incomplete open",
-                                {"session_date": session,
-                                 "strategy_id": paired.get("strategy_id"),
-                                 "variant_id": paired.get("variant_id")}, None)
-                        else:
-                            kind, reason, payload, plan = self._evaluate(
-                                paired, event, bars, quotes, options)
-                        inserted = self.store.decision(
-                            candidate_id=paired_id, event_key=event_key,
-                            session_date=session, symbol=symbol, kind=kind,
-                            reason=reason, payload=payload,
-                            max_decisions=self.config.max_decisions)
-                        if inserted and plan is not None:
-                            self.store.virtual_open(
-                                candidate_id=paired_id,
-                                decision_id=_digest({"candidate_id": paired_id,
-                                                     "event_key": event_key}),
-                                symbol=symbol, plan=plan)
+                arms.append(dict(root_control))
+        arms.sort(key=lambda item: str(item.get("candidate_id") or ""))
+        for arm in arms:
+            self.store.upsert_candidate(arm)
 
-                for paired in paired_candidates:
-                    paired_id = str(paired["candidate_id"])
-                    rows = self.store.decisions(paired_id)
-                    self._replay(paired, session, session_bars, session_quotes,
-                                 rows, session_options)
+        # Convert all worker inputs to detached JSON values and tuples.  The
+        # tuples are never handed to a mutating path, making the poll snapshot
+        # explicit even if a provider returns mutable row objects.
+        frozen_events = tuple(json.loads(_json(dict(row))) for row in events)
+        frozen_bars = {
+            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            for symbol, values in bars.items()}
+        frozen_quotes = {
+            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            for symbol, values in quotes.items()}
+        frozen_options = {
+            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            for symbol, values in options.items()}
+        frozen_session_events: dict[str, tuple[dict, ...]] = {}
+        for session, values in session_events.items():
+            frozen_session_events[session] = tuple(
+                json.loads(_json(dict(row))) for row in values)
+        frozen_session_inputs: dict[str, tuple[tuple[dict, ...], tuple[dict, ...], tuple[dict, ...]]] = {}
+        for session, (session_bars, session_quotes, session_options) in session_inputs.items():
+            frozen_session_inputs[session] = (
+                tuple(json.loads(_json(dict(row))) for row in session_bars),
+                tuple(json.loads(_json(dict(row))) for row in session_quotes),
+                tuple(json.loads(_json(dict(row))) for row in session_options),
+            )
+        event_watermark = {
+            "count": len(frozen_events),
+            "events_digest": _digest([
+                {key: row.get(key) for key in (
+                    "event_key", "digest", "event_type", "symbol",
+                    "timestamp", "as_of")}
+                for row in frozen_events]),
+            "last_event_key": (str(frozen_events[-1].get("event_key") or "")
+                                if frozen_events else None),
+            "last_timestamp": (str(frozen_events[-1].get("timestamp") or "")
+                                if frozen_events else None),
+        }
+        candidate_watermark = [{
+            "candidate_id": str(arm.get("candidate_id") or ""),
+            "variant_id": str(arm.get("variant_id") or ""),
+            "strategy_id": str(arm.get("strategy_id") or ""),
+            "vehicle": str(arm.get("vehicle") or ""),
+            "status": str(arm.get("status") or ""),
+            "config_digest": _digest(_safe_config(arm)),
+        } for arm in arms]
+        manifest = {
+            "schema": "shadow-manifest.v1",
+            "candidate_set": candidate_watermark,
+            "candidate_set_digest": _digest(candidate_watermark),
+            "source_watermark": {
+                "offsets": {str(key): int(value) for key, value in next_offsets.items()},
+                "forward_event_floor": float(forward_floor or 0.0),
+            },
+            "event_watermark": event_watermark,
+            "session_watermark": sorted(str(session) for session in frozen_session_events),
+            "max_workers": int(self.config.max_workers),
+        }
+        manifest_digest = self.store.save_manifest(manifest)
+
+        # Dispatch one immutable session at a time.  The parent commits
+        # decisions and performs replay before the next session is submitted,
+        # preserving virtual-book blocking when a replay remains incomplete.
+        # Workers still run candidate arms concurrently within each barrier.
+        arm_by_id = {str(arm["candidate_id"]): arm for arm in arms}
+        candidate_errors: dict[str, str] = {}
+        failed_arms: set[str] = set()
+        for session in sorted(frozen_session_events):
+            session_events_one = {session: frozen_session_events[session]}
+            session_inputs_one = {session: frozen_session_inputs[session]}
+            active_arms = [arm for arm in arms
+                           if str(arm["candidate_id"]) not in failed_arms]
+            initial_states = {
+                str(arm["candidate_id"]): self._portfolio_state(
+                    str(arm["candidate_id"])) for arm in active_arms}
+            worker_results: list[dict[str, Any]] = []
+            if active_arms:
+                with ThreadPoolExecutor(max_workers=self.config.max_workers,
+                                        thread_name_prefix="shadow-eval") as pool:
+                    futures = {
+                        pool.submit(self._evaluate_arm_snapshot, arm,
+                                    session_events_one, session_inputs_one,
+                                    frozen_bars, frozen_quotes, frozen_options,
+                                    initial_states[str(arm["candidate_id"])]): arm
+                        for arm in active_arms}
+                    for future in as_completed(futures):
+                        arm = futures[future]
+                        try:
+                            worker_results.append(future.result())
+                        except Exception as exc:  # pragma: no cover - defensive
+                            worker_results.append({
+                                "candidate_id": str(arm["candidate_id"]),
+                                "decisions": [],
+                                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                            })
+            worker_results.sort(key=lambda item: str(item.get("candidate_id") or ""))
+
+            # Stable candidate/event/session order is the sole write order.
+            for result in worker_results:
+                candidate_id = str(result.get("candidate_id") or "")
+                if result.get("error"):
+                    candidate_errors[candidate_id] = str(result["error"])
+                    failed_arms.add(candidate_id)
+                    continue
+                decisions = sorted(result.get("decisions") or [], key=lambda item: (
+                    str(item.get("event_key") or ""),
+                    str(item.get("session_date") or ""),
+                    str(item.get("symbol") or "")))
+                for decision in decisions:
+                    inserted = self.store.decision(
+                        candidate_id=candidate_id,
+                        event_key=str(decision.get("event_key") or ""),
+                        session_date=str(decision.get("session_date") or ""),
+                        symbol=str(decision.get("symbol") or ""),
+                        kind=str(decision.get("kind") or "no_data"),
+                        reason=decision.get("reason"),
+                        payload=decision.get("payload") or {},
+                        max_decisions=self.config.max_decisions)
+                    if inserted and decision.get("plan") is not None:
+                        self.store.virtual_open(
+                            candidate_id=candidate_id,
+                            decision_id=_digest({
+                                "candidate_id": candidate_id,
+                                "event_key": str(decision.get("event_key") or "")}),
+                            symbol=str(decision.get("symbol") or ""),
+                            plan=decision["plan"])
+
+            # Replay is parent-only and runs before the next session barrier.
+            session_bars, session_quotes, session_options = frozen_session_inputs[session]
+            for result in worker_results:
+                candidate_id = str(result.get("candidate_id") or "")
+                if result.get("error"):
+                    continue
+                try:
+                    rows = self.store.decisions(candidate_id)
+                    self._replay(arm_by_id[candidate_id], session,
+                                 session_bars, session_quotes, rows,
+                                 session_options)
+                except Exception as exc:
+                    candidate_errors[candidate_id] = (
+                        f"{type(exc).__name__}: {str(exc)[:240]}")
+                    failed_arms.add(candidate_id)
         prune = self.store.prune()
         replay_quarantine = self.store.replay_quarantine()
         pending_repairs = [
@@ -2372,6 +2699,8 @@ class ShadowRunner:
         return {"candidates": len(candidates), "ingested_events": ingested,
                 "events": len(events), "decisions": len(self.store.decisions()),
                 "conflicts": conflicts, "invalid_events": invalid_events,
+                "manifest_digest": manifest_digest,
+                "candidate_errors": dict(sorted(candidate_errors.items())),
                 "skipped_recovery_bytes": skipped_recovery_bytes,
                 "quarantine_through_session": quarantine_through,
                 "stale_tail": stale_tail,
@@ -2392,13 +2721,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--shadow-db", type=Path, default=Path("runtime/research/shadow.sqlite3"))
     parser.add_argument("--once", action="store_true", help="ingest and evaluate one cycle")
     parser.add_argument("--interval", type=float, default=60.0)
+    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     cfg = ShadowConfig(corpus_path=args.corpus, edge_db=args.edge_db,
-                       shadow_db=args.shadow_db, poll_seconds=args.interval)
+                       shadow_db=args.shadow_db, poll_seconds=args.interval,
+                       max_workers=args.max_workers)
     while True:
         try:
             print(json.dumps(run_shadow_once(cfg), sort_keys=True), flush=True)
@@ -2412,7 +2743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
-    "DEFAULT_EQUITY", "DEFAULT_RETENTION_DAYS", "InputConflict",
+    "DEFAULT_EQUITY", "DEFAULT_MAX_WORKERS", "DEFAULT_RETENTION_DAYS", "InputConflict",
     "_opportunity_capacity", "REPLAY_QUARANTINE_META_KEY",
     "SESSION_CATALOG_META_KEY", "REPLAY_QUARANTINE_OVERFLOW_KEY",
     "ShadowConfig", "ShadowError",

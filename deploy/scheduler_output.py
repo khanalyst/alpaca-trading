@@ -429,7 +429,7 @@ def structured_research_cycle(payload: object) -> dict | None:
         return None
     status = str(payload.get("status") or "").lower()
     if status not in {"completed", "completed_no_edge", "no_data", "failed",
-                      "search_exhausted", "llm_provider_failure"}:
+                      "unevaluable", "search_exhausted", "llm_provider_failure"}:
         return None
     outcomes = payload.get("outcomes")
     if not isinstance(outcomes, list):
@@ -448,6 +448,8 @@ def structured_research_cycle(payload: object) -> dict | None:
         "proofs": bool(payload.get("proofs")),
         "no_edge": bool(payload.get("no_edge")),
     }
+    if "evidence_available" in payload:
+        result["evidence_available"] = bool(payload.get("evidence_available"))
     preflight = structured_research_preflight(payload.get("preflight"))
     if preflight is not None:
         result["preflight"] = preflight

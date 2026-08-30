@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from contextlib import closing
 import ast
 import copy
@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 from typing import get_args, get_type_hints
 
 from research import edge_lab, edge_ledger, edge_ledger_proof, edge_ledger_store, gates
@@ -28,7 +29,7 @@ from research.gates import (
 )
 from research.costs import SQLiteQuoteIndex, quote_fill
 from research.factory_ledger import FactoryLedger
-from tests.research.test_factory_end_to_end import edge_corpus
+from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 
 
 def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex"):
@@ -504,7 +505,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
 
 
 class EdgeLedgerStoreExtractionTests(unittest.TestCase):
-    def test_ledger_accepts_legacy_sip_but_explicit_sip_cannot_authorize(self):
+    def test_ledger_accepts_legacy_and_configured_sip_proofs_but_not_delayed(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
             candidate = ledger.register_candidate(
@@ -525,15 +526,14 @@ class EdgeLedgerStoreExtractionTests(unittest.TestCase):
                 ledger, candidate["candidate_id"], "backtest",
                 record=False, equity_feed="sip")
             self.assertEqual(explicit["equity_feed"], "sip")
-            self.assertFalse(explicit["passes"])
-            forged = copy.deepcopy(explicit)
-            forged["passes"] = True
-            forged["content_hash"] = gates._content_hash({
-                key: value for key, value in forged.items()
-                if key != "content_hash"
-            })
-            with self.assertRaisesRegex(ValueError, "envelope/hash"):
-                ledger.record_verified_gate(explicit_run["run_id"], forged)
+            self.assertTrue(explicit["passes"])
+            ledger.record_verified_gate(explicit_run["run_id"], explicit)
+
+            delayed_run, delayed = _persist_gate(
+                ledger, candidate["candidate_id"], "shadow",
+                record=False, equity_feed="delayed_sip")
+            self.assertEqual(delayed["equity_feed"], "delayed_sip")
+            self.assertFalse(delayed["passes"])
 
     def test_store_symbols_are_identical_through_edge_facades(self):
         names = (
@@ -692,6 +692,38 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
         self.assertEqual(snapshots, {})
         self.assertEqual(quotes, [])
         normalizer.assert_called_once_with(row, provider="alpaca", feed="iex")
+
+    def test_equity_corpus_requires_exact_configured_realtime_feed_and_provider(self):
+        row = {
+            "kind": "bar", "symbol": "SPY",
+            "timestamp": "2024-01-02T14:30:00+00:00",
+            "as_of": "2024-01-02T14:31:00+00:00",
+            "observed_at": "2024-01-02T14:31:00+00:00",
+            "open": 100, "high": 101, "low": 99, "close": 100,
+            "volume": 1, "provider": "alpaca", "feed": "sip",
+        }
+        raw, bars, snapshots, quotes = edge_discovery_core._read_discovery_rows(
+            [row], require_provenance=True, expected_equity_feed="sip",
+            expected_provider="alpaca")
+        self.assertEqual(raw, [row])
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].feed, "sip")
+        self.assertEqual(snapshots, {})
+        self.assertEqual(quotes, [])
+
+        with self.assertRaisesRegex(DiscoveryError, "does not match configured"):
+            edge_discovery_core._read_discovery_rows(
+                [row], require_provenance=True, expected_equity_feed="iex",
+                expected_provider="alpaca")
+        with self.assertRaisesRegex(DiscoveryError, "configured provider"):
+            edge_discovery_core._read_discovery_rows(
+                [row], require_provenance=True, expected_equity_feed="sip",
+                expected_provider="other")
+        delayed = {**row, "feed": "delayed_sip"}
+        with self.assertRaisesRegex(DiscoveryError, "diagnostic-only"):
+            edge_discovery_core._read_discovery_rows(
+                [delayed], require_provenance=True, expected_equity_feed="sip",
+                expected_provider="alpaca")
 
     def test_option_corpus_requires_explicit_opra_provenance(self):
         row = {
@@ -2091,6 +2123,59 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         # a hypothesis or otherwise churn the lifecycle.
         self.assertEqual(candidate["status"], "candidate")
         self.assertIn("insufficient_data", {event["event_type"] for event in events})
+
+
+class NullAdmissibilityTests(unittest.TestCase):
+    def test_null_clock_does_not_require_the_candidate_predicate(self):
+        """Admissible controls stay available even when no signal fires."""
+        from agent.contracts.rule import validate_rule_spec
+
+        spec = validate_rule_spec({**ROOT_SPEC,
+                                   "family": "momentum_continuation",
+                                   "confirmation": "none",
+                                   "confirmations": [],
+                                   "lookback": 5,
+                                   "slow_lookback": 40,
+                                   "atr_period": 14,
+                                   "entry_after_minutes": 0,
+                                   "entry_before_minutes": 390})
+        opening = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
+        bars = []
+        for index in range(30):
+            stamp = opening + timedelta(minutes=index)
+            bars.append(SimpleNamespace(
+                symbol="SPY", session_date=date(2026, 1, 5),
+                timestamp=stamp, end=stamp + timedelta(minutes=1),
+                open=100.0, close=100.0,
+            ))
+        policy = edge_discovery_core.ReplayPolicy(strict_market_data=False)
+
+        dependencies = {
+            "feature_window_bars": lambda _spec: 7,
+            "_contiguous": lambda _rows, _start, _stop: True,
+            "_available": lambda bar, _policy: bar.end,
+        }
+
+        def dependency(name):
+            if name == "evaluate_rule_signal":
+                raise AssertionError("null admissibility must not evaluate predicate")
+            return dependencies[name]
+
+        with mock.patch.object(edge_discovery_core,
+                               "_simulation_dependency",
+                               side_effect=dependency) as resolve, \
+             mock.patch.object(edge_discovery_core, "quote_fill_record",
+                               return_value=None), \
+             mock.patch.object(edge_discovery_core,
+                               "replay_open_is_available", return_value=True), \
+             mock.patch.object(edge_discovery_core, "replay_available_at",
+                               side_effect=lambda bar, **_kwargs: bar.end):
+            entries = edge_discovery_core._null_admissible_entry_indices(
+                bars, spec, direction="long", policy=policy, vehicle="equity",
+                snapshots=(), quote_index=None)
+
+        self.assertTrue(entries)
+        self.assertNotIn(mock.call("evaluate_rule_signal"), resolve.call_args_list)
 
 
 if __name__ == "__main__":

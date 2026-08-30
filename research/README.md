@@ -16,8 +16,9 @@ not an independent venue attestation.
 
 The shipped paper deployment defaults to the free Basic IEX equity feed and an
 equity-only universe; it does not acquire options. `indicative` is the safe
-options-feed default and is non-executable. IEX is required for the autonomous
-equity lane. The trader's runtime execution profile remains `shares`, with live
+options-feed default and is non-executable. Authorizing equity evidence must
+use the exact IEX or SIP feed; `delayed_sip` is diagnostic only. The trader's
+runtime execution profile remains `shares`, with live
 trading disabled. Scheduled research follows the deployed equity/shares lane by
 default (`ALPACA_RESEARCH_VEHICLES=equity`). Set the variable to `option` or
 `all` only after explicitly adding an option universe and configuring OPRA;
@@ -25,6 +26,14 @@ option research is evidence generation, not permission to execute options.
 Compose starts the recorder, scheduled research, broker-free shadow, watchdog,
 trader, and dashboard with one plain `docker compose up -d` command; systemd
 uses the same defaults.
+
+The recorder samples on a fixed 30-second cadence and keeps durable per-symbol
+quote and completed-bar watermarks. Research readiness requires both watermarks
+to be no older than 30 seconds for each required symbol; a quote watermark
+cannot stand in for a bar watermark. Exact Alpaca calendar metadata records
+holidays and early closes. Scheduler liveness is reported separately from
+research evidence/readiness, so an alive scheduler is not evidence of a ready
+corpus or a validated edge.
 
 ## Normalized data
 
@@ -41,9 +50,9 @@ corpus, appended into one partition per New York session date under
 partitions in session order (`ALPACA_RESEARCH_SESSION_WINDOW` limits it to the
 most recent N), validates the result, and routes the vehicle-local discovery
 lanes from it.
-It also invokes `research.strategy_factory`, which evaluates eleven logical
-strategy slots over the finite catalog of eleven rule families by default.
-Seven is slot/worker capacity, not the number of families. Each generated
+It also invokes `research.strategy_factory`, which evaluates twelve logical
+strategy slots over the finite catalog of twelve rule families by default.
+Slot count and worker capacity are independent controls. Each generated
 variant owns an isolated simulated account processed by one bounded worker; no
 capital or P&L is shared between arms.
 Paper runtime selection can then use `selection_mode: all_proved`, which keeps
@@ -102,7 +111,7 @@ timestamp.
 3. Make the signal actionable at the maximum availability time of the required
    records (`timestamp`, `as_of`, and `observed_at`). A delayed recorder bar
    may signal when observed; enter at that decision/observation time using a
-   fresh IEX/OPRA quote. Delayed full OHLC never backfills an earlier entry, and
+   fresh exact IEX or SIP quote (equity) or OPRA quote (option). Delayed full OHLC never backfills an earlier entry, and
    partial pre-entry ranges are excluded.
 4. Apply gap-aware fills and stop-first ties when a candle touches both stop
    and target. A bar that opens beyond the stop or target fills at that open,
@@ -133,10 +142,11 @@ live-shadow, and paper remain strict and require fresh executable quotes.
 Backtest evidence never authorizes paper.
 
 Authorizing fill-quality evidence is stricter than a diagnostic backtest:
-equity entry and exit legs must carry Alpaca IEX quote provenance, and option
-entry and exit legs must carry OPRA quote provenance. Every leg records provider,
-feed, quote timestamp/age, and fill source; both legs must be executable and no
-older than 30 seconds. Bar-only, missing, partial-feed, or stale legs remain
+equity entry and exit legs must carry exact IEX or SIP quote provenance, and
+option entry and exit legs must carry OPRA quote provenance. `delayed_sip` is
+diagnostic only. Every leg records provider, feed, quote timestamp/age, and
+fill source; both legs must be executable and no older than 30 seconds.
+Bar-only, missing, partial-feed, or stale legs remain
 diagnostic and cannot authorize a proof. Fit diagnostics may count planned
 signal/exit geometry as a quote-required, non-authorizing measurement when
 executable pricing is absent.
@@ -242,6 +252,13 @@ returns a veto and non-zero status. The scheduled cycle still records offline
 discovery/factory diagnostics, but it does not ingest shadow authorization until
 calibration is fresh and authorized. In-flight orders are excluded; calibration
 never adjusts the model automatically.
+The scheduled calibration-only pass is per symbol/session on the fixed
+9/15/25/50-bps ladder and is disabled by default. Activation requires an
+explicit operator path and a content-addressed artifact with exact
+provider/feed identity, disjoint chronological held-out sessions, sufficient
+coverage, and one artifact-wide effective-after boundary. An unusable cell
+falls back to the configured scalar stress; the artifact cannot authorize
+itself.
 
 ## Evidence and provenance
 
@@ -388,16 +405,19 @@ decision), not merely repeat those fields in a caller-supplied envelope.
 ## Autonomous strategy factory
 
 `research.strategy_factory` owns safe hypothesis generation. Its proposal
-language is the finite grammar in `agent.contracts.rule`: eleven signal
+language is the finite grammar in `agent.contracts.rule`: twelve signal
 primitives — opening-range breakout/fade, momentum continuation, mean
 reversion, trend pullback, volatility breakout, volume breakout, VWAP
-reversion, VWAP trend, range expansion, and opening drive — with bounded
-confirmations and exit parameters. It never generates or imports source code.
+reversion, VWAP trend, range expansion, opening drive, and the shares-only
+`cross_sectional_residual` family against SPY with synchronized one-minute
+context — with bounded confirmations and exit parameters. It never generates
+or imports source code.
 
-The last four are session-anchored: they re-derive the current session from the
-bars' own New York dates, so a longer history can never contaminate a session
-statistic. Research replays one session at a time and the runtime fetches from
-the session open, so the two see the same window either way.
+Session-anchored families re-derive the current session from the bars' own New
+York dates, so a longer history can never contaminate a session statistic.
+`cross_sectional_residual` is a separate shares-only synchronized-context path.
+Research replays one session at a time and the runtime fetches from the session
+open, so the two see the same window either way.
 
 The grammar has three versions. `rule-strategy.v1` is the original field set and
 is unchanged, so every candidate already in a ledger keeps its exact
@@ -465,12 +485,20 @@ missing or invalid LLM proposal leaves the family pending replacement, not
 retired. Insufficient data is not treated as failure. Backtest winners must
 still pass strictly later forward data before runtime can select them.
 
+Before replay, the fit-only signal screen supplies the report's forward-return
+and control rows. Unavailable comparisons are represented by explicit `p=1`
+placeholders, and a terminal current-hypothesis no-edge outcome is reported
+instead of silently treating a corpus as proof; a changed corpus reseeds the
+hypothesis. `research.path_telemetry` measures target/hold reachability from
+the actual entry through the bounded hold, while lower-target and hold proposals
+are limited to preregistered ladders and remain non-authorizing.
+
 Before full variant replay, `research.fit_diagnostics` records fit-only
 eligible-prefix and first-signal rates, ATR and 30-bps-floor binding, planned
-stop/target/hold distributions, configured/stressed cost-to-risk, configured
-pre-cap risk versus capped delivered risk, exit reason/tie/gap counts, and
-clustered MDE/power,
-provider/feed provenance, entry-pricing sources, configured limits,
+stop/target/hold distributions, gross/net/fees/slippage and configured/stressed
+cost-to-risk, configured pre-cap versus fill-delivered risk, exit reason/tie/gap
+counts, and clustered MDE/power, provider/feed provenance for each leg,
+entry-pricing sources, configured limits,
 pass/fail/unknown row counts, behavioral alias fingerprints, and an execution-
 rejection section that passes only aggregate fit-partition counts/reasons to
 proposal generation. The exit grammar stays fixed
@@ -520,7 +548,7 @@ output contract:
 
 ### The model tunes values; it cannot invent a signal
 
-The signal primitives are fixed code. `RULE_FAMILIES` names eleven of them,
+The signal primitives are fixed code. `RULE_FAMILIES` names twelve of them,
 `CONFIRMATIONS` and `SIDES` are closed enums, the permitted field set is fixed
 per grammar version, and every numeric field has hard bounds — so
 `validate_rule_spec` rejects an unknown family, an unknown filter, an invented
@@ -805,15 +833,15 @@ coverage/refusal gates; every other malformed row remains a hard validation
 failure.
 
 ```bash
-python research.py factory run --data market.jsonl --strategies 11 --variants 4 --workers 2
+python research.py factory run --data market.jsonl --strategies 12 --variants 4 --workers 2
 python research.py factory status
 python research.py factory report [--slot N] [--format text|markdown|json] [--write]
 ```
 
 The standalone factory preflight requires readable normalized JSONL with
-explicit provider/feed provenance; the default equity lane requires IEX.
-`--diagnostic-only` is an explicit non-authorizing mode for partial or
-non-IEX input, marks the result diagnostic, and emits no proofs. In this mode
+explicit provider/feed provenance; the equity lane requires exact IEX or SIP.
+`delayed_sip` and other partial/non-exact feeds are diagnostic-only, mark the
+result diagnostic, and emit no proofs. In this mode
 the configured strategy model may still perform bounded discovery and tuning;
 its hypotheses, variants, call evidence, and aggregate refusal diagnostics are
 written to `ALPACA_FACTORY_DIAGNOSTIC_REPORT`, never to either authorizing

@@ -8,18 +8,22 @@ orchestrator.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 import math
 from statistics import mean
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    RULE_FAMILIES, RULE_SCHEMA_V2, RULE_SCHEMA_V3, SESSION_MINUTES,
+    CROSS_SECTIONAL_BENCHMARK, RULE_FAMILIES, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
+    SESSION_MINUTES,
     V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS,
     completed_bar_exit_transition, evaluate_rule_signal,
+    evaluate_rule_signal_trace,
     feature_window_bars, hold_deadline, rule_semantic_signature,
-    initialize_exit_state, rule_variant_id, rule_vehicle_executable,
+    initialize_exit_state, rule_behavior_identity, rule_variant_id,
+    rule_vehicle_executable,
     validate_rule_spec,
 )
 from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
@@ -35,6 +39,7 @@ from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, option_has_liquidity,
                           replay_available_at, replay_open_is_available,
                           replay_record_is_available)
+from .path_telemetry import compute_path_telemetry
 
 
 # `risk.max_position_notional_pct` in the checked runtime config.  Research
@@ -53,7 +58,9 @@ NOTIONAL_CAP_PCT = 25.0
 FRESH_OPTION_QUOTE_SECONDS = 30.0
 MAX_OPTION_QUOTE_STALENESS_SECONDS = 30.0
 
-DEFAULT_STRATEGIES = len(RULE_FAMILIES)
+# The default catalog covers every bounded family, including the contextual
+# SPY-relative rule appended at slot twelve.
+DEFAULT_STRATEGIES = 12
 DEFAULT_VARIANTS = 4
 MAX_STRATEGIES = len(RULE_FAMILIES)
 MAX_VARIANTS = 8
@@ -116,6 +123,9 @@ def _thesis(spec: Mapping[str, Any]) -> str:
         "opening_drive": (
             "a one-sided opening auction establishes a directional inventory "
             "transfer that continues after the opening window"),
+        "cross_sectional_residual": (
+            "an ETF's synchronized short-horizon return relative to SPY "
+            "captures idiosyncratic directional flow"),
     }
     mechanism = mechanisms.get(str(spec["family"]),
                                "the specified completed-bar condition captures persistent flow")
@@ -158,6 +168,8 @@ FAMILY_TEMPLATES: tuple[dict[str, Any], ...] = (
      "volume_multiplier": 2.0, "threshold_bps": 5.0, "confirmation": "none"},
     {"family": "opening_drive", "range_minutes": 30,
      "threshold_bps": 30.0, "confirmation": "volume"},
+    {"family": "cross_sectional_residual", "lookback": 15,
+     "threshold_bps": 12.0, "confirmation": "none"},
 )
 
 
@@ -381,6 +393,38 @@ def _contiguous(rows: Sequence[UnderlyingBar], start: int, stop: int) -> bool:
                for left, right in zip(rows[start:stop - 1], rows[start + 1:stop]))
 
 
+def _immutable_bars_by_symbol(
+        value: Mapping[str, Sequence[UnderlyingBar]] | None,
+) -> Mapping[str, tuple[UnderlyingBar, ...]]:
+    """Freeze caller-owned market context without sorting or repairing it."""
+    if not isinstance(value, Mapping):
+        return MappingProxyType({})
+    frozen: dict[str, tuple[UnderlyingBar, ...]] = {}
+    for raw_symbol, raw_rows in value.items():
+        symbol = str(raw_symbol).strip().upper()
+        if (not symbol or isinstance(raw_rows, (str, bytes)) or
+                not isinstance(raw_rows, Sequence) or symbol in frozen):
+            if symbol:
+                frozen[symbol] = ()
+            continue
+        frozen[symbol] = tuple(raw_rows)
+    return MappingProxyType(frozen)
+
+
+def _visible_rule_context(
+        bars_by_symbol: Mapping[str, Sequence[UnderlyingBar]], *,
+        day: date, cutoff: datetime, policy: ReplayPolicy,
+) -> Mapping[str, tuple[UnderlyingBar, ...]]:
+    """Return the immutable benchmark prefix observable at ``cutoff``."""
+    benchmark = bars_by_symbol.get(CROSS_SECTIONAL_BENCHMARK, ())
+    visible = tuple(
+        row for row in benchmark
+        if row.session_date == day and row.timestamp <= cutoff and
+        _visible(row, cutoff + timedelta(minutes=1), policy)
+    )
+    return MappingProxyType({CROSS_SECTIONAL_BENCHMARK: visible})
+
+
 def _at_or_before_force_flat(timestamp: datetime, policy: ReplayPolicy) -> bool:
     if policy.force_flat_time is None:
         return True
@@ -391,7 +435,9 @@ def _at_or_before_force_flat(timestamp: datetime, policy: ReplayPolicy) -> bool:
 def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, Any],
                     snapshots: Sequence[OptionSnapshot], vehicle: str,
                     quotes: Mapping[str, Sequence[QuoteSnapshot]] | None = None,
-                    policy: ReplayPolicy | Mapping[str, Any] | None = None) -> dict | None:
+                    policy: ReplayPolicy | Mapping[str, Any] | None = None,
+                    bars_by_symbol: Mapping[
+                        str, Sequence[UnderlyingBar]] | None = None) -> dict | None:
     resolved_policy = _coerce_policy(policy)
     if not session_bars:
         return None
@@ -402,10 +448,14 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             signal_opportunity=False)
     spec = validate_rule_spec(spec)
     if not rule_vehicle_executable(spec, vehicle):
+        reason = ("cross_sectional_residual is executable only for equity shares"
+                  if spec["family"] == "cross_sectional_residual" else
+                  "rule-strategy.v3 is not executable for options")
         return _unpriced(
             session_bars[0], session_bars[0], session_bars[0].session_date,
-            "unknown", "rule-strategy.v3 is not executable for options",
+            "unknown", reason,
             stage="rule_eligibility", signal_opportunity=False)
+    market_context = _immutable_bars_by_symbol(bars_by_symbol)
     try:
         resolved_policy = replay_policy_for_bars(
             resolved_policy, session_bars,
@@ -431,6 +481,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     last_refusal: dict | None = None
     evaluated_prefixes = 0
     gapped_prefixes = 0
+    cross_context_refusals = 0
+    cross_context_valid_prefixes = 0
+    last_cross_reason: str | None = None
+    last_cross_metadata: dict[str, Any] = {}
     for index in range(1, len(session_bars) - 1):
         if index + 1 < minimum_prefix:
             continue
@@ -444,9 +498,28 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             gapped_prefixes += 1
             continue
         evaluated_prefixes += 1
-        signal = evaluate_rule_signal(session_bars[:index + 1], spec)
+        if spec["family"] == "cross_sectional_residual":
+            context = _visible_rule_context(
+                market_context, day=signal_bar.session_date,
+                cutoff=signal_bar.timestamp, policy=resolved_policy)
+            trace = evaluate_rule_signal_trace(
+                session_bars[:index + 1], spec,
+                bars_by_symbol=context, symbol=signal_bar.symbol)
+            signal = trace["signal"]
+            last_cross_metadata = dict(trace.get("market_context") or {})
+            if signal is None:
+                reason = str((trace.get("stages") or [{}])[-1].get("reason") or "")
+                if reason.startswith(("benchmark_context_", "subject_context_")):
+                    cross_context_refusals += 1
+                    last_cross_reason = reason
+                else:
+                    cross_context_valid_prefixes += 1
+        else:
+            signal = evaluate_rule_signal(session_bars[:index + 1], spec)
         if signal is None:
             continue
+        if spec["family"] == "cross_sectional_residual":
+            cross_context_valid_prefixes += 1
         entry_bar = session_bars[index + 1]
         available = [_available(item, resolved_policy)
                      for item in session_bars[feature_start:index + 1]
@@ -785,6 +858,11 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "entry_slippage_reference": entry_slippage_reference,
             "underlying_entry": entry_underlying, "stop_price": stop,
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
+            "target_r": float(spec.get("target_r")) if spec.get("target_r") is not None else None,
+            "max_hold_bars": int(spec.get("max_hold_bars")) if spec.get("max_hold_bars") is not None else None,
+            "deadline_timestamp": (
+                datetime.fromtimestamp(float(deadline), timezone.utc).isoformat()
+                if deadline is not None else None),
             # ``exit_reason`` is a long-standing consumer field and remains
             # ``time`` for both cases.  These additive fields distinguish a
             # sparse-hold termination from a normal configured expiry without
@@ -842,6 +920,13 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 else "forward_observed"
             ),
         }
+        if spec["family"] == "cross_sectional_residual":
+            trade_row.update({
+                key: signal.get(key) for key in (
+                    "benchmark_symbol", "symbol_return", "benchmark_return",
+                    "residual_return", "market_context_digest",
+                    "candidate_behavior_identity")
+            })
         if spec.get("breakeven_r") is not None:
             trade_row.update({
                 "breakeven_r": spec["breakeven_r"],
@@ -850,14 +935,32 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
             })
+        trade_row["path_telemetry"] = compute_path_telemetry(
+            trade_row, session_bars)
         return trade_row
     if last_refusal is not None:
         return last_refusal
     if evaluated_prefixes:
-        return _no_signal(
+        reason = (last_cross_reason
+                  if (spec["family"] == "cross_sectional_residual" and
+                      cross_context_refusals and not cross_context_valid_prefixes)
+                  else "rule_not_triggered")
+        result = _no_signal(
             session_bars, prefix_status="valid_prefix_no_signal",
             detail={"gapped_prefixes": gapped_prefixes,
-                    "evaluated_prefixes": evaluated_prefixes})
+                    "evaluated_prefixes": evaluated_prefixes,
+                    **({"context_refusals": cross_context_refusals,
+                        "context_valid_prefixes": cross_context_valid_prefixes}
+                       if spec["family"] == "cross_sectional_residual" else {})},
+            reason=reason)
+        if spec["family"] == "cross_sectional_residual":
+            result.update(last_cross_metadata)
+            result.setdefault(
+                "candidate_behavior_identity",
+                rule_behavior_identity(
+                    spec, market_context_digest=result.get(
+                        "market_context_digest")))
+        return result
     if gapped_prefixes:
         return _unpriced(
             session_bars[0], session_bars[0], session_bars[0].session_date,
@@ -897,7 +1000,9 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                      starting_cash: float = 100_000.0, risk_pct: float = .5,
                      costs: CostModel | None = None,
                      quotes: Sequence[QuoteSnapshot] | None = None,
-                     policy: ReplayPolicy | Mapping[str, Any] | None = None) -> dict:
+                     policy: ReplayPolicy | Mapping[str, Any] | None = None,
+                     bars_by_symbol: Mapping[
+                         str, Sequence[UnderlyingBar]] | None = None) -> dict:
     """Replay one variant in an event-ordered isolated cash/equity book."""
     spec = validate_rule_spec(spec)
     model = costs or CostModel()
@@ -911,16 +1016,30 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         grouped.setdefault((bar.symbol, bar.session_date), []).append(bar)
     rows: list[dict] = []
     candidates: list[dict] = []
-    bars_by_symbol: dict[str, list[UnderlyingBar]] = {}
-    for bar in bars:
-        bars_by_symbol.setdefault(str(bar.symbol).upper(), []).append(bar)
-    for symbol_rows in bars_by_symbol.values():
-        symbol_rows.sort(key=lambda item: item.timestamp)
+    if bars_by_symbol is None:
+        derived_context: dict[str, list[UnderlyingBar]] = {}
+        for bar in bars:
+            derived_context.setdefault(str(bar.symbol).upper(), []).append(bar)
+        market_context = _immutable_bars_by_symbol(derived_context)
+    else:
+        market_context = _immutable_bars_by_symbol(bars_by_symbol)
     for (symbol, day), session_bars in sorted(
             grouped.items(), key=lambda item: (item[0][1], item[0][0])):
-        opportunity = f"{rule_variant_id(spec)}:{vehicle}:{symbol}:{day.isoformat()}"
         raw = _simulate_trade(session_bars, spec, snapshots, vehicle,
-                              quotes=quote_index, policy=resolved_policy)
+                              quotes=quote_index, policy=resolved_policy,
+                              bars_by_symbol=market_context)
+        behavior_identity = rule_variant_id(spec)
+        if spec["family"] == "cross_sectional_residual":
+            raw = dict(raw) if isinstance(raw, Mapping) else raw
+            context_digest = (raw.get("market_context_digest")
+                              if isinstance(raw, Mapping) else None)
+            behavior_identity = rule_behavior_identity(
+                spec, market_context_digest=context_digest)
+            if isinstance(raw, dict):
+                raw.setdefault("benchmark_symbol", CROSS_SECTIONAL_BENCHMARK)
+                raw.setdefault("candidate_behavior_identity", behavior_identity)
+        opportunity = (
+            f"{behavior_identity}:{vehicle}:{symbol}:{day.isoformat()}")
         if raw is None:
             # A non-empty grouped session must always have a terminal
             # disposition. Keep an internal contract breach visible and
@@ -1004,7 +1123,7 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                     session_date=date.fromisoformat(str(item["session_date"])))
                 if mark is None:
                     mark = _visible_bar_mark(
-                        bars_by_symbol.get(symbol, ()), timestamp,
+                        market_context.get(symbol, ()), timestamp,
                         resolved_policy,
                     )
             if mark is None:
@@ -1068,6 +1187,9 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         stress_enabled = (
             resolved_policy.stressed_cost_scenario_bps is not None or
             resolved_policy.max_stressed_cost_to_risk_ratio is not None)
+        stress_scenario, stress_activation_reason = (
+            resolved_policy.resolve_stress_scenario(
+                symbol, raw.get("entry_timestamp"), vehicle=vehicle))
         # Keep direct ReplayPolicy fixtures behaviour-compatible when both
         # controls are omitted, while validated runtime policies expose the
         # nominal risk unit used by RiskEngine.
@@ -1123,7 +1245,7 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             }
             checked, stress_reason = check_stressed_cost_plan(
                 plan,
-                scenario_bps=resolved_policy.stressed_cost_scenario_bps,
+                scenario_bps=stress_scenario,
                 max_ratio=resolved_policy.max_stressed_cost_to_risk_ratio,
                 costs=model,
             )
@@ -1137,20 +1259,20 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                     "stressed_cost_basis": dict(STRESSED_COST_BASIS),
                     "stressed_cost_entry_notional": float(entry_notional),
                     "entry_notional": float(entry_notional),
-                    "stressed_cost_scenario_bps": (
-                        resolved_policy.stressed_cost_scenario_bps),
+                    "stressed_cost_scenario_bps": stress_scenario,
+                    "stressed_cost_activation_reason": stress_activation_reason,
                     "max_stressed_cost_to_risk_ratio": (
                         resolved_policy.max_stressed_cost_to_risk_ratio),
                     "stressed_cost_risk_usd": float(nominal_risk_usd),
                     "risk_usd": float(nominal_risk_usd),
                 }
                 try:
-                    if (resolved_policy.stressed_cost_scenario_bps is not None and
+                    if (stress_scenario is not None and
                             resolved_policy.max_stressed_cost_to_risk_ratio is not None and
                             nominal_risk_usd > 0 and entry_notional > 0):
                         stressed = stressed_cost_usd(
                             entry_notional=entry_notional,
-                            scenario_bps=resolved_policy.stressed_cost_scenario_bps,
+                            scenario_bps=stress_scenario,
                             vehicle=vehicle, quantity=quantity, costs=model)
                         stress_telemetry.update({
                             "stressed_cost_usd": float(stressed),
@@ -1233,13 +1355,14 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                  "contracts": quantity if vehicle == "option" else None,
                  "shares": quantity if vehicle == "equity" else None,
                  "notional": entry_notional, "risk_usd": nominal_risk_usd},
-                scenario_bps=resolved_policy.stressed_cost_scenario_bps,
+                scenario_bps=stress_scenario,
                 max_ratio=resolved_policy.max_stressed_cost_to_risk_ratio,
                 costs=model)
             if checked is not None:
                 row.update({key: value for key, value in checked.items()
                             if key.startswith("stressed_cost_") or
                             key == "max_stressed_cost_to_risk_ratio"})
+                row["stressed_cost_activation_reason"] = stress_activation_reason
         rows.append(row)
         active.append(row)
     if active:
@@ -1696,6 +1819,15 @@ def interaction_mutation_pool(
     root_signature = rule_semantic_signature(root)
     seen = {rule_variant_id(root)}
     variants: list[tuple[dict, str]] = []
+    geometry_pair = _target_hold_geometry_pair(
+        root, diagnostic, lessons, coordinate_exhausted=coordinate_exhausted)
+    geometry_pair_id = (rule_variant_id(geometry_pair[0])
+                        if geometry_pair is not None else None)
+    if geometry_pair is not None:
+        variants.append(geometry_pair)
+        seen.add(geometry_pair_id)
+        if len(variants) >= max(0, int(limit)):
+            return variants[:max(0, int(limit))]
     blocked_pair = _blocked_stress_pair(
         root, lessons, diagnostic=diagnostic,
         risk_config=risk_config, coordinate_exhausted=coordinate_exhausted)
@@ -1716,6 +1848,11 @@ def interaction_mutation_pool(
                     rule_semantic_signature(candidate) == root_signature or
                     len(spec_delta(root, candidate)) != 2):
                 continue
+            if geometry_pair is not None and {left, right} == {
+                    "target_r", "max_hold_bars"}:
+                # The dedicated geometry selector owns this pair and emits at
+                # most one recommendation.
+                continue
             if ((blocked_pair is not None or blocked_execution) and
                     {left, right} == {"min_atr_bps", "stop_atr"}):
                 # Keep exactly one measured ATR interaction; the dedicated
@@ -1734,8 +1871,12 @@ def interaction_mutation_pool(
     # The dedicated pair is first so a bounded interaction batch cannot spend
     # its entire allowance on weaker generic combinations. Trim only after
     # inserting it, preserving the existing pool cap and identity semantics.
-    variants = [blocked_pair] + [item for item in variants
-                                 if rule_variant_id(item[0]) != blocked_pair_id]
+    variants = ([blocked_pair] + [item for item in variants
+                                  if rule_variant_id(item[0]) not in {
+                                      blocked_pair_id, geometry_pair_id}])
+    if geometry_pair is not None:
+        variants = [geometry_pair] + [item for item in variants
+                                      if rule_variant_id(item[0]) != geometry_pair_id]
     return variants[:max(0, int(limit))]
 
 
@@ -1783,6 +1924,93 @@ MAX_DISCOVERY_ATTEMPTS = (
     len(_DISCOVERY_WINDOWS) * len(_DISCOVERY_CONFIRMATIONS) *
     len(_DISCOVERY_BANDS) * len(_DISCOVERY_SHAPES) *
     len(_DISCOVERY_BREAKEVEN_FRACTIONS))
+
+
+def _target_hold_geometry_pair(
+        root: Mapping[str, Any], diagnostic: Mapping[str, Any] | None,
+        lessons: Sequence[Mapping[str, Any]] = (), *,
+        coordinate_exhausted: bool = True,
+        ) -> tuple[dict, str] | None:
+    """Return at most one fit-only target/hold interaction.
+
+    This selector is downstream of the ordinary coordinate neighborhood. It
+    consumes only the compact reachability diagnostic and one-factor lesson
+    coordinates; all values are checked against the finite discovery shapes
+    and the rule validator before a new variant is emitted.
+    """
+    if not coordinate_exhausted or not isinstance(diagnostic, Mapping):
+        return None
+    section = diagnostic.get("target_hold_reachability")
+    if not isinstance(section, Mapping):
+        fit = diagnostic.get("fit_diagnostics")
+        section = fit.get("target_hold_reachability") \
+            if isinstance(fit, Mapping) else None
+    if not isinstance(section, Mapping):
+        return None
+    if section.get("diagnostic_only") is not True or \
+            section.get("authorizing") is True:
+        return None
+    if section.get("genuine_mismatch") is not True or \
+            section.get("adequate") is not True:
+        return None
+    try:
+        if int(section.get("usable")) < 30:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    recommendation = section.get("recommendation")
+    if not isinstance(recommendation, Mapping):
+        return None
+
+    root = validate_rule_spec(root)
+    allowed_targets = {round(float(shape[1]), 8)
+                       for shape in _DISCOVERY_SHAPES}
+    allowed_holds = {int(shape[3]) for shape in _DISCOVERY_SHAPES}
+    # Lessons may add a value only when it is a validated one-factor change;
+    # the candidate itself is validated again below.
+    for lesson in lessons:
+        if not isinstance(lesson, Mapping):
+            continue
+        changed = lesson.get("tried") or lesson.get("changed") or {}
+        if not isinstance(changed, Mapping) or len(changed) != 1:
+            continue
+        field, change = next(iter(changed.items()))
+        if field not in {"target_r", "max_hold_bars"} or \
+                not isinstance(change, Mapping) or "to" not in change:
+            continue
+        try:
+            value = (round(float(change["to"]), 8)
+                     if field == "target_r" else int(change["to"]))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        try:
+            validated = _safe_variant(root, **{field: value})
+        except (TypeError, ValueError):
+            continue
+        if validated.get(field) == value:
+            (allowed_targets if field == "target_r" else allowed_holds).add(value)
+
+    try:
+        target = round(float(recommendation.get("target_r")), 8)
+        hold = int(recommendation.get("max_hold_bars"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if target not in allowed_targets or hold not in allowed_holds:
+        return None
+    try:
+        candidate = _safe_variant(root, target_r=target, max_hold_bars=hold)
+    except (TypeError, ValueError):
+        return None
+    delta = spec_delta(root, candidate)
+    if not delta or len(delta) > 2 or set(delta) - {"target_r", "max_hold_bars"}:
+        return None
+    if rule_variant_id(candidate) == rule_variant_id(root):
+        return None
+    reason = (
+        "Bounded target/hold geometry interaction after coordinate exhaustion: "
+        "fit-only time-expiry/unreachable-target evidence selected "
+        f"target_r={target:g}, max_hold_bars={hold}.")[:240]
+    return candidate, reason
 
 
 def discovery_spec(index: int, *, family: str,

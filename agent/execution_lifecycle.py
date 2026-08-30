@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import json
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RuleSpecError,
                              completed_bar_exit_transition,
                              initialize_exit_state)
 from .instruments import validate_instrument
+from research.costs import CostError, CostModel
 
 _FILLED_ORDER_STATUSES = {"filled", "partially_filled"}
 _TERMINAL_ORDER_STATUSES = {
@@ -166,6 +168,73 @@ class ExecutionLifecycleMixin:
             return None
         return round(numerator / denominator, 12)
 
+    def _close_pnl_attribution(self, trade: Mapping, gross_pnl: float | None,
+                               entry_price: float | None,
+                               exit_price: float | None, quantity: float,
+                               multiplier: float) -> dict[str, Any]:
+        """Compute one explicit gross/fee/slippage/net close attribution.
+
+        Broker fills determine gross P&L.  Their prices already contain spread
+        and execution slippage, so net P&L subtracts fees only; slippage stays
+        as separately reported execution-quality telemetry and is never billed
+        a second time.
+        """
+        gross = self._number(gross_pnl)
+        if gross is None:
+            return {"gross_pnl": None, "fees": None, "slippage": None,
+                    "net_pnl": None, "pnl_pct": None,
+                    "pnl_semantics": "broker_fill_pnl_minus_fees",
+                    "pnl_provenance": "broker_fills",
+                    "cost_provenance": None}
+        vehicle = ("option" if _option_profile(trade.get("execution_profile"))
+                   else "equity")
+        fees = self._number(trade.get("fees"))
+        if fees is None:
+            fees = self._number(trade.get("fee_usd"))
+        slippage = self._number(trade.get("slippage"))
+        if slippage is None:
+            slippage = self._number(trade.get("slippage_usd"))
+        if slippage is None:
+            slippage = self._number(trade.get("adverse_slippage_usd"))
+        provenance: dict[str, Any] = {"source": "configured_cost_model",
+                                      "vehicle": vehicle}
+        if fees is None or slippage is None:
+            try:
+                cfg = getattr(self, "cfg", {})
+                model = CostModel.from_config(cfg, vehicle=vehicle)
+                if entry_price is not None and exit_price is not None:
+                    expected_fees = model.fees(
+                        entry_price, exit_price, quantity, multiplier,
+                        vehicle=vehicle)
+                    expected_total = model.round_trip_cost(
+                        entry_price, exit_price, quantity, multiplier,
+                        vehicle=vehicle)
+                    if fees is None:
+                        fees = expected_fees
+                    if slippage is None:
+                        # ``round_trip_cost`` includes the same expected
+                        # spread/adverse-slippage component used by replay.
+                        slippage = max(0.0, expected_total - expected_fees)
+                provenance.update(model.as_dict())
+            except (CostError, TypeError, ValueError, OverflowError):
+                provenance = {"source": "cost_model_unavailable",
+                              "vehicle": vehicle}
+        fees = max(0.0, fees or 0.0)
+        slippage = max(0.0, slippage or 0.0)
+        net = gross - fees
+        notional = (abs(entry_price) * quantity * multiplier
+                    if entry_price is not None else None)
+        pnl_pct = (net / notional * 100.0
+                   if notional is not None and notional > 0 else None)
+        return {
+            "gross_pnl": round(gross, 12), "fees": round(fees, 12),
+            "slippage": round(slippage, 12), "net_pnl": round(net, 12),
+            "pnl_pct": round(pnl_pct, 12) if pnl_pct is not None else None,
+            "pnl_semantics": "broker_fill_pnl_minus_fees",
+            "pnl_provenance": "broker_fills",
+            "cost_provenance": provenance,
+        }
+
     def _risk_telemetry(self, plan: Mapping, profile: str,
                         requested_qty: float | None, planned_qty: float | None,
                         multiplier: float, filled_qty: float,
@@ -287,6 +356,17 @@ class ExecutionLifecycleMixin:
         # existing intended value may be scaled to requested/planned quantity
         # for rolling-state compatibility and is tracked separately.
         planned_risk = self._planned_risk(risk_plan, fallback=intended_risk)
+        provenance_fields = {
+            key: risk_plan.get(key) for key in (
+                "entry_fill_source", "exit_fill_source", "entry_feed",
+                "exit_feed", "entry_provider", "exit_provider",
+                "entry_quote_age_seconds", "exit_quote_age_seconds",
+                "signal_bar_feed", "signal_bar_provider",
+                "signal_bar_age_seconds", "entry_bar_feed",
+                "entry_bar_provider", "entry_bar_age_seconds",
+                "exit_bar_feed", "exit_bar_provider",
+                "exit_bar_age_seconds") if key in risk_plan
+        }
         order_state = {
             "order_id": order_id, "symbol": symbol, "status": status,
             "client_order_id": request.client_order_id, "qty": str(request.qty),
@@ -319,6 +399,7 @@ class ExecutionLifecycleMixin:
             "logged_filled_qty": 0.0, "logged_filled_avg_price": None,
             "updated_ts": time.time(),
         }
+        order_state.update(provenance_fields)
         def update(current: dict) -> dict:
             current.setdefault("orders", {})[order_id] = order_state
             if filled_qty > 0 and status in _FILLED_ORDER_STATUSES:
@@ -354,7 +435,8 @@ class ExecutionLifecycleMixin:
                         planned_to_configured_risk_ratio=persisted_order.get(
                             "planned_to_configured_risk_ratio"),
                         delivered_to_configured_risk_ratio=persisted_order.get(
-                            "delivered_to_configured_risk_ratio"))
+                            "delivered_to_configured_risk_ratio"),
+                        **provenance_fields)
         self._event("order_submitted", {"symbol": request.symbol, "qty": str(request.qty),
                                          "status": status, "filled_qty": filled_qty,
                                          "client_order_id": request.client_order_id,
@@ -498,6 +580,15 @@ class ExecutionLifecycleMixin:
         # the requested-quantity-scaled intended value here.
         planned_risk = self._planned_risk(
             plan, fallback=order_state.get("planned_risk_usd", intended_risk))
+        # Legacy option plans sometimes carried an underlying stop-distance
+        # ``risk_usd`` while their actual premium risk was computed correctly
+        # from the fill.  Without an explicit planned/nominal field, retain
+        # the option's comparable premium denominator rather than 9750x risk.
+        if (_option_profile(profile) and
+                plan.get("planned_risk_usd") is None and
+                cumulative_risk is not None and
+                (planned_risk is None or planned_risk > cumulative_risk)):
+            planned_risk = cumulative_risk
         planned_to_configured = self._risk_ratio(planned_risk, configured_budget)
         delivered_to_configured = self._risk_ratio(delivered_risk, configured_budget)
         # ``risk_usd`` historically represented the cumulative open-position
@@ -555,6 +646,23 @@ class ExecutionLifecycleMixin:
             "strategy_id": plan.get("strategy_id", self.cfg.get("strategy", {}).get("id")),
             "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
             "contract_multiplier": multiplier,
+            "entry_fill_source": plan.get("entry_fill_source", "quote"),
+            "exit_fill_source": plan.get("exit_fill_source"),
+            "entry_feed": plan.get("entry_feed"),
+            "exit_feed": plan.get("exit_feed"),
+            "entry_provider": plan.get("entry_provider"),
+            "exit_provider": plan.get("exit_provider"),
+            "entry_quote_age_seconds": plan.get("entry_quote_age_seconds"),
+            "exit_quote_age_seconds": plan.get("exit_quote_age_seconds"),
+            "signal_bar_feed": plan.get("signal_bar_feed"),
+            "signal_bar_provider": plan.get("signal_bar_provider"),
+            "signal_bar_age_seconds": plan.get("signal_bar_age_seconds"),
+            "entry_bar_feed": plan.get("entry_bar_feed"),
+            "entry_bar_provider": plan.get("entry_bar_provider"),
+            "entry_bar_age_seconds": plan.get("entry_bar_age_seconds"),
+            "exit_bar_feed": plan.get("exit_bar_feed"),
+            "exit_bar_provider": plan.get("exit_bar_provider"),
+            "exit_bar_age_seconds": plan.get("exit_bar_age_seconds"),
         }
         if str(plan.get("rule_schema") or "") == RULE_SCHEMA_V3:
             if v3_progressed:
@@ -637,6 +745,22 @@ class ExecutionLifecycleMixin:
                 planned_risk_usd=planned_risk,
                 planned_to_configured_risk_ratio=planned_to_configured,
                 delivered_to_configured_risk_ratio=delivered_to_configured,
+                entry_fill_source=trade.get("entry_fill_source"),
+                exit_fill_source=trade.get("exit_fill_source"),
+                entry_feed=trade.get("entry_feed"), exit_feed=trade.get("exit_feed"),
+                entry_provider=trade.get("entry_provider"),
+                exit_provider=trade.get("exit_provider"),
+                entry_quote_age_seconds=trade.get("entry_quote_age_seconds"),
+                exit_quote_age_seconds=trade.get("exit_quote_age_seconds"),
+                signal_bar_feed=trade.get("signal_bar_feed"),
+                signal_bar_provider=trade.get("signal_bar_provider"),
+                signal_bar_age_seconds=trade.get("signal_bar_age_seconds"),
+                entry_bar_feed=trade.get("entry_bar_feed"),
+                entry_bar_provider=trade.get("entry_bar_provider"),
+                entry_bar_age_seconds=trade.get("entry_bar_age_seconds"),
+                exit_bar_feed=trade.get("exit_bar_feed"),
+                exit_bar_provider=trade.get("exit_bar_provider"),
+                exit_bar_age_seconds=trade.get("exit_bar_age_seconds"),
                 runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
                 run_id=self.run_id)
             order_state["fill_logged"] = True
@@ -967,36 +1091,97 @@ class ExecutionLifecycleMixin:
                                               "order_ids": cancelled})
         return True
 
-    def _protection_price(self, trade: Mapping, position: Any,
-                          now: datetime) -> float | None:
-        """Return the underlying price used by both stock and option exits."""
+    @staticmethod
+    def _empty_exit_observation(source: str = "unknown") -> dict[str, Any]:
+        return {
+            "exit_fill_source": source,
+            "exit_feed": None,
+            "exit_provider": None,
+            "exit_quote_age_seconds": None,
+            "exit_bar_feed": None,
+            "exit_bar_provider": None,
+            "exit_bar_age_seconds": None,
+        }
+
+    def _protection_observation(
+            self, trade: Mapping, position: Any, now: datetime, *,
+            market_row: Mapping[str, Any] | None = None,
+            allow_fetch: bool = True) -> tuple[float | None, dict[str, Any]]:
+        """Return the exact price observation and provenance used by protection."""
         profile = str(trade.get("execution_profile", "shares")).lower()
         if not _option_profile(profile):
             direct = self._number(_value(position, "current_price",
                                          _value(position, "price", None)))
             if direct is not None and direct > 0:
-                return direct
+                provenance = self._empty_exit_observation("broker_position")
+                provenance["exit_provider"] = str(
+                    getattr(self.provider, "name", "alpaca") or "alpaca")
+                return direct, provenance
         underlying = str(trade.get("underlying_symbol") or
                          _value(position, "symbol", "")).upper()
         if not underlying:
-            return None
-        try:
-            rows = self.market.stock_quotes(
-                [underlying], start=now - timedelta(minutes=2), end=now)
-            values = rows.get(underlying, []) if isinstance(rows, Mapping) else []
-            quote = self._quote_mapping(values[-1], underlying) if values else {}
-        except Exception:  # noqa: BLE001
-            return None
+            return None, self._empty_exit_observation()
+        row = market_row if isinstance(market_row, Mapping) else {}
+        quote = row.get("quote") if isinstance(row.get("quote"), Mapping) else None
+        if quote is None:
+            values = row.get("quotes") if isinstance(row, Mapping) else None
+            if isinstance(values, (list, tuple)) and values:
+                quote = values[-1] if isinstance(values[-1], Mapping) else None
+        if quote is None and allow_fetch:
+            try:
+                rows = self.market.stock_quotes(
+                    [underlying], start=now - timedelta(minutes=2), end=now)
+                values = rows.get(underlying, []) if isinstance(rows, Mapping) else []
+                quote = self._quote_mapping(values[-1], underlying) if values else {}
+            except Exception:  # noqa: BLE001
+                return None, self._empty_exit_observation()
+        if not isinstance(quote, Mapping):
+            return None, self._empty_exit_observation()
         timestamp = self._timestamp(quote.get("timestamp"))
         maximum = float(self.cfg.get("execution", {}).get(
             "max_market_data_age_seconds", 30) or 30)
         if timestamp is None or timestamp > now or (now - timestamp).total_seconds() > maximum:
-            return None
+            return None, self._empty_exit_observation()
         bid = self._number(quote.get("bid", quote.get("bid_price")))
         ask = self._number(quote.get("ask", quote.get("ask_price")))
         if bid is None or ask is None or bid <= 0 or ask < bid:
-            return None
-        return (bid + ask) / 2.0
+            return None, self._empty_exit_observation()
+        provenance = self._empty_exit_observation("quote")
+        provenance.update({
+            "exit_feed": quote.get("feed", row.get("quote_feed", row.get("feed"))),
+            "exit_provider": quote.get(
+                "provider", row.get("quote_provider", row.get("provider"))),
+            "exit_quote_age_seconds": max(0.0, (now - timestamp).total_seconds()),
+        })
+        return (bid + ask) / 2.0, provenance
+
+    def _protection_price(self, trade: Mapping, position: Any,
+                          now: datetime) -> float | None:
+        """Compatibility wrapper returning only the protection observation price."""
+        price, _provenance = self._protection_observation(
+            trade, position, now, allow_fetch=True)
+        return price
+
+    def _completed_bar_observation(
+            self, bar: Mapping[str, Any], exit_row: Mapping[str, Any],
+            now: datetime) -> tuple[float | None, dict[str, Any]]:
+        """Describe a v3 local exit triggered by one completed OHLC bar."""
+        price = self._number(exit_row.get("price"))
+        stamp = self._timestamp(bar.get("timestamp"))
+        age = self._number(bar.get("bar_age_seconds", bar.get("data_age_seconds")))
+        if age is None and stamp is not None:
+            interval = self._number(bar.get("interval_seconds")) or float(BAR_SECONDS)
+            age = max(0.0, (now - (
+                stamp + timedelta(seconds=interval))).total_seconds())
+        provenance = self._empty_exit_observation("bar")
+        provenance.update({
+            "exit_feed": bar.get("feed"),
+            "exit_provider": bar.get("provider"),
+            "exit_bar_feed": bar.get("feed"),
+            "exit_bar_provider": bar.get("provider"),
+            "exit_bar_age_seconds": age,
+        })
+        return price, provenance
 
     def _completed_exit_bars(self, trade: Mapping, now: datetime,
                              market_rows: Mapping[str, Any] | None) -> list[Any]:
@@ -1005,7 +1190,7 @@ class ExecutionLifecycleMixin:
                          trade.get("symbol") or "").upper()
         row = market_rows.get(underlying, {}) if isinstance(market_rows, Mapping) else {}
         bars = row.get("bars", []) if isinstance(row, Mapping) else []
-        if not bars:
+        if not bars and not isinstance(market_rows, Mapping):
             start_epoch = (self._number(trade.get("last_completed_bar_epoch")) or
                            self._number(trade.get("exit_entry_bar_epoch")) or
                            self._number(trade.get("opened_at")))
@@ -1239,6 +1424,8 @@ class ExecutionLifecycleMixin:
                 continue
             protected = _broker_protected(legs)
             transition_reason = None
+            transition_bar = None
+            transition_exit = None
             filled_fraction = (self._number(trade.get("filled_fraction"))
                                if isinstance(trade, Mapping) else None)
             if (isinstance(trade, Mapping) and
@@ -1278,7 +1465,9 @@ class ExecutionLifecycleMixin:
                             if transition.get("exit") is not None:
                                 transition_reason = str(
                                     transition["exit"].get("reason") or "") or None
-                                trade["completed_bar_exit"] = dict(transition["exit"])
+                                transition_exit = dict(transition["exit"])
+                                transition_bar = bar
+                                trade["completed_bar_exit"] = transition_exit
                                 break
                     except RuleSpecError as exc:
                         failed.append({"symbol": symbol,
@@ -1316,7 +1505,28 @@ class ExecutionLifecycleMixin:
                         # broker leg is the exit; never fall through to the
                         # local protection poller and submit a second close.
                         continue
-            price = self._protection_price(trade, position, now) if isinstance(trade, Mapping) else None
+            exit_updates = self._empty_exit_observation()
+            if (transition_reason is not None and
+                    isinstance(transition_bar, Mapping) and
+                    isinstance(transition_exit, Mapping)):
+                price, exit_updates = self._completed_bar_observation(
+                    transition_bar, transition_exit, now)
+            elif isinstance(trade, Mapping) and isinstance(market_rows, Mapping):
+                underlying = str(trade.get("underlying_symbol") or symbol).upper()
+                observed = market_rows.get(underlying, {})
+                price, exit_updates = self._protection_observation(
+                    trade, position, now,
+                    market_row=(observed if isinstance(observed, Mapping) else {}),
+                    allow_fetch=False)
+            elif isinstance(trade, Mapping):
+                # Preserve direct-call compatibility for watchdog/tests.  The
+                # production cycle always supplies ``market_rows`` above.
+                price = self._protection_price(trade, position, now)
+                if not _option_trade(trade):
+                    _direct, exit_updates = self._protection_observation(
+                        trade, position, now, allow_fetch=False)
+            else:
+                price = None
             direction = str(trade.get("direction", _value(position, "side", "long"))).lower()
             stop = self._number(trade.get("active_stop_price",
                                           trade.get("stop_price")))
@@ -1369,6 +1579,7 @@ class ExecutionLifecycleMixin:
                     order = self._close_position(position, reason, attempt=attempt)
                     closed.append({"symbol": symbol, "reason": reason})
                     if isinstance(trade, dict):
+                        trade.update(exit_updates)
                         close_fill = self._number(getattr(order, "filled_avg_price", None))
                         close_order_id = str(getattr(order, "id", None) or
                                              self._client_id("close", {
@@ -1755,10 +1966,8 @@ class ExecutionLifecycleMixin:
             multiplier = self._number(trade.get("contract_multiplier")) or 1.0
             realized = None
             sign = -1.0 if str(trade.get("position_side", "long")) == "short" else 1.0
-            if entry is not None and exit_price is not None:
-                realized = (exit_price - entry) * qty * multiplier * sign
-            pnl_pct = ((exit_price - entry) / entry * 100.0 * sign
-                       if entry and exit_price is not None else None)
+            gross_pnl = None
+            pnl_pct = None
             # The broker's terminal close and durable active-trade removal are
             # separate writes (SQLite and JSON respectively).  A crash in
             # between must replay the close journal as a no-op, not book a
@@ -1818,14 +2027,33 @@ class ExecutionLifecycleMixin:
             close_fraction = (close_filled / close_requested
                               if close_requested and close_requested > 0 else None)
             if entry is not None and exit_price is not None:
-                realized = (exit_price - entry) * close_filled * multiplier * sign
+                gross_pnl = (exit_price - entry) * close_filled * multiplier * sign
+            attribution = self._close_pnl_attribution(
+                trade, gross_pnl, entry, exit_price, close_filled, multiplier)
+            realized = attribution.get("net_pnl")
+            pnl_pct = attribution.get("pnl_pct")
             state.log_trade(
                 symbol, "sell" if str(trade.get("position_side", "long")) == "long" else "buy",
                 "close", close_filled, price=exit_price, notional=close_notional,
                 reason=trade.get("closing_reason", "broker_reconcile"),
                 trade_id=close_trade_id,
-                realized_pnl_usd=realized, pnl_pct=pnl_pct,
+                # ``realized_pnl_usd`` is the historical fill-only column;
+                # explicit ``net_pnl`` below carries the all-in value.
+                realized_pnl_usd=attribution.get("gross_pnl"), pnl_pct=pnl_pct,
+                gross_pnl=attribution.get("gross_pnl"),
+                fees=attribution.get("fees"), slippage=attribution.get("slippage"),
+                net_pnl=attribution.get("net_pnl"),
+                pnl_semantics=attribution.get("pnl_semantics"),
+                pnl_provenance=attribution.get("pnl_provenance"),
+                cost_provenance=json.dumps(
+                    attribution.get("cost_provenance"), sort_keys=True,
+                    default=str) if attribution.get("cost_provenance") is not None else None,
                 close_trigger=trade.get("closing_reason", "broker_reconcile"),
+                # ``exit_fill_source`` describes the quote/bar observation
+                # that triggered valuation; this separate evidence marker
+                # records whether a broker close fill actually settled it.
+                close_evidence=("broker_order_fill" if close_order is not None
+                                else "local_trigger"),
                 setup_id=trade.get("setup_id"), setup_type=trade.get("setup_type"),
                 strategy_id=trade.get("strategy_id"),
                 strategy_version=trade.get("strategy_version"),
@@ -1849,13 +2077,34 @@ class ExecutionLifecycleMixin:
                     "configured_risk_budget_usd", trade.get("risk_budget_usd")),
                 planned_risk_usd=trade.get(
                     "planned_risk_usd", trade.get("intended_risk_usd")),
+                nominal_risk_usd=trade.get(
+                    "planned_risk_usd", trade.get("intended_risk_usd")),
                 planned_to_configured_risk_ratio=trade.get(
                     "planned_to_configured_risk_ratio"),
                 delivered_to_configured_risk_ratio=trade.get(
                     "delivered_to_configured_risk_ratio"),
+                entry_fill_source=trade.get("entry_fill_source"),
+                exit_fill_source=trade.get("exit_fill_source"),
+                entry_feed=trade.get("entry_feed"), exit_feed=trade.get("exit_feed"),
+                entry_provider=trade.get("entry_provider"),
+                exit_provider=trade.get("exit_provider"),
+                entry_quote_age_seconds=trade.get("entry_quote_age_seconds"),
+                exit_quote_age_seconds=trade.get("exit_quote_age_seconds"),
+                signal_bar_feed=trade.get("signal_bar_feed"),
+                signal_bar_provider=trade.get("signal_bar_provider"),
+                signal_bar_age_seconds=trade.get("signal_bar_age_seconds"),
+                entry_bar_feed=trade.get("entry_bar_feed"),
+                entry_bar_provider=trade.get("entry_bar_provider"),
+                entry_bar_age_seconds=trade.get("entry_bar_age_seconds"),
+                exit_bar_feed=trade.get("exit_bar_feed"),
+                exit_bar_provider=trade.get("exit_bar_provider"),
+                exit_bar_age_seconds=trade.get("exit_bar_age_seconds"),
                 runtime_mode=self.mode,
                 account_fingerprint=current.get("account_fingerprint"), run_id=self.run_id)
-            self._record_edge_outcome(trade, realized, pnl_pct, exit_price)
+            # Keep the positional call shape for lightweight observers and
+            # test seams; the helper recomputes the same attribution from the
+            # gross fill value when no explicit mapping is supplied.
+            self._record_edge_outcome(trade, gross_pnl, pnl_pct, exit_price)
             entry_order = order_state.get(entry_order_id)
             if isinstance(entry_order, dict):
                 closing_attempt = self._number(trade.get("closing_attempt"))
@@ -1905,15 +2154,48 @@ class ExecutionLifecycleMixin:
         return result
 
     def _record_edge_outcome(self, trade: Mapping, realized: float | None,
-                             pnl_pct: float | None, exit_price: float | None) -> None:
+                             pnl_pct: float | None, exit_price: float | None,
+                             *, attribution: Mapping | None = None) -> None:
         if self.mode != "paper":
             return
         variant_id = trade.get("variant_id")
-        realized_value = self._number(realized)
-        if not variant_id or realized_value is None:
+        if not variant_id:
             return
+        entry_price = self._number(trade.get("entry_price"))
+        quantity = self._number(trade.get("qty")) or 0.0
+        multiplier = self._number(trade.get("contract_multiplier")) or 1.0
+        if attribution is None:
+            # Direct callers historically passed fill P&L as ``realized``;
+            # treat it as gross and apply the same configured cost seam used
+            # by reconciliation rather than preserving a misleading net label.
+            attribution = self._close_pnl_attribution(
+                trade, realized, entry_price, self._number(exit_price),
+                quantity, multiplier)
+        realized_value = self._number(attribution.get("net_pnl"))
+        if realized_value is None:
+            return
+        gross_value = self._number(attribution.get("gross_pnl"))
+        fees_value = self._number(attribution.get("fees")) or 0.0
+        slippage_value = self._number(attribution.get("slippage")) or 0.0
         vehicle = "option" if _option_profile(trade.get("execution_profile")) else "equity"
-        risk_usd = self._number(trade.get("risk_usd"))
+        # Paper R is intentionally based on the immutable post-cap planned
+        # risk, which is the same nominal denominator used by research.  The
+        # broker-fill delivered risk remains telemetry, never the denominator.
+        explicit_planned = (trade.get("planned_risk_usd") is not None or
+                            trade.get("nominal_risk_usd") is not None)
+        if explicit_planned:
+            risk_usd = self._planned_risk(
+                trade, fallback=self._number(trade.get("delivered_risk_usd",
+                                               trade.get("risk_usd"))))
+        else:
+            # Legacy rows used ``risk_usd`` for intended risk even when
+            # premium-based delivered risk was computed later.  In the
+            # absence of an explicit nominal field, use delivered risk so
+            # those rows remain comparable rather than inventing 65x R.
+            risk_usd = self._number(trade.get("delivered_risk_usd",
+                                           trade.get("risk_usd")))
+        delivered_risk = self._number(
+            trade.get("delivered_risk_usd", trade.get("risk_usd")))
         opened = self._number(trade.get("opened_at")) or time.time()
         outcome = {
             "variant_id": variant_id, "vehicle": vehicle,
@@ -1922,13 +2204,41 @@ class ExecutionLifecycleMixin:
             "opportunity_id": trade.get("setup_id") or
                               f"{trade.get('symbol')}:{opened:.6f}",
             "session_date": datetime.fromtimestamp(opened, timezone.utc).date().isoformat(),
-            "net_pnl": realized_value, "pnl_pct": self._number(pnl_pct),
-            "risk_usd": risk_usd,
+            "gross_pnl": gross_value, "fees": fees_value,
+            "slippage": slippage_value, "net_pnl": realized_value,
+            "pnl_pct": self._number(attribution.get("pnl_pct", pnl_pct)),
+            "pnl_semantics": attribution.get(
+                "pnl_semantics", "broker_fill_pnl_minus_fees"),
+            "pnl_provenance": attribution.get("pnl_provenance", "broker_fills"),
+            "cost_provenance": attribution.get("cost_provenance"),
+            "risk_usd": risk_usd, "nominal_risk_usd": risk_usd,
+            "planned_risk_usd": risk_usd,
+            "delivered_risk_usd": delivered_risk,
             "r_multiple": (realized_value / risk_usd
                            if risk_usd and risk_usd > 0 else None),
             "entry_price": self._number(trade.get("entry_price")),
             "exit_price": self._number(exit_price),
             "reason": trade.get("closing_reason", "broker_reconcile"),
+            "close_evidence": ("broker_order_fill"
+                               if trade.get("closing_order_id") else
+                               "local_trigger"),
+            "entry_fill_source": trade.get("entry_fill_source"),
+            "exit_fill_source": trade.get("exit_fill_source"),
+            "entry_feed": trade.get("entry_feed"),
+            "exit_feed": trade.get("exit_feed"),
+            "entry_provider": trade.get("entry_provider"),
+            "exit_provider": trade.get("exit_provider"),
+            "entry_quote_age_seconds": trade.get("entry_quote_age_seconds"),
+            "exit_quote_age_seconds": trade.get("exit_quote_age_seconds"),
+            "signal_bar_feed": trade.get("signal_bar_feed"),
+            "signal_bar_provider": trade.get("signal_bar_provider"),
+            "signal_bar_age_seconds": trade.get("signal_bar_age_seconds"),
+            "entry_bar_feed": trade.get("entry_bar_feed"),
+            "entry_bar_provider": trade.get("entry_bar_provider"),
+            "entry_bar_age_seconds": trade.get("entry_bar_age_seconds"),
+            "exit_bar_feed": trade.get("exit_bar_feed"),
+            "exit_bar_provider": trade.get("exit_bar_provider"),
+            "exit_bar_age_seconds": trade.get("exit_bar_age_seconds"),
             "paper": True,
         }
         # Queue only.  The outcome becomes durable in the same atomic state

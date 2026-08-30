@@ -191,6 +191,18 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self.engine._record_open_order(request, order, plan)
         return request, order
 
+    def test_broker_fill_net_pnl_does_not_double_count_slippage(self):
+        self._bind_engine(runtime_name="runtime-pnl-attribution")
+        attribution = self.engine._close_pnl_attribution(
+            {"execution_profile": "shares", "fees": 1.0, "slippage": 2.0},
+            10.0, 100.0, 101.0, 10.0, 1.0)
+        self.assertEqual(attribution["gross_pnl"], 10.0)
+        self.assertEqual(attribution["fees"], 1.0)
+        self.assertEqual(attribution["slippage"], 2.0)
+        self.assertEqual(attribution["net_pnl"], 9.0)
+        self.assertEqual(attribution["pnl_semantics"],
+                         "broker_fill_pnl_minus_fees")
+
     def test_partial_fill_progression_is_monotonic_and_incremental(self):
         self._bind_engine(runtime_name="runtime-partial")
         _, entry = self._submit_stock_entry()

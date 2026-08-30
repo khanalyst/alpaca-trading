@@ -14,7 +14,7 @@ Environment=ALPACA_LIVE_ENABLE=false
 Environment=ALPACA_DATA_FEED=iex
 Environment=ALPACA_STOCK_FEED=iex
 Environment=ALPACA_OPTIONS_FEED=indicative
-ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/deploy/recorder.py --out /opt/alpaca-agent-trading/runtime/research/recorded --interval 60
+ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/deploy/recorder.py --out /opt/alpaca-agent-trading/runtime/research/recorded --interval 30
 Restart=always
 RestartSec=60
 NoNewPrivileges=true

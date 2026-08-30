@@ -168,8 +168,8 @@ class AlpacaProvider(AlpacaMarketDataMixin):
         import_env_feed = os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED")
         import_env_option_feed = os.getenv("ALPACA_OPTIONS_FEED")
         # Keep minimal/injected configs on the shipped protocol too.  A caller
-        # that has not passed validated config still receives the exact IEX
-        # identity rather than an unrelated historical feed assumption.
+        # that has not passed validated config still receives the shipped
+        # default identity rather than an unrelated historical feed assumption.
         configured_data_feed = broker.get("data_feed") if "data_feed" in broker else data_cfg.get("feed", "iex")
         configured_options_feed = broker.get("options_feed") if "options_feed" in broker else data_cfg.get("options_feed", "indicative")
         self.data_feed = _canonical_feed(import_env_feed or configured_data_feed)
@@ -183,9 +183,10 @@ class AlpacaProvider(AlpacaMarketDataMixin):
         # The checked configuration defaults research on; an unvalidated
         # mapping must not opt out merely by omitting the field.
         research_enabled = bool(research.get("enabled", True))
-        if research_enabled and self.data_feed != "iex":
+        if research_enabled and self.data_feed not in {"iex", "sip"}:
             raise PaperModeError(
-                "autonomous research requires the IEX equity feed")
+                "autonomous research requires a configured real-time equity "
+                "feed (iex or sip); delayed_sip is diagnostic-only")
         if ((str(strategy.get("execution_mode", "shares")).lower()
              in {"options", "option"}) or
                 (research_enabled and option_lane)) and \

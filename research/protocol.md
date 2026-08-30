@@ -6,7 +6,7 @@ payloads are converted to `research.market_data` records before feature
 calculation or replay. Required records become actionable only at the maximum
 of their market event timestamp, `as_of`, and `observed_at` timestamps. A
 delayed recorder bar can therefore signal when observed; execution enters at
-that decision/observation time using fresh IEX (equity) or OPRA (option)
+that decision/observation time using fresh exact IEX or SIP (equity) or OPRA (option)
 evidence. Delayed full OHLC never backfills an earlier entry, and partial
 pre-entry bar ranges are excluded. `as_of` may never be later than
 `observed_at`. Records retain provider/feed identity and the New York session
@@ -16,12 +16,12 @@ configured/requested feed label is used, not an independent venue attestation.
 
 The shipped paper deployment uses the free Basic IEX equity feed and does not
 acquire options (`universe.asset_classes=["us_equity"]`). `indicative` is the
-safe options-feed default and is non-executable. IEX is the exact feed required
-for the shipped equity research/authorization lane; a partial or mixed feed
-cannot satisfy a research proof. IEX is a limited venue view rather than the
-consolidated SIP tape, so coverage can be sparse and its evidence is not
-interchangeable with a paid-feed corpus. A feed change requires collecting the
-new corpus and re-deriving research/shadow proofs. The trader remains paper-only with live
+safe options-feed default and is non-executable. Equity authorization requires
+the exact configured IEX or SIP feed; `delayed_sip` is diagnostic only, and a
+partial or mixed feed cannot satisfy a research proof. IEX is a limited venue
+view rather than the consolidated SIP tape, so coverage can be sparse and its
+evidence is not interchangeable with a paid-feed corpus. A feed change requires
+collecting the new corpus and re-deriving research/shadow proofs. The trader remains paper-only with live
 trading disabled and uses the `shares` runtime execution profile. Scheduled
 research follows the equity lane by default (`ALPACA_RESEARCH_VEHICLES=equity`);
 `option` or `all` is an explicit operator selection that requires changing the
@@ -43,9 +43,22 @@ validation, and conservative broker-tick equity rounding. Epoch-4 proofs remain
 readable for audit but are quarantined and cannot validate, champion, or
 authorize the paper trader until re-derived under epoch 5.
 
+The finite rule grammar contains twelve families. The twelfth,
+`cross_sectional_residual`, is shares-only, benchmarks SPY, and requires
+synchronized one-minute context. It is an additional bounded hypothesis path,
+not a replacement for the shipped 24-ETF universe; future family or universe
+changes require evidence from the fit screen and cross-sectional report.
+
 Production replay requires exact Alpaca calendar metadata for every session,
 including early closes. Missing metadata is a refusal; no fixed 16:00 close is
 promoted as a fallback.
+
+The recorder samples on a fixed 30-second cadence and durably tracks a quote
+watermark and a completed-bar watermark for every symbol. Readiness requires
+both to be no older than 30 seconds; neither watermark can substitute for the
+other. Alpaca calendar metadata records holidays as explicit closed sessions.
+Scheduler liveness is a separate operational dimension from research evidence
+and readiness.
 
 Historical backfill preserves that exact calendar metadata in the recorder
 sidecar and labels rows `source_mode: historical_backfill`. Its truthful
@@ -84,10 +97,11 @@ Every replay must establish the following invariants:
   freshness bound at the instant being priced; a signal whose contract has no such quote
   is recorded as an explicit unpriced row, never dropped and never filled from
   the contract's last quote of the morning;
-- authorizing equity fills require IEX quote provenance on both entry and exit
-  legs; authorizing option fills require OPRA quote provenance on both legs.
-  Provider, feed, quote age, and fill source are retained for each leg, and any
-  leg older than 30 seconds, bar-only, partial-feed, or missing remains diagnostic;
+- authorizing equity fills require exact IEX or SIP quote provenance on both
+  entry and exit legs; `delayed_sip` remains diagnostic only. Authorizing option
+  fills require OPRA quote provenance on both legs. Provider, feed, quote age,
+  and fill source are retained for each leg, and any leg older than 30 seconds,
+  bar-only, partial-feed, or missing remains diagnostic;
 - positions are force-flat before the session close;
 - a bounded rule position also carries a `max_hold_bars` time exit, computed by
   the one helper the runtime uses (`agent/contracts/rule.py::hold_deadline`)
@@ -124,6 +138,14 @@ below 80% of requested quantity, or a partial-cancel rate above 20% returns a
 veto and non-zero status. Offline diagnostics may still run, but shadow
 authorization remains blocked. In-flight orders are excluded, and the model is
 never adjusted automatically.
+
+The scheduled calibration-only pass measures per-symbol/session stress on the
+9/15/25/50-bps ladder and is disabled by default. Runtime use requires an
+explicit operator-enabled path and an artifact with exact provider/feed
+identity, a content hash, sufficient disjoint chronological held-out sessions,
+and one artifact-wide effective-after boundary. A missing or unusable cell
+uses the configured scalar fallback; calibration is diagnostic unless that
+operator path is enabled and never self-authorizes.
 
 `ReplayPolicy.from_config` is the runtime policy source for replay. The shipped
 `execution.strict_market_data` default is `true`; direct replay APIs are strict
@@ -288,6 +310,10 @@ a backtest, then accepts only a later, unseen session tail for offline
 forward-shadow evidence. Passing gates advance `candidate` ->
 `backtest_passed` -> `shadow` only; runtime entries stay blocked because
 backtest or offline forward-shadow evidence cannot authorize paper deployment.
+Concurrent shadow workers bind each poll to a content-addressed manifest, and
+every reader re-verifies the manifest digest before consuming it. A missing,
+unreadable, or mismatched manifest is quarantined and cannot advance a shadow
+watermark or FDR boundary.
 The broker-free ShadowRunner
 evaluates eligible candidates in isolated virtual books from recorder events,
 creates exact-session candidate, paired synthetic root-control, and
@@ -324,11 +350,12 @@ isolated simulated account.
 
 Before variant replay, the factory records compact fit-only diagnostics: the
 eligible-prefix and first-signal rates, ATR-in-basis-points and 30-bps-floor
-binding, signal-anchored planned stop/target/hold distributions, configured
-and stressed cost-to-risk (9/15/25/50 bps) summaries, configured pre-cap risk
-versus capped delivered risk, realized exit reasons/ties/gaps, and a diagnostic
-clustered MDE/power report whose effect and cluster units are explicit. It also records
-provider/feed provenance, entry-pricing source, configured limits, and
+binding, signal-anchored planned stop/target/hold distributions, gross/net/
+fees/slippage and configured/stressed cost-to-risk (9/15/25/50 bps) summaries,
+configured pre-cap versus fill-delivered risk, per-leg provider/feed provenance,
+realized exit reasons/ties/gaps, and a diagnostic clustered MDE/power report
+whose effect and cluster units are explicit. It also records entry-pricing
+source, configured limits, and
 pass/fail/unknown row counts. The current fixed exit grammar is machine-readable
 as `fixed-atr-floor-bracket-r-target-bar-cap.v1`; its only supported modes are
 the parity-verified ATR-floor bracket, configured R target, and configured bar
@@ -339,6 +366,13 @@ other unsupported exit field is flagged as
 research result. Planned signal/exit geometry may be counted even when
 executable quote pricing is absent, but is marked quote-required and remains
 non-authorizing.
+
+The pre-replay signal screen records forward-return/control rows and emits
+explicit `p=1` placeholders when a comparison is unavailable. A terminal
+current-hypothesis no-edge result is reported as such and reseeds when the
+corpus changes. Target/hold path telemetry measures reachability from the
+actual entry through the bounded hold; lower-target and hold proposals remain
+on a finite ladder and cannot authorize a candidate.
 
 The factory persists one `bar-coverage.v1` record per input corpus rather than
 recomputing it per variant. It reports per-symbol/session observed minutes,
@@ -358,9 +392,9 @@ may close after the bounded attempt budget only to progress and observe search
 exhaustion; it is not a powered negative edge conclusion.
 
 The standalone `research.py factory run`/`factory-run` preflight requires
-explicit row provenance and IEX for the default equity lane. `--diagnostic-only`
-is an explicit non-authorizing mode for incomplete or non-IEX input and emits
-no proofs.
+explicit row provenance and exact IEX or SIP for the equity lane. `delayed_sip`
+and other incomplete/non-exact inputs are diagnostic-only; `--diagnostic-only`
+is an explicit non-authorizing mode and emits no proofs.
 
 The first-signal planned vectors also produce deterministic entry and full
 behavior fingerprints. When the fit contains a signal, full behavioral aliases

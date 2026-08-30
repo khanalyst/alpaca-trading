@@ -24,6 +24,7 @@ from .gates import (
     authorization_projection, arm_evidence_report,
     walk_forward_report, validate_protocol_floor,
     PROTOCOL_SHADOW_MIN_TRADES, PROTOCOL_SHADOW_MIN_SESSIONS,
+    paired_control_adequacy,
 )
 from .costs import CostModel, ReplayPolicy, replay_policy_for_mode
 from .ibr import IBRConfig, replay_ibr
@@ -71,7 +72,7 @@ def _adequate(gate: Mapping) -> bool:
     """
     return bool(gate.get("fit_floor", {}).get("adequate") and
                 gate.get("heldout_floor", {}).get("adequate") and
-                (gate.get("walk_forward") or {}).get("available") and
+                (gate.get("walk_forward") or {}).get("adequate") and
                 (gate.get("qualification") or {}).get("available"))
 
 

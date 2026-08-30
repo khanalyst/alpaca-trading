@@ -155,6 +155,79 @@ class LiveShadowTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(row["kind"] in {"no_data", "unpriced", "no_trade", "reject"} for row in rows))
 
+    def test_poll_manifest_is_content_addressed_and_reused_on_retry(self):
+        self._candidate()
+        self._write_rows()
+        first = self._run(max_events=20, max_workers=2)
+        second = self._run(max_events=20, max_workers=2)
+        self.assertEqual(first["manifest_digest"], second["manifest_digest"])
+        store = ShadowStore(self.shadow)
+        manifest = store.manifest(first["manifest_digest"])
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest["schema"], "shadow-manifest.v1")
+        self.assertEqual(manifest["manifest_digest"], first["manifest_digest"])
+        self.assertEqual(manifest["event_watermark"]["count"], 3)
+
+    def test_manifest_read_rejects_tampered_digest_addressed_body(self):
+        store = ShadowStore(self.shadow)
+        digest = store.save_manifest({"event_watermark": {"count": 1}})
+        key = f"shadow-manifest.v1:{digest}"
+        with sqlite3.connect(self.shadow) as db:
+            payload = json.loads(db.execute(
+                "SELECT value FROM meta WHERE key=?", (key,)).fetchone()[0])
+            payload["event_watermark"]["count"] = 2
+            db.execute("UPDATE meta SET value=? WHERE key=?",
+                       (json.dumps(payload), key))
+        with self.assertRaises(ShadowError):
+            store.manifest(digest)
+
+    def test_manifest_read_requires_requested_digest_key(self):
+        store = ShadowStore(self.shadow)
+        digest = store.save_manifest({"event_watermark": {"count": 1}})
+        wrong_key = "0" * 64 if digest != "0" * 64 else "1" * 64
+        payload = store.manifest(digest)
+        self.assertIsNotNone(payload)
+        with sqlite3.connect(self.shadow) as db:
+            db.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                       (f"shadow-manifest.v1:{wrong_key}",
+                        json.dumps(payload, sort_keys=True,
+                                   separators=(",", ":"))))
+        with self.assertRaises(ShadowError):
+            store.manifest(wrong_key)
+
+    def test_latest_manifest_pointer_is_self_verified(self):
+        store = ShadowStore(self.shadow)
+        store.save_manifest({"event_watermark": {"count": 1}})
+        with sqlite3.connect(self.shadow) as db:
+            payload = json.loads(db.execute(
+                "SELECT value FROM meta WHERE key='shadow-manifest.v1:latest'"
+            ).fetchone()[0])
+            payload["event_watermark"]["count"] = 2
+            db.execute("UPDATE meta SET value=? WHERE key=?",
+                       (json.dumps(payload), "shadow-manifest.v1:latest"))
+        with self.assertRaises(ShadowError):
+            store.manifest()
+
+    def test_worker_failure_is_contained_to_one_candidate(self):
+        failed = self._candidate(variant="ibr.range.30")
+        healthy = self._candidate(variant="ibr.baseline")
+        self._write_rows()
+        original = ShadowRunner._evaluate
+
+        def evaluate(runner, candidate, event, bars, quotes, options):
+            if str(candidate["candidate_id"]) == str(failed["candidate_id"]):
+                raise RuntimeError("candidate-only failure")
+            return original(runner, candidate, event, bars, quotes, options)
+
+        with patch.object(ShadowRunner, "_evaluate", new=evaluate):
+            result = self._run(max_events=20, max_workers=2)
+        self.assertIn(failed["candidate_id"], result["candidate_errors"])
+        self.assertNotIn(healthy["candidate_id"], result["candidate_errors"])
+        self.assertEqual(len(ShadowStore(self.shadow).decisions(
+            failed["candidate_id"])), 0)
+        self.assertGreater(len(ShadowStore(self.shadow).decisions(
+            healthy["candidate_id"])), 0)
+
     def test_changed_digest_is_a_hard_conflict(self):
         self._candidate()
         self._write_rows()

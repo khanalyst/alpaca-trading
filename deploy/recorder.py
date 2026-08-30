@@ -31,6 +31,7 @@ import time
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 try:
@@ -81,6 +82,7 @@ from deploy.recorder_market import (  # noqa: E402
     _underlying_price,
     _value,
 )
+from deploy.provenance import deployment_provenance  # noqa: E402
 
 
 def _validate_dataset_row(row: dict) -> tuple[str, str, datetime]:
@@ -114,6 +116,7 @@ STATUS_NAME = ".recorder-status.json"
 STATUS_SCHEMA = "recorder-status.v1"
 PARTITION_DIR = "sessions"
 PARTITION_SOURCE_SCHEMA = "recorder-partition-source.v1"
+PARTITION_CALENDAR_SCHEMA = "recorder-partition-calendar.v1"
 # The recorder only ever asks the provider for ``watermark - 1 minute`` onwards,
 # so a row it can legally receive is at most one minute older than the
 # watermark. The dedup window is fifteen minutes: an order of magnitude of
@@ -128,10 +131,32 @@ DEFAULT_FETCH_WINDOW_MINUTES = 1
 DEFAULT_FORWARD_OBSERVATION_MAX_LAG_MINUTES = 15
 DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
+MAX_AUTHORIZING_INTERVAL_SECONDS = 30.0
 # Calendar metadata is an audit boundary, not a deduplication cache.  Keep the
 # name for callers that imported the old constant, but do not prune calendar
 # entries by age.
 SESSION_CALENDAR_RETENTION_DAYS = 90
+
+
+def _next_cadence_deadline(previous: float | None, now: float,
+                           interval: float) -> float:
+    """Return the next fixed-cadence monotonic deadline.
+
+    Work time is not added to the interval.  If a request overruns multiple
+    ticks, advance directly to the first future tick rather than issuing a
+    burst of catch-up requests.
+    """
+    interval = float(interval)
+    if interval <= 0:
+        raise ValueError("recorder interval must be positive")
+    now = float(now)
+    if previous is None:
+        return now + interval
+    deadline = float(previous)
+    if deadline > now:
+        return deadline
+    missed = int((now - deadline) // interval) + 1
+    return deadline + missed * interval
 
 
 def _save_status(output: Path, payload: dict) -> dict:
@@ -141,6 +166,7 @@ def _save_status(output: Path, payload: dict) -> dict:
     value = {
         "schema": STATUS_SCHEMA,
         "updated_ts": time.time(),
+        "provenance": deployment_provenance(),
         **payload,
     }
     temporary = root / (STATUS_NAME + ".tmp")
@@ -194,6 +220,71 @@ def _partition_source_path(output: Path, day: date) -> Path:
     """Durable provenance marker written before a backfill partition."""
     partition = _partition_path(output, day)
     return partition.with_name(partition.name + ".source.json")
+
+
+def _partition_calendar_path(output: Path, day: date) -> Path:
+    """Return the exact-calendar marker beside one session partition."""
+    partition = _partition_path(output, day)
+    return partition.with_name(partition.name + ".calendar.json")
+
+
+def _save_partition_calendar(output: Path, day: date, session) -> None:
+    """Persist broker open/close bounds before rows can be consumed.
+
+    The aggregate index is a cache and may be rebuilt after any crash.  A
+    compact per-partition marker lets research recover an older session even
+    when the aggregate sidecar predates exact-calendar support.
+    """
+    path = _partition_calendar_path(output, day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    opened = session.open.astimezone(timezone.utc).isoformat()
+    closed = session.close.astimezone(timezone.utc).isoformat()
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump({"schema": PARTITION_CALENDAR_SCHEMA,
+                   "partition": _partition_path(output, day).name,
+                   "open": opened, "close": closed,
+                   "source": "alpaca_calendar"}, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+
+
+def _partition_calendars_from_markers(output: Path) -> dict[str, dict[str, str]]:
+    """Load exact calendar markers for existing partitions, fail closed on corruption."""
+    directory = _corpus_root(output) / PARTITION_DIR
+    if not directory.is_dir():
+        return {}
+    existing = {path.name for path in corpus_partitions(output)}
+    result: dict[str, dict[str, str]] = {}
+    for path in sorted(directory.glob("market-*.csv.calendar.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid recorder partition calendar marker {path}") from exc
+        partition = payload.get("partition") if isinstance(payload, dict) else None
+        opened = _timestamp(payload.get("open")) if isinstance(payload, dict) else None
+        closed = _timestamp(payload.get("close")) if isinstance(payload, dict) else None
+        if (not isinstance(payload, dict) or
+                payload.get("schema") != PARTITION_CALENDAR_SCHEMA or
+                not isinstance(partition, str) or
+                path.name != partition + ".calendar.json" or
+                partition not in existing or opened is None or closed is None or
+                opened >= closed or payload.get("source") != "alpaca_calendar"):
+            raise RuntimeError(f"invalid recorder partition calendar marker {path}")
+        day_name = partition.removeprefix("market-").removesuffix(".csv")
+        try:
+            parsed_day = date.fromisoformat(day_name)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid recorder partition calendar marker {path}") from exc
+        if (opened.astimezone(NEW_YORK).date() != parsed_day or
+                closed.astimezone(NEW_YORK).date() != parsed_day):
+            raise RuntimeError(f"recorder partition calendar marker has wrong day: {path}")
+        result[day_name] = {"open": opened.isoformat(),
+                            "close": closed.isoformat(),
+                            "source": "alpaca_calendar"}
+    return result
 
 
 def _save_partition_source(output: Path, day: date, source_mode: str) -> None:
@@ -299,6 +390,7 @@ def _scan_corpus(output: Path) -> dict:
     """
     watermark: datetime | None = None
     latest_bars: dict[str, str] = {}
+    observation_watermarks: dict[str, dict[str, str]] = {}
     data_feeds: set[str] = set()
     for row, _key, event, symbol, parsed in _validated_corpus_rows(output):
         if watermark is None or parsed > watermark:
@@ -311,6 +403,8 @@ def _scan_corpus(output: Path) -> dict:
             previous = latest_bars.get(symbol)
             if previous is None or parsed.isoformat() > previous:
                 latest_bars[symbol] = parsed.isoformat()
+        _update_observation_watermarks(
+            {"observation_watermarks": observation_watermarks}, (row,))
 
     if len(data_feeds) > 1:
         raise RuntimeError(
@@ -326,9 +420,10 @@ def _scan_corpus(output: Path) -> dict:
     index = {"schema": INDEX_SCHEMA,
              "watermark": watermark.isoformat() if watermark else None,
              "latest_bars": latest_bars,
+             "observation_watermarks": observation_watermarks,
              "recent_key_index": recent_key_index,
              "option_pins": {}, "bar_coverage": {},
-             "session_calendar": {},
+             "session_calendar": _partition_calendars_from_markers(output),
              "partition_sources": _partition_sources_from_markers(output),
              "data_feed": next(iter(data_feeds), None),
              "partitions": partitions,
@@ -676,6 +771,7 @@ def _prune_index(index: dict) -> dict:
     index.setdefault("session_calendar", {})
     index.setdefault("partition_sources", {})
     index.setdefault("data_feed", None)
+    index.setdefault("observation_watermarks", {})
     watermark = _timestamp(index.get("watermark"))
     recent_keys = index.get("recent_keys")
     if watermark is not None and isinstance(recent_keys, dict):
@@ -683,6 +779,29 @@ def _prune_index(index: dict) -> dict:
         index["recent_keys"] = {key: value for key, value in recent_keys.items()
                                 if value >= floor}
     return index
+
+
+def _update_observation_watermarks(index: dict,
+                                   rows: Sequence[Mapping[str, object]]) -> None:
+    """Record latest quote/bar availability even when every row is a duplicate."""
+    watermarks = index.setdefault("observation_watermarks", {})
+    for row in rows:
+        event = str(row.get("event_type") or "").strip().lower()
+        kind = ("quote" if event == "quote" else
+                "bar" if event in {"bar", "bar_1m"} else None)
+        if kind is None:
+            continue
+        symbol = str(row.get("symbol") or "").strip().upper()
+        observed = _timestamp(row.get("as_of") or row.get("timestamp"))
+        if not symbol or observed is None:
+            raise RuntimeError("recorder observation watermark is invalid")
+        current = watermarks.get(symbol)
+        if not isinstance(current, dict):
+            current = {}
+        previous = _timestamp(current.get(kind))
+        if previous is None or observed > previous:
+            current[kind] = observed.astimezone(timezone.utc).isoformat()
+        watermarks[symbol] = current
 
 
 def _stream_index_metadata(path: Path) -> dict:
@@ -819,6 +938,30 @@ def _validate_index(index: object, output: Path, *, require_recent: bool,
         index["bar_coverage"] = {}
     elif not isinstance(coverage, dict):
         return None
+    observations = index.get("observation_watermarks")
+    if observations is None:  # backward-compatible additive v1 field
+        index["observation_watermarks"] = {}
+        index["_observation_watermarks_migration_pending"] = True
+    elif not isinstance(observations, dict):
+        return None
+    else:
+        normalized_observations: dict[str, dict[str, str]] = {}
+        for raw_symbol, raw_record in observations.items():
+            symbol = str(raw_symbol).strip().upper()
+            if (not symbol or symbol in normalized_observations or
+                    not isinstance(raw_record, dict)):
+                return None
+            record: dict[str, str] = {}
+            for kind in ("quote", "bar"):
+                raw_stamp = raw_record.get(kind)
+                if raw_stamp in (None, ""):
+                    continue
+                stamp = _timestamp(raw_stamp)
+                if stamp is None:
+                    return None
+                record[kind] = stamp.astimezone(timezone.utc).isoformat()
+            normalized_observations[symbol] = record
+        index["observation_watermarks"] = normalized_observations
     session_calendar = index.get("session_calendar")
     if session_calendar is None:  # additive recorder-index.v1 field
         index["session_calendar"] = {}
@@ -828,6 +971,14 @@ def _validate_index(index: object, output: Path, *, require_recent: bool,
         for day, value in session_calendar.items():
             if not isinstance(day, str) or not isinstance(value, dict):
                 return None
+            if value.get("status") == "closed":
+                if value.get("source") != "alpaca_calendar":
+                    return None
+                try:
+                    date.fromisoformat(day)
+                except ValueError:
+                    return None
+                continue
             if not all(isinstance(value.get(name), str)
                        for name in ("open", "close")):
                 return None
@@ -851,10 +1002,23 @@ def _validate_index(index: object, output: Path, *, require_recent: bool,
             if (not isinstance(name, str) or not isinstance(value, dict) or
                     not isinstance(value.get("source_mode"), str)):
                 return None
+    configured_symbols = index.get("configured_symbols")
+    if configured_symbols is not None:
+        if (not isinstance(configured_symbols, list) or
+                any(not isinstance(symbol, str) or not symbol.strip()
+                    for symbol in configured_symbols)):
+            return None
+        index["configured_symbols"] = sorted(set(
+            symbol.strip().upper() for symbol in configured_symbols))
     durable_sources = _partition_sources_from_markers(output)
     if (require_partition_match and
             any(index["partition_sources"].get(name) != value
                 for name, value in durable_sources.items())):
+        return None
+    durable_calendar = _partition_calendars_from_markers(output)
+    if (require_partition_match and
+            any(index["session_calendar"].get(day) != value
+                for day, value in durable_calendar.items())):
         return None
     data_feed = index.get("data_feed")
     if data_feed is not None and not isinstance(data_feed, str):
@@ -929,6 +1093,7 @@ def _save_index(output: Path, index: dict,
     root = _corpus_root(output)
     root.mkdir(parents=True, exist_ok=True)
     index = _prune_index(dict(index))
+    index.pop("_observation_watermarks_migration_pending", None)
     partitions = _partition_sizes(output)
     fingerprints = _partition_fingerprints(output)
     index.update({
@@ -976,14 +1141,25 @@ def _save_index(output: Path, index: dict,
 def _prepare_index(output: Path) -> dict:
     """Load or rebuild both caches while preserving irreplaceable metadata."""
     index = _load_index(output)
-    if index is None:
+    if (index is None or
+            index.pop("_observation_watermarks_migration_pending", False)):
+        loaded_metadata = index
         preserved = _load_preserved_index_metadata(output)
+        if preserved is None:
+            preserved = loaded_metadata
         index = _scan_corpus(output)
         if preserved is not None:
             # Partition provenance is reconstructed from marker files and must
             # never be replaced by the stale aggregate sidecar being salvaged.
-            for name in ("bar_coverage", "session_calendar", "option_pins"):
+            for name in ("bar_coverage", "option_pins"):
                 index[name] = dict(preserved.get(name) or {})
+            # Durable per-partition markers outrank a stale aggregate cache;
+            # older aggregate calendar entries remain useful for partitions
+            # written before marker support existed.
+            index["session_calendar"] = {
+                **dict(preserved.get("session_calendar") or {}),
+                **dict(index.get("session_calendar") or {}),
+            }
         _save_index(output, index)
         loaded = _load_index(output)
         if loaded is None:
@@ -1089,7 +1265,8 @@ class CalendarCache:
 
 
 def _record_session_calendar(index: dict, calendar: CalendarCache | None,
-                             start: datetime, end: datetime) -> None:
+                             start: datetime, end: datetime,
+                             output: Path | None = None) -> None:
     """Persist exact Alpaca opens/closes for replay completion boundaries."""
     if calendar is None:
         return
@@ -1103,10 +1280,20 @@ def _record_session_calendar(index: dict, calendar: CalendarCache | None,
         if calendar.known(cursor):
             session = calendar.session(cursor)
             if session is not None:
+                if output is not None:
+                    _save_partition_calendar(output, cursor, session)
                 sessions[cursor.isoformat()] = {
                     "open": session.open.astimezone(timezone.utc).isoformat(),
                     "close": session.close.astimezone(timezone.utc).isoformat(),
                     "source": "alpaca_calendar",
+                }
+            else:
+                # A successful Alpaca calendar response can cover a weekday
+                # with no session (holiday). Persist that fact explicitly so
+                # exact replay/filtering and health do not treat it as missing
+                # metadata or a recorder failure.
+                sessions[cursor.isoformat()] = {
+                    "status": "closed", "source": "alpaca_calendar",
                 }
         cursor += timedelta(days=1)
 
@@ -1178,7 +1365,15 @@ def _recorded_session_rows(index: dict, fetched_rows: list[dict], *,
             continue
         if require_exact_calendar:
             parsed = _timestamp(row.get("timestamp"))
-            session = (_session_date(parsed) if parsed is not None else "unknown")
+            session = (_session_date(parsed).isoformat()
+                       if parsed is not None else "unknown")
+            marker = (index.get("session_calendar", {}).get(session)
+                      if isinstance(index.get("session_calendar"), dict)
+                      else None)
+            if isinstance(marker, dict) and marker.get("status") == "closed":
+                # Calendar-authoritative holiday: reject the row, but do not
+                # report missing exact metadata or fail the recorder cycle.
+                continue
             bounds = _exact_recorded_session_bounds(index, row)
             if parsed is None or bounds is None:
                 raise RuntimeError(
@@ -1612,6 +1807,7 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
         rows, latest_bars, window_end, symbols, calendar, feed=feed,
         policy=bar_gap_policy, maximum=bar_gap_maximum)
     _update_bar_coverage(index, coverage, observed_at)
+    _update_observation_watermarks(index, rows)
     unique_rows: list[dict] = []
     unique_keys: set[str] = set()
     recent_entries: list[tuple[str, str]] = []
@@ -1744,6 +1940,7 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             f"recorder data feed changed from {indexed_feed} to {resolved_feed}; "
             "use a separate corpus")
     index["data_feed"] = resolved_feed
+    index["configured_symbols"] = sorted(set(symbols))
     bar_gap_policy = _bar_gap_policy(resolved_feed)
     bar_gap_maximum = timedelta(minutes=_bar_gap_minutes())
     forward_observation_max_lag = _forward_observation_max_lag()
@@ -1760,7 +1957,7 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
     # materialize millions of quotes in one provider response.
     start = (watermark - timedelta(minutes=1)
              if watermark is not None else now - timedelta(minutes=3))
-    _record_session_calendar(index, calendar, start, now)
+    _record_session_calendar(index, calendar, start, now, output)
     pins = {contract: value for contract, value in index["option_pins"].items()
             if str(value) > now.isoformat()}
     horizon = None if watermark is None else watermark - DEDUP_HORIZON
@@ -1805,6 +2002,10 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
         cursor = window_end
 
     if total_rows == 0:
+        # Persist calendar coverage only after all bounded requests completed;
+        # this keeps strict fetch failures atomic while retaining closed-day
+        # markers for a successful no-data holiday response.
+        _save_index(output, index)
         raise RuntimeError("Alpaca returned no point-in-time bars or quotes")
     return total_unique
 
@@ -1850,7 +2051,7 @@ def probe_market_data(provider: AlpacaProvider, symbols: list[str], *,
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="record Alpaca paper market data")
     p.add_argument("--out", default="runtime/research/recorded")
-    p.add_argument("--interval", type=float, default=60.0)
+    p.add_argument("--interval", type=float, default=30.0)
     p.add_argument("--once", action="store_true")
     p.add_argument(
         "--probe", action="store_true",
@@ -1869,8 +2070,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
-    if args.interval <= 0:
-        raise SystemExit("--interval must be positive")
+    if args.interval <= 0 or args.interval > MAX_AUTHORIZING_INTERVAL_SECONDS:
+        raise SystemExit("--interval must be greater than 0 and at most 30 seconds")
     env_file = os.getenv("ALPACA_AGENT_SECRETS_FILE")
     if env_file:
         load_dotenv(env_file, override=False)
@@ -1937,6 +2138,10 @@ def main(argv=None) -> int:
         return 0
     calendar = CalendarCache(provider)
     failure_count = 0
+    # Anchor cadence before the request starts.  Scheduling from a timestamp
+    # captured after ``record_once`` would make the true polling period equal
+    # to request latency plus the configured interval.
+    next_tick: float | None = time.monotonic()
     while True:
         try:
             count = record_once(provider, symbols, output, config=cfg,
@@ -1970,6 +2175,10 @@ def main(argv=None) -> int:
             if args.once:
                 return 1
             time.sleep(delay)
+            # A retry backoff is intentionally wall-clock based.  Resume the
+            # fixed cadence from the next successful cycle instead of firing
+            # an immediate request after the backoff expires.
+            next_tick = time.monotonic()
             continue
         failure_count = 0
         _save_status(output, {
@@ -1986,7 +2195,10 @@ def main(argv=None) -> int:
         print(f"recorded {count} Alpaca rows to {output}", flush=True)
         if args.once:
             return 0
-        time.sleep(args.interval)
+        now_monotonic = time.monotonic()
+        next_tick = _next_cadence_deadline(
+            next_tick, now_monotonic, args.interval)
+        time.sleep(max(0.0, next_tick - time.monotonic()))
 
 
 if __name__ == "__main__":

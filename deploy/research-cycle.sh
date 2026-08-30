@@ -81,6 +81,11 @@ print(json.dumps({
     "exit_code": int(exit_code),
     "outcomes": raw_outcomes.split() if raw_outcomes else [],
     "proofs": bool(int(success)), "no_edge": bool(int(no_edge)),
+    # A completed no-edge cycle is a valid negative observation.  Failed,
+    # empty, and exhausted cycles cannot provide evidence to operators.
+    "evidence_available": bool(
+        status in {"completed", "completed_no_edge"} and
+        (int(success) or int(no_edge) or bool(raw_outcomes))),
     "unevaluable": bool(int(unevaluable)),
     "search_exhausted": bool(int(search_exhausted)),
     "llm_provider_failure": bool(int(llm_provider_failure)),
@@ -141,8 +146,9 @@ load_llm_secrets() {
 load_llm_secrets
 
 # Feed selection is part of the autonomous-research contract. Do this
-# preflight before dataset work so a non-IEX equity override fails with a
-# useful reason rather than silently producing evidence from another feed.
+# preflight before dataset work so a non-real-time or mismatched equity
+# override fails with a useful reason rather than silently producing evidence
+# from another feed.
 set +e
 feed_guard="$($python_bin - "$agent_config" <<'PY'
 import sys
@@ -157,8 +163,8 @@ except Exception as exc:
 broker = config.get("broker") or {}
 research = config.get("research") or {}
 classes = (config.get("universe") or {}).get("asset_classes") or []
-if research.get("enabled", True) and broker.get("data_feed") != "iex":
-    print("autonomous research requires the exact IEX equity feed")
+if research.get("enabled", True) and broker.get("data_feed") not in {"iex", "sip"}:
+    print("autonomous research requires the exact configured real-time equity feed (iex or sip); delayed_sip is diagnostic-only")
     raise SystemExit(1)
 option_lane = any(str(item).lower() in {"us_option", "option", "options"}
                   for item in classes)
@@ -741,6 +747,28 @@ if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
   emit_progress "backtest" 1 1 "steps" "equity"
 fi
 
+# Quote-cost/stress calibration is a bounded measurement pass only.  It fits
+# and validates the existing quote schedule without replaying the factory
+# cohort; the resulting artifact remains diagnostic until an operator enables
+# it in runtime risk configuration with its content-addressed path.
+if [ "${ALPACA_RESEARCH_STRESS_CALIBRATION_ENABLED:-1}" = "1" ] && [ -s "$quotes_input" ]; then
+  stress_calibration_report="${ALPACA_RESEARCH_STRESS_CALIBRATION_REPORT:-$repo_root/runtime/research/stressed-cost-calibration-latest.json}"
+  if [[ "$stress_calibration_report" != /* ]]; then
+    stress_calibration_report="$repo_root/$stress_calibration_report"
+  fi
+  mkdir -p "$(dirname "$stress_calibration_report")"
+  set +e
+  "$python_bin" "$repo_root/research/cost_rerun.py" --calibration-only \
+    --corpus "$quotes_input" --config "$agent_config" \
+    --min-quotes-per-cell "${ALPACA_RESEARCH_STRESS_MIN_QUOTES_PER_CELL:-500}" \
+    --out "$stress_calibration_report"
+  stress_calibration_status=$?
+  set -e
+  if [ "$stress_calibration_status" -ne 0 ]; then
+    echo '{"schema":"stressed-cost-calibration-run.v1","status":"blocked","reason":"calibration_failed","authorizing":false}' >&2
+  fi
+fi
+
 edge_db="${ALPACA_EDGE_DB:-$repo_root/runtime/research/edge_lab.sqlite3}"
 if [[ "$edge_db" != /* ]]; then
   edge_db="$repo_root/$edge_db"
@@ -1020,7 +1048,7 @@ run_factory() {
     --data "$validated_input" --worker-data "$replay_input" \
     --vehicle "$vehicle" --db "$edge_db" \
     --agent-config "$agent_config" \
-    --strategies "${ALPACA_FACTORY_STRATEGIES:-11}" \
+    --strategies "${ALPACA_FACTORY_STRATEGIES:-12}" \
     --variants "${ALPACA_FACTORY_VARIANTS:-4}" \
     --workers "${ALPACA_FACTORY_WORKERS:-2}" \
     --starting-cash "${ALPACA_FACTORY_STARTING_CASH:-100000}" \

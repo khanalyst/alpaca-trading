@@ -9,6 +9,7 @@ cycle.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -47,7 +48,7 @@ def _rule_session(ts: datetime) -> str:
 
 def _rule_runtime_bars(
         bars: Any, spec: Mapping[str, Any], now: datetime, *,
-        max_age_seconds: float = 90.0) -> tuple[list, str, float] | None:
+        max_age_seconds: float = 30.0) -> tuple[list, str, float] | None:
     """Return the current session's completed, contiguous feature prefix.
 
     Replay evaluates one completed session and rejects a gap inside the exact
@@ -88,8 +89,11 @@ def _rule_runtime_bars(
     if _rule_session(latest_stamp) != _rule_session(current):
         return None
     try:
+        freshness_limit = float(max_age_seconds)
+        if not freshness_limit >= 0 or freshness_limit == float("inf"):
+            return None
         age = (current - (latest_stamp + timedelta(minutes=1))).total_seconds()
-        if age < 0 or age > max(float(max_age_seconds), 60.0):
+        if age < 0 or age > freshness_limit:
             return None
     except (TypeError, ValueError, OverflowError):
         return None
@@ -257,7 +261,23 @@ class EngineCycleMixin:
             closed = self.flatten_all("before_close")
             return {"action": "force_flat", "closed": closed,
                     "residual": _plain(self.provider.positions())}
-        monitored = self._monitor_positions(now, positions)
+        symbols = self._universe()
+        # Existing positions need the same normalized market snapshot used by
+        # entry evaluation.  Collect it once so local protection never fetches
+        # a second, potentially different observation in the same cycle.
+        rows = None
+        if positions:
+            try:
+                rows = self._collect(symbols, now, snapshot)
+            except Exception as exc:  # noqa: BLE001
+                # Protection must still run when the shared market snapshot is
+                # unavailable.  Passing an empty context prevents a duplicate
+                # fetch and drives unprotected positions through the existing
+                # fail-closed close path.
+                rows = {}
+                self._event("protection_market_data_unavailable", {
+                    "error": str(exc)})
+        monitored = self._monitor_positions(now, positions, market_rows=rows)
         if monitored.get("failed"):
             return {"action": "hold", "reason": "position_close_failed", **monitored}
         if monitored.get("closed"):
@@ -284,8 +304,8 @@ class EngineCycleMixin:
                 self.cfg.get("session", {}).get("force_flat_minutes_before_close", 10),
             ))
             force_flat_at = session_close - timedelta(minutes=max(0, minutes))
-        symbols = self._universe()
-        rows = self._collect(symbols, now, snapshot)
+        if rows is None:
+            rows = self._collect(symbols, now, snapshot)
         try:
             account = self.provider.account()
         except Exception as exc:  # noqa: BLE001
@@ -427,7 +447,12 @@ class EngineCycleMixin:
                     # re-fire would change that sample and multiply exposure.
                     signal_state_key = f"rule|{symbol}"
                     try:
-                        from .contracts.rule import validate_rule_spec
+                        from .contracts.rule import (
+                            CROSS_SECTIONAL_BENCHMARK,
+                            evaluate_rule_signal_trace,
+                            rule_vehicle_executable,
+                            validate_rule_spec,
+                        )
                         rule_spec = validate_rule_spec(
                             strategy_cfg.get("rule_spec") or {})
                     except (TypeError, ValueError):
@@ -437,12 +462,22 @@ class EngineCycleMixin:
                                      else {})
                     try:
                         configured_bar_age = float(
-                            execution_cfg.get("max_market_data_age_seconds", 90) or 90)
+                            execution_cfg.get("max_market_data_age_seconds", 30) or 30)
                     except (TypeError, ValueError, OverflowError):
-                        configured_bar_age = 90.0
+                        configured_bar_age = 30.0
+                    execution_mode = str(
+                        strategy_cfg.get("execution_mode") or "").lower()
+                    if (rule_spec["family"] == "cross_sectional_residual" and
+                            not rule_vehicle_executable(
+                                rule_spec, execution_mode)):
+                        self._event("rule_signal_reject", {
+                            "symbol": symbol,
+                            "reason": "cross_sectional_requires_equity_shares",
+                            "variant_id": (edge_record or {}).get("variant_id")})
+                        continue
                     prepared = _rule_runtime_bars(
                         bars, rule_spec, now,
-                        max_age_seconds=max(configured_bar_age, 60.0))
+                        max_age_seconds=configured_bar_age)
                     if prepared is None:
                         self._event("rule_signal_reject", {
                             "symbol": symbol,
@@ -450,12 +485,55 @@ class EngineCycleMixin:
                             "variant_id": (edge_record or {}).get("variant_id")})
                         continue
                     rule_bars, current_session, latest_bar_ts = prepared
+                    market_context = None
+                    if rule_spec["family"] == "cross_sectional_residual":
+                        benchmark_row = rows.get(CROSS_SECTIONAL_BENCHMARK)
+                        benchmark_bars = (benchmark_row.get("bars", [])
+                                          if isinstance(benchmark_row, Mapping)
+                                          else [])
+                        benchmark_prepared = (
+                            prepared if symbol == CROSS_SECTIONAL_BENCHMARK else
+                            _rule_runtime_bars(
+                                benchmark_bars, rule_spec, now,
+                                max_age_seconds=configured_bar_age))
+                        if benchmark_prepared is None:
+                            reason = ("benchmark_context_missing"
+                                      if not benchmark_bars else
+                                      "benchmark_context_stale")
+                            self._event("rule_signal_reject", {
+                                "symbol": symbol, "reason": reason,
+                                "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+                                "variant_id": (edge_record or {}).get("variant_id")})
+                            continue
+                        market_context = MappingProxyType({
+                            CROSS_SECTIONAL_BENCHMARK:
+                                tuple(benchmark_prepared[0]),
+                        })
                     if signal_sessions.get(signal_state_key) == current_session:
                         self._event("rule_signal_duplicate_blocked", {
                             "symbol": symbol, "session": current_session})
                         continue
-                    signal = generate_rule_signal(
-                        symbol, rule_bars, config=edge_cfg, now=now)
+                    if market_context is None:
+                        signal = generate_rule_signal(
+                            symbol, rule_bars, config=edge_cfg, now=now)
+                    else:
+                        signal = generate_rule_signal(
+                            symbol, rule_bars, config=edge_cfg, now=now,
+                            bars_by_symbol=market_context)
+                    if (signal is None and
+                            rule_spec["family"] == "cross_sectional_residual"):
+                        trace = evaluate_rule_signal_trace(
+                            rule_bars, rule_spec, bars_by_symbol=market_context,
+                            symbol=symbol)
+                        stages = trace.get("stages") or []
+                        reason = (str(stages[-1].get("reason") or "")
+                                  if stages else "")
+                        if reason.startswith(("benchmark_context_",
+                                              "subject_context_")):
+                            self._event("rule_signal_reject", {
+                                "symbol": symbol, "reason": reason,
+                                "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+                                "variant_id": (edge_record or {}).get("variant_id")})
                     if signal is not None:
                         signal_ts = signal.get("signal_ts")
                         try:
@@ -549,6 +627,17 @@ class EngineCycleMixin:
                 if plan is None:
                     self._event("setup_reject", {"symbol": symbol, "reason": why})
                     continue
+                if (strategy_id == "rule" and
+                        rule_spec["family"] == "cross_sectional_residual"):
+                    plan = dict(plan)
+                    plan.update({
+                        key: signal.get(key) for key in (
+                            "benchmark_symbol", "symbol_return",
+                            "benchmark_return", "residual_return",
+                            "market_context_digest",
+                            "candidate_behavior_identity",
+                        )
+                    })
                 signals.append(plan)
                 if not self._llm_allows(plan, row, portfolio_data):
                     continue

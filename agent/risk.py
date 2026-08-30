@@ -13,7 +13,8 @@ from collections.abc import Mapping
 from .instruments import validate_equity_symbol, validate_option_symbol
 from .contracts.rule import RULE_SCHEMA_V3
 from research.costs import (CostError, STRESSED_COST_BASIS,
-                            STRESSED_COST_SCHEMA, stressed_cost_usd)
+                            STRESSED_COST_SCHEMA, ReplayPolicy,
+                            stressed_cost_usd)
 
 from .risk_inputs import (
     _OCC_OPTION_RE,
@@ -74,6 +75,30 @@ class RiskEngine:
         if stop is None and entry is not None and distance is not None:
             stop = entry - distance if decision.get("direction") == "long" else entry + distance
         return entry, stop, distance
+
+    @staticmethod
+    def _entry_observation_timestamp(decision: Mapping,
+                                     market: Mapping,
+                                     evaluation_epoch: float | None = None) -> str | None:
+        """Return the concrete market-observation instant for a runtime plan."""
+        candidates: list[object] = []
+        quote = market.get("quote") if isinstance(market, Mapping) else None
+        if isinstance(quote, Mapping):
+            candidates.extend(quote.get(name) for name in
+                              ("timestamp", "quote_ts", "quote_timestamp"))
+        if isinstance(market, Mapping):
+            candidates.extend(market.get(name) for name in
+                              ("quote_timestamp", "entry_timestamp", "timestamp"))
+        if isinstance(decision, Mapping):
+            candidates.append(decision.get("entry_timestamp"))
+        for candidate in candidates:
+            epoch = _timestamp(candidate)
+            if epoch is None:
+                continue
+            if evaluation_epoch is not None and epoch > float(evaluation_epoch):
+                return None
+            return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
+        return None
 
     def size_shares(self, equity: float, entry_price: float,
                     stop_distance: float, symbol_data: Mapping | None = None,
@@ -153,11 +178,23 @@ class RiskEngine:
         """
         source = cfg if isinstance(cfg, Mapping) else self.cfg
         scenario, limit = self._stressed_cost_settings(source)
+        vehicle = ("option" if isinstance(plan, Mapping) and
+                   str(plan.get("execution_profile", "shares")).lower()
+                   in {"option", "options", "defined_risk_options",
+                       "options_defined_risk"} else "equity")
+        activation_reason = "activation_disabled"
+        if isinstance(plan, Mapping) and isinstance(source, Mapping):
+            try:
+                policy = ReplayPolicy.from_config(source)
+                if policy.stressed_cost_calibration_enabled:
+                    scenario, activation_reason = policy.resolve_stress_scenario(
+                        plan.get("symbol"),
+                        plan.get("entry_timestamp", plan.get("timestamp")),
+                        vehicle=vehicle)
+            except (CostError, TypeError, ValueError, OverflowError):
+                activation_reason = "calibration_policy_invalid"
         if scenario is None or limit is None:
             return None, "stressed_cost_invalid"
-        vehicle = ("option" if str(plan.get("execution_profile", "shares")).lower()
-                   in {"option", "options", "defined_risk_options", "options_defined_risk"}
-                   else "equity")
         notional = _num(plan.get("notional"), None)
         risk_usd = _num(plan.get("risk_usd"), None)
         quantity_key = "contracts" if vehicle == "option" else "shares"
@@ -187,6 +224,7 @@ class RiskEngine:
             "stressed_cost_usd": float(stressed),
             "stressed_cost_to_risk_ratio": float(ratio),
             "max_stressed_cost_to_risk_ratio": float(limit),
+            "stressed_cost_activation_reason": activation_reason,
         })
         return enriched, None
 
@@ -665,6 +703,10 @@ class RiskEngine:
                 # start from the same next bar used by research replay.
                 "signal_ts": v3_signal_ts,
             })
+        observation_timestamp = self._entry_observation_timestamp(
+            decision, market, evaluation_epoch=now_value)
+        if observation_timestamp is not None:
+            plan["entry_timestamp"] = observation_timestamp
         plan, cost_reason = self.check_stressed_cost(plan, cfg=cost_cfg)
         if plan is None:
             return None, cost_reason

@@ -1,5 +1,12 @@
 # Signal-quality null control — 2026-08-30
 
+> **Supersession note (2026-08-29 remediation):** This file name is a
+> pre-existing `2026-08-30` historical artifact; its measurements are retained
+> unchanged. The current screen/report adds explicit `p=1` placeholders and a
+> terminal current-hypothesis no-edge outcome that reseeds on a changed corpus;
+> it remains fit-only and non-authorizing. See [the remediation
+> record](trading-edge-remediation-2026-08-29.md).
+
 The conditional forward-return screen added on 2026-08-29 reported a large
 edge on a corpus containing no predictive structure. This change set corrects
 the control it compares against, and gives every number it reports an error

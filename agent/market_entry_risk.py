@@ -132,6 +132,13 @@ class MarketEntryRiskMixin:
         result["symbol"] = validate_equity_symbol(result.get("symbol") or symbol)
         return result
 
+    @classmethod
+    def _bar_interval_seconds(cls, bar: Mapping[str, Any]) -> float | None:
+        """Return the bar's declared interval, defaulting one-minute rows to 60s."""
+        raw = bar.get("interval_seconds")
+        interval = 60.0 if raw in (None, "") else cls._number(raw)
+        return interval if interval is not None and interval > 0 else None
+
     def _universe(self) -> list[str]:
         universe = self.cfg.get("universe", {})
         rows = universe.get("symbols", []) if isinstance(universe, Mapping) else []
@@ -230,14 +237,36 @@ class MarketEntryRiskMixin:
             if bid is None or ask is None or bid <= 0 or ask < bid:
                 continue
             spread_bps = (ask - bid) / ((ask + bid) / 2) * 10000
-            age = max(0.0, (now - quote_ts).total_seconds())
+            quote_age = max(0.0, (now - quote_ts).total_seconds())
             for item in normalized_bars:
                 item["bid"] = bid; item["ask"] = ask
-                item["spread_bps"] = spread_bps; item["data_age_seconds"] = age
+                # A bar's freshness belongs to its own timestamp.  The old
+                # implementation copied the selected quote age onto every
+                # bar, making a stale feature window look fresh whenever the
+                # quote happened to be current.  Keep ``data_age_seconds``
+                # as the compatibility alias, but derive both values from
+                # the bar row itself.
+                bar_ts = self._timestamp(item.get("timestamp"))
+                interval_seconds = self._bar_interval_seconds(item)
+                timestamp_age = ((now - bar_ts).total_seconds()
+                                 if bar_ts is not None else None)
+                bar_age = (max(0.0, (now - (
+                    bar_ts + timedelta(seconds=interval_seconds))).total_seconds())
+                           if bar_ts is not None and interval_seconds is not None
+                           else None)
+                item["spread_bps"] = spread_bps
+                item["bar_age_seconds"] = bar_age
+                item["timestamp_age_seconds"] = timestamp_age
+                item["data_age_seconds"] = bar_age
             row["bars"] = normalized_bars
             row["quote"] = quote
             row["spread_bps"] = spread_bps
-            row["data_age_seconds"] = age
+            row["quote_age_seconds"] = quote_age
+            row["quote_timestamp"] = quote_ts
+            # ``data_age_seconds`` on the parent row historically meant quote
+            # age.  Preserve that alias for callers that consume the snapshot
+            # envelope while ensuring each bar carries an independent age.
+            row["data_age_seconds"] = quote_age
             row["stale"] = False
             row["quote_stale"] = False
             result[symbol] = row
@@ -301,7 +330,9 @@ class MarketEntryRiskMixin:
 
     def _completed(self, bar: Mapping, now: datetime) -> bool:
         ts = self._timestamp(bar.get("timestamp"))
-        return bool(ts is not None and ts + timedelta(minutes=1) <= now and ts <= now)
+        interval_seconds = self._bar_interval_seconds(bar)
+        return bool(ts is not None and interval_seconds is not None and
+                    ts + timedelta(seconds=interval_seconds) <= now and ts <= now)
 
     def _llm_allows(self, signal: Mapping, snapshot: Mapping, portfolio: Mapping) -> bool:
         if self.brain is None:
@@ -567,6 +598,48 @@ class MarketEntryRiskMixin:
         if plan is None:
             self._event("risk_reject", {"symbol": symbol, "reason": why})
             return None
+        # Persist the exact market-observation identity used for sizing.  The
+        # research rows carry these leg-level fields and runtime must retain
+        # them rather than relying on a later quote or provider default.
+        quote = row.get("quote") if isinstance(row.get("quote"), Mapping) else {}
+        bars = row.get("bars") if isinstance(row.get("bars"), (list, tuple)) else []
+        bar = bars[-1] if bars and isinstance(bars[-1], Mapping) else {}
+        quote_ts = self._timestamp(quote.get("timestamp", quote.get("quote_ts")))
+        quote_age = self._number(row.get("quote_age_seconds"))
+        if quote_age is None and quote_ts is not None:
+            quote_age = max(0.0, (now - quote_ts).total_seconds())
+        bar_ts = self._timestamp(bar.get("timestamp", bar.get("ts")))
+        bar_age = self._number(bar.get("bar_age_seconds", bar.get(
+            "timestamp_age_seconds", bar.get("data_age_seconds"))))
+        if bar_age is None and bar_ts is not None:
+            interval_seconds = self._bar_interval_seconds(bar)
+            if interval_seconds is not None:
+                bar_age = max(0.0, (now - (
+                    bar_ts + timedelta(seconds=interval_seconds))).total_seconds())
+        provider_default = str(getattr(self.provider, "name", "alpaca") or "alpaca")
+        entry_feed = (quote.get("feed") or row.get("quote_feed") or
+                      row.get("feed"))
+        entry_provider = (quote.get("provider") or row.get("quote_provider") or
+                          row.get("provider") or provider_default)
+        bar_feed = bar.get("feed") or row.get("bar_feed") or row.get("feed")
+        bar_provider = (bar.get("provider") or row.get("bar_provider") or
+                        row.get("provider") or provider_default)
+        plan.update({
+            "entry_fill_source": "quote",
+            "exit_fill_source": None,
+            "entry_feed": str(entry_feed) if entry_feed is not None else None,
+            "entry_provider": str(entry_provider) if entry_provider is not None else None,
+            "entry_quote_age_seconds": quote_age,
+            "exit_quote_age_seconds": None,
+            "signal_bar_feed": str(bar_feed) if bar_feed is not None else None,
+            "signal_bar_provider": str(bar_provider) if bar_provider is not None else None,
+            "signal_bar_age_seconds": bar_age,
+            "entry_bar_feed": str(bar_feed) if bar_feed is not None else None,
+            "entry_bar_provider": str(bar_provider) if bar_provider is not None else None,
+            "entry_bar_age_seconds": bar_age,
+            "exit_bar_feed": None, "exit_bar_provider": None,
+            "exit_bar_age_seconds": None,
+        })
         buying_power = self._number(_value(account, "buying_power", None))
         if buying_power is None or buying_power <= 0 or float(plan.get("notional", 0) or 0) > buying_power:
             self._event("risk_reject", {"symbol": symbol, "reason": "insufficient buying power"})
@@ -581,6 +654,18 @@ class MarketEntryRiskMixin:
             option_symbol = str(option.get("symbol") or "").upper()
             if not option_symbol:
                 return None
+            # For options the executable leg is the OPRA snapshot, not the
+            # underlying equity quote used only as the sizing anchor.
+            option_age = self._number(option.get("quote_age_seconds"))
+            option_feed = option.get("feed") or option.get("quote_feed")
+            option_provider = option.get("provider") or option.get("quote_provider")
+            if option_age is not None:
+                plan["entry_quote_age_seconds"] = option_age
+            if option_feed is not None:
+                plan["entry_feed"] = str(option_feed)
+            if option_provider is not None:
+                plan["entry_provider"] = str(option_provider)
+            plan["entry_fill_source"] = "quote"
             qty = Decimal(str(plan["contracts"]))
             try:
                 order_type, tif, limit = self._entry_execution(
@@ -588,6 +673,14 @@ class MarketEntryRiskMixin:
             except ValueError as exc:
                 self._event("execution_reject", {"symbol": option_symbol, "reason": str(exc)})
                 return None
+            # A marketable limit is the only way to make the premium-risk
+            # budget invariant true at submission time: a market fill can
+            # consume a worse ask than the quote used to size the contracts.
+            if order_type == "market":
+                executable = self._number(option.get("ask", option.get("debit")))
+                if executable is None or executable <= 0:
+                    return None
+                order_type, limit = "limit", Decimal(str(executable))
             return OrderRequest(option_symbol, qty, "buy", type=order_type,
                                 time_in_force=tif, limit_price=limit,
                                 client_order_id=self._client_id("open", signal),
@@ -599,8 +692,22 @@ class MarketEntryRiskMixin:
         try:
             order_type, tif, limit = self._entry_execution(
                 side, row.get("quote", {}),
+                # Preserve the authored signal-vs-quote slippage gate.  Once
+                # admitted, sizing/bracket geometry is re-anchored to the
+                # executable quote and the limit below caps adverse fills.
                 authored_entry_reference if authored_entry_reference is not None
                 else plan.get("entry_price"))
+            # Clamp a default market entry to the validated executable side.
+            # The resulting limit prevents a later adverse fill from widening
+            # stop-distance risk beyond the plan before protection is active.
+            if order_type == "market":
+                executable = self._number(
+                    row.get("quote", {}).get("ask" if side == "buy" else "bid",
+                                              row.get("quote", {}).get(
+                                                  "ask_price" if side == "buy" else "bid_price")))
+                if executable is None or executable <= 0:
+                    raise ValueError("executable entry quote is unavailable")
+                order_type, limit = "limit", Decimal(str(executable))
             if limit is not None:
                 limit = _quantize_equity_price(
                     limit, rounding=(ROUND_CEILING if side == "buy" else ROUND_FLOOR))

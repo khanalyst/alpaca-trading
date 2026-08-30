@@ -137,7 +137,7 @@ class IBRConfig:
     force_flat_minutes_before_close: int = 5
     target_r: float = 2.0
     max_entry_extension_r: float = float("inf")
-    stale_minutes: int = 60
+    stale_minutes: float = 0.5
     max_spread_bps: float = 25.0
 
     @classmethod

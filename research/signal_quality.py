@@ -14,12 +14,14 @@ import hashlib
 import json
 import math
 from statistics import mean, median, stdev
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    entry_window_bounds, evaluate_rule_signal, feature_window_bars,
-    rule_variant_id, session_minutes, validate_rule_spec,
+    CROSS_SECTIONAL_BENCHMARK, entry_window_bounds, evaluate_rule_signal,
+    evaluate_rule_signal_trace, feature_window_bars, rule_variant_id,
+    session_minutes, validate_rule_spec,
 )
 from .market_data import replay_available_at, replay_record_is_available
 
@@ -136,6 +138,30 @@ def _contiguous(rows: Sequence[Any], start: int, stop: int) -> bool:
                for left, right in zip(stamps, stamps[1:]))
 
 
+def _mature_prefix(spec: Mapping[str, Any], window: int | None) -> int:
+    """Return the exact causal prefix required by the executable rule.
+
+    ``feature_window_bars`` covers bounded family windows, while
+    opening/session-anchored families intentionally return ``None``.  Their
+    active confirmations still have dependencies, however, so include those
+    explicitly alongside the evaluator's base ATR/lookback prefix.  Do not
+    use the normalized-but-inactive ``slow_lookback`` field as a blanket
+    requirement.
+    """
+    required = max(int(spec["lookback"]) + 1,
+                   int(spec["atr_period"]) + 1,
+                   int(window or 0))
+    confirmations = {str(spec.get("confirmation") or "none")}
+    confirmations.update(str(item) for item in spec.get("confirmations") or ())
+    if "trend" in confirmations:
+        required = max(required, int(spec["slow_lookback"]))
+    if "volume" in confirmations:
+        required = max(required, int(spec["lookback"]) + 1)
+    if "volatility" in confirmations:
+        required = max(required, int(spec["atr_period"]) + 1)
+    return required
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False, default=str)
@@ -145,10 +171,42 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
+def _immutable_market_context(
+        bars: Sequence[Any],
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None,
+        ) -> Mapping[str, tuple[Any, ...]]:
+    """Freeze caller context, or derive it deterministically from the corpus."""
+    if bars_by_symbol is None:
+        derived: dict[str, list[Any]] = {}
+        for row in bars:
+            symbol = _symbol(row)
+            if symbol:
+                derived.setdefault(symbol, []).append(row)
+        source: Mapping[str, Sequence[Any]] = derived
+    elif isinstance(bars_by_symbol, Mapping):
+        source = bars_by_symbol
+    else:
+        return MappingProxyType({})
+    frozen: dict[str, tuple[Any, ...]] = {}
+    for raw_symbol, raw_rows in source.items():
+        symbol = str(raw_symbol).strip().upper()
+        if (not symbol or symbol in frozen or isinstance(raw_rows, (str, bytes)) or
+                not isinstance(raw_rows, Sequence)):
+            if symbol:
+                frozen[symbol] = ()
+            continue
+        frozen[symbol] = tuple(raw_rows)
+    return MappingProxyType(frozen)
+
+
 def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
-                 allow_backfill: bool) -> tuple[dict[str, Any] | None, str | None]:
+                 allow_backfill: bool,
+                 bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+                 symbol: str | None = None,
+                 ) -> tuple[dict[str, Any] | None, str | None]:
     """Return the first causal signal/entry pair for one symbol-session."""
     window = feature_window_bars(spec)
+    context_reason: str | None = None
     for index in range(1, max(1, len(rows) - 1)):
         feature_start = 0 if window is None else max(0, index + 1 - int(window))
         feature_rows = rows[feature_start:index + 1]
@@ -172,7 +230,19 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
                                 _timestamp(rows[probe]) >= entry_at)), None)
         if entry_index is None:
             continue
-        signal = evaluate_rule_signal(rows[:index + 1], spec)
+        if spec["family"] == "cross_sectional_residual":
+            trace = evaluate_rule_signal_trace(
+                rows[:index + 1], spec, bars_by_symbol=bars_by_symbol,
+                symbol=symbol)
+            signal = trace.get("signal")
+            if signal is None:
+                reason = str((trace.get("stages") or [{}])[-1].get(
+                    "reason") or "")
+                if reason.startswith(("benchmark_context_",
+                                      "subject_context_")):
+                    context_reason = reason
+        else:
+            signal = evaluate_rule_signal(rows[:index + 1], spec)
         if signal is None:
             continue
         # This is a pre-execution signal-quality measurement, not a fabricated
@@ -186,7 +256,7 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
         return ({"signal": signal, "signal_index": index,
                  "entry_index": entry_index, "entry_at": entry_at,
                  "entry_price": entry_price}, None)
-    return None, "no_actionable_signal"
+    return None, context_reason or "no_actionable_signal"
 
 
 def _forward_return(rows: Sequence[Any], *, entry_index: int, horizon: int,
@@ -223,13 +293,21 @@ class _ControlPolicy:
     __slots__ = ("minimum_prefix", "window", "after", "before")
 
     def __init__(self, spec: Mapping[str, Any]) -> None:
-        self.minimum_prefix = max(int(spec["lookback"]) + 1,
-                                  int(spec["atr_period"]) + 1)
+        # ``feature_window_bars`` is the executable rule's dependency
+        # declaration.  It includes a slow lookback only for families or
+        # confirmations that actually consume it; merely having the field in
+        # every normalized spec must not make unrelated families wait for it.
+        # Session-anchored families return ``None`` because their input is the
+        # complete session prefix rather than a bounded trailing window.
         self.window = feature_window_bars(spec)
+        self.minimum_prefix = _mature_prefix(spec, self.window)
         self.after, self.before = entry_window_bounds(spec)
 
     def admissible(self, rows: Sequence[Any], index: int) -> float | None:
         """Return the bar's session minute when the rule could enter on it."""
+        # Never shorten a declared dependency for a small corpus.  Returning
+        # no eligible controls is the truthful underpowered result; evaluating
+        # with a shorter prefix would silently change the rule being measured.
         if index + 1 < self.minimum_prefix:
             return None
         feature_start = (0 if self.window is None
@@ -455,6 +533,7 @@ def measure_signal_quality(
         horizons: Sequence[int] = DEFAULT_HORIZONS,
         cost_hurdle_bps: float | None = None,
         precomputed_first_signals: Sequence[Mapping[str, Any]] | None = None,
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
         ) -> dict[str, Any]:
     """Measure conditional forward returns and a matched random-entry control.
 
@@ -465,6 +544,7 @@ def measure_signal_quality(
     metadata is rejected rather than silently falling back to a scan.
     """
     normalized = validate_rule_spec(spec)
+    market_context = _immutable_market_context(bars, bars_by_symbol)
     requested = tuple(int(value) for value in horizons)
     if not requested or any(value <= 0 for value in requested) or \
             len(set(requested)) != len(requested):
@@ -524,7 +604,8 @@ def measure_signal_quality(
     for (symbol, session), rows in sorted(grouped.items()):
         if precomputed_first_signals is None:
             event, reason = _first_event(
-                rows, normalized, allow_backfill=allow_backfill)
+                rows, normalized, allow_backfill=allow_backfill,
+                bars_by_symbol=market_context, symbol=symbol)
         elif (symbol, session) in precomputed_invalid_cells:
             event, reason = None, "precomputed_event_invalid"
         else:
@@ -643,7 +724,7 @@ def measure_signal_quality(
             "symbol_clusters": len(symbols),
             "session_symbol_cells": len(cells),
         }
-    return {
+    result = {
         "schema": SIGNAL_QUALITY_SCHEMA,
         "scope": "fit_only",
         "authorizing": False,
@@ -665,6 +746,21 @@ def measure_signal_quality(
         "event_digest": _digest(sorted(event_vectors, key=_canonical)),
         "horizon_metrics": horizon_metrics,
     }
+    if normalized["family"] == "cross_sectional_residual":
+        context_rejections = {
+            reason: count for reason, count in event_reasons.items()
+            if reason.startswith(("benchmark_context_", "subject_context_"))
+        }
+        result["market_context"] = {
+            "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+            "status": ("unknown" if not events and context_rejections else
+                       "partial" if context_rejections else "complete"),
+            "reason": (max(sorted(context_rejections),
+                           key=context_rejections.get)
+                       if context_rejections else "synchronized_context"),
+            "rejection_counts": dict(sorted(context_rejections.items())),
+        }
+    return result
 
 
 __all__ = ["DEFAULT_HORIZONS", "SIGNAL_QUALITY_SCHEMA",

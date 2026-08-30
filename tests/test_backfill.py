@@ -9,6 +9,7 @@ backfilled corpus honest.
 """
 
 import csv
+import json
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 import tempfile
@@ -22,11 +23,13 @@ from deploy.backfill import (
     completed_sessions, last_completed_session,
 )
 from deploy.recorder import (
-    _load_index, _partition_path, _scan_corpus, corpus_partitions,
+    _load_index, _partition_calendar_path, _partition_path, _scan_corpus,
+    corpus_partitions,
     iter_corpus_rows,
 )
 from deploy.recorder_market import FIELDS
-from deploy.research_dataset import apply_partition_source
+from deploy.research_dataset import (_partition_calendar_sidecars,
+                                     apply_partition_source)
 
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -215,6 +218,12 @@ class CorpusEquivalenceTests(unittest.TestCase):
             )
             self.assertEqual(early["source"], "alpaca_calendar")
             partition = _partition_path(output, date(2026, 3, 19))
+            calendar_marker = _partition_calendar_path(
+                output, date(2026, 3, 19))
+            self.assertTrue(calendar_marker.is_file())
+            self.assertEqual(
+                json.loads(calendar_marker.read_text(encoding="utf-8"))["source"],
+                "alpaca_calendar")
             with partition.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 210)
@@ -265,6 +274,39 @@ class CorpusEquivalenceTests(unittest.TestCase):
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_orphan_calendar_sidecar_is_ignored_without_a_partition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sessions"
+            root.mkdir()
+            selected = root / "market-2026-03-19.csv"
+            selected.write_text("event_key\n", encoding="utf-8")
+            orphan = root / "market-2026-03-18.csv.calendar.json"
+            orphan.write_text(json.dumps({
+                "schema": "recorder-partition-calendar.v1",
+                "partition": "market-2026-03-18.csv",
+                "open": "2026-03-18T13:30:00+00:00",
+                "close": "2026-03-18T20:00:00+00:00",
+                "source": "alpaca_calendar",
+            }), encoding="utf-8")
+
+            self.assertIsNone(_partition_calendar_sidecars([selected], root.parent))
+
+    def test_unselected_partition_sidecar_is_not_part_of_selected_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sessions"
+            root.mkdir()
+            selected = root / "market-2026-03-19.csv"
+            selected.write_text("event_key\n", encoding="utf-8")
+            unselected = root / "market-2026-03-18.csv"
+            unselected.write_text("event_key\n", encoding="utf-8")
+            # An invalid marker outside the selected session window must not
+            # make an otherwise valid selected corpus fail validation.
+            (root / "market-2026-03-18.csv.calendar.json").write_text(
+                "not-json", encoding="utf-8")
+
+            self.assertIsNone(
+                _partition_calendar_sidecars([selected], root.parent))
+
     def test_a_repeat_run_is_a_no_op_and_costs_no_requests(self):
         provider = FakeProvider(bars_per_session=3)
         with tempfile.TemporaryDirectory() as directory:

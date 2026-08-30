@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from research.live_shadow import (DEFAULT_RETENTION_DAYS, ShadowConfig,
+from research.live_shadow import (DEFAULT_MAX_WORKERS, DEFAULT_RETENTION_DAYS, ShadowConfig,
                                   ShadowRunner)  # noqa: E402
 
 
@@ -35,6 +35,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--max-candidates", type=int, default=32)
     p.add_argument("--max-events", type=int, default=20_000)
     p.add_argument("--max-decisions", type=int, default=100_000)
+    p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
+                   help="bounded parallel candidate evaluators (default: %(default)s)")
     p.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
     return p
 
@@ -68,21 +70,26 @@ def main(argv: list[str] | None = None) -> int:
     config = ShadowConfig(
         corpus_path=args.corpus, edge_db=args.edge_db, shadow_db=args.shadow_db,
         max_candidates=args.max_candidates, max_events=args.max_events,
-        max_decisions=args.max_decisions, retention_days=args.retention_days,
+        max_decisions=args.max_decisions, max_workers=args.max_workers,
+        retention_days=args.retention_days,
         poll_seconds=args.interval)
     runner = ShadowRunner(config)
     health_file = args.health_file or args.shadow_db.with_name("shadow-health.json")
     while True:
         try:
             result = runner.run_once()
+            candidate_errors = result.get("candidate_errors") or {}
             safe_result = {key: result.get(key) for key in (
                 "candidates", "events", "decisions", "ingested_events",
                 "conflicts", "invalid_events", "skipped_recovery_bytes",
+                "manifest_digest", "candidate_errors",
                 "quarantine_through_session", "pruned_replay_diffs",
                 "retention_days", "retention_floor_ts",
                 "retention_gap_watermark", "stale_tail")
                 if key in result}
-            _write_health(health_file, "running", last_error=None, **safe_result)
+            _write_health(health_file, "degraded" if candidate_errors else "running",
+                          last_error=("candidate evaluation failures" if candidate_errors
+                                      else None), **safe_result)
             print(json.dumps(result, sort_keys=True), flush=True)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

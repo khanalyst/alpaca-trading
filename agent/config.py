@@ -59,9 +59,8 @@ def _int(block: Mapping[str, Any], key: str, path: str, lo: int, hi: int, defaul
 
 
 def _feed(value: Any, *, options: bool = False) -> str:
-    # The shipped equity protocol is bound to Alpaca IEX.  Other recognized
-    # streams remain valid diagnostic identities, but omission must resolve to
-    # the exact authorizing feed rather than silently changing proof semantics.
+    # The shipped equity default is IEX.  SIP is also a valid real-time
+    # identity when explicitly configured; delayed SIP remains diagnostic.
     raw = str(value or ("opra" if options else "iex")).strip().lower().replace("-", "_")
     if raw == "delayed":
         raw = "delayed_sip"
@@ -76,8 +75,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "broker": {"paper": True, "allow_live": False, "data_feed": "iex", "options_feed": "indicative"},
     "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "require_exact_calendar": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
     "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO", "VB", "EFA", "EEM", "TLT", "HYG", "GLD", "SLV", "SMH"], "asset_classes": ["us_equity"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
-    "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
-    "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0, "stressed_cost_scenario_bps": 25.0, "max_stressed_cost_to_risk_ratio": 0.30},
+    "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 0.5, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
+    "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "max_gross_exposure_pct": 50.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0, "stressed_cost_scenario_bps": 25.0, "max_stressed_cost_to_risk_ratio": 0.30, "stressed_cost_calibration_enabled": False, "stressed_cost_calibration_path": ""},
     "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100, "strict_market_data": True},
     "costs": {"spread_bps": 4.0, "slippage_bps": 6.0, "fee_bps": 0.5,
               "option_fee_per_contract_side": 0.65,
@@ -213,18 +212,18 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         raise ConfigError(f"universe.denylist: {exc}") from exc
     out["universe"] = universe
 
-    # Autonomous equity research is intentionally bound to the shipped IEX
-    # protocol.  SIP/delayed streams remain recognizable diagnostics, but are
-    # not alternate authorization identities.
+    # Autonomous equity research may use either real-time equity entitlement,
+    # but the configured identity remains authoritative end-to-end.  Delayed
+    # SIP is retained for diagnostics only and can never authorize research.
     research_requested = bool(
         isinstance(out.get("research"), Mapping)
         and out.get("research", {}).get("enabled", True))
     option_lane = any(str(item).lower() in {"us_option", "option", "options"}
                       for item in universe["asset_classes"])
-    if research_requested and broker["data_feed"] != "iex":
+    if research_requested and broker["data_feed"] not in {"iex", "sip"}:
         raise ConfigError(
-            "research.enabled requires the IEX equity feed; "
-            "set broker.data_feed=\"iex\" or ALPACA_DATA_FEED=iex")
+            "research.enabled requires a configured real-time equity feed "
+            "(iex or sip); delayed_sip is diagnostic-only")
     if (option_lane and research_requested and
             broker["options_feed"] != "opra"):
         raise ConfigError(
@@ -264,7 +263,8 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     strategy["max_ibr_width_atr"] = _num(strategy, "max_ibr_width_atr", "strategy", 0, 100, 3)
     strategy["atr_period"] = _int(strategy, "atr_period", "strategy", 1, 500, 14)
     strategy["max_spread_bps"] = _num(strategy, "max_spread_bps", "strategy", 0, 10_000, 25)
-    strategy["stale_minutes"] = _int(strategy, "stale_minutes", "strategy", 1, 1440, 60)
+    strategy["stale_minutes"] = _num(
+        strategy, "stale_minutes", "strategy", 1.0 / 60.0, 1440, .5)
     strategy["force_flat_minutes_before_close"] = _int(
         strategy, "force_flat_minutes_before_close", "strategy", 1, 240,
         session["force_flat_minutes_before_close"])
@@ -288,12 +288,14 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     out["strategy"] = strategy
 
     risk = _map(out.get("risk"), "risk")
-    _unknown(risk, {"risk_per_trade_pct", "daily_loss_limit_pct", "max_open_risk_pct", "max_total_open_risk_pct", "max_concurrent_positions", "max_position_notional_pct", "options_min_dte", "options_max_dte", "options_max_spread_pct", "max_gross_exposure_pct", "min_confidence", "stressed_cost_scenario_bps", "max_stressed_cost_to_risk_ratio"}, "risk")
+    _unknown(risk, {"risk_per_trade_pct", "daily_loss_limit_pct", "max_open_risk_pct", "max_total_open_risk_pct", "max_concurrent_positions", "max_position_notional_pct", "options_min_dte", "options_max_dte", "options_max_spread_pct", "max_gross_exposure_pct", "min_confidence", "stressed_cost_scenario_bps", "max_stressed_cost_to_risk_ratio", "stressed_cost_calibration_enabled", "stressed_cost_calibration_path"}, "risk")
     risk["risk_per_trade_pct"] = _num(risk, "risk_per_trade_pct", "risk", .001, 100, .5)
     risk["daily_loss_limit_pct"] = _num(risk, "daily_loss_limit_pct", "risk", .01, 100, 2)
     risk["max_open_risk_pct"] = _num(risk, "max_open_risk_pct", "risk", .01, 100, 2)
     risk["max_concurrent_positions"] = _int(risk, "max_concurrent_positions", "risk", 1, 100, 3)
     risk["max_position_notional_pct"] = _num(risk, "max_position_notional_pct", "risk", .1, 1000, 25)
+    risk["max_gross_exposure_pct"] = _num(
+        risk, "max_gross_exposure_pct", "risk", .1, 1000, 50)
     risk["options_min_dte"] = _int(risk, "options_min_dte", "risk", 0, 3650, 7)
     risk["options_max_dte"] = _int(risk, "options_max_dte", "risk", 1, 3650, 60)
     if risk["options_min_dte"] > risk["options_max_dte"]:
@@ -307,6 +309,14 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
             "risk.stressed_cost_scenario_bps must be one of 9, 15, 25, or 50")
     risk["max_stressed_cost_to_risk_ratio"] = _num(
         risk, "max_stressed_cost_to_risk_ratio", "risk", 0, float("inf"), 0.30)
+    risk["stressed_cost_calibration_enabled"] = _bool(
+        risk, "stressed_cost_calibration_enabled", "risk", False)
+    calibration_path = risk.get("stressed_cost_calibration_path", "")
+    if calibration_path is None:
+        calibration_path = ""
+    if not isinstance(calibration_path, str):
+        raise ConfigError("risk.stressed_cost_calibration_path must be a string")
+    risk["stressed_cost_calibration_path"] = calibration_path
     out["risk"] = risk
 
     execution = _map(out.get("execution"), "execution")

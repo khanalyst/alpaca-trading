@@ -36,10 +36,15 @@ class EvidenceGateTests(unittest.TestCase):
         row.update(changes)
         return row
 
-    def test_equity_fill_quality_requires_iex_quote_provenance_on_both_legs(self):
+    def test_equity_fill_quality_binds_to_configured_feed_on_both_legs(self):
         from research.gates import fill_source_summary
         self.assertTrue(fill_source_summary(
             [self._equity_quote_row()], vehicle="equity")["adequate"])
+        sip = self._equity_quote_row(entry_feed="sip", exit_feed="sip")
+        self.assertTrue(fill_source_summary(
+            [sip], vehicle="equity", equity_feed="sip")["adequate"])
+        self.assertFalse(fill_source_summary(
+            [sip], vehicle="equity", equity_feed="iex")["adequate"])
         for changes in (
                 {"entry_feed": "sip"}, {"exit_feed": "sip"},
                 {"entry_feed": "delayed_sip"}, {"exit_feed": "delayed_sip"},

@@ -1,15 +1,17 @@
 """Conditional forward-return diagnostics stay causal and non-authorizing."""
 
+from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
 
 from agent.contracts.rule import (
-    evaluate_rule_signal, evaluate_rule_signal_trace,
+    evaluate_rule_signal, evaluate_rule_signal_trace, validate_rule_spec,
 )
 from research.costs import diagnostic_backfill_policy
 from research.edge_lab import _read_discovery_rows
 from research.fit_diagnostics import _fit_prefixes
-from research.signal_quality import _forward_return, measure_signal_quality
+from research.signal_quality import (_ControlPolicy, _forward_return,
+                                     measure_signal_quality)
 from research.strategy_factory import _sanitize_fit_selection
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 
@@ -166,6 +168,46 @@ class ConditionalForwardReturnTests(unittest.TestCase):
             {"precomputed_event_invalid": 1,
              "no_actionable_signal": len(prefix["first_signals"]) - 1},
         )
+
+
+class ControlPrefixTests(unittest.TestCase):
+    def test_inactive_slow_lookback_does_not_delay_a_control(self):
+        spec = validate_rule_spec({**ROOT_SPEC,
+                                   "family": "momentum_continuation",
+                                   "confirmation": "none",
+                                   "confirmations": [],
+                                   "lookback": 5,
+                                   "slow_lookback": 40,
+                                   "atr_period": 14})
+        policy = _ControlPolicy(spec)
+        # Momentum reads lookback/ATR (and its own trailing feature window),
+        # but not the normalized slow_lookback field.
+        self.assertEqual(policy.minimum_prefix, 15)
+
+    def test_active_trend_confirmation_requires_slow_lookback(self):
+        spec = validate_rule_spec({**ROOT_SPEC,
+                                   "family": "opening_range_breakout",
+                                   "confirmation": "trend",
+                                   "confirmations": [],
+                                   "slow_lookback": 40,
+                                   "atr_period": 14})
+        policy = _ControlPolicy(spec)
+        self.assertEqual(policy.minimum_prefix, 40)
+
+    def test_underpowered_corpus_does_not_fall_back_to_shorter_prefix(self):
+        spec = validate_rule_spec({**ROOT_SPEC,
+                                   "family": "opening_range_breakout",
+                                   "confirmation": "trend",
+                                   "confirmations": [],
+                                   "slow_lookback": 40})
+        policy = _ControlPolicy(spec)
+        rows = [{"timestamp": (self._opening() + timedelta(minutes=index)).isoformat()}
+                for index in range(20)]
+        self.assertIsNone(policy.admissible(rows, len(rows) - 1))
+
+    @staticmethod
+    def _opening():
+        return datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
 
 
 if __name__ == "__main__":

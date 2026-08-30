@@ -147,6 +147,10 @@ class _Accumulator:
         return {
             "quote_count": self.spread.count,
             "session_count": len(self.sessions),
+            # Keep the actual session IDs alongside the count.  A count alone
+            # cannot distinguish broad chronological coverage from repeated
+            # observations in one session when stress calibration is persisted.
+            "sessions": sorted(self.sessions),
             "rejected_quote_count": self.rejected,
             "spread_bps": self.spread.summary(),
             "touch_shares": {**shares, "count": self.depth.count},
@@ -219,6 +223,7 @@ def measure_quote_costs(quotes: Iterable[Any], *,
     by_cell: dict[tuple[str, str], _Accumulator] = defaultdict(_Accumulator)
     feeds: set[str] = set()
     providers: set[str] = set()
+    missing_provider_rows = 0
     first_session: str | None = None
     last_session: str | None = None
     seen = 0
@@ -253,18 +258,28 @@ def measure_quote_costs(quotes: Iterable[Any], *,
         ask_size = _number(_value(row, "ask_size"))
         sizes = [size for size in (bid_size, ask_size)
                  if size is not None and size > 0]
+        identity = _value(row, "identity")
+        row_feed = _value(row, "feed", _value(identity, "feed"))
+        row_provider = _value(row, "provider", _value(identity, "provider"))
+        normalized_provider = (str(row_provider).strip().lower()
+                               if row_provider not in (None, "") else "")
+        if not normalized_provider:
+            # A usable quote without provider identity is not a measurement;
+            # accepting it would make the fitted schedule impossible to tie
+            # back to a recorder/source.  Invalid bid/ask rows above remain
+            # ordinary rejected observations for compatibility.
+            missing_provider_rows += 1
+            universe.rejected += 1
+            by_symbol[symbol].rejected += 1
+            continue
         for accumulator in (universe, by_symbol[symbol], by_cell[cell]):
             accumulator.spread.add(spread_bps)
             accumulator.sessions.add(session)
             if sizes:
                 accumulator.depth.add(math.log10(min(sizes)))
-        identity = _value(row, "identity")
-        row_feed = _value(row, "feed", _value(identity, "feed"))
-        row_provider = _value(row, "provider", _value(identity, "provider"))
         if row_feed:
             feeds.add(str(row_feed).strip().lower())
-        if row_provider:
-            providers.add(str(row_provider).strip().lower())
+        providers.add(normalized_provider)
         if first_session is None or session < first_session:
             first_session = session
         if last_session is None or session > last_session:
@@ -273,9 +288,23 @@ def measure_quote_costs(quotes: Iterable[Any], *,
     if not universe.spread.count:
         raise QuoteCostError(
             "no usable two-sided quotes in the corpus; cannot fit a cost model")
+    if missing_provider_rows:
+        raise QuoteCostError(
+            "quote-cost measurement requires provider provenance on every "
+            f"usable quote; missing {missing_provider_rows} row(s)")
     if feed is not None and feeds and {str(feed).strip().lower()} != feeds:
         raise QuoteCostError(
             f"corpus feeds {sorted(feeds)} do not match the expected {feed!r}")
+    expected_provider = (str(provider).strip().lower()
+                         if provider not in (None, "") else None)
+    if expected_provider is not None and providers != {expected_provider}:
+        raise QuoteCostError(
+            f"corpus providers {sorted(providers)} do not match the expected "
+            f"{expected_provider!r}")
+    if expected_provider is None and len(providers) != 1:
+        raise QuoteCostError(
+            "quote-cost measurement requires one explicit provider; "
+            f"got {sorted(providers)}")
 
     symbols = {}
     for symbol, accumulator in sorted(by_symbol.items()):
@@ -300,6 +329,8 @@ def measure_quote_costs(quotes: Iterable[Any], *,
             "quote_rows_rejected": universe.rejected,
             "first_session": first_session, "last_session": last_session,
             "feeds": sorted(feeds), "providers": sorted(providers),
+            "provider": next(iter(providers)) if len(providers) == 1 else None,
+            "missing_provider_rows": int(missing_provider_rows),
             "min_quotes_per_cell": int(min_quotes_per_cell),
             "bucket_minutes": BUCKET_MINUTES,
         },
@@ -392,6 +423,21 @@ def schedule_costs_block(schedule: Mapping[str, Any], **kwargs: Any) -> dict[str
              "option_fee_per_contract_side", "provenance")}
 
 
+# Re-export the diagnostic bridge from the schedule module so callers that
+# already depend on ``research.quote_costs`` can discover calibration without
+# importing a runtime/risk module.  The implementation remains separate to
+# keep the measured schedule and stress-selection contracts distinct.
+from .stressed_cost_calibration import (  # noqa: E402  (late import avoids cycles)
+    DEFAULT_FALLBACK_SCENARIO_BPS, DEFAULT_MIN_SESSIONS_PER_CELL,
+    STRESS_CALIBRATION_SCHEMA, StressCalibrationError,
+    calibrate_stress_schedule, calibrate_stressed_cost,
+    empirical_stress_calibration,
+)
+
 __all__ = ["BUCKET_MINUTES", "PERCENTILES", "QUOTE_COST_SCHEMA",
            "QuoteCostError", "bucket_label", "cost_model_from_schedule",
-           "measure_quote_costs", "schedule_costs_block"]
+           "measure_quote_costs", "schedule_costs_block",
+           "DEFAULT_FALLBACK_SCENARIO_BPS", "DEFAULT_MIN_SESSIONS_PER_CELL",
+           "STRESS_CALIBRATION_SCHEMA", "StressCalibrationError",
+           "calibrate_stress_schedule", "calibrate_stressed_cost",
+           "empirical_stress_calibration"]

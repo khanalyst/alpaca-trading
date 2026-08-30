@@ -225,6 +225,68 @@ def _source_paths(source: Path | Sequence[Path] | Iterable[Path] | None,
     return paths
 
 
+def _partition_calendar_sidecars(source_paths: Sequence[Path],
+                                 recorded_root: Path | None) -> dict | None:
+    """Merge exact calendar markers across all selected old partitions.
+
+    Older recorder indexes may only contain the newest partition's metadata.
+    Reading one tiny marker per selected partition avoids a corpus-sized
+    migration and gives research the same exact early-close boundaries.  A
+    malformed marker is a hard error; guessing a regular 16:00 close would
+    contaminate replay.
+    """
+    roots = []
+    if recorded_root is not None:
+        roots.append(Path(recorded_root) / "sessions")
+    roots.extend(path.parent for path in source_paths)
+    roots = list(dict.fromkeys(root.resolve() for root in roots
+                               if root.is_dir()))
+    result: dict[str, dict] = {}
+    sidecars: set[Path] = set()
+    for source in source_paths:
+        if _PARTITION_NAME.fullmatch(source.name) is None:
+            continue
+        for root in roots:
+            candidate = root / f"{source.name}.calendar.json"
+            if candidate.is_file():
+                sidecars.add(candidate)
+    for path in sorted(sidecars):
+        root = path.parent
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read exact calendar sidecar {path}") from exc
+        if not isinstance(payload, dict) or payload.get("schema") != \
+                "recorder-partition-calendar.v1":
+            raise ValueError(f"invalid exact calendar sidecar {path}")
+        partition = payload.get("partition")
+        if not isinstance(partition, str) or path.name != partition + ".calendar.json":
+            raise ValueError(f"invalid exact calendar sidecar {path}")
+        match = _PARTITION_NAME.fullmatch(partition)
+        if match is None:
+            raise ValueError(f"invalid exact calendar sidecar {path}")
+        # A marker is written before a partition during backfill.  A crash in
+        # that narrow window leaves a harmless orphan; do not let an old
+        # sidecar supply calendar metadata to a replacement partition.
+        if not (root / partition).is_file():
+            continue
+        day = match.group(1)
+        opened = _calendar_timestamp(payload.get("open"))
+        closed = _calendar_timestamp(payload.get("close"))
+        if (opened is None or closed is None or opened >= closed or
+                opened.astimezone(_NEW_YORK).date().isoformat() != day or
+                closed.astimezone(_NEW_YORK).date().isoformat() != day or
+                payload.get("source") != "alpaca_calendar"):
+            raise ValueError(f"invalid exact calendar sidecar {path}")
+        value = {"open": opened.isoformat(), "close": closed.isoformat(),
+                 "source": "alpaca_calendar"}
+        previous = result.get(day)
+        if previous is not None and previous != value:
+            raise ValueError(f"conflicting exact calendar sidecars for {day}")
+        result[day] = value
+    return result or None
+
+
 def _validate_csv_headers(paths: Sequence[Path], *, csv_mode: str,
                           identities: Mapping[Path, tuple[object, ...]]) -> list[str]:
     del csv_mode  # Kept in the helper signature to document the CSV contract.
@@ -330,6 +392,9 @@ def _config_and_sidecars(agent_config: Path | Mapping[str, object] | None,
                 # metadata is required; optional mode can still process rows.
                 calendar = None
                 partition_sources = None
+        marker_calendar = _partition_calendar_sidecars(source_paths, sidecar_root)
+        if marker_calendar:
+            calendar = {**(calendar or {}), **marker_calendar}
     return required, calendar, partition_sources
 
 

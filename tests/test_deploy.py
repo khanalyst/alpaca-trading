@@ -480,6 +480,9 @@ class DeployTests(unittest.TestCase):
             "ALPACA_FACTORY_WORKERS: ${ALPACA_FACTORY_WORKERS:-2}",
             research)
         self.assertIn(
+            "ALPACA_FACTORY_STRATEGIES: ${ALPACA_FACTORY_STRATEGIES:-12}",
+            research)
+        self.assertIn(
             "ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY: ${ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY:-}",
             research)
         self.assertIn(
@@ -620,6 +623,8 @@ class DeployTests(unittest.TestCase):
         self.assertIn("execution-blocked", script)
         self.assertIn("qualification-unavailable", script)
         self.assertIn('finish "completed_no_edge"', script)
+        self.assertIn('research/cost_rerun.py" --calibration-only', script)
+        self.assertIn('ALPACA_RESEARCH_STRESS_CALIBRATION_REPORT', script)
 
         for status in ("search_exhausted", "llm_provider_failure"):
             with self.subTest(status=status):
@@ -862,7 +867,7 @@ class DeployTests(unittest.TestCase):
             self.assertIn("slash pair", validation["errors"][0])
 
     def test_research_cycle_rejects_external_sip_equity_provenance(self):
-        """A legacy SIP row cannot be promoted by IEX CLI metadata."""
+        """A SIP row cannot be promoted under the shipped IEX configuration."""
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
             "open,high,low,close,volume\n"
@@ -877,8 +882,42 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
             validation = [item for item in _cycle_payloads(result.stdout, "valid")][0]
             self.assertFalse(validation["valid"])
-            self.assertTrue(any("expected 'iex'" in error
+            self.assertTrue(any(("configured executable feed 'iex'" in error or
+                                "expected 'iex'" in error)
                                 for error in validation["errors"]))
+
+    def test_research_cycle_accepts_sip_when_configured_end_to_end(self):
+        """Configured SIP must survive feed guard and corpus validation."""
+        csv_text = (
+            "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
+            "open,high,low,close,volume\n"
+            "sip,2026-08-08T13:31:00+00:00,alpaca,sip,bar_1m,SPY,"
+            "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
+            "100,101,99,100.5,10\n")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "market.csv"
+            config = root / "sip-config.json"
+            dataset.write_text(csv_text, encoding="utf-8")
+            config.write_text(json.dumps({
+                "mode": "paper",
+                "broker": {"paper": True, "allow_live": False,
+                           "data_feed": "sip", "options_feed": "opra"},
+                "universe": {"asset_classes": ["us_equity"]},
+                "session": {"require_exact_calendar": False},
+                "strategy": {"selection_mode": "all_proved",
+                             "execution_mode": "shares"},
+                "research": {"enabled": True,
+                             "require_validated_variant": True,
+                             "strategy_llm": {"enabled": False}},
+            }), encoding="utf-8")
+            result = _run_research_cycle(
+                dataset, root, ALPACA_AGENT_CONFIG=str(config),
+                ALPACA_DATA_FEED="sip", ALPACA_STOCK_FEED="sip",
+                ALPACA_OPTIONS_FEED="opra")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            validation = [item for item in _cycle_payloads(result.stdout, "valid")][0]
+            self.assertTrue(validation["valid"])
 
     def test_research_cycle_routes_recorded_quotes_into_the_replay(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1027,12 +1066,21 @@ class DeployTests(unittest.TestCase):
             now = datetime.now(timezone.utc).timestamp()
             path.write_text(json.dumps({
                 "status": "completed_no_edge", "updated_ts": now,
-                "last_exit_code": 0}), encoding="utf-8")
+                "last_exit_code": 0,
+                "research_readiness": {
+                    "schema": "research-readiness.v1", "state": "pending",
+                    "recorded_sessions": 1, "required_sessions": 2,
+                    "sessions_remaining": 1,
+                },
+            }), encoding="utf-8")
             self.assertTrue(health.research(path, 60, now=now)["ok"])
             path.write_text(json.dumps({
                 "status": "no_data", "updated_ts": now,
                 "last_exit_code": 2}), encoding="utf-8")
-            self.assertFalse(health.research(path, 60, now=now)["ok"])
+            degraded = health.research(path, 60, now=now)
+            self.assertTrue(degraded["ok"])
+            self.assertEqual(degraded["research_status"], "degraded")
+            self.assertFalse(degraded["evidence_available"])
 
     def test_research_health_exposes_transient_provider_degraded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1051,7 +1099,7 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(result["research_preflight"]["status"], "degraded")
         self.assertTrue(result["provider_preflight_degraded"])
 
-    def test_running_research_is_judged_independently_of_previous_cycle(self):
+    def test_running_research_exposes_scheduler_liveness_but_fails_prior_cycle(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "research.json"
             path.write_text(json.dumps({
@@ -1060,10 +1108,12 @@ class DeployTests(unittest.TestCase):
             }), encoding="utf-8")
             result = health.research(path, 60, now=100)
         self.assertTrue(result["ok"])
+        self.assertTrue(result["scheduler_liveness"]["ok"])
         self.assertTrue(result["previous_cycle_degraded"])
+        self.assertEqual(result["research_status"], "degraded")
         self.assertEqual(result["last_exit_code"], 2)
 
-    def test_waiting_scheduler_is_judged_independently_of_previous_cycle(self):
+    def test_waiting_scheduler_exposes_liveness_but_fails_prior_cycle(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "research.json"
             path.write_text(json.dumps({
@@ -1073,8 +1123,10 @@ class DeployTests(unittest.TestCase):
             }), encoding="utf-8")
             result = health.research(path, 60, now=100)
             self.assertTrue(result["ok"])
+            self.assertTrue(result["scheduler_liveness"]["ok"])
             self.assertTrue(result["waiting_after_no_data"])
             self.assertTrue(result["previous_cycle_degraded"])
+            self.assertEqual(result["research_status"], "degraded")
 
             path.write_text(json.dumps({
                 "status": "waiting", "updated_ts": 100,
@@ -1083,8 +1135,24 @@ class DeployTests(unittest.TestCase):
             }), encoding="utf-8")
             result = health.research(path, 60, now=100)
         self.assertTrue(result["ok"])
+        self.assertTrue(result["scheduler_liveness"]["ok"])
         self.assertFalse(result["waiting_after_no_data"])
         self.assertTrue(result["previous_cycle_degraded"])
+        self.assertEqual(result["research_status"], "degraded")
+
+    def test_waiting_scheduler_before_first_cycle_is_process_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            path.write_text(json.dumps({
+                "status": "waiting", "updated_ts": 100,
+                "next_run_ts": 200,
+            }), encoding="utf-8")
+            result = health.research(path, 60, now=100)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["scheduler_liveness"]["ok"])
+        self.assertEqual(result["research_status"], "degraded")
+        self.assertEqual(result["reason"],
+                         "research scheduler waiting for first cycle")
 
     def test_shadow_health_requires_a_fresh_successful_poll(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1168,7 +1236,7 @@ class DeployTests(unittest.TestCase):
                 vehicles = dict(db.execute(
                     "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
                 ).fetchall())
-            self.assertEqual(vehicles, {"equity": 11, "option": 11})
+            self.assertEqual(vehicles, {"equity": 12, "option": 12})
 
     def test_research_cycle_studies_equity_only_by_default(self):
         """The scheduled profile stays on the runtime's equity lane by default."""
@@ -1201,7 +1269,7 @@ class DeployTests(unittest.TestCase):
                 vehicles = dict(db.execute(
                     "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
                 ).fetchall())
-            self.assertEqual(vehicles, {"equity": 11})
+            self.assertEqual(vehicles, {"equity": 12})
 
     def test_research_cycle_equity_only_filters_indicative_options(self):
         """A mixed indicative corpus remains usable for the equity lane."""
@@ -1272,7 +1340,7 @@ class DeployTests(unittest.TestCase):
                 vehicles = dict(db.execute(
                     "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
                 ).fetchall())
-            self.assertEqual(vehicles, {"equity": 11})
+            self.assertEqual(vehicles, {"equity": 12})
 
     def test_research_cycle_selected_all_with_indicative_options_fails(self):
         """Selecting the option lane requires configured OPRA provenance."""
@@ -1359,6 +1427,197 @@ class DeployTests(unittest.TestCase):
                                          ("bars", "sip"), ("quotes", "sip")])
             self.assertEqual(len({row["event_key"] for row in rows}), 2)
             self.assertTrue(all(row["feed"] == "sip" for row in rows))
+
+    def test_duplicate_only_stale_quote_is_live_but_not_authorization_ready(self):
+        fixed_now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc)
+
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+        class StaleQuoteFake:
+            data_feed = "iex"
+
+            def bars(self, symbols, *, start, end, feed, **kwargs):
+                return {}
+
+            def quotes(self, symbols, *, start, end, feed):
+                return {"SPY": [SimpleNamespace(
+                    timestamp=fixed_now - timedelta(seconds=45),
+                    bid=100, ask=101, last=100.5)]}
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(recorder, "datetime", FrozenDatetime):
+            root = Path(directory)
+            path = root / "market.csv"
+            fake = StaleQuoteFake()
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path), 1)
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path), 0)
+            for item in (next((root / "sessions").glob("*.csv")),
+                         root / recorder.INDEX_NAME):
+                os.utime(item, (fixed_now.timestamp(), fixed_now.timestamp()))
+
+            result = health.recorder(
+                root, max_age=300, now=fixed_now.timestamp(),
+                configured_symbols=["SPY"], configured_data_feed="iex")
+
+        self.assertTrue(result["service_liveness"]["ok"])
+        self.assertFalse(result["market_data_ready"])
+        self.assertEqual(result["market_data_freshness_status"], "stale")
+        self.assertGreater(result["observation_ages"]["SPY"]
+                           ["quote_age_seconds"], 30)
+
+    def test_recorder_health_marks_fresh_exact_feed_quotes_ready(self):
+        now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "sessions" / "market-2026-08-28.csv"
+            corpus.parent.mkdir()
+            corpus.write_text("event_key\n", encoding="utf-8")
+            index = root / recorder.INDEX_NAME
+            index.write_text(json.dumps({
+                "data_feed": "iex", "configured_symbols": ["SPY"],
+                "observation_watermarks": {
+                    "SPY": {
+                        "quote": datetime.fromtimestamp(
+                            now - 10, timezone.utc).isoformat(),
+                        "bar": datetime.fromtimestamp(
+                            now - 20, timezone.utc).isoformat(),
+                    },
+                },
+            }), encoding="utf-8")
+            os.utime(corpus, (now, now))
+            os.utime(index, (now, now))
+
+            result = health.recorder(
+                root, max_age=300, now=now, configured_symbols=["SPY"],
+                configured_data_feed="iex")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["market_data_ready"])
+        self.assertEqual(result["market_data_freshness_status"], "ready")
+        self.assertEqual(result["aggregate_observation_ages"]
+                         ["quote_age_seconds"], 10)
+
+    def test_recorder_health_missing_watermarks_is_unknown_and_fail_closed(self):
+        now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "sessions" / "market-2026-08-28.csv"
+            corpus.parent.mkdir()
+            corpus.write_text("event_key\n", encoding="utf-8")
+            index = root / recorder.INDEX_NAME
+            index.write_text(json.dumps({
+                "data_feed": "iex", "configured_symbols": ["SPY"],
+            }), encoding="utf-8")
+            os.utime(corpus, (now, now))
+            os.utime(index, (now, now))
+
+            result = health.recorder(
+                root, max_age=300, now=now, configured_symbols=["SPY"],
+                configured_data_feed="iex")
+
+        self.assertTrue(result["service_liveness"]["ok"])
+        self.assertFalse(result["market_data_ready"])
+        self.assertEqual(result["market_data_freshness_status"], "unknown")
+        self.assertEqual(result["market_data_reason"],
+                         "observation_watermarks_missing")
+
+    def test_recorder_health_missing_bar_is_unknown_and_fail_closed(self):
+        now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "sessions" / "market-2026-08-28.csv"
+            corpus.parent.mkdir()
+            corpus.write_text("event_key\n", encoding="utf-8")
+            index = root / recorder.INDEX_NAME
+            index.write_text(json.dumps({
+                "data_feed": "iex", "configured_symbols": ["SPY"],
+                "observation_watermarks": {
+                    "SPY": {"quote": datetime.fromtimestamp(
+                        now - 10, timezone.utc).isoformat()},
+                },
+            }), encoding="utf-8")
+            os.utime(corpus, (now, now))
+            os.utime(index, (now, now))
+
+            result = health.recorder(
+                root, max_age=300, now=now, configured_symbols=["SPY"],
+                configured_data_feed="iex")
+
+        self.assertFalse(result["market_data_ready"])
+        self.assertEqual(result["market_data_freshness_status"], "unknown")
+        self.assertEqual(result["market_data_reason"],
+                         "bar_watermarks_missing:SPY")
+
+    def test_recorder_health_stale_bar_is_not_authorization_ready(self):
+        now = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "sessions" / "market-2026-08-28.csv"
+            corpus.parent.mkdir()
+            corpus.write_text("event_key\n", encoding="utf-8")
+            index = root / recorder.INDEX_NAME
+            index.write_text(json.dumps({
+                "data_feed": "iex", "configured_symbols": ["SPY"],
+                "observation_watermarks": {
+                    "SPY": {
+                        "quote": datetime.fromtimestamp(
+                            now - 10, timezone.utc).isoformat(),
+                        "bar": datetime.fromtimestamp(
+                            now - 31, timezone.utc).isoformat(),
+                    },
+                },
+            }), encoding="utf-8")
+            os.utime(corpus, (now, now))
+            os.utime(index, (now, now))
+
+            result = health.recorder(
+                root, max_age=300, now=now, configured_symbols=["SPY"],
+                configured_data_feed="iex")
+
+        self.assertFalse(result["market_data_ready"])
+        self.assertEqual(result["market_data_freshness_status"], "stale")
+        self.assertEqual(result["market_data_reason"],
+                         "bar_observations_stale:SPY")
+
+    def test_closed_market_no_data_keeps_recorder_live_but_not_ready(self):
+        now = datetime(2026, 8, 28, 22, 0, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index = root / recorder.INDEX_NAME
+            index.write_text(json.dumps({
+                "data_feed": "iex", "configured_symbols": ["SPY"],
+                "session_calendar": {
+                    "2026-08-28": {
+                        "open": "2026-08-28T13:30:00+00:00",
+                        "close": "2026-08-28T20:00:00+00:00",
+                    },
+                },
+                "observation_watermarks": {
+                    "SPY": {"quote": "2026-08-28T19:59:50+00:00"},
+                },
+            }), encoding="utf-8")
+            status = root / recorder.STATUS_NAME
+            status.write_text(json.dumps({
+                "status": "failed", "updated_ts": now,
+                "failure_kind": "market_data_request_failed",
+                "error": "Alpaca returned no point-in-time bars or quotes",
+            }), encoding="utf-8")
+            os.utime(index, (now - 3600, now - 3600))
+
+            result = health.recorder(
+                root, max_age=300, now=now, configured_symbols=["SPY"],
+                configured_data_feed="iex")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["service_liveness"]["ok"])
+        self.assertEqual(result["series_files"], 0)
+        self.assertEqual(result["status"], "recording_market_closed")
+        self.assertFalse(result["market_data_ready"])
+        self.assertEqual(result["market_data_freshness_status"],
+                         "market_closed")
 
     def test_recorder_never_persists_an_active_partial_bar(self):
         fake = _MarketFake()
@@ -1482,6 +1741,137 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(result["coverage_status"], "gap_observed")
             self.assertEqual(result["bar_gap_symbols"], ["DIA"])
             self.assertEqual(result["bar_coverage"]["DIA"]["policy"], "observe")
+
+    def test_strict_recorder_health_fails_gap_and_unobserved_configured_symbols(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            corpus = sessions / "market-2026-08-13.csv"
+            corpus.write_text("event_key\n", encoding="utf-8")
+            index = root / recorder.INDEX_NAME
+            index.write_text(json.dumps({
+                "data_feed": "iex",
+                "configured_symbols": ["DIA", "SPY"],
+                "bar_coverage": {
+                    "DIA": {"status": "gap_observed", "gap_observations": 1,
+                             "last_bar": "2026-08-13T19:00:00+00:00"},
+                },
+            }), encoding="utf-8")
+            os.utime(corpus, (1000, 1000))
+            os.utime(index, (1000, 1000))
+
+            result = health.recorder(
+                root, max_age=60, now=1000,
+                configured_symbols=["DIA", "SPY"], strict_bar_feeds="iex")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["strict_bar_policy"])
+        self.assertEqual(result["bar_coverage_failures"], ["DIA", "SPY"])
+        self.assertIn("strict_bar_coverage_failed", result["reason"])
+
+    def test_deployment_provenance_parity_is_deterministic(self):
+        from deploy.provenance import deployment_parity, deployment_provenance
+
+        current = deployment_provenance({
+            "ALPACA_DEPLOYMENT_COMMIT": "A" * 40,
+            "ALPACA_DEPLOYMENT_IMAGE": "agent:test",
+        })
+        self.assertEqual(current["identity"], "a" * 40)
+        self.assertIsNone(deployment_provenance({
+            "ALPACA_DEPLOYMENT_IMAGE": "agent:local",
+        })["identity"])
+        invalid = deployment_provenance({
+            "ALPACA_DEPLOYMENT_IMAGE_DIGEST": "latest",
+        })
+        self.assertIsNone(invalid["identity"])
+        self.assertTrue(invalid["image_digest_invalid"])
+        self.assertEqual(invalid["image_digest_reason"],
+                         "invalid_oci_sha256_digest")
+        self.assertFalse(deployment_parity([
+            {"component": "recorder", "provenance": invalid},
+        ])["ok"])
+        valid = deployment_provenance({
+            "ALPACA_DEPLOYMENT_IMAGE_DIGEST": "sha256:" + "AB" * 32,
+        })
+        self.assertEqual(valid["identity"], "sha256:" + "ab" * 32)
+        embedded = deployment_provenance({
+            "ALPACA_DEPLOYMENT_IMAGE": "agent@sha256:" + "CD" * 32,
+        })
+        self.assertEqual(embedded["identity"], "sha256:" + "cd" * 32)
+        commit_fallback = deployment_provenance({
+            "ALPACA_BUILD_COMMIT": "a" * 40,
+            "ALPACA_DEPLOYMENT_IMAGE_DIGEST": "latest",
+        })
+        self.assertEqual(commit_fallback["identity"], "a" * 40)
+        invalid_commit = deployment_provenance({
+            "ALPACA_DEPLOYMENT_COMMIT": "main",
+        })
+        self.assertIsNone(invalid_commit["identity"])
+        self.assertTrue(invalid_commit["commit_invalid"])
+        self.assertEqual(invalid_commit["commit_invalid_reason"],
+                         "invalid_git_object_id")
+        self.assertFalse(deployment_parity([
+            {"component": "invalid", "provenance": invalid_commit},
+        ])["ok"])
+        mixed_commit = deployment_provenance({
+            "ALPACA_DEPLOYMENT_COMMIT": "main",
+            "ALPACA_BUILD_COMMIT": "a" * 40,
+        })
+        self.assertEqual(mixed_commit["identity"], "a" * 40)
+        self.assertTrue(deployment_parity([
+            {"component": "mixed", "provenance": mixed_commit},
+        ])["ok"])
+        self.assertTrue(deployment_parity([
+            {"component": "recorder", "provenance": current},
+            {"component": "research", "provenance": current},
+        ])["ok"])
+        self.assertFalse(deployment_parity([
+            {"component": "recorder", "provenance": current},
+            {"component": "research", "provenance": {"identity": "other"}},
+        ])["ok"])
+
+    def test_baked_commit_outranks_placeholder_and_conflicts_fail_closed(self):
+        from deploy.provenance import deployment_provenance
+
+        baked = deployment_provenance({
+            "ALPACA_DEPLOYMENT_COMMIT": "unknown",
+            "ALPACA_BUILD_COMMIT": "a" * 40,
+            "ALPACA_DEPLOYMENT_IMAGE": "agent:local",
+        })
+        self.assertEqual(baked["identity"], "a" * 40)
+        self.assertFalse(baked["commit_mismatch"])
+        conflict = deployment_provenance({
+            "ALPACA_DEPLOYMENT_COMMIT": "b" * 40,
+            "ALPACA_BUILD_COMMIT": "a" * 40,
+        })
+        self.assertIsNone(conflict["identity"])
+        self.assertTrue(conflict["commit_mismatch"])
+        from deploy.provenance import deployment_parity
+        self.assertFalse(deployment_parity([{"component": "conflict",
+                                             "provenance": conflict}])["ok"])
+        compose = (Path(__file__).resolve().parents[1] / "compose.yaml").read_text()
+        dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
+        self.assertIn("ALPACA_DEPLOYMENT_IMAGE_DIGEST", compose)
+        self.assertIn("ALPACA_BUILD_COMMIT", dockerfile)
+
+    def test_recorder_cadence_skips_missed_ticks_without_bursting(self):
+        self.assertEqual(recorder._next_cadence_deadline(None, 100.0, 30), 130.0)
+        # A five-second request that began on the 100-second tick still sleeps
+        # only to 130, so work time is not added to the polling interval.
+        self.assertEqual(recorder._next_cadence_deadline(100.0, 105.0, 30), 130.0)
+        self.assertEqual(recorder._next_cadence_deadline(130.0, 120.0, 30), 130.0)
+        # A 95-second request overran three 30-second ticks; the next request
+        # is scheduled for 130 rather than replaying 40/70/100 immediately.
+        self.assertEqual(recorder._next_cadence_deadline(40.0, 125.0, 30), 130.0)
+        unit = (Path(__file__).resolve().parents[1] /
+                "deploy/alpaca-recorder.service").read_text()
+        self.assertIn("deploy/recorder.py --out", unit)
+        self.assertIn("--interval 30", unit)
+
+    def test_recorder_rejects_intervals_above_quote_freshness_window(self):
+        with self.assertRaisesRegex(SystemExit, "at most 30 seconds"):
+            recorder.main(["--interval", "30.001"])
 
     def test_strict_feed_gap_fails_before_mutating_the_corpus(self):
         fixed_now = datetime(2026, 8, 13, 16, 0, tzinfo=timezone.utc)
@@ -1668,6 +2058,44 @@ class DeployTests(unittest.TestCase):
                     read_only=True) as recent:
                 self.assertEqual(
                     recent.count(), migrated["recent_key_index"]["count"])
+
+    def test_recorder_rebuild_preserves_observation_watermarks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=2)
+            quote = dict(rows[-1])
+            quote.update({
+                "event_key": recorder._event_key(
+                    "quote", "SPY", quote["timestamp"]),
+                "event_type": "quote", "bid": "100", "ask": "101",
+                "last": "100.5", "open": "", "high": "", "low": "",
+                "close": "", "volume": "",
+            })
+            recorder._append_partitions(path, [*rows, quote])
+            legacy = recorder._scan_corpus(path)
+            legacy["partitions"] = {}
+            (root / recorder.INDEX_NAME).write_text(
+                json.dumps(legacy, sort_keys=True), encoding="utf-8")
+
+            rebuilt = recorder._prepare_index(path)
+            self.assertEqual(
+                rebuilt["observation_watermarks"]["SPY"]["quote"],
+                quote["as_of"])
+            self.assertEqual(
+                rebuilt["observation_watermarks"]["SPY"]["bar"],
+                rows[-1]["as_of"])
+
+            pre_watermark = dict(rebuilt)
+            pre_watermark.pop("observation_watermarks")
+            (root / recorder.INDEX_NAME).write_text(
+                json.dumps(pre_watermark, sort_keys=True), encoding="utf-8")
+            migrated = recorder._prepare_index(path)
+
+        self.assertEqual(migrated["observation_watermarks"]["SPY"]["quote"],
+                         quote["as_of"])
+        self.assertEqual(migrated["observation_watermarks"]["SPY"]["bar"],
+                         rows[-1]["as_of"])
 
     def test_recorder_same_size_partition_rewrite_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2135,6 +2563,52 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(session["open"], "2026-08-07T13:30:00+00:00")
         self.assertEqual(session["close"], "2026-08-07T17:00:00+00:00")
         self.assertEqual(session["source"], "alpaca_calendar")
+
+    def test_recorder_persists_closed_weekday_calendar_marker(self):
+        calendar = recorder.CalendarCache(_CalendarFake())
+        index = {"session_calendar": {}}
+        zone = recorder.NEW_YORK
+        start = datetime(2026, 8, 5, 12, 0, tzinfo=zone)
+        end = datetime(2026, 8, 5, 18, 0, tzinfo=zone)
+        recorder._record_session_calendar(index, calendar, start, end)
+        self.assertEqual(index["session_calendar"]["2026-08-05"], {
+            "status": "closed", "source": "alpaca_calendar"})
+        self.assertEqual(health._market_session_status(index, start.timestamp()),
+                         "closed")
+        row = {"event_type": "bar_1m",
+               "timestamp": "2026-08-05T14:00:00+00:00",
+               "as_of": "2026-08-05T14:01:00+00:00"}
+        self.assertFalse(recorder._inside_recorded_session(
+            index, row, require_exact_calendar=True))
+        self.assertEqual(recorder._recorded_session_rows(
+            index, [row], require_exact_calendar=True), [])
+
+    def test_recorder_health_holiday_no_data_is_live_but_not_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            now = datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc).timestamp()
+            (path / recorder.INDEX_NAME).write_text(json.dumps({
+                "session_calendar": {
+                    "2026-08-05": {
+                        "status": "closed", "source": "alpaca_calendar",
+                    }},
+                "data_feed": "iex", "observation_watermarks": {},
+            }), encoding="utf-8")
+            (path / ".recorder-status.json").write_text(json.dumps({
+                "status": "failed", "updated_ts": now,
+                "failure_kind": "market_data_request_failed",
+                "error": "Alpaca returned no point-in-time bars or quotes",
+                "data_feed": "iex",
+            }), encoding="utf-8")
+            os.utime(path / recorder.INDEX_NAME, (now, now))
+            os.utime(path / ".recorder-status.json", (now, now))
+            result = health.recorder(path, 60, now=now,
+                                     configured_data_feed="iex",
+                                     configured_symbols=["SPY"])
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["service_liveness"]["ok"])
+        self.assertEqual(result["market_session_status"], "closed")
+        self.assertFalse(result["market_data_ready"])
 
     def test_recorder_discards_extended_rows_after_an_early_close(self):
         index = {"session_calendar": {"2026-08-07": {

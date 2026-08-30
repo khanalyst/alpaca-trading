@@ -34,6 +34,7 @@
     "max_entry_extension_r": 1.0,
     "min_ibr_width_atr": 0.25,
     "max_ibr_width_atr": 3.0,
+    "stale_minutes": 0.5,
     "latest_entry_time": "15:00",
     "force_flat_minutes_before_close": 10
   },
@@ -43,6 +44,7 @@
     "max_open_risk_pct": 2.0,
     "max_concurrent_positions": 3,
     "max_position_notional_pct": 25.0,
+    "max_gross_exposure_pct": 50.0,
     "options_min_dte": 7,
     "options_max_dte": 60,
     "options_max_spread_pct": 10.0,

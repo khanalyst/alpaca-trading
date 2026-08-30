@@ -525,16 +525,19 @@ class AlpacaRuntimeTests(unittest.TestCase):
         self.assertEqual(config["broker"]["options_feed"], "indicative")
         self.assertEqual(config["universe"]["asset_classes"], ["us_equity"])
         self.assertFalse(config["llm"]["enabled"])
+        self.assertEqual(config["strategy"]["stale_minutes"], .5)
+        self.assertEqual(config["risk"]["max_gross_exposure_pct"], 50.0)
         with self.assertRaises(ConfigError):
             validate_config({"mode": "live", "broker": {"paper": False}})
         with self.assertRaisesRegex(ConfigError, "model is required"):
             validate_config({"llm": {"enabled": True}})
 
-    def test_research_equity_feed_is_exact_iex_and_option_lane_stays_opra(self):
-        for feed in ("sip", "delayed_sip"):
-            with self.subTest(feed=feed), self.assertRaisesRegex(
-                    ConfigError, "requires the IEX equity feed"):
-                validate_config({"broker": {"data_feed": feed}})
+    def test_research_equity_feed_matches_config_and_option_lane_stays_opra(self):
+        self.assertEqual(validate_config({})["broker"]["data_feed"], "iex")
+        sip = validate_config({"broker": {"data_feed": "sip"}})
+        self.assertEqual(sip["broker"]["data_feed"], "sip")
+        with self.assertRaisesRegex(ConfigError, "real-time.*delayed_sip"):
+            validate_config({"broker": {"data_feed": "delayed_sip"}})
         diagnostic = validate_config({
             "research": {"enabled": False},
             "broker": {"data_feed": "sip"},

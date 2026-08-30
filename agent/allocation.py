@@ -193,11 +193,12 @@ def allocate(records: Sequence[Mapping], *, free_slots: int,
         except Exception:  # noqa: BLE001
             ledger = None
     policy = dependence_policy
-    if policy is None and db_path is not None:
+    if policy is None:
         try:
             vehicles = {str(record.get("vehicle") or "equity") for record in ranked}
             vehicle = next(iter(vehicles)) if len(vehicles) == 1 else "equity"
-            policy = FactoryLedger(db_path).latest_dependence_policy(vehicle=vehicle)
+            policy_path = db_path or getattr(ledger, "path", None) or DEFAULT_DB_PATH
+            policy = FactoryLedger(policy_path).latest_dependence_policy(vehicle=vehicle)
         except Exception:  # noqa: BLE001 - unreadable policy is safe fallback
             policy = None
     sessions: list[dict[str, float]] = []

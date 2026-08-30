@@ -1,5 +1,11 @@
 # Edge-discovery upgrade — 2026-08-29
 
+> **Supersession note (2026-08-29 remediation):** This historical report
+> retains its original measurements. The current fit-only screen, matched
+> null/control handling, target/hold telemetry, and twelve-family grammar are
+> summarized in [the remediation record](trading-edge-remediation-2026-08-29.md).
+> No candidate from this report is currently validated or championed.
+
 This change set improves the information produced by the research factory
 without weakening live or authorizing controls. It is based on the completed
 11-family × 4-variant diagnostic report and the subsequent trader review.
