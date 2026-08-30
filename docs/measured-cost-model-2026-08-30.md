@@ -104,16 +104,20 @@ stop_distance / price  ≥  stressed_cost_scenario_bps / max_cost_to_risk_ratio
 ```
 
 A better expected-cost fit does not touch it. Any variant whose stop is tighter
-than 83.3 bps of price is refused in both arms, which is why the factory's own
-tuning had to reach `stop_atr = 7` before anything could execute — and why the
-resulting bracket never triggers, leaving 71–84% time-expiry exits.
+than 83.3 bps of price is refused in both arms, while a sufficiently wide-stop
+variant can pass the same geometry gate; the gate does not widen stops for a
+candidate. This is why the factory's own bounded tuning had to reach
+`stop_atr = 7` before anything could execute — and why the resulting bracket
+never triggers, leaving 71–84% time-expiry exits.
 
 The runner reports the implied minimum stop and counts gate refusals per
 variant so a zero-trade row stays attributable to the control that caused it
 rather than reading as "the strategy found nothing".
 
 Deciding what the stress scenario should be is a risk decision and is
-deliberately not made here. The schedule now supplies the evidence for it: the
+deliberately not made here. The shipped 25 bps scenario remains the
+default/fallback until an operator activates a valid artifact; setting one
+flag is not calibration. The schedule now supplies the evidence for it: the
 measured p95 and p99 spread per symbol and per half-hour is what a 25 bps
 stress assumption should be checked against.
 

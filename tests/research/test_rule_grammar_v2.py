@@ -20,7 +20,8 @@ from zoneinfo import ZoneInfo
 from agent.contracts.rule import (
     DEFAULT_RULE_SPEC, MAX_CONFIRMATIONS, RULE_FAMILIES, RULE_SCHEMA_V1,
     RULE_SCHEMA_V2, RULE_SCHEMA_V3, SIDES, CONFIRMATIONS, RuleSpecError,
-    evaluate_rule_signal, rule_spec_hash, rule_variant_id, setup_evidence,
+    evaluate_rule_signal, rule_spec_hash, rule_spec_json_schema,
+    rule_variant_id, setup_evidence,
     validate_rule_spec,
 )
 
@@ -146,6 +147,32 @@ class V1IdentityTests(unittest.TestCase):
                 self.assertIsNotNone(signal)
                 self.assertNotIn("breakeven_r", signal)
                 self.assertNotIn("rule_schema", signal)
+
+
+class EligibilitySchemaTests(unittest.TestCase):
+    def test_provider_schema_exposes_allowlist_only_on_cross_sectional_branch(self):
+        for schema_name in (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3):
+            with self.subTest(schema=schema_name):
+                schema = rule_spec_json_schema(schema_name)
+                branches = schema["oneOf"]
+                cross = next(branch for branch in branches
+                             if branch["properties"]["family"].get("const") ==
+                             "cross_sectional_residual")
+                non_cross = next(branch for branch in branches
+                                 if "enum" in branch["properties"]["family"])
+                self.assertIn("eligible_symbols", cross["properties"])
+                self.assertNotIn("eligible_symbols", non_cross["properties"])
+
+        accepted = validate_rule_spec({
+            "family": "cross_sectional_residual",
+            "eligible_symbols": ["QQQ"],
+        })
+        self.assertEqual(accepted["eligible_symbols"], ["QQQ"])
+        with self.assertRaisesRegex(RuleSpecError, "only valid"):
+            validate_rule_spec({
+                "family": "momentum_continuation",
+                "eligible_symbols": ["QQQ"],
+            })
 
 
 class V3ValidationTests(unittest.TestCase):

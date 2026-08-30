@@ -17,7 +17,8 @@ schedule.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
@@ -27,17 +28,21 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
-from .cost_counterfactual import _cost_decomposition, load_frozen_specs
+from .cost_counterfactual import (_code_bundle_files, _code_bundle_hash,
+                                  _cost_decomposition, load_frozen_specs)
 from .costs import CostModel, ReplayPolicy, diagnostic_backfill_policy
+from .edge_ledger import content_hash
 from .edge_discovery_core import _read_discovery_rows
 from .factory_core import (DEFAULT_VARIANTS, FAMILY_TEMPLATES,
                            coordinate_mutation_pool, diagnose, spec_delta,
                            simulate_account, template_hypothesis)
 from .quote_costs import (measure_quote_costs, cost_model_from_schedule,
-                          schedule_costs_block, bucket_label, QuoteCostError)
+                          measured_cost_resolver, schedule_costs_block,
+                          bucket_label, QuoteCostError)
 from .stressed_cost_calibration import activation_overlay, calibrate_stressed_cost
 
 RERUN_SCHEMA = "cost-rerun.v1"
+EVIDENCE_SCHEMA = "cost-rerun-evidence.v1"
 # The diagnosis handed to the deterministic mutation pool when no frozen cohort
 # is supplied.  It only selects which coordinate axes are tried first, so the
 # generated variants stay comparable to the ones the factory reported.
@@ -49,6 +54,163 @@ def _measure(section: Any) -> float | None:
         value = section.get("value")
         return float(value) if isinstance(value, (int, float)) else None
     return None
+
+
+def _finite(value: Any) -> float | None:
+    """Return finite numeric telemetry without allowing JSON impostors."""
+    if isinstance(value, (bool, str, bytes, bytearray)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _session_hash(sessions: Sequence[Any]) -> str:
+    """Hash canonical session IDs, retaining split identity in the report."""
+    return content_hash(sorted({str(item) for item in sessions if str(item)}))
+
+
+def _bucket_for_row(row: Mapping[str, Any]) -> str:
+    return _row_bucket(row) or "unknown"
+
+
+def _row_reference_r(row: Mapping[str, Any], risk: float) -> float | None:
+    """Reconstruct the no-cost reference outcome from frozen boundary fields."""
+    if risk <= 0:
+        return None
+    quantity = _finite(row.get("quantity", row.get("contracts")))
+    multiplier = _finite(row.get("contract_multiplier", row.get("multiplier", 1.0)))
+    entry = _finite(row.get("entry_reference"))
+    exit_price = _finite(row.get("exit_reference"))
+    if quantity is None or multiplier is None or entry is None or exit_price is None:
+        return None
+    direction = "long" if str(row.get("vehicle") or "equity") == "option" else str(
+        row.get("direction") or "long")
+    gross = ((exit_price - entry) if direction == "long" else
+             (entry - exit_price)) * quantity * multiplier
+    return gross / risk
+
+
+def _breakdown(rows: Sequence[Mapping[str, Any]], *, family: str | None = None
+               ) -> list[dict[str, Any]]:
+    """Summarize immutable opportunity rows by family/symbol/time bucket.
+
+    This projection deliberately includes refusals and no-signal rows.  A
+    zero-execution cell therefore remains attributable to a missing signal,
+    portfolio admission, or an unpriceable quote rather than looking empty.
+    """
+    grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (str(family or row.get("family") or "unknown"),
+               str(row.get("symbol") or "?").upper(), _bucket_for_row(row))
+        grouped.setdefault(key, []).append(row)
+    output: list[dict[str, Any]] = []
+    for (group_family, symbol, bucket), items in sorted(grouped.items()):
+        opportunities = [item for item in items
+                         if bool(item.get("signal_opportunity"))]
+        executed = [item for item in items if item.get("no_trade") is not True]
+        refused = [item for item in opportunities if item.get("no_trade") is True]
+        net_values: list[float] = []
+        reference_values: list[float] = []
+        drag_values: list[float] = []
+        gross_pnl_values: list[float] = []
+        net_pnl_values: list[float] = []
+        for item in executed:
+            risk = _finite(item.get("risk_usd") or item.get("nominal_risk_usd"))
+            net = _finite(item.get("net_pnl"))
+            if risk is None or risk <= 0 or net is None:
+                continue
+            net_r = net / risk
+            reference_r = _row_reference_r(item, risk)
+            if reference_r is None:
+                # Existing decomposition carries the same boundary reference
+                # for rows where the raw reference fields are unavailable.
+                try:
+                    parts = _cost_decomposition(item)
+                    drag = _measure(parts.get("execution_drag", {}).get("r"))
+                    fee = _measure(parts.get("fee_cost", {}).get("r"))
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    drag = fee = None
+                reference_r = (net_r + drag + fee
+                               if drag is not None and fee is not None else None)
+            if reference_r is not None:
+                reference_values.append(reference_r)
+                drag_values.append(reference_r - net_r)
+            net_values.append(net_r)
+            gross_pnl = _finite(item.get("gross_pnl"))
+            if gross_pnl is not None:
+                gross_pnl_values.append(gross_pnl)
+            net_pnl_values.append(net)
+        def mean(values: Sequence[float]) -> float | None:
+            return sum(values) / len(values) if values else None
+        def drawdown(values: Sequence[float]) -> float:
+            peak = cumulative = dd = 0.0
+            for value in values:
+                cumulative += value
+                peak = max(peak, cumulative)
+                dd = max(dd, peak - cumulative)
+            return dd
+        wins = [value for value in net_values if value > 0]
+        losses = [-value for value in net_values if value < 0]
+        # Keep the report strict-JSON serializable; the wider research stack
+        # uses 999 as the finite sentinel for a winning sample with no losses.
+        pf = sum(wins) / sum(losses) if losses else (999.0 if wins else 0.0)
+        exits = Counter(str(item.get("exit_reason_detail") or
+                            item.get("exit_reason") or "unknown")
+                        for item in executed)
+        model_provenance = Counter(
+            str(item.get("cost_model_provenance") or "unknown")
+            for item in executed)
+        entry_model_provenance = Counter(
+            str(item.get("entry_cost_model_provenance") or
+                item.get("cost_model_provenance") or "unknown")
+            for item in executed)
+        exit_model_provenance = Counter(
+            str(item.get("exit_cost_model_provenance") or
+                item.get("cost_model_provenance") or "unknown")
+            for item in executed)
+        sigma = None
+        if len(net_values) > 1:
+            average = sum(net_values) / len(net_values)
+            sigma = math.sqrt(sum((value - average) ** 2 for value in net_values) /
+                              (len(net_values) - 1))
+        stderr = sigma / math.sqrt(len(net_values)) if sigma is not None else None
+        output.append({
+            "family": group_family, "symbol": symbol, "time_bucket": bucket,
+            "opportunities": len(opportunities),
+            "admissions": len(executed), "executions": len(executed),
+            "refusals": len(refused),
+            "trades": len(executed), "sample_count": len(net_values),
+            "reference_r": mean(reference_values), "drag_r": mean(drag_values),
+            "net_r": mean(net_values),
+            "gross_pnl": sum(gross_pnl_values),
+            "net_pnl": sum(net_pnl_values),
+            "win_rate": (len(wins) / len(net_values) if net_values else 0.0),
+            "profit_factor": pf, "drawdown_r": drawdown(net_values),
+            "exit_reasons": dict(sorted(exits.items())),
+            "cost_model_provenance_counts": dict(sorted(
+                model_provenance.items())),
+            "entry_cost_model_provenance_counts": dict(sorted(
+                entry_model_provenance.items())),
+            "exit_cost_model_provenance_counts": dict(sorted(
+                exit_model_provenance.items())),
+            "uncertainty": {
+                "method": "normal_approximation",
+                "sample_count": len(net_values), "sample_sigma_r": sigma,
+                "standard_error_r": stderr,
+                "ci95_r": (None if stderr is None else {
+                    "lower": mean(net_values) - 1.96 * stderr,
+                    "upper": mean(net_values) + 1.96 * stderr,
+                }),
+                "deterministic": True,
+            },
+            "reject_reasons": dict(sorted(Counter(
+                str(item.get("reject_reason") or "unknown")
+                for item in refused).items())),
+        })
+    return output
 
 
 @dataclass(frozen=True)
@@ -70,6 +232,9 @@ class ArmResult:
     # zero-trade row from reading as "the strategy found nothing".
     stressed_cost_rejections: int
     signal_opportunities: int
+    breakdown: list[dict[str, Any]] = field(default_factory=list)
+    sample_counts: dict[str, int] = field(default_factory=dict)
+    exit_reasons: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +247,9 @@ class ArmResult:
             "target_rate": self.target_rate, "stop_rate": self.stop_rate,
             "stressed_cost_rejections": self.stressed_cost_rejections,
             "signal_opportunities": self.signal_opportunities,
+            "breakdown": self.breakdown,
+            "sample_counts": self.sample_counts,
+            "exit_reasons": self.exit_reasons,
         }
 
 
@@ -115,6 +283,10 @@ def _arm(rows: Sequence[Mapping[str, Any]], *, starting_cash: float) -> ArmResul
         return sum(values) / len(values) if values else None
 
     hold = summary.get("hold_telemetry") or {}
+    breakdown = _breakdown(rows)
+    exit_reasons = dict(sorted(Counter(
+        str(row.get("exit_reason_detail") or row.get("exit_reason") or "unknown")
+        for row in executed).items()))
     return ArmResult(
         trades=summary["trades"], net_pnl=summary["net_pnl"],
         expectancy=summary["expectancy"], win_rate=summary["win_rate"],
@@ -128,7 +300,16 @@ def _arm(rows: Sequence[Mapping[str, Any]], *, starting_cash: float) -> ArmResul
             str(row.get("reject_reason") or "") == "stressed_cost_risk_limit"
             for row in rows),
         signal_opportunities=sum(
-            bool(row.get("signal_opportunity")) for row in rows))
+            bool(row.get("signal_opportunity")) for row in rows),
+        breakdown=breakdown,
+        sample_counts={
+            "rows": len(rows),
+            "opportunities": sum(bool(row.get("signal_opportunity")) for row in rows),
+            "admissions": len(executed),
+            "executions": len(executed),
+            "valid_r": len(net_values),
+        },
+        exit_reasons=exit_reasons)
 
 
 def _row_bucket(row: Mapping[str, Any]) -> str | None:
@@ -148,59 +329,6 @@ def _row_bucket(row: Mapping[str, Any]) -> str | None:
         return None
 
 
-def _reprice_with_schedule(rows: Sequence[Mapping[str, Any]], schedule: Mapping[str, Any],
-                           *, percentile: str, vehicle: str) -> list[dict[str, Any]]:
-    """Apply symbol/bucket/depth measured costs to each executed opportunity.
-
-    ``simulate_account`` takes one model for portfolio admission.  The
-    measured rerun therefore keeps that deterministic trade population, then
-    reprices each realized opportunity with its own symbol/time/depth cell.
-    This avoids silently collapsing the measured schedule back to a universe
-    no-slippage constant while preserving the frozen-cohort comparison.
-    """
-    repriced: list[dict[str, Any]] = []
-    for original in rows:
-        row = dict(original)
-        if row.get("no_trade") is True:
-            repriced.append(row)
-            continue
-        try:
-            quantity = float(row.get("quantity", row.get("contracts", 0.0)))
-            multiplier = float(row.get(
-                "contract_multiplier", row.get("multiplier", 100.0
-                                                  if vehicle == "option" else 1.0)))
-            entry_reference = float(row["entry_reference"])
-            exit_reference = float(row["exit_reference"])
-            direction = "long" if vehicle == "option" else str(row["direction"])
-            bucket = _row_bucket(row)
-            model = cost_model_from_schedule(
-                schedule, symbol=str(row.get("symbol") or ""), bucket=bucket,
-                percentile=percentile, order_shares=quantity)
-            entry = model.execution_price(
-                entry_reference, direction, entry=True,
-                executable_quote=(row.get("entry_fill_source") == "quote"))
-            exit_price = model.execution_price(
-                exit_reference, direction, entry=False,
-                executable_quote=(row.get("exit_fill_source") == "quote"))
-            gross = ((exit_price - entry) if direction == "long" else
-                     (entry - exit_price)) * quantity * multiplier
-            fees = model.fees(entry, exit_price, quantity, multiplier,
-                              vehicle=vehicle)
-            row.update({"entry_price": entry, "exit_price": exit_price,
-                        "gross_pnl": gross, "costs": fees,
-                        "net_pnl": gross - fees,
-                        "measured_cost_symbol": str(row.get("symbol") or "").upper(),
-                        "measured_cost_bucket": bucket,
-                        "measured_cost_order_shares": quantity,
-                        "measured_cost_provenance": model.provenance})
-        except (KeyError, TypeError, ValueError, OverflowError):
-            # A malformed frozen row remains visible to the arm summary rather
-            # than being silently dropped from the cohort.
-            row["measured_cost_error"] = "unpriceable_frozen_row"
-        repriced.append(row)
-    return repriced
-
-
 def deterministic_cohort(variants_per_strategy: int = DEFAULT_VARIANTS
                          ) -> list[dict[str, Any]]:
     """The catalog's roots plus their leading coordinate variants.
@@ -217,6 +345,118 @@ def deterministic_cohort(variants_per_strategy: int = DEFAULT_VARIANTS
     return cohort
 
 
+def _evidence_manifest(*, provenance: Mapping[str, Any],
+                       runtime_config: Mapping[str, Any],
+                       specs: Sequence[Mapping[str, Any]],
+                       schedule: Mapping[str, Any],
+                       validation_schedule: Mapping[str, Any] | None,
+                       fit_sessions: Sequence[Any],
+                       validation_sessions: Sequence[Any],
+                       percentile: str, vehicle: str) -> dict[str, Any]:
+    """Build the immutable identity of one cost rerun invocation.
+
+    The manifest is intentionally separate from the human-facing metrics: it
+    binds the exact frozen corpus, validated specs, runtime policy, measured
+    schedule, feed/provider identity, and chronological split.  A report with
+    a missing or invalid split remains diagnostic and cannot be mistaken for
+    held-out evidence.
+    """
+    spec_payload = [dict(spec) for spec in specs]
+    code_files = _code_bundle_files()
+    body = {
+        "schema": EVIDENCE_SCHEMA,
+        "diagnostic_only": True, "authorizing": False,
+        "immutable": True,
+        "corpus_hash": provenance.get("corpus_hash"),
+        "corpus_rows": provenance.get("corpus_rows"),
+        "config_hash": content_hash(runtime_config),
+        "spec_hash": content_hash(spec_payload),
+        "spec_count": len(spec_payload),
+        "measurement_code_hash": _code_bundle_hash(code_files),
+        "measurement_code_files": list(code_files),
+        "schedule_hash": schedule.get("schedule_hash"),
+        "validation_schedule_hash": (validation_schedule or {}).get("schedule_hash"),
+        "provider": provenance.get("provider"),
+        "feed": provenance.get("feed"),
+        "runtime_provider": provenance.get("runtime_provider"),
+        "runtime_feed": provenance.get("runtime_feed"),
+        "fit_sessions": sorted(str(item) for item in fit_sessions),
+        "validation_sessions": sorted(str(item) for item in validation_sessions),
+        "fit_sessions_hash": provenance.get("fit_sessions_hash"),
+        "validation_sessions_hash": provenance.get("validation_sessions_hash"),
+        "split_hash": provenance.get("split_hash"),
+        "split_valid": bool(provenance.get("split_valid")),
+        "split_reason": provenance.get("split_reason"),
+        "percentile": str(percentile), "vehicle": str(vehicle),
+    }
+    body["manifest_hash"] = content_hash(body)
+    return body
+
+
+def write_immutable_evidence(path: str | Path,
+                             report: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist one content-addressed JSON report without overwriting it.
+
+    Existing files are never replaced.  This makes reruns auditable: callers
+    must choose a new path when any frozen input or result changes.
+    """
+    if not isinstance(report, Mapping):
+        raise TypeError("report must be a mapping")
+    payload = dict(report)
+    body = dict(payload)
+    supplied_hash = body.pop("content_hash", None)
+    calculated_hash = content_hash(body)
+    if supplied_hash not in (None, "") and str(supplied_hash) != calculated_hash:
+        raise ValueError("immutable evidence content hash is invalid")
+    payload["content_hash"] = calculated_hash
+    encoded = json.dumps(payload, sort_keys=True, indent=2,
+                         ensure_ascii=False, allow_nan=False, default=str)
+    destination = Path(path)
+    try:
+        with destination.open("x", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.write("\n")
+    except FileExistsError as exc:
+        raise ValueError(f"immutable evidence already exists: {destination}") from exc
+    return payload
+
+
+def verify_cost_evidence(report: Mapping[str, Any] | None) -> tuple[bool, str | None]:
+    """Verify a persisted diagnostic report without authorizing it."""
+    if not isinstance(report, Mapping):
+        return False, "report_missing"
+    if report.get("schema") != RERUN_SCHEMA:
+        return False, "report_schema_mismatch"
+    if report.get("diagnostic_only") is not True or report.get("authorizing") is not False:
+        return False, "report_authority_invalid"
+    digest = report.get("content_hash")
+    if not digest:
+        return False, "report_content_hash_missing"
+    body = dict(report)
+    body.pop("content_hash", None)
+    if str(digest) != content_hash(body):
+        return False, "report_content_hash_invalid"
+    manifest = report.get("evidence")
+    if not isinstance(manifest, Mapping) or manifest.get("schema") != EVIDENCE_SCHEMA:
+        return False, "evidence_manifest_missing"
+    manifest_body = dict(manifest)
+    manifest_digest = manifest_body.pop("manifest_hash", None)
+    if not manifest_digest or str(manifest_digest) != content_hash(manifest_body):
+        return False, "evidence_manifest_hash_invalid"
+    if (manifest.get("immutable") is not True or
+            manifest.get("diagnostic_only") is not True or
+            manifest.get("authorizing") is not False):
+        return False, "evidence_manifest_authority_invalid"
+    code_files = manifest.get("measurement_code_files")
+    expected_files = list(_code_bundle_files())
+    if code_files != expected_files:
+        return False, "measurement_code_files_mismatch"
+    if str(manifest.get("measurement_code_hash") or "") != _code_bundle_hash(
+            expected_files):
+        return False, "measurement_code_hash_mismatch"
+    return True, None
+
+
 def run_cost_rerun(
         corpus: str | Path | Sequence[Mapping[str, Any]], *,
         runtime_config: Mapping[str, Any],
@@ -225,14 +465,20 @@ def run_cost_rerun(
         starting_cash: float = 100_000.0,
         min_quotes_per_cell: int = 500) -> dict[str, Any]:
     """Fit a cost schedule from the corpus, then replay every spec twice."""
+    vehicle = str(vehicle).strip().lower()
+    if vehicle != "equity":
+        raise ValueError(
+            "measured quote-cost rerun currently supports equity only")
     policy_source, bars, snapshots, quotes, schedule, validation_schedule, \
         validation_schedule_reason, stress_calibration, fit_sessions, \
-        validation_sessions, fit_quotes, validation_quotes = _prepare_cost_calibration(
+        validation_sessions, fit_quotes, validation_quotes, provenance = _prepare_cost_calibration(
             corpus, runtime_config=runtime_config,
             min_quotes_per_cell=min_quotes_per_cell)
     policy = diagnostic_backfill_policy(policy_source)
     configured = CostModel.from_config(runtime_config, vehicle=vehicle)
     measured = cost_model_from_schedule(schedule, percentile=percentile)
+    measured_resolver = measured_cost_resolver(
+        schedule, percentile=percentile, vehicle=vehicle)
 
     risk = runtime_config.get("risk") or {}
     scenario = risk.get("stressed_cost_scenario_bps")
@@ -260,12 +506,10 @@ def run_cost_rerun(
                 bars, snapshots, spec, vehicle=vehicle,
                 account_id=f"{name}:{variant_id}", starting_cash=starting_cash,
                 risk_pct=policy.risk_per_trade_pct, costs=model,
+                cost_resolver=(measured_resolver if name == "measured" else None),
                 quotes=quotes, policy=policy)
-            measured_rows = account["rows"]
-            if name == "measured":
-                measured_rows = _reprice_with_schedule(
-                    measured_rows, schedule, percentile=percentile,
-                    vehicle=vehicle)
+            measured_rows = [dict(item, family=spec["family"])
+                             for item in account["rows"]]
             row[name] = _arm(measured_rows, starting_cash=starting_cash).as_dict()
         results.append(row)
 
@@ -273,7 +517,7 @@ def run_cost_rerun(
         implied_min_stop_bps = float(scenario) / float(ratio)
     except (TypeError, ValueError, ZeroDivisionError):
         implied_min_stop_bps = None
-    return {
+    report = {
         "schema": RERUN_SCHEMA,
         "diagnostic_only": True, "authorizing": False,
         # The admission gate is a separate control from the expected-cost
@@ -299,12 +543,14 @@ def run_cost_rerun(
             "fit_fraction": .70,
             "fit_sessions": sorted(fit_sessions),
             "validation_sessions": sorted(validation_sessions),
-            "fit_quotes": len(fit_quotes),
-            "validation_quotes": len(validation_quotes),
+            "fit_quotes": fit_quotes,
+            "validation_quotes": validation_quotes,
             "fit_schedule_hash": schedule.get("schedule_hash"),
             "validation_schedule": validation_schedule,
             "validation_unavailable_reason": validation_schedule_reason,
             "authorizing": False,
+            "split_valid": bool(provenance.get("split_valid")),
+            "split_hash": provenance.get("split_hash"),
         },
         "stress_calibration": stress_calibration,
         "stress_calibration_activation": activation_overlay(
@@ -313,7 +559,15 @@ def run_cost_rerun(
         "costs_block": schedule_costs_block(schedule, percentile=percentile),
         "bars": len(bars), "quotes": len(quotes),
         "variants": len(results), "results": results,
+        "evidence": _evidence_manifest(
+            provenance=provenance, runtime_config=runtime_config,
+            specs=cohort, schedule=schedule,
+            validation_schedule=validation_schedule,
+            fit_sessions=fit_sessions, validation_sessions=validation_sessions,
+            percentile=percentile, vehicle=vehicle),
     }
+    report["content_hash"] = content_hash(report)
+    return report
 
 
 def _prepare_cost_calibration(
@@ -321,39 +575,54 @@ def _prepare_cost_calibration(
         runtime_config: Mapping[str, Any], min_quotes_per_cell: int):
     """Measure fit/held-out quote schedules without replaying a cohort."""
     policy_source = ReplayPolicy.from_config(runtime_config)
-    _raw, bars, snapshot_map, quote_rows = _read_discovery_rows(
+    raw, bars, snapshot_map, quote_rows = _read_discovery_rows(
         corpus, require_provenance=True,
         expected_equity_feed=policy_source.equity_feed)
     quotes = (quote_rows if callable(getattr(quote_rows, "quote_fill", None))
               else list(quote_rows))
-    quote_rows_list = quotes if isinstance(quotes, list) else list(quotes)
-    quote_sessions = sorted({
-        str(getattr(item, "session_date", "") or
-            (item.get("session_date") if isinstance(item, Mapping) else ""))
-        for item in quote_rows_list
-        if (getattr(item, "session_date", None) is not None or
-            isinstance(item, Mapping))})
+    def raw_quotes():
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            kind = str(item.get("kind", "quote")).strip().lower()
+            if kind in {"quote", "quote_snapshot", "equity_quote",
+                        "underlying_quote", ""}:
+                yield item
+
+    def quote_session(item: Mapping[str, Any]) -> str:
+        stamp = item.get("timestamp", item.get("ts"))
+        try:
+            parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        except (TypeError, ValueError, OverflowError):
+            return str(item.get("session_date") or "")
+
+    quote_sessions = sorted({quote_session(item) for item in raw_quotes()
+                             if quote_session(item)})
     split_at = max(1, min(len(quote_sessions) - 1,
                           int(len(quote_sessions) * .70))) \
         if len(quote_sessions) >= 2 else len(quote_sessions)
     fit_sessions = set(quote_sessions[:split_at])
     validation_sessions = set(quote_sessions[split_at:])
-    quote_session = lambda item: str(
-        getattr(item, "session_date", "") or
-        (item.get("session_date", "") if isinstance(item, Mapping) else ""))
-    fit_quotes = [item for item in quote_rows_list
-                  if quote_session(item) in fit_sessions]
-    validation_quotes = [item for item in quote_rows_list
-                         if quote_session(item) in validation_sessions]
+    fit_quote_count = sum(1 for item in raw_quotes()
+                          if quote_session(item) in fit_sessions)
+    validation_quote_count = sum(1 for item in raw_quotes()
+                                 if quote_session(item) in validation_sessions)
+    fit_source = (lambda: (item for item in raw_quotes()
+                           if quote_session(item) in fit_sessions))
+    validation_source = (lambda: (item for item in raw_quotes()
+                                  if quote_session(item) in validation_sessions))
     schedule = measure_quote_costs(
-        fit_quotes or quote_rows_list,
+        fit_source() if fit_quote_count else raw_quotes(),
         min_quotes_per_cell=int(min_quotes_per_cell))
     validation_schedule = None
     validation_schedule_reason = None
-    if validation_quotes:
+    if validation_quote_count:
         try:
             validation_schedule = measure_quote_costs(
-                validation_quotes, min_quotes_per_cell=int(min_quotes_per_cell))
+                validation_source(), min_quotes_per_cell=int(min_quotes_per_cell))
         except QuoteCostError as exc:
             validation_schedule_reason = str(exc)
     risk = runtime_config.get("risk") or {}
@@ -370,9 +639,30 @@ def _prepare_cost_calibration(
         expected_feed=policy_source.equity_feed,
         validation_failure_reason=validation_schedule_reason,
         max_cost_to_risk_ratio=ratio)
+    split_valid = bool(fit_sessions and validation_sessions and
+                       not (fit_sessions & validation_sessions) and
+                       max(fit_sessions) < min(validation_sessions))
+    provenance = {
+        "corpus_hash": content_hash(raw),
+            "corpus_rows": len(raw),
+        "provider": sorted(schedule.get("measured", {}).get("providers") or []),
+        "feed": sorted(schedule.get("measured", {}).get("feeds") or []),
+        "runtime_provider": policy_source.equity_provider,
+        "runtime_feed": policy_source.equity_feed,
+        "fit_sessions": sorted(fit_sessions),
+        "validation_sessions": sorted(validation_sessions),
+        "fit_sessions_hash": _session_hash(sorted(fit_sessions)),
+        "validation_sessions_hash": _session_hash(sorted(validation_sessions)),
+        "split_hash": content_hash({"fit": sorted(fit_sessions),
+                                     "validation": sorted(validation_sessions)}),
+        "split_valid": split_valid,
+        "split_reason": (None if split_valid else
+                          "disjoint_chronological_validation_sessions_required"),
+    }
     return (policy_source, bars, list(snapshot_map.values()), quotes, schedule,
             validation_schedule, validation_schedule_reason, stress_calibration,
-            fit_sessions, validation_sessions, fit_quotes, validation_quotes)
+            fit_sessions, validation_sessions, fit_quote_count, validation_quote_count,
+            provenance)
 
 
 def run_cost_calibration(
@@ -381,16 +671,16 @@ def run_cost_calibration(
         min_quotes_per_cell: int = 500) -> dict[str, Any]:
     """Produce a diagnostic artifact without replaying; enable it separately."""
     policy, bars, snapshots, quotes, schedule, validation_schedule, reason, calibration, \
-        fit_sessions, validation_sessions, fit_quotes, validation_quotes = _prepare_cost_calibration(
+        fit_sessions, validation_sessions, fit_quotes, validation_quotes, provenance = _prepare_cost_calibration(
             corpus, runtime_config=runtime_config,
             min_quotes_per_cell=min_quotes_per_cell)
-    return {
+    report = {
         "schema": "stressed-cost-calibration-run.v1",
         "diagnostic_only": True, "authorizing": False,
         "provider": policy.equity_provider, "feed": policy.equity_feed,
         "fit_sessions": sorted(fit_sessions),
         "validation_sessions": sorted(validation_sessions),
-        "fit_quotes": len(fit_quotes), "validation_quotes": len(validation_quotes),
+        "fit_quotes": fit_quotes, "validation_quotes": validation_quotes,
         "cost_schedule": schedule,
         "validation_schedule": validation_schedule,
         "validation_unavailable_reason": reason,
@@ -399,7 +689,14 @@ def run_cost_calibration(
             calibration, expected_provider=policy.equity_provider,
             expected_feed=policy.equity_feed),
         "bars": len(bars), "quotes": len(quotes),
+        "evidence": _evidence_manifest(
+            provenance=provenance, runtime_config=runtime_config, specs=(),
+            schedule=schedule, validation_schedule=validation_schedule,
+            fit_sessions=fit_sessions, validation_sessions=validation_sessions,
+            percentile="p95", vehicle="equity"),
     }
+    report["content_hash"] = content_hash(report)
+    return report
 
 
 def _fmt(value: Any, places: int = 2) -> str:
@@ -557,19 +854,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.out is not None:
         output_payload = (report.get("stress_calibration")
                           if args.calibration_only else report)
-        args.out.write_text(json.dumps(output_payload, indent=2, default=str),
-                            encoding="utf-8")
+        write_immutable_evidence(args.out, output_payload)
         print(f"\n  wrote {args.out}")
     if args.schedule_out is not None:
-        args.schedule_out.write_text(
-            json.dumps(report["cost_schedule"], indent=2, default=str),
-            encoding="utf-8")
+        write_immutable_evidence(args.schedule_out, report["cost_schedule"])
         print(f"  wrote {args.schedule_out}")
     return 0
 
 
-__all__ = ["ArmResult", "RERUN_SCHEMA", "deterministic_cohort", "main",
-           "render_text", "run_cost_calibration", "run_cost_rerun"]
+__all__ = ["ArmResult", "EVIDENCE_SCHEMA", "RERUN_SCHEMA",
+           "deterministic_cohort", "main", "render_text",
+           "run_cost_calibration", "run_cost_rerun",
+           "verify_cost_evidence", "write_immutable_evidence"]
 
 
 if __name__ == "__main__":

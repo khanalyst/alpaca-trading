@@ -356,9 +356,16 @@ def _provenance(schedule: Mapping[str, Any] | None, *, expected_provider: str | 
 def _validate_schedule(schedule: Mapping[str, Any] | None, *, schema: str) -> None:
     if schedule is None:
         return
+    if not isinstance(schedule, Mapping):
+        raise StressCalibrationError("quote-cost schedule must be a mapping")
     if str(schedule.get("schema")) != schema:
         raise StressCalibrationError(
             f"expected quote-cost schedule {schema}, got {schedule.get('schema')!r}")
+    supplied_hash = str(schedule.get("schedule_hash") or "")
+    body = dict(schedule)
+    body.pop("schedule_hash", None)
+    if not supplied_hash or supplied_hash != content_hash(body):
+        raise StressCalibrationError("quote-cost schedule hash is missing or invalid")
 
 
 def _schedule_hash(schedule: Mapping[str, Any] | None) -> str | None:
@@ -366,6 +373,12 @@ def _schedule_hash(schedule: Mapping[str, Any] | None) -> str | None:
         return None
     value = schedule.get("schedule_hash")
     return str(value) if value not in (None, "") else None
+
+
+def _schedule_measured(schedule: Mapping[str, Any] | None,
+                       key: str) -> Any:
+    measured = schedule.get("measured") if isinstance(schedule, Mapping) else None
+    return measured.get(key) if isinstance(measured, Mapping) else None
 
 
 def _cell_candidates(schedule: Mapping[str, Any], requested: Iterable[tuple[str, str]] | None
@@ -674,6 +687,13 @@ def calibrate_stressed_cost(
         "schema": STRESS_CALIBRATION_SCHEMA,
         "diagnostic_only": True, "authorizing": False,
         "fit_schedule_hash": fit_hash, "validation_schedule_hash": validation_hash,
+        "fit_quote_content_hash": _schedule_measured(
+            fit_schedule, "quote_content_hash"),
+        "validation_quote_content_hash": _schedule_measured(
+            validation_schedule, "quote_content_hash"),
+        "fit_session_hash": _schedule_measured(fit_schedule, "session_hash"),
+        "validation_session_hash": _schedule_measured(
+            validation_schedule, "session_hash"),
         "validation_failure_reason": validation_failure_reason,
         "fit_quote_count": fit_quote_count, "fit_session_count": fit_session_count,
         "validation_quote_count": validation_quote_count,

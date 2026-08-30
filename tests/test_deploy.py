@@ -2945,6 +2945,46 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(result["index_write_ts"], 900)
             self.assertEqual(result["latest_write_ts"], 900)
 
+    def test_recorder_health_exposes_readiness_counts_watermark_and_cadence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = 1000.0
+            csv_path = root / "sessions" / "market-2026-08-07.csv"
+            csv_path.parent.mkdir()
+            csv_path.write_text("event_key\n", encoding="utf-8")
+            (root / recorder.INDEX_NAME).write_text(json.dumps({
+                "data_feed": "iex", "configured_symbols": ["SPY", "QQQ"],
+                "watermark": "1970-01-01T00:16:30+00:00",
+                "observation_watermarks": {
+                    "SPY": {"quote": "1970-01-01T00:16:25+00:00",
+                             "bar": "1970-01-01T00:16:25+00:00"},
+                    "QQQ": {"quote": "1970-01-01T00:15:00+00:00",
+                             "bar": "1970-01-01T00:15:00+00:00"},
+                },
+                "partition_sources": {
+                    "market-2026-08-07.csv": {"source_mode": "forward"},
+                },
+            }), encoding="utf-8")
+            (root / recorder.STATUS_NAME).write_text(json.dumps({
+                "status": "recording", "updated_ts": now,
+                "cadence": {"configured_interval_seconds": 30,
+                             "realized_intervals_seconds": [30, 45],
+                             "gap_seconds": 15, "gap_detected": True},
+            }), encoding="utf-8")
+            os.utime(csv_path, (now, now))
+            os.utime(root / recorder.INDEX_NAME, (now, now))
+            result = health.recorder(root, max_age=60, now=now,
+                                     configured_symbols=["SPY", "QQQ"],
+                                     configured_data_feed="iex")
+        self.assertEqual(result["missing_quote_symbol_count"], 0)
+        self.assertEqual(result["stale_quote_symbol_count"], 1)
+        self.assertEqual(result["recorded_watermark"],
+                         "1970-01-01T00:16:30+00:00")
+        self.assertEqual(result["data_readiness"]["provenance"][
+            "source_mode_counts"], {"forward": 1})
+        self.assertTrue(result["cadence"]["gap_detected"])
+        self.assertEqual(result["cadence"]["realized_interval_p95_seconds"], 45)
+
     def test_recorder_health_does_not_decode_oversized_legacy_index(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

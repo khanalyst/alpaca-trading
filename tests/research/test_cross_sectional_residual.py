@@ -10,7 +10,8 @@ from unittest.mock import patch
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, evaluate_rule_signal,
     evaluate_rule_signal_trace, generate_rule_signal, rule_behavior_identity,
-    rule_variant_id, rule_vehicle_executable, validate_rule_spec,
+    cross_sectional_symbol_eligibility, rule_variant_id,
+    rule_vehicle_executable, validate_rule_spec,
 )
 from agent.engine_cycle import _rule_runtime_bars
 from research.costs import ReplayPolicy
@@ -131,8 +132,60 @@ class CrossSectionalRuleTests(unittest.TestCase):
             bars_by_symbol={"SPY": tuple(self.spy)}, symbol="SPY")
         self.assertIsNone(trace["signal"])
         self.assertEqual(trace["stages"][-1]["reason"],
-                         "residual_threshold_not_met")
-        self.assertEqual(trace["market_context"]["residual_return"], 0.0)
+                         "subject_context_ineligible:benchmark_self_reference")
+        self.assertEqual(trace["market_context"]["eligibility"]["reason"],
+                         "benchmark_self_reference")
+
+    def test_eligibility_is_bounded_to_comparable_equity_etfs(self):
+        eligible = cross_sectional_symbol_eligibility(
+            "QQQ", rows=self.spy, spec=SPEC)
+        self.assertTrue(eligible["eligible"])
+        self.assertEqual(eligible["reason"], "eligible_equity_etf")
+        for symbol in ("TLT", "GLD", "DBC", "SPY", "UNKNOWN"):
+            with self.subTest(symbol=symbol):
+                result = cross_sectional_symbol_eligibility(
+                    symbol, rows=self.spy, spec=SPEC)
+                self.assertFalse(result["eligible"])
+                self.assertEqual(result["status"], "ineligible")
+        blocked = evaluate_rule_signal_trace(
+            mapping_bars("TLT", [100, 100.2, 100.4, 101.0]), SPEC,
+            bars_by_symbol={"SPY": tuple(self.spy)}, symbol="TLT")
+        self.assertEqual(blocked["stages"][-1]["reason"],
+                         "subject_context_ineligible:symbol_not_in_default_eligibility")
+        narrowed = validate_rule_spec({**SPEC, "eligible_symbols": ["QQQ"]})
+        self.assertFalse(cross_sectional_symbol_eligibility(
+            "IWM", rows=self.spy, spec=narrowed)["eligible"])
+
+    def test_diagnostics_stratify_ineligible_symbols_without_events(self):
+        corpus = [
+            *mapping_bars("QQQ", [100, 100.2, 100.4, 101.0]),
+            *mapping_bars("TLT", [100, 100.2, 100.4, 101.0]),
+            *mapping_bars("GLD", [100, 100.2, 100.4, 101.0]),
+            *mapping_bars("DBC", [100, 100.2, 100.4, 101.0]),
+            *self.spy,
+        ]
+        quality = measure_signal_quality(
+            corpus, SPEC, policy=BAR_FALLBACK, horizons=(1,))
+        by_symbol = quality["eligibility"]["by_symbol"]
+        self.assertTrue(by_symbol["QQQ"]["eligible"])
+        self.assertFalse(by_symbol["TLT"]["eligible"])
+        self.assertFalse(by_symbol["GLD"]["eligible"])
+        self.assertFalse(by_symbol["DBC"]["eligible"])
+        self.assertFalse(by_symbol["SPY"]["eligible"])
+        self.assertEqual(by_symbol["TLT"]["event_count"], 0)
+        self.assertEqual(by_symbol["GLD"]["event_count"], 0)
+        self.assertEqual(by_symbol["DBC"]["event_count"], 0)
+        self.assertEqual(
+            quality["eligibility"]["symbol_counts"],
+            {"total": 5, "eligible": 1, "ineligible": 4},
+        )
+        fit = measure_fit_diagnostics(
+            corpus, SPEC, policy=BAR_FALLBACK)
+        self.assertEqual(
+            fit["eligibility"]["by_symbol"]["GLD"]["reason"],
+            "symbol_not_in_default_eligibility",
+        )
+        self.assertFalse(fit["eligibility"]["by_symbol"]["SPY"]["eligible"])
 
     def test_existing_family_output_and_identity_ignore_market_context(self):
         spec = validate_rule_spec({

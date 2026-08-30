@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from contextlib import closing
 import json
+import math
 from pathlib import Path
 import sqlite3
 from typing import Any, Mapping, Sequence
@@ -30,6 +31,8 @@ from .stats import cross_family_dependence_report
 
 REPORT_SCHEMA = "factory-report.v1"
 DEPENDENCE_POLICY_REPORT_SCHEMA = "dependence-policy.v1"
+SIGNAL_QUALITY_SCREEN_SCHEMA = "signal-quality-screen.v2"
+STALE_SIGNAL_QUALITY_SCHEMA_REASON = "stale_signal_quality_schema"
 
 # Origins where the model actually authored the hypothesis.  Everything else
 # is deterministic, even when a provider was asked first and refused.
@@ -533,10 +536,30 @@ def _screen_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         # that wrap event results before persistence, but never inspect raw
         # worker rows here.
         if (section is None and isinstance(payload, Mapping) and
-                payload.get("schema") == "signal-quality-screen.v1"):
+                payload.get("schema") == SIGNAL_QUALITY_SCREEN_SCHEMA):
             section = payload
         if not isinstance(section, Mapping):
             continue
+        # A ledger may contain a quality result from before the current
+        # compact screen contract (for example ``signal-quality.v1``).  Show
+        # that hand-off as stale/unknown, never as a skipped variant or an
+        # authorization hint.  Both the compact handoff and underlying
+        # measurement are independently pinned to their v2 contracts.
+        if section.get("schema") != SIGNAL_QUALITY_SCREEN_SCHEMA:
+            return {
+                "schema": SIGNAL_QUALITY_SCREEN_SCHEMA,
+                "scope": "fit_only",
+                "diagnostic_only": True,
+                "authorizing": False,
+                "status": "unknown",
+                "reason": STALE_SIGNAL_QUALITY_SCHEMA_REASON,
+                "source_schema": section.get("schema"),
+                "variant_count": 0,
+                "skipped_count": 0,
+                "digest": None,
+                "primary_horizon": None,
+                "variants": [],
+            }
         variants = section.get("variants")
         if not isinstance(variants, Mapping):
             variants = {}
@@ -601,7 +624,7 @@ def _screen_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 "variant_count": len(primary_rows),
             }
         return {
-            "schema": str(section.get("schema") or "signal-quality-screen.v1"),
+            "schema": str(section.get("schema") or SIGNAL_QUALITY_SCREEN_SCHEMA),
             "scope": str(section.get("scope") or "fit_only"),
             "diagnostic_only": section.get("diagnostic_only") is True,
             "authorizing": section.get("authorizing") is True,

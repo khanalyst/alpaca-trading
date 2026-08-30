@@ -1,71 +1,86 @@
-# Trading-edge remediation — 2026-08-29
+# Trading-edge remediation — 2026-08-30
 
 ## Scope and provenance
 
-This note records the verified remediation state on Saturday, 2026-08-29. The
-work is on `codex/trading-edge-remediation`, branched from
-`claude/signal-quality-null-control` at `a42348d`; `main` is `e1a4a93`. No
-deployment was performed.
+This note records the verified remediation state on Sunday, 2026-08-30. The
+follow-up work is on `codex/trading-edge-remediation`, based on `main` at
+`a68593c`. It is intended to advance `main` only after the full regression
+suite passes; no VM deployment is part of this change.
 
 The implementation is fail-closed and diagnostic until the required evidence
-exists. The local edge database currently contains seven rows, all in
-`candidate` state, with zero `validated` or `champion` rows. Equity and option
-calibration reports are blocked with `insufficient_data`. No recorder corpus is
-present locally, so a fresh real-market result cannot be produced here. No
-positive trading edge is currently validated.
+exists. This code change does not manufacture a corpus result, enable live
+trading, or claim a positive edge. A fresh positive-edge conclusion still
+requires exact-feed recorded data, chronological validation, qualification,
+and parity-matched shadow evidence.
 
 ## Implemented controls
 
-### P0 — source, calendar, and liveness truth
+### P0 — fail-closed defaults and stale evidence
 
-- Recorder partitions carry exact Alpaca calendar/source metadata, including
-  explicit holiday closure and early-close boundaries. Deployment provenance is
-  retained with the partition/source identity.
-- Recorder sampling uses a fixed 30-second cadence. Per-symbol quote and
-  completed-bar watermarks are durable, and readiness requires both to be no
-  older than 30 seconds for every required symbol.
-- Scheduler/service liveness is reported separately from research evidence and
-  readiness. A live scheduler or a market-closed heartbeat is not evidence of a
-  ready corpus or a validated edge.
+- Shipped configuration explicitly keeps stressed-cost calibration disabled
+  and its artifact path empty. Missing, malformed, stale, or mismatched evidence
+  therefore resolves to the conservative configured fallback rather than
+  silently changing admission.
+- Signal-quality measurement and compact handoff contracts are both versioned
+  at v2. Pre-v2 measurements or screens are reported as stale/unknown, cannot
+  suppress a fresh replay, and cannot contribute promotion evidence.
+- Documentation distinguishes expected execution cost from the independent
+  stressed-cost admission gate; neither a lower measured spread nor a single
+  calibrated rung is described as proof of positive expectancy.
 
-### P1 — execution accounting and fail-closed gates
+### P1 — measured-cost evidence and causal replay
 
-- Reports and runtime state retain gross, net, fees, slippage, planned risk,
-  delivered risk, and provider/feed provenance for each leg.
-- Marketable-limit checks and the account-wide gross-exposure cap are enforced
-  before submission.
-- Null/control, coverage, lifecycle, and execution-rejection checks are
-  stricter and distinguish sparse or underpowered data from an explicitly
-  `execution_blocked` fit.
+- Quote schedules require explicit single-provider and single-feed provenance,
+  reject missing identities, carry order-independent quote/session hashes, and
+  reject a missing or tampered schedule hash before use.
+- The measured arm resolves symbol, half-hour cell, and displayed-depth impact
+  inside account simulation before admission and fills. The previous post-hoc
+  repricing path was removed, so configured-versus-measured results use the same
+  causal replay boundary.
+- The immutable diagnostic bundle binds corpus, configuration, specs, schedules,
+  provider/feed identity, and chronological fit/validation splits. Reports add
+  per-family/symbol/time-bucket opportunities, refusals, executions, gross/net
+  P&L, R decomposition, win rate, profit factor, drawdown, exits, uncertainty,
+  and cost-model provenance. Existing paths cannot be overwritten, and supplied
+  stale content hashes are rejected.
 
-### P2 — bounded research and path evidence
+### P2 — cross-sectional semantic containment
 
-- The pre-replay screen is fit-only. It emits control/report rows, uses `p=1`
-  placeholders when a comparison is unavailable, and records a terminal
-  current-hypothesis no-edge outcome. A changed corpus reseeds that hypothesis.
-- Target/hold path telemetry measures reachability from actual entry through the
-  bounded hold. Lower-target and hold proposals are restricted to a finite,
-  bounded ladder and are non-authorizing.
-- The grammar now has twelve families. The twelfth,
-  `cross_sectional_residual`, is shares-only, compares residuals against SPY,
-  and requires synchronized one-minute context. The universe remains the
-  shipped 24-ETF basket; future family or universe changes must be supported by
-  screen and cross-sectional evidence, not an arbitrary replacement.
+- The grammar's twelfth family,
+  `cross_sectional_residual`, keeps its compatibility identifier but implements
+  a shares-only, single-leg SPY-relative directional-momentum signal, not a
+  beta-neutral or hedged spread. It requires synchronized one-minute context
+  and fails closed for SPY self-reference and non-comparable symbols.
+- A bounded default comparable-equity ETF set is enforced. An authored
+  `eligible_symbols` list can narrow that set but cannot expand it; rates,
+  credit, metals, commodities, and unknown symbols cannot be treated as SPY
+  residuals by stale or externally supplied events.
+- Signal-quality and fit diagnostics report eligibility by symbol separately
+  from market-context availability, so intentional structural exclusions do
+  not look like missing data.
 
-### P3 — feed and shadow authorization
+### P3 — shadow calibration and readiness
 
-- Authorizing equity evidence must use the exact IEX or SIP feed. The
-  `delayed_sip` feed is diagnostic only. Option authorization remains exact OPRA
-  evidence, with strict quote-age and leg provenance checks.
-- Concurrent shadow workers use content-addressed manifests. Readers verify
-  the manifest digest before use; missing, unreadable, or mismatched manifests
-  are quarantined and cannot advance a shadow watermark or FDR boundary.
+- Empirical stress calibration can be enabled only in the shadow lane through a
+  dedicated operator switch and artifact path. A path alone is inert; invalid
+  flags, artifacts, provider identities, or feed identities fail closed. The
+  candidate/runtime configuration is not mutated.
+- Shadow telemetry reports effective scenario/source/hash plus generated-signal
+  opportunities, admissions, refusals, rates, and bounded refusal reasons.
+  Recorder health reports liveness separately from data readiness, including
+  quote/bar symbol counts, watermarks, provenance, and realized cadence gaps.
+- Sessions that currently contribute matched gate evidence are reloaded through
+  a bounded timestamp-indexed query and reevaluated even after the forward event
+  floor advances. A changed replay can therefore revoke stale candidate rows
+  while its paired root control remains independently evaluated; no broad WAL
+  rescan is introduced.
 
 ### P4 — stressed-cost calibration
 
-- The per-symbol/session stress ladder is 9, 15, 25, and 50 bps. Calibration is
-  disabled by default and requires an explicit operator-controlled activation
-  path; it does not self-authorize.
+- The per-symbol/session stress ladder is 9, 15, 25, and 50 bps. The shipped
+  25 bps scenario is the default/fallback. Calibration is disabled by default
+  and requires an explicit operator-controlled activation path with a valid
+  artifact; an enable flag alone is insufficient and it does not self-authorize.
 - An activation-ready artifact must bind the exact provider/feed, content hash,
   sufficient disjoint chronological held-out sessions, and one artifact-wide
   effective-after boundary. Missing or unusable cells resolve to the configured

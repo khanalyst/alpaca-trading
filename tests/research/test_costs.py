@@ -649,6 +649,28 @@ class SQLiteQuoteIndexTests(unittest.TestCase):
             row["entry_price"],
             100.81 * (1 + model.slippage_bps / 10_000.0), places=9)
 
+    def test_dynamic_cost_resolver_prices_entry_and_exit_at_their_own_times(self):
+        calls = []
+
+        def resolver(context):
+            leg = str(context.get("cost_leg") or "mark")
+            calls.append((leg, context.get("cost_timestamp")))
+            return CostModel(
+                spread_bps=2.0 if leg == "entry" else 8.0,
+                slippage_bps=0.0, fee_bps=0.0,
+                provenance=f"measured:{leg}")
+
+        book = simulate_account(
+            _bars(RISING + FLAT), [], SPEC, vehicle="equity",
+            account_id="dynamic-cost", risk_pct=.05,
+            policy=PERMISSIVE_POLICY, cost_resolver=resolver)
+        row = book["rows"][0]
+        self.assertEqual([leg for leg, _stamp in calls], ["entry", "exit"])
+        self.assertEqual(row["entry_cost_model_provenance"], "measured:entry")
+        self.assertEqual(row["exit_cost_model_provenance"], "measured:exit")
+        self.assertEqual(calls[0][1], row["entry_timestamp"])
+        self.assertEqual(calls[1][1], row["exit_timestamp"])
+
 
 class NullControlSharesTheFillModelTests(unittest.TestCase):
     """The chance-entry null must not get exit realism the candidate lacks."""

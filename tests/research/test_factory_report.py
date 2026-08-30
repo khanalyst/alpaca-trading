@@ -22,8 +22,8 @@ from agent.contracts.rule import (rule_spec_hash, rule_variant_id,
                                   validate_rule_spec)
 import research.gates as gates
 from research.factory_report import (DEFAULT_REPORT_ROOT, REPORT_SCHEMA,
-                                     build_report, render_markdown,
-                                     render_text, write_report)
+                                     _screen_events, build_report,
+                                     render_markdown, render_text, write_report)
 import research.strategy_factory as factory_module
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
                                    ProposalResult)
@@ -78,7 +78,7 @@ def _run(directory, *, llm=True):
             spec = validate_rule_spec(raw_spec)
             variant_id = rule_variant_id(spec)
             screens[variant_id] = {
-                "schema": "signal-quality-screen.v1",
+                "schema": "signal-quality-screen.v2",
                 "scope": "fit_only",
                 "authorizing": False,
                 "diagnostic_only": True,
@@ -270,6 +270,24 @@ class ReportContentTests(unittest.TestCase):
 
 
 class ReportDegradationTests(unittest.TestCase):
+    def test_stale_signal_quality_handoff_is_reported_unknown_not_skipped(self):
+        audit = _screen_events([{
+            "payload": {
+                "signal_quality_screen": {
+                    "schema": "signal-quality-screen.v1",
+                    "status": "complete_zero_actionable_signal",
+                    "reason": "no_actionable_signal",
+                    "variants": {"legacy": {
+                        "status": "complete_zero_actionable_signal",
+                    }},
+                },
+            },
+        }])
+        self.assertEqual(audit["status"], "unknown")
+        self.assertEqual(audit["reason"], "stale_signal_quality_schema")
+        self.assertEqual(audit["skipped_count"], 0)
+        self.assertEqual(audit["source_schema"], "signal-quality-screen.v1")
+
     def test_a_missing_ledger_reports_absence_rather_than_raising(self):
         report = build_report(Path("/nonexistent/edge.sqlite3"))
         self.assertFalse(report["available"])

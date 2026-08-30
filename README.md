@@ -57,11 +57,15 @@ The strategy factory normally runs twelve logical research slots, so a fresh
 cycle can cover every bounded rule family. Each slot holds one hypothesis and
 evaluates four isolated-account variants. It diagnoses only chronological fit
 data, then judges the variants on untouched held-out data.
-The twelfth family is `cross_sectional_residual`: a shares-only residual signal
-against SPY built from synchronized one-minute context. It remains inside the
-finite grammar and does not replace the shipped 24-ETF universe; any future
-family or universe change must be justified by fit-only screen and
-cross-sectional results.
+The twelfth family retains the compatibility identifier
+`cross_sectional_residual`, but its executable thesis is a shares-only,
+single-leg SPY-relative directional-momentum signal built from synchronized
+one-minute context—not a beta-neutral or hedged spread. It fails closed for SPY
+self-reference and for symbols outside its bounded comparable-equity ETF set;
+fit diagnostics report eligibility per symbol. It remains inside the finite
+grammar and does not replace the shipped 24-ETF universe; any future family or
+universe change must be justified by fit-only screen and cross-sectional
+results.
 Candidates are de-duplicated by their family-specific executable semantic
 signature (including v1/v2/v3 no-op aliases). Continuous numeric axes use
 relative/local scaling for semantic novelty, while integer/topology axes use
@@ -86,8 +90,10 @@ aggregate fit-partition execution-rejection counts/reasons for operator review.
 Before replay, the fit-only signal screen reports forward-return/control rows,
 including `p=1` placeholders when a comparison is unavailable. A terminal
 current-hypothesis no-edge result is explicit and reseeds when the corpus
-changes. Target/hold path telemetry measures reachability only; lower-target and
-hold proposals stay on a bounded ladder and cannot authorize an edge.
+changes. Target/hold path telemetry measures reachability only; the bounded
+target/hold mutation path is already wired into factory selection, so
+lower-target and hold proposals stay on a finite ladder and cannot authorize
+an edge.
 The cycle also records per-symbol/session bar coverage once per corpus and
 distinguishes hold discontinuities from ordinary time expiry without assigning
 a directional R effect; it is diagnostic only, does not expand exits, and
@@ -215,8 +221,9 @@ otherwise the configured/requested feed label is used; it is not an independent
 venue attestation. Bar-only,
 partial-feed, or stale legs cannot authorize proof.
 
-The recorder runs on a fixed 30-second cadence and durably records per-symbol
-quote and completed-bar watermarks. Readiness requires both watermarks to be no
+The recorder runs on a fixed-deadline 30-second cadence (deadlines are anchored
+to the schedule, not to the previous request's completion) and durably records
+per-symbol quote and completed-bar watermarks. Readiness requires both watermarks to be no
 older than 30 seconds for every required symbol; quote and bar readiness are not
 substituted for one another. Exact Alpaca calendar metadata records holidays and
 early closes explicitly. Scheduler service liveness is reported separately from
@@ -291,11 +298,16 @@ The shared vehicle-specific cost model uses explicit `costs.vehicles.equity` or
 defaults are 4 bps spread, 6 bps adverse slippage, and 0.5 bps per-side
 notional fee, plus a 0.65 currency-unit listed-option fee per contract per side.
 Proofs also persist preregistered all-in stress scenarios of
-9, 15, 25, and 50 bps; the 25 bps scenario is the required authorization
-check, while the others are diagnostics. Runtime rejection caps are separate
-from expected costs. Stress applies the scenario bps to entry notional and then
-adds listed-option round-trip fees for both per-contract sides; it is not a
-per-side bps charge. The shipped `max_stressed_cost_to_risk_ratio` is `0.30`.
+9, 15, 25, and 50 bps. The shipped runtime uses 25 bps as its default and
+fail-closed fallback; an explicitly activated, valid held-out calibration
+artifact may select one of the preregistered rungs for a symbol/time cell.
+No stress rung by itself authorizes a candidate.
+Runtime rejection caps are separate from expected costs. Stress applies the
+scenario bps to entry notional and then adds listed-option round-trip fees for
+both per-contract sides; it is not a per-side bps charge. The shipped
+`max_stressed_cost_to_risk_ratio` is `0.30`. This is an admission geometry
+check: a floor-width stop can be vetoed, while a sufficiently wide-stop
+candidate can pass the same gate; no stop is widened automatically.
 Runtime, factory, explicit IBR, and randomized-null quote-entry replays share
 one pure entry-slippage cap; malformed inputs use `entry_slippage_invalid`,
 and over-cap quotes use `entry_slippage_exceeds_limit` as stable
@@ -306,15 +318,17 @@ risk, so the trade is vetoed by that limit before any option fees.
 `research.py calibrate` reads the journal without mutation and checks entry and
 exit fills independently per vehicle; equity and option calibration is never
 pooled. Runtime risk applies the configured stressed-cost scenario (25 bps by
-default) and abstains when `stressed_cost_to_risk_ratio` exceeds
+default, with the scalar fallback retained when no valid artifact cell is
+available) and abstains when `stressed_cost_to_risk_ratio` exceeds
 `max_stressed_cost_to_risk_ratio`; intended,
 delivered, ratio, and shortfall telemetry are persisted with orders and fills.
 The scheduled calibration-only pass measures each symbol/session on the
 9/15/25/50-bps ladder. It is disabled by default and can affect runtime only
-through an explicit operator-enabled path whose artifact carries the exact
+through an explicit operator-enabled path whose valid artifact carries the exact
 provider/feed, content hash, disjoint chronological held-out sessions, and an
 artifact-wide effective-after boundary. Missing or unusable cells use the
-configured scalar fallback; calibration never self-authorizes.
+configured scalar fallback; setting the enable flag without a valid artifact
+does not activate calibration, and calibration never self-authorizes.
 Shadow authorization fails closed when the journal is
 missing or stale, the sample is insufficient, costs are optimistic, a terminal
 fill is materially underfilled (<80% of requested quantity), or the

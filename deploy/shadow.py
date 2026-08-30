@@ -85,7 +85,8 @@ def main(argv: list[str] | None = None) -> int:
                 "manifest_digest", "candidate_errors",
                 "quarantine_through_session", "pruned_replay_diffs",
                 "retention_days", "retention_floor_ts",
-                "retention_gap_watermark", "stale_tail")
+                "retention_gap_watermark", "signal_dispositions",
+                "stress_calibration", "stale_tail")
                 if key in result}
             _write_health(health_file, "degraded" if candidate_errors else "running",
                           last_error=("candidate evaluation failures" if candidate_errors

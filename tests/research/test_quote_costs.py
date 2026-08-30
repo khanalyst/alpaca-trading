@@ -6,6 +6,7 @@ module is to replace an assumption with a measurement; a measurement that
 cannot be verified is just a second assumption.
 """
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import unittest
 from zoneinfo import ZoneInfo
@@ -13,7 +14,8 @@ from zoneinfo import ZoneInfo
 from research.costs import CostError
 from research.quote_costs import (QUOTE_COST_SCHEMA, QuoteCostError,
                                   bucket_label, cost_model_from_schedule,
-                                  measure_quote_costs, schedule_costs_block)
+                                  measure_quote_costs, measured_cost_resolver,
+                                  schedule_costs_block)
 
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -95,6 +97,19 @@ class MeasurementTests(unittest.TestCase):
         with self.assertRaises(QuoteCostError):
             measure_quote_costs(rows)
 
+    def test_a_usable_quote_without_feed_is_refused(self):
+        rows = _quotes("SPY", spread_bps=1.0)
+        rows[0].pop("feed")
+        with self.assertRaises(QuoteCostError):
+            measure_quote_costs(rows)
+
+    def test_measurement_and_content_hash_are_input_order_independent(self):
+        rows = (_quotes("SPY", spread_bps=0.18, minutes=35) +
+                _quotes("XLE", spread_bps=1.1, minutes=35))
+        forward = measure_quote_costs(rows, min_quotes_per_cell=1)
+        reverse = measure_quote_costs(reversed(rows), min_quotes_per_cell=1)
+        self.assertEqual(forward, reverse)
+
     def test_sparse_buckets_are_excluded_and_counted(self):
         schedule = measure_quote_costs(
             _quotes("SPY", spread_bps=1.0, minutes=120, sessions=1),
@@ -157,6 +172,16 @@ class CostModelConstructionTests(unittest.TestCase):
     def test_a_foreign_schema_is_refused(self):
         with self.assertRaises(QuoteCostError):
             cost_model_from_schedule({"schema": "something-else.v1"})
+
+    def test_a_tampered_schedule_hash_is_refused(self):
+        tampered = deepcopy(self.schedule)
+        tampered["symbols"]["SPY"]["spread_bps"]["p75"] = 99.0
+        with self.assertRaisesRegex(QuoteCostError, "hash"):
+            cost_model_from_schedule(tampered, symbol="SPY")
+
+    def test_measured_resolver_rejects_option_vehicle(self):
+        with self.assertRaisesRegex(QuoteCostError, "equity only"):
+            measured_cost_resolver(self.schedule, vehicle="option")
 
     def test_the_costs_block_round_trips_into_a_replay_config(self):
         from research.costs import CostModel

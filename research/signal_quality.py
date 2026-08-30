@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, entry_window_bounds, evaluate_rule_signal,
     evaluate_rule_signal_trace, feature_window_bars, rule_variant_id,
+    cross_sectional_symbol_eligibility,
     session_minutes, validate_rule_spec,
 )
 from .market_data import replay_available_at, replay_record_is_available
@@ -239,7 +240,8 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
                 reason = str((trace.get("stages") or [{}])[-1].get(
                     "reason") or "")
                 if reason.startswith(("benchmark_context_",
-                                      "subject_context_")):
+                                      "subject_context_",
+                                      "subject_ineligible:")):
                     context_reason = reason
         else:
             signal = evaluate_rule_signal(rows[:index + 1], spec)
@@ -563,6 +565,20 @@ def measure_signal_quality(
         rows.sort(key=lambda item: _timestamp(item) or
                   datetime.min.replace(tzinfo=timezone.utc))
 
+    eligibility_by_symbol: dict[str, dict[str, Any]] = {}
+    if normalized["family"] == "cross_sectional_residual":
+        symbol_rows: dict[str, list[Any]] = {}
+        for (symbol, _session_name), rows in grouped.items():
+            symbol_rows.setdefault(symbol, []).extend(rows)
+        for symbol, rows in sorted(symbol_rows.items()):
+            eligibility_by_symbol[symbol] = {
+                **cross_sectional_symbol_eligibility(
+                    symbol, rows=rows, spec=normalized),
+                "session_count": len({
+                    _session(row) for row in rows if _session(row)}),
+                "event_count": 0,
+            }
+
     events: list[tuple[str, str, Sequence[Any], dict[str, Any]]] = []
     event_reasons: Counter[str] = Counter()
     event_time_buckets: Counter[str] = Counter()
@@ -611,10 +627,21 @@ def measure_signal_quality(
         else:
             event = precomputed_by_cell.get((symbol, session))
             reason = None if event is not None else "no_actionable_signal"
+        if (event is not None and normalized["family"] ==
+                "cross_sectional_residual" and
+                not eligibility_by_symbol.get(symbol, {}).get("eligible", False)):
+            # A stale/externally supplied fit hand-off cannot bypass the
+            # current structural eligibility policy.
+            event = None
+            reason = ("subject_context_ineligible:" +
+                      str(eligibility_by_symbol.get(symbol, {}).get(
+                          "reason", "symbol_not_in_default_eligibility")))
         if event is None:
             event_reasons[str(reason or "unknown")] += 1
             continue
         events.append((symbol, session, rows, event))
+        if symbol in eligibility_by_symbol:
+            eligibility_by_symbol[symbol]["event_count"] += 1
         signal_stamp = datetime.fromtimestamp(
             float(event["signal"]["signal_ts"]), timezone.utc).astimezone(_NY)
         minutes = (signal_stamp.hour * 60 + signal_stamp.minute) - (9 * 60 + 30)
@@ -749,7 +776,9 @@ def measure_signal_quality(
     if normalized["family"] == "cross_sectional_residual":
         context_rejections = {
             reason: count for reason, count in event_reasons.items()
-            if reason.startswith(("benchmark_context_", "subject_context_"))
+            if reason.startswith(("benchmark_context_", "subject_context_",
+                                  "subject_ineligible:")) and
+            not reason.startswith("subject_context_ineligible:")
         }
         result["market_context"] = {
             "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
@@ -759,6 +788,23 @@ def measure_signal_quality(
                            key=context_rejections.get)
                        if context_rejections else "synchronized_context"),
             "rejection_counts": dict(sorted(context_rejections.items())),
+        }
+        result["eligibility"] = {
+            "schema": "cross-sectional-eligibility.v1",
+            "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+            "by_symbol": eligibility_by_symbol,
+            "symbol_counts": {
+                "total": len(eligibility_by_symbol),
+                "eligible": sum(bool(item["eligible"])
+                                for item in eligibility_by_symbol.values()),
+                "ineligible": sum(not bool(item["eligible"])
+                                  for item in eligibility_by_symbol.values()),
+            },
+            "event_symbols": sorted(
+                symbol for symbol, item in eligibility_by_symbol.items()
+                if item["event_count"]),
+            "authorizing": False,
+            "diagnostic_only": True,
         }
     return result
 

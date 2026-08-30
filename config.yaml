@@ -49,7 +49,9 @@
     "options_max_dte": 60,
     "options_max_spread_pct": 10.0,
     "stressed_cost_scenario_bps": 25.0,
-    "max_stressed_cost_to_risk_ratio": 0.30
+    "max_stressed_cost_to_risk_ratio": 0.30,
+    "stressed_cost_calibration_enabled": false,
+    "stressed_cost_calibration_path": ""
   },
   "execution": {
     "order_type": "market",

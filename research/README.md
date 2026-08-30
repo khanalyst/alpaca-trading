@@ -416,6 +416,10 @@ or imports source code.
 Session-anchored families re-derive the current session from the bars' own New
 York dates, so a longer history can never contaminate a session statistic.
 `cross_sectional_residual` is a separate shares-only synchronized-context path.
+The identifier is retained for compatibility, while the implemented thesis is
+SPY-relative directional momentum rather than a beta-neutral residual or paired
+hedge. SPY self-reference and symbols outside the bounded comparable-equity ETF
+eligibility set fail closed and remain visible in per-symbol diagnostics.
 Research replays one session at a time and the runtime fetches from the session
 open, so the two see the same window either way.
 

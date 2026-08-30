@@ -12,7 +12,7 @@ from datetime import date, datetime, time, timedelta, timezone
 import math
 from statistics import mean
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
@@ -124,8 +124,9 @@ def _thesis(spec: Mapping[str, Any]) -> str:
             "a one-sided opening auction establishes a directional inventory "
             "transfer that continues after the opening window"),
         "cross_sectional_residual": (
-            "an ETF's synchronized short-horizon return relative to SPY "
-            "captures idiosyncratic directional flow"),
+            "an eligible equity ETF's synchronized short-horizon return "
+            "relative to SPY identifies directional relative momentum; this "
+            "single-leg signal is not a beta-neutral or hedged residual"),
     }
     mechanism = mechanisms.get(str(spec["family"]),
                                "the specified completed-bar condition captures persistent flow")
@@ -999,13 +1000,29 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                      spec: Mapping[str, Any], *, vehicle: str, account_id: str,
                      starting_cash: float = 100_000.0, risk_pct: float = .5,
                      costs: CostModel | None = None,
+                     cost_resolver: Callable[[Mapping[str, Any]], CostModel] | None = None,
                      quotes: Sequence[QuoteSnapshot] | None = None,
                      policy: ReplayPolicy | Mapping[str, Any] | None = None,
                      bars_by_symbol: Mapping[
                          str, Sequence[UnderlyingBar]] | None = None) -> dict:
-    """Replay one variant in an event-ordered isolated cash/equity book."""
+    """Replay one variant in an event-ordered isolated cash/equity book.
+
+    ``costs`` remains the compatibility/default model.  A diagnostic caller
+    may additionally supply ``cost_resolver`` to select a validated model from
+    immutable opportunity fields such as symbol, entry timestamp, and sized
+    quantity.  The resolver is invoked inside account simulation before the
+    stress check and fills; it cannot mutate the authored rule or policy.
+    """
     spec = validate_rule_spec(spec)
-    model = costs or CostModel()
+    base_model = costs or CostModel()
+
+    def resolve_cost_model(context: Mapping[str, Any]) -> CostModel:
+        if cost_resolver is None:
+            return base_model
+        resolved = cost_resolver(context)
+        if not isinstance(resolved, CostModel):
+            raise CostError("cost_resolver must return a CostModel")
+        return resolved
     # Keep the explicit risk_pct argument meaningful for direct callers while
     # still applying the safe ReplayPolicy defaults when no policy is passed.
     resolved_policy = (_coerce_policy(policy) if policy is not None else
@@ -1136,7 +1153,8 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             entry = float(item["entry_price"])
             gross = ((mark - entry) if direction == "long" else
                      (entry - mark)) * quantity * multiplier
-            entry_fees = model.fees(
+            active_model = resolve_cost_model(item)
+            entry_fees = active_model.fees(
                 entry, entry, quantity, multiplier, vehicle=vehicle) / 2.0
             unrealized += gross - entry_fees
         return unrealized
@@ -1209,6 +1227,30 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 if risk_budget > 0 else None),
             "planned_notional": float(entry_notional),
         }
+        cost_context = {
+            **{key: value for key, value in raw.items()
+               if not str(key).startswith("_")},
+            "vehicle": vehicle,
+            "symbol": symbol,
+            "session_date": day_key,
+            "cost_leg": "entry",
+            "cost_timestamp": raw.get("entry_timestamp"),
+            "quantity": quantity,
+            "shares": quantity if vehicle == "equity" else None,
+            "contracts": quantity if vehicle == "option" else None,
+            "entry_notional": float(entry_notional),
+        }
+        model = resolve_cost_model(cost_context)
+        sizing_telemetry.update({
+            "cost_model_provenance": model.provenance,
+            "entry_cost_model_provenance": model.provenance,
+            "cost_model_spread_bps": model.spread_bps,
+            "cost_model_slippage_bps": model.slippage_bps,
+            "cost_model_fee_bps": model.fee_bps,
+            "entry_cost_model_spread_bps": model.spread_bps,
+            "entry_cost_model_slippage_bps": model.slippage_bps,
+            "entry_cost_model_fee_bps": model.fee_bps,
+        })
         reject_reason = None
         reject_stage = None
         if (resolved_policy.max_concurrent_positions is not None and
@@ -1319,19 +1361,28 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                              "entry_slippage": slippage_telemetry})
                 continue
         execution_direction = "long" if vehicle == "option" else raw["direction"]
+        exit_model = resolve_cost_model({
+            **cost_context,
+            "cost_leg": "exit",
+            "cost_timestamp": raw.get("exit_timestamp"),
+        })
         entry = model.execution_price(
             raw["entry_reference"], execution_direction, entry=True,
             executable_quote=(vehicle == "option" and _fresh(
                 raw, "entry", resolved_policy.max_market_data_age_seconds)) or
             raw.get("entry_fill_source") == QUOTE)
-        exit_price = model.execution_price(
+        exit_price = exit_model.execution_price(
             raw["exit_reference"], execution_direction, entry=False,
             executable_quote=(vehicle == "option" and _fresh(
                 raw, "exit", resolved_policy.max_market_data_age_seconds)) or
             raw.get("exit_fill_source") == QUOTE)
         gross = ((exit_price - entry) if execution_direction == "long" else
                  (entry - exit_price)) * quantity * multiplier
-        fees = model.fees(entry, exit_price, quantity, multiplier, vehicle=vehicle)
+        entry_fees = model.fees(
+            entry, entry, quantity, multiplier, vehicle=vehicle) / 2.0
+        exit_fees = exit_model.fees(
+            exit_price, exit_price, quantity, multiplier, vehicle=vehicle) / 2.0
+        fees = entry_fees + exit_fees
         net = gross - fees
         row = {key: value for key, value in raw.items() if not key.startswith("_")}
         row.update({"quantity": quantity, "entry_price": entry, "exit_price": exit_price,
@@ -1343,6 +1394,10 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                     "no_trade": False, "entry_notional": entry_notional,
                     "execution_disposition": "executed",
                     "signal_opportunity": True,
+                    "exit_cost_model_provenance": exit_model.provenance,
+                    "exit_cost_model_spread_bps": exit_model.spread_bps,
+                    "exit_cost_model_slippage_bps": exit_model.slippage_bps,
+                    "exit_cost_model_fee_bps": exit_model.fee_bps,
                     **sizing_telemetry})
         if slippage_telemetry is not None:
             row["entry_slippage"] = slippage_telemetry

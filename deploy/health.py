@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import os
 import time
 import urllib.request
@@ -76,6 +77,16 @@ def _timestamp_epoch(value: object) -> float | None:
         return parsed.timestamp()
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _quantile(values: list[float], fraction: float) -> float | None:
+    """Return a bounded nearest-rank quantile for telemetry only."""
+    if not values:
+        return None
+    ordered = sorted(float(item) for item in values)
+    index = min(len(ordered) - 1,
+                max(0, int(math.ceil(len(ordered) * float(fraction))) - 1))
+    return ordered[index]
 
 
 def _market_session_status(index: dict, now: float) -> str:
@@ -186,6 +197,15 @@ def _market_data_readiness(
             "quote_age_seconds": max(quote_ages) if quote_ages else None,
             "bar_age_seconds": max(bar_ages) if bar_ages else None,
         },
+        "required_symbol_count": len(required),
+        "missing_quote_symbol_count": len(missing_quotes),
+        "missing_bar_symbol_count": len(missing_bars),
+        "stale_quote_symbol_count": len(stale_quotes),
+        "stale_bar_symbol_count": len(stale_bars),
+        "missing_quote_symbols": missing_quotes[:64],
+        "missing_bar_symbols": missing_bars[:64],
+        "stale_quote_symbols": stale_quotes[:64],
+        "stale_bar_symbols": stale_bars[:64],
     }
 
 
@@ -244,6 +264,57 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "alert": residual_risk,
         "alert_kind": alert_kind,
     }, heartbeat)
+
+
+def _recorder_cadence(attempt: dict) -> dict:
+    """Project recorder timing evidence without making it a liveness gate."""
+    raw = attempt.get("cadence")
+    cadence = dict(raw) if isinstance(raw, dict) else {}
+    interval = cadence.get("configured_interval_seconds",
+                           attempt.get("configured_interval_seconds"))
+    try:
+        interval = float(interval) if interval is not None else None
+    except (TypeError, ValueError):
+        interval = None
+    realized_values: list[float] = []
+    raw_values = cadence.get("realized_intervals_seconds",
+                            attempt.get("realized_intervals_seconds"))
+    if isinstance(raw_values, (list, tuple)):
+        for value in raw_values[-128:]:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number >= 0:
+                realized_values.append(number)
+    current = cadence.get("realized_interval_seconds")
+    try:
+        if current is not None and float(current) >= 0:
+            realized_values.append(float(current))
+    except (TypeError, ValueError):
+        pass
+    gap = cadence.get("gap_seconds")
+    try:
+        gap = float(gap) if gap is not None else None
+    except (TypeError, ValueError):
+        gap = None
+    p50 = cadence.get("realized_interval_p50_seconds")
+    p95 = cadence.get("realized_interval_p95_seconds")
+    if p50 is None:
+        p50 = _quantile(realized_values, .50)
+    if p95 is None:
+        p95 = _quantile(realized_values, .95)
+    return {
+        "configured_interval_seconds": interval,
+        "realized_interval_seconds": (realized_values[-1]
+                                       if realized_values else None),
+        "realized_interval_p50_seconds": p50,
+        "realized_interval_p95_seconds": p95,
+        "gap_seconds": gap,
+        "gap_detected": bool(cadence.get("gap_detected", gap is not None and
+                                           interval is not None and gap > 0)),
+        "samples": len(realized_values),
+    }
 
 
 def recorder(path: Path, max_age: float, *, now: float | None = None,
@@ -327,6 +398,17 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
         index, symbols=configured, selected_feed=selected_feed,
         configured_feed=configured_data_feed, now=current,
         index_migration_pending=index_oversized)
+    recorded_watermark = index.get("watermark")
+    watermark_epoch = _timestamp_epoch(recorded_watermark)
+    partition_sources = index.get("partition_sources")
+    partition_sources = (partition_sources
+                         if isinstance(partition_sources, dict) else {})
+    provenance_counts: dict[str, int] = {}
+    for source in partition_sources.values():
+        mode = (str(source.get("source_mode") or "unknown")
+                if isinstance(source, dict) else "unknown")
+        provenance_counts[mode] = provenance_counts.get(mode, 0) + 1
+    cadence = _recorder_cadence(attempt)
     closed_no_data_failure = bool(
         attempt_failed and
         market_readiness["market_session_status"] == "closed" and
@@ -347,6 +429,21 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
             details.append("unobserved=" + ",".join(required_unobserved))
         coverage_reason = "strict_bar_coverage_failed: " + "; ".join(details)
     service_liveness_ok = fresh and (bool(files) or closed_no_data_failure)
+    data_readiness = {
+        "ok": bool(market_readiness["market_data_ready"] and
+                   not coverage_failures),
+        "status": market_readiness["market_data_freshness_status"],
+        "market_data_ready": bool(market_readiness["market_data_ready"]),
+        "watermark": recorded_watermark,
+        "watermark_age_seconds": (None if watermark_epoch is None else
+                                   current - watermark_epoch),
+        "provenance": {
+            "partition_count": len(partition_sources),
+            "source_mode_counts": provenance_counts,
+            "partition_sources": dict(sorted(partition_sources.items())[-64:]),
+        },
+        "cadence": cadence,
+    }
     result = {
         "ok": (service_liveness_ok and not blocking_attempt_failure and
                not coverage_failures),
@@ -386,6 +483,16 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
         "strict_bar_policy": strict_coverage,
         "bar_coverage_failures": coverage_failures,
         "coverage_reason": coverage_reason,
+        # Data readiness is deliberately separate from service liveness: a
+        # fresh recorder process may still be missing/stale an authorizing
+        # quote or bar and must not be presented as trade-ready.
+        "data_readiness": data_readiness,
+        "readiness": data_readiness,
+        "recorded_watermark": recorded_watermark,
+        "watermark_age_seconds": (None if watermark_epoch is None else
+                                   current - watermark_epoch),
+        "partition_provenance": dict(sorted(partition_sources.items())[-64:]),
+        "cadence": cadence,
         **market_readiness,
     }
     if coverage_reason:
@@ -519,6 +626,14 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
     fresh = _fresh(heartbeat.get("updated_ts"), max_age, now)
     raw_error = heartbeat.get("last_error")
     last_error = (str(raw_error)[:500] if raw_error not in {None, ""} else None)
+    stale_tail = heartbeat.get("stale_tail")
+    stale_tail = stale_tail if isinstance(stale_tail, dict) else {}
+    signal_dispositions = heartbeat.get("signal_dispositions")
+    if not isinstance(signal_dispositions, dict):
+        signal_dispositions = stale_tail.get("signal_dispositions")
+    stress_calibration = heartbeat.get("stress_calibration")
+    if not isinstance(stress_calibration, dict):
+        stress_calibration = stale_tail.get("stress_calibration")
     return _with_provenance({
         "ok": fresh and status == "running",
         "component": "shadow",
@@ -534,6 +649,8 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "retention_floor_ts": heartbeat.get("retention_floor_ts"),
         "retention_gap_watermark": heartbeat.get("retention_gap_watermark"),
         "stale_tail": heartbeat.get("stale_tail"),
+        "signal_dispositions": signal_dispositions,
+        "stress_calibration": stress_calibration,
         "quarantine_through_session": heartbeat.get(
             "quarantine_through_session"),
         # Shadow capacity is diagnostic only.  Keep it bounded by forwarding

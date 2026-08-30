@@ -26,6 +26,8 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
+import hashlib
+import json
 import math
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -52,6 +54,8 @@ _SPREAD_BIN_BPS = .05
 # magnitude across this universe and a linear grid wastes almost every bin.
 _DEPTH_LOG_CEILING = 7.0          # 10**7 shares
 _DEPTH_LOG_BIN = .02
+_SUM_SCALE = 1_000_000_000_000
+_DIGEST_MODULUS = 1 << 256
 
 
 class QuoteCostError(ValueError):
@@ -71,7 +75,10 @@ class _Histogram:
     ceiling: float
     floor: float = 0.0
     count: int = 0
-    total: float = 0.0
+    # Fixed-point accumulation keeps summaries independent of input order.
+    # That matters because schedule hashes are evidence identities, while
+    # recorder partitions may be traversed in a different stable order.
+    total: int = 0
     overflow: int = 0
     minimum: float = math.inf
     maximum: float = -math.inf
@@ -81,7 +88,7 @@ class _Histogram:
         if not math.isfinite(value):
             return
         self.count += 1
-        self.total += value
+        self.total += int(round(value * _SUM_SCALE))
         self.minimum = min(self.minimum, value)
         self.maximum = max(self.maximum, value)
         if value > self.ceiling or value < self.floor:
@@ -91,7 +98,8 @@ class _Histogram:
 
     @property
     def mean(self) -> float | None:
-        return self.total / self.count if self.count else None
+        return (self.total / (_SUM_SCALE * self.count)
+                if self.count else None)
 
     def quantile(self, fraction: float) -> float | None:
         """Upper edge of the bin containing *fraction* of the mass.
@@ -223,10 +231,17 @@ def measure_quote_costs(quotes: Iterable[Any], *,
     by_cell: dict[tuple[str, str], _Accumulator] = defaultdict(_Accumulator)
     feeds: set[str] = set()
     providers: set[str] = set()
+    missing_feed_rows = 0
     missing_provider_rows = 0
     first_session: str | None = None
     last_session: str | None = None
     seen = 0
+    # A streaming multiset digest is insensitive to row iteration order while
+    # still preserving multiplicity.  Combining modular sum and xor avoids the
+    # duplicate cancellation weakness of xor alone.
+    quote_digest_sum = 0
+    quote_digest_xor = 0
+    quote_digest_count = 0
 
     for row in quotes:
         if str(_value(row, "kind", "quote")).strip().lower() not in {"quote", ""}:
@@ -261,14 +276,36 @@ def measure_quote_costs(quotes: Iterable[Any], *,
         identity = _value(row, "identity")
         row_feed = _value(row, "feed", _value(identity, "feed"))
         row_provider = _value(row, "provider", _value(identity, "provider"))
+        # Bind the measured schedule to the exact observations that shaped it.
+        # The normalized primitive projection works for both raw mappings and
+        # QuoteSnapshot records and keeps the fit streaming.
+        digest_row = {
+            "symbol": symbol, "timestamp": (stamp.isoformat() if stamp else None),
+            "bid": bid, "ask": ask,
+            "bid_size": bid_size, "ask_size": ask_size,
+            "provider": (None if row_provider in (None, "") else str(row_provider).strip().lower()),
+            "feed": (None if row_feed in (None, "") else str(row_feed).strip().lower()),
+        }
+        digest_bytes = json.dumps(
+            digest_row, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False, default=str).encode("utf-8")
+        row_digest = int.from_bytes(hashlib.sha256(digest_bytes).digest(), "big")
+        quote_digest_sum = (quote_digest_sum + row_digest) % _DIGEST_MODULUS
+        quote_digest_xor ^= row_digest
+        quote_digest_count += 1
         normalized_provider = (str(row_provider).strip().lower()
                                if row_provider not in (None, "") else "")
-        if not normalized_provider:
-            # A usable quote without provider identity is not a measurement;
+        normalized_feed = (str(row_feed).strip().lower()
+                           if row_feed not in (None, "") else "")
+        if not normalized_provider or not normalized_feed:
+            # A usable quote without source identity is not a measurement;
             # accepting it would make the fitted schedule impossible to tie
-            # back to a recorder/source.  Invalid bid/ask rows above remain
+            # back to a recorder/feed.  Invalid bid/ask rows above remain
             # ordinary rejected observations for compatibility.
-            missing_provider_rows += 1
+            if not normalized_feed:
+                missing_feed_rows += 1
+            if not normalized_provider:
+                missing_provider_rows += 1
             universe.rejected += 1
             by_symbol[symbol].rejected += 1
             continue
@@ -277,24 +314,38 @@ def measure_quote_costs(quotes: Iterable[Any], *,
             accumulator.sessions.add(session)
             if sizes:
                 accumulator.depth.add(math.log10(min(sizes)))
-        if row_feed:
-            feeds.add(str(row_feed).strip().lower())
+        feeds.add(normalized_feed)
         providers.add(normalized_provider)
         if first_session is None or session < first_session:
             first_session = session
         if last_session is None or session > last_session:
             last_session = session
 
-    if not universe.spread.count:
+    quote_content_hash = hashlib.sha256(
+        (f"sha256-multiset-sum-xor.v1:{quote_digest_count}:"
+         f"{quote_digest_sum:064x}:{quote_digest_xor:064x}").encode("ascii")
+    ).hexdigest()
+    if missing_feed_rows:
         raise QuoteCostError(
-            "no usable two-sided quotes in the corpus; cannot fit a cost model")
+            "quote-cost measurement requires feed provenance on every "
+            f"usable quote; missing {missing_feed_rows} row(s)")
     if missing_provider_rows:
         raise QuoteCostError(
             "quote-cost measurement requires provider provenance on every "
             f"usable quote; missing {missing_provider_rows} row(s)")
-    if feed is not None and feeds and {str(feed).strip().lower()} != feeds:
+    if not universe.spread.count:
         raise QuoteCostError(
-            f"corpus feeds {sorted(feeds)} do not match the expected {feed!r}")
+            "no usable two-sided quotes in the corpus; cannot fit a cost model")
+    expected_feed = (str(feed).strip().lower()
+                     if feed not in (None, "") else None)
+    if expected_feed is not None and feeds != {expected_feed}:
+        raise QuoteCostError(
+            f"corpus feeds {sorted(feeds)} do not match the expected "
+            f"{expected_feed!r}")
+    if expected_feed is None and len(feeds) != 1:
+        raise QuoteCostError(
+            "quote-cost measurement requires one explicit feed; "
+            f"got {sorted(feeds)}")
     expected_provider = (str(provider).strip().lower()
                          if provider not in (None, "") else None)
     if expected_provider is not None and providers != {expected_provider}:
@@ -329,10 +380,17 @@ def measure_quote_costs(quotes: Iterable[Any], *,
             "quote_rows_rejected": universe.rejected,
             "first_session": first_session, "last_session": last_session,
             "feeds": sorted(feeds), "providers": sorted(providers),
+            "feed": next(iter(feeds)) if len(feeds) == 1 else None,
             "provider": next(iter(providers)) if len(providers) == 1 else None,
+            "missing_feed_rows": int(missing_feed_rows),
             "missing_provider_rows": int(missing_provider_rows),
             "min_quotes_per_cell": int(min_quotes_per_cell),
             "bucket_minutes": BUCKET_MINUTES,
+            "quote_content_hash": quote_content_hash,
+            "quote_content_hash_algorithm": "sha256-multiset-sum-xor.v1",
+            "session_hash": content_hash(sorted({
+                session for accumulator in (universe,)
+                for session in accumulator.sessions})),
         },
         "universe": universe.summary(),
         "symbols": symbols,
@@ -390,6 +448,11 @@ def cost_model_from_schedule(
     if str(schedule.get("schema")) != QUOTE_COST_SCHEMA:
         raise QuoteCostError(
             f"expected {QUOTE_COST_SCHEMA}, got {schedule.get('schema')!r}")
+    schedule_hash = str(schedule.get("schedule_hash") or "")
+    schedule_body = dict(schedule)
+    schedule_body.pop("schedule_hash", None)
+    if not schedule_hash or schedule_hash != content_hash(schedule_body):
+        raise QuoteCostError("cost schedule hash is missing or invalid")
     if percentile not in PERCENTILES:
         raise QuoteCostError(f"percentile must be one of {PERCENTILES}")
     if depth_percentile not in PERCENTILES:
@@ -423,6 +486,49 @@ def schedule_costs_block(schedule: Mapping[str, Any], **kwargs: Any) -> dict[str
              "option_fee_per_contract_side", "provenance")}
 
 
+def measured_cost_resolver(schedule: Mapping[str, Any], *,
+                           percentile: str = "p75",
+                           vehicle: str = "equity"):
+    """Return the causal per-opportunity schedule resolver.
+
+    Replay/account code can call this immediately before admission and each
+    execution leg.  It intentionally accepts a row-like mapping rather than
+    mutating account state, making the same resolver usable by configured and
+    measured arms without changing the authored rule or sizing policy.
+    """
+    if not isinstance(schedule, Mapping):
+        raise QuoteCostError("schedule must be a mapping")
+    if str(vehicle).strip().lower() != "equity":
+        raise QuoteCostError(
+            "measured quote-cost resolver currently supports equity only")
+    def resolve(row: Mapping[str, Any] | None = None, *,
+                symbol: str | None = None, bucket: str | None = None,
+                order_shares: float | None = None) -> CostModel:
+        item = row if isinstance(row, Mapping) else {}
+        resolved_symbol = symbol or item.get("symbol")
+        resolved_bucket = bucket
+        if resolved_bucket in (None, ""):
+            raw = (item.get("cost_timestamp") or
+                   item.get("entry_timestamp") or item.get("timestamp"))
+            if raw not in (None, ""):
+                try:
+                    stamp = _timestamp({"timestamp": raw})
+                    if stamp is not None:
+                        local = stamp.astimezone(_NY)
+                        minutes = ((local.hour * 60 + local.minute +
+                                    local.second / 60.0) - 9 * 60 - 30)
+                        resolved_bucket = bucket_label(minutes)
+                except (TypeError, ValueError, OverflowError):
+                    resolved_bucket = None
+        if order_shares is None:
+            order_shares = _number(item.get("quantity", item.get("shares")))
+        return cost_model_from_schedule(
+            schedule, symbol=(None if resolved_symbol in (None, "") else str(resolved_symbol)),
+            bucket=resolved_bucket, percentile=percentile,
+            order_shares=order_shares)
+    return resolve
+
+
 # Re-export the diagnostic bridge from the schedule module so callers that
 # already depend on ``research.quote_costs`` can discover calibration without
 # importing a runtime/risk module.  The implementation remains separate to
@@ -436,7 +542,7 @@ from .stressed_cost_calibration import (  # noqa: E402  (late import avoids cycl
 
 __all__ = ["BUCKET_MINUTES", "PERCENTILES", "QUOTE_COST_SCHEMA",
            "QuoteCostError", "bucket_label", "cost_model_from_schedule",
-           "measure_quote_costs", "schedule_costs_block",
+           "measure_quote_costs", "measured_cost_resolver", "schedule_costs_block",
            "DEFAULT_FALLBACK_SCENARIO_BPS", "DEFAULT_MIN_SESSIONS_PER_CELL",
            "STRESS_CALIBRATION_SCHEMA", "StressCalibrationError",
            "calibrate_stress_schedule", "calibrate_stressed_cost",

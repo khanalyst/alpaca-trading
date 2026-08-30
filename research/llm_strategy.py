@@ -979,9 +979,14 @@ class RuleProposalAdapter:
         """
 
         if vehicle == "option":
+            # ``rule_spec_json_schema`` is family-stratified per schema. Keep
+            # the option union flat so the provider adapter's ``anyOf`` has
+            # direct object branches (and can inspect schema/family fields)
+            # rather than nested oneOf wrappers.
             return {"oneOf": [
-                rule_spec_json_schema(RULE_SCHEMA_V1),
-                rule_spec_json_schema(RULE_SCHEMA_V2),
+                branch
+                for schema_name in (RULE_SCHEMA_V1, RULE_SCHEMA_V2)
+                for branch in rule_spec_json_schema(schema_name)["oneOf"]
             ]}
         return rule_spec_json_schema()
 

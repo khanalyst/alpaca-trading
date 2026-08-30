@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS,
+    cross_sectional_symbol_eligibility,
     evaluate_rule_signal_metadata,
     evaluate_rule_signal_trace, feature_window_bars, rule_variant_id,
     validate_rule_spec, SESSION_MINUTES,
@@ -715,6 +716,21 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             first_signals.append(first)
         if session_had_eligible_prefix:
             eligible_sessions += 1
+    eligibility_by_symbol: dict[str, dict[str, Any]] = {}
+    if spec["family"] == "cross_sectional_residual":
+        symbol_rows: dict[str, list[Any]] = {}
+        for (day, symbol), rows in grouped.items():
+            symbol_rows.setdefault(symbol, []).extend(rows)
+        for symbol, rows in sorted(symbol_rows.items()):
+            eligibility_by_symbol[symbol] = {
+                **cross_sectional_symbol_eligibility(
+                    symbol, rows=rows, spec=spec),
+                "session_count": len({
+                    _session(row) for row in rows if _session(row)}),
+                "signal_count": sum(
+                    1 for item in first_signals
+                    if str(item.get("symbol", "")).upper() == symbol),
+            }
     funnel = {
         name: {"tested": int(counts["tested"]),
                "passed": int(counts["passed"]),
@@ -732,7 +748,8 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             "prefix_status_counts": dict(sorted(prefix_status.items())),
             "predicate_funnel": funnel,
             "terminal_stage_counts": dict(sorted(terminal_stages.items())),
-            "terminal_reason_counts": dict(sorted(terminal_reasons.items()))}
+            "terminal_reason_counts": dict(sorted(terminal_reasons.items())),
+            "eligibility_by_symbol": eligibility_by_symbol}
 
 
 def _risk_value(row: Mapping[str, Any]) -> float | None:
@@ -1392,7 +1409,9 @@ def measure_fit_diagnostics(
             reason: int(count)
             for reason, count in prefix["terminal_reason_counts"].items()
             if str(reason).startswith(("benchmark_context_",
-                                       "subject_context_"))
+                                       "subject_context_",
+                                       "subject_ineligible:")) and
+            not str(reason).startswith("subject_context_ineligible:")
         }
         reason = (max(sorted(context_rejections),
                       key=context_rejections.get)
@@ -1403,6 +1422,24 @@ def measure_fit_diagnostics(
                        "partial" if context_rejections else "complete"),
             "reason": reason,
             "rejection_counts": dict(sorted(context_rejections.items())),
+        }
+        eligibility_by_symbol = dict(prefix.get("eligibility_by_symbol") or {})
+        fit_diagnostics["eligibility"] = {
+            "schema": "cross-sectional-eligibility.v1",
+            "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+            "by_symbol": eligibility_by_symbol,
+            "symbol_counts": {
+                "total": len(eligibility_by_symbol),
+                "eligible": sum(bool(item["eligible"])
+                                for item in eligibility_by_symbol.values()),
+                "ineligible": sum(not bool(item["eligible"])
+                                  for item in eligibility_by_symbol.values()),
+            },
+            "event_symbols": sorted(
+                symbol for symbol, item in eligibility_by_symbol.items()
+                if item.get("signal_count", 0)),
+            "authorizing": False,
+            "diagnostic_only": True,
         }
     # Historical backfill can be inspected only through the explicit policy
     # above. Keep that provenance visible and permanently non-authorizing so a

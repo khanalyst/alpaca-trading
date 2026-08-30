@@ -22,6 +22,7 @@ import csv
 import fcntl
 import hashlib
 import json
+import math
 import mmap
 import os
 import sqlite3
@@ -249,6 +250,62 @@ def _save_partition_calendar(output: Path, day: date, session) -> None:
         os.fsync(handle.fileno())
     os.replace(temporary, path)
     _fsync_directory(path.parent)
+
+
+def _cadence_telemetry(output: Path, *, interval: float,
+                       cycle_started_ts: float,
+                       cycle_completed_ts: float) -> dict:
+    """Persist bounded realized cadence evidence without changing scheduling."""
+    previous: dict = {}
+    try:
+        previous = json.loads((output.parent / STATUS_NAME).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        previous = {}
+    previous_cadence = previous.get("cadence")
+    previous_cadence = (previous_cadence
+                        if isinstance(previous_cadence, dict) else {})
+    realized_values: list[float] = []
+    raw_values = previous_cadence.get("realized_intervals_seconds")
+    if isinstance(raw_values, list):
+        for value in raw_values[-127:]:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number >= 0:
+                realized_values.append(number)
+    previous_start = previous_cadence.get("cycle_started_ts")
+    realized = None
+    try:
+        if previous_start is not None:
+            realized = max(0.0, float(cycle_started_ts) - float(previous_start))
+    except (TypeError, ValueError):
+        realized = None
+    if realized is not None:
+        realized_values.append(realized)
+    values = sorted(realized_values)
+
+    def quantile(fraction: float) -> float | None:
+        if not values:
+            return None
+        index = min(len(values) - 1,
+                    max(0, int(math.ceil(len(values) * fraction)) - 1))
+        return values[index]
+
+    gap = (None if realized is None else
+           max(0.0, realized - float(interval)))
+    return {
+        "configured_interval_seconds": float(interval),
+        "cycle_started_ts": float(cycle_started_ts),
+        "cycle_completed_ts": float(cycle_completed_ts),
+        "realized_interval_seconds": realized,
+        "realized_intervals_seconds": realized_values[-128:],
+        "realized_interval_p50_seconds": quantile(.50),
+        "realized_interval_p95_seconds": quantile(.95),
+        "gap_seconds": gap,
+        "gap_detected": bool(gap is not None and gap > 0),
+    }
 
 
 def _partition_calendars_from_markers(output: Path) -> dict[str, dict[str, str]]:
@@ -2156,6 +2213,7 @@ def main(argv=None) -> int:
     # to request latency plus the configured interval.
     next_tick: float | None = time.monotonic()
     while True:
+        cycle_started_ts = time.time()
         try:
             count = record_once(provider, symbols, output, config=cfg,
                                 include_options=include_options,
@@ -2182,6 +2240,10 @@ def main(argv=None) -> int:
                 "error": str(exc),
                 "failure_count": failure_count,
                 "retry_seconds": delay,
+                "cadence": _cadence_telemetry(
+                    output, interval=args.interval,
+                    cycle_started_ts=cycle_started_ts,
+                    cycle_completed_ts=time.time()),
             }
             _save_status(output, payload)
             print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
@@ -2204,6 +2266,10 @@ def main(argv=None) -> int:
             "retryable": None,
             "error_type": None,
             "error": None,
+            "cadence": _cadence_telemetry(
+                output, interval=args.interval,
+                cycle_started_ts=cycle_started_ts,
+                cycle_completed_ts=time.time()),
         })
         print(f"recorded {count} Alpaca rows to {output}", flush=True)
         if args.once:

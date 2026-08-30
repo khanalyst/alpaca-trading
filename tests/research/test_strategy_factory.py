@@ -113,6 +113,17 @@ def fake_adequate_worker(payload):
             "expected_variants": len(specs), "worker_pid": int(hypothesis["slot"]) + 100}
 
 
+def _seal_fixture_screen(record):
+    """Produce the same bound compact handoff as a real quality worker."""
+    quality = {
+        "schema": "signal-quality.v2", "scope": "fit_only",
+        "authorizing": False, "diagnostic_only": True,
+        "variant_id": record["variant_id"], "fixture": dict(record),
+    }
+    return factory_module._seal_signal_quality_screen_record(
+        record, quality=quality)
+
+
 def fake_signal_quality_screen_worker(payload):
     """Keep legacy worker-fixture tests focused on their gate behavior."""
     screens = {}
@@ -120,13 +131,15 @@ def fake_signal_quality_screen_worker(payload):
         spec = validate_rule_spec(raw_spec)
         variant_id = rule_variant_id(spec)
         screens[variant_id] = {
-            "schema": "signal-quality-screen.v1", "scope": "fit_only",
+            "schema": "signal-quality-screen.v2", "scope": "fit_only",
             "authorizing": False, "diagnostic_only": True,
             "variant_id": variant_id, "status": "complete_actionable_signal",
             "reason": "actionable_signal_present", "event_count": 1,
             "fit_cells": 1, "event_rejection_counts": {},
             "digest": "fixture-screen-digest",
         }
+    screens = {variant_id: _seal_fixture_screen(record)
+               for variant_id, record in screens.items()}
     return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
             "screens": dict(sorted(screens.items())), "worker_pid": 1}
 
@@ -137,7 +150,7 @@ def zero_signal_quality_screen_worker(payload):
         spec = validate_rule_spec(raw_spec)
         variant_id = rule_variant_id(spec)
         screens[variant_id] = {
-            "schema": "signal-quality-screen.v1", "scope": "fit_only",
+            "schema": "signal-quality-screen.v2", "scope": "fit_only",
             "authorizing": False, "diagnostic_only": True,
             "variant_id": variant_id,
             "status": "complete_zero_actionable_signal",
@@ -146,6 +159,8 @@ def zero_signal_quality_screen_worker(payload):
             "event_rejection_counts": {"no_actionable_signal": 1},
             "digest": "fixture-zero-screen-digest",
         }
+    screens = {variant_id: _seal_fixture_screen(record)
+               for variant_id, record in screens.items()}
     return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
             "screens": dict(sorted(screens.items())), "worker_pid": 1}
 
@@ -156,7 +171,7 @@ def nonpositive_signal_quality_screen_worker(payload):
         spec = validate_rule_spec(raw_spec)
         variant_id = rule_variant_id(spec)
         screens[variant_id] = {
-            "schema": "signal-quality-screen.v1", "scope": "fit_only",
+            "schema": "signal-quality-screen.v2", "scope": "fit_only",
             "authorizing": False, "diagnostic_only": True,
             "variant_id": variant_id,
             "status": "complete_nonpositive_control",
@@ -169,6 +184,8 @@ def nonpositive_signal_quality_screen_worker(payload):
             },
             "digest": "fixture-nonpositive-screen-digest",
         }
+    screens = {variant_id: _seal_fixture_screen(record)
+               for variant_id, record in screens.items()}
     return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
             "screens": dict(sorted(screens.items())), "worker_pid": 1}
 
@@ -181,7 +198,7 @@ def mixed_signal_quality_screen_worker(payload):
         variant_id = rule_variant_id(spec)
         if index == 0:
             screens[variant_id] = {
-                "schema": "signal-quality-screen.v1", "scope": "fit_only",
+                "schema": "signal-quality-screen.v2", "scope": "fit_only",
                 "authorizing": False, "diagnostic_only": True,
                 "variant_id": variant_id,
                 "status": "complete_zero_actionable_signal",
@@ -192,7 +209,7 @@ def mixed_signal_quality_screen_worker(payload):
             }
         else:
             screens[variant_id] = {
-                "schema": "signal-quality-screen.v1", "scope": "fit_only",
+                "schema": "signal-quality-screen.v2", "scope": "fit_only",
                 "authorizing": False, "diagnostic_only": True,
                 "variant_id": variant_id,
                 "status": "complete_nonpositive_control",
@@ -205,6 +222,8 @@ def mixed_signal_quality_screen_worker(payload):
                 },
                 "digest": "fixture-mixed-nonpositive-screen-digest",
             }
+    screens = {variant_id: _seal_fixture_screen(record)
+               for variant_id, record in screens.items()}
     return {"hypothesis_id": str(payload["hypothesis"]["hypothesis_id"]),
             "screens": dict(sorted(screens.items())), "worker_pid": 1}
 
@@ -215,7 +234,7 @@ def unknown_signal_quality_screen_worker(payload):
         spec = validate_rule_spec(raw_spec)
         variant_id = rule_variant_id(spec)
         screens[variant_id] = {
-            "schema": "signal-quality-screen.v1", "scope": "fit_only",
+            "schema": "signal-quality-screen.v2", "scope": "fit_only",
             "authorizing": False, "diagnostic_only": True,
             "variant_id": variant_id, "status": "unknown",
             "reason": "worker_failure", "event_count": None,
@@ -746,6 +765,7 @@ class StrategyFactoryTests(unittest.TestCase):
 
     def test_complete_nonpositive_control_screen_skips_only_with_adequate_match(self):
         quality = {
+            "schema": "signal-quality.v2",
             "scope": "fit_only", "authorizing": False,
             "diagnostic_only": True, "variant_id": "variant",
             "event_count": 32, "event_rejection_counts": {},
@@ -765,6 +785,19 @@ class StrategyFactoryTests(unittest.TestCase):
                                30 / 32)
         self.assertTrue(factory_module._screen_record_can_skip(
             record, variant_id="variant"))
+        tampered_digest = {**record, "digest": "f" * 64}
+        self.assertFalse(factory_module._screen_record_can_skip(
+            tampered_digest, variant_id="variant"))
+        tampered_scope = {**record,
+                          "provenance": {**record["provenance"],
+                                         "scope": "heldout"}}
+        self.assertFalse(factory_module._screen_record_can_skip(
+            tampered_scope, variant_id="variant"))
+        malformed = {key: value for key, value in record.items()
+                     if key != "provenance"}
+        malformed["digest"] = "arbitrary-nonempty-string"
+        self.assertFalse(factory_module._screen_record_can_skip(
+            malformed, variant_id="variant"))
 
         underpowered = dict(quality)
         underpowered["horizon_metrics"] = {
@@ -777,8 +810,39 @@ class StrategyFactoryTests(unittest.TestCase):
         self.assertFalse(factory_module._screen_record_can_skip(
             record, variant_id="variant"))
 
+    def test_pre_v2_signal_quality_handoff_is_stale_and_fails_open(self):
+        """Old persisted quality results cannot suppress replay or promotion."""
+        quality = {
+            "schema": "signal-quality.v1",
+            "scope": "fit_only", "authorizing": False,
+            "diagnostic_only": True, "variant_id": "variant",
+            "event_count": 0,
+            "event_rejection_counts": {"no_actionable_signal": 32},
+        }
+        record = factory_module._signal_quality_screen_record(
+            quality, variant_id="variant", fit_cells=32,
+            primary_horizon=60)
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["reason"],
+                         factory_module.STALE_SIGNAL_QUALITY_SCHEMA_REASON)
+        self.assertEqual(record["received_schema"], "signal-quality.v1")
+        self.assertEqual(record["expected_schema"], "signal-quality.v2")
+        self.assertFalse(factory_module._screen_record_can_skip(
+            record, variant_id="variant"))
+
+    def test_shipped_calibration_defaults_are_explicit_and_disabled(self):
+        shipped = json.loads((Path(__file__).resolve().parents[2] /
+                              "config.yaml").read_text(encoding="utf-8"))
+        risk = shipped["risk"]
+        self.assertIs(risk["stressed_cost_calibration_enabled"], False)
+        self.assertEqual(risk["stressed_cost_calibration_path"], "")
+        normalized = validate_config(shipped)
+        self.assertFalse(normalized["risk"]["stressed_cost_calibration_enabled"])
+        self.assertEqual(normalized["risk"]["stressed_cost_calibration_path"], "")
+
     def test_partial_market_context_screen_fails_open(self):
         quality = {
+            "schema": "signal-quality.v2",
             "scope": "fit_only", "authorizing": False,
             "diagnostic_only": True, "variant_id": "variant",
             "event_count": 32, "event_rejection_counts": {},
@@ -803,6 +867,7 @@ class StrategyFactoryTests(unittest.TestCase):
         for delta in (None, 1.0):
             with self.subTest(delta=delta):
                 quality = {
+                    "schema": "signal-quality.v2",
                     "scope": "fit_only", "authorizing": False,
                     "diagnostic_only": True, "variant_id": "variant",
                     "event_count": 30, "event_rejection_counts": {},

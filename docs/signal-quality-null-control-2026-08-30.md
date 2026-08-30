@@ -94,8 +94,11 @@ inside the entry window, that the pool is larger than one draw, that each
 reported t equals its mean over its standard error, and that an empty screen
 reports absent error terms rather than zeroes.
 
-The screen's schema is `signal-quality.v2`: the control's meaning changed, so a
-consumer must not read the new shape as the old one.
+The measurement schema is `signal-quality.v2` and its compact factory handoff
+is `signal-quality-screen.v2`: the control's meaning changed, so a consumer
+must not read either new shape as the old one. Persisted or handed-off results
+from before those versions are treated as stale/unknown and remain eligible
+for fresh replay; they cannot screen, promote, or authorize a candidate.
 
 Runtime is unchanged (14.03s → 14.05s on a 48,000-bar corpus across six
 horizons). The eligible null pool is now built once per session per horizon

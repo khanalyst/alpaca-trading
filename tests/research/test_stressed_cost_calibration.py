@@ -10,7 +10,7 @@ from agent.config import validate_config
 from agent.risk import RiskEngine
 from research.costs import ReplayPolicy, check_stressed_cost_plan
 from research.stressed_cost_calibration import (
-    calibrate_stressed_cost, resolve_stress_scenario,
+    StressCalibrationError, calibrate_stressed_cost, resolve_stress_scenario,
     verify_stress_calibration_artifact)
 from research.edge_ledger import content_hash
 from research.cost_rerun import main as cost_rerun_main
@@ -46,14 +46,17 @@ def _schedule(*, spread=4.0, depth=10_000.0, quotes=100, sessions=5,
                      if buckets else {}),
         "sparse_buckets": sparse,
     }
-    return {
-        "schema": "quote-cost-schedule.v1", "schedule_hash": digest,
+    schedule = {
+        "schema": "quote-cost-schedule.v1",
         "measured": {
             "providers": [provider] if provider else [],
             "feeds": [feed] if feed else [], "min_quotes_per_cell": 50,
+            "fixture_identity": digest,
         },
         "symbols": {"SPY": entry},
     }
+    schedule["schedule_hash"] = content_hash(schedule)
+    return schedule
 
 
 def _rehash(artifact):
@@ -61,6 +64,12 @@ def _rehash(artifact):
     result.pop("content_hash", None)
     result["content_hash"] = content_hash(result)
     return result
+
+
+def _rehash_schedule(schedule):
+    schedule.pop("schedule_hash", None)
+    schedule["schedule_hash"] = content_hash(schedule)
+    return schedule
 
 
 class StressCalibrationTests(unittest.TestCase):
@@ -125,15 +134,32 @@ class StressCalibrationTests(unittest.TestCase):
 
     def test_hash_is_deterministic_and_validation_hash_is_persisted(self):
         kwargs = dict(expected_provider="alpaca", expected_feed="iex")
+        fit = _schedule(digest="fit")
+        validation = _schedule(spread=8.0, digest="validation")
         first = calibrate_stressed_cost(
-            _schedule(digest="fit"), validation_schedule=_schedule(
-                spread=8.0, digest="validation"), **kwargs)
+            fit, validation_schedule=validation, **kwargs)
         second = calibrate_stressed_cost(
-            _schedule(digest="fit"), validation_schedule=_schedule(
-                spread=8.0, digest="validation"), **kwargs)
+            fit, validation_schedule=validation, **kwargs)
         self.assertEqual(first["content_hash"], second["content_hash"])
-        self.assertEqual(first["fit_schedule_hash"], "fit")
-        self.assertEqual(first["validation_schedule_hash"], "validation")
+        self.assertEqual(first["fit_schedule_hash"], fit["schedule_hash"])
+        self.assertEqual(first["validation_schedule_hash"],
+                         validation["schedule_hash"])
+
+    def test_tampered_fit_or_validation_schedule_is_rejected(self):
+        fit = _schedule(digest="fit")
+        validation = _schedule(digest="validation", session_start=6)
+        fit["symbols"]["SPY"]["spread_bps"]["p95"] = 40.0
+        with self.assertRaisesRegex(StressCalibrationError, "hash"):
+            calibrate_stressed_cost(
+                fit, validation_schedule=validation,
+                expected_provider="alpaca", expected_feed="iex")
+
+        fit = _schedule(digest="fit")
+        validation["symbols"]["SPY"]["spread_bps"]["p95"] = 40.0
+        with self.assertRaisesRegex(StressCalibrationError, "hash"):
+            calibrate_stressed_cost(
+                fit, validation_schedule=validation,
+                expected_provider="alpaca", expected_feed="iex")
 
     def test_cost_above_50_bps_falls_closed(self):
         result = calibrate_stressed_cost(
@@ -300,6 +326,8 @@ class StressCalibrationTests(unittest.TestCase):
             spread=20.0, digest="validation", session_start=10)
         fit["symbols"]["QQQ"] = later_fit["symbols"]["SPY"]
         validation["symbols"]["QQQ"] = later_validation["symbols"]["SPY"]
+        _rehash_schedule(fit)
+        _rehash_schedule(validation)
         artifact = calibrate_stressed_cost(
             fit, validation_schedule=validation,
             expected_provider="alpaca", expected_feed="iex")

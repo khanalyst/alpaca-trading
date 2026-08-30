@@ -22,7 +22,9 @@ from research.live_shadow import (InputConflict, ShadowConfig, ShadowRunner,
                                    ShadowError, ShadowStore, _compact_shadow_rows,
                                    _replay_signature,
                                    _shadow_signature, _signature_diffs,
+                                   _replay_code_hash,
                                    _opportunity_capacity,
+                                   _signal_dispositions,
                                    run_shadow_once, MAX_QUARANTINE_EVENTS,
                                    QUARANTINE_OVERFLOW_KEY)
 
@@ -69,6 +71,40 @@ class LiveShadowTests(unittest.TestCase):
         self.assertFalse(summary["feasible"])
         self.assertEqual(summary["status"], "structurally_impossible")
         self.assertEqual(summary["shortfalls"]["opportunities"], 1)
+
+    def test_signal_dispositions_exclude_no_signal_decisions(self):
+        rows = [
+            {"candidate_id": "candidate", "kind": "no_trade",
+             "reason": "no signal", "payload_json": '{"signal": null}'},
+            {"candidate_id": "candidate", "kind": "open_incomplete",
+             "payload_json": '{"signal": {"direction": "long"}}'},
+            {"candidate_id": "candidate", "kind": "unpriced",
+             "reason": "stale quote",
+             "payload_json": '{"signal": {"direction": "short"}}'},
+        ]
+        result = _signal_dispositions(rows)
+        self.assertEqual(result["signal_opportunities"], 2)
+        self.assertEqual(result["admitted"], 1)
+        self.assertEqual(result["refused"], 1)
+        self.assertEqual(result["refusal_reason_counts"], {"stale quote": 1})
+
+    def test_shadow_calibration_path_is_inert_without_explicit_enable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.json"
+            path.write_text("{}", encoding="utf-8")
+            config = ShadowConfig(self.corpus, self.edge, self.shadow,
+                                  stress_calibration_path=path)
+            self.assertFalse(config.stress_calibration_enabled)
+            self.assertIsNone(config.stress_calibration_artifact)
+
+    def test_shadow_calibration_enabled_fails_closed_on_invalid_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.json"
+            path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "artifact invalid"):
+                ShadowConfig(self.corpus, self.edge, self.shadow,
+                             stress_calibration_path=path,
+                             stress_calibration_enabled=True)
 
     def _candidate(self, *, variant="ibr.baseline", strategy="ibr", vehicle="equity",
                    status="backtest_passed", config=None):
@@ -167,6 +203,7 @@ class LiveShadowTests(unittest.TestCase):
         self.assertEqual(manifest["schema"], "shadow-manifest.v1")
         self.assertEqual(manifest["manifest_digest"], first["manifest_digest"])
         self.assertEqual(manifest["event_watermark"]["count"], 3)
+        self.assertEqual(manifest["replay_code_hash"], _replay_code_hash())
 
     def test_no_candidate_poll_skips_historical_materialization(self):
         """An empty candidate set must not copy a large immutable WAL."""
@@ -186,6 +223,7 @@ class LiveShadowTests(unittest.TestCase):
         manifest = store.manifest(result["manifest_digest"])
         self.assertEqual(manifest["replay_scope"], "no_candidates")
         self.assertEqual(manifest["event_watermark"]["snapshot"], "not_loaded")
+        self.assertEqual(manifest["replay_code_hash"], _replay_code_hash())
 
     def test_candidate_replay_reads_only_post_activation_events(self):
         """Rows ingested after an empty activation poll form the next window."""
@@ -283,6 +321,27 @@ class LiveShadowTests(unittest.TestCase):
                                    separators=(",", ":"))))
         with self.assertRaises(ShadowError):
             store.manifest(wrong_key)
+
+    def test_manifest_read_rejects_missing_replay_code_identity(self):
+        store = ShadowStore(self.shadow)
+        digest = store.save_manifest({"event_watermark": {"count": 1}})
+        key = f"shadow-manifest.v1:{digest}"
+        with sqlite3.connect(self.shadow) as db:
+            payload = json.loads(db.execute(
+                "SELECT value FROM meta WHERE key=?", (key,)).fetchone()[0])
+            payload.pop("replay_code_hash", None)
+            db.execute("UPDATE meta SET value=? WHERE key=?",
+                       (json.dumps(payload), key))
+        with self.assertRaises(ShadowError):
+            store.manifest(digest)
+
+    def test_manifest_read_rejects_dependency_code_identity_mismatch(self):
+        store = ShadowStore(self.shadow)
+        digest = store.save_manifest({"event_watermark": {"count": 1}})
+        with patch("research.live_shadow._replay_code_hash",
+                   return_value="f" * 64):
+            with self.assertRaises(ShadowError):
+                store.manifest(digest)
 
     def test_latest_manifest_pointer_is_self_verified(self):
         store = ShadowStore(self.shadow)
@@ -834,6 +893,61 @@ class LiveShadowTests(unittest.TestCase):
         feed_mismatch = {**replay, "equity_feed": "sip"}
         differences = _signature_diffs([runtime], [feed_mismatch])
         self.assertEqual([item["field"] for item in differences], ["equity_feed"])
+        self.assertNotIn("benchmark_symbol", runtime)
+
+    def test_cross_sectional_context_is_bound_in_signatures(self):
+        eligibility = {
+            "schema": "cross-sectional-eligibility.v1",
+            "symbol": "QQQ", "benchmark_symbol": "SPY",
+            "eligible": True, "status": "eligible",
+            "reason": "eligible_equity_etf", "source": "default_universe",
+        }
+        context = {
+            "benchmark_symbol": "SPY",
+            "market_context_digest": "a" * 64,
+            "candidate_behavior_identity": "rule.cross-sectional.behavior.abc",
+            "residual_return": 0.0125,
+            "eligibility": eligibility,
+        }
+        payload = {"equity_feed": "iex",
+                   "signal": {"family": "cross_sectional_residual",
+                               "direction": "long", "setup_type": "rule_cross_sectional_residual",
+                               "signal_ts": 1767369600.0,
+                               "decision_timestamp": "2026-01-02T16:00:00+00:00",
+                               "entry_timestamp": "2026-01-02T16:01:00+00:00",
+                               **context},
+                   "setup_plan": {"direction": "long", "setup_type": "rule_cross_sectional_residual",
+                                  "family": "cross_sectional_residual",
+                                  "signal_ts": 1767369600.0, "stop_price": 99,
+                                  "target_price": 102, "stop_distance": 1,
+                                  "target_r": 2, "execution_profile": "shares",
+                                  "decision_timestamp": "2026-01-02T16:00:00+00:00",
+                                  "entry_timestamp": "2026-01-02T16:01:00+00:00"}}
+        runtime = _shadow_signature({"kind": "open_incomplete", "symbol": "QQQ",
+                                     "session_date": "2026-01-02", "payload_json": json.dumps(payload)})
+        replay = _replay_signature({"symbol": "QQQ", "session_date": "2026-01-02",
+                                    "direction": "long", "signal_timestamp": "2026-01-02T16:00:00+00:00",
+                                    "decision_timestamp": "2026-01-02T16:00:00+00:00",
+                                    "entry_timestamp": "2026-01-02T16:01:00+00:00",
+                                    "stop_price": 99, "target_price": 102,
+                                    "stop_distance": 1, **context},
+                                   vehicle="equity", strategy_id="rule",
+                                   target_r=2, setup_type="rule_cross_sectional_residual",
+                                   equity_feed="iex")
+        self.assertEqual(_signature_diffs([runtime], [replay]), [])
+        self.assertEqual({field: runtime[field] for field in context}, context)
+        mismatches = {
+            "benchmark_symbol": "IWM",
+            "market_context_digest": "b" * 64,
+            "candidate_behavior_identity": "rule.cross-sectional.behavior.other",
+            "residual_return": -0.0125,
+            "eligibility": {**eligibility, "eligible": False},
+        }
+        for field, replacement in mismatches.items():
+            with self.subTest(field=field):
+                differences = _signature_diffs(
+                    [runtime], [{**replay, field: replacement}])
+                self.assertIn(field, [item["field"] for item in differences])
 
     def test_completed_replay_closes_virtual_book_for_the_next_session(self):
         store = ShadowStore(self.shadow)

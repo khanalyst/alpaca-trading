@@ -51,6 +51,18 @@ CONFIRMATIONS = ("none", "trend", "volume", "volatility")
 SIDES = ("both", "long", "short")
 BAR_SECONDS = 60.0
 CROSS_SECTIONAL_BENCHMARK = "SPY"
+# The residual family is a directional, single-leg equity signal relative to
+# SPY.  It is not a market-neutral hedge and therefore must not pool symbols
+# whose price process is not comparable to a broad equity ETF.  Keep this
+# policy bounded and data-only: callers may carry an explicit symbol allowlist
+# in the rule spec, while the fallback list preserves legacy specs that did not
+# carry eligibility metadata.
+CROSS_SECTIONAL_MAX_ELIGIBLE_SYMBOLS = 64
+CROSS_SECTIONAL_DEFAULT_ELIGIBLE_SYMBOLS = frozenset({
+    "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI",
+    "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO", "VB", "EFA",
+    "EEM", "SMH",
+})
 # A bracket that is tighter than the configured minimum can be consumed by
 # ordinary spread/slippage before it has a chance to express the strategy's
 # thesis.  This is deliberately an execution-time floor, not a grammar field:
@@ -226,6 +238,9 @@ def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
         fields.update(("atr_period", "compression_bps"))
     if spec.get("breakeven_r") is not None:
         fields.add("breakeven_r")
+    if spec.get("family") == "cross_sectional_residual" and \
+            "eligible_symbols" in spec:
+        fields.add("eligible_symbols")
     return fields
 
 
@@ -309,9 +324,8 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
         raise RuleSpecError(f"unknown rule schema: {schema!r}")
 
     def one(name: str) -> dict[str, Any]:
-        properties: dict[str, Any] = {
+        common_properties: dict[str, Any] = {
             "schema": {"type": "string", "const": name},
-            "family": {"type": "string", "enum": list(RULE_FAMILIES)},
             "side": {"type": "string", "enum": list(SIDES)},
             "lookback": {"type": "integer", "minimum": 3, "maximum": 120},
             "slow_lookback": {"type": "integer", "minimum": 5, "maximum": 240},
@@ -328,7 +342,7 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
         }
         required = list(DEFAULT_RULE_SPEC)
         if name in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
-            properties.update({
+            common_properties.update({
                 "confirmations": {"type": "array", "maxItems": MAX_CONFIRMATIONS,
                                   "uniqueItems": True,
                                   "items": {"type": "string", "enum": list(_EXTRA_CONFIRMATIONS)}},
@@ -341,16 +355,42 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             })
             required += list(V2_DEFAULT_EXTENSIONS)
         if name == RULE_SCHEMA_V3:
-            properties["breakeven_r"] = {
+            common_properties["breakeven_r"] = {
                 "type": ["number", "null"], "minimum": 0.0, "maximum": 10.0,
             }
             required += list(V3_DEFAULT_EXTENSIONS)
-        return {"type": "object", "additionalProperties": False,
-                "required": required, "properties": properties}
+        def branch(family: dict[str, Any], *, eligible: bool) -> dict[str, Any]:
+            properties = {**common_properties, "family": family}
+            if eligible:
+                # Optional and deliberately not required: omitting this field
+                # is the legacy cross-sectional identity.  The property lives
+                # only on this branch so non-cross-sectional providers cannot
+                # emit a field runtime rejects.
+                properties["eligible_symbols"] = {
+                    "type": "array",
+                    "maxItems": CROSS_SECTIONAL_MAX_ELIGIBLE_SYMBOLS,
+                    "uniqueItems": True,
+                    "items": {"type": "string",
+                              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,14}$"},
+                }
+            return {"type": "object", "additionalProperties": False,
+                    "required": required, "properties": properties}
+
+        non_cross = [family for family in RULE_FAMILIES
+                     if family != "cross_sectional_residual"]
+        return {"oneOf": [
+            branch({"type": "string", "enum": non_cross}, eligible=False),
+            branch({"type": "string", "const": "cross_sectional_residual"},
+                   eligible=True),
+        ]}
 
     if len(schemas) == 1:
         return one(schemas[0])
-    return {"oneOf": [one(name) for name in schemas]}
+    # Flatten the per-schema family branches so a provider validating the
+    # union never has to interpret nested ``oneOf`` wrappers.
+    return {"oneOf": [branch
+                       for name in schemas
+                       for branch in one(name)["oneOf"]]}
 
 
 class RuleSpecError(ValueError):
@@ -378,6 +418,28 @@ def _validate_confirmations(value: Any) -> list[str]:
     return sorted(selected)
 
 
+def _validate_eligible_symbols(value: Any) -> list[str]:
+    """Normalize a bounded symbol allowlist carried by a rule spec."""
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise RuleSpecError("rule_spec.eligible_symbols must be a list of symbols")
+    if len(value) > CROSS_SECTIONAL_MAX_ELIGIBLE_SYMBOLS:
+        raise RuleSpecError(
+            "rule_spec.eligible_symbols accepts at most "
+            f"{CROSS_SECTIONAL_MAX_ELIGIBLE_SYMBOLS} symbols")
+    result: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise RuleSpecError("rule_spec.eligible_symbols entries must be strings")
+        symbol = item.strip().upper()
+        if (not symbol or len(symbol) > 15 or not symbol[0].isalpha() or
+                any(not (char.isalnum() or char in "._-") for char in symbol)):
+            raise RuleSpecError(
+                "rule_spec.eligible_symbols entries must be valid symbols")
+        result.add(symbol)
+    return sorted(result)
+
+
 def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise RuleSpecError("rule_spec must be a mapping")
@@ -385,7 +447,7 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if schema not in RULE_SCHEMAS:
         raise RuleSpecError(
             f"rule_spec.schema must be one of {', '.join(map(repr, RULE_SCHEMAS))}")
-    permitted = set(DEFAULT_RULE_SPEC)
+    permitted = set(DEFAULT_RULE_SPEC) | {"eligible_symbols"}
     if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
         permitted |= set(V2_DEFAULT_EXTENSIONS)
     if schema == RULE_SCHEMA_V3:
@@ -413,6 +475,11 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     spec["schema"] = schema
     if spec.get("family") not in RULE_FAMILIES:
         raise RuleSpecError(f"unsupported rule family: {spec.get('family')!r}")
+    if ("eligible_symbols" in spec and
+            spec.get("family") != "cross_sectional_residual"):
+        raise RuleSpecError(
+            "rule_spec.eligible_symbols is only valid for "
+            "cross_sectional_residual")
     if spec.get("side") not in SIDES:
         raise RuleSpecError("rule_spec.side must be both, long, or short")
     if spec.get("confirmation") not in CONFIRMATIONS:
@@ -435,6 +502,9 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if spec["slow_lookback"] <= spec["lookback"]:
         raise RuleSpecError("rule_spec.slow_lookback must exceed lookback")
     if schema == RULE_SCHEMA_V1:
+        if "eligible_symbols" in spec:
+            spec["eligible_symbols"] = _validate_eligible_symbols(
+                spec["eligible_symbols"])
         return spec
     spec["confirmations"] = _validate_confirmations(spec["confirmations"])
     for name, (lower, upper, cast) in _V2_BOUNDS.items():
@@ -457,9 +527,15 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if spec["max_atr_bps"] <= spec["min_atr_bps"]:
         raise RuleSpecError("rule_spec.max_atr_bps must exceed min_atr_bps")
     if schema == RULE_SCHEMA_V2:
+        if "eligible_symbols" in spec:
+            spec["eligible_symbols"] = _validate_eligible_symbols(
+                spec["eligible_symbols"])
         return spec
     breakeven = spec.get("breakeven_r")
     if breakeven is None:
+        if "eligible_symbols" in spec:
+            spec["eligible_symbols"] = _validate_eligible_symbols(
+                spec["eligible_symbols"])
         return spec
     if isinstance(breakeven, bool):
         raise RuleSpecError("rule_spec.breakeven_r has an invalid type")
@@ -474,6 +550,9 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if breakeven >= float(spec["target_r"]):
         raise RuleSpecError("rule_spec.breakeven_r must be below target_r")
     spec["breakeven_r"] = breakeven
+    if "eligible_symbols" in spec:
+        spec["eligible_symbols"] = _validate_eligible_symbols(
+            spec["eligible_symbols"])
     return spec
 
 
@@ -822,6 +901,53 @@ def _context_digest(benchmark_rows: Sequence[Any]) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+def cross_sectional_symbol_eligibility(
+        symbol: str | None, *, rows: Sequence[Any] = (),
+        spec: Mapping[str, Any] | None = None,
+        benchmark_symbol: str = CROSS_SECTIONAL_BENCHMARK) -> dict[str, Any]:
+    """Classify whether a residual-family subject is comparable to SPY.
+
+    The result is descriptive and deterministic; callers still evaluate the
+    ordinary single-leg signal and execution gates. The default set is the
+    shipped equity-ETF universe with the known rates/credit and metals
+    exposures excluded. An authored allowlist can narrow that set, but cannot
+    expand it; unknown symbols therefore fail closed.
+    """
+
+    normalized_spec = validate_rule_spec(spec) if spec is not None else None
+    subject = str(symbol or "").strip().upper()
+    benchmark = str(benchmark_symbol or CROSS_SECTIONAL_BENCHMARK).strip().upper()
+    result: dict[str, Any] = {
+        "schema": "cross-sectional-eligibility.v1",
+        "symbol": subject,
+        "benchmark_symbol": benchmark,
+        "eligible": False,
+        "status": "ineligible",
+        "reason": "subject_symbol_missing" if not subject else None,
+        "source": "none",
+    }
+    if not subject:
+        return result
+    if subject == benchmark:
+        result.update(reason="benchmark_self_reference", source="benchmark_policy")
+        return result
+    allowlist = ((normalized_spec or {}).get("eligible_symbols")
+                 if normalized_spec is not None else None)
+    if allowlist is not None and subject not in set(allowlist):
+        result.update(reason="symbol_not_in_spec_eligibility", source="spec_allowlist")
+        return result
+
+    if subject not in CROSS_SECTIONAL_DEFAULT_ELIGIBLE_SYMBOLS:
+        result.update(reason="symbol_not_in_default_eligibility",
+                      source="default_universe")
+        return result
+    result.update(eligible=True, status="eligible",
+                  reason="eligible_equity_etf",
+                  source=("spec_allowlist" if allowlist is not None
+                          else "default_universe"))
+    return result
+
+
 def rule_behavior_identity(value: Mapping[str, Any], *,
                            market_context_digest: str | None = None) -> str:
     """Return executable identity, including context for relative rules."""
@@ -854,6 +980,11 @@ def _cross_sectional_direction(
     subject_symbol = str(symbol or _row_symbol(subject[-1]) or "").strip().upper()
     if not subject_symbol:
         return None, "subject_symbol_missing", metadata
+    eligibility = cross_sectional_symbol_eligibility(
+        subject_symbol, rows=subject, spec=spec)
+    metadata["eligibility"] = eligibility
+    if not eligibility["eligible"]:
+        return None, f"subject_context_ineligible:{eligibility['reason']}", metadata
     if any(row_symbol not in (None, subject_symbol)
            for row_symbol in (_row_symbol(row) for row in subject)):
         return None, "subject_context_misaligned", metadata
@@ -1476,6 +1607,8 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
 
 __all__ = [
     "BAR_SECONDS", "CONFIRMATIONS", "CROSS_SECTIONAL_BENCHMARK",
+    "CROSS_SECTIONAL_DEFAULT_ELIGIBLE_SYMBOLS",
+    "CROSS_SECTIONAL_MAX_ELIGIBLE_SYMBOLS",
     "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
     "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
@@ -1485,6 +1618,7 @@ __all__ = [
            "OPENING_ANCHORED_FAMILIES",
            "entry_window_bounds", "session_minutes",
            "feature_window_bars", "rule_behavior_identity",
+           "cross_sectional_symbol_eligibility",
            "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",
     "RuleSpecError", "breakeven_stop_price", "completed_bar_exit_transition",

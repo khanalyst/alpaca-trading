@@ -22,6 +22,7 @@ import io
 import json
 from dataclasses import replace
 import math
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -32,15 +33,18 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.ibr import generate_ibr_signal
 from agent.contracts.rule import (
-    CROSS_SECTIONAL_BENCHMARK, evaluate_rule_signal_trace,
-    generate_rule_signal, rule_variant_id, rule_vehicle_executable,
-    validate_rule_spec,
+    CROSS_SECTIONAL_BENCHMARK, cross_sectional_symbol_eligibility,
+    evaluate_rule_signal_trace, generate_rule_signal, rule_behavior_identity,
+    rule_variant_id, rule_vehicle_executable, validate_rule_spec,
 )
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
 from deploy.recorder import INDEX_NAME as RECORDER_INDEX_NAME, corpus_partitions
 from research.costs import (ReplayPolicy, cost_model_for_vehicle,
                              replay_policy_for_session)
+from research.stressed_cost_calibration import (
+    load_stress_calibration_artifact, verify_stress_calibration_artifact,
+)
 from research.edge_discovery_core import _effective_ibr_config, _opportunity_rows
 from research.edge_discovery_core import _null_reference_rows, null_control_account
 from research.edge_lab import _null_spec
@@ -82,6 +86,8 @@ MAX_ACTIVE_REPLAY_QUARANTINE = 1024
 REPLAY_QUARANTINE_OVERFLOW_KEY = "__replay_quarantine_overflow__"
 SHADOW_MANIFEST_META_PREFIX = "shadow-manifest.v1:"
 SHADOW_MANIFEST_LATEST_KEY = "shadow-manifest.v1:latest"
+_REPLAY_CODE_BUNDLE_ROOTS = ("agent", "research")
+_REPLAY_CODE_BUNDLE_EXTRAS = ("deploy/recorder.py", "requirements.lock.txt")
 
 
 class ShadowError(RuntimeError):
@@ -101,6 +107,28 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _replay_code_hash() -> str:
+    """Return a deterministic hash of the bounded replay source bundle."""
+    root = Path(__file__).resolve().parents[1]
+    files = {
+        path.relative_to(root).as_posix()
+        for name in _REPLAY_CODE_BUNDLE_ROOTS
+        for path in (root / name).rglob("*.py")
+        if path.is_file()
+    }
+    files.update(name for name in _REPLAY_CODE_BUNDLE_EXTRAS
+                if (root / name).is_file())
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        digest.update(name.encode("utf-8") + b"\0")
+        path = root / name
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(f"missing:{name}".encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _validated_shadow_manifest(
         value: Any, *, requested_digest: str | None = None) -> dict[str, Any]:
     """Validate one persisted manifest before exposing it to callers.
@@ -113,6 +141,10 @@ def _validated_shadow_manifest(
     """
     if not isinstance(value, Mapping) or value.get("schema") != "shadow-manifest.v1":
         raise ShadowError("shadow manifest metadata is invalid")
+    replay_code_hash = value.get("replay_code_hash")
+    if (not isinstance(replay_code_hash, str) or
+            replay_code_hash != _replay_code_hash()):
+        raise ShadowError("shadow manifest replay code identity is invalid")
     stored_digest = value.get("manifest_digest")
     body = dict(value)
     body.pop("manifest_digest", None)
@@ -247,9 +279,10 @@ def _event_end(row: Mapping[str, Any]) -> datetime | None:
     return stamp + timedelta(minutes=1) if stamp is not None else None
 
 
-def _session_policy(config: Mapping[str, Any], close_at: datetime | None) -> ReplayPolicy:
+def _session_policy(config: Mapping[str, Any], close_at: datetime | None,
+                    *, policy: ReplayPolicy | None = None) -> ReplayPolicy:
     """Apply runtime close-relative entry and force-flat cutoffs to replay."""
-    policy = _policy(config)
+    policy = _policy(config) if policy is None else policy
     if close_at is None:
         return policy
     local_close = close_at.astimezone(NEW_YORK)
@@ -292,6 +325,69 @@ def _iso_time(value: Any) -> str | None:
 def _number_or_none(value: Any) -> float | None:
     number = _finite(value)
     return None if number is None else round(number, 10)
+
+
+_CROSS_SECTIONAL_CONTEXT_FIELDS = (
+    "benchmark_symbol", "market_context_digest",
+    "candidate_behavior_identity", "residual_return", "eligibility",
+)
+
+
+def _canonical_context_value(value: Any) -> Any:
+    """Return a deterministic JSON-safe projection of context metadata."""
+    try:
+        return json.loads(_json(value))
+    except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+        return str(value)
+
+
+def _cross_sectional_context(sources: Sequence[Mapping[str, Any]], *,
+                            force: bool = False,
+                            defaults: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Project relative-rule context, retaining missing values as ``None``.
+
+    The context is omitted for ordinary arms so their legacy signatures remain
+    byte-for-byte compatible.  Once a cross-sectional marker or one context
+    field is present, all fields are bound; a missing replay field therefore
+    fails closed instead of silently matching.
+    """
+    flattened: list[Mapping[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        flattened.append(source)
+        for nested_key in ("context", "market_context", "metadata",
+                           "cross_sectional_context"):
+            nested = source.get(nested_key)
+            if isinstance(nested, Mapping):
+                flattened.append(nested)
+    present = force or any(
+        any(field in source for field in _CROSS_SECTIONAL_CONTEXT_FIELDS)
+        for source in flattened)
+    if not present:
+        return {}
+    fallback = defaults if isinstance(defaults, Mapping) else {}
+    result: dict[str, Any] = {}
+    for field in _CROSS_SECTIONAL_CONTEXT_FIELDS:
+        value: Any = None
+        found = False
+        for source in flattened:
+            if field in source:
+                value = source[field]
+                found = True
+                break
+        if not found and field in fallback:
+            value = fallback[field]
+        if field == "benchmark_symbol" and value is not None:
+            value = str(value).strip().upper()
+        elif field in {"market_context_digest", "candidate_behavior_identity"}:
+            value = None if value is None else str(value)
+        elif field == "residual_return":
+            value = _number_or_none(value)
+        elif field == "eligibility" and value is not None:
+            value = _canonical_context_value(value)
+        result[field] = value
+    return result
 
 
 def _canonical_equity_feed(value: Any) -> str | None:
@@ -391,6 +487,65 @@ def _opportunity_capacity(rows: Sequence[Mapping[str, Any]], *,
     }
 
 
+def _signal_dispositions(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Count signal opportunities by actual shadow admission disposition.
+
+    ``decisions`` includes data checks and no-signal observations, so using
+    its row count as a signal denominator materially understates admission and
+    refusal rates.  A generated signal is the opportunity boundary; an
+    ``open_incomplete`` decision is admitted and every other disposition is a
+    refusal (including stale/unpriced, risk, and duplicate-book vetoes).
+    """
+    opportunities = admitted = refused = 0
+    refusal_reasons: dict[str, int] = {}
+    by_candidate: dict[str, dict[str, int]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        payload: Any = row.get("payload")
+        if payload is None:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+        if not isinstance(payload, Mapping):
+            continue
+        signal = payload.get("signal")
+        if not isinstance(signal, Mapping) or not signal:
+            continue
+        opportunities += 1
+        kind = str(row.get("kind") or "")
+        if kind == "open_incomplete":
+            admitted += 1
+            disposition = "admitted"
+        else:
+            refused += 1
+            disposition = "refused"
+            reason = str(row.get("reason") or "unspecified")[:120]
+            refusal_reasons[reason] = refusal_reasons.get(reason, 0) + 1
+        candidate = str(row.get("candidate_id") or "")
+        if candidate:
+            item = by_candidate.setdefault(candidate, {
+                "signal_opportunities": 0, "admitted": 0, "refused": 0,
+            })
+            item["signal_opportunities"] += 1
+            item[disposition] += 1
+    return {
+        "denominator": "generated_signal",
+        "signal_opportunities": opportunities,
+        "signal_opportunity_count": opportunities,
+        "opportunities": opportunities,
+        "admitted": admitted,
+        "admitted_count": admitted,
+        "refused": refused,
+        "refused_count": refused,
+        "admitted_rate": (admitted / opportunities if opportunities else 0.0),
+        "refused_rate": (refused / opportunities if opportunities else 0.0),
+        "refusal_reason_counts": dict(sorted(refusal_reasons.items())[:64]),
+        "by_candidate": dict(sorted(by_candidate.items())[-64:]),
+    }
+
+
 def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
     """Project a runtime shadow open into the replay comparison contract."""
     if row.get("kind") != "open_incomplete":
@@ -419,7 +574,7 @@ def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
         # Legacy shadow payloads predate explicit causal timestamps.
         entry_ts = (datetime.fromtimestamp(signal_ts, UTC) +
                     timedelta(seconds=60)).isoformat()
-    return {
+    signature = {
         "symbol": str(row.get("symbol") or plan.get("symbol") or signal.get("symbol") or ""),
         "session_date": str(row.get("session_date") or plan.get("session") or signal.get("session") or ""),
         "direction": str(plan.get("direction") or signal.get("direction") or ""),
@@ -438,12 +593,22 @@ def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
         "profile": execution_profile,
         "equity_feed": equity_feed,
     }
+    family = str(plan.get("family") or signal.get("family") or
+                 payload.get("family") or "").lower()
+    setup_type = str(signature.get("setup_type") or "").lower()
+    context = _cross_sectional_context(
+        (plan, risk_plan, signal, snapshot, payload),
+        force=(family == "cross_sectional_residual" or
+               setup_type.endswith("cross_sectional_residual")))
+    signature.update(context)
+    return signature
 
 
 def _replay_signature(row: Mapping[str, Any], *, vehicle: str,
                       strategy_id: str, target_r: float | None = None,
                       setup_type: str | None = None,
-                      equity_feed: str | None = None) -> dict[str, Any] | None:
+                      equity_feed: str | None = None,
+                      context_defaults: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
     """Project a factory/IBR replay trade into the same semantic contract."""
     if row.get("no_trade") is True:
         return None
@@ -465,7 +630,7 @@ def _replay_signature(row: Mapping[str, Any], *, vehicle: str,
         resolved_target_r = abs(target - stop) / distance - 1.0
     setup_type = ("ibr_breakout" if strategy_id == "ibr" else
                   str(setup_type or row.get("setup_type") or "rule_signal"))
-    return {
+    signature = {
         "symbol": str(row.get("symbol") or ""),
         "session_date": str(row.get("session_date") or ""),
         "direction": direction,
@@ -483,6 +648,13 @@ def _replay_signature(row: Mapping[str, Any], *, vehicle: str,
         "profile": "options" if vehicle in {"option", "options"} else "shares",
         "equity_feed": _canonical_equity_feed(equity_feed),
     }
+    context = _cross_sectional_context(
+        (row,),
+        force=str(setup_type or row.get("setup_type") or "").lower().endswith(
+            "cross_sectional_residual"),
+        defaults=context_defaults)
+    signature.update(context)
+    return signature
 
 
 def _signature_diffs(expected: Sequence[Mapping[str, Any]],
@@ -491,7 +663,8 @@ def _signature_diffs(expected: Sequence[Mapping[str, Any]],
     key_fields = ("symbol", "session_date", "direction", "setup_type")
     compare_fields = ("signal_ts", "decision_ts", "entry_ts", "stop_price", "target_price",
                       "stop_distance", "range_high", "range_low", "target_r",
-                      "vehicle", "profile", "equity_feed")
+                      "vehicle", "profile", "equity_feed",
+                      *_CROSS_SECTIONAL_CONTEXT_FIELDS)
     left = sorted((dict(item) for item in expected),
                   key=lambda item: tuple(str(item.get(key) or "") for key in key_fields))
     right = sorted((dict(item) for item in observed),
@@ -654,6 +827,12 @@ class ShadowConfig:
     retention_days: int = DEFAULT_RETENTION_DAYS
     equity: float = DEFAULT_EQUITY
     poll_seconds: float = 60.0
+    # Shadow-only empirical stress overlay.  These fields are intentionally
+    # separate from candidate/runtime config: enabling them cannot mutate the
+    # trader's production policy or its persisted configuration.
+    stress_calibration_path: str | Path | None = None
+    stress_calibration_enabled: bool | None = None
+    stress_calibration_artifact: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_candidates", "max_events", "max_decisions", "max_workers",
@@ -665,6 +844,45 @@ class ShadowConfig:
             raise ValueError(f"max_workers must be <= {MAX_MAX_WORKERS}")
         if _finite(self.equity) is None or float(self.equity) <= 0:
             raise ValueError("equity must be positive and finite")
+        path = self.stress_calibration_path
+        if path in (None, ""):
+            path = (os.getenv("ALPACA_SHADOW_STRESS_CALIBRATION_PATH") or
+                    os.getenv("ALPACA_SHADOW_CALIBRATION_PATH") or None)
+        enabled = self.stress_calibration_enabled
+        if enabled is None:
+            raw = (os.getenv("ALPACA_SHADOW_STRESS_CALIBRATION_ENABLED") or
+                   os.getenv("ALPACA_SHADOW_CALIBRATION_ENABLED"))
+            if raw is None:
+                # A path is inert unless the dedicated operator switch is
+                # explicitly true; accidental artifact mounts must not alter
+                # shadow policy.
+                enabled = False
+            else:
+                normalized = str(raw).strip().lower()
+                if normalized not in {
+                        "0", "1", "false", "true", "no", "yes", "off", "on"}:
+                    raise ValueError(
+                        "shadow stress calibration enabled flag must be boolean")
+                enabled = normalized in {"1", "true", "yes", "on"}
+        if not isinstance(enabled, bool):
+            raise ValueError("stress_calibration_enabled must be true or false")
+        if enabled:
+            artifact = self.stress_calibration_artifact
+            reason = None
+            if artifact is None:
+                artifact, reason = load_stress_calibration_artifact(path)
+            if artifact is None:
+                raise ValueError(
+                    f"shadow stress calibration artifact unavailable: {reason or 'artifact_missing'}")
+            valid, reason = verify_stress_calibration_artifact(
+                artifact, expected_provider="alpaca")
+            if not valid:
+                raise ValueError(
+                    f"shadow stress calibration artifact invalid: {reason or 'artifact_invalid'}")
+            object.__setattr__(self, "stress_calibration_artifact", dict(artifact))
+        object.__setattr__(self, "stress_calibration_path",
+                           None if path in (None, "") else str(path))
+        object.__setattr__(self, "stress_calibration_enabled", bool(enabled))
 
 
 class ShadowStore:
@@ -783,6 +1001,7 @@ class ShadowStore:
                   BEGIN SELECT RAISE(ABORT, 'shadow trades are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS shadow_trades_no_delete BEFORE DELETE ON shadow_trades
                   BEGIN SELECT RAISE(ABORT, 'shadow trades are immutable'); END;
+                CREATE INDEX IF NOT EXISTS events_timestamp_idx ON events(timestamp);
             """)
 
     def ingest_event(self, row: Mapping[str, Any], *, max_events: int) -> tuple[str, bool]:
@@ -865,6 +1084,7 @@ class ShadowStore:
         body = dict(manifest)
         body.pop("manifest_digest", None)
         body.setdefault("schema", "shadow-manifest.v1")
+        body.setdefault("replay_code_hash", _replay_code_hash())
         digest = _digest(body)
         encoded = _json({**body, "manifest_digest": digest})
         with self._connection() as db:
@@ -1271,6 +1491,31 @@ class ShadowStore:
                 "SELECT * FROM events WHERE inserted_at>=? ORDER BY timestamp,event_key",
                 (float(inserted_after),))]
 
+    def events_for_sessions(self, sessions: Sequence[str], *,
+                            max_events: int) -> list[dict]:
+        """Read bounded immutable events for replay-correction sessions only."""
+        ranges: list[tuple[str, str]] = []
+        for raw in sorted({str(value) for value in sessions if str(value).strip()}):
+            try:
+                day = date.fromisoformat(raw)
+            except ValueError:
+                continue
+            opened = datetime.combine(day, dt_time.min, tzinfo=NEW_YORK).astimezone(UTC)
+            ranges.append((opened.isoformat(), (opened + timedelta(days=1)).isoformat()))
+        if not ranges:
+            return []
+        clauses = " OR ".join("(timestamp>=? AND timestamp<?)" for _ in ranges)
+        params: list[Any] = [bound for item in ranges for bound in item]
+        params.append(int(max_events) + 1)
+        with self._connection() as db:
+            rows = db.execute(
+                f"SELECT * FROM events WHERE {clauses} "
+                "ORDER BY timestamp,event_key LIMIT ?", tuple(params)).fetchall()
+        if len(rows) > int(max_events):
+            raise ShadowError(
+                f"shadow replay validation event bound {max_events} exceeded")
+        return [dict(row) for row in rows]
+
     def decisions(self, candidate_id: str | None = None) -> list[dict]:
         with self._connection() as db:
             if candidate_id:
@@ -1283,6 +1528,19 @@ class ShadowStore:
         """Return a scalar decision count without materializing WAL rows."""
         with self._connection() as db:
             return int(db.execute("SELECT count(*) FROM decisions").fetchone()[0])
+
+    def gate_sessions(self) -> list[tuple[str, str]]:
+        """Return candidate/session pairs whose replay evidence currently gates."""
+        with self._connection() as db:
+            rows = db.execute("""SELECT DISTINCT t.candidate_id,t.session_date
+                FROM shadow_trades t JOIN replay_diffs d
+                  ON d.candidate_id=t.candidate_id
+                 AND d.session_date=t.session_date
+                 AND d.replay_digest=t.replay_digest
+                WHERE d.status='match' AND t.replay_status='match'
+                ORDER BY t.session_date,t.candidate_id""").fetchall()
+        return [(str(row["candidate_id"]), str(row["session_date"]))
+                for row in rows]
 
     def replay_diff(self, *, candidate_id: str, session_date: str, source_digest: str,
                     shadow_digest: str, replay_digest: str | None, status: str,
@@ -1610,6 +1868,80 @@ class ShadowRunner:
         # sibling candidate's virtual book.
         self._worker_state = threading.local()
 
+    def _shadow_policy(self, config: Mapping[str, Any]) -> ReplayPolicy:
+        """Resolve a candidate policy with the optional shadow-only overlay."""
+        base = _policy(config)
+        if not self.config.stress_calibration_enabled:
+            return base
+        artifact = self.config.stress_calibration_artifact
+        valid, reason = verify_stress_calibration_artifact(
+            artifact, expected_provider=base.equity_provider,
+            expected_feed=base.equity_feed)
+        if not valid:
+            raise ShadowError(
+                f"shadow stress calibration artifact invalid: {reason or 'artifact_invalid'}")
+        return replace(
+            base,
+            stressed_cost_calibration_enabled=True,
+            stressed_cost_calibration_path=self.config.stress_calibration_path,
+            stressed_cost_calibration_artifact=artifact,
+        )
+
+    def _stress_telemetry(self, policy: ReplayPolicy, *,
+                          symbol: str | None = None,
+                          timestamp: Any = None,
+                          vehicle: str = "equity") -> dict[str, Any]:
+        scenario, reason = policy.resolve_stress_scenario(
+            symbol, timestamp, vehicle=vehicle)
+        artifact = policy.stressed_cost_calibration_artifact
+        return {
+            "enabled": bool(policy.stressed_cost_calibration_enabled),
+            "effective_scenario_bps": scenario,
+            "activation_reason": reason,
+            "source": ("shadow_override" if self.config.stress_calibration_enabled
+                        else ("candidate_policy" if policy.stressed_cost_calibration_enabled
+                              else "disabled")),
+            "path": (self.config.stress_calibration_path
+                     if self.config.stress_calibration_enabled else
+                     policy.stressed_cost_calibration_path),
+            "artifact_content_hash": (
+                artifact.get("content_hash") if isinstance(artifact, Mapping)
+                else None),
+        }
+
+    def _calibration_status(self) -> dict[str, Any]:
+        """Return bounded operator-facing status for the shadow overlay."""
+        artifact = self.config.stress_calibration_artifact
+        scenarios = sorted({float(cell.get("selected_scenario_bps"))
+                            for cell in (artifact.get("cells", ())
+                                         if isinstance(artifact, Mapping) else ())
+                            if isinstance(cell, Mapping) and
+                            _finite(cell.get("selected_scenario_bps")) is not None})
+        return {
+            "enabled": bool(self.config.stress_calibration_enabled),
+            "source": ("shadow_override" if self.config.stress_calibration_enabled
+                        else "disabled"),
+            "path": self.config.stress_calibration_path,
+            "artifact_content_hash": (
+                artifact.get("content_hash") if isinstance(artifact, Mapping)
+                else None),
+            "validation": "valid" if self.config.stress_calibration_enabled else "disabled",
+            "effective_scenario_bps": scenarios[0] if len(scenarios) == 1 else None,
+            "effective_scenarios_bps": scenarios[:16],
+        }
+
+    def _shadow_candidate_config(self, config: Mapping[str, Any]) -> dict[str, Any]:
+        """Copy candidate config and apply only the shadow stress overlay."""
+        if not self.config.stress_calibration_enabled:
+            return dict(config)
+        result = dict(config)
+        risk = dict(config.get("risk") or {}) if isinstance(
+            config.get("risk"), Mapping) else {}
+        risk["stressed_cost_calibration_enabled"] = True
+        risk["stressed_cost_calibration_path"] = self.config.stress_calibration_path
+        result["risk"] = risk
+        return result
+
     def _rule_root_control(self, candidate: Mapping[str, Any]) -> dict[str, Any] | None:
         """Build the exact-window root control for a tuned rule candidate.
 
@@ -1647,12 +1979,12 @@ class ShadowRunner:
                 "config": config,
                 "axes": {"hypothesis_id": hypothesis_id, "role": "paired_root_control"}}
 
-    def _load_events(self) -> tuple[list[dict], dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
+    @staticmethod
+    def _group_event_rows(event_rows: Sequence[Mapping[str, Any]]) -> tuple[
+            dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
         bars: dict[str, list[dict]] = {}
         quotes: dict[str, list[dict]] = {}
         options: dict[str, list[dict]] = {}
-        floor = self.store.forward_event_floor() or 0.0
-        event_rows = self.store.events(inserted_after=floor)
         for row in event_rows:
             try:
                 payload = json.loads(row["event_json"])
@@ -1671,6 +2003,19 @@ class ShadowRunner:
         for values in (bars, quotes, options):
             for key in values:
                 values[key].sort(key=lambda row: str(row.get("timestamp") or ""))
+        return bars, quotes, options
+
+    def _load_events(self) -> tuple[list[dict], dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
+        floor = self.store.forward_event_floor() or 0.0
+        event_rows = self.store.events(inserted_after=floor)
+        bars, quotes, options = self._group_event_rows(event_rows)
+        return event_rows, bars, quotes, options
+
+    def _load_events_for_sessions(self, sessions: Sequence[str]) -> tuple[
+            list[dict], dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
+        event_rows = self.store.events_for_sessions(
+            sessions, max_events=self.config.max_events)
+        bars, quotes, options = self._group_event_rows(event_rows)
         return event_rows, bars, quotes, options
 
     @staticmethod
@@ -1692,7 +2037,7 @@ class ShadowRunner:
                   bars: Mapping[str, list], quotes: Mapping[str, list],
                   options: Mapping[str, list]) -> tuple[str, str | None, dict, dict | None]:
         symbol = str(event.get("symbol") or "")
-        cfg = _safe_config(candidate)
+        cfg = self._shadow_candidate_config(_safe_config(candidate))
         strategy = cfg.get("strategy", {})
         event_at = _availability_time(event)
         if event_at is None:
@@ -1710,7 +2055,8 @@ class ShadowRunner:
             return ("no_data", "exact broker calendar metadata unavailable",
                     {"session_date": session,
                      "calendar_source": calendar_source}, None)
-        policy = _session_policy(cfg, close_at)
+        policy = _session_policy(
+            cfg, close_at, policy=self._shadow_policy(cfg))
         expected_equity_feed = policy.equity_feed
         observed_equity_feed = _canonical_equity_feed(event.get("feed"))
         if observed_equity_feed != expected_equity_feed:
@@ -1788,7 +2134,10 @@ class ShadowRunner:
             return "reject", f"signal exception: {type(exc).__name__}", {"error": str(exc)[:240]}, None
         base = {"session_date": session, "strategy_id": strategy_id,
                 "equity_feed": expected_equity_feed,
-                "variant_id": candidate.get("variant_id"), "signal": signal}
+                "variant_id": candidate.get("variant_id"), "signal": signal,
+                "stress_calibration": self._stress_telemetry(
+                    policy, symbol=symbol, timestamp=event_at,
+                    vehicle=str(candidate.get("vehicle") or "equity"))}
         if signal is None:
             if (rule_spec is not None and
                     rule_spec["family"] == "cross_sectional_residual"):
@@ -1937,7 +2286,7 @@ class ShadowRunner:
         # digest so a corrected/stale option snapshot cannot be mistaken for
         # the same replay window merely because the underlying bars/quotes
         # were unchanged.
-        cfg = _safe_config(candidate)
+        cfg = self._shadow_candidate_config(_safe_config(candidate))
         session_cfg = cfg.get("session") if isinstance(cfg.get("session"), Mapping) else {}
         require_exact_calendar = bool(session_cfg.get("require_exact_calendar", False))
         calendar_close, calendar_source = _session_close(
@@ -1957,7 +2306,8 @@ class ShadowRunner:
         in_session_options = [row for row in (session_options or ())
                               if calendar_close is None or
                               (_timestamp(row.get("timestamp")) or calendar_close) <= calendar_close]
-        replay_policy = _session_policy(cfg, calendar_close)
+        replay_policy = _session_policy(
+            cfg, calendar_close, policy=self._shadow_policy(cfg))
         expected_equity_feed = replay_policy.equity_feed
         candidate_vehicle = str(candidate.get("vehicle") or "equity")
         feed_mismatches = [
@@ -2002,6 +2352,11 @@ class ShadowRunner:
                                                      if calendar_close else None),
                                    "calendar_source": calendar_source,
                                    "shadow_signatures": shadow_signatures,
+                                   "stress_calibration": self._stress_telemetry(
+                                       replay_policy,
+                                       vehicle=candidate_vehicle,
+                                       timestamp=(calendar_close or
+                                                  datetime.now(UTC))),
                                    "replay_signatures": replay_signatures}
         complete = bool(calendar_close is not None and
                         any((_event_end(row) or datetime.min.replace(tzinfo=UTC)) >=
@@ -2096,12 +2451,30 @@ class ShadowRunner:
                 realized_pnl = _finite(account.get("realized_pnl"))
                 if realized_pnl is None:
                     realized_pnl = ending_cash - starting_cash
+
+                normalized_spec = validate_rule_spec(spec)
+
+                def replay_context_defaults(trade: Mapping[str, Any]) -> dict[str, Any] | None:
+                    if normalized_spec["family"] != "cross_sectional_residual":
+                        return None
+                    defaults: dict[str, Any] = {
+                        "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
+                        "eligibility": cross_sectional_symbol_eligibility(
+                            str(trade.get("symbol") or ""), spec=normalized_spec),
+                    }
+                    context_digest = trade.get("market_context_digest")
+                    if context_digest is not None:
+                        defaults["candidate_behavior_identity"] = rule_behavior_identity(
+                            normalized_spec, market_context_digest=str(context_digest))
+                    return defaults
+
                 replay_signatures = [signature for trade in rows
                                      if (signature := _replay_signature(
                                          trade, vehicle=candidate_vehicle,
                                          strategy_id="rule", target_r=float(spec.get("target_r", 2.0)),
                                          setup_type=f"rule_{spec.get('family', 'signal')}",
-                                         equity_feed=expected_equity_feed)) is not None]
+                                         equity_feed=expected_equity_feed,
+                                         context_defaults=replay_context_defaults(trade))) is not None]
                 details.update(complete=complete, trade_count=len(replay_signatures),
                                replay_signatures=replay_signatures, account=account)
                 details["opportunity_capacity"] = _opportunity_capacity(
@@ -2471,6 +2844,8 @@ class ShadowRunner:
             stored_events = self.store.event_count()
             decision_count = self.store.decision_count()
             quarantine_through = self.store.quarantine_through_session()
+            signal_dispositions = _signal_dispositions(self.store.decisions())
+            calibration_status = self._calibration_status()
             stale_tail = {
                 "status": "blocked" if (
                     invalid_sessions or unknown_quarantine or pending_repairs or
@@ -2485,10 +2860,13 @@ class ShadowRunner:
                     if item.get("session_date")}),
                 "replay_quarantine": pending_repairs[-64:],
                 "authoritative_catalog_sessions": [],
+                "signal_dispositions": signal_dispositions,
+                "stress_calibration": calibration_status,
             }
             candidate_watermark: list[dict[str, Any]] = []
             manifest = {
                 "schema": "shadow-manifest.v1",
+                "replay_code_hash": _replay_code_hash(),
                 "replay_scope": "no_candidates",
                 "candidate_set": candidate_watermark,
                 "candidate_set_digest": _digest(candidate_watermark),
@@ -2525,6 +2903,8 @@ class ShadowRunner:
                 "stale_tail": stale_tail,
                 "replay_quarantine": pending_repairs[-64:],
                 "opportunity_capacity": [],
+                "signal_dispositions": signal_dispositions,
+                "stress_calibration": calibration_status,
                 **prune,
             }
         events, bars, quotes, options = self._load_events()
@@ -2613,6 +2993,39 @@ class ShadowRunner:
         for arm in arms:
             self.store.upsert_candidate(arm)
 
+        # A strict forward floor intentionally excludes already-consumed
+        # source rows. Revalidate only sessions that currently contribute
+        # matched gate evidence, using a timestamp-indexed bounded WAL query;
+        # this catches corrected replay semantics without rescanning corpus
+        # history or treating a no-op poll as fresh evidence.
+        arm_ids = {str(arm.get("candidate_id") or "") for arm in arms}
+        gate_pairs = {(candidate_id, session)
+                      for candidate_id, session in self.store.gate_sessions()
+                      if candidate_id in arm_ids}
+        replay_only_sessions = {
+            session for _candidate_id, session in gate_pairs
+            if session not in session_inputs}
+        if replay_only_sessions:
+            old_events, old_bars, old_quotes, old_options = (
+                self._load_events_for_sessions(sorted(replay_only_sessions)))
+            for target, source in ((bars, old_bars), (quotes, old_quotes),
+                                  (options, old_options)):
+                for symbol, values in source.items():
+                    target.setdefault(symbol, []).extend(values)
+            for session in sorted(replay_only_sessions):
+                session_events[session] = [
+                    row for row in old_events
+                    if row.get("event_type") in {"bar", "bar_1m"}
+                    and row_session(row) == session]
+                session_inputs[session] = (
+                    [row for values in old_bars.values() for row in values
+                     if row_session(row) == session],
+                    [row for values in old_quotes.values() for row in values
+                     if row_session(row) == session],
+                    [row for values in old_options.values() for row in values
+                     if row_session(row) == session],
+                )
+
         # Convert all worker inputs to detached JSON values and tuples.  The
         # tuples are never handed to a mutating path, making the poll snapshot
         # explicit even if a provider returns mutable row objects.
@@ -2659,6 +3072,7 @@ class ShadowRunner:
         } for arm in arms]
         manifest = {
             "schema": "shadow-manifest.v1",
+            "replay_code_hash": _replay_code_hash(),
             "candidate_set": candidate_watermark,
             "candidate_set_digest": _digest(candidate_watermark),
             "source_watermark": {
@@ -2666,7 +3080,10 @@ class ShadowRunner:
                 "forward_event_floor": float(forward_floor or 0.0),
             },
             "event_watermark": event_watermark,
-            "session_watermark": sorted(str(session) for session in frozen_session_events),
+            "session_watermark": sorted(str(session) for session in
+                                         set(frozen_session_events) |
+                                         replay_only_sessions),
+            "replay_validation_sessions": sorted(replay_only_sessions),
             "max_workers": int(self.config.max_workers),
         }
         # A successful replay advances the immutable event floor below.  On a
@@ -2677,12 +3094,14 @@ class ShadowRunner:
         prior_manifest = self.store.manifest()
         reuse_manifest = bool(
             not events and not frozen_session_events and
+            not replay_only_sessions and
             isinstance(prior_manifest, Mapping) and
             prior_manifest.get("candidate_set_digest") == manifest["candidate_set_digest"] and
             prior_manifest.get("source_watermark", {}).get("offsets") ==
             manifest["source_watermark"]["offsets"] and
             prior_manifest.get("source_watermark", {}).get("forward_event_floor") ==
-            manifest["source_watermark"]["forward_event_floor"])
+            manifest["source_watermark"]["forward_event_floor"] and
+            prior_manifest.get("replay_code_hash") == manifest["replay_code_hash"])
         if reuse_manifest:
             manifest = dict(prior_manifest)
             manifest_digest = str(manifest["manifest_digest"])
@@ -2697,11 +3116,17 @@ class ShadowRunner:
         candidate_errors: dict[str, str] = {}
         failed_arms: set[str] = set()
         replay_blocked = False
-        for session in sorted(frozen_session_events):
+        replay_decisions: dict[str, list[dict[str, Any]]] = {}
+        for session in sorted(set(frozen_session_events) | replay_only_sessions):
+            is_replay_only = session in replay_only_sessions
             session_events_one = {session: frozen_session_events[session]}
             session_inputs_one = {session: frozen_session_inputs[session]}
+            session_candidates = ({candidate_id for candidate_id, value in gate_pairs
+                                   if value == session}
+                                  if is_replay_only else arm_ids)
             active_arms = [arm for arm in arms
-                           if str(arm["candidate_id"]) not in failed_arms]
+                           if str(arm["candidate_id"]) in session_candidates and
+                           str(arm["candidate_id"]) not in failed_arms]
             session_success = bool(active_arms)
             initial_states = {
                 str(arm["candidate_id"]): self._portfolio_state(
@@ -2760,6 +3185,8 @@ class ShadowRunner:
                                 "event_key": str(decision.get("event_key") or "")}),
                             symbol=str(decision.get("symbol") or ""),
                             plan=decision["plan"])
+                if is_replay_only:
+                    replay_decisions[candidate_id] = decisions
 
             # Replay is parent-only and runs before the next session barrier.
             session_bars, session_quotes, session_options = frozen_session_inputs[session]
@@ -2769,6 +3196,19 @@ class ShadowRunner:
                     continue
                 try:
                     rows = self.store.decisions(candidate_id)
+                    if is_replay_only and candidate_id in replay_decisions:
+                        current_rows = [{
+                            "candidate_id": candidate_id,
+                            "event_key": str(item.get("event_key") or ""),
+                            "session_date": str(item.get("session_date") or ""),
+                            "symbol": str(item.get("symbol") or ""),
+                            "kind": str(item.get("kind") or "no_data"),
+                            "reason": item.get("reason"),
+                            "payload_json": _json(item.get("payload") or {}),
+                        } for item in replay_decisions[candidate_id]]
+                        rows = [row for row in rows
+                                if row.get("session_date") != session]
+                        rows.extend(current_rows)
                     complete = self._replay(
                         arm_by_id[candidate_id], session, session_bars,
                         session_quotes, rows, session_options)
@@ -2842,6 +3282,10 @@ class ShadowRunner:
                 if isinstance(detail, Mapping)
                 and str(detail.get("source") or "") == "recorder_alpaca_calendar")[-64:],
         }
+        signal_dispositions = _signal_dispositions(self.store.decisions())
+        calibration_status = self._calibration_status()
+        stale_tail["signal_dispositions"] = signal_dispositions
+        stale_tail["stress_calibration"] = calibration_status
         # Surface the latest per-candidate capacity summaries without copying
         # raw account rows into the heartbeat.  Replay details are already
         # bounded at write time; retain only a deterministic candidate/session
@@ -2871,6 +3315,8 @@ class ShadowRunner:
                 "stale_tail": stale_tail,
                 "replay_quarantine": pending_repairs[-64:],
                 "opportunity_capacity": capacity,
+                "signal_dispositions": signal_dispositions,
+                "stress_calibration": calibration_status,
                 **prune}
 
 
@@ -2909,7 +3355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "DEFAULT_EQUITY", "DEFAULT_MAX_WORKERS", "DEFAULT_RETENTION_DAYS", "InputConflict",
-    "_opportunity_capacity", "REPLAY_QUARANTINE_META_KEY",
+    "_opportunity_capacity", "_signal_dispositions", "REPLAY_QUARANTINE_META_KEY",
     "SESSION_CATALOG_META_KEY", "REPLAY_QUARANTINE_OVERFLOW_KEY",
     "ShadowConfig", "ShadowError",
     "ShadowRunner", "ShadowStore", "run_shadow_once", "main",

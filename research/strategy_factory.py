@@ -66,7 +66,7 @@ from .stats import benjamini_hochberg, stable_seed
 from .fit_diagnostics import (bar_coverage_telemetry,
                                collapse_behavior_aliases,
                                measure_fit_diagnostics)
-from .signal_quality import measure_signal_quality
+from .signal_quality import SIGNAL_QUALITY_SCHEMA, measure_signal_quality
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
@@ -119,6 +119,68 @@ SHARED_LEARNING_MIN_ATTEMPTS = 3
 # produced; the root is an ordinary null-tested candidate and consumes
 # multiplicity alongside its mutations.
 HYPOTHESIS_LESSON_KINDS = ("discovery", "reseed", "replacement", "rotation")
+
+# The worker hand-off has its own compact persistence schema (v2), while the
+# underlying signal-quality measurement has an independent versioned schema.
+# Never let a result produced before the current measurement contract be
+# interpreted as an actionable no-signal screen.  The stale reason is kept
+# explicit in the durable record so operators can distinguish schema drift
+# from a genuinely complete negative screen.
+SIGNAL_QUALITY_SCREEN_SCHEMA = "signal-quality-screen.v2"
+STALE_SIGNAL_QUALITY_SCHEMA_REASON = "stale_signal_quality_schema"
+
+# A compact screen is handed across a worker boundary and may later be read
+# from a durable task payload.  Its digest therefore binds every field that
+# can influence replay suppression, while the provenance block binds the
+# underlying current signal-quality result, variant, fit scope, and cell
+# count.  ``_screen_record_can_skip`` recomputes this digest before allowing a
+# skip; a non-empty arbitrary string is not evidence.
+_SCREEN_PROVENANCE_SCHEMA = "signal-quality-screen-provenance.v1"
+
+
+def _screen_record_binding_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the canonical compact payload covered by a screen digest."""
+    return {str(key): value for key, value in record.items()
+            if str(key) != "digest"}
+
+
+def _seal_signal_quality_screen_record(
+        record: Mapping[str, Any], *, quality: Mapping[str, Any] | None = None,
+        quality_digest: str | None = None) -> dict[str, Any]:
+    """Attach authenticated compact provenance to a current screen result.
+
+    ``quality`` is retained only through its digest.  Test/worker seams that
+    construct an already-compact result may supply a precomputed digest, but
+    all records still receive the same exact variant/scope/fit-cell binding.
+    """
+    sealed = dict(record)
+    if quality_digest is None and isinstance(quality, Mapping):
+        quality_digest = content_hash(quality)
+    if (not isinstance(quality_digest, str) or len(quality_digest) != 64 or
+            any(char not in "0123456789abcdef"
+                for char in quality_digest.lower())):
+        return sealed
+    variant = str(sealed.get("variant_id") or "")
+    scope = str(sealed.get("scope") or "")
+    raw_fit_cells = sealed.get("fit_cells")
+    try:
+        fit_cells = int(raw_fit_cells)
+        if (isinstance(raw_fit_cells, bool) or
+                float(fit_cells) != float(raw_fit_cells)):
+            return sealed
+    except (TypeError, ValueError, OverflowError):
+        return sealed
+    provenance = {
+        "schema": _SCREEN_PROVENANCE_SCHEMA,
+        "quality_schema": SIGNAL_QUALITY_SCHEMA,
+        "quality_digest": quality_digest,
+        "variant_id": variant,
+        "scope": scope,
+        "fit_cells": fit_cells,
+    }
+    sealed["provenance"] = provenance
+    sealed["digest"] = content_hash(_screen_record_binding_payload(sealed))
+    return sealed
 
 
 # The model may help order a bounded fit search, but it must not see evidence
@@ -1993,7 +2055,7 @@ def _signal_quality_screen_record(
     compact.
     """
     record: dict[str, Any] = {
-        "schema": "signal-quality-screen.v1",
+        "schema": SIGNAL_QUALITY_SCREEN_SCHEMA,
         "scope": "fit_only",
         "authorizing": False,
         "diagnostic_only": True,
@@ -2005,6 +2067,19 @@ def _signal_quality_screen_record(
         "digest": None,
     }
     if not isinstance(quality, Mapping):
+        return record
+    # ``signal-quality.v2`` changed the control semantics and error fields.
+    # A persisted or handed-off result from an earlier schema must remain
+    # eligible for fresh replay but unusable as screening or promotion
+    # evidence. Keep an explicit stale reason rather than treating an
+    # otherwise similar shape as current evidence.
+    if quality.get("schema") != SIGNAL_QUALITY_SCHEMA:
+        record.update({
+            "status": "unknown",
+            "reason": STALE_SIGNAL_QUALITY_SCHEMA_REASON,
+            "received_schema": quality.get("schema"),
+            "expected_schema": SIGNAL_QUALITY_SCHEMA,
+        })
         return record
     # The API markers are part of the contract.  A result that omits one or
     # changes scope is not allowed to make an execution decision.
@@ -2128,6 +2203,9 @@ def _signal_quality_screen_record(
                            "reason": "actionable_signal_present"})
     else:
         record.update({"status": "unknown", "reason": "unexpected_rejections"})
+    if record["status"] in {"complete_zero_actionable_signal",
+                             "complete_nonpositive_control"}:
+        record = _seal_signal_quality_screen_record(record, quality=quality)
     return record
 
 
@@ -2135,13 +2213,33 @@ def _screen_record_can_skip(record: Any, *, variant_id: str) -> bool:
     """Require a complete fit-only zero-signal or negative-control contract."""
     if not isinstance(record, Mapping):
         return False
-    if (record.get("schema") != "signal-quality-screen.v1" or
+    if (record.get("schema") != SIGNAL_QUALITY_SCREEN_SCHEMA or
             record.get("scope") != "fit_only" or
             record.get("authorizing") is not False or
             record.get("diagnostic_only") is not True or
             str(record.get("variant_id") or "") != str(variant_id) or
             not isinstance(record.get("digest"), str) or
             not record.get("digest")):
+        return False
+    digest = str(record.get("digest"))
+    if (len(digest) != 64 or
+            any(char not in "0123456789abcdef" for char in digest.lower())):
+        return False
+    provenance = record.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    quality_digest = provenance.get("quality_digest")
+    if (provenance.get("schema") != _SCREEN_PROVENANCE_SCHEMA or
+            provenance.get("quality_schema") != SIGNAL_QUALITY_SCHEMA or
+            not isinstance(quality_digest, str) or len(quality_digest) != 64 or
+            any(char not in "0123456789abcdef"
+                for char in quality_digest.lower()) or
+            str(provenance.get("variant_id") or "") != str(variant_id) or
+            provenance.get("scope") != "fit_only" or
+            provenance.get("scope") != record.get("scope") or
+            provenance.get("fit_cells") != record.get("fit_cells")):
+        return False
+    if content_hash(_screen_record_binding_payload(record)) != digest:
         return False
     status = str(record.get("status") or "")
     reason = str(record.get("reason") or "")
@@ -2207,6 +2305,39 @@ def _screen_record_can_skip(record: Any, *, variant_id: str) -> bool:
         return False
 
 
+def _stale_screen_record(record: Mapping[str, Any], *, variant_id: str,
+                         fit_cells: Any = None) -> dict[str, Any]:
+    """Quarantine a screen hand-off from an unsupported schema.
+
+    Worker seams and persisted ledgers are intentionally treated as untrusted
+    inputs.  Keeping the normalized unknown shape lets the report explain why
+    replay remained queued while ensuring no stale status/reason can be used
+    as a terminal no-edge decision.
+    """
+    raw_fit_cells = fit_cells
+    try:
+        normalized_fit_cells = int(raw_fit_cells)
+        if (isinstance(raw_fit_cells, bool) or normalized_fit_cells < 0 or
+                float(normalized_fit_cells) != float(raw_fit_cells)):
+            raise ValueError("invalid fit cell count")
+    except (TypeError, ValueError, OverflowError):
+        normalized_fit_cells = None
+    return {
+        "schema": SIGNAL_QUALITY_SCREEN_SCHEMA,
+        "scope": "fit_only",
+        "authorizing": False,
+        "diagnostic_only": True,
+        "variant_id": str(variant_id),
+        "status": "unknown",
+        "reason": STALE_SIGNAL_QUALITY_SCHEMA_REASON,
+        "event_count": None,
+        "fit_cells": normalized_fit_cells,
+        "digest": None,
+        "received_schema": record.get("schema"),
+        "expected_schema": SIGNAL_QUALITY_SCHEMA,
+    }
+
+
 def _signal_quality_screen_worker(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Run the fit-only signal-quality pre-screen in a bounded worker.
 
@@ -2235,7 +2366,7 @@ def _signal_quality_screen_worker(payload: Mapping[str, Any]) -> dict[str, Any]:
                 # Per-variant API failures are diagnostic unknowns.  The
                 # orchestrator keeps that candidate scheduled.
                 record = {
-                    "schema": "signal-quality-screen.v1",
+                    "schema": SIGNAL_QUALITY_SCREEN_SCHEMA,
                     "scope": "fit_only",
                     "authorizing": False,
                     "diagnostic_only": True,
@@ -3885,9 +4016,18 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 raw_record = by_variant.get(variant_id)
                 if isinstance(raw_record, Mapping):
                     record = dict(raw_record)
+                    # A provider/worker may hand back a persisted
+                    # ``signal-quality.v1`` (or another pre-screen shape)
+                    # instead of the compact screen contract.  Quarantine it
+                    # before status evaluation: stale evidence must remain in
+                    # the replay queue and carry an explicit schema reason.
+                    if record.get("schema") != SIGNAL_QUALITY_SCREEN_SCHEMA:
+                        record = _stale_screen_record(
+                            record, variant_id=variant_id,
+                            fit_cells=record.get("fit_cells"))
                 else:
                     record = {
-                        "schema": "signal-quality-screen.v1",
+                        "schema": SIGNAL_QUALITY_SCREEN_SCHEMA,
                         "scope": "fit_only", "authorizing": False,
                         "diagnostic_only": True, "variant_id": variant_id,
                         "status": "unknown", "reason": "worker_failure",
@@ -3937,7 +4077,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 else "actionable_signal_or_fail_open")
             task["specs"] = kept_specs
             signal_quality_screens[hypothesis_id] = {
-                "schema": "signal-quality-screen.v1",
+                "schema": SIGNAL_QUALITY_SCREEN_SCHEMA,
                 "scope": "fit_only",
                 "authorizing": False,
                 "diagnostic_only": True,

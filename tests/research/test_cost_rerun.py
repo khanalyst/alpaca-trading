@@ -7,16 +7,19 @@ control that caused it.
 """
 
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from agent.contracts.rule import validate_rule_spec
 from research.cost_rerun import (deterministic_cohort, render_text,
-                                 run_cost_rerun)
+                                 run_cost_rerun, verify_cost_evidence,
+                                 write_immutable_evidence)
 from tests.research.test_factory_end_to_end import edge_corpus
 
 
 def _config() -> dict:
-    config = json.loads(open("config.yaml", encoding="utf-8").read())
+    config = json.loads(Path("config.yaml").read_text(encoding="utf-8"))
     # The synthetic fixture carries no broker calendar bounds; a production
     # corpus is calendar-authoritative and keeps the shipped requirement.
     config["session"] = {**config["session"], "require_exact_calendar": False}
@@ -49,6 +52,48 @@ class CostRerunTests(unittest.TestCase):
         self.assertLess(models["measured_round_trip_bps"],
                         models["configured_round_trip_bps"])
 
+    def test_evidence_manifest_is_content_addressed_and_split_bound(self):
+        valid, reason = verify_cost_evidence(self.report)
+        self.assertTrue(valid, reason)
+        evidence = self.report["evidence"]
+        self.assertTrue(evidence["split_valid"])
+        self.assertTrue(evidence["corpus_hash"])
+        self.assertTrue(evidence["config_hash"])
+        self.assertTrue(evidence["spec_hash"])
+        self.assertTrue(evidence["measurement_code_hash"])
+        self.assertTrue(evidence["measurement_code_files"])
+        self.assertTrue(evidence["fit_sessions_hash"])
+        self.assertTrue(evidence["validation_sessions_hash"])
+
+        tampered = json.loads(json.dumps(self.report))
+        tampered["bars"] += 1
+        self.assertEqual(
+            verify_cost_evidence(tampered),
+            (False, "report_content_hash_invalid"),
+        )
+
+    def test_immutable_writer_refuses_to_replace_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "evidence.json"
+            written = write_immutable_evidence(target, self.report)
+            self.assertEqual(written["content_hash"], self.report["content_hash"])
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                write_immutable_evidence(target, self.report)
+
+    def test_immutable_writer_rejects_a_stale_supplied_hash(self):
+        tampered = json.loads(json.dumps(self.report))
+        tampered["bars"] += 1
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "tampered.json"
+            with self.assertRaisesRegex(ValueError, "content hash"):
+                write_immutable_evidence(target, tampered)
+            self.assertFalse(target.exists())
+
+    def test_option_vehicle_is_rejected_until_option_costs_are_measured(self):
+        with self.assertRaisesRegex(ValueError, "equity only"):
+            run_cost_rerun([], runtime_config=self.config, specs=(),
+                            vehicle="option")
+
     def test_only_the_cost_model_differs_between_arms(self):
         self.assertTrue(self.traded)
         for item in self.traded:
@@ -63,6 +108,30 @@ class CostRerunTests(unittest.TestCase):
                                 item["configured"]["drag_r"])
                 self.assertGreater(item["measured"]["net_pnl"],
                                    item["configured"]["net_pnl"])
+
+    def test_measured_cost_cells_are_used_inside_account_replay(self):
+        observed = 0
+        for item in self.traded:
+            for cell in item["measured"]["breakdown"]:
+                if not cell["executions"]:
+                    continue
+                observed += 1
+                provenance = cell["cost_model_provenance_counts"]
+                self.assertTrue(provenance)
+                self.assertTrue(all(
+                    value > 0 and key.startswith("measured:") and
+                    cell["symbol"] in key
+                    for key, value in provenance.items()))
+                self.assertTrue(cell["entry_cost_model_provenance_counts"])
+                self.assertTrue(cell["exit_cost_model_provenance_counts"])
+                self.assertGreaterEqual(cell["gross_pnl"], cell["net_pnl"])
+                uncertainty = cell["uncertainty"]
+                if uncertainty["ci95_r"] is not None:
+                    self.assertLessEqual(uncertainty["ci95_r"]["lower"],
+                                         cell["net_r"])
+                    self.assertGreaterEqual(uncertainty["ci95_r"]["upper"],
+                                            cell["net_r"])
+        self.assertGreater(observed, 0)
 
     def test_the_r_decomposition_ties_out_to_net(self):
         for item in self.traded:
