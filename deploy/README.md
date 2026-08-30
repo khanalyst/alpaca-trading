@@ -432,10 +432,11 @@ telemetry is reachability-only; bounded lower-target/hold proposals cannot
 authorize a candidate.
 
 Research never rewrites the append-only recorder corpus. A temporary cycle view
-explicitly quarantines legacy rows whose `as_of` is later than `observed_at`,
-emits `research-cycle-quarantine.v1` counts, and lets replay coverage/refusal
-gates account for the missing evidence. All other normalization and integrity
-errors still fail the cycle before discovery. The same source pass builds a
+explicitly quarantines legacy rows whose `as_of` is later than `observed_at`
+and excludes rows proven outside an authoritative Alpaca session, emitting
+`research-cycle-quarantine.v1` and `research-cycle-calendar-filter.v1` counts.
+Missing, malformed, or conflicting exact-calendar metadata still fails the
+cycle before discovery. The same source pass builds a
 compact bar/option worker view; factory workers share the parent's finalized
 read-only quote index, so each hypothesis no longer rescans and reindexes the
 full quote corpus. The parent verifies that view against the full normalized

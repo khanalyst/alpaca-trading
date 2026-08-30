@@ -832,9 +832,10 @@ permits bypassing the runtime edge gate.
 Before validation, the scheduled cycle builds temporary normalized views and
 emits `research-cycle-quarantine.v1`. Recorder rows from the legacy observation
 timestamp bug (`as_of > observed_at`) are excluded from those views without
-modifying the append-only source. Missing evidence remains visible to replay
-coverage/refusal gates; every other malformed row remains a hard validation
-failure.
+modifying the append-only source. Rows proven outside an authoritative Alpaca
+session, including an authoritative closed day, are likewise excluded and
+reported as `research-cycle-calendar-filter.v1`; missing, malformed, or
+conflicting exact-calendar metadata remains a hard validation failure.
 
 ```bash
 python research.py factory run --data market.jsonl --strategies 12 --variants 4 --workers 2

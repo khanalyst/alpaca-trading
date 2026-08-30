@@ -225,6 +225,34 @@ def _source_paths(source: Path | Sequence[Path] | Iterable[Path] | None,
     return paths
 
 
+def _normalize_calendar_entry(day: str, value: object, *, label: str) -> dict:
+    """Canonicalize one recorder calendar entry for semantic comparisons."""
+    try:
+        date.fromisoformat(day)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} has invalid calendar day {day!r}") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} for {day} is malformed")
+    if value.get("source") != "alpaca_calendar":
+        raise ValueError(f"{label} for {day} has unsupported source")
+    raw_status = value.get("status")
+    status = str(raw_status).strip().lower() if raw_status not in (None, "") else "open"
+    if status == "closed":
+        if value.get("open") not in (None, "") or value.get("close") not in (None, ""):
+            raise ValueError(f"{label} for {day} conflicts with closed status")
+        return {"status": "closed", "source": "alpaca_calendar"}
+    if status != "open":
+        raise ValueError(f"{label} for {day} has invalid status")
+    opened = _calendar_timestamp(value.get("open"))
+    closed = _calendar_timestamp(value.get("close"))
+    if (opened is None or closed is None or opened >= closed or
+            opened.astimezone(_NEW_YORK).date().isoformat() != day or
+            closed.astimezone(_NEW_YORK).date().isoformat() != day):
+        raise ValueError(f"{label} for {day} is malformed")
+    return {"status": "open", "open": opened.isoformat(),
+            "close": closed.isoformat(), "source": "alpaca_calendar"}
+
+
 def _partition_calendar_sidecars(source_paths: Sequence[Path],
                                  recorded_root: Path | None) -> dict | None:
     """Merge exact calendar markers across all selected old partitions.
@@ -271,15 +299,11 @@ def _partition_calendar_sidecars(source_paths: Sequence[Path],
         if not (root / partition).is_file():
             continue
         day = match.group(1)
-        opened = _calendar_timestamp(payload.get("open"))
-        closed = _calendar_timestamp(payload.get("close"))
-        if (opened is None or closed is None or opened >= closed or
-                opened.astimezone(_NEW_YORK).date().isoformat() != day or
-                closed.astimezone(_NEW_YORK).date().isoformat() != day or
-                payload.get("source") != "alpaca_calendar"):
-            raise ValueError(f"invalid exact calendar sidecar {path}")
-        value = {"open": opened.isoformat(), "close": closed.isoformat(),
-                 "source": "alpaca_calendar"}
+        try:
+            value = _normalize_calendar_entry(
+                day, payload, label=f"exact calendar sidecar {path}")
+        except ValueError as exc:
+            raise ValueError(f"invalid exact calendar sidecar {path}") from exc
         previous = result.get(day)
         if previous is not None and previous != value:
             raise ValueError(f"conflicting exact calendar sidecars for {day}")
@@ -382,19 +406,37 @@ def _config_and_sidecars(agent_config: Path | Mapping[str, object] | None,
         if sidecar is not None and sidecar.is_file():
             try:
                 payload = json.loads(sidecar.read_text(encoding="utf-8"))
-                if isinstance(payload, dict):
-                    value = payload.get("session_calendar")
-                    calendar = value if isinstance(value, dict) else None
-                    value = payload.get("partition_sources")
-                    partition_sources = value if isinstance(value, dict) else None
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 # This matches the cycle's fail-closed behavior when exact
                 # metadata is required; optional mode can still process rows.
                 calendar = None
                 partition_sources = None
+            else:
+                if isinstance(payload, dict):
+                    value = payload.get("session_calendar")
+                    if isinstance(value, dict):
+                        # Keep aggregate metadata lazy: old indexes can carry
+                        # unrelated malformed days outside this selected
+                        # window.  The selected row and marker overlap are
+                        # validated below when they become authoritative.
+                        calendar = {str(day): entry
+                                    for day, entry in value.items()}
+                    value = payload.get("partition_sources")
+                    partition_sources = value if isinstance(value, dict) else None
         marker_calendar = _partition_calendar_sidecars(source_paths, sidecar_root)
         if marker_calendar:
-            calendar = {**(calendar or {}), **marker_calendar}
+            aggregate = calendar or {}
+            for day, marker in marker_calendar.items():
+                previous = aggregate.get(day)
+                if previous is not None:
+                    previous = _normalize_calendar_entry(
+                        day, previous,
+                        label=f"recorder calendar index {sidecar}")
+                    if previous != marker:
+                        raise ValueError(
+                            f"conflicting recorder calendar metadata for {day}")
+                aggregate[day] = marker
+            calendar = aggregate
     return required, calendar, partition_sources
 
 
@@ -417,13 +459,19 @@ def _calendar_timestamp(value) -> datetime | None:
 def _apply_calendar(payload: dict, *, row_number: int,
                     calendar: dict | None,
                     partition_sources: Mapping[str, object] | None,
-                    required: bool) -> None:
+                    required: bool) -> bool:
+    """Validate exact session metadata and report whether a row is usable.
+
+    A row outside a valid exact session is a known legacy extended-hours row,
+    so it is safely skipped by the caller.  Every metadata/timestamp error
+    remains a hard failure; only the boundary comparison returns ``False``.
+    """
     stamp = _calendar_timestamp(payload.get("timestamp"))
     if stamp is None:
         if required:
             raise ValueError(
                 f"row {row_number} has no timestamp for exact calendar validation")
-        return
+        return True
     day = stamp.astimezone(_NEW_YORK).date().isoformat()
     apply_partition_source(payload, day, partition_sources, row_number=row_number)
 
@@ -432,8 +480,22 @@ def _apply_calendar(payload: dict, *, row_number: int,
     if (opened is None) != (closed is None):
         raise ValueError(f"row {row_number} has only one exact session boundary")
     side = calendar.get(day) if isinstance(calendar, dict) else None
+    if side is not None:
+        side = _normalize_calendar_entry(
+            day, side, label=f"calendar metadata for {day}")
+    side_status = (str(side.get("status") or "").strip().lower()
+                   if isinstance(side, Mapping) else "")
     side_open = _calendar_timestamp(side.get("open")) if isinstance(side, dict) else None
     side_close = _calendar_timestamp(side.get("close")) if isinstance(side, dict) else None
+    if side_status == "closed":
+        if (side_open is not None or side_close is not None or
+                payload.get("session_open") not in (None, "") or
+                payload.get("session_close") not in (None, "")):
+            raise ValueError(
+                f"row {row_number} conflicts with closed calendar for {day}")
+        return False
+    if side is not None and side_status not in {"", "open"}:
+        raise ValueError(f"calendar metadata for {day} is malformed")
     if side is not None and (side_open is None or side_close is None):
         raise ValueError(f"calendar metadata for {day} is malformed")
     if opened is None and side_open is not None:
@@ -443,15 +505,14 @@ def _apply_calendar(payload: dict, *, row_number: int,
     if opened is None:
         if required:
             raise ValueError(f"exact broker calendar metadata missing for {day}")
-        return
+        return True
     if (opened >= closed or
             opened.astimezone(_NEW_YORK).date().isoformat() != day or
             closed.astimezone(_NEW_YORK).date().isoformat() != day):
         raise ValueError(f"conflicting exact broker calendar metadata for {day}")
     if side_open is not None and (opened != side_open or closed != side_close):
         raise ValueError(f"row {row_number} conflicts with recorder calendar for {day}")
-    if not opened <= stamp < closed:
-        raise ValueError(f"row {row_number} is outside exact broker session {day}")
+    return opened <= stamp < closed
 
 
 def _selected_set(selected_vehicles: str | Iterable[object] | None) -> set[str] | None:
@@ -523,11 +584,14 @@ def build_views(
     selected = _selected_set(selected_vehicles)
     excluded_options = 0
     quarantined = Counter()
+    calendar_skipped = Counter()
     kept = 0
     view_counts = {"normalized": 0, "bars": 0, "quotes": 0,
                    "options": 0, "replay": 0}
     first_source_row = None
     last_source_row = None
+    calendar_first_source_row = None
+    calendar_last_source_row = None
 
     def rows_for(path: Path, row_offset: int = 0) -> Iterator[tuple[int, dict]]:
         if input_format == "csv":
@@ -575,10 +639,19 @@ def build_views(
 
                 transformed_row += 1
                 if agent_config is not None:
-                    _apply_calendar(
+                    in_session = _apply_calendar(
                         payload, row_number=transformed_row, calendar=calendar,
                         partition_sources=partition_sources,
                         required=required_calendar)
+                    if not in_session:
+                        calendar_skipped[kind or "unknown"] += 1
+                        if calendar_first_source_row is None:
+                            calendar_first_source_row = source_row
+                        calendar_last_source_row = source_row
+                        # ``kept_rows`` is the pre-vehicle-filter count of
+                        # usable evidence.  Extended-hours rows are not kept.
+                        kept -= 1
+                        continue
                 # The historical direct API accepted diagnostic option rows
                 # without feed metadata.  Enforce executable OPRA provenance
                 # whenever the new vehicle-aware/production path is active;
@@ -634,6 +707,22 @@ def build_views(
             "status": "filtered" if excluded_options else "unchanged",
             "selected_vehicles": sorted(selected),
             "excluded_option_rows": excluded_options,
+            "source_unchanged": True,
+        }
+    calendar_skipped_rows = sum(calendar_skipped.values())
+    # Keep the historical direct/diagnostic report byte-for-byte compatible
+    # when exact calendar validation is disabled and no row was filtered.  A
+    # strict calendar path always emits the additive accounting object,
+    # including its unchanged state; an optional path emits it when an exact
+    # boundary did result in a skip.
+    if agent_config is not None and (required_calendar or calendar_skipped_rows):
+        result["calendar_filter"] = {
+            "schema": "research-cycle-calendar-filter.v1",
+            "status": "filtered" if calendar_skipped_rows else "unchanged",
+            "outside_session_rows": calendar_skipped_rows,
+            "by_kind": dict(sorted(calendar_skipped.items())),
+            "first_source_row": calendar_first_source_row,
+            "last_source_row": calendar_last_source_row,
             "source_unchanged": True,
         }
     return result

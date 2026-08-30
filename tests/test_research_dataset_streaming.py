@@ -32,6 +32,216 @@ def _outputs(root: Path) -> dict[str, Path]:
 
 
 class ResearchDatasetStreamingTests(unittest.TestCase):
+    def test_exact_calendar_quarantines_extended_hours_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "market.jsonl"
+            session_open = "2026-01-05T14:30:00+00:00"
+            session_close = "2026-01-05T21:00:00+00:00"
+
+            def row(symbol: str, timestamp: str) -> dict:
+                return {
+                    "kind": "bar", "provider": "alpaca", "feed": "iex",
+                    "symbol": symbol, "timestamp": timestamp,
+                    "observed_at": timestamp, "as_of": timestamp,
+                    "session_open": session_open,
+                    "session_close": session_close,
+                    "open": 100, "high": 101, "low": 99,
+                    "close": 100, "volume": 10,
+                }
+
+            rows = [
+                row("BEFORE", "2026-01-05T14:29:00+00:00"),
+                row("VALID", "2026-01-05T14:30:00+00:00"),
+                row("AT_CLOSE", session_close),
+            ]
+            source_text = "".join(json.dumps(item) + "\n" for item in rows)
+            source.write_text(source_text, encoding="utf-8")
+            outputs = _outputs(root)
+
+            report = build_views(
+                source, input_format="jsonl", normalized=outputs["normalized"],
+                bars=outputs["bars"], quotes=outputs["quotes"],
+                options=outputs["options"], replay=outputs["replay"],
+                agent_config={"session": {"require_exact_calendar": True}})
+
+            normalized = [json.loads(line) for line in outputs["normalized"]
+                          .read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([item["symbol"] for item in normalized], ["VALID"])
+            self.assertEqual(report["kept_rows"], 1)
+            self.assertEqual(report["view_counts"], {
+                "normalized": 1, "bars": 1, "quotes": 0,
+                "options": 0, "replay": 1,
+            })
+            self.assertEqual(report["calendar_filter"], {
+                "schema": "research-cycle-calendar-filter.v1",
+                "status": "filtered",
+                "outside_session_rows": 2,
+                "by_kind": {"bar": 2},
+                "first_source_row": 1,
+                "last_source_row": 3,
+                "source_unchanged": True,
+            })
+            self.assertEqual(source.read_text(encoding="utf-8"), source_text)
+
+    def test_exact_calendar_missing_or_malformed_metadata_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outputs = _outputs(root)
+
+            for suffix, row, message in (
+                    ("missing", {
+                        "kind": "bar", "symbol": "SPY",
+                        "timestamp": "2026-01-05T14:30:00+00:00",
+                    }, "exact broker calendar metadata missing"),
+                    ("malformed", {
+                        "kind": "bar", "symbol": "SPY",
+                        "timestamp": "not-a-time",
+                        "session_open": "2026-01-05T14:30:00+00:00",
+                        "session_close": "2026-01-05T21:00:00+00:00",
+                    }, "has no timestamp")):
+                source = root / f"{suffix}.jsonl"
+                source.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                with self.subTest(case=suffix), self.assertRaisesRegex(
+                        ValueError, message):
+                    build_views(
+                        source, input_format="jsonl",
+                        normalized=outputs["normalized"], bars=outputs["bars"],
+                        quotes=outputs["quotes"], options=outputs["options"],
+                        replay=outputs["replay"],
+                        agent_config={"session": {
+                            "require_exact_calendar": True}})
+
+    def test_from_recorder_index_and_marker_compare_normalized_calendar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            sessions = corpus / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99, "close": 100,
+                "volume": 10,
+            }])
+            (corpus / ".recorder-index.json").write_text(json.dumps({
+                "session_calendar": {"2026-01-05": {
+                    "open": "2026-01-05T09:30:00-05:00",
+                    "close": "2026-01-05T16:00:00-05:00",
+                    "source": "alpaca_calendar",
+                }},
+                "partition_sources": {
+                    partition.name: {"source_mode": "historical_backfill"},
+                },
+            }), encoding="utf-8")
+            marker = partition.with_name(partition.name + ".calendar.json")
+            marker.write_text(json.dumps({
+                "schema": "recorder-partition-calendar.v1",
+                "partition": partition.name,
+                "open": "2026-01-05T14:30:00+00:00",
+                "close": "2026-01-05T21:00:00+00:00",
+                "source": "alpaca_calendar",
+            }), encoding="utf-8")
+            outputs = _outputs(root)
+
+            report = build_views(
+                partition_root=sessions, input_format="csv",
+                normalized=outputs["normalized"], bars=outputs["bars"],
+                quotes=outputs["quotes"], options=outputs["options"],
+                replay=outputs["replay"], agent_config={"session": {
+                    "require_exact_calendar": True}},
+                recorded_root=corpus, from_recorder=True)
+            self.assertEqual(report["view_counts"]["bars"], 1)
+
+            marker.write_text(json.dumps({
+                "schema": "recorder-partition-calendar.v1",
+                "partition": partition.name,
+                "open": "2026-01-05T14:30:00+00:00",
+                "close": "2026-01-05T20:00:00+00:00",
+                "source": "alpaca_calendar",
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError,
+                                       "conflicting recorder calendar metadata"):
+                build_views(
+                    partition_root=sessions, input_format="csv",
+                    normalized=outputs["normalized"], bars=outputs["bars"],
+                    quotes=outputs["quotes"], options=outputs["options"],
+                    replay=outputs["replay"], agent_config={"session": {
+                        "require_exact_calendar": True}},
+                    recorded_root=corpus, from_recorder=True)
+
+    def test_from_recorder_closed_calendar_filters_and_rejects_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            sessions = corpus / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99, "close": 100,
+                "volume": 10,
+            }])
+            (corpus / ".recorder-index.json").write_text(json.dumps({
+                "session_calendar": {"2026-01-05": {
+                    "status": "closed", "source": "alpaca_calendar",
+                }},
+            }), encoding="utf-8")
+            marker = partition.with_name(partition.name + ".calendar.json")
+            marker.write_text(json.dumps({
+                "schema": "recorder-partition-calendar.v1",
+                "partition": partition.name,
+                "status": "closed", "source": "alpaca_calendar",
+            }), encoding="utf-8")
+            outputs = _outputs(root)
+
+            report = build_views(
+                partition_root=sessions, input_format="csv",
+                normalized=outputs["normalized"], bars=outputs["bars"],
+                quotes=outputs["quotes"], options=outputs["options"],
+                replay=outputs["replay"], agent_config={"session": {
+                    "require_exact_calendar": True}},
+                recorded_root=corpus, from_recorder=True)
+            self.assertEqual(report["view_counts"]["normalized"], 0)
+            self.assertEqual(report["calendar_filter"]["outside_session_rows"], 1)
+
+            marker.write_text(json.dumps({
+                "schema": "recorder-partition-calendar.v1",
+                "partition": partition.name,
+                "status": "closed", "open": "2026-01-05T14:30:00+00:00",
+                "source": "alpaca_calendar",
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError,
+                                       "invalid exact calendar sidecar"):
+                build_views(
+                    partition_root=sessions, input_format="csv",
+                    normalized=outputs["normalized"], bars=outputs["bars"],
+                    quotes=outputs["quotes"], options=outputs["options"],
+                    replay=outputs["replay"], agent_config={"session": {
+                        "require_exact_calendar": True}},
+                    recorded_root=corpus, from_recorder=True)
+
+            json_source = corpus / "market.jsonl"
+            json_source.write_text(json.dumps({
+                "kind": "bar", "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "session_open": "2026-01-05T14:30:00+00:00",
+                "session_close": "2026-01-05T21:00:00+00:00",
+            }) + "\n", encoding="utf-8")
+            marker.unlink()
+            with self.assertRaisesRegex(ValueError, "conflicts with closed calendar"):
+                build_views(
+                    json_source, input_format="jsonl",
+                    normalized=outputs["normalized"], bars=outputs["bars"],
+                    quotes=outputs["quotes"], options=outputs["options"],
+                    replay=outputs["replay"], agent_config={"session": {
+                        "require_exact_calendar": True}},
+                    recorded_root=corpus, from_recorder=True)
+
     def test_partition_window_streams_in_order_with_global_source_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
