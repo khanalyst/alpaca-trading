@@ -1,9 +1,10 @@
 """The cost re-run must isolate the cost model and nothing else.
 
-Both arms replay the same corpus, policy, specs and sizing; only the cost
-schedule differs.  These tests pin that, pin the R decomposition against the
-replay's own P&L, and pin that a zero-trade row stays attributable to the
-control that caused it.
+Both arms replay the same corpus, specs, policy, and sizing logic; the cost
+schedule is the changed input.  Realized quantities and equity may diverge
+causally from that treatment, so the synthetic fixture pins the invariant
+trade count/reference R and the R decomposition against each replay's own
+P&L, while keeping zero-trade rows attributable to their control.
 """
 
 import json
@@ -15,6 +16,7 @@ from agent.contracts.rule import validate_rule_spec
 from research.cost_rerun import (deterministic_cohort, render_text,
                                  run_cost_rerun, verify_cost_evidence,
                                  write_immutable_evidence)
+from research.quote_costs import QuoteCostError
 from tests.research.test_factory_end_to_end import edge_corpus
 
 
@@ -35,7 +37,9 @@ class CostRerunTests(unittest.TestCase):
         cls.cohort = [validate_rule_spec({**spec, "stop_atr": 7.0})
                       for spec in deterministic_cohort()][:8]
         cls.report = run_cost_rerun(
-            edge_corpus(12), runtime_config=cls.config, specs=cls.cohort,
+            # Keep the existing 50-quote cell floor, but provide enough
+            # sessions for the late exit bucket to be genuinely measured.
+            edge_corpus(25), runtime_config=cls.config, specs=cls.cohort,
             min_quotes_per_cell=50)
         cls.traded = [item for item in cls.report["results"]
                       if item["configured"]["trades"] > 0]
@@ -94,12 +98,23 @@ class CostRerunTests(unittest.TestCase):
             run_cost_rerun([], runtime_config=self.config, specs=(),
                             vehicle="option")
 
+    def test_an_undercovered_requested_bucket_fails_the_rerun_clearly(self):
+        # Six sessions leave only 12 quotes in the late exit bucket at the
+        # existing 50-quote floor.  The strict measured resolver must surface
+        # that missing evidence instead of producing a non-comparable report.
+        with self.assertRaisesRegex(
+                QuoteCostError,
+                r"requested measured cost bucket .*unavailable.*under-covered"):
+            run_cost_rerun(edge_corpus(6), runtime_config=self.config,
+                           specs=self.cohort[:1], min_quotes_per_cell=50)
+
     def test_only_the_cost_model_differs_between_arms(self):
         self.assertTrue(self.traded)
         for item in self.traded:
             with self.subTest(variant=item["label"]):
-                # Same specs, corpus and sizing: the trade population is
-                # identical and only what each fill costs changes.
+                # Same specs, corpus, policy, and sizing logic.  This synthetic
+                # fixture preserves trade count/reference R while each arm's
+                # realized path remains causally cost-dependent.
                 self.assertEqual(item["configured"]["trades"],
                                  item["measured"]["trades"])
                 self.assertAlmostEqual(item["configured"]["reference_r"],
@@ -152,7 +167,7 @@ class CostRerunTests(unittest.TestCase):
         """A tight-stop cohort trades nothing; the reason must be visible."""
         tight = [validate_rule_spec({**spec, "stop_atr": 1.0})
                  for spec in deterministic_cohort()][:2]
-        report = run_cost_rerun(edge_corpus(6), runtime_config=self.config,
+        report = run_cost_rerun(edge_corpus(25), runtime_config=self.config,
                                 specs=tight, min_quotes_per_cell=50)
         blocked = [item for item in report["results"]
                    if item["measured"]["stressed_cost_rejections"] > 0]

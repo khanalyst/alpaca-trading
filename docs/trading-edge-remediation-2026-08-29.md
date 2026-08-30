@@ -3,9 +3,9 @@
 ## Scope and provenance
 
 This note records the verified remediation state on Sunday, 2026-08-30. The
-follow-up work is on `codex/trading-edge-remediation`, based on `main` at
-`a68593c`. It is intended to advance `main` only after the full regression
-suite passes; no VM deployment is part of this change.
+original P0–P3 work was based on `main` at `a68593c`; this document also includes
+the subsequent sparse-cost follow-up. Deployment is performed separately through
+the supported runbook after verification.
 
 The implementation is fail-closed and diagnostic until the required evidence
 exists. This code change does not manufacture a corpus result, enable live
@@ -37,6 +37,12 @@ and parity-matched shadow evidence.
   inside account simulation before admission and fills. The previous post-hoc
   repricing path was removed, so configured-versus-measured results use the same
   causal replay boundary.
+- The causal measured resolver requires an explicitly requested symbol/time
+  bucket to meet the schedule's `min_quotes_per_cell` quote-count floor. Missing
+  or under-covered cells fail the complete configured-versus-measured rerun
+  instead of silently falling back to a symbol-wide or universe aggregate,
+  preventing missing-cell fallback/selection from producing a misleading partial
+  comparison.
 - The immutable diagnostic bundle binds corpus, configuration, specs, schedules,
   provider/feed identity, and chronological fit/validation splits. Reports add
   per-family/symbol/time-bucket opportunities, refusals, executions, gross/net

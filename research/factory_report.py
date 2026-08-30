@@ -1124,9 +1124,10 @@ def render_text(report: Mapping[str, Any]) -> str:
                     primary = screen.get("primary_horizon") or {}
                     primary_text = ""
                     if primary:
+                        horizon = (primary.get("horizon_minutes") or
+                                   primary.get("horizons"))
                         primary_text = (
-                            f"; primary horizon {primary.get('horizon_minutes') or
-                            primary.get('horizons')}m n={primary.get('candidate_count')}"
+                            f"; primary horizon {horizon}m n={primary.get('candidate_count')}"
                             f" matched={primary.get('matched_count')}"
                             f" coverage {_fmt(primary.get('matched_coverage'))}"
                             f" vs-null {_fmt(primary.get('candidate_minus_control_bps'), 2)}bps")
@@ -1319,9 +1320,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                     primary = screen.get("primary_horizon") or {}
                     primary_text = ""
                     if primary:
+                        horizon = (primary.get("horizon_minutes") or
+                                   primary.get("horizons"))
                         primary_text = (
-                            f"; primary horizon {primary.get('horizon_minutes') or
-                            primary.get('horizons')}m, n={primary.get('candidate_count')}, "
+                            f"; primary horizon {horizon}m, n={primary.get('candidate_count')}, "
                             f"matched={primary.get('matched_count')}, coverage "
                             f"{_fmt(primary.get('matched_coverage'))}, vs-null "
                             f"{_fmt(primary.get('candidate_minus_control_bps'), 2)} bps")

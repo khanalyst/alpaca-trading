@@ -403,14 +403,45 @@ def _cell(schedule: Mapping[str, Any], symbol: str | None,
           bucket: str | None) -> tuple[Mapping[str, Any], str]:
     """Resolve the tightest measured cell available, and say which was used."""
     symbols = schedule.get("symbols") or {}
-    if symbol:
-        entry = symbols.get(str(symbol).strip().upper())
+    normalized_symbol = (str(symbol).strip().upper()
+                         if symbol not in (None, "") else None)
+    normalized_bucket = (str(bucket).strip()
+                         if bucket not in (None, "") else None)
+    if normalized_symbol:
+        entry = symbols.get(normalized_symbol)
         if entry is not None:
-            if bucket:
-                measured = (entry.get("buckets") or {}).get(str(bucket))
-                if measured is not None:
-                    return measured, f"symbol_bucket:{symbol}:{bucket}"
-            return entry, f"symbol:{symbol}"
+            if normalized_bucket is not None:
+                measured = (entry.get("buckets") or {}).get(normalized_bucket)
+                measured_meta = schedule.get("measured")
+                required_quotes = _number(
+                    measured_meta.get("min_quotes_per_cell")
+                    if isinstance(measured_meta, Mapping) else None)
+                observed_quotes = (_number(measured.get("quote_count"))
+                                   if isinstance(measured, Mapping) else None)
+                if (isinstance(measured, Mapping) and measured and
+                        (required_quotes is None or
+                         (observed_quotes is not None and
+                          observed_quotes >= required_quotes))):
+                    return measured, (f"symbol_bucket:{normalized_symbol}:"
+                                      f"{normalized_bucket}")
+                # A bucket omitted by ``measure_quote_costs`` did not meet
+                # its coverage floor.  Falling back to the symbol aggregate
+                # would make that sparse cell look measured and can price an
+                # opportunity using evidence from the wrong time of day.
+                raise QuoteCostError(
+                    "requested measured cost bucket "
+                    f"{normalized_symbol}/{normalized_bucket} is unavailable "
+                    "or under-covered; refusing symbol-wide fallback")
+            return entry, f"symbol:{normalized_symbol}"
+        if normalized_bucket is not None:
+            raise QuoteCostError(
+                "requested measured cost bucket "
+                f"{normalized_symbol}/{normalized_bucket} is unavailable; "
+                "refusing universe fallback")
+    if normalized_bucket is not None:
+        raise QuoteCostError(
+            "requested measured cost bucket "
+            f"{normalized_bucket} has no symbol; refusing universe fallback")
     return schedule["universe"], "universe"
 
 
@@ -508,18 +539,24 @@ def measured_cost_resolver(schedule: Mapping[str, Any], *,
         resolved_symbol = symbol or item.get("symbol")
         resolved_bucket = bucket
         if resolved_bucket in (None, ""):
-            raw = (item.get("cost_timestamp") or
-                   item.get("entry_timestamp") or item.get("timestamp"))
+            raw = next((item.get(name) for name in
+                        ("cost_timestamp", "entry_timestamp", "timestamp")
+                        if item.get(name) not in (None, "")), None)
             if raw not in (None, ""):
                 try:
                     stamp = _timestamp({"timestamp": raw})
-                    if stamp is not None:
-                        local = stamp.astimezone(_NY)
-                        minutes = ((local.hour * 60 + local.minute +
-                                    local.second / 60.0) - 9 * 60 - 30)
-                        resolved_bucket = bucket_label(minutes)
-                except (TypeError, ValueError, OverflowError):
-                    resolved_bucket = None
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise QuoteCostError(
+                        "measured cost resolver received an unparsable "
+                        "timestamp") from exc
+                if stamp is None:
+                    raise QuoteCostError(
+                        "measured cost resolver received an unparsable "
+                        "timestamp")
+                local = stamp.astimezone(_NY)
+                minutes = ((local.hour * 60 + local.minute +
+                            local.second / 60.0) - 9 * 60 - 30)
+                resolved_bucket = bucket_label(minutes)
         if order_shares is None:
             order_shares = _number(item.get("quantity", item.get("shares")))
         return cost_model_from_schedule(

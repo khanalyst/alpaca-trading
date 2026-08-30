@@ -10,8 +10,9 @@ is fitted to the recorded quotes instead of assumed?
 It is a measurement tool, not a self-authorizing one.  It replays frozen specs,
 never tunes or promotes, and writes no ledger state.  An operator may apply a
 validated artifact explicitly through runtime configuration; both arms use the
-identical corpus, policy, and sizing so the only thing that differs is the cost
-schedule.
+identical corpus, specs, policy, and sizing logic, with only the cost schedule
+changed as an input.  Realized quantities and equity may diverge causally as
+each cost treatment changes the account path.
 """
 
 from __future__ import annotations

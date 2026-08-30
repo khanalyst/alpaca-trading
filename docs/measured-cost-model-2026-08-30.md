@@ -59,10 +59,19 @@ auditable percentile choice instead of a number nobody can trace.
 
 ## `research/cost_rerun.py` — the comparison
 
-Replays each spec twice over the identical corpus, policy, and sizing, changing
-only the cost schedule, and reports per variant: trades, gate refusals, net
-P&L, expectancy, win rate, profit factor, and the reference / drag / net R
-decomposition the diagnostic report uses.
+Replays each spec twice over the identical corpus and policy, using the same
+sizing policy and logic while changing only the cost schedule. Realized
+quantities may diverge causally as the different costs change account equity.
+It reports per variant: trades, gate refusals, net P&L, expectancy, win rate,
+profit factor, and the reference / drag / net R decomposition the diagnostic
+report uses.
+
+The causal measured resolver requires an explicitly requested symbol/time bucket
+to meet the schedule's `min_quotes_per_cell` quote-count floor. A missing or
+under-covered cell fails the complete configured-versus-measured rerun instead
+of silently falling back to a symbol-wide or universe aggregate; this guard
+prevents missing-cell fallback/selection from producing a misleading partial
+comparison.
 
 ```
 python -m research.cost_rerun \
@@ -123,9 +132,9 @@ stress assumption should be checked against.
 
 ## Not addressed
 
-- The replay takes one `CostModel` for the whole account, so the comparison arm
-  uses the universe-level fit. Per-symbol costs are measured and reported in the
-  schedule but applying them per fill needs a replay-side change.
+- The report's top-level `cost_models.measured` field remains a universe-level
+  summary; per-fill costs are resolved causally by symbol and time bucket as
+  described above.
 - Entry, target and stop legs are charged symmetrically. A triggered stop in a
   moving market genuinely pays more than a marketable entry; separating them
   needs the same replay-side change.

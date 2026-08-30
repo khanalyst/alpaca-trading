@@ -118,6 +118,38 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(entry["buckets"], {})
         self.assertGreater(entry["sparse_buckets"], 0)
 
+    def test_a_requested_sparse_bucket_fails_closed_instead_of_using_symbol_aggregate(self):
+        schedule = measure_quote_costs(
+            _quotes("SPY", spread_bps=1.0, minutes=30, sessions=20) +
+            _quotes("SPY", spread_bps=9.0, minutes=30, sessions=1,
+                    start_minute=30),
+            min_quotes_per_cell=500)
+        self.assertIn("m000_030", schedule["symbols"]["SPY"]["buckets"])
+        self.assertNotIn("m030_060", schedule["symbols"]["SPY"]["buckets"])
+        with self.assertRaisesRegex(
+                QuoteCostError,
+                r"SPY/m030_060.*unavailable.*under-covered.*symbol-wide"):
+            cost_model_from_schedule(schedule, symbol="SPY",
+                                     bucket="m030_060")
+
+    def test_a_dense_requested_bucket_is_used_and_provenance_is_specific(self):
+        schedule = measure_quote_costs(
+            _quotes("SPY", spread_bps=1.0, minutes=30, sessions=20),
+            min_quotes_per_cell=500)
+        model = cost_model_from_schedule(schedule, symbol="SPY",
+                                         bucket="m000_030")
+        self.assertAlmostEqual(model.spread_bps, 1.0, delta=0.05)
+        self.assertIn("symbol_bucket:SPY:m000_030", model.provenance)
+
+    def test_a_bucket_request_without_a_symbol_fails_closed(self):
+        schedule = measure_quote_costs(
+            _quotes("SPY", spread_bps=1.0, minutes=30, sessions=20),
+            min_quotes_per_cell=500)
+        with self.assertRaisesRegex(
+                QuoteCostError,
+                r"m000_030.*has no symbol.*universe fallback"):
+            cost_model_from_schedule(schedule, bucket="m000_030")
+
 
 class CostModelConstructionTests(unittest.TestCase):
     def setUp(self):
@@ -182,6 +214,18 @@ class CostModelConstructionTests(unittest.TestCase):
     def test_measured_resolver_rejects_option_vehicle(self):
         with self.assertRaisesRegex(QuoteCostError, "equity only"):
             measured_cost_resolver(self.schedule, vehicle="option")
+
+    def test_measured_resolver_rejects_unparsable_supplied_timestamps(self):
+        resolver = measured_cost_resolver(self.schedule)
+        for field in ("cost_timestamp", "entry_timestamp", "timestamp"):
+            for value in ("not-a-timestamp", " "):
+                with self.subTest(field=field, value=repr(value)):
+                    with self.assertRaisesRegex(QuoteCostError, "timestamp"):
+                        resolver({"symbol": "SPY", field: value})
+
+    def test_measured_resolver_keeps_symbol_fallback_without_timestamp(self):
+        model = measured_cost_resolver(self.schedule)({"symbol": "SPY"})
+        self.assertIn("symbol:SPY", model.provenance)
 
     def test_the_costs_block_round_trips_into_a_replay_config(self):
         from research.costs import CostModel
