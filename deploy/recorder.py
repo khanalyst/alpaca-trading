@@ -1141,8 +1141,21 @@ def _save_index(output: Path, index: dict,
 def _prepare_index(output: Path) -> dict:
     """Load or rebuild both caches while preserving irreplaceable metadata."""
     index = _load_index(output)
-    if (index is None or
-            index.pop("_observation_watermarks_migration_pending", False)):
+    if index is not None:
+        # ``observation_watermarks`` is an additive v1 field.  If every other
+        # cache component validates, initialize the new map conservatively and
+        # persist the migration without rescanning historical partitions.  The
+        # next provider ingestion fills exact quote/bar observation times.
+        migration_pending = index.pop(
+            "_observation_watermarks_migration_pending", False)
+        if migration_pending:
+            index["observation_watermarks"] = {}
+            _save_index(output, index)
+            loaded = _load_index(output)
+            if loaded is None:
+                raise RuntimeError("recorder observation watermark migration failed")
+            return loaded
+    if index is None:
         loaded_metadata = index
         preserved = _load_preserved_index_metadata(output)
         if preserved is None:

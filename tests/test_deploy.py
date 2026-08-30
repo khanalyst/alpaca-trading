@@ -2180,12 +2180,28 @@ class DeployTests(unittest.TestCase):
             pre_watermark.pop("observation_watermarks")
             (root / recorder.INDEX_NAME).write_text(
                 json.dumps(pre_watermark, sort_keys=True), encoding="utf-8")
-            migrated = recorder._prepare_index(path)
+            with patch.object(
+                    recorder, "_scan_corpus",
+                    side_effect=AssertionError(
+                        "additive observation watermark migration must not scan")):
+                migrated = recorder._prepare_index(path)
+            self.assertEqual(migrated["observation_watermarks"], {})
 
-        self.assertEqual(migrated["observation_watermarks"]["SPY"]["quote"],
-                         quote["as_of"])
-        self.assertEqual(migrated["observation_watermarks"]["SPY"]["bar"],
-                         rows[-1]["as_of"])
+            class FrozenDatetime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    fixed = datetime(2026, 8, 8, 14, 0, tzinfo=timezone.utc)
+                    return fixed if tz is not None else fixed.replace(tzinfo=None)
+
+            with patch.object(recorder, "datetime", FrozenDatetime):
+                self.assertEqual(recorder.record_once(
+                    _MarketFake(), ["SPY"], path), 2)
+            reloaded = recorder._load_index(path)
+
+        self.assertEqual(reloaded["observation_watermarks"]["SPY"]["quote"],
+                         "2026-08-08T13:30:01+00:00")
+        self.assertEqual(reloaded["observation_watermarks"]["SPY"]["bar"],
+                         "2026-08-08T13:31:00+00:00")
 
     def test_recorder_same_size_partition_rewrite_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as directory:

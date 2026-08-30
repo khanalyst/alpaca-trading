@@ -1279,6 +1279,11 @@ class ShadowStore:
                 rows = db.execute("SELECT * FROM decisions ORDER BY created_at,decision_id").fetchall()
             return [dict(row) for row in rows]
 
+    def decision_count(self) -> int:
+        """Return a scalar decision count without materializing WAL rows."""
+        with self._connection() as db:
+            return int(db.execute("SELECT count(*) FROM decisions").fetchone()[0])
+
     def replay_diff(self, *, candidate_id: str, session_date: str, source_digest: str,
                     shadow_digest: str, replay_digest: str | None, status: str,
                     details: Mapping) -> None:
@@ -2307,8 +2312,12 @@ class ShadowRunner:
             # feaca71 established source offsets before filtering the legacy
             # event cache. Mark the migration boundary once and keep all later
             # cycles scoped to genuinely forward observations.
-            forward_floor = (time.time() if self.store.event_count() >=
-                             self.config.max_events else 0.0)
+            # An empty-candidate poll establishes its activation boundary only
+            # after ingestion/quarantine checks below; initializing it to
+            # ``time.time()`` here would skip unresolved evidence.
+            forward_floor = (time.time() if candidates and
+                             self.store.event_count() >= self.config.max_events
+                             else 0.0)
             self.store.save_forward_event_floor(forward_floor)
         if offsets is None:
             # A pre-upgrade WAL already at the old total-event ceiling has
@@ -2334,8 +2343,9 @@ class ShadowRunner:
             skipped_recovery_bytes = pending_bytes
             next_offsets = {str(source.resolve()): source.stat().st_size
                             for source in sources}
-            forward_floor = time.time()
-            self.store.save_forward_event_floor(forward_floor)
+            if candidates:
+                forward_floor = time.time()
+                self.store.save_forward_event_floor(forward_floor)
             self.store.save_quarantine_through_session(
                 datetime.now(UTC).astimezone(NEW_YORK).date().isoformat())
         else:
@@ -2424,6 +2434,99 @@ class ShadowRunner:
             not isinstance(detail, Mapping) or not detail.get("session_date")
             for detail in quarantine.values())
         quarantine_overflow = QUARANTINE_OVERFLOW_KEY in quarantine
+
+        # A poll without an eligible candidate still has to finish ingestion,
+        # quarantine, and source-offset persistence above.  It must not then
+        # materialize the complete immutable event WAL merely to report that
+        # there is no work: a recorder can legitimately contain hundreds of
+        # thousands of rows before the first hypothesis is registered.  The
+        # activation boundary makes this empty poll a strict forward barrier;
+        # future candidates cannot consume evidence observed before they became
+        # eligible, while every event remains durably queryable in SQLite.
+        if not candidates:
+            replay_quarantine = self.store.replay_quarantine()
+            pending_repairs = [
+                dict(detail) for detail in replay_quarantine.values()
+                if isinstance(detail, Mapping) and detail.get("status") in {
+                    "quarantined", "overflow"}
+            ]
+            pending_repairs.sort(key=lambda item: (
+                str(item.get("session_date") or ""),
+                str(item.get("candidate_id") or "")))
+            current_floor = float(forward_floor or 0.0)
+            blocked_activation = bool(
+                invalid_sessions or unknown_quarantine or quarantine_overflow or
+                pending_repairs or skipped_recovery_bytes)
+            if not blocked_activation and (current_floor <= 0.0 or ingested > 0):
+                activation_boundary = time.time()
+                forward_floor = max(current_floor, activation_boundary)
+                if forward_floor > current_floor:
+                    self.store.save_forward_event_floor(forward_floor)
+            else:
+                # Preserve the prior floor across malformed or unresolved
+                # evidence; an empty candidate set is not permission to skip
+                # a quarantined session.
+                forward_floor = current_floor
+            prune = self.store.prune()
+            stored_events = self.store.event_count()
+            decision_count = self.store.decision_count()
+            quarantine_through = self.store.quarantine_through_session()
+            stale_tail = {
+                "status": "blocked" if (
+                    invalid_sessions or unknown_quarantine or pending_repairs or
+                    skipped_recovery_bytes) else "clear",
+                "sessions": sorted(invalid_sessions),
+                "unknown_events": bool(unknown_quarantine),
+                "quarantine_overflow": bool(quarantine_overflow),
+                "invalid_events": int(invalid_events),
+                "replay_repairs_required": len(pending_repairs),
+                "replay_quarantine_sessions": sorted({
+                    str(item.get("session_date")) for item in pending_repairs
+                    if item.get("session_date")}),
+                "replay_quarantine": pending_repairs[-64:],
+                "authoritative_catalog_sessions": [],
+            }
+            candidate_watermark: list[dict[str, Any]] = []
+            manifest = {
+                "schema": "shadow-manifest.v1",
+                "replay_scope": "no_candidates",
+                "candidate_set": candidate_watermark,
+                "candidate_set_digest": _digest(candidate_watermark),
+                "source_watermark": {
+                    "offsets": {str(key): int(value)
+                                for key, value in next_offsets.items()},
+                    "forward_event_floor": float(forward_floor),
+                },
+                "event_watermark": {
+                    "count": int(stored_events),
+                    "snapshot": "not_loaded",
+                    "forward_event_floor": float(forward_floor),
+                },
+                "session_watermark": [],
+                "max_workers": int(self.config.max_workers),
+            }
+            manifest_digest = self.store.save_manifest(manifest)
+            return {
+                "candidates": 0,
+                "no_candidates": True,
+                "ingested_events": ingested,
+                # ``events`` is the bounded poll snapshot; no event rows were
+                # loaded.  ``stored_events`` retains the scalar WAL count.
+                "events": 0,
+                "stored_events": int(stored_events),
+                "decisions": int(decision_count),
+                "conflicts": conflicts,
+                "invalid_events": invalid_events,
+                "manifest_digest": manifest_digest,
+                "candidate_errors": {},
+                "skipped_recovery_bytes": skipped_recovery_bytes,
+                "quarantine_through_session": quarantine_through,
+                "forward_event_floor": float(forward_floor),
+                "stale_tail": stale_tail,
+                "replay_quarantine": pending_repairs[-64:],
+                "opportunity_capacity": [],
+                **prune,
+            }
         events, bars, quotes, options = self._load_events()
         # Persist only exact recorder/Alpaca calendar sessions.  This catalog
         # is the continuity authority used by ingestion; event timestamps or
@@ -2566,7 +2669,25 @@ class ShadowRunner:
             "session_watermark": sorted(str(session) for session in frozen_session_events),
             "max_workers": int(self.config.max_workers),
         }
-        manifest_digest = self.store.save_manifest(manifest)
+        # A successful replay advances the immutable event floor below.  On a
+        # retry with no newly loaded rows, reuse that final content-addressed
+        # snapshot rather than creating a digest that merely says ``count=0``;
+        # this keeps retries auditable and idempotent while still allowing a
+        # changed candidate/source snapshot to receive a new manifest.
+        prior_manifest = self.store.manifest()
+        reuse_manifest = bool(
+            not events and not frozen_session_events and
+            isinstance(prior_manifest, Mapping) and
+            prior_manifest.get("candidate_set_digest") == manifest["candidate_set_digest"] and
+            prior_manifest.get("source_watermark", {}).get("offsets") ==
+            manifest["source_watermark"]["offsets"] and
+            prior_manifest.get("source_watermark", {}).get("forward_event_floor") ==
+            manifest["source_watermark"]["forward_event_floor"])
+        if reuse_manifest:
+            manifest = dict(prior_manifest)
+            manifest_digest = str(manifest["manifest_digest"])
+        else:
+            manifest_digest = self.store.save_manifest(manifest)
 
         # Dispatch one immutable session at a time.  The parent commits
         # decisions and performs replay before the next session is submitted,
@@ -2575,11 +2696,13 @@ class ShadowRunner:
         arm_by_id = {str(arm["candidate_id"]): arm for arm in arms}
         candidate_errors: dict[str, str] = {}
         failed_arms: set[str] = set()
+        replay_blocked = False
         for session in sorted(frozen_session_events):
             session_events_one = {session: frozen_session_events[session]}
             session_inputs_one = {session: frozen_session_inputs[session]}
             active_arms = [arm for arm in arms
                            if str(arm["candidate_id"]) not in failed_arms]
+            session_success = bool(active_arms)
             initial_states = {
                 str(arm["candidate_id"]): self._portfolio_state(
                     str(arm["candidate_id"])) for arm in active_arms}
@@ -2604,6 +2727,8 @@ class ShadowRunner:
                                 "error": f"{type(exc).__name__}: {str(exc)[:240]}",
                             })
             worker_results.sort(key=lambda item: str(item.get("candidate_id") or ""))
+            if len(worker_results) != len(active_arms):
+                session_success = False
 
             # Stable candidate/event/session order is the sole write order.
             for result in worker_results:
@@ -2611,6 +2736,7 @@ class ShadowRunner:
                 if result.get("error"):
                     candidate_errors[candidate_id] = str(result["error"])
                     failed_arms.add(candidate_id)
+                    session_success = False
                     continue
                 decisions = sorted(result.get("decisions") or [], key=lambda item: (
                     str(item.get("event_key") or ""),
@@ -2643,13 +2769,18 @@ class ShadowRunner:
                     continue
                 try:
                     rows = self.store.decisions(candidate_id)
-                    self._replay(arm_by_id[candidate_id], session,
-                                 session_bars, session_quotes, rows,
-                                 session_options)
+                    complete = self._replay(
+                        arm_by_id[candidate_id], session, session_bars,
+                        session_quotes, rows, session_options)
+                    if complete is not True:
+                        session_success = False
                 except Exception as exc:
                     candidate_errors[candidate_id] = (
                         f"{type(exc).__name__}: {str(exc)[:240]}")
                     failed_arms.add(candidate_id)
+                    session_success = False
+            if not session_success:
+                replay_blocked = True
         prune = self.store.prune()
         replay_quarantine = self.store.replay_quarantine()
         pending_repairs = [
@@ -2660,6 +2791,39 @@ class ShadowRunner:
         pending_repairs.sort(key=lambda item: (
             str(item.get("session_date") or ""),
             str(item.get("candidate_id") or "")))
+
+        # Advance only after every loaded event belongs to a session whose
+        # complete replay and durable evidence write succeeded.  ``events``
+        # uses an inclusive SQL floor, so nextafter makes the boundary strict:
+        # a later candidate cannot repeatedly reload the final completed row.
+        # Any unresolved worker/replay/quarantine state leaves the floor in
+        # place for a deterministic retry; immutable evidence is never pruned.
+        floor_eligible = bool(
+            frozen_session_events and not replay_blocked and
+            not candidate_errors and not failed_arms and
+            not invalid_sessions and not unknown_quarantine and
+            not pending_repairs)
+        if floor_eligible:
+            loaded_sessions = {row_session(row) for row in events}
+            processed_sessions = set(frozen_session_events)
+            inserted_at_values = [
+                float(row.get("inserted_at")) for row in events
+                if row_session(row) in processed_sessions and
+                _finite(row.get("inserted_at")) is not None
+            ]
+            floor_eligible = bool(
+                loaded_sessions == processed_sessions and inserted_at_values)
+        if floor_eligible:
+            completed_floor = math.nextafter(max(inserted_at_values), math.inf)
+            current_floor = float(forward_floor or 0.0)
+            if completed_floor > current_floor:
+                self.store.save_forward_event_floor(completed_floor)
+                forward_floor = completed_floor
+                manifest["source_watermark"]["forward_event_floor"] = completed_floor
+                manifest["event_watermark"]["forward_event_floor"] = completed_floor
+                # This second immutable body records the post-replay boundary;
+                # the pre-dispatch manifest remains addressable by its digest.
+                manifest_digest = self.store.save_manifest(manifest)
         catalog = self.store.session_catalog()
         stale_tail = {
             "status": "blocked" if (
@@ -2697,12 +2861,13 @@ class ShadowRunner:
         capacity = sorted(capacity, key=lambda item: (
             item["candidate_id"], item["session_date"]))[-64:]
         return {"candidates": len(candidates), "ingested_events": ingested,
-                "events": len(events), "decisions": len(self.store.decisions()),
+                "events": len(events), "decisions": self.store.decision_count(),
                 "conflicts": conflicts, "invalid_events": invalid_events,
                 "manifest_digest": manifest_digest,
                 "candidate_errors": dict(sorted(candidate_errors.items())),
                 "skipped_recovery_bytes": skipped_recovery_bytes,
                 "quarantine_through_session": quarantine_through,
+                "forward_event_floor": float(forward_floor or 0.0),
                 "stale_tail": stale_tail,
                 "replay_quarantine": pending_repairs[-64:],
                 "opportunity_capacity": capacity,

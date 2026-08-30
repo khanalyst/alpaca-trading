@@ -168,6 +168,95 @@ class LiveShadowTests(unittest.TestCase):
         self.assertEqual(manifest["manifest_digest"], first["manifest_digest"])
         self.assertEqual(manifest["event_watermark"]["count"], 3)
 
+    def test_no_candidate_poll_skips_historical_materialization(self):
+        """An empty candidate set must not copy a large immutable WAL."""
+        self._write_rows()
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_events=200_000))
+        with patch.object(runner, "_load_events",
+                          side_effect=AssertionError("historical rows loaded")), \
+                patch.object(runner.store, "event_count", return_value=106_274):
+            result = runner.run_once()
+        store = ShadowStore(self.shadow)
+        self.assertTrue(result["no_candidates"])
+        self.assertEqual(result["events"], 0)
+        self.assertEqual(result["stored_events"], 106_274)
+        self.assertEqual(store.event_count(), 3)
+        self.assertGreater(result["forward_event_floor"], 0.0)
+        manifest = store.manifest(result["manifest_digest"])
+        self.assertEqual(manifest["replay_scope"], "no_candidates")
+        self.assertEqual(manifest["event_watermark"]["snapshot"], "not_loaded")
+
+    def test_candidate_replay_reads_only_post_activation_events(self):
+        """Rows ingested after an empty activation poll form the next window."""
+        self.corpus.write_text(
+            "event_key,event_type,symbol,timestamp,as_of,observed_at,provider,feed,open,high,low,close,volume,bid,ask\n",
+            encoding="utf-8")
+        empty = self._run(max_events=20)
+        activation_floor = empty["forward_event_floor"]
+        candidate = self._candidate()
+        self._write_rows()
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_events=20))
+        with patch.object(runner, "_load_events",
+                          wraps=runner._load_events) as load_events:
+            result = runner.run_once()
+        self.assertEqual(result["candidates"], 1)
+        self.assertEqual(result["events"], 3)
+        self.assertEqual(load_events.call_count, 1)
+        self.assertGreaterEqual(runner.store.forward_event_floor(), activation_floor)
+        self.assertEqual(runner.store.event_count(), 3)
+        self.assertEqual(candidate["candidate_id"], runner.store.candidates()[0]["candidate_id"])
+
+    def test_no_candidate_floor_is_monotonic(self):
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        future = time.time() + 3600.0
+        runner.store.save_forward_event_floor(future)
+        result = runner.run_once()
+        self.assertEqual(result["forward_event_floor"], future)
+        self.assertEqual(runner.store.forward_event_floor(), future)
+
+    def test_repeated_empty_candidate_poll_reuses_activation_manifest(self):
+        self._write_rows()
+        first = self._run(max_events=20)
+        second = self._run(max_events=20)
+        self.assertEqual(first["manifest_digest"], second["manifest_digest"])
+        self.assertEqual(first["forward_event_floor"], second["forward_event_floor"])
+        self.assertEqual(second["ingested_events"], 0)
+
+    def test_failed_replay_does_not_advance_event_floor(self):
+        self._candidate()
+        self._write_session_closing_rows()
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_events=20))
+        before = runner.store.forward_event_floor() or 0.0
+        with patch.object(runner, "_replay", return_value=False):
+            result = runner.run_once()
+        self.assertEqual(result["forward_event_floor"], before)
+        self.assertEqual(runner.store.forward_event_floor() or 0.0, before)
+
+    def test_replay_exception_does_not_advance_event_floor(self):
+        self._candidate()
+        self._write_session_closing_rows()
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_events=20))
+        before = runner.store.forward_event_floor() or 0.0
+        with patch.object(runner, "_replay", side_effect=RuntimeError("failed replay")):
+            result = runner.run_once()
+        self.assertEqual(result["forward_event_floor"], before)
+        self.assertEqual(runner.store.forward_event_floor() or 0.0, before)
+
+    def test_no_candidate_quarantine_does_not_advance_event_floor(self):
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        runner.store.quarantine_replay_session(
+            candidate_id="candidate", session_date="2026-01-02",
+            reason="incomplete", status="incomplete")
+        result = runner.run_once()
+        self.assertEqual(result["forward_event_floor"], 0.0)
+        self.assertEqual(runner.store.forward_event_floor() or 0.0, 0.0)
+        self.assertEqual(result["stale_tail"]["status"], "blocked")
+        self.assertEqual(result["stale_tail"]["replay_repairs_required"], 1)
+
     def test_manifest_read_rejects_tampered_digest_addressed_body(self):
         store = ShadowStore(self.shadow)
         digest = store.save_manifest({"event_watermark": {"count": 1}})
