@@ -713,7 +713,12 @@ class DeployTests(unittest.TestCase):
         self.assertIn("execution-blocked", script)
         self.assertIn("qualification-unavailable", script)
         self.assertIn('finish "completed_no_edge"', script)
-        self.assertIn('research/cost_rerun.py" --calibration-only', script)
+        self.assertIn(
+            '(cd "$repo_root" && "$python_bin" -m research.cost_rerun '
+            '--calibration-only', script)
+        self.assertNotIn(
+            '"$python_bin" "$repo_root/research/cost_rerun.py" '
+            '--calibration-only', script)
         self.assertIn('ALPACA_RESEARCH_STRESS_CALIBRATION_REPORT', script)
 
         for status in ("search_exhausted", "llm_provider_failure"):

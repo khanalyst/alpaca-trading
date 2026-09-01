@@ -758,10 +758,13 @@ if [ "${ALPACA_RESEARCH_STRESS_CALIBRATION_ENABLED:-1}" = "1" ] && [ -s "$quotes
   fi
   mkdir -p "$(dirname "$stress_calibration_report")"
   set +e
-  "$python_bin" "$repo_root/research/cost_rerun.py" --calibration-only \
+  # Run through the package so cost_rerun's relative imports resolve. The
+  # scheduler normally sets cwd to repo_root, but keep this direct invocation
+  # independent of the caller's working directory as well.
+  (cd "$repo_root" && "$python_bin" -m research.cost_rerun --calibration-only \
     --corpus "$quotes_input" --config "$agent_config" \
     --min-quotes-per-cell "${ALPACA_RESEARCH_STRESS_MIN_QUOTES_PER_CELL:-500}" \
-    --out "$stress_calibration_report"
+    --out "$stress_calibration_report")
   stress_calibration_status=$?
   set -e
   if [ "$stress_calibration_status" -ne 0 ]; then
