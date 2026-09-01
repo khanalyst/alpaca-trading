@@ -11,10 +11,15 @@ from datetime import date, datetime, timezone
 from collections.abc import Mapping
 
 from .instruments import validate_equity_symbol, validate_option_symbol
-from .contracts.rule import RULE_SCHEMA_V3
+from .contracts.risk_geometry import (
+    RiskGeometryError, effective_stop_distance, equity_price_increment,
+    quantize_equity_bracket,
+)
+from .contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V3,
+                             RULE_SCHEMA_V4)
 from research.costs import (CostError, STRESSED_COST_BASIS,
                             STRESSED_COST_SCHEMA, ReplayPolicy,
-                            stressed_cost_usd)
+                            stressed_cost_ratio_exceeds, stressed_cost_usd)
 
 from .risk_inputs import (
     _OCC_OPTION_RE,
@@ -168,20 +173,14 @@ class RiskEngine:
             limit = None
         return scenario, limit
 
-    def check_stressed_cost(self, plan: Mapping,
-                            cfg: Mapping | None = None) -> tuple[dict | None, str | None]:
-        """Veto plans whose preregistered stressed cost exceeds intended risk.
+    def _resolved_stressed_cost_settings(
+            self, plan: Mapping, cfg: Mapping | None = None, *,
+            vehicle: str = "equity",
+            ) -> tuple[float | None, float | None, str]:
+        """Resolve the exact stress cell shared by geometry and admission."""
 
-        The returned copy carries only telemetry needed by lifecycle/journal;
-        no stop or target values are changed.  A malformed plan, config, or
-        cost schedule fails closed with a stable explicit reason.
-        """
         source = cfg if isinstance(cfg, Mapping) else self.cfg
         scenario, limit = self._stressed_cost_settings(source)
-        vehicle = ("option" if isinstance(plan, Mapping) and
-                   str(plan.get("execution_profile", "shares")).lower()
-                   in {"option", "options", "defined_risk_options",
-                       "options_defined_risk"} else "equity")
         activation_reason = "activation_disabled"
         if isinstance(plan, Mapping) and isinstance(source, Mapping):
             try:
@@ -192,7 +191,25 @@ class RiskEngine:
                         plan.get("entry_timestamp", plan.get("timestamp")),
                         vehicle=vehicle)
             except (CostError, TypeError, ValueError, OverflowError):
-                activation_reason = "calibration_policy_invalid"
+                return None, None, "calibration_policy_invalid"
+        return scenario, limit, activation_reason
+
+    def check_stressed_cost(self, plan: Mapping,
+                            cfg: Mapping | None = None) -> tuple[dict | None, str | None]:
+        """Veto plans whose preregistered stressed cost exceeds intended risk.
+
+        The returned copy carries only telemetry needed by lifecycle/journal;
+        no stop or target values are changed.  A malformed plan, config, or
+        cost schedule fails closed with a stable explicit reason.
+        """
+        source = cfg if isinstance(cfg, Mapping) else self.cfg
+        vehicle = ("option" if isinstance(plan, Mapping) and
+                   str(plan.get("execution_profile", "shares")).lower()
+                   in {"option", "options", "defined_risk_options",
+                       "options_defined_risk"} else "equity")
+        scenario, limit, activation_reason = (
+            self._resolved_stressed_cost_settings(
+                plan, source, vehicle=vehicle))
         if scenario is None or limit is None:
             return None, "stressed_cost_invalid"
         notional = _num(plan.get("notional"), None)
@@ -211,7 +228,7 @@ class RiskEngine:
             return None, "stressed_cost_invalid"
         if not math.isfinite(stressed) or not math.isfinite(ratio):
             return None, "stressed_cost_invalid"
-        if ratio > limit:
+        if stressed_cost_ratio_exceeds(ratio, limit):
             return None, "stressed_cost_risk_limit"
         enriched = dict(plan)
         enriched.update({
@@ -623,13 +640,93 @@ class RiskEngine:
             "profile", strategy_cfg.get("execution_profile", "shares")))).lower()
         if (profile in {"options", "option", "defined_risk_options",
                         "options_defined_risk"} and
-                str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3):
-            return None, "rule-strategy.v3 is not executable for options"
-        v3_signal_ts = None
-        if str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3:
-            v3_signal_ts = _num(decision.get("signal_ts"))
-            if v3_signal_ts is None or v3_signal_ts < 0:
-                return None, "rule-strategy.v3 signal timestamp is unavailable"
+                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}):
+            return None, "rule-strategy.v4 is not executable for options" if \
+                str(decision.get("rule_schema") or "") == RULE_SCHEMA_V4 else \
+                "rule-strategy.v3 is not executable for options"
+        rule_signal_ts = None
+        if str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+            rule_signal_ts = _num(decision.get("signal_ts"))
+            if rule_signal_ts is None or rule_signal_ts < 0:
+                schema_name = str(decision.get("rule_schema") or "")
+                return None, f"{schema_name} signal timestamp is unavailable"
+        observation_timestamp = self._entry_observation_timestamp(
+            decision, market, evaluation_epoch=now_value)
+        geometry_telemetry: dict[str, object] = {}
+        if profile in {"shares", "stock", "etf", "stock_etf",
+                       "stock_etf_shares"}:
+            signal_authored_stop = float(stop)
+            signal_authored_target = float(target)
+            signal_authored_distance = float(distance)
+            try:
+                stop, target, distance = quantize_equity_bracket(
+                    entry, stop, target, direction)
+            except RiskGeometryError:
+                return None, "broker_tick_geometry_invalid"
+            broker_normalized_stop = float(stop)
+            broker_normalized_target = float(target)
+            broker_normalized_distance = float(distance)
+            geometry_context = {
+                "symbol": symbol,
+                "entry_timestamp": (
+                    observation_timestamp or decision.get("entry_timestamp") or
+                    (datetime.fromtimestamp(rule_signal_ts, timezone.utc).isoformat()
+                     if rule_signal_ts is not None else None)),
+            }
+            scenario, limit, activation_reason = (
+                self._resolved_stressed_cost_settings(
+                    geometry_context, cost_cfg, vehicle="equity"))
+            if scenario is not None and limit is not None:
+                try:
+                    distance, floor_bps = effective_stop_distance(
+                        entry, broker_normalized_distance,
+                        base_floor_bps=MIN_STOP_DISTANCE_BPS,
+                        scenario_bps=scenario,
+                        max_cost_to_risk_ratio=limit,
+                        minimum_increment=equity_price_increment(entry))
+                except RiskGeometryError:
+                    return None, "stressed_cost_invalid"
+                binding = distance > broker_normalized_distance + 1e-12
+                if binding:
+                    stop = (entry - distance if direction == "long" else
+                            entry + distance)
+                    target_mode = str(
+                        decision.get("target_mode") or "fixed_r")
+                    if target_mode == "fixed_r":
+                        target_r = _num(decision.get("target_r"))
+                        if target_r is None or target_r <= 0:
+                            target_r = (abs(signal_authored_target - entry) /
+                                        signal_authored_distance)
+                        if not math.isfinite(target_r) or target_r <= 0:
+                            return None, "stop/target side validation failed"
+                        target = (entry + target_r * distance
+                                  if direction == "long" else
+                                  entry - target_r * distance)
+                    try:
+                        stop, target, distance = quantize_equity_bracket(
+                            entry, stop, target, direction)
+                    except RiskGeometryError:
+                        return None, "broker_tick_geometry_invalid"
+                geometry_telemetry = {
+                    "authored_stop_price": signal_authored_stop,
+                    "authored_target_price": signal_authored_target,
+                    "authored_stop_distance": signal_authored_distance,
+                    "authored_stop_distance_bps": (
+                        signal_authored_distance / entry * 10_000.0),
+                    "broker_normalized_stop_price": broker_normalized_stop,
+                    "broker_normalized_target_price": broker_normalized_target,
+                    "broker_normalized_stop_distance": broker_normalized_distance,
+                    "effective_stop_floor_bps": float(floor_bps),
+                    "stress_floor_binding": bool(binding),
+                    "stop_geometry_scenario_bps": float(scenario),
+                    "stop_geometry_max_cost_to_risk_ratio": float(limit),
+                    "stop_geometry_activation_reason": activation_reason,
+                }
+                if (not math.isfinite(float(stop)) or stop <= 0 or
+                        not math.isfinite(float(target)) or target <= 0 or
+                        (direction == "long" and not (stop < entry < target)) or
+                        (direction == "short" and not (target < entry < stop))):
+                    return None, "stressed_cost_invalid"
         try:
             budget = self._risk_usd(equity, decision)
         except ValueError as exc:
@@ -695,16 +792,27 @@ class RiskEngine:
                      "max_hold_bars": decision.get("max_hold_bars"),
                      "hold_deadline_ts": decision.get("hold_deadline_ts"),
                      "underlying_stop_price": stop, "underlying_target_price": target})
+        plan.update(geometry_telemetry)
         if str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3:
             plan.update({
                 "rule_schema": RULE_SCHEMA_V3,
                 "breakeven_r": decision.get("breakeven_r"),
                 # The completed-bar runtime must exclude the signal bar and
                 # start from the same next bar used by research replay.
-                "signal_ts": v3_signal_ts,
+                "signal_ts": rule_signal_ts,
             })
-        observation_timestamp = self._entry_observation_timestamp(
-            decision, market, evaluation_epoch=now_value)
+        elif str(decision.get("rule_schema") or "") == RULE_SCHEMA_V4:
+            plan.update({
+                "rule_schema": RULE_SCHEMA_V4,
+                "breakeven_r": decision.get("breakeven_r"),
+                "target_mode": decision.get("target_mode", "fixed_r"),
+                "target_reference": decision.get("target_reference"),
+                "target_lookback": decision.get("target_lookback"),
+                "trailing_stop_r": decision.get("trailing_stop_r"),
+                "exit_before_minutes": decision.get("exit_before_minutes"),
+                "exit_before_ts": decision.get("exit_before_ts"),
+                "signal_ts": rule_signal_ts,
+            })
         if observation_timestamp is not None:
             plan["entry_timestamp"] = observation_timestamp
         plan, cost_reason = self.check_stressed_cost(plan, cfg=cost_cfg)

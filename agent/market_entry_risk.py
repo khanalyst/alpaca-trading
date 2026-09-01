@@ -17,7 +17,12 @@ from typing import Any, Mapping
 from . import state
 from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
-from .contracts.rule import RULE_SCHEMA_V3
+from .contracts.risk_geometry import (
+    RiskGeometryError,
+    quantize_equity_bracket as _shared_quantize_equity_bracket,
+    quantize_equity_price as _shared_quantize_equity_price,
+)
+from .contracts.rule import RULE_SCHEMA_V3, RULE_SCHEMA_V4
 from .execution_lifecycle import _plain, _value
 from .instruments import validate_equity_symbol
 from research.costs import (ENTRY_SLIPPAGE_INVALID_REASON,
@@ -26,31 +31,20 @@ from research.costs import (ENTRY_SLIPPAGE_INVALID_REASON,
 log = logging.getLogger("engine")
 
 
-def _equity_price_increment(price: Decimal) -> Decimal:
-    """Return Alpaca's equity sub-penny increment for one price."""
-    return Decimal("0.01") if price >= Decimal("1") else Decimal("0.0001")
-
-
 def _quantize_equity_price(value: Any, *, rounding: str) -> Decimal:
-    price = Decimal(str(value))
-    if not price.is_finite() or price <= 0:
-        raise ValueError("equity order price must be finite and positive")
-    rounded = price.quantize(_equity_price_increment(price), rounding=rounding)
-    # A sub-dollar price can cross the $1 boundary when rounded upward.  Its
-    # resulting broker-bound representation must then obey the two-decimal
-    # increment required at or above $1 rather than retaining four decimals.
-    if price < Decimal("1") <= rounded:
-        rounded = rounded.quantize(Decimal("0.01"), rounding=rounding)
-    return rounded
+    try:
+        return _shared_quantize_equity_price(value, rounding=rounding)
+    except RiskGeometryError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _quantize_equity_bracket(decision: Mapping[str, Any]) -> dict[str, Any]:
-    """Move bracket legs toward entry onto broker-valid equity price ticks.
+    """Normalize bracket legs onto broker-valid equity price ticks.
 
-    Rounding toward entry is deliberately conservative: it cannot increase the
-    authored stop risk or overstate the attainable target.  Risk sizing then
-    consumes these exact broker-bound prices rather than a higher-precision
-    geometry the broker would reject or normalize differently.
+    The stop rounds away from entry so broker normalization cannot shrink an
+    authored or policy-derived minimum distance.  The target rounds toward
+    entry so replay never overstates attainable reward.  Risk sizing consumes
+    these exact broker-bound prices.
     """
     out = dict(decision)
     if out.get("stop_price") is None or out.get("target_price") is None:
@@ -62,23 +56,16 @@ def _quantize_equity_bracket(decision: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("equity entry price is unavailable for tick rounding") from exc
     if not entry.is_finite() or entry <= 0:
         raise ValueError("equity entry price is unavailable for tick rounding")
-    if direction == "long":
-        stop = _quantize_equity_price(out["stop_price"], rounding=ROUND_CEILING)
-        target = _quantize_equity_price(out["target_price"], rounding=ROUND_FLOOR)
-        valid = stop < entry < target
-    elif direction == "short":
-        stop = _quantize_equity_price(out["stop_price"], rounding=ROUND_FLOOR)
-        target = _quantize_equity_price(out["target_price"], rounding=ROUND_CEILING)
-        valid = target < entry < stop
-    else:
-        raise ValueError("equity direction is unavailable for tick rounding")
-    if not valid:
-        raise ValueError("tick-rounded bracket legs do not straddle entry")
-    distance = abs(entry - stop)
-    out.update(stop_price=float(stop), target_price=float(target),
-               stop_distance=float(distance),
-               stop_loss_pct=float(distance / entry * Decimal("100")),
-               take_profit_pct=float(abs(target - entry) / entry * Decimal("100")))
+    try:
+        stop, target, distance = _shared_quantize_equity_bracket(
+            entry, out["stop_price"], out["target_price"], direction)
+    except RiskGeometryError as exc:
+        raise ValueError(str(exc)) from exc
+    out.update(stop_price=stop, target_price=target,
+               stop_distance=distance,
+               stop_loss_pct=float(Decimal(str(distance)) / entry * Decimal("100")),
+               take_profit_pct=float(abs(Decimal(str(target)) - entry) /
+                                     entry * Decimal("100")))
     return out
 
 
@@ -506,27 +493,35 @@ class MarketEntryRiskMixin:
                                    strategy.get("execution_mode", "shares"))).lower()
         decision["execution_profile"] = "options" if profile in {"options", "option"} else "shares"
         if (decision["execution_profile"] == "options" and
-                str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3):
+                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}):
             self._event("risk_reject", {
                 "symbol": symbol,
-                "reason": "rule-strategy.v3 is not executable for options",
+                "reason": ("rule-strategy.v4 is not executable for options"
+                           if str(decision.get("rule_schema") or "") == RULE_SCHEMA_V4
+                           else "rule-strategy.v3 is not executable for options"),
             })
             return None
         if (decision["execution_profile"] == "shares" and
-                str(decision.get("rule_schema") or "") == RULE_SCHEMA_V3 and
-                decision.get("breakeven_r") is not None and
+                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4} and
+                (decision.get("breakeven_r") is not None or
+                 decision.get("trailing_stop_r") is not None) and
                 not callable(getattr(self.provider, "replace_stop_order", None))):
             self._event("execution_reject", {
                 "symbol": symbol,
-                "reason": "rule-strategy.v3 requires broker stop replacement capability",
+                "reason": ("rule-strategy.v4 requires broker stop replacement capability"
+                           if str(decision.get("rule_schema") or "") == RULE_SCHEMA_V4
+                           else "rule-strategy.v3 requires broker stop replacement capability"),
             })
             return None
         if decision["execution_profile"] == "shares":
+            entry_reference = _equity_entry_reference(decision, row)
+            if entry_reference is not None:
+                decision["entry_price"] = entry_reference
             try:
-                entry_reference = _equity_entry_reference(decision, row)
-                if entry_reference is not None:
-                    decision["entry_price"] = entry_reference
-                decision = _quantize_equity_bracket(decision)
+                # Validate the broker-facing bracket before entering the risk
+                # boundary, but leave normalization to RiskEngine so direct
+                # and engine-mediated callers use the same sized geometry.
+                _quantize_equity_bracket(decision)
             except (ValueError, ArithmeticError) as exc:
                 self._event("execution_reject", {
                     "symbol": symbol, "reason": str(exc)})
@@ -596,8 +591,37 @@ class MarketEntryRiskMixin:
             decision, equity, mapped_positions, {symbol: row}, {}, gross,
             active_trades=active, now=now.timestamp(), cost_cfg=edge_cfg)
         if plan is None:
-            self._event("risk_reject", {"symbol": symbol, "reason": why})
+            self._event(
+                "execution_reject" if why == "broker_tick_geometry_invalid"
+                else "risk_reject",
+                {"symbol": symbol, "reason": why})
             return None
+        if decision["execution_profile"] == "shares":
+            try:
+                rounded = _quantize_equity_bracket(plan)
+            except (ValueError, ArithmeticError) as exc:
+                self._event("execution_reject", {
+                    "symbol": symbol, "reason": str(exc)})
+                return None
+            # Policy-derived distances are rounded outward before sizing, so
+            # broker normalization may only adjust the target here.  Refuse a
+            # surprise stop change rather than submitting geometry whose risk
+            # was not the geometry that was sized and stress-checked.
+            if abs(float(rounded["stop_distance"]) -
+                   float(plan["stop_distance"])) > 1e-9:
+                self._event("execution_reject", {
+                    "symbol": symbol,
+                    "reason": "broker tick rounding changed sized stop distance",
+                })
+                return None
+            plan = rounded
+            plan.update({
+                "sl_pct": plan["stop_loss_pct"],
+                "tp_pct": plan["take_profit_pct"],
+                "estimated_loss_pct": plan["stop_loss_pct"],
+                "underlying_stop_price": plan["stop_price"],
+                "underlying_target_price": plan["target_price"],
+            })
         # Persist the exact market-observation identity used for sizing.  The
         # research rows carry these leg-level fields and runtime must retain
         # them rather than relying on a later quote or provider default.
@@ -647,7 +671,9 @@ class MarketEntryRiskMixin:
         plan.update({key: signal.get(key) for key in (
             "setup_id", "setup_type", "strategy_id", "strategy_version",
             "variant_id", "signal_ts", "force_flat_at", "rule_schema",
-            "breakeven_r") if signal.get(key) is not None})
+            "breakeven_r", "target_mode", "target_reference", "target_lookback",
+            "trailing_stop_r", "exit_before_minutes", "exit_before_ts")
+            if signal.get(key) is not None})
         plan["underlying_symbol"] = symbol
         if decision["execution_profile"] == "options":
             option = plan.get("option", {})

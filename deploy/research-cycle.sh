@@ -22,6 +22,12 @@ cycle_unevaluable=0
 cycle_search_exhausted=0
 cycle_llm_provider_failure=0
 cycle_outcomes=()
+# Compact, non-authorizing observability blocks are copied from the factory's
+# terminal JSON. They remain separate from proofs/FDR and are omitted when a
+# child never reached the factory.
+cycle_research_funnel='{}'
+cycle_research_verdict='{}'
+cycle_cost_diagnostic='{}'
 # Every terminal cycle carries a bounded preflight record. ``not_run`` is
 # explicit for failures that happen before the provider probe.
 llm_preflight_record='{"schema":"research-llm-preflight.v1","status":"not_run","reason":"provider preflight was not reached","evidence":{}}'
@@ -54,12 +60,14 @@ emit_cycle() {
   "$python_bin" - "$status" "$reason" "$exit_code" "$outcomes" \
     "$cycle_success" "$cycle_no_edge" "$cycle_unevaluable" \
     "$cycle_search_exhausted" "$cycle_llm_provider_failure" \
-    "$llm_preflight_record" <<'PY'
+    "$llm_preflight_record" "$cycle_research_funnel" \
+    "$cycle_research_verdict" "$cycle_cost_diagnostic" <<'PY'
 import json
 import sys
 
 status, reason, exit_code, raw_outcomes, success, no_edge, unevaluable, \
-    search_exhausted, llm_provider_failure, raw_preflight = sys.argv[1:]
+    search_exhausted, llm_provider_failure, raw_preflight, raw_funnel, \
+    raw_verdict, raw_cost = sys.argv[1:]
 try:
     preflight = json.loads(raw_preflight)
 except (TypeError, ValueError):
@@ -76,7 +84,16 @@ if not isinstance(preflight, dict):
         "reason": "provider preflight record was malformed",
         "evidence": {},
     }
-print(json.dumps({
+def object_or_none(raw):
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) and value else None
+funnel = object_or_none(raw_funnel)
+verdict = object_or_none(raw_verdict)
+cost = object_or_none(raw_cost)
+payload = {
     "schema": "research-cycle.v1", "status": status, "reason": reason,
     "exit_code": int(exit_code),
     "outcomes": raw_outcomes.split() if raw_outcomes else [],
@@ -90,6 +107,15 @@ print(json.dumps({
     "search_exhausted": bool(int(search_exhausted)),
     "llm_provider_failure": bool(int(llm_provider_failure)),
     "preflight": preflight,
+}
+if funnel is not None:
+    payload["research_funnel"] = funnel
+if verdict is not None:
+    payload["research_verdict"] = verdict
+if cost is not None:
+    payload["cost_diagnostic"] = cost
+print(json.dumps({
+    **payload,
 }, sort_keys=True))
 PY
 }
@@ -686,6 +712,11 @@ except Exception:
 
 recorded = len(sessions)
 shadow_min = max(0, shadow_half_min * 2)
+# Two separate 30-session shadow obligations are additive: one selection
+# window and one candidate confirmation window. Keep the legacy tail alias as
+# their total for existing status consumers.
+shadow_selection = max(0, shadow_half_min)
+shadow_confirmation = max(0, shadow_half_min)
 offline_parts = []
 if heldout_fraction > 0:
     offline_parts.append(int(math.ceil(backtest_min / heldout_fraction)))
@@ -718,6 +749,8 @@ print(json.dumps({
     "qualification_min_sessions": qualification_min,
     "shadow_min_sessions": shadow_min,
     "shadow_tail_sessions": shadow_min,
+    "shadow_selection_sessions": shadow_selection,
+    "shadow_confirmation_sessions": shadow_confirmation,
     "offline_required_sessions": offline_required,
     "heldout_fraction": heldout_fraction,
     "qualification_fraction": qualification_fraction,
@@ -1036,6 +1069,37 @@ run_discovery() {
   emit_progress "discovery" 1 1 "steps" "$vehicle"
 }
 
+capture_factory_observability() {
+  local output_file="$1"
+  "$python_bin" - "$output_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+funnel = verdict = cost = {}
+try:
+    lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+except OSError:
+    lines = []
+for line in reversed(lines):
+    try:
+        payload = json.loads(line)
+    except (TypeError, ValueError):
+        continue
+    if not isinstance(payload, dict) or payload.get("schema") != "strategy-factory.v1":
+        continue
+    if isinstance(payload.get("research_funnel"), dict):
+        funnel = payload["research_funnel"]
+    if isinstance(payload.get("research_verdict"), dict):
+        verdict = payload["research_verdict"]
+    if isinstance(payload.get("cost_diagnostic"), dict):
+        cost = payload["cost_diagnostic"]
+    break
+print(json.dumps({"funnel": funnel, "verdict": verdict, "cost": cost},
+                 sort_keys=True, separators=(",", ":")))
+PY
+}
+
 run_factory() {
   local vehicle="$1"
   local diagnostic_flag=""
@@ -1046,7 +1110,10 @@ run_factory() {
     fi
   fi
   emit_progress "factory" 0 1 "tasks" "$vehicle"
+  local factory_output_file="$tmp_dir/factory-$vehicle.stdout"
   set +e
+  ALPACA_RESEARCH_COST_RERUN_ENABLED="${ALPACA_RESEARCH_COST_RERUN_ENABLED:-1}" \
+  ALPACA_RESEARCH_COST_RERUN_DIR="${ALPACA_RESEARCH_COST_RERUN_DIR:-$repo_root/runtime/research/diagnostics}" \
   "$python_bin" "$repo_root/research.py" factory run \
     --data "$validated_input" --worker-data "$replay_input" \
     --vehicle "$vehicle" --db "$edge_db" \
@@ -1060,9 +1127,17 @@ run_factory() {
     --alpha "${ALPACA_FACTORY_ALPHA:-0.05}" \
     --max-generations "${ALPACA_FACTORY_MAX_GENERATIONS:-5}" \
     --max-confirmatory-attempts "${ALPACA_FACTORY_MAX_CONFIRMATORY_ATTEMPTS:-3}" \
-    ${diagnostic_flag:+$diagnostic_flag}
+    ${diagnostic_flag:+$diagnostic_flag} >"$factory_output_file"
   local status=$?
   set -e
+  # Keep the child's JSON byte-for-byte on stdout while extracting only the
+  # bounded additive observability blocks for the terminal cycle record.
+  cat "$factory_output_file"
+  local observability
+  observability="$(capture_factory_observability "$factory_output_file")"
+  cycle_research_funnel="$(printf '%s' "$observability" | "$python_bin" -c 'import json,sys; print(json.dumps((json.load(sys.stdin).get("funnel") or {}), separators=(",",":"), sort_keys=True))')"
+  cycle_research_verdict="$(printf '%s' "$observability" | "$python_bin" -c 'import json,sys; print(json.dumps((json.load(sys.stdin).get("verdict") or {}), separators=(",",":"), sort_keys=True))')"
+  cycle_cost_diagnostic="$(printf '%s' "$observability" | "$python_bin" -c 'import json,sys; print(json.dumps((json.load(sys.stdin).get("cost") or {}), separators=(",",":"), sort_keys=True))')"
   if [ "$status" -eq 0 ]; then
     cycle_success=1
     cycle_outcomes+=("$vehicle:factory:completed")

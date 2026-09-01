@@ -23,7 +23,8 @@ from agent.contracts.rule import (rule_spec_hash, rule_variant_id,
 import research.gates as gates
 from research.factory_report import (DEFAULT_REPORT_ROOT, REPORT_SCHEMA,
                                      _screen_events, build_report,
-                                     render_markdown, render_text, write_report)
+                                     render_markdown, render_text, research_funnel,
+                                     research_verdict, write_report)
 import research.strategy_factory as factory_module
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
                                    ProposalResult)
@@ -120,6 +121,45 @@ def _run(directory, *, llm=True):
 
 
 class ReportContentTests(unittest.TestCase):
+    def test_top_level_funnel_is_disjoint_and_verdict_is_non_authorizing(self):
+        gate = {
+            "fill_quality": {
+                "fit": {"execution_opportunities": 5, "executed": 2,
+                         "no_signal": 3, "refused": 3,
+                         "unclassified_refusals": 0,
+                         "reject_reasons": {"no_quote_at_entry": 3}},
+                "heldout": {"execution_opportunities": 2, "executed": 1,
+                             "no_signal": 1, "refused": 1,
+                             "unclassified_refusals": 0,
+                             "reject_reasons": {"no_quote_at_entry": 1}},
+            },
+            "authorization_projection": {
+                "fit": {"counts": {"eligible": 2}},
+                "heldout": {"counts": {"eligible": 1}},
+            },
+            "arm_diagnostics": {"fit": {"arms": {"candidate": {
+                "counts": {"eligible_executed": 2}}}},
+                "heldout": {"arms": {"candidate": {
+                    "counts": {"eligible_executed": 1}}}}},
+            "test": {"mean_delta": 0.12, "mean_delta_lcb": 0.02,
+                     "p_value": 0.03},
+            "post_selection": {"qualification_consumed": True},
+        }
+        result = {"schema": "strategy-factory.v1", "vehicle": "equity",
+                  "results": [{"gate": gate}]}
+        funnel = research_funnel(result)
+        self.assertEqual(funnel["counts"], {
+            "opportunities": 7, "admitted": 3, "executed": 3,
+            "authorizing_eligible": 3, "gated": 4, "selected": 1})
+        self.assertEqual(funnel["no_signal"], 4)
+        self.assertEqual(funnel["refused"], 4)
+        self.assertEqual(funnel["dominant_refusal_reason"], "no_quote_at_entry")
+        verdict = research_verdict(result)
+        self.assertFalse(verdict["authorizing"])
+        self.assertTrue(verdict["diagnostic_only"])
+        self.assertAlmostEqual(verdict["effect_estimate"], .12)
+        self.assertEqual(verdict["confidence_interval"]["lower"], .02)
+
     def test_it_answers_every_question_the_ledgers_can_answer(self):
         with tempfile.TemporaryDirectory() as directory:
             report = build_report(_run(directory))

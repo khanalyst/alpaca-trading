@@ -17,15 +17,22 @@ from pathlib import Path
 import random
 from typing import Any, Mapping, Sequence
 
-from agent.contracts.rule import (completed_bar_exit_transition, hold_deadline,
-                                  initialize_exit_state,
-                                  rule_vehicle_executable, validate_rule_spec)
-from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
-                    CostError, CostModel,
+from agent.contracts.risk_geometry import (
+    RiskGeometryError, effective_stop_distance, equity_price_increment,
+    quantize_equity_bracket,
+)
+from agent.contracts.rule import (
+    MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V4, completed_bar_exit_transition,
+    frozen_target_reference, hold_deadline, initialize_exit_state,
+    rule_vehicle_executable, thesis_exit_deadline, validate_rule_spec,
+)
+from .costs import (BAR, QUOTE, RESTING_BRACKET,
+                    RESTING_BRACKET_FILL_SCHEMA, STRESSED_COST_BASIS,
+                    STRESSED_COST_SCHEMA, CostError, CostModel,
                     ReplayPolicy, SQLiteQuoteIndex,
                     SQLiteQuoteIndexDescriptor, check_stressed_cost_plan,
                     check_entry_slippage, index_quotes, quote_fill,
-                    quote_fill_record,
+                    quote_fill_record, resting_bracket_fill_claim,
                     stressed_cost_usd)
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, replay_available_at,
@@ -323,7 +330,8 @@ def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None =
                 snap = normalize_option_snapshot(row, provider=provider, feed=feed)
                 if keep is None or keep(snap.session_date.isoformat()):
                     snapshots[f"{snap.timestamp.isoformat()}|{snap.contract.symbol}"] = snap
-            elif kind in {"quote", "equity_quote", "underlying_quote"}:
+            elif kind in {"quote", "quote_snapshot", "equity_quote",
+                          "underlying_quote"}:
                 # An equity quote is the executable price at its instant.  It
                 # is used only where a fill lands on that instant; everything
                 # else still falls back to the bar and says so.
@@ -850,7 +858,9 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             continue
         try:
             entry_underlying_ref = float(reference["underlying_entry"])
-            distance = abs(entry_underlying_ref - float(reference["stop_price"]))
+            distance = float(reference.get(
+                "stop_distance",
+                abs(entry_underlying_ref - float(reference["stop_price"]))))
             direction = str(reference["direction"])
         except (KeyError, TypeError, ValueError):
             rows.append(_null_row(symbol, day, opportunity, vehicle,
@@ -964,12 +974,63 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             rows.append(_null_row(symbol, day, opportunity, vehicle,
                                   "latest entry boundary"))
             continue
+        authored_distance = distance
+        stop_floor_bps = MIN_STOP_DISTANCE_BPS
+        stop_floor_binding = False
+        stress_scenario, stress_activation_reason = (
+            policy.resolve_stress_scenario(
+                symbol, entry_at, vehicle=vehicle))
+        if (vehicle == "equity" and stress_scenario is not None and
+                policy.max_stressed_cost_to_risk_ratio is not None):
+            try:
+                distance, stop_floor_bps = effective_stop_distance(
+                    entry_underlying, authored_distance,
+                    base_floor_bps=MIN_STOP_DISTANCE_BPS,
+                    scenario_bps=stress_scenario,
+                    max_cost_to_risk_ratio=(
+                        policy.max_stressed_cost_to_risk_ratio),
+                    minimum_increment=equity_price_increment(entry_underlying))
+            except RiskGeometryError:
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      "stressed_cost_invalid"))
+                continue
+            stop_floor_binding = distance > authored_distance + 1e-12
         stop = (entry_underlying - distance if direction == "long" else
                 entry_underlying + distance)
-        target = (entry_underlying + distance * float(spec["target_r"])
-                  if direction == "long" else
-                  entry_underlying - distance * float(spec["target_r"]))
+        target_mode = str(spec.get("target_mode") or "fixed_r")
+        target_reference = None
+        if target_mode == "fixed_r":
+            target = (entry_underlying + distance * float(spec["target_r"])
+                      if direction == "long" else
+                      entry_underlying - distance * float(spec["target_r"]))
+        else:
+            target_reference = frozen_target_reference(
+                session_bars[:entry_index], spec)
+            target = target_reference
+            if (target is None or
+                    (direction == "long" and target <= entry_underlying) or
+                    (direction == "short" and target >= entry_underlying)):
+                rows.append(_null_row(
+                    symbol, day, opportunity, vehicle,
+                    "target_reference_unavailable_or_wrong_side"))
+                continue
+        if (not math.isfinite(stop) or stop <= 0 or
+                not math.isfinite(float(target)) or float(target) <= 0 or
+                (direction == "long" and not (stop < entry_underlying < target)) or
+                (direction == "short" and not (target < entry_underlying < stop))):
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "stressed_cost_invalid"))
+            continue
+        if vehicle == "equity":
+            try:
+                stop, target, distance = quantize_equity_bracket(
+                    entry_underlying, stop, target, direction)
+            except RiskGeometryError:
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      "broker_tick_geometry_invalid"))
+                continue
         deadline = hold_deadline(entry_at, spec)
+        thesis_deadline = thesis_exit_deadline(entry_at, spec)
         if policy.force_flat_time is not None:
             force_flat = entry_at.astimezone(
                 ZoneInfo("America/New_York")).replace(
@@ -999,9 +1060,18 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         exit_ref = float(exit_bar.close)
         exit_at = exit_bar.end
         boundary_exit = True
+        exit_reason = ("exit_before" if thesis_deadline is not None and
+                       abs(float(deadline) - float(thesis_deadline)) <= 1e-9 and
+                       abs(exit_at.timestamp() - float(deadline)) <= 1e-9
+                       else "time")
+        tie_broken = False
         exit_state = initialize_exit_state(
             direction, entry_underlying, stop, target,
-            breakeven_r=spec.get("breakeven_r"))
+            breakeven_r=spec.get("breakeven_r"),
+            trailing_stop_r=spec.get("trailing_stop_r"),
+            target_mode=target_mode,
+            target_lookback=spec.get("target_lookback"),
+            exit_before_ts=thesis_deadline)
         for bar in session_bars[entry_index:last_index + 1]:
             if replay_available_at(
                     bar,
@@ -1017,11 +1087,15 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             if resolved is None:
                 continue
             exit_ref = float(resolved["price"])
+            exit_reason = str(resolved["reason"])
+            tie_broken = bool(resolved.get("tie_broken"))
             exit_bar = bar
             boundary_exit = bool(resolved.get("gapped"))
             exit_at = bar.timestamp if boundary_exit else bar.end
             break
         exit_source = BAR
+        exit_fill_schema = None
+        exit_fill_claim = None
         exit_feed = exit_provider = None
         exit_age = 0.0
         multiplier = 1
@@ -1037,12 +1111,27 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 side="sell" if direction == "long" else "buy",
                 max_age_seconds=policy.max_market_data_age_seconds,
                 session_date=entry_bar.session_date)
-            if quoted_exit is not None:
+            # A non-gap level trigger is the broker-resident bracket fill; a
+            # quote at the bar boundary cannot identify its unknown trigger
+            # instant and must never replace the planned resting level.
+            if (not boundary_exit and exit_reason in {"stop", "target"}):
+                exit_source = RESTING_BRACKET
+                exit_fill_schema = RESTING_BRACKET_FILL_SCHEMA
+                active_stop = float(exit_state.get("active_stop_price", stop))
+                exit_fill_claim = resting_bracket_fill_claim(
+                    exit_reason=exit_reason, exit_reference=exit_ref,
+                    stop_price=active_stop, target_price=target,
+                    bar_timestamp=exit_bar.timestamp.isoformat(),
+                    bar_feed=exit_bar.feed, bar_provider=exit_bar.provider,
+                    tie_broken=tie_broken)
+            elif quoted_exit is not None:
                 exit_ref, exit_source = quoted_exit.price, QUOTE
                 exit_feed, exit_provider = quoted_exit.feed, quoted_exit.provider
                 exit_age = max(0.0, (exit_quote_at -
                                     quoted_exit.timestamp).total_seconds())
-            elif policy.strict_market_data and boundary_exit:
+            elif policy.strict_market_data and (boundary_exit or
+                                                exit_reason in {
+                                                    "time", "exit_before"}):
                 rows.append(_null_row(symbol, day, opportunity, vehicle,
                                       "no fresh equity quote at exit"))
                 continue
@@ -1080,7 +1169,8 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             continue
         stress_enabled = (
             policy.stressed_cost_scenario_bps is not None or
-            policy.max_stressed_cost_to_risk_ratio is not None)
+            policy.max_stressed_cost_to_risk_ratio is not None or
+            policy.stressed_cost_calibration_enabled)
         nominal_risk_usd = quantity * float(risk_per_unit)
         entry_notional = ((float(entry_underlying) * quantity)
                           if vehicle == "equity" else
@@ -1096,7 +1186,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             }
             checked, stress_reason = check_stressed_cost_plan(
                 plan,
-                scenario_bps=policy.stressed_cost_scenario_bps,
+                scenario_bps=stress_scenario,
                 max_ratio=policy.max_stressed_cost_to_risk_ratio,
                 costs=model,
             )
@@ -1107,20 +1197,21 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                     "stressed_cost_basis": dict(STRESSED_COST_BASIS),
                     "stressed_cost_entry_notional": float(entry_notional),
                     "entry_notional": float(entry_notional),
-                    "stressed_cost_scenario_bps": (
-                        policy.stressed_cost_scenario_bps),
+                    "stressed_cost_scenario_bps": stress_scenario,
+                    "stressed_cost_activation_reason": (
+                        stress_activation_reason),
                     "max_stressed_cost_to_risk_ratio": (
                         policy.max_stressed_cost_to_risk_ratio),
                     "stressed_cost_risk_usd": float(nominal_risk_usd),
                     "risk_usd": float(nominal_risk_usd),
                 }
                 try:
-                    if (policy.stressed_cost_scenario_bps is not None and
+                    if (stress_scenario is not None and
                             policy.max_stressed_cost_to_risk_ratio is not None and
                             nominal_risk_usd > 0 and entry_notional > 0):
                         stressed = stressed_cost_usd(
                             entry_notional=entry_notional,
-                            scenario_bps=policy.stressed_cost_scenario_bps,
+                            scenario_bps=stress_scenario,
                             vehicle=vehicle, quantity=quantity, costs=model)
                         stress_telemetry.update({
                             "stressed_cost_usd": float(stressed),
@@ -1160,18 +1251,58 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                      "entry_timestamp": entry_bar.timestamp.isoformat(),
                      "exit_timestamp": exit_bar.end.isoformat(),
                      "quantity": quantity, "entry_price": entry,
-                     "exit_price": exit_price, "gross_pnl": gross, "costs": fees,
+                     "exit_price": exit_price, "entry_reference": entry_ref,
+                     "exit_reference": exit_ref,
+                     "gross_pnl": gross, "costs": fees,
                      "net_pnl": net,
                      "return_value": net / before if before > 0 else 0.0,
                      "no_trade": False,
+                     "exit_reason": exit_reason,
+                     "tie_broken": tie_broken,
+                     "gap_fill": bool(boundary_exit),
+                     "entry_gap_fill": False,
+                     "exit_gap_fill": bool(boundary_exit),
+                     "stop_price": stop,
+                     "stop_distance": distance,
+                     "authored_stop_distance": authored_distance,
+                     "authored_stop_distance_bps": (
+                         authored_distance / entry_underlying * 10_000.0),
+                     "effective_stop_floor_bps": stop_floor_bps,
+                     "stress_floor_binding": stop_floor_binding,
+                     "stop_geometry_scenario_bps": stress_scenario,
+                     "stop_geometry_max_cost_to_risk_ratio": (
+                         policy.max_stressed_cost_to_risk_ratio),
+                     "stop_geometry_activation_reason": (
+                         stress_activation_reason),
+                     "active_stop_price": float(
+                         exit_state.get("active_stop_price", stop)),
+                     "target_price": target,
+                     "target_mode": target_mode,
+                     "target_reference": target_reference,
+                     "target_lookback": spec.get("target_lookback"),
+                     "trailing_stop_r": spec.get("trailing_stop_r"),
+                     "exit_before_minutes": spec.get("exit_before_minutes"),
+                     "exit_before_ts": thesis_deadline,
+                     "rule_schema": spec.get("schema"),
                      "entry_fill_source": entry_source,
                      "exit_fill_source": exit_source,
+                     "exit_fill_schema": exit_fill_schema,
+                     "exit_fill_claim": exit_fill_claim,
+                     "exit_fill_bar_timestamp": (
+                         exit_bar.timestamp.isoformat()
+                         if exit_source == RESTING_BRACKET else None),
                      "entry_quote_age_seconds": entry_age,
                      "exit_quote_age_seconds": exit_age,
                      "entry_feed": entry_feed,
                      "exit_feed": exit_feed,
                      "entry_provider": entry_provider,
                      "exit_provider": exit_provider,
+                     "signal_bar_feed": source_entry_bar.feed,
+                     "signal_bar_provider": source_entry_bar.provider,
+                     "entry_bar_feed": entry_bar.feed,
+                     "entry_bar_provider": entry_bar.provider,
+                     "exit_bar_feed": exit_bar.feed,
+                     "exit_bar_provider": exit_bar.provider,
                      "evidence_mode": (
                          "diagnostic_historical_backfill"
                          if any(
@@ -1191,6 +1322,15 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 "active_stop_price": exit_state["active_stop_price"],
                 "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
+            })
+        if spec.get("schema") == RULE_SCHEMA_V4:
+            row.update({
+                "initial_stop_price": exit_state["initial_stop_price"],
+                "active_stop_price": exit_state["active_stop_price"],
+                "trailing_stop_r": exit_state.get("trailing_stop_r"),
+                "target_mode": exit_state.get("target_mode", "fixed_r"),
+                "target_lookback": exit_state.get("target_lookback"),
+                "exit_before_ts": exit_state.get("exit_before_ts"),
             })
         rows.append(row)
     executed = [row for row in rows if row.get("no_trade") is not True]

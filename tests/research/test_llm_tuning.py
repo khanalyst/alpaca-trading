@@ -180,6 +180,38 @@ class TuningContractTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("bounded local step", result.error)
 
+    def test_execution_blocked_stress_ladder_allows_a_preregistered_stop_jump(self):
+        tuned = {**ROOT, "stop_atr": 6.0}
+        result = _adapter(_reply((
+            tuned,
+            "Raised stop_atr on the preregistered stressed-cost ladder after execution_blocked."))) \
+            .tune("equity", 0, ROOT,
+                  {"primary_failure": "execution_blocked"}, count=1)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.variants[0]["rule_spec"]["stop_atr"], 6.0)
+
+    def test_execution_blocked_stress_ladder_allows_a_preregistered_min_atr_jump(self):
+        tuned = {**ROOT, "min_atr_bps": 15.0}
+        result = _adapter(_reply((
+            tuned,
+            "Raised min_atr_bps on the preregistered stressed-cost ladder after execution_blocked."))) \
+            .tune("equity", 0, ROOT,
+                  {"execution_blocked": True}, count=1)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.variants[0]["rule_spec"]["min_atr_bps"], 15.0)
+
+    def test_stress_ladder_rejects_arbitrary_large_values_and_ungated_jumps(self):
+        for value, diagnosis in ((6.1, {"primary_failure": "execution_blocked"}),
+                                 (6.0, {"primary_failure": "negative_expectancy"})):
+            with self.subTest(value=value, diagnosis=diagnosis):
+                tuned = {**ROOT, "stop_atr": value}
+                result = _adapter(_reply((
+                    tuned,
+                    "Raised stop_atr after the diagnosed cost stress."))) \
+                    .tune("equity", 0, ROOT, diagnosis, count=1)
+                self.assertFalse(result.success)
+                self.assertIn("bounded local step", result.error)
+
     def test_interaction_tuning_accepts_exactly_two_named_fields(self):
         interaction = {**ROOT, "threshold_bps": 6.0, "target_r": 1.6}
         adapter = _adapter(_reply((

@@ -244,7 +244,9 @@ def measure_quote_costs(quotes: Iterable[Any], *,
     quote_digest_count = 0
 
     for row in quotes:
-        if str(_value(row, "kind", "quote")).strip().lower() not in {"quote", ""}:
+        if str(_value(row, "kind", "quote")).strip().lower() not in {
+                "quote", "quote_snapshot", "equity_quote",
+                "underlying_quote", ""}:
             continue
         seen += 1
         symbol = str(_value(row, "symbol", "")).strip().upper()

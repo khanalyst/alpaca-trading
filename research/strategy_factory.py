@@ -23,7 +23,8 @@ import uuid
 
 from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
                                   RULE_SCHEMA_V1, RULE_SCHEMA_V2,
-                                  V2_DEFAULT_EXTENSIONS, EXECUTABLE_RULE_FIELDS,
+                                  RULE_SCHEMA_V4, V2_DEFAULT_EXTENSIONS,
+                                  V4_DEFAULT_EXTENSIONS, EXECUTABLE_RULE_FIELDS,
                                   hold_deadline,
                                   rule_semantic_distance,
                                   rule_semantic_signature, rule_variant_id,
@@ -67,6 +68,7 @@ from .fit_diagnostics import (bar_coverage_telemetry,
                                collapse_behavior_aliases,
                                measure_fit_diagnostics)
 from .signal_quality import SIGNAL_QUALITY_SCHEMA, measure_signal_quality
+from .factory_report import research_funnel, research_verdict
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
@@ -119,6 +121,116 @@ SHARED_LEARNING_MIN_ATTEMPTS = 3
 # produced; the root is an ordinary null-tested candidate and consumes
 # multiplicity alongside its mutations.
 HYPOTHESIS_LESSON_KINDS = ("discovery", "reseed", "replacement", "rotation")
+
+
+def _automatic_cost_diagnostic(
+        corpus: str | Path | Sequence[Mapping[str, Any]], *,
+        runtime_config: Mapping[str, Any] | None,
+        vehicle: str,
+        specs: Sequence[Mapping[str, Any]],
+        bars: Sequence[Any] | None,
+        quotes: Any,
+        cycle_id: str | None = None,
+        ) -> dict[str, Any]:
+    """Run the configured-vs-measured cost rerun as non-authorizing telemetry.
+
+    The cost-rerun module owns quote fitting and replay arithmetic. This
+    wrapper only controls the bounded lifecycle: skip when the corpus/report
+    prerequisites are absent, persist an immutable artifact when available,
+    and convert every failure into a visible diagnostic status rather than a
+    factory failure.
+    """
+    result: dict[str, Any] = {
+        "schema": "cost-rerun-diagnostic.v1", "diagnostic_only": True,
+        "authorizing": False, "status": "not_run", "path": None,
+        "report_path": None, "delta": None, "reason": None,
+    }
+    if str(os.getenv("ALPACA_RESEARCH_COST_RERUN_ENABLED", "0")).strip().lower() in {
+            "0", "false", "no", "off"}:
+        result["reason"] = "disabled_by_configuration"
+        return result
+    if str(vehicle).strip().lower() != "equity":
+        result["reason"] = "measured_quote_cost_rerun_supports_equity_only"
+        return result
+    if not specs:
+        result["reason"] = "factory_report_has_no_frozen_specs"
+        return result
+    try:
+        bar_count = len(bars or ())
+    except (TypeError, ValueError):
+        bar_count = 0
+    try:
+        count_value = getattr(quotes, "count", None)
+        quote_count = (int(count_value) if isinstance(count_value, int) else
+                       len(quotes or ()))
+    except (TypeError, ValueError, AttributeError):
+        quote_count = 0
+    if bar_count <= 0 or quote_count <= 0:
+        result["reason"] = "bars_and_quotes_required"
+        return result
+    try:
+        from .cost_rerun import run_cost_rerun, write_immutable_evidence
+        config = dict(runtime_config or {})
+        report = run_cost_rerun(
+            corpus, runtime_config=config, specs=specs,
+            percentile=str(os.getenv("ALPACA_RESEARCH_COST_RERUN_PERCENTILE", "p75")),
+            starting_cash=float(os.getenv("ALPACA_FACTORY_STARTING_CASH", "100000")),
+            min_quotes_per_cell=int(os.getenv("ALPACA_RESEARCH_COST_RERUN_MIN_QUOTES", "500")),
+        )
+        configured = report.get("cost_models", {}).get("configured_round_trip_bps")
+        measured = report.get("cost_models", {}).get("measured_round_trip_bps")
+        net_deltas = []
+        sign_changes = 0
+        for item in report.get("results") or ():
+            left = (item.get("configured") or {}).get("net_r")
+            right = (item.get("measured") or {}).get("net_r")
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                net_deltas.append(float(right) - float(left))
+                sign_changes += int(float(left) <= 0 < float(right))
+        delta = {
+            "configured_round_trip_bps": configured,
+            "measured_round_trip_bps": measured,
+            "round_trip_bps_delta": (float(measured) - float(configured)
+                                      if isinstance(configured, (int, float)) and
+                                      isinstance(measured, (int, float)) else None),
+            "mean_net_r_delta": (sum(net_deltas) / len(net_deltas)
+                                  if net_deltas else None),
+            "sign_changes_to_positive": sign_changes,
+        }
+        root = os.getenv("ALPACA_RESEARCH_COST_RERUN_REPORT")
+        if root:
+            root = root.replace("%s", str(vehicle))
+            target = Path(root)
+            if not target.is_absolute():
+                target = Path.cwd() / target
+        else:
+            directory = Path(os.getenv(
+                "ALPACA_RESEARCH_COST_RERUN_DIR",
+                "runtime/research/diagnostics"))
+            if not directory.is_absolute():
+                directory = Path.cwd() / directory
+            target = directory / f"cost-rerun-{vehicle}-{cycle_id or uuid.uuid4().hex}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            persisted = write_immutable_evidence(target, report)
+        except ValueError as exc:
+            # A stable operator-supplied path may already contain this exact
+            # artifact. Keep the diagnostic visible without replacing it.
+            result["status"] = "failed"
+            result["reason"] = f"persist_failed:{str(exc)[:180]}"
+            result["path"] = str(target)
+            result["report_path"] = str(target)
+            result["delta"] = delta
+            return result
+        result.update({"status": "completed", "path": str(target),
+                       "report_path": str(target), "content_hash": persisted.get("content_hash"),
+                       "delta": delta, "bars": bar_count, "quotes": quote_count,
+                       "variants": len(report.get("results") or ())})
+        return result
+    except Exception as exc:  # diagnostic path must never fail the factory
+        result["status"] = "failed"
+        result["reason"] = f"{type(exc).__name__}:{str(exc)[:180]}"
+        return result
 
 # The worker hand-off has its own compact persistence schema (v2), while the
 # underlying signal-quality measurement has an independent versioned schema.
@@ -298,7 +410,9 @@ _FIT_EXECUTION_GEOMETRY_KEYS = frozenset({
     "stressed_cost_scenario_bps", "scenario_bps",
     "max_stressed_cost_to_risk_ratio", "max_cost_to_risk_ratio",
     "required_stop_distance_bps", "grammar_stop_floor_bps",
-    "grammar_stop_floor_admissible", "stop_distance_formula_available",
+    "effective_stop_floor_bps", "grammar_stop_floor_admissible",
+    "policy_adjusted_stop_floor_admissible",
+    "stop_distance_formula_available",
     "stop_distance_formula_unavailable_reason",
     "expected_symmetric_bar_round_trip_bps",
     "expected_executable_quote_round_trip_bps",
@@ -642,7 +756,9 @@ def _execution_geometry_context(*, vehicle: str, costs: CostModel,
     if vehicle == "option":
         geometry.update({
             "required_stop_distance_bps": None,
+            "effective_stop_floor_bps": None,
             "grammar_stop_floor_admissible": None,
+            "policy_adjusted_stop_floor_admissible": True,
             "stop_distance_formula_available": False,
             "stop_distance_formula_unavailable_reason": (
                 "option fees and premium risk make stop distance "
@@ -662,9 +778,17 @@ def _execution_geometry_context(*, vehicle: str, costs: CostModel,
 
     geometry.update({
         "required_stop_distance_bps": required_stop,
+        "effective_stop_floor_bps": (
+            None if required_stop is None else
+            max(float(MIN_STOP_DISTANCE_BPS), float(required_stop))),
         "grammar_stop_floor_admissible": (
             None if required_stop is None else
             float(MIN_STOP_DISTANCE_BPS) >= required_stop),
+        # The runtime amends an authored stop to this effective floor when
+        # stress controls bind.  Keep the authored grammar-floor result above
+        # explicit: it describes the submitted root, while this flag records
+        # that policy-adjusted geometry is admissible for discovery.
+        "policy_adjusted_stop_floor_admissible": True,
         "stop_distance_formula_available": valid_controls,
         "stop_distance_formula_unavailable_reason": (
             None if valid_controls else
@@ -953,7 +1077,7 @@ def structure_signature(spec: Mapping[str, Any],
             (prior_confirmations is not None and
              conditional["confirmations"] != prior_confirmations)):
         active_axes.append("confirmations")
-    extension_active = normalized.get("schema") == RULE_SCHEMA_V2 and (
+    extension_active = normalized.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V4} and (
             conditional["entry_window"] != (defaults["entry_after_minutes"],
                                                defaults["entry_before_minutes"]) or
             conditional["atr_band"] != (defaults["min_atr_bps"],
@@ -1009,6 +1133,8 @@ def _structurally_distinct(spec: Mapping[str, Any],
             continue
         changed = [name for name in EXECUTABLE_RULE_FIELDS
                    if prior.get(name) != current.get(name)]
+        changed.extend(name for name, default in V4_DEFAULT_EXTENSIONS.items()
+                       if prior.get(name, default) != current.get(name, default))
         # Same-family one-axis numeric motion is tuning, not discovery.  Two
         # executable changes form a distinct interaction topology.
         if len(changed) < 2:
@@ -3328,6 +3454,13 @@ def _run_diagnostic_factory(
             "variants": variants,
         })
     close = getattr(quote_rows, "close", None)
+    cost_diagnostic = _automatic_cost_diagnostic(
+        data, runtime_config=runtime_config, vehicle=vehicle,
+        specs=[variant.get("rule_spec") for report in reports
+               for variant in (report.get("variants") or ())
+               if isinstance(variant, Mapping) and
+               isinstance(variant.get("rule_spec"), Mapping)],
+        bars=bars, quotes=quote_rows)
     if callable(close) and isinstance(quote_rows, SQLiteQuoteIndex):
         close()
     llm_attempted = len(llm_observations)
@@ -3379,6 +3512,9 @@ def _run_diagnostic_factory(
             "paper_promotion_allowed": False,
             "reason": "historical diagnostic evidence cannot authorize",
         },
+        "research_funnel": research_funnel({"reports": reports}, vehicle=vehicle),
+        "research_verdict": research_verdict({"reports": reports}, vehicle=vehicle),
+        "cost_diagnostic": cost_diagnostic,
     }
 
 
@@ -3656,7 +3792,16 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     duplicate = factory.existing_cycle(dataset_hash, vehicle, identity)
     if duplicate is not None:
         return {**duplicate, "duplicate": True,
-                "bar_coverage": duplicate.get("bar_coverage", bar_coverage)}
+                "bar_coverage": duplicate.get("bar_coverage", bar_coverage),
+                "research_funnel": duplicate.get(
+                    "research_funnel", research_funnel(duplicate, vehicle=vehicle)),
+                "research_verdict": duplicate.get(
+                    "research_verdict", research_verdict(duplicate, vehicle=vehicle)),
+                "cost_diagnostic": duplicate.get("cost_diagnostic", {
+                    "schema": "cost-rerun-diagnostic.v1", "diagnostic_only": True,
+                    "authorizing": False, "status": "not_run",
+                    "reason": "duplicate_cycle_reused", "path": None,
+                    "report_path": None, "delta": None})}
     # Freeze the dependence map before any current-cycle diagnosis, tuning, or
     # replay.  The ledger method reads only completed cycles before this
     # cutoff; the current cycle id is not inserted until the entire cycle
@@ -3705,7 +3850,14 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 "vehicle": vehicle, "strategies": 0, "variants": 0, "accounts": 0,
                 "seeded": seeded, "revived": revived,
                 "cycle_id": cycle_id, "dependence_policy": dependence_policy,
-                "bar_coverage": bar_coverage}
+                "bar_coverage": bar_coverage,
+                "research_funnel": research_funnel({}, vehicle=vehicle),
+                "research_verdict": research_verdict({}, vehicle=vehicle),
+                "cost_diagnostic": {"schema": "cost-rerun-diagnostic.v1",
+                                    "diagnostic_only": True, "authorizing": False,
+                                    "status": "not_run",
+                                    "reason": "no_active_hypotheses", "path": None,
+                                    "report_path": None, "delta": None}}
     tasks = []
     sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
@@ -5265,6 +5417,16 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                       ("candidate_id", "variant_id", "strategy_id", "vehicle", "status")}
                      if champion else None),
     }
+    # Descriptive observability is deliberately computed after all gates and
+    # selection decisions, then attached as a separate non-authorizing block.
+    # It never feeds FDR, ledger transitions, proof envelopes, or promotion.
+    result["research_funnel"] = research_funnel(result, vehicle=vehicle)
+    result["research_verdict"] = research_verdict(result, vehicle=vehicle)
+    result["cost_diagnostic"] = _automatic_cost_diagnostic(
+        data, runtime_config=runtime_config, vehicle=vehicle,
+        specs=[variant.get("rule_spec") for _owner, variant, _gate in variant_rows
+               if isinstance(variant.get("rule_spec"), Mapping)],
+        bars=bars, quotes=quote_rows, cycle_id=cycle_id)
     if not worker_failures:
         factory.add_cycle(cycle_id, dataset_hash, vehicle, max_workers,
                           len(worker_results), len(summaries), result,

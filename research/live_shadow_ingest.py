@@ -6,7 +6,7 @@ requires a complete replay tail (including the paired control and null
 sources), splits it into disjoint chronological selection and confirmatory
 windows, rebuilds the existing verified-gate envelope, and only then appends
 an immutable ``lane='shadow'`` run to EdgeLedger. Batch family/global BH
-q-values select the candidate; the v5 LORD++ scope receives only the newer
+q-values select the candidate; the active v6 LORD++ scope receives only the newer
 confirmatory gate's raw p-value. A missing, mismatched,
 or already-consumed session is a no-op.
 """
@@ -47,8 +47,9 @@ MAX_CONFIRMATORY_ITERATIONS = 2_000_000
 # tail is a diagnostic/no-op and must be replayed in smaller chronological
 # cycles rather than silently truncating the selection source.
 MAX_SELECTION_SOURCE_ROWS = 100_000
-# v5 starts a fresh durable LORD++ sequence.  Prior v2/v3/v4 sequences remain
-# readable for audit but must not be reused for raw-p confirmatory spending.
+# v6 starts a fresh durable LORD++ sequence with its preregistered W0=alpha/2.
+# Prior v2/v3/v4/v5 sequences remain readable for audit but must not be reused
+# for raw-p confirmatory spending.
 CONFIRMATORY_P_VALUE_SOURCE = "live_shadow_confirmatory_gate"
 
 
@@ -75,7 +76,7 @@ def _digest(value: Any) -> str:
 
 
 def _confirmatory_test_id(candidate_id: str, source: Mapping[str, Any]) -> str:
-    """Build the crash-safe v4 FDR idempotency key.
+    """Build the crash-safe active-FDR idempotency key.
 
     Resolution, alpha, p-values, and BH metadata may legitimately differ when
     a process retries the same uncommitted tail.  Only the candidate lineage

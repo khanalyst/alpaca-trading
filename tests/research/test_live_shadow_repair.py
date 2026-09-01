@@ -204,7 +204,7 @@ class LiveShadowRepairTests(unittest.TestCase):
                 self.assertEqual({item["arm"] for item in row["repair_required"]}, {"baseline"})
                 self.assertEqual(ledger.runs(candidate["candidate_id"], lane="shadow"), [])
                 self.assertEqual(FactoryLedger(edge_path).fdr_state(
-                    "shadow-confirmation-v5:equity")["tests"], 0)
+                    "shadow-confirmation-v6:equity")["tests"], 0)
 
     def test_absent_calendar_catalog_blocks_before_fdr(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -262,7 +262,7 @@ class LiveShadowRepairTests(unittest.TestCase):
                 self.assertEqual(row["status"], "incomplete")
                 self.assertEqual(ledger.runs(candidate["candidate_id"], lane="shadow"), [])
                 self.assertEqual(FactoryLedger(edge_path).fdr_state(
-                    "shadow-confirmation-v5:equity")["tests"], 0)
+                    "shadow-confirmation-v6:equity")["tests"], 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

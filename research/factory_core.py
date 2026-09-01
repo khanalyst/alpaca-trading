@@ -16,21 +16,28 @@ from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    CROSS_SECTIONAL_BENCHMARK, RULE_FAMILIES, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
-    SESSION_MINUTES,
-    V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS,
+    CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
+    RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, SESSION_MINUTES,
+    V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS, V4_DEFAULT_EXTENSIONS,
     completed_bar_exit_transition, evaluate_rule_signal,
-    evaluate_rule_signal_trace,
-    feature_window_bars, hold_deadline, rule_semantic_signature,
+    evaluate_rule_signal_trace, frozen_target_reference,
+    feature_window_bars, hold_deadline, thesis_exit_deadline,
+    rule_semantic_signature,
     initialize_exit_state, rule_behavior_identity, rule_variant_id,
     rule_vehicle_executable,
     validate_rule_spec,
 )
-from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
-                    CostError, CostModel, ReplayPolicy,
+from agent.contracts.risk_geometry import (
+    RiskGeometryError, effective_stop_distance, equity_price_increment,
+    quantize_equity_bracket,
+)
+from .costs import (BAR, QUOTE, RESTING_BRACKET,
+                    RESTING_BRACKET_FILL_SCHEMA, STRESSED_COST_BASIS,
+                    STRESSED_COST_SCHEMA, CostError, CostModel, ReplayPolicy,
                     check_entry_slippage, check_stressed_cost_plan,
                     index_quotes, quote_fill,
-                    quote_fill_record, stressed_cost_usd,
+                    quote_fill_record, resting_bracket_fill_claim,
+                    stressed_cost_usd,
                     replay_policy_for_bars)
 from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
@@ -180,7 +187,7 @@ def family_template(family: str) -> dict[str, Any]:
             # The raw catalog remains v1 so its historical content-addressed
             # IDs stay readable.  This family template is v2's documented
             # no-op extension form; ``template_hypothesis`` promotes new
-            # equity factory roots to v3 without rewriting persisted v1
+            # equity factory roots to v4 without rewriting persisted v1-v3
             # specifications.
             return {**dict(template), "schema": RULE_SCHEMA_V2,
                     **V2_DEFAULT_EXTENSIONS}
@@ -193,15 +200,19 @@ def template_hypothesis(slot: int, *, vehicle: str = "equity",
     if not 0 <= int(slot) < MAX_STRATEGIES:
         raise FactoryError(f"slot must be between 0 and {MAX_STRATEGIES - 1}")
     # The raw catalog remains available above for legacy v1/v2
-    # content-addressed IDs.  New equity roots use v3's no-op form so the
-    # deterministic coordinate neighborhood can reach bounded exits without
-    # depending on an LLM proposal; option roots stay on executable v2.
+    # content-addressed IDs.  New equity roots use v4's neutral no-op form so
+    # the deterministic coordinate neighborhood can reach the complete,
+    # bounded exit grammar without depending on an LLM proposal; option roots
+    # stay on executable v2.
     authored = family_template(FAMILY_TEMPLATES[int(slot)]["family"])
     if str(vehicle) == "equity":
         # Equity is the only vehicle with a parity-safe runtime amendment path.
-        # Promote new roots to v3 at its neutral default so the ordinary
-        # coordinate neighborhood can deterministically activate breakeven.
-        authored.update({"schema": RULE_SCHEMA_V3, **V3_DEFAULT_EXTENSIONS})
+        # Promote new roots to v4 at its neutral defaults so the ordinary
+        # coordinate neighborhood can deterministically activate every
+        # bounded exit policy, including v3 breakeven semantics.
+        authored.update({"schema": RULE_SCHEMA_V4,
+                         **V3_DEFAULT_EXTENSIONS,
+                         **V4_DEFAULT_EXTENSIONS})
     spec = validate_rule_spec(authored)
     return StrategyHypothesis(
         _hypothesis_id(vehicle, int(slot), int(generation), spec), int(slot),
@@ -664,13 +675,75 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 decision_timestamp=signal_ready,
                 entry_timestamp=entry_at)
             continue
-        distance = float(signal["stop_distance"])
+        authored_distance = float(signal["stop_distance"])
+        distance = authored_distance
         # The runtime submits the bracket legs with the entry order, before any
         # fill exists, so the only anchor it can use is the signal bar's close.
         # Research must use the same levels and let the entry gap show up as
         # real sizing/R error rather than silently re-anchoring them.
-        stop = float(signal["stop_price"])
-        target = float(signal["target_price"])
+        plan_entry = float(signal["entry_price"])
+        authored_stop = float(signal["stop_price"])
+        authored_target = float(signal["target_price"])
+        stop = authored_stop
+        target = authored_target
+        stop_floor_bps = MIN_STOP_DISTANCE_BPS
+        stop_floor_binding = False
+        stop_geometry_scenario = None
+        stop_geometry_activation_reason = "stress_disabled"
+        if (vehicle == "equity" and
+                (resolved_policy.stressed_cost_scenario_bps is not None or
+                 resolved_policy.stressed_cost_calibration_enabled) and
+                resolved_policy.max_stressed_cost_to_risk_ratio is not None):
+            stop_geometry_scenario, stop_geometry_activation_reason = (
+                resolved_policy.resolve_stress_scenario(
+                    signal_bar.symbol, entry_at, vehicle="equity"))
+            if stop_geometry_scenario is None:
+                return _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date, direction,
+                    "stressed_cost_invalid", stage="risk_geometry",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at)
+            try:
+                distance, stop_floor_bps = effective_stop_distance(
+                    plan_entry, authored_distance,
+                    base_floor_bps=MIN_STOP_DISTANCE_BPS,
+                    scenario_bps=stop_geometry_scenario,
+                    max_cost_to_risk_ratio=(
+                        resolved_policy.max_stressed_cost_to_risk_ratio),
+                    minimum_increment=equity_price_increment(plan_entry))
+            except RiskGeometryError:
+                return _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date, direction,
+                    "stressed_cost_invalid", stage="risk_geometry",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at)
+            stop_floor_binding = distance > authored_distance + 1e-12
+            if stop_floor_binding:
+                stop = (plan_entry - distance if direction == "long" else
+                        plan_entry + distance)
+                if str(spec.get("target_mode") or "fixed_r") == "fixed_r":
+                    target = (plan_entry + distance * float(spec["target_r"])
+                              if direction == "long" else
+                              plan_entry - distance * float(spec["target_r"]))
+            if (not math.isfinite(stop) or stop <= 0 or
+                    not math.isfinite(target) or target <= 0 or
+                    (direction == "long" and not (stop < plan_entry < target)) or
+                    (direction == "short" and not (target < plan_entry < stop))):
+                return _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date, direction,
+                    "stressed_cost_invalid", stage="risk_geometry",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at)
+        if vehicle == "equity":
+            try:
+                stop, target, distance = quantize_equity_bracket(
+                    plan_entry, stop, target, direction)
+            except RiskGeometryError:
+                return _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date, direction,
+                    "broker_tick_geometry_invalid", stage="risk_geometry",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at)
         # Sizing reproduces `RiskEngine.size_shares`, which divides the budget by
         # this same nominal distance at plan time.  Accounting uses the distance
         # from the real fill to that stop, which is what the account actually
@@ -678,6 +751,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         real_risk = max(0.0, entry_underlying - stop if direction == "long"
                         else stop - entry_underlying)
         deadline = hold_deadline(entry_at, spec)
+        thesis_deadline = thesis_exit_deadline(entry_at, spec)
         last_index = entry_index
         # The existing replay intentionally resolves a hold on the last
         # observed bar when the next bar is non-adjacent.  Keep that P&L path
@@ -751,13 +825,21 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         exit_ref = float(exit_bar.close)
         exit_at = exit_bar.end
         pricing_cutoff = exit_at
-        reason = "time"
+        reason = ("exit_before" if not hold_discontinuity and
+                  thesis_deadline is not None and
+                  abs(float(deadline) - float(thesis_deadline)) <= 1e-9 and
+                  abs(exit_at.timestamp() - float(deadline)) <= 1e-9
+                  else "time")
         tie = False
         gapped = False
         exit_gapped = False
         exit_state = initialize_exit_state(
             direction, entry_underlying, stop, target,
-            breakeven_r=spec.get("breakeven_r"))
+            breakeven_r=spec.get("breakeven_r"),
+            trailing_stop_r=spec.get("trailing_stop_r"),
+            target_mode=spec.get("target_mode", "fixed_r"),
+            target_lookback=spec.get("target_lookback"),
+            exit_before_ts=thesis_deadline)
         # The scan starts at the entry bar: the broker bracket is live from the
         # fill.  The shared transition owns entry-gap, later-gap, stop-wins tie,
         # and completed-close breakeven ordering for replay, null, and runtime.
@@ -783,10 +865,12 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         multiplier = 1
         contract = None
         exit_source = BAR
+        exit_fill_schema = None
+        exit_fill_claim = None
         exit_feed = exit_provider = None
         exit_age = 0.0
         if vehicle == "equity":
-            if reason == "time" or gapped or exit_gapped:
+            if reason in {"time", "exit_before"} or gapped or exit_gapped:
                 quoted_exit = quote_fill_record(
                     quotes, symbol=signal_bar.symbol, at=pricing_cutoff,
                     side="sell" if direction == "long" else "buy",
@@ -803,6 +887,25 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                      decision_timestamp=signal_ready,
                                      entry_timestamp=entry_at,
                                      stage="exit_pricing")
+        # A non-gap stop/target is the broker-resident bracket leg observed by
+        # the completed exact-feed bar.  There is no executable quote at the
+        # unknown trigger instant, so retain the planned level and let the
+        # cost model charge its ordinary adverse spread/slippage.
+        if (vehicle == "equity" and reason in {"stop", "target"} and
+                not gapped and not exit_gapped):
+            exit_source = RESTING_BRACKET
+            exit_fill_schema = RESTING_BRACKET_FILL_SCHEMA
+            # ``completed_bar_exit_transition`` may amend the protective leg
+            # (for example a breakeven stop) before this bar triggers it.  The
+            # resting claim is about the active broker leg, not merely the
+            # originally authored stop used for sizing.
+            active_stop = float(exit_state.get("active_stop_price", stop))
+            exit_fill_claim = resting_bracket_fill_claim(
+                exit_reason=reason, exit_reference=exit_ref,
+                stop_price=active_stop, target_price=target,
+                bar_timestamp=exit_bar.timestamp.isoformat(),
+                bar_feed=exit_bar.feed, bar_provider=exit_bar.provider,
+                tie_broken=tie)
         entry_option_feed = exit_option_feed = None
         if vehicle == "option":
             assert entry_snap is not None
@@ -858,8 +961,17 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "entry_reference": entry_ref, "exit_reference": exit_ref,
             "entry_slippage_reference": entry_slippage_reference,
             "underlying_entry": entry_underlying, "stop_price": stop,
+            "active_stop_price": float(
+                exit_state.get("active_stop_price", stop)),
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
             "target_r": float(spec.get("target_r")) if spec.get("target_r") is not None else None,
+            "rule_schema": spec.get("schema"),
+            "target_mode": spec.get("target_mode", "fixed_r"),
+            "target_reference": signal.get("target_reference"),
+            "target_lookback": spec.get("target_lookback"),
+            "trailing_stop_r": spec.get("trailing_stop_r"),
+            "exit_before_minutes": spec.get("exit_before_minutes"),
+            "exit_before_ts": thesis_deadline,
             "max_hold_bars": int(spec.get("max_hold_bars")) if spec.get("max_hold_bars") is not None else None,
             "deadline_timestamp": (
                 datetime.fromtimestamp(float(deadline), timezone.utc).isoformat()
@@ -888,14 +1000,36 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 if hold_discontinuity_exit else None),
             "hold_exit_reason": ("discontinuity"
                                  if hold_discontinuity_exit else
-                                 "time_expiry" if reason == "time" else reason),
+                                 "time_expiry" if reason == "time" else
+                                 "thesis_deadline" if reason == "exit_before"
+                                 else reason),
             "exit_reason_detail": ("discontinuity"
                                    if hold_discontinuity_exit else
-                                   "time_expiry" if reason == "time" else reason),
+                                   "time_expiry" if reason == "time" else
+                                   "thesis_deadline" if reason == "exit_before"
+                                   else reason),
             "contract": contract, "contract_multiplier": multiplier,
-            "stop_distance": distance, "entry_gap_fill": gapped,
+            "stop_distance": distance,
+            "authored_stop_price": authored_stop,
+            "authored_target_price": authored_target,
+            "authored_stop_distance": authored_distance,
+            "authored_stop_distance_bps": (
+                authored_distance / plan_entry * 10_000.0),
+            "effective_stop_floor_bps": stop_floor_bps,
+            "stress_floor_binding": stop_floor_binding,
+            "stop_geometry_scenario_bps": stop_geometry_scenario,
+            "stop_geometry_max_cost_to_risk_ratio": (
+                resolved_policy.max_stressed_cost_to_risk_ratio),
+            "stop_geometry_activation_reason": (
+                stop_geometry_activation_reason),
+            "entry_gap_fill": gapped,
             "exit_gap_fill": exit_gapped,
             "entry_fill_source": entry_source, "exit_fill_source": exit_source,
+            "exit_fill_schema": exit_fill_schema,
+            "exit_fill_claim": exit_fill_claim,
+            "exit_fill_bar_timestamp": (
+                exit_bar.timestamp.isoformat()
+                if exit_source == RESTING_BRACKET else None),
             "entry_quote_age_seconds": entry_age,
             "exit_quote_age_seconds": exit_age,
             "entry_feed": entry_feed,
@@ -906,7 +1040,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "exit_option_feed": exit_option_feed,
             # The price the runtime plans and caps notional against; the fill
             # reference above may have gapped away from it.
-            "plan_entry": float(signal["entry_price"]),
+            "plan_entry": plan_entry,
             "risk_per_unit": (entry_ref * multiplier if vehicle == "option"
                               else distance),
             # A long option's maximum loss is the premium actually paid, so its
@@ -935,6 +1069,15 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 "active_stop_price": exit_state["active_stop_price"],
                 "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
+            })
+        if spec.get("schema") == RULE_SCHEMA_V4:
+            trade_row.update({
+                "initial_stop_price": exit_state["initial_stop_price"],
+                "active_stop_price": exit_state["active_stop_price"],
+                "trailing_stop_r": exit_state.get("trailing_stop_r"),
+                "target_mode": exit_state.get("target_mode", "fixed_r"),
+                "target_lookback": exit_state.get("target_lookback"),
+                "exit_before_ts": exit_state.get("exit_before_ts"),
             })
         trade_row["path_telemetry"] = compute_path_telemetry(
             trade_row, session_bars)
@@ -1204,7 +1347,8 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                           (float(raw["entry_reference"]) * quantity * multiplier))
         stress_enabled = (
             resolved_policy.stressed_cost_scenario_bps is not None or
-            resolved_policy.max_stressed_cost_to_risk_ratio is not None)
+            resolved_policy.max_stressed_cost_to_risk_ratio is not None or
+            resolved_policy.stressed_cost_calibration_enabled)
         stress_scenario, stress_activation_reason = (
             resolved_policy.resolve_stress_scenario(
                 symbol, raw.get("entry_timestamp"), vehicle=vehicle))
@@ -1574,6 +1718,7 @@ def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
 
 _COORDINATE_FIELDS = (
     "threshold_bps", "target_r", "breakeven_r", "stop_atr", "max_hold_bars",
+    "target_mode", "target_lookback", "trailing_stop_r", "exit_before_minutes",
     "lookback", "slow_lookback", "range_minutes", "zscore",
     "volume_multiplier", "compression_bps", "atr_period", "side",
     "confirmation", "entry_after_minutes", "entry_before_minutes",
@@ -1589,14 +1734,20 @@ _FAILURE_FIELD_PRIORITY = {
         "lookback", "range_minutes"),
     "negative_expectancy": (
         "threshold_bps", "target_r", "breakeven_r", "stop_atr", "max_hold_bars",
-        "confirmation", "side"),
+        "confirmation", "side", "target_mode", "target_lookback",
+        "trailing_stop_r", "exit_before_minutes"),
     "poor_payoff": (
-        "target_r", "breakeven_r", "stop_atr", "max_hold_bars", "threshold_bps"),
+        "target_r", "breakeven_r", "stop_atr", "target_mode",
+        "target_lookback", "trailing_stop_r", "exit_before_minutes",
+        "max_hold_bars", "threshold_bps"),
     "low_win_rate": (
-        "target_r", "breakeven_r", "threshold_bps", "max_hold_bars", "confirmation"),
+        "target_r", "breakeven_r", "threshold_bps", "max_hold_bars",
+        "confirmation", "target_mode", "target_lookback",
+        "trailing_stop_r", "exit_before_minutes"),
     "excess_drawdown": (
         "stop_atr", "max_hold_bars", "side", "threshold_bps",
-        "confirmation"),
+        "confirmation", "trailing_stop_r", "target_mode",
+        "exit_before_minutes"),
 }
 _ZERO_AXIS_STEPS = {
     "threshold_bps": (5.0, 10.0),
@@ -1609,9 +1760,62 @@ _ZERO_AXIS_STEPS = {
 # expose the audited grammar span explicitly while retaining one-coordinate
 # mutations.  Values are ordered from tight to wide for deterministic search.
 _STOP_ATR_LADDER = (0.2, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
+# The min-ATR axis shares the same preregistered large-axis values as the
+# LLM lane.  It is exposed by the deterministic lane only for an explicit
+# execution/cost-stress diagnosis; ordinary roots retain their local nudge.
+_MIN_ATR_BPS_LADDER = (
+    0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0,
+    75.0, 100.0, 150.0, 200.0, 300.0, 500.0, 1_000.0, 2_000.0,
+)
+_TARGET_MODE_LADDER = ("fixed_r", "session_vwap", "rolling_mean")
+_TARGET_LOOKBACK_LADDER = (2, 5, 10, 20, 40, 60, 90, 120)
+_TRAILING_STOP_R_LADDER = (None, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
+_EXIT_BEFORE_MINUTES_LADDER = (None, 30, 60, 120, 180, 240, 300, 360, 389)
 
 
-def _coordinate_values(root: Mapping[str, Any], field: str) -> list[Any]:
+def _stressed_cost_diagnostic(diagnostic: Mapping[str, Any] | None) -> bool:
+    """Whether a fit-only diagnosis explicitly opens the stress ladder."""
+    if not isinstance(diagnostic, Mapping):
+        return False
+    if diagnostic.get("execution_blocked") is True or \
+            str(diagnostic.get("primary_failure") or "") == "execution_blocked":
+        return True
+
+    def walk(value: Any, key: str = "") -> bool:
+        normalized = "".join(char if char.isalnum() else "_"
+                              for char in str(key).lower()).strip("_")
+        if normalized == "grammar_stop_floor_admissible" and value is False:
+            return True
+        if normalized in {"required_stop_distance_bps", "effective_stop_floor_bps"}:
+            try:
+                if float(value) > float(MIN_STOP_DISTANCE_BPS):
+                    return True
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if normalized in {"cost_stress", "cost_stressed",
+                          "stressed_cost_rejection", "stressed_cost_blocked"}:
+            return value is True or (isinstance(value, (int, float)) and
+                                     not isinstance(value, bool) and value > 0)
+        if ("stressed_cost_risk" in normalized or
+                "stressed_cost_rejection" in normalized or
+                "stressed_cost_blocked" in normalized):
+            return value is not False and value is not None and (
+                not isinstance(value, (int, float)) or value > 0)
+        if isinstance(value, str):
+            text = value.lower().replace("-", "_").replace(" ", "_")
+            return any(token in text for token in (
+                "cost_stress", "stressed_cost", "execution_blocked"))
+        if isinstance(value, Mapping):
+            return any(walk(item, str(name)) for name, item in value.items())
+        if isinstance(value, (list, tuple)):
+            return any(walk(item, normalized) for item in value)
+        return False
+
+    return walk(diagnostic)
+
+
+def _coordinate_values(root: Mapping[str, Any], field: str,
+                       diagnostic: Mapping[str, Any] | None = None) -> list[Any]:
     """Return two bounded directions for one executable field.
 
     Validation remains the source of truth for bounds.  This helper merely
@@ -1624,6 +1828,14 @@ def _coordinate_values(root: Mapping[str, Any], field: str) -> list[Any]:
     if field == "confirmation":
         return [item for item in ("none", "trend", "volume", "volatility")
                 if item != value]
+    if field == "target_mode":
+        return [item for item in _TARGET_MODE_LADDER if item != value]
+    if field == "target_lookback":
+        return [item for item in _TARGET_LOOKBACK_LADDER if item != value]
+    if field == "trailing_stop_r":
+        return [item for item in _TRAILING_STOP_R_LADDER if item != value]
+    if field == "exit_before_minutes":
+        return [item for item in _EXIT_BEFORE_MINUTES_LADDER if item != value]
     if field == "confirmations":
         current = list(value or ())
         values: list[list[str]] = []
@@ -1645,6 +1857,9 @@ def _coordinate_values(root: Mapping[str, Any], field: str) -> list[Any]:
     if field == "stop_atr":
         return [value for value in _STOP_ATR_LADDER
                 if float(value) != float(root.get(field))]
+    if field == "min_atr_bps" and _stressed_cost_diagnostic(diagnostic):
+        return [candidate for candidate in _MIN_ATR_BPS_LADDER
+                if float(candidate) != float(value)]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return []
     if field in _ZERO_AXIS_STEPS and float(value) == 0.0:
@@ -1680,7 +1895,7 @@ def coordinate_mutation_pool(
     for field in fields:
         if field not in root:
             continue
-        for value in _coordinate_values(root, field):
+        for value in _coordinate_values(root, field, diagnostic):
             try:
                 candidate = _safe_variant(root, **{field: value})
             except (TypeError, ValueError):
@@ -1981,6 +2196,18 @@ MAX_DISCOVERY_ATTEMPTS = (
     len(_DISCOVERY_BREAKEVEN_FRACTIONS))
 
 
+def discovery_attempt_limit(vehicle: str = "equity") -> int:
+    """Return one duplicate-free Cartesian traversal for a vehicle."""
+
+    normalized = str(vehicle).lower()
+    if normalized not in {"equity", "option"}:
+        raise FactoryError("vehicle must be equity or option")
+    base = (len(_DISCOVERY_WINDOWS) * len(_DISCOVERY_CONFIRMATIONS) *
+            len(_DISCOVERY_BANDS) * len(_DISCOVERY_SHAPES))
+    return (base * len(_DISCOVERY_BREAKEVEN_FRACTIONS)
+            if normalized == "equity" else base)
+
+
 def _target_hold_geometry_pair(
         root: Mapping[str, Any], diagnostic: Mapping[str, Any] | None,
         lessons: Sequence[Mapping[str, Any]] = (), *,
@@ -2073,22 +2300,28 @@ def discovery_spec(index: int, *, family: str,
     """Return the deterministic *index*-th conditional variant of a family.
 
     The ladder dimensions have mixed lengths (5, 5, 4, 7 against an 11-family
-    rotation) so consecutive indices vary several axes at once rather
-    than sweeping one and repeating.
+    rotation). ``_DISCOVERY_SHAPES`` is the fastest-varying dimension so
+    consecutive indices probe payoff geometry before repeating a window or
+    confirmation predicate.
     """
 
     spec = family_template(family)
     if str(vehicle) == "equity":
-        spec.update({"schema": RULE_SCHEMA_V3, **V3_DEFAULT_EXTENSIONS})
+        spec.update({"schema": RULE_SCHEMA_V4,
+                     **V3_DEFAULT_EXTENSIONS,
+                     **V4_DEFAULT_EXTENSIONS})
     if index <= 0:
         return validate_rule_spec(spec)
     windows, confirms = len(_DISCOVERY_WINDOWS), len(_DISCOVERY_CONFIRMATIONS)
     bands, shapes = len(_DISCOVERY_BANDS), len(_DISCOVERY_SHAPES)
-    after, before = _DISCOVERY_WINDOWS[index % windows]
-    confirmations = _DISCOVERY_CONFIRMATIONS[(index // windows) % confirms]
-    low, high = _DISCOVERY_BANDS[(index // (windows * confirms)) % bands]
-    side, target_r, stop_atr, max_hold = _DISCOVERY_SHAPES[
-        (index // (windows * confirms * bands)) % shapes]
+    shape_index = index % shapes
+    band_index = (index // shapes) % bands
+    confirmation_index = (index // (shapes * bands)) % confirms
+    window_index = (index // (shapes * bands * confirms)) % windows
+    after, before = _DISCOVERY_WINDOWS[window_index]
+    confirmations = _DISCOVERY_CONFIRMATIONS[confirmation_index]
+    low, high = _DISCOVERY_BANDS[band_index]
+    side, target_r, stop_atr, max_hold = _DISCOVERY_SHAPES[shape_index]
     breakeven_fraction = _DISCOVERY_BREAKEVEN_FRACTIONS[
         (index // (windows * confirms * bands * shapes)) %
         len(_DISCOVERY_BREAKEVEN_FRACTIONS)]
@@ -2100,8 +2333,9 @@ def discovery_spec(index: int, *, family: str,
                  "max_hold_bars": max_hold})
     if str(vehicle) == "equity":
         spec.update({
-            "schema": RULE_SCHEMA_V3,
+            "schema": RULE_SCHEMA_V4,
             "breakeven_r": round(target_r * breakeven_fraction, 8),
+            **V4_DEFAULT_EXTENSIONS,
         })
     return validate_rule_spec(spec)
 
@@ -2138,7 +2372,7 @@ def discovery_hypothesis(previous: Mapping[str, Any], *, generation: int,
         seeded = build(discovery_spec(0, family=family, vehicle=vehicle))
         if seeded is not None:
             return seeded
-    for index in range(1, MAX_DISCOVERY_ATTEMPTS + 1):
+    for index in range(1, discovery_attempt_limit(vehicle) + 1):
         family = RULE_FAMILIES[(start + index) % len(RULE_FAMILIES)]
         seeded = build(discovery_spec(index, family=family, vehicle=vehicle))
         if seeded is not None:

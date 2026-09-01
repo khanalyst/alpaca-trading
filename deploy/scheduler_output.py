@@ -24,7 +24,8 @@ _READINESS_FIELDS = frozenset({
     "recorded_session_count", "qualification_min_sessions",
     "observed_session_rate_per_day", "qualification_fraction",
     "development_fraction", "offline_required_sessions",
-    "shadow_tail_sessions",
+    "shadow_tail_sessions", "shadow_selection_sessions",
+    "shadow_confirmation_sessions",
 })
 
 
@@ -150,7 +151,8 @@ def structured_research_readiness(payload: object) -> dict | None:
         value = _readiness_int(raw_value)
         if value is not None:
             result[key] = value
-    for key in ("offline_required_sessions", "shadow_tail_sessions"):
+    for key in ("offline_required_sessions", "shadow_tail_sessions",
+                "shadow_selection_sessions", "shadow_confirmation_sessions"):
         value = _readiness_int(payload.get(key))
         if value is not None:
             result[key] = value
@@ -202,9 +204,21 @@ def derive_research_readiness(progress: Mapping[str, object] | None = None,
     qualification_min = _readiness_int(base.get("qualification_min_sessions"))
     heldout_min = backtest_min if heldout_min is None else heldout_min
     shadow_floor = shadow_min if shadow_floor is None else shadow_floor
-    shadow_floor = (_readiness_int(base.get("shadow_tail_sessions"))
-                    if _readiness_int(base.get("shadow_tail_sessions")) is not None
-                    else shadow_floor)
+    # Shadow readiness has two independent 30-session obligations: selection
+    # evidence and candidate confirmation. ``shadow_tail_sessions`` remains
+    # a compatibility alias for their sum in older status consumers.
+    shadow_selection = _readiness_int(base.get("shadow_selection_sessions"))
+    shadow_confirmation = _readiness_int(base.get("shadow_confirmation_sessions"))
+    if shadow_selection is None and shadow_confirmation is None:
+        legacy_tail = _readiness_int(base.get("shadow_tail_sessions"))
+        if legacy_tail is None:
+            legacy_tail = _readiness_int(base.get("shadow_min_sessions"))
+        if legacy_tail is not None:
+            shadow_selection = legacy_tail // 2
+            shadow_confirmation = legacy_tail - shadow_selection
+    shadow_selection = (shadow_min if shadow_selection is None else shadow_selection)
+    shadow_confirmation = (shadow_min if shadow_confirmation is None else shadow_confirmation)
+    shadow_floor = shadow_selection + shadow_confirmation
     qualification_min = (qualification_floor if qualification_min is None
                          else qualification_min)
     heldout_fraction = _readiness_number(base.get("heldout_fraction"), maximum=1.0)
@@ -263,6 +277,8 @@ def derive_research_readiness(progress: Mapping[str, object] | None = None,
         "offline_required_sessions": offline_required,
         "shadow_tail_sessions": shadow_floor,
         "shadow_min_sessions": shadow_floor,
+        "shadow_selection_sessions": shadow_selection,
+        "shadow_confirmation_sessions": shadow_confirmation,
         "required_sessions": required,
         "sessions_remaining": remaining,
         "progress_age_seconds": age,
@@ -299,6 +315,9 @@ class _BoundedCapture:
         self.research_progress: dict | None = None
         self.research_readiness: dict | None = None
         self.research_preflight: dict | None = None
+        self.research_funnel: dict | None = None
+        self.research_verdict: dict | None = None
+        self.cost_diagnostic: dict | None = None
 
     def feed(self, text: str) -> None:
         value = str(text)
@@ -340,6 +359,12 @@ class _BoundedCapture:
                 nested_preflight = cycle.get("preflight")
                 if isinstance(nested_preflight, dict):
                     self.research_preflight = nested_preflight
+                if isinstance(cycle.get("research_funnel"), dict):
+                    self.research_funnel = cycle["research_funnel"]
+                if isinstance(cycle.get("research_verdict"), dict):
+                    self.research_verdict = cycle["research_verdict"]
+                if isinstance(cycle.get("cost_diagnostic"), dict):
+                    self.cost_diagnostic = cycle["cost_diagnostic"]
             reason = structured_failure(payload)
             if reason is not None and len(self.structured_failures) < 32:
                 self.structured_failures.append(reason)
@@ -453,6 +478,15 @@ def structured_research_cycle(payload: object) -> dict | None:
     preflight = structured_research_preflight(payload.get("preflight"))
     if preflight is not None:
         result["preflight"] = preflight
+    funnel = structured_research_funnel(payload.get("research_funnel"))
+    if funnel is not None:
+        result["research_funnel"] = funnel
+    verdict = structured_research_verdict(payload.get("research_verdict"))
+    if verdict is not None:
+        result["research_verdict"] = verdict
+    cost_diagnostic = structured_cost_diagnostic(payload.get("cost_diagnostic"))
+    if cost_diagnostic is not None:
+        result["cost_diagnostic"] = cost_diagnostic
     # These additive flags are emitted by newer cycle wrappers. Keep parsing
     # older payloads byte-compatible for callers that compare the bounded
     # dictionary exactly.
@@ -460,6 +494,131 @@ def structured_research_cycle(payload: object) -> dict | None:
         if key in payload:
             result[key] = bool(payload.get(key))
     return result
+
+
+def _bounded_count(value: object, *, maximum: int = 10_000_000_000) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if 0 <= number <= maximum and number == value else None
+
+
+def structured_research_funnel(payload: object) -> dict | None:
+    """Validate the additive diagnostic funnel crossing the scheduler."""
+    if not isinstance(payload, dict) or payload.get("schema") != "research-funnel.v1":
+        return None
+    counts = payload.get("counts")
+    if not isinstance(counts, dict):
+        counts = {}
+    output_counts = {}
+    for key in ("opportunities", "admitted", "executed", "authorizing_eligible",
+                "gated", "selected"):
+        value = _bounded_count(counts.get(key, payload.get(key)))
+        if value is None:
+            return None
+        output_counts[key] = value
+    output = {
+        "schema": "research-funnel.v1", "scope": str(payload.get("scope") or "factory_cycle")[:64],
+        "diagnostic_only": True,
+        "authorizing": False,
+        "counts": output_counts,
+    }
+    for key in ("no_signal", "refused", "unclassified_refusals"):
+        value = _bounded_count(payload.get(key, 0))
+        if value is not None:
+            output[key] = value
+    reasons = payload.get("refusal_reasons")
+    if isinstance(reasons, dict):
+        output["refusal_reasons"] = {
+            str(name)[:120]: value for name, raw in list(reasons.items())[:32]
+            if (value := _bounded_count(raw, maximum=1_000_000)) is not None}
+    dominant = payload.get("dominant_refusal_reason")
+    if dominant is not None:
+        output["dominant_refusal_reason"] = str(dominant)[:120]
+    return output
+
+
+def structured_research_verdict(payload: object) -> dict | None:
+    """Validate a non-authorizing effect/power diagnostic."""
+    if not isinstance(payload, dict) or payload.get("schema") != "research-verdict.v1":
+        return None
+    output = {
+        "schema": "research-verdict.v1", "scope": str(payload.get("scope") or "factory_cycle")[:64],
+        "diagnostic_only": True,
+        "authorizing": False,
+        "status": str(payload.get("status") or "unavailable")[:64],
+        "effect_unit": str(payload.get("effect_unit") or "delta_per_observation")[:64],
+        "interpretation": str(payload.get("interpretation") or "")[:240],
+    }
+    for key in ("effect_estimate", "confidence", "p_value", "power", "mde"):
+        value = payload.get(key)
+        if value is None:
+            output[key] = None
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(number):
+            output[key] = number
+    if "effect_estimate" in output:
+        output["effect"] = output["effect_estimate"]
+    if "power" in output:
+        output["estimated_power"] = output["power"]
+    if "mde" in output:
+        output["minimum_detectable_effect"] = output["mde"]
+    interval = payload.get("confidence_interval")
+    if isinstance(interval, dict):
+        output["confidence_interval"] = {
+            key: float(interval[key]) for key in ("lower", "upper")
+            if interval.get(key) is not None and isinstance(interval.get(key), (int, float))
+            and math.isfinite(float(interval[key]))}
+        output["ci"] = dict(output["confidence_interval"])
+    for key in ("power_status", "mde_status"):
+        output[key] = str(payload.get(key) or "unavailable")[:64]
+    evidence_count = _bounded_count(payload.get("evidence_count", 0))
+    if evidence_count is not None:
+        output["evidence_count"] = evidence_count
+    return output
+
+
+def structured_cost_diagnostic(payload: object) -> dict | None:
+    """Validate cost-rerun status/path/delta without importing its report."""
+    if not isinstance(payload, dict) or payload.get("schema") != "cost-rerun-diagnostic.v1":
+        return None
+    output = {
+        "schema": "cost-rerun-diagnostic.v1", "diagnostic_only": True,
+        "authorizing": False,
+        "status": str(payload.get("status") or "not_run")[:32],
+        "reason": str(payload.get("reason") or "")[:240],
+    }
+    for key in ("path", "report_path", "content_hash"):
+        if payload.get(key) is not None:
+            output[key] = str(payload[key])[:512]
+    delta = payload.get("delta")
+    if isinstance(delta, dict):
+        safe = {}
+        for key in ("configured_round_trip_bps", "measured_round_trip_bps",
+                    "round_trip_bps_delta", "mean_net_r_delta", "sign_changes_to_positive"):
+            value = delta.get(key)
+            if isinstance(value, bool):
+                continue
+            if key == "sign_changes_to_positive":
+                count = _bounded_count(value, maximum=1_000_000)
+                if count is not None:
+                    safe[key] = count
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(number):
+                safe[key] = number
+        output["delta"] = safe
+    return output
 
 
 def structured_research_preflight(payload: object) -> dict | None:
@@ -549,6 +708,9 @@ def _capture_detail(stdout: _BoundedCapture | None,
         "research_progress": progress,
         "research_readiness": readiness,
         "research_preflight": preflight,
+        "research_funnel": out.research_funnel or err.research_funnel,
+        "research_verdict": out.research_verdict or err.research_verdict,
+        "cost_diagnostic": out.cost_diagnostic or err.cost_diagnostic,
     }
 
 

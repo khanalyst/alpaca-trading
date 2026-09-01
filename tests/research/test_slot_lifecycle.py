@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from agent.config import validate_config
 from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
-                                  RULE_SCHEMA_V2, RULE_SCHEMA_V3,
+                                  RULE_SCHEMA_V2, RULE_SCHEMA_V4,
                                   rule_variant_id)
 from research.edge_lab import EdgeLedger
 from research.costs import CostModel, ReplayPolicy
@@ -88,6 +88,11 @@ class SlotStateTests(unittest.TestCase):
             MIN_STOP_DISTANCE_BPS)
         self.assertFalse(
             context["execution_geometry"]["grammar_stop_floor_admissible"])
+        self.assertAlmostEqual(
+            context["execution_geometry"]["effective_stop_floor_bps"],
+            25.0 / 0.30)
+        self.assertTrue(
+            context["execution_geometry"]["policy_adjusted_stop_floor_admissible"])
         self.assertEqual(
             context["execution_geometry"]["expected_symmetric_bar_round_trip_bps"],
             17.0)
@@ -116,7 +121,9 @@ class SlotStateTests(unittest.TestCase):
 
         self.assertFalse(option_geometry["stop_distance_formula_available"])
         self.assertIsNone(option_geometry["required_stop_distance_bps"])
+        self.assertIsNone(option_geometry["effective_stop_floor_bps"])
         self.assertIsNone(option_geometry["grammar_stop_floor_admissible"])
+        self.assertTrue(option_geometry["policy_adjusted_stop_floor_admissible"])
         self.assertIn("plan-dependent", option_geometry[
             "stop_distance_formula_unavailable_reason"])
         self.assertIsNone(option_geometry[
@@ -252,7 +259,7 @@ class DeterministicDiscoveryTests(unittest.TestCase):
             self.assertEqual(seeded.rule_spec,
                              template_hypothesis(1).rule_spec)
 
-    def test_equity_discovery_continues_into_v3_once_every_family_is_tried(self):
+    def test_equity_discovery_continues_into_v4_once_every_family_is_tried(self):
         with tempfile.TemporaryDirectory() as directory:
             factory, _edge = _ledgers(directory)
             _seed(factory)
@@ -262,8 +269,9 @@ class DeterministicDiscoveryTests(unittest.TestCase):
                 existing_variant_ids=_variant_ids(factory),
                 tried_families=set(RULE_FAMILIES))
             self.assertIsNotNone(seeded)
-            self.assertEqual(seeded.rule_spec["schema"], RULE_SCHEMA_V3)
+            self.assertEqual(seeded.rule_spec["schema"], RULE_SCHEMA_V4)
             self.assertIsNotNone(seeded.rule_spec["breakeven_r"])
+            self.assertEqual(seeded.rule_spec["target_mode"], "fixed_r")
 
     def test_option_discovery_stays_on_executable_v2(self):
         with tempfile.TemporaryDirectory() as directory:

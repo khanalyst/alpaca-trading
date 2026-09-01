@@ -11,13 +11,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
+import math
 from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from agent.contracts.rule import MIN_STOP_DISTANCE_FRACTION
-from .costs import (BAR, QUOTE, CostError, CostModel, ReplayPolicy,
-                    check_entry_slippage, index_quotes, quote_fill_record,
-                    replay_policy_for_bars)
+from agent.contracts.risk_geometry import (
+    RiskGeometryError, effective_stop_distance, equity_price_increment,
+    quantize_equity_bracket,
+)
+from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS,
+                                  MIN_STOP_DISTANCE_FRACTION)
+from .costs import (BAR, QUOTE, RESTING_BRACKET,
+                    RESTING_BRACKET_FILL_SCHEMA, CostError, CostModel,
+                    ReplayPolicy, check_entry_slippage, index_quotes,
+                    quote_fill_record, replay_policy_for_bars,
+                    resting_bracket_fill_claim)
 
 RUNTIME_MAX_MARKET_DATA_AGE_SECONDS = 30.0
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
@@ -117,6 +125,12 @@ class IBRTrade:
     # or the bar it fell back to.  Calibration needs to know the difference.
     entry_fill_source: str = BAR
     exit_fill_source: str = BAR
+    # Non-gap equity stop/target exits use a broker-resident resting leg.  The
+    # claim is persisted as a mapping so gates can independently revalidate
+    # the level, tie, and exact-feed bar evidence.
+    exit_fill_schema: str | None = None
+    exit_fill_claim: Mapping[str, object] | None = None
+    exit_fill_bar_timestamp: str | None = None
     # Option evidence is point-in-time and executable only when it carries the
     # quote age and feed identity used by the replay.  These fields are at the
     # end of the dataclass to preserve positional construction of legacy
@@ -156,6 +170,12 @@ class IBRTrade:
     # labelled historical backfill. Authorization rejects this marker; replay
     # visibility remains controlled independently by the policy.
     evidence_mode: str = "forward_observed"
+    authored_stop_distance: float | None = None
+    effective_stop_floor_bps: float | None = None
+    stress_floor_binding: bool = False
+    stop_geometry_scenario_bps: float | None = None
+    stop_geometry_max_cost_to_risk_ratio: float | None = None
+    stop_geometry_activation_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -297,6 +317,7 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      stop_price: float, target_price: float, multiplier: int = 1,
                      entry_timestamp: datetime | None = None,
                      entry_source: str = BAR, exit_source: str = BAR,
+                     exit_fill_claim: Mapping[str, object] | None = None,
                      entry_quote_age_seconds: float | None = None,
                      exit_quote_age_seconds: float | None = None,
                      entry_feed: str | None = None,
@@ -306,7 +327,14 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      planned_risk_per_unit: float | None = None,
                      decision_timestamp: datetime | None = None,
                      underlying_entry: float | None = None,
-                     underlying_quote_feed: str | None = None) -> IBRTrade:
+                     underlying_quote_feed: str | None = None,
+                     authored_stop_distance: float | None = None,
+                     effective_stop_floor_bps: float | None = None,
+                     stress_floor_binding: bool = False,
+                     stop_geometry_scenario_bps: float | None = None,
+                     stop_geometry_max_cost_to_risk_ratio: float | None = None,
+                     stop_geometry_activation_reason: str | None = None,
+                     ) -> IBRTrade:
     # Listed options are always bought to open in the runtime, including puts
     # used for a short-underlying thesis.  Their P&L is therefore long-option
     # P&L even when the underlying direction is short.
@@ -348,6 +376,16 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
              float(stop_price) - entry_price),
         )
     risk_usd = float(cfg.quantity) * realized_risk_per_unit
+    claim = exit_fill_claim
+    schema = None
+    if exit_source == RESTING_BRACKET:
+        claim = resting_bracket_fill_claim(
+            exit_reason=reason, exit_reference=exit_reference,
+            stop_price=stop_price, target_price=target_price,
+            bar_timestamp=exit_bar.timestamp.isoformat(),
+            bar_feed=exit_bar.feed, bar_provider=exit_bar.provider,
+            tie_broken=tie)
+        schema = RESTING_BRACKET_FILL_SCHEMA
     return IBRTrade(
         vehicle=vehicle, session_date=day, symbol=symbol, direction=direction,
         range_high=range_high, range_low=range_low,
@@ -359,6 +397,10 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         costs=costs, net_pnl=gross - costs, tie_broken=tie, gap_fill=gap,
         contract_multiplier=multiplier, entry_fill_source=entry_source,
         exit_fill_source=exit_source,
+        exit_fill_schema=schema,
+        exit_fill_claim=claim,
+        exit_fill_bar_timestamp=(exit_bar.timestamp.isoformat()
+                                 if exit_source == RESTING_BRACKET else None),
         entry_quote_age_seconds=entry_quote_age_seconds,
         exit_quote_age_seconds=exit_quote_age_seconds,
         entry_feed=entry_feed, exit_feed=exit_feed,
@@ -379,6 +421,13 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                 for item in (signal, entry_bar, exit_bar))
             else "forward_observed"
         ),
+        authored_stop_distance=authored_stop_distance,
+        effective_stop_floor_bps=effective_stop_floor_bps,
+        stress_floor_binding=stress_floor_binding,
+        stop_geometry_scenario_bps=stop_geometry_scenario_bps,
+        stop_geometry_max_cost_to_risk_ratio=(
+            stop_geometry_max_cost_to_risk_ratio),
+        stop_geometry_activation_reason=stop_geometry_activation_reason,
     )
 
 
@@ -653,17 +702,51 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                        abs(anchor) * MIN_STOP_DISTANCE_FRACTION)
         target_r = cfg.target_r if cfg.target_r is not None else (
             cfg.target_pct / cfg.stop_pct)
-        stop = anchor - distance if direction == "long" else anchor + distance
-        target = (anchor + target_r * distance if direction == "long"
-                  else anchor - target_r * distance)
     else:
         distance = max(abs(anchor) * cfg.stop_pct,
                        abs(anchor) * MIN_STOP_DISTANCE_FRACTION)
         target_distance = max(abs(anchor) * cfg.target_pct,
                               abs(anchor) * MIN_STOP_DISTANCE_FRACTION)
-        stop = anchor - distance if direction == "long" else anchor + distance
-        target = (anchor + target_distance if direction == "long"
-                  else anchor - target_distance)
+        target_r = target_distance / distance
+    authored_distance = distance
+    stop_floor_bps = MIN_STOP_DISTANCE_BPS
+    stop_floor_binding = False
+    stop_geometry_scenario = None
+    stop_geometry_activation_reason = "stress_disabled"
+    if (vehicle == "equity" and
+            (cfg.policy.stressed_cost_scenario_bps is not None or
+             cfg.policy.stressed_cost_calibration_enabled) and
+            cfg.policy.max_stressed_cost_to_risk_ratio is not None):
+        stop_geometry_scenario, stop_geometry_activation_reason = (
+            cfg.policy.resolve_stress_scenario(
+                symbol, entry_at, vehicle="equity"))
+        if stop_geometry_scenario is None:
+            return refuse("stressed_cost_invalid")
+        try:
+            distance, stop_floor_bps = effective_stop_distance(
+                anchor, authored_distance,
+                base_floor_bps=MIN_STOP_DISTANCE_BPS,
+                scenario_bps=stop_geometry_scenario,
+                max_cost_to_risk_ratio=(
+                    cfg.policy.max_stressed_cost_to_risk_ratio),
+                minimum_increment=equity_price_increment(anchor))
+        except RiskGeometryError:
+            return refuse("stressed_cost_invalid")
+        stop_floor_binding = distance > authored_distance + 1e-12
+    stop = anchor - distance if direction == "long" else anchor + distance
+    target = (anchor + target_r * distance if direction == "long"
+              else anchor - target_r * distance)
+    if (not math.isfinite(stop) or stop <= 0 or
+            not math.isfinite(target) or target <= 0 or
+            (direction == "long" and not (stop < anchor < target)) or
+            (direction == "short" and not (target < anchor < stop))):
+        return refuse("stressed_cost_invalid")
+    if vehicle == "equity":
+        try:
+            stop, target, distance = quantize_equity_bracket(
+                anchor, stop, target, direction)
+        except RiskGeometryError:
+            return refuse("broker_tick_geometry_invalid")
 
     def option_exit_snapshot(cutoff: datetime) -> OptionSnapshot | None:
         if vehicle != "option":
@@ -760,7 +843,16 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     entry_provider=entry_provider,
                                     exit_provider=exit_provider,
                                     planned_risk_per_unit=distance,
-                                    underlying_quote_feed=underlying_quote_feed)
+                                    underlying_quote_feed=underlying_quote_feed,
+                                    authored_stop_distance=authored_distance,
+                                    effective_stop_floor_bps=stop_floor_bps,
+                                    stress_floor_binding=stop_floor_binding,
+                                    stop_geometry_scenario_bps=(
+                                        stop_geometry_scenario),
+                                    stop_geometry_max_cost_to_risk_ratio=(
+                                        cfg.policy.max_stressed_cost_to_risk_ratio),
+                                    stop_geometry_activation_reason=(
+                                        stop_geometry_activation_reason))
         if hit_stop or hit_target:
             # Stop wins if both are touched by one candle.
             reason = "stop" if hit_stop else "target"
@@ -784,14 +876,29 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     entry_timestamp=entry_at,
                                     decision_timestamp=signal_ready,
                                     underlying_entry=underlying_entry,
-                                    exit_source=(QUOTE if vehicle == "option" else BAR),
+                                    # Equity non-gap level triggers are fills
+                                    # of the already-resting broker bracket;
+                                    # they must not masquerade as a quote or a
+                                    # generic bar/time fallback.  Options
+                                    # retain their executable OPRA bid path.
+                                    exit_source=(QUOTE if vehicle == "option"
+                                                 else RESTING_BRACKET),
                                     entry_quote_age_seconds=entry_quote_age_seconds,
                                     exit_quote_age_seconds=exit_quote_age_seconds,
                                     entry_feed=entry_feed, exit_feed=exit_feed,
                                     entry_provider=entry_provider,
                                     exit_provider=exit_provider,
                                     planned_risk_per_unit=distance,
-                                    underlying_quote_feed=underlying_quote_feed)
+                                    underlying_quote_feed=underlying_quote_feed,
+                                    authored_stop_distance=authored_distance,
+                                    effective_stop_floor_bps=stop_floor_bps,
+                                    stress_floor_binding=stop_floor_binding,
+                                    stop_geometry_scenario_bps=(
+                                        stop_geometry_scenario),
+                                    stop_geometry_max_cost_to_risk_ratio=(
+                                        cfg.policy.max_stressed_cost_to_risk_ratio),
+                                    stop_geometry_activation_reason=(
+                                        stop_geometry_activation_reason))
     # Force-flat at the last completed bar before the configured close.
     boundary = next((b for b in hold if _local(b.timestamp, zone) >= close_at
                      and _open_visible(b, b.timestamp, cfg.policy)), None)
@@ -833,7 +940,16 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                             entry_provider=entry_provider,
                             exit_provider=exit_provider,
                             planned_risk_per_unit=distance,
-                            underlying_quote_feed=underlying_quote_feed)
+                            underlying_quote_feed=underlying_quote_feed,
+                            authored_stop_distance=authored_distance,
+                            effective_stop_floor_bps=stop_floor_bps,
+                            stress_floor_binding=stop_floor_binding,
+                            stop_geometry_scenario_bps=(
+                                stop_geometry_scenario),
+                            stop_geometry_max_cost_to_risk_ratio=(
+                                cfg.policy.max_stressed_cost_to_risk_ratio),
+                            stop_geometry_activation_reason=(
+                                stop_geometry_activation_reason))
 
 
 def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,

@@ -17,12 +17,13 @@ import unittest
 from agent import state
 from agent.alpaca_domain import Account, Order, OrderRequest, Position, Quote
 from agent.config import validate_config
+from agent.contracts.risk_geometry import quantize_equity_bracket
 from agent.contracts.rule import (BAR_SECONDS, RuleSpecError,
                                   MIN_STOP_DISTANCE_FRACTION,
-                                  RULE_SCHEMA_V3,
+                                  RULE_SCHEMA_V3, RULE_SCHEMA_V4,
                                   completed_bar_exit_transition,
                                   generate_rule_signal, hold_deadline,
-                                  initialize_exit_state,
+                                  initialize_exit_state, thesis_exit_deadline,
                                   rule_variant_id, validate_rule_spec)
 from agent.engine import Engine
 from agent.risk import RiskEngine
@@ -57,7 +58,9 @@ def _expected_protective_levels():
     """Derive the stop/target from the current executable stop floor."""
     anchor = RISING[-1]
     distance = anchor * MIN_STOP_DISTANCE_FRACTION
-    return anchor - distance, anchor + distance * SPEC["target_r"], distance
+    return quantize_equity_bracket(
+        anchor, anchor - distance, anchor + distance * SPEC["target_r"],
+        "long")
 
 
 def _payloads(closes, opens=None, ranges=None):
@@ -204,6 +207,33 @@ class CompletedBarExitTransitionTests(unittest.TestCase):
         stopped = completed_bar_exit_transition(armed["state"], next_bar)
         self.assertEqual(stopped["exit"]["reason"], "stop")
         self.assertEqual(stopped["exit"]["price"], 100.0)
+
+    def test_trailing_close_ratchet_is_monotone_and_next_bar_only(self):
+        state_row = initialize_exit_state(
+            "long", 100.0, 99.0, 110.0, trailing_stop_r=1.0,
+            target_mode="fixed_r")
+        first = completed_bar_exit_transition(state_row, {
+            "timestamp": BASE, "open": 100.0, "high": 103.0,
+            "low": 99.5, "close": 102.0})
+        self.assertIsNone(first["exit"])
+        self.assertTrue(first["stop_changed"])
+        self.assertEqual(first["state"]["active_stop_price"], 101.0)
+        # A pullback on the next completed bar cannot loosen the ratchet.
+        second = completed_bar_exit_transition(first["state"], {
+            "timestamp": BASE + timedelta(minutes=1), "open": 101.5,
+            "high": 101.8, "low": 101.2, "close": 101.3})
+        self.assertIsNone(second["exit"])
+        self.assertEqual(second["state"]["active_stop_price"], 101.0)
+
+    def test_thesis_deadline_is_distinct_and_clamps_hold(self):
+        spec = validate_rule_spec({"schema": RULE_SCHEMA_V4,
+                                   "family": "momentum_continuation",
+                                   "exit_before_minutes": 10,
+                                   "max_hold_bars": 390})
+        entry = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc).timestamp()
+        thesis = thesis_exit_deadline(entry, spec)
+        self.assertIsNotNone(thesis)
+        self.assertEqual(hold_deadline(entry, spec), thesis)
 
     def test_gap_precedes_intrabar_and_stop_wins_a_tie(self):
         state_row = initialize_exit_state("long", 100, 99, 103)
@@ -417,7 +447,7 @@ class ExitContractDifferentialTests(unittest.TestCase):
             filled_avg_price=Decimal(str(plan["entry_price"])))
         self.provider.positions_live = [self._position(plan["entry_price"])]
         engine.reconcile()
-        return engine, plan
+        return engine, risk_plan
 
     def _position(self, price):
         return Position("SPY", Decimal("10"), "long",

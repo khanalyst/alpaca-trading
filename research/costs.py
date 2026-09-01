@@ -773,6 +773,15 @@ class CostModel:
 
 BAR = "bar"
 QUOTE = "quote"
+# A broker-resident stop/target can be observed as touched by a completed
+# exact-feed bar, but it has no point-in-time executable quote at the trigger.
+# Keep this source distinct from both a diagnostic bar fallback and a quote so
+# gates can apply the ordinary adverse cost model and audit the claim.
+RESTING_BRACKET = "resting_bracket"
+RESTING_BRACKET_FILL_SCHEMA = "resting-bracket-fill.v1"
+# Readable compatibility alias for callers that describe the field as a
+# source schema rather than a fill schema.
+RESTING_BRACKET_SCHEMA = RESTING_BRACKET_FILL_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -789,6 +798,185 @@ class QuoteFill:
     as_of: datetime
     provider: str
     feed: str
+
+
+def resting_bracket_fill_claim(*, exit_reason: Any, exit_reference: Any,
+                               stop_price: Any, target_price: Any,
+                               bar_timestamp: Any = None,
+                               bar_feed: Any = None,
+                               bar_provider: Any = None,
+                               tie_broken: Any = False) -> dict[str, Any]:
+    """Build the canonical claim for a non-gap resting bracket leg.
+
+    The constructor is deliberately strict: replay code must not emit an
+    apparently auditable claim for a malformed level or provenance record.
+    Authorization performs the same checks plus entry/evidence validation via
+    :func:`validate_resting_bracket_fill`.
+    """
+    reason = str(exit_reason or "").strip().lower()
+    if reason not in {"stop", "target"}:
+        raise CostError("resting bracket exit_reason must be stop or target")
+    if isinstance(tie_broken, bool) is False:
+        raise CostError("resting bracket tie_broken must be boolean")
+
+    def finite(value: Any, name: str, *, positive: bool = False) -> float:
+        if isinstance(value, bool):
+            raise CostError(f"resting bracket {name} must be numeric")
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CostError(f"resting bracket {name} must be numeric") from exc
+        if not math.isfinite(number) or (positive and number <= 0):
+            qualifier = "finite and positive" if positive else "finite"
+            raise CostError(f"resting bracket {name} must be {qualifier}")
+        return number
+
+    reference = finite(exit_reference, "exit_reference", positive=True)
+    stop = finite(stop_price, "stop_price", positive=True)
+    target = finite(target_price, "target_price", positive=True)
+    level = stop if reason == "stop" else target
+    if not math.isclose(reference, level, rel_tol=0.0, abs_tol=1e-9):
+        raise CostError("resting bracket exit_reference must equal planned level")
+    feed = str(bar_feed or "").strip().lower().replace("-", "_")
+    provider = str(bar_provider or "").strip()
+    if not feed or not provider:
+        raise CostError("resting bracket bar feed and provider are required")
+    timestamp = None if bar_timestamp is None else str(bar_timestamp).strip()
+    if not timestamp:
+        raise CostError("resting bracket bar timestamp is required")
+    return {
+        "schema": RESTING_BRACKET_FILL_SCHEMA,
+        "source": RESTING_BRACKET,
+        "trigger": "intrabar",
+        "exit_reason": reason,
+        "planned_level": float(level),
+        "exit_reference": float(reference),
+        "stop_price": float(stop),
+        "target_price": float(target),
+        "gap": False,
+        "tie_broken": bool(tie_broken),
+        "bar_timestamp": timestamp,
+        "bar_feed": feed,
+        "bar_provider": provider,
+    }
+
+
+def validate_resting_bracket_fill(row: Mapping[str, Any], *,
+                                  equity_feed: str = "iex") -> str | None:
+    """Return a stable rejection reason for a resting-bracket row.
+
+    This is the shared fail-closed predicate used by gates and replay/control
+    callers.  It intentionally requires fresh quote-backed entry evidence,
+    exact-feed bar provenance on signal/entry/exit bars, and a complete claim;
+    callers must separately apply the cost model with ``executable_quotes``
+    false for this source.
+    """
+    if not isinstance(row, Mapping):
+        return "resting_bracket_malformed_claim"
+    if str(row.get("exit_fill_source") or "").strip().lower() != RESTING_BRACKET:
+        return "resting_bracket_source_mismatch"
+    if str(row.get("exit_fill_schema") or "").strip() != RESTING_BRACKET_FILL_SCHEMA:
+        return "resting_bracket_schema_mismatch"
+    claim = row.get("exit_fill_claim")
+    if not isinstance(claim, Mapping):
+        return "resting_bracket_missing_claim"
+    if str(claim.get("schema") or "").strip() != RESTING_BRACKET_FILL_SCHEMA:
+        return "resting_bracket_schema_mismatch"
+    if str(claim.get("source") or "").strip().lower() != RESTING_BRACKET:
+        return "resting_bracket_claim_source_mismatch"
+    if str(claim.get("trigger") or "").strip().lower() != "intrabar":
+        return "resting_bracket_trigger_mismatch"
+    reason = str(row.get("exit_reason") or "").strip().lower()
+    if reason not in {"stop", "target"}:
+        return "resting_bracket_non_level_exit"
+    if str(claim.get("exit_reason") or "").strip().lower() != reason:
+        return "resting_bracket_reason_mismatch"
+    if row.get("gap_fill") is True or row.get("entry_gap_fill") is True or \
+            row.get("exit_gap_fill") is True or claim.get("gap") is not False:
+        return "resting_bracket_gap_claim"
+    row_tie = row.get("tie_broken")
+    claim_tie = claim.get("tie_broken")
+    if not isinstance(row_tie, bool) or not isinstance(claim_tie, bool):
+        return "resting_bracket_tie_malformed"
+    if row_tie != claim_tie:
+        return "resting_bracket_tie_mismatch"
+    if reason == "target" and row_tie:
+        return "resting_bracket_target_tie"
+
+    def finite(value: Any, *, positive: bool = False) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return (number if math.isfinite(number) and
+                (not positive or number > 0) else None)
+
+    reference = finite(row.get("exit_reference"), positive=True)
+    authored_stop = finite(row.get("stop_price"), positive=True)
+    # Rule/factory replays may amend a broker-resident stop (breakeven or a
+    # later trailing leg).  Prefer the persisted active leg for the claim while
+    # retaining the authored stop for sizing/risk reports.
+    stop = finite(row.get("active_stop_price",
+                        row.get("exit_active_stop_price", row.get("stop_price"))),
+                  positive=True)
+    target = finite(row.get("target_price"), positive=True)
+    level = stop if reason == "stop" else target
+    planned = finite(claim.get("planned_level"), positive=True)
+    claimed_reference = finite(claim.get("exit_reference"), positive=True)
+    claimed_stop = finite(claim.get("stop_price"), positive=True)
+    claimed_target = finite(claim.get("target_price"), positive=True)
+    if (reference is None or authored_stop is None or stop is None or
+            target is None or level is None or claimed_stop is None or
+            claimed_target is None or
+            planned is None or claimed_reference is None or
+            not math.isclose(reference, level, rel_tol=0.0, abs_tol=1e-9) or
+            not math.isclose(planned, level, rel_tol=0.0, abs_tol=1e-9) or
+            not math.isclose(claimed_reference, reference,
+                             rel_tol=0.0, abs_tol=1e-9) or
+            not math.isclose(claimed_stop, stop, rel_tol=0.0, abs_tol=1e-9) or
+            not math.isclose(claimed_target, target,
+                             rel_tol=0.0, abs_tol=1e-9)):
+        return "resting_bracket_level_mismatch"
+    if str(row.get("entry_fill_source") or "").strip().lower() != QUOTE:
+        return "resting_bracket_entry_not_quote"
+    age = row.get("entry_quote_age_seconds")
+    if (isinstance(age, bool) or not isinstance(age, (int, float)) or
+            not math.isfinite(float(age)) or not 0.0 <= float(age) <= 30.0):
+        return "resting_bracket_entry_quote_stale"
+    feed = str(equity_feed or "").strip().lower().replace("-", "_")
+    if feed == "delayed":
+        feed = "delayed_sip"
+    if feed not in {"iex", "sip"}:
+        return "resting_bracket_non_authorizing_feed"
+    entry_feed = str(row.get("entry_feed") or "").strip().lower().replace("-", "_")
+    entry_provider = str(row.get("entry_provider") or "").strip()
+    if entry_feed != feed or not entry_provider:
+        return "resting_bracket_entry_provenance"
+    if str(row.get("evidence_mode") or "forward_observed").strip().lower() == \
+            "diagnostic_historical_backfill":
+        return "diagnostic_historical_backfill"
+    # Every bar participating in the claim must carry explicit exact-feed
+    # identity.  Missing metadata is not upgraded from the quote identity.
+    for leg in ("signal_bar", "entry_bar", "exit_bar"):
+        bar_feed = str(row.get(f"{leg}_feed") or "").strip().lower().replace("-", "_")
+        bar_provider = str(row.get(f"{leg}_provider") or "").strip()
+        if bar_feed != feed or not bar_provider:
+            return "resting_bracket_bar_provenance"
+    claim_feed = str(claim.get("bar_feed") or "").strip().lower().replace("-", "_")
+    claim_provider = str(claim.get("bar_provider") or "").strip()
+    if claim_feed != feed or not claim_provider:
+        return "resting_bracket_claim_provenance"
+    if claim_feed != str(row.get("exit_bar_feed") or "").strip().lower().replace("-", "_") or \
+            claim_provider != str(row.get("exit_bar_provider") or "").strip():
+        return "resting_bracket_claim_provenance"
+    expected_bar_timestamp = row.get("exit_fill_bar_timestamp")
+    claim_bar_timestamp = str(claim.get("bar_timestamp") or "").strip()
+    if (not expected_bar_timestamp or not claim_bar_timestamp or
+            claim_bar_timestamp != str(expected_bar_timestamp).strip()):
+        return "resting_bracket_claim_timestamp"
+    return None
 
 
 def _quote_fill_from_record(quote: Any, *, side: str) -> QuoteFill | None:
@@ -880,6 +1068,13 @@ def stressed_cost_usd(planned_notional: float | None = None,
     return float(stressed)
 
 
+def stressed_cost_ratio_exceeds(ratio: float, limit: float) -> bool:
+    """Compare the stress ratio without rejecting floating-point equality."""
+
+    tolerance = max(1e-12, abs(float(limit)) * 1e-12)
+    return float(ratio) - float(limit) > tolerance
+
+
 def check_stressed_cost_plan(
         plan: Mapping[str, Any], *, scenario_bps: float | None,
         max_ratio: float | None, costs: Any = None,
@@ -946,7 +1141,7 @@ def check_stressed_cost_plan(
         return None, "stressed_cost_invalid"
     if not math.isfinite(stressed) or not math.isfinite(ratio):
         return None, "stressed_cost_invalid"
-    if ratio > limit:
+    if stressed_cost_ratio_exceeds(ratio, limit):
         return None, "stressed_cost_risk_limit"
     enriched = dict(plan)
     enriched.update({
@@ -1050,8 +1245,16 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
                 feed = str(row.get(f"{leg}_feed") or "").strip().lower()
                 provider = str(row.get(f"{leg}_provider") or "").strip()
                 return source == QUOTE and feed == equity_feed and bool(provider)
-            equity_provenance = _equity_leg("entry") and _equity_leg("exit")
-            if not equity_provenance:
+            resting_exit = (str(row.get("exit_fill_source") or "").strip().lower()
+                            == RESTING_BRACKET)
+            if resting_exit:
+                resting_reason = validate_resting_bracket_fill(
+                    row, equity_feed=equity_feed)
+                equity_provenance = resting_reason is None
+                provenance_reason = resting_reason
+            else:
+                equity_provenance = _equity_leg("entry") and _equity_leg("exit")
+            if not equity_provenance and provenance_reason is None:
                 provenance_reason = (
                     f"equity legs require {equity_feed.upper()} quote provenance")
         elif vehicle == "option":
@@ -1472,15 +1675,18 @@ __all__ = [
     "ENTRY_SLIPPAGE_INVALID_REASON", "ENTRY_SLIPPAGE_REJECT_REASON",
     "check_entry_slippage", "DEFAULT_FEE_BPS",
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
-    "DEFAULT_SPREAD_BPS", "QUOTE",
+    "DEFAULT_SPREAD_BPS", "QUOTE", "RESTING_BRACKET",
+    "RESTING_BRACKET_FILL_SCHEMA", "RESTING_BRACKET_SCHEMA",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS",
     "COST_STRESS_SCENARIOS_BPS", "STRESSED_COST_SCHEMA", "STRESSED_COST_BASIS",
     "ReplayPolicy", "diagnostic_backfill_policy",
     "replay_policy_for_mode", "replay_policy_for_session",
     "replay_policy_for_bars", "derive_session_replay_policy",
     "cost_model_for_vehicle", "stressed_cost_usd", "stress_cost_usd",
+    "stressed_cost_ratio_exceeds",
     "check_stressed_cost_plan",
     "stressed_cost", "risk_unit_report",
     "QuoteFill", "SQLiteQuoteIndex", "SQLiteQuoteIndexDescriptor", "index_quotes",
-    "quote_fill", "quote_fill_record",
+    "quote_fill", "quote_fill_record", "resting_bracket_fill_claim",
+    "validate_resting_bracket_fill",
 ]

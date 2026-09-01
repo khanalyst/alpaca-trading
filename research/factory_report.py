@@ -30,6 +30,8 @@ from .factory_ledger import dependence_policy_digest
 from .stats import cross_family_dependence_report
 
 REPORT_SCHEMA = "factory-report.v1"
+RESEARCH_FUNNEL_SCHEMA = "research-funnel.v1"
+RESEARCH_VERDICT_SCHEMA = "research-verdict.v1"
 DEPENDENCE_POLICY_REPORT_SCHEMA = "dependence-policy.v1"
 SIGNAL_QUALITY_SCREEN_SCHEMA = "signal-quality-screen.v2"
 STALE_SIGNAL_QUALITY_SCHEMA_REASON = "stale_signal_quality_schema"
@@ -85,6 +87,324 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number == number and abs(number) != float("inf") else None
+
+
+def _empty_research_funnel(*, vehicle: str | None = None) -> dict[str, Any]:
+    """Return the bounded, non-overlapping research funnel contract.
+
+    ``opportunities`` are rows with a signal/execution opportunity (a
+    no-signal row is deliberately outside this denominator). ``admitted`` and
+    ``executed`` are terminal executed rows; the aliases are retained to make
+    the boundary explicit to older dashboard consumers. ``authorizing_eligible``
+    is the strict executable subset that was allowed into gate statistics.
+    ``gated`` counts opportunities refused at execution/admission, while
+    ``selected`` counts variants selected for the sealed qualification window.
+    These are additive diagnostics and never drive a gate.
+    """
+    counts = {
+        "opportunities": 0, "admitted": 0, "executed": 0,
+        "authorizing_eligible": 0, "gated": 0, "selected": 0,
+    }
+    return {
+        "schema": RESEARCH_FUNNEL_SCHEMA,
+        "scope": "factory_cycle",
+        "vehicle": vehicle,
+        "diagnostic_only": True,
+        "authorizing": False,
+        "counts": counts,
+        # Stable aliases make the contract readable without requiring callers
+        # to infer that a selected variant is not a selected trade row.
+        "opportunities": 0,
+        "admitted": 0,
+        "executed": 0,
+        "authorizing_eligible": 0,
+        "gated": 0,
+        "gated_out": 0,
+        "selected": 0,
+        "no_signal": 0,
+        "refused": 0,
+        "unclassified_refusals": 0,
+        "refusal_reasons": {},
+        "dominant_refusal_reason": None,
+        "definitions": {
+            "opportunities": "signal/execution opportunities; excludes no_signal rows",
+            "admitted": "rows admitted to execution (no_trade is false)",
+            "executed": "terminal executed rows; same row boundary as admitted",
+            "authorizing_eligible": "strict projection rows eligible for gate evidence",
+            "gated": "signal opportunities refused by an execution/admission gate",
+            "selected": "variants selected for post-selection qualification",
+            "no_signal": "rows ending no_signal and excluded from opportunities",
+            "refused": "signal opportunities ending refused with a reason",
+        },
+    }
+
+
+def _funnel_add(funnel: dict[str, Any], values: Mapping[str, Any]) -> None:
+    """Add one disjoint partition to a funnel, with conservative coercion."""
+    counts = funnel.setdefault("counts", {})
+    source = values.get("counts") if isinstance(values.get("counts"), Mapping) else values
+    for key in ("opportunities", "admitted", "executed",
+                "authorizing_eligible", "gated", "selected"):
+        try:
+            value = int(source.get(key, values.get(key, 0)) or 0)
+        except (TypeError, ValueError, OverflowError):
+            value = 0
+        counts[key] = int(counts.get(key, 0) or 0) + max(0, value)
+    for key in ("no_signal", "refused", "unclassified_refusals"):
+        try:
+            value = int(source.get(key, values.get(key, 0)) or 0)
+        except (TypeError, ValueError, OverflowError):
+            value = 0
+        funnel[key] = int(funnel.get(key, 0) or 0) + max(0, value)
+    for reason, raw_count in (source.get("refusal_reasons", values.get("refusal_reasons")) or {}).items():
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if count > 0:
+            reasons = funnel.setdefault("refusal_reasons", {})
+            reasons[str(reason)] = int(reasons.get(str(reason), 0) or 0) + count
+
+
+def _funnel_partition(gate: Mapping[str, Any], *, selected: bool = False) -> dict[str, Any]:
+    """Project one gate's persisted fill-quality summaries into the funnel."""
+    envelope = gate.get("verified_gate") if isinstance(gate.get("verified_gate"), Mapping) else gate
+    if not isinstance(envelope, Mapping):
+        return {"selected": int(selected)}
+    total: dict[str, Any] = {"counts": {"selected": int(selected)}}
+    qualities = envelope.get("fill_quality")
+    projections = envelope.get("authorization_projection")
+    arms = envelope.get("arm_diagnostics")
+    if not isinstance(qualities, Mapping):
+        qualities = {}
+    if not isinstance(projections, Mapping):
+        projections = {}
+    if not isinstance(arms, Mapping):
+        arms = {}
+    for partition in ("fit", "heldout"):
+        quality = qualities.get(partition)
+        if not isinstance(quality, Mapping):
+            continue
+        # ``execution_opportunities`` is the disjoint opportunity denominator:
+        # ``opportunities`` also includes no-signal rows in legacy reports.
+        opportunities = quality.get("execution_opportunities")
+        if opportunities is None:
+            opportunities = int(quality.get("opportunities") or 0) - int(
+                quality.get("no_signal") or 0)
+        item = {
+            "opportunities": opportunities,
+            "admitted": quality.get("executed", 0),
+            "executed": quality.get("executed", 0),
+            "no_signal": quality.get("no_signal", 0),
+            "refused": quality.get("refused", 0),
+            "unclassified_refusals": quality.get("unclassified_refusals", 0),
+            "gated": quality.get("refused", 0),
+            "refusal_reasons": quality.get("reject_reasons") or {},
+        }
+        projection = projections.get(partition)
+        if isinstance(projection, Mapping):
+            counts = projection.get("counts")
+            if isinstance(counts, Mapping):
+                item["authorizing_eligible"] = counts.get("eligible", 0)
+        arm = arms.get(partition)
+        if isinstance(arm, Mapping):
+            candidate = (arm.get("arms") or {}).get("candidate")
+            if isinstance(candidate, Mapping):
+                counts = candidate.get("counts")
+                if isinstance(counts, Mapping):
+                    # This is the strict, executable subset—not raw rows that
+                    # happened to carry a diagnostic fill.
+                    item["authorizing_eligible"] = counts.get(
+                        "eligible_executed", item.get("authorizing_eligible", 0))
+        _funnel_add(total, item)
+    return total
+
+
+def _finalize_research_funnel(funnel: dict[str, Any]) -> dict[str, Any]:
+    counts = funnel.setdefault("counts", {})
+    for key in ("opportunities", "admitted", "executed", "authorizing_eligible",
+                "gated", "selected"):
+        funnel[key] = int(counts.get(key, 0) or 0)
+    funnel["gated_out"] = funnel["gated"]
+    reasons = funnel.get("refusal_reasons") or {}
+    funnel["refusal_reasons"] = dict(sorted(reasons.items()))
+    funnel["dominant_refusal_reason"] = (
+        max(funnel["refusal_reasons"].items(), key=lambda item: (item[1], item[0]))[0]
+        if funnel["refusal_reasons"] else None)
+    return funnel
+
+
+def research_funnel(payload: Mapping[str, Any] | None, *,
+                    vehicle: str | None = None) -> dict[str, Any]:
+    """Build a bounded top-level funnel from factory/cycle result payloads."""
+    funnel = _empty_research_funnel(vehicle=vehicle or (
+        str(payload.get("vehicle")) if isinstance(payload, Mapping) and payload.get("vehicle") else None))
+    if not isinstance(payload, Mapping):
+        return funnel
+    records = payload.get("results")
+    if isinstance(records, Sequence) and not isinstance(records, (str, bytes)):
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            if (vehicle is not None and
+                    str(record.get("vehicle") or "equity") != str(vehicle)):
+                continue
+            gate = record.get("gate")
+            if isinstance(gate, Mapping):
+                selected = bool((gate.get("post_selection") or {}).get("qualification_consumed"))
+                _funnel_add(funnel, _funnel_partition(gate, selected=selected))
+    reports = payload.get("reports")
+    if isinstance(reports, Sequence) and not isinstance(reports, (str, bytes)):
+        for report in reports:
+            if not isinstance(report, Mapping):
+                continue
+            if (vehicle is not None and report.get("vehicle") is not None and
+                    str(report.get("vehicle")) != str(vehicle)):
+                continue
+            variants = report.get("variants")
+            if not isinstance(variants, Sequence) or isinstance(variants, (str, bytes)):
+                variants = (report,)
+            for variant in variants:
+                if not isinstance(variant, Mapping):
+                    continue
+                diagnostic = variant.get("diagnostic")
+                if not isinstance(diagnostic, Mapping):
+                    diagnostic = report.get("diagnostic")
+                if not isinstance(diagnostic, Mapping):
+                    continue
+                try:
+                    rows = int(diagnostic.get("rows") or 0)
+                    no_signal = int(diagnostic.get("no_signal_count") or 0)
+                    refused = int(diagnostic.get("execution_rejection_count") or 0)
+                    unclassified = int(diagnostic.get("unclassified_no_trade_count") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                _funnel_add(funnel, {
+                    "opportunities": max(0, rows - no_signal),
+                    "admitted": diagnostic.get("trades", 0),
+                    "executed": diagnostic.get("trades", 0),
+                    "no_signal": no_signal, "refused": refused,
+                    "unclassified_refusals": unclassified, "gated": refused,
+                })
+    return _finalize_research_funnel(funnel)
+
+
+def research_verdict(payload: Mapping[str, Any] | None, *,
+                     vehicle: str | None = None) -> dict[str, Any]:
+    """Return a deterministic, non-authorizing effect/power diagnostic."""
+    verdict: dict[str, Any] = {
+        "schema": RESEARCH_VERDICT_SCHEMA, "scope": "factory_cycle",
+        "vehicle": vehicle or (payload.get("vehicle") if isinstance(payload, Mapping) else None),
+        "diagnostic_only": True, "authorizing": False,
+        "status": "unavailable", "effect_estimate": None,
+        "effect": None,
+        "effect_unit": "delta_per_observation", "confidence_interval": None,
+        "ci": None,
+        "confidence": None, "p_value": None, "power": None, "mde": None,
+        "estimated_power": None, "minimum_detectable_effect": None,
+        "power_status": "unavailable", "mde_status": "unavailable",
+        "evidence_count": 0, "interpretation": "no effect evidence available",
+    }
+    if not isinstance(payload, Mapping):
+        return verdict
+    effects: list[float] = []
+    lowers: list[float] = []
+    uppers: list[float] = []
+    p_values: list[float] = []
+    powers: list[float] = []
+    mdes: list[float] = []
+    mde_statuses: list[str] = []
+
+    def consume(record: Mapping[str, Any]) -> None:
+        gate = record.get("gate")
+        if isinstance(gate, Mapping):
+            test = gate.get("test")
+            if isinstance(test, Mapping):
+                effect = _number(test.get("mean_delta"))
+                if effect is not None:
+                    effects.append(effect)
+                lower = _number(test.get("mean_delta_lcb"))
+                upper = _number(test.get("mean_delta_ucb"))
+                if lower is not None:
+                    lowers.append(lower)
+                if upper is not None:
+                    uppers.append(upper)
+                p_value = _number(test.get("p_value"))
+                if p_value is not None:
+                    p_values.append(p_value)
+        diagnostic = record.get("fit_diagnostics") or record.get("diagnostic")
+        if isinstance(diagnostic, Mapping):
+            fit = diagnostic.get("fit_diagnostics")
+            fit = fit if isinstance(fit, Mapping) else diagnostic
+            quality = fit.get("signal_quality") if isinstance(fit, Mapping) else None
+            horizons = quality.get("horizon_metrics") if isinstance(quality, Mapping) else None
+            if isinstance(horizons, Mapping):
+                for metric in horizons.values():
+                    if not isinstance(metric, Mapping):
+                        continue
+                    effect = _number(metric.get("candidate_minus_control_bps"))
+                    if effect is not None:
+                        effects.append(effect)
+            power = fit.get("mde_power") if isinstance(fit, Mapping) else None
+            if isinstance(power, Mapping):
+                value = _number(power.get("power", power.get("estimated_power")))
+                mde = _number(power.get("mde", power.get("minimum_detectable_effect")))
+                if value is not None:
+                    powers.append(value)
+                if mde is not None:
+                    mdes.append(mde)
+                if power.get("available") is True:
+                    mde_statuses.append("available")
+                elif power.get("reason"):
+                    mde_statuses.append(str(power.get("reason")))
+
+    records = payload.get("results")
+    if isinstance(records, Sequence) and not isinstance(records, (str, bytes)):
+        for record in records:
+            if (isinstance(record, Mapping) and
+                    (vehicle is None or
+                     str(record.get("vehicle") or "equity") == str(vehicle))):
+                consume(record)
+    reports = payload.get("reports")
+    if isinstance(reports, Sequence) and not isinstance(reports, (str, bytes)):
+        for report in reports:
+            if not isinstance(report, Mapping):
+                continue
+            if (vehicle is not None and report.get("vehicle") is not None and
+                    str(report.get("vehicle")) != str(vehicle)):
+                continue
+            variants = report.get("variants")
+            if isinstance(variants, Sequence) and not isinstance(variants, (str, bytes)):
+                for variant in variants:
+                    if isinstance(variant, Mapping):
+                        consume(variant)
+            else:
+                consume(report)
+    if effects:
+        verdict["status"] = "evidence_available"
+        verdict["effect_estimate"] = sum(effects) / len(effects)
+        verdict["effect"] = verdict["effect_estimate"]
+        verdict["evidence_count"] = len(effects)
+        verdict["confidence"] = (1.0 - min(p_values) if p_values else None)
+        verdict["p_value"] = min(p_values) if p_values else None
+        if lowers or uppers:
+            verdict["confidence_interval"] = {
+                "lower": min(lowers) if lowers else None,
+                "upper": max(uppers) if uppers else None,
+            }
+            verdict["ci"] = dict(verdict["confidence_interval"])
+        verdict["interpretation"] = "descriptive effect; no authorization implied"
+    if powers:
+        verdict["power"] = sum(powers) / len(powers)
+        verdict["estimated_power"] = verdict["power"]
+        verdict["power_status"] = "available"
+    if mdes:
+        verdict["mde"] = sum(mdes) / len(mdes)
+        verdict["minimum_detectable_effect"] = verdict["mde"]
+        verdict["mde_status"] = "available"
+    elif mde_statuses:
+        verdict["mde_status"] = sorted(mde_statuses)[0]
+    return verdict
 
 
 def _risk_summary_value(section: Any) -> float | None:
@@ -649,14 +969,16 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
     if not path.is_file():
         return {"schema": REPORT_SCHEMA, "available": False,
                 "reason": "ledger not created", "db_path": str(path),
-                "vehicles": []}
+                "vehicles": [], "research_funnel": _empty_research_funnel(vehicle=vehicle),
+                "research_verdict": research_verdict(None, vehicle=vehicle)}
     with closing(_connect(path)) as db:
         tables = {str(row[0]) for row in db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if "factory_hypotheses" not in tables:
             return {"schema": REPORT_SCHEMA, "available": False,
                     "reason": "no factory lineage recorded", "db_path": str(path),
-                    "vehicles": []}
+                    "vehicles": [], "research_funnel": _empty_research_funnel(vehicle=vehicle),
+                    "research_verdict": research_verdict(None, vehicle=vehicle)}
         frozen_policies: dict[str, list[dict]] = {name: [] for name in VEHICLES}
         if "factory_dependence_policies" in tables:
             for row in db.execute(
@@ -677,6 +999,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             item["payload"] = _loads(item.pop("payload_json")) or {}
             events.setdefault(str(item["hypothesis_id"]), []).append(item)
         accounts: dict[str, list[dict]] = {}
+        report_records: list[dict[str, Any]] = []
         closures: dict[str, list[dict]] = {}
         if "factory_variant_closures" in tables:
             for row in db.execute(
@@ -693,6 +1016,9 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                    FROM factory_accounts ORDER BY created_at, account_id"""):
             record = _loads(row["result_json"])
             if isinstance(record, Mapping):
+                if (vehicle is None or
+                        str(record.get("vehicle") or "equity") == str(vehicle)):
+                    report_records.append(dict(record))
                 hypothesis_id = str(row["hypothesis_id"])
                 accounts.setdefault(hypothesis_id, []).append(_variant_row(record))
                 spec = record.get("rule_spec")
@@ -952,8 +1278,16 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             "slots": [{"slot": key, "generations": slots[key]}
                       for key in sorted(slots)],
         })
+    all_records_payload = {"results": report_records}
     return {"schema": REPORT_SCHEMA, "available": True, "db_path": str(path),
-            "cycles": cycles, "vehicles": report_vehicles}
+            "cycles": cycles, "vehicles": report_vehicles,
+            # These top-level projections intentionally sit beside (rather
+            # than inside) the lifecycle verdicts. They are descriptive and
+            # explicitly non-authorizing.
+            "research_funnel": research_funnel(all_records_payload,
+                                                vehicle=vehicle),
+            "research_verdict": research_verdict(all_records_payload,
+                                                  vehicle=vehicle)}
 
 
 # How many graded reasons the rendered narrative shows before it becomes a log
@@ -1000,6 +1334,22 @@ def render_text(report: Mapping[str, Any]) -> str:
     add = out.append
     add(f"Autonomous research report  ({report['db_path']})")
     add(f"cycles run: {report.get('cycles', 0)}")
+    funnel = report.get("research_funnel") or _empty_research_funnel()
+    counts = funnel.get("counts") or {}
+    add("research funnel (diagnostic, non-authorizing): "
+        f"opportunities {counts.get('opportunities', 0)} | "
+        f"admitted {counts.get('admitted', 0)} | executed {counts.get('executed', 0)} | "
+        f"authorizing-eligible {counts.get('authorizing_eligible', 0)} | "
+        f"gated {counts.get('gated', 0)} | selected {counts.get('selected', 0)}")
+    add("  no-signal/refused: "
+        f"{funnel.get('no_signal', 0)}/{funnel.get('refused', 0)}; "
+        f"dominant refusal {funnel.get('dominant_refusal_reason') or 'none'}")
+    verdict = report.get("research_verdict") or research_verdict(None)
+    add("research verdict (diagnostic, non-authorizing): "
+        f"{verdict.get('status')} effect {_fmt(verdict.get('effect_estimate'))} "
+        f"CI {verdict.get('confidence_interval') or 'unavailable'} "
+        f"power {verdict.get('power') if verdict.get('power') is not None else 'unavailable'} "
+        f"MDE {verdict.get('mde') if verdict.get('mde') is not None else 'unavailable'}")
     for vehicle in report["vehicles"]:
         summary = vehicle["summary"]
         add("")
@@ -1250,6 +1600,14 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         return f"# Research report\n\nNo lineage yet ({report.get('reason')}).\n"
     out = [f"# Autonomous research report", "",
            f"- Ledger: `{report['db_path']}`", f"- Cycles run: {report.get('cycles', 0)}"]
+    funnel = report.get("research_funnel") or _empty_research_funnel()
+    counts = funnel.get("counts") or {}
+    verdict = report.get("research_verdict") or research_verdict(None)
+    out += ["", "## Diagnostic observability", "",
+            "These fields are derived telemetry; they cannot authorize, mutate FDR/ledger state, or promote a candidate.",
+            f"- Funnel: opportunities {counts.get('opportunities', 0)}, admitted {counts.get('admitted', 0)}, executed {counts.get('executed', 0)}, authorizing-eligible {counts.get('authorizing_eligible', 0)}, gated {counts.get('gated', 0)}, selected {counts.get('selected', 0)}",
+            f"- No-signal/refused: {funnel.get('no_signal', 0)}/{funnel.get('refused', 0)}; dominant refusal: `{funnel.get('dominant_refusal_reason') or 'none'}`",
+            f"- Research verdict: `{verdict.get('status')}`; effect `{_fmt(verdict.get('effect_estimate'))}`; confidence interval `{verdict.get('confidence_interval') or 'unavailable'}`; power `{verdict.get('power') if verdict.get('power') is not None else 'unavailable'}`; MDE `{verdict.get('mde') if verdict.get('mde') is not None else 'unavailable'}`"]
     for vehicle in report["vehicles"]:
         summary = vehicle["summary"]
         out += ["", f"## {vehicle['vehicle']}", "",
@@ -1445,5 +1803,6 @@ def write_report(db_path: str | Path = DEFAULT_DB_PATH, *,
     return target
 
 
-__all__ = ["DEFAULT_REPORT_ROOT", "REPORT_SCHEMA", "build_report",
-           "render_markdown", "render_text", "write_report"]
+__all__ = ["DEFAULT_REPORT_ROOT", "REPORT_SCHEMA", "RESEARCH_FUNNEL_SCHEMA",
+           "RESEARCH_VERDICT_SCHEMA", "build_report", "research_funnel",
+           "research_verdict", "render_markdown", "render_text", "write_report"]

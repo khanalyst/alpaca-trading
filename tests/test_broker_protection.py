@@ -321,7 +321,7 @@ class BrokerProtectionTests(ProtectionHarness):
         self.assertIsNone(result)
         self.assertEqual(self.provider.submitted, [])
         self.assertEqual(events[-1], ("risk_reject", {
-            "symbol": "SPY", "reason": "stressed_cost_risk_limit"}))
+            "symbol": "SPY", "reason": "stressed_cost_invalid"}))
 
     def test_equity_entry_attaches_a_bracket_with_plan_stop_and_target(self):
         self._bind_engine(runtime_name="runtime-bracket")
@@ -339,11 +339,11 @@ class BrokerProtectionTests(ProtectionHarness):
                       stop_distance=1.503)
         request, plan = self.engine._risk_order(
             "SPY", signal, self._row(), self.provider.account(), [], self.NOW)
-        self.assertEqual(request.stop_loss, Decimal("100.00"))
+        self.assertEqual(request.stop_loss, Decimal("99.99"))
         self.assertEqual(request.take_profit, Decimal("105.00"))
-        self.assertEqual(plan["stop_price"], 100.0)
+        self.assertEqual(plan["stop_price"], 99.99)
         self.assertEqual(plan["target_price"], 105.0)
-        self.assertEqual(plan["stop_distance"], 1.5)
+        self.assertEqual(plan["stop_distance"], 1.51)
 
     def test_equity_tick_rounding_uses_executable_quote_when_signal_omits_entry(self):
         self._bind_engine(runtime_name="runtime-bracket-quote-entry")
@@ -353,8 +353,8 @@ class BrokerProtectionTests(ProtectionHarness):
         request, plan = self.engine._risk_order(
             "SPY", signal, self._row(), self.provider.account(), [], self.NOW)
         self.assertEqual(plan["entry_price"], 101.5)
-        self.assertEqual(plan["stop_price"], 100.0)
-        self.assertEqual(request.stop_loss, Decimal("100.00"))
+        self.assertEqual(plan["stop_price"], 99.99)
+        self.assertEqual(request.stop_loss, Decimal("99.99"))
         self.assertEqual(request.take_profit, Decimal("105.00"))
 
     def test_quote_derived_entry_is_rounded_adversely_before_equity_sizing(self):
@@ -371,8 +371,8 @@ class BrokerProtectionTests(ProtectionHarness):
                 request, plan = self.engine._risk_order(
                     "SPY", signal, row, self.provider.account(), [], self.NOW)
                 self.assertEqual(plan["entry_price"], expected_entry)
-                self.assertEqual(request.stop_loss, Decimal("100.00") if direction == "long"
-                                 else Decimal("103.00"))
+                self.assertEqual(request.stop_loss, Decimal("99.99") if direction == "long"
+                                 else Decimal("103.01"))
                 self.assertEqual(request.take_profit, Decimal("105.00") if direction == "long"
                                  else Decimal("99.00"))
 
@@ -387,8 +387,8 @@ class BrokerProtectionTests(ProtectionHarness):
         request, plan = self.engine._risk_order(
             "SPY", signal, row, self.provider.account(), [], self.NOW)
         self.assertEqual(plan["entry_price"], 101.51)
-        self.assertEqual(plan["stop_distance"], 1.51)
-        self.assertEqual(request.stop_loss, Decimal("100.00"))
+        self.assertEqual(plan["stop_distance"], 1.52)
+        self.assertEqual(request.stop_loss, Decimal("99.99"))
         self.assertEqual(request.take_profit, Decimal("105.00"))
 
     def test_malformed_authored_entry_cannot_be_repaired_by_a_valid_quote(self):

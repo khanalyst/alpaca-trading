@@ -41,22 +41,30 @@ LESSON_KINDS = {"tuning", "tuning_retry", "discovery", "replacement", "rotation"
                 # produced by real fills rather than a replay.
                 "trial"}
 LESSON_SOURCES = {"llm", "deterministic", "live_paper"}
-# v5 is the active raw-p confirmatory method.  It is a standard LORD++
-# sequence (not merely LORD-style): the initial wealth is explicit and the
-# first discovery receives only the unspent wealth, alpha - W0.  The prior
-# v2/v3/v4 scopes remain readable and isolated because their allocation
-# semantics differ.  In particular, v4 used the old balanced raw-p sequence
-# even though its scope was introduced as a fresh sequence by the prior
-# release.
-CONFIRMATORY_SCOPE_VERSION = "shadow-confirmation-v5"
-FDR_METHOD = "lord_plus_plus_balanced_raw_p_v5"
+# v6 is the active raw-p confirmatory method.  It is a new durable scope and
+# therefore gets its own LORD++ sequence and initial-wealth preregistration.
+# v5 remains fully readable/replayable: its rows retain the original W0=alpha
+# allocation and are never reinterpreted as v6 after a restart.  The prior
+# v2/v3/v4 scopes likewise retain their historical methods.
+CONFIRMATORY_SCOPE_VERSION = "shadow-confirmation-v6"
+CONFIRMATORY_SCOPE_VERSION_V5 = "shadow-confirmation-v5"
+FDR_METHOD_V5 = "lord_plus_plus_balanced_raw_p_v5"
+FDR_METHOD_V6 = "lord_plus_plus_balanced_raw_p_v6"
+# FDR_METHOD is the active method for new callers.  Keep the explicit v5
+# symbol above for audit/replay consumers that must select the old semantics.
+FDR_METHOD = FDR_METHOD_V6
 LEGACY_FDR_METHOD = "lord_balanced_v2"
 LEGACY_RAW_FDR_METHOD = "lord_balanced_raw_p_v3"
-FDR_METHOD_VERSION = "v5"
-# Preserve the deployed sequence's pre-discovery spending: W0 was the full
-# nominal alpha.  Under LORD++ this makes the first-discovery reward
-# alpha-W0 explicitly zero, while later discoveries still receive alpha.
-FDR_INITIAL_WEALTH_FRACTION = 1.0
+FDR_METHOD_VERSION_V5 = "v5"
+FDR_METHOD_VERSION_V6 = "v6"
+FDR_METHOD_VERSION = FDR_METHOD_VERSION_V6
+# v5 spent the full nominal alpha before its first discovery.  v6 is the new
+# preregistration: half of alpha is initial wealth, leaving alpha/2 for the
+# first-discovery reward.  The unsuffixed constant is the active v6 value;
+# callers replaying v5 should use the explicit v5 constant.
+FDR_INITIAL_WEALTH_FRACTION_V5 = 1.0
+FDR_INITIAL_WEALTH_FRACTION_V6 = 0.5
+FDR_INITIAL_WEALTH_FRACTION = FDR_INITIAL_WEALTH_FRACTION_V6
 FDR_GAMMA_METHOD = "balanced_telescoping"
 
 
@@ -146,9 +154,10 @@ def _fdr_semantics(scope: str) -> tuple[str, str]:
 
     A scope is the durable method-version boundary.  The v2 rows spent a
     selection q-value; v3 and v4 rows spent the old balanced raw-p sequence.
-    Neither history is allowed to seed the active v5 LORD++ sequence.  An
-    unversioned/new scope uses the current method so callers cannot silently
-    opt into a retired rule by omitting a version.
+    v5 and v6 are separate LORD++ sequences with different preregistered
+    initial wealth.  An unversioned/custom scope retains the pre-v6 raw-p
+    semantics so an old caller cannot silently opt into the new rule by
+    omitting a version.
     """
     value = str(scope)
     if value.startswith("shadow-confirmation-v2:"):
@@ -156,11 +165,15 @@ def _fdr_semantics(scope: str) -> tuple[str, str]:
     if value.startswith(("shadow-confirmation-v3:",
                          "shadow-confirmation-v4:")):
         return LEGACY_RAW_FDR_METHOD, "raw_confirmatory"
+    if value.startswith(f"{CONFIRMATORY_SCOPE_VERSION_V5}:"):
+        return FDR_METHOD_V5, "raw_confirmatory"
     if value.startswith(f"{CONFIRMATORY_SCOPE_VERSION}:"):
-        return FDR_METHOD, "raw_confirmatory"
+        return FDR_METHOD_V6, "raw_confirmatory"
     if value.startswith("shadow-confirmation-v"):
         raise FactoryError(f"unsupported confirmatory FDR scope: {value}")
-    return FDR_METHOD, "raw_confirmatory"
+    # Unversioned/custom scopes predate the v6 boundary.  Keep their old
+    # raw-p LORD++ semantics rather than silently opting them into W0=alpha/2.
+    return FDR_METHOD_V5, "raw_confirmatory"
 
 
 class FactoryError(ValueError):
@@ -168,8 +181,10 @@ class FactoryError(ValueError):
 
 
 def _fdr_method_version(method: str) -> str:
-    if method == FDR_METHOD:
-        return FDR_METHOD_VERSION
+    if method == FDR_METHOD_V5:
+        return FDR_METHOD_VERSION_V5
+    if method == FDR_METHOD_V6:
+        return FDR_METHOD_VERSION_V6
     if method == LEGACY_RAW_FDR_METHOD:
         return "v3"
     if method == LEGACY_FDR_METHOD:
@@ -180,7 +195,7 @@ def _fdr_method_version(method: str) -> str:
 def _fdr_p_value_kind(method: str) -> str:
     if method == LEGACY_FDR_METHOD:
         return "legacy_q"
-    if method in {FDR_METHOD, LEGACY_RAW_FDR_METHOD}:
+    if method in {FDR_METHOD_V5, FDR_METHOD_V6, LEGACY_RAW_FDR_METHOD}:
         return "raw_confirmatory"
     raise FactoryError(f"unsupported durable FDR method: {method}")
 
@@ -240,9 +255,10 @@ def _legacy_fdr_allocation(decisions: list[Mapping[str, Any]],
     return test_index, min(float(alpha), allocated)
 
 
-def _fdr_allocation(decisions: list[Mapping[str, Any]],
-                    alpha: float) -> tuple[int, float]:
-    """Return the next standard LORD++ allocation without mutating state.
+def _lord_plus_plus_allocation(
+        decisions: list[Mapping[str, Any]], alpha: float,
+        initial_wealth_fraction: float) -> tuple[int, float]:
+    """Return a LORD++ allocation for one preregistered initial wealth.
 
     Let ``tau_j`` be the test index of the j-th prior discovery and let
     ``gamma_i = 1/(i(i+1))``.  For an explicitly preregistered initial wealth
@@ -251,16 +267,18 @@ def _fdr_allocation(decisions: list[Mapping[str, Any]],
     ``W0*gamma_i + (alpha-W0)*gamma_(i-tau_1) +
     alpha*sum(gamma_(i-tau_j), j >= 2)``
 
-    over discoveries strictly before ``i``.  The configured ``W0`` is the
-    full nominal alpha, preserving the pre-discovery sequence; consequently
-    the first-discovery reward is explicitly ``alpha - W0 = 0`` and every
-    later discovery reward is ``alpha``;
+    over discoveries strictly before ``i``.  ``initial_wealth_fraction`` is
+    part of the durable method identity; changing it without a new scope
+    would reinterpret every prior allocation.
     indices with no prior discovery contribute nothing.  The balanced gamma
     sequence sums to one, so the base and each reward stream are separately
     bounded as required by LORD++.
     """
     test_index = len(decisions) + 1
-    initial_wealth = float(alpha) * FDR_INITIAL_WEALTH_FRACTION
+    fraction = float(initial_wealth_fraction)
+    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+        raise FactoryError("initial wealth fraction must be in (0,1]")
+    initial_wealth = float(alpha) * fraction
     allocated = initial_wealth * _fdr_gamma(test_index)
     discoveries = [index for index, row in enumerate(decisions, start=1)
                    if bool(row["decision"])]
@@ -275,27 +293,48 @@ def _fdr_allocation(decisions: list[Mapping[str, Any]],
     return test_index, min(float(alpha), allocated)
 
 
+def _fdr_allocation(decisions: list[Mapping[str, Any]],
+                    alpha: float) -> tuple[int, float]:
+    """Return the v5 LORD++ allocation (the historical W0=alpha rule)."""
+    return _lord_plus_plus_allocation(
+        decisions, alpha, FDR_INITIAL_WEALTH_FRACTION_V5)
+
+
+def _fdr_allocation_v6(decisions: list[Mapping[str, Any]],
+                       alpha: float) -> tuple[int, float]:
+    """Return the v6 LORD++ allocation (the new preregistered W0=alpha/2)."""
+    return _lord_plus_plus_allocation(
+        decisions, alpha, FDR_INITIAL_WEALTH_FRACTION_V6)
+
+
 def _fdr_allocation_for_method(decisions: list[Mapping[str, Any]], alpha: float,
                                method: str) -> tuple[int, float]:
     """Dispatch allocation while preserving the old scope semantics."""
     if method in {LEGACY_FDR_METHOD, LEGACY_RAW_FDR_METHOD}:
         return _legacy_fdr_allocation(decisions, alpha)
-    return _fdr_allocation(decisions, alpha)
+    if method == FDR_METHOD_V5:
+        return _fdr_allocation(decisions, alpha)
+    if method == FDR_METHOD_V6:
+        return _fdr_allocation_v6(decisions, alpha)
+    raise FactoryError(f"unsupported durable FDR method: {method}")
 
 
 def _fdr_metadata(method: str, p_value_kind: str, alpha: float) -> dict[str, Any]:
     """Describe the durable method without conflating old and current rules."""
     metadata = {"method": str(method), "p_value_kind": str(p_value_kind)}
-    if method == FDR_METHOD:
-        initial_wealth = float(alpha) * FDR_INITIAL_WEALTH_FRACTION
+    if method in {FDR_METHOD_V5, FDR_METHOD_V6}:
+        fraction = (FDR_INITIAL_WEALTH_FRACTION_V5
+                    if method == FDR_METHOD_V5
+                    else FDR_INITIAL_WEALTH_FRACTION_V6)
+        initial_wealth = float(alpha) * fraction
         metadata.update({
-            "method_version": FDR_METHOD_VERSION,
+            "method_version": _fdr_method_version(method),
             "algorithm": "LORD++",
             "gamma_method": FDR_GAMMA_METHOD,
             "gamma_formula": "1/(i*(i+1))",
             "gamma_sum": 1.0,
             "initial_wealth": initial_wealth,
-            "initial_wealth_fraction": FDR_INITIAL_WEALTH_FRACTION,
+            "initial_wealth_fraction": fraction,
             "first_discovery_reward": float(alpha) - initial_wealth,
             "subsequent_discovery_reward": float(alpha),
             "reference": (
@@ -341,7 +380,8 @@ def deferred_fdr(scope: str, test_id: str) -> dict[str, Any]:
     """Describe an offline proof whose cumulative test is reserved for live shadow."""
     method, p_kind = _fdr_semantics(scope)
     deferred_method = {
-        FDR_METHOD: "deferred_confirmatory_raw_p_v5",
+        FDR_METHOD_V5: "deferred_confirmatory_raw_p_v5",
+        FDR_METHOD_V6: "deferred_confirmatory_raw_p_v6",
         LEGACY_RAW_FDR_METHOD: "deferred_confirmatory_raw_p_v3",
         LEGACY_FDR_METHOD: "deferred_confirmatory_legacy_q_v2",
     }.get(method, "deferred_confirmatory_legacy")
@@ -350,9 +390,9 @@ def deferred_fdr(scope: str, test_id: str) -> dict[str, Any]:
             "decision": False, "cumulative": True,
             "method": deferred_method,
             "p_value_kind": p_kind,
-            **({"method_version": FDR_METHOD_VERSION,
-                "online_method": FDR_METHOD}
-               if method == FDR_METHOD else {})}
+            **({"method_version": _fdr_method_version(method),
+                "online_method": method}
+               if method in {FDR_METHOD_V5, FDR_METHOD_V6} else {})}
 
 
 def _real(value: Any) -> float | None:
@@ -685,7 +725,8 @@ class FactoryLedger:
             # only available version discriminator, so backfill v2/v3/v4
             # rows from that prefix before the append-only triggers are
             # recreated.  This prevents a v4 row from being reinterpreted as
-            # the active v5 LORD++ sequence after restart.
+            # a newer LORD++ sequence after restart.  Scope prefixes are
+            # resolved individually so existing v5 rows never become v6.
             fdr_columns = {str(row["name"]) for row in
                            db.execute("PRAGMA table_info(factory_fdr)")}
             if "method" not in fdr_columns or "method_version" not in fdr_columns:
@@ -705,9 +746,14 @@ class FactoryLedger:
                 rows = db.execute("SELECT decision_id,scope FROM factory_fdr").fetchall()
                 for row in rows:
                     scope = str(row["scope"])
-                    method = (LEGACY_FDR_METHOD
-                              if scope.startswith("shadow-confirmation-v2:")
-                              else LEGACY_RAW_FDR_METHOD)
+                    if scope.startswith("shadow-confirmation-v2:"):
+                        method = LEGACY_FDR_METHOD
+                    elif scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION_V5}:"):
+                        method = FDR_METHOD_V5
+                    elif scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION}:"):
+                        method = FDR_METHOD_V6
+                    else:
+                        method = LEGACY_RAW_FDR_METHOD
                     version = _fdr_method_version(method)
                     db.execute("UPDATE factory_fdr SET method=?,method_version=? "
                                "WHERE decision_id=?", (method, version, row["decision_id"]))
@@ -720,8 +766,10 @@ class FactoryLedger:
                     db.execute("DROP TRIGGER IF EXISTS factory_fdr_no_update")
                     for row in rows:
                         scope = str(row["scope"])
-                        if scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION}:"):
-                            method = FDR_METHOD
+                        if scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION_V5}:"):
+                            method = FDR_METHOD_V5
+                        elif scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION}:"):
+                            method = FDR_METHOD_V6
                         elif scope.startswith("shadow-confirmation-v2:"):
                             method = LEGACY_FDR_METHOD
                         else:
@@ -1773,9 +1821,10 @@ class FactoryLedger:
                             *, alpha: float = .05) -> dict[str, Any]:
         """Persist one deterministic cumulative online-FDR decision.
 
-        For the active v5 live-shadow scope, ``p_value`` is the raw
-        confirmatory statistic and the allocation is standard LORD++.  v2/v3/v4
-        scopes retain their legacy allocation for audit compatibility.
+        For v5 and the active v6 live-shadow scopes, ``p_value`` is the raw
+        confirmatory statistic and the allocation is standard LORD++ under
+        that scope's preregistered initial wealth. v2/v3/v4 scopes retain
+        their legacy allocation for audit compatibility.
         Family/global BH q-values are candidate-selection summaries and must
         not be passed to a raw-p scope.
 
@@ -1927,9 +1976,12 @@ class FactoryLedger:
 __all__ = [
     "ACTIVE_HYPOTHESIS_STATES", "FACTORY_SCHEMA", "FACTORY_IDENTITY_SCHEMA", "FACTORY_STATUSES",
     "VARIANT_CLOSURE_MODES",
-    "CONFIRMATORY_SCOPE_VERSION", "FDR_METHOD", "LEGACY_FDR_METHOD",
-    "LEGACY_RAW_FDR_METHOD", "FDR_METHOD_VERSION",
-    "FDR_INITIAL_WEALTH_FRACTION", "FDR_GAMMA_METHOD", "LESSON_KINDS",
+    "CONFIRMATORY_SCOPE_VERSION", "CONFIRMATORY_SCOPE_VERSION_V5",
+    "FDR_METHOD", "FDR_METHOD_V5", "FDR_METHOD_V6",
+    "LEGACY_FDR_METHOD", "LEGACY_RAW_FDR_METHOD",
+    "FDR_METHOD_VERSION", "FDR_METHOD_VERSION_V5", "FDR_METHOD_VERSION_V6",
+    "FDR_INITIAL_WEALTH_FRACTION", "FDR_INITIAL_WEALTH_FRACTION_V5",
+    "FDR_INITIAL_WEALTH_FRACTION_V6", "FDR_GAMMA_METHOD", "LESSON_KINDS",
     "LESSON_SOURCES", "FactoryError", "FactoryLedger",
     "deferred_fdr",
     "experiment_identity",

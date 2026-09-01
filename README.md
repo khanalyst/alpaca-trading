@@ -80,11 +80,18 @@ global result can authorize cross-family selection. Historical and offline
 forward screens do not spend cumulative alpha. The one durable online-FDR test
 is reserved for the later parity-matched live-shadow tail.
 
-The exit grammar remains fixed: an ATR-derived bracket (with the 30 bps minimum
-stop floor), configured R target, and bounded bar-cap time exit. Factory
-fit-only measurement reports eligible prefixes/first signals, 30-bps floor
-binding, planned exits, gross/net/fees/slippage economics, power, configured
-pre-cap versus fill-delivered risk, provider/feed provenance for each leg, pricing source,
+The exit grammar is versioned. v3 already provides the bounded equity
+`breakeven_r` transition; v4 additionally supports a frozen session VWAP or
+rolling-mean target, a monotone trailing stop, and an `exit-before` deadline.
+The effective equity stop floor is `max(30 bps, stressed-cost scenario /
+max-cost-to-risk ratio)`. When that floor binds, the fixed-R target is recomputed
+from the widened risk and the authored/effective geometry plus binding decision
+are retained in telemetry. Authorizing resting-bracket stop/target evidence is
+still charged with the ordinary conservative adverse-cost model; gap and
+time/deadline exits require a fresh executable quote. Factory fit-only measurement
+remains diagnostic and reports eligible prefixes/first signals, floor binding,
+planned exits, configured/stressed economics, power, configured pre-cap versus
+fill-delivered risk, provider/feed provenance for each leg, pricing source,
 configured limits, pass/fail/unknown row counts, behavioral aliases, and
 aggregate fit-partition execution-rejection counts/reasons for operator review.
 Before replay, the fit-only signal screen reports forward-return/control rows,
@@ -107,7 +114,10 @@ closure only progresses search exhaustion and is not a powered negative edge.
 The authorizing floors are immutable: backtest/factory evidence requires 100
 trades and 30 complete sessions/clusters; the sealed qualification window
 requires 100 trades and 30 complete sessions/clusters; the parity-matched
-live-shadow tail requires 150 trades and 30 complete sessions. Effective
+live-shadow tail requires 150 trades and 30 complete sessions. Readiness is
+tracked separately as 150 offline sessions plus 30 shadow-selection and 30
+shadow-confirmation sessions (210 total; the 60 shadow sessions are two
+non-overlapping obligations). Effective
 breadth is persisted as a matched symbol/session correlation diagnostic, is
 re-verified with the proof, and never counts as extra independent N. It is
 separate from authorizing dependence: before a factory cycle, completed
@@ -118,6 +128,13 @@ cluster veto can only reject. Paper `selection_mode: all_proved` then admits
 the strongest proved edge per verified frozen cluster. Families without a
 verified assignment use the existing held-out correlation fallback and never
 gain independence from missing data.
+
+Each scheduled research cycle also attempts the configured-vs-measured cost
+comparison when bars, quotes, and the factory report are available. The result
+is persisted with diagnostic status, artifact path, and measured-minus-configured
+delta in the cycle observability payload. It is non-authorizing and non-fatal:
+missing inputs or a comparison failure are reported for follow-up without
+mutating ledgers, FDR, proofs, or promotion state.
 
 Serial inference is deterministic. Session/day-cluster deltas use a seeded
 moving-block cluster bootstrap, with draw count, seed, and block length carried
@@ -141,13 +158,14 @@ loss; correct the source and run the bounded replay repair before retrying
 ingestion. There is no unsafe auto-skip: unresolved quarantine blocks watermark
 and FDR advancement until the repair completes.
 
-The `shadow-confirmation-v5` live-shadow scope is independent and chronological:
+The `shadow-confirmation-v6` live-shadow scope is independent and chronological:
 each complete tail is split into an older selection window and a newer disjoint
 confirmatory window. Batch BH uses selection p-values; only the selected
-candidate's raw confirmatory p-value is sent to LORD++. With `W0=alpha`, its
-first-discovery reward is zero and later discoveries receive the standard
-`alpha` reward stream. Legacy v2/v3/v4 scopes remain audit-only and cannot
-authorize under v5.
+candidate's raw confirmatory p-value is sent to LORD++. With `W0=alpha/2`,
+pre-discovery spending is `(alpha/2)*gamma_t`, the first-discovery reward is
+`alpha/2`, and later discoveries receive the standard `alpha` reward stream.
+v5 is historical/audit-only (its rows retain `W0=alpha`) and is not pooled into
+the v6 sequence; legacy v2/v3/v4 scopes remain audit-only as well.
 
 Within a hypothesis, refinement first changes exactly one executable field at
 a time. Only after that coordinate neighborhood is measured can it combine two
@@ -439,14 +457,17 @@ normalizes account, asset, quote/bar, calendar, option-chain, order, and trade
 update data for the rest of the application. `agent/alpaca_session.py` owns
 the NYSE calendar and session policy. `agent/contracts/rule.py` is the safe
 strategy grammar shared by research and runtime; generated specifications can
-never contain executable code. It has three versions: `rule-strategy.v1` is
+never contain executable code. It has four versions: `rule-strategy.v1` is
 unchanged and keeps every existing variant id, `rule-strategy.v2` is a strict
 superset adding entry-side predicates only — a multi-filter confirmation list,
 a session-time entry window, and an ATR volatility band — and
 `rule-strategy.v3` adds nullable numeric `breakeven_r` for equity shares.
-Options remain on executable v1/v2 schemas; a v3 root stays v3 while tuning.
-V2 entry predicates do not reach sizing or execution; v3 affects only the shared
-bounded breakeven stop-transition path and cannot author arbitrary orders.
+`rule-strategy.v4` adds only the equity exit modes described above (frozen
+session VWAP/rolling-mean target, monotone trailing stop, and `exit-before`
+deadline). Options remain on executable v1/v2 schemas; a v3/v4 root stays on
+its declared schema while tuning. V2 entry predicates do not reach sizing or
+execution; v3/v4 affect only shared bounded exit state and cannot author
+arbitrary orders.
 `agent/contracts/ibr.py` remains the explicit
 IBR replay/baseline. Risk and execution
 profiles enforce sizing, single-leg long-option checks, idempotent client
@@ -656,7 +677,10 @@ release blocker. Root discovery includes the deployment and research suites.
 ## What is deliberately not included
 
 There is no overnight strategy, withdrawal flow, default unattended live
-deployment, multi-leg/naked option path, crypto path, or assertion that any
-generated signal has positive expectancy. Any live launch requires a separate
+deployment, multi-leg/naked option path, crypto path, partial-exit workflow, or
+assertion that any generated signal has positive expectancy. Multi-symbol
+expansion is deferred until a known-positive end-to-end reproduction; partial
+exits remain unimplemented because broker lifecycle and position reconciliation
+would otherwise be unsafe. Any live launch requires a separate
 reviewed config/runtime scope, provider guard, named edge, risk policy,
 session-close behaviour, tests, and operational controls.

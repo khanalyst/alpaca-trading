@@ -85,6 +85,11 @@ it has no order, broker, or runtime-state mutation path.
 The scheduled research cycle invokes `edge ingest-shadow` by default when
 enabled. The consumer treats a missing shadow WAL as a no-op and never creates
 or migrates that WAL; the live service remains the sole writer.
+When bars, quotes, and the factory report are present, the same cycle invokes
+the configured-vs-measured cost comparison and persists its diagnostic status,
+artifact path, and delta in the cycle result. This comparison is strictly
+non-authorizing and non-fatal; unavailable inputs or a failed rerun are surfaced
+for observability without changing ledgers, FDR, proofs, or promotion.
 
 ## Trading runtime
 
@@ -150,13 +155,21 @@ to the session force-flat time. Both the research simulator
 validated with an N-bar time exit runs with that same time exit rather than an
 approximation of it.
 
-The executable exit grammar is fixed to the ATR-derived bracket (including the
-30 bps minimum stop floor), configured R target, and bar-cap time exit. The
-factory's fit-only diagnostics expose signal eligibility, 30-bps floor binding,
-planned exits, configured/stressed economics, clustered power, behavioral alias
-fingerprints, intended-versus-delivered risk, provider/feed provenance,
-entry-pricing source, configured limits, pass/fail/unknown row counts, and
-aggregate fit-partition execution-rejection counts/reasons for operator review.
+The executable exit grammar is versioned. v3 already provides the bounded
+equity `breakeven_r` transition; v4 adds frozen session VWAP/rolling-mean
+targets, a monotone trailing stop, and an `exit-before` deadline. The effective
+equity stop floor is `max(30 bps, active stressed-cost scenario /
+max-cost-to-risk ratio)`. If it binds, a fixed-R target is recomputed from the
+effective stop and the authored/effective geometry plus binding decision are
+persisted as telemetry. A non-gap stop/target observed on an exact-feed bar is
+the conservative resting-bracket exception: it remains cost-charged even
+without a trigger-time quote. Gap, time, and deadline exits still require a
+fresh executable quote. The factory's fit-only diagnostics expose signal
+eligibility, floor binding, planned exits, configured/stressed economics,
+clustered power, behavioral alias fingerprints, intended-versus-delivered risk,
+provider/feed provenance, entry-pricing source, configured limits,
+pass/fail/unknown row counts, and aggregate fit-partition execution-rejection
+counts/reasons for operator review.
 Planned signal/exit geometry may be counted as quote-required measurement when
 delayed pricing is unavailable; it remains non-authorizing. If every fit
 opportunity is explicitly execution-rejected, the fit is `execution_blocked`,
@@ -402,13 +415,14 @@ resolvable. `rule-strategy.v2` is a strict superset, reached only by naming it,
 that adds four entry-side predicates — a multi-filter `confirmations` list, a
 session-time entry window, and an ATR volatility band. `rule-strategy.v3`
 retains those predicates and adds nullable numeric `breakeven_r` for equity
-shares; options remain on executable v1/v2 schemas. Each entry extension is a
-pure function of the same completed-bar prefix, so `evaluate_rule_signal`
-remains the single evaluator shared by research and runtime. V2 entry
-predicates remain outside sizing/execution; v3 affects only the shared bounded
-breakeven stop-transition path. A v2 spec that admits a signal emits exactly the
-v1 plan;
-a v3 spec adds only its declared equity exit state.
+shares; v3 is therefore the first breakeven version. `rule-strategy.v4` adds
+the equity-only frozen session VWAP/rolling-mean target, monotone trailing stop,
+and `exit-before` deadline. Options remain on executable v1/v2 schemas. Each
+entry extension is a pure function of the same completed-bar prefix, so
+`evaluate_rule_signal` remains the single evaluator shared by research and
+runtime. V2 entry predicates remain outside sizing/execution; v3/v4 affect only
+shared bounded exit state. A v2 spec that admits a signal emits exactly the v1
+plan; v3/v4 specs add only their declared equity exit state.
 
 ### Corpus acquisition
 
@@ -450,7 +464,7 @@ A slot is a unit of logical research capacity. Its hypothesis leaves
 variant is deployed and must never be re-tuned; the slot is therefore reseeded
 with a new hypothesis in the same cycle. Reseeding prefers an untried family at
 that family's template and then continues into a deterministic conditional
-grammar ladder (v2 entry predicates and v3 equity exits). Each reseed grants one
+grammar ladder (v2 entry predicates and v3/v4 equity exits). Each reseed grants one
 further `max_generations` budget and is counted
 separately from the failure-recovery rotation budget, which it never consumes.
 `run_factory` additionally revives any slot holding no active hypothesis before
@@ -502,9 +516,12 @@ malformed non-empty responses veto the cycle; an empty or irrelevant response
 means no veto and returns to the deterministic path. Live mode rejects both
 `llm.enabled: true` and a directly injected brain at the Engine boundary.
 
-Future research extensions keep explicit evidence boundaries. Universe expansion
-requires an operator-approved exact symbol list, recorder coverage for that
-list, and a new identity/proof. Event conditioning requires a point-in-time
+Future research extensions keep explicit evidence boundaries. Multi-symbol
+expansion is deferred until a known-positive end-to-end reproduction; any later
+expansion still requires an operator-approved exact symbol list, recorder
+coverage for that list, and a new identity/proof. Partial exits remain
+unimplemented because broker lifecycle and position reconciliation are not yet
+safe to extend. Event conditioning requires a point-in-time
 event source with provider, `as_of`, and observation provenance. Prior-session,
 true multi-timeframe, and cross-sectional features require explicit replay
 context and fail closed when that context is missing or ambiguous. Shadow
@@ -608,17 +625,19 @@ sealed window only for qualification. The strictly newer parity-matched
 live-shadow tail receives the one durable cumulative online-FDR test per
 vehicle scope. Its standard LORD++ state is persisted in the factory
 ledger across cycles, so a new cycle cannot reset allocated alpha or discovery
-history. The active `shadow-confirmation-v5` scope uses
-`gamma_n=1/(n(n+1))` and `W0=alpha`: its base allocation is
-`alpha*gamma_n`, the first-discovery reward is zero, and each later discovery
-starts an `alpha*gamma` stream. This preserves an infinite testing horizon
-without allowing offline candidate churn to exhaust it.
+history. The active `shadow-confirmation-v6` scope uses
+`gamma_n=1/(n(n+1))` and `W0=alpha/2`: its pre-discovery allocation is
+`(alpha/2)*gamma_n`, the first-discovery reward is `alpha/2`, and each later
+discovery starts an `alpha*gamma` stream. This preserves an infinite testing
+horizon without allowing offline candidate churn to exhaust it.
 
-The v5 scope splits each complete tail into older
+The v6 scope splits each complete tail into older
 chronological selection sessions and a newer disjoint confirmatory window. BH
 selection uses only the former; the selected candidate is recomputed on the
 latter and only that raw confirmatory p-value is sent to LORD++. Legacy
-v2/v3/v4 evidence remains auditable but cannot authorize under v5. The current
+v2/v3/v4 evidence remains auditable but cannot authorize under v6. Historical
+v5 LORD++ rows retain their `W0=alpha` semantics and are audit-only, isolated
+from the active v6 sequence. The current
 `REPLAY_ENGINE_EPOCH` is 5: epoch 5 also seals paired synthetic root-control
 shadow decisions/replays, diagnostic historical-backfill provenance with exact
 calendar metadata, chronological paired inference, finite BH input validation,
@@ -628,6 +647,11 @@ authorize runtime and must be re-derived under epoch 5; future epochs are
 quarantined by the same exact-equality check. A current-epoch run seals one
 immutable verified gate proof; re-derivation appends a new proof instead of
 rewriting the old run.
+
+Readiness arithmetic is explicit and non-authorizing: 150 offline sessions plus
+30 shadow-selection sessions plus 30 disjoint shadow-confirmation sessions,
+210 sessions total. The compatibility tail count of 60 is the sum of those two
+shadow obligations, not a single shadow window.
 
 `research.edge_ledger_store` owns the SQLite schema and hashing primitives.
 `research.edge_ledger_proof` owns verified-gate persistence and re-verification.

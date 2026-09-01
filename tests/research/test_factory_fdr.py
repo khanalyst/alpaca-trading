@@ -8,8 +8,10 @@ import threading
 import unittest
 
 from research.factory_ledger import (
-    CONFIRMATORY_SCOPE_VERSION, FDR_METHOD, FDR_GAMMA_METHOD,
-    FDR_INITIAL_WEALTH_FRACTION, LEGACY_FDR_METHOD, LEGACY_RAW_FDR_METHOD,
+    CONFIRMATORY_SCOPE_VERSION, CONFIRMATORY_SCOPE_VERSION_V5,
+    FDR_METHOD, FDR_METHOD_V5, FDR_GAMMA_METHOD,
+    FDR_INITIAL_WEALTH_FRACTION, FDR_INITIAL_WEALTH_FRACTION_V5,
+    LEGACY_FDR_METHOD, LEGACY_RAW_FDR_METHOD,
     FactoryLedger, deferred_fdr)
 from research.factory_core import initial_hypotheses
 from research.factory_ledger import FactoryError
@@ -24,10 +26,10 @@ class FactoryFdrTests(unittest.TestCase):
             first = ledger.next_fdr_allocation(scope)
             self.assertEqual(first["method"], FDR_METHOD)
             self.assertEqual(first["tests"], 1)
-            self.assertAlmostEqual(first["allocated_alpha"], .025)
+            self.assertAlmostEqual(first["allocated_alpha"], .0125)
             self.assertEqual(ledger.fdr_state(scope)["tests"], 0)
 
-            expected = (.025, .05 / 6, .05 / 12, .05 / 20)
+            expected = (.0125, .025 / 6, .025 / 12, .025 / 20)
             for index, allocation in enumerate(expected, start=1):
                 preview = ledger.next_fdr_allocation(scope)
                 self.assertEqual(preview["tests"], index)
@@ -45,11 +47,10 @@ class FactoryFdrTests(unittest.TestCase):
             first = ledger.record_fdr_decision(scope, "proof-a", .001)
             self.assertTrue(first["decision"])
 
-            # LORD++ keeps the base stream at W0*gamma_2.  With the
-            # preregistered W0=alpha, the first-discovery reward alpha-W0 is
-            # zero; only later discoveries receive a reward stream.
+            # LORD++ keeps the base stream at W0*gamma_2.  With v6's
+            # preregistered W0=alpha/2, the first-discovery reward is alpha/2.
             preview = ledger.next_fdr_allocation(scope)
-            self.assertAlmostEqual(preview["allocated_alpha"], .05 / 6)
+            self.assertAlmostEqual(preview["allocated_alpha"], .025 / 6 + .025 / 2)
             duplicate = ledger.record_fdr_decision(scope, "proof-a", .9)
             self.assertEqual(duplicate["tests"], 1)
             self.assertEqual(duplicate["p_value"], .001)
@@ -61,7 +62,7 @@ class FactoryFdrTests(unittest.TestCase):
             ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
             scope = f"{CONFIRMATORY_SCOPE_VERSION}:equity"
             first = ledger.record_fdr_decision(scope, "proof-a", 1.0, alpha=.05)
-            self.assertAlmostEqual(first["allocated_alpha"], .025)
+            self.assertAlmostEqual(first["allocated_alpha"], .0125)
             with self.assertRaisesRegex(FactoryError, "immutable"):
                 ledger.next_fdr_allocation(scope, alpha=1.0)
             with self.assertRaisesRegex(FactoryError, "immutable"):
@@ -83,7 +84,7 @@ class FactoryFdrTests(unittest.TestCase):
             self.assertEqual(sorted(row["tests"] for row in rows), [1, 2])
             self.assertEqual(
                 sorted(round(row["allocated_alpha"], 12) for row in rows),
-                sorted((round(.05 / 2, 12), round(.05 / 6, 12))),
+                sorted((round(.025 / 2, 12), round(.025 / 6, 12))),
             )
             self.assertEqual(ledger.fdr_state(scope)["tests"], 2)
 
@@ -93,7 +94,7 @@ class FactoryFdrTests(unittest.TestCase):
         self.assertFalse(record["tested"])
         self.assertFalse(record["decision"])
         self.assertEqual(record["status"], "deferred_to_live_shadow")
-        self.assertEqual(record["method"], "deferred_confirmatory_raw_p_v5")
+        self.assertEqual(record["method"], "deferred_confirmatory_raw_p_v6")
         self.assertEqual(record["p_value_kind"], "raw_confirmatory")
         self.assertEqual(record["online_method"], FDR_METHOD)
         self.assertNotIn("p_value", record)
@@ -114,33 +115,71 @@ class FactoryFdrTests(unittest.TestCase):
             scope = f"{CONFIRMATORY_SCOPE_VERSION}:equity"
 
             pre = ledger.next_fdr_allocation(scope)
-            self.assertAlmostEqual(pre["allocated_alpha"], .05 / 2)
-            self.assertAlmostEqual(pre["initial_wealth"], .05)
+            self.assertAlmostEqual(pre["allocated_alpha"], .025 / 2)
+            self.assertAlmostEqual(pre["initial_wealth"], .025)
             self.assertEqual(pre["initial_wealth_fraction"],
                              FDR_INITIAL_WEALTH_FRACTION)
             self.assertEqual(pre["gamma_method"], FDR_GAMMA_METHOD)
-            self.assertAlmostEqual(pre["first_discovery_reward"], 0.0)
+            self.assertAlmostEqual(pre["first_discovery_reward"], .025)
             self.assertAlmostEqual(pre["subsequent_discovery_reward"], .05)
 
             first = ledger.record_fdr_decision(scope, "first", .001)
             self.assertTrue(first["decision"])
-            self.assertAlmostEqual(first["allocated_alpha"], .05 / 2)
+            self.assertAlmostEqual(first["allocated_alpha"], .025 / 2)
 
-            # The first-discovery stream is alpha-W0=0, leaving only the
-            # base gamma_2 allocation at the next test.
+            # The first-discovery stream contributes (alpha/2)*gamma_1 to
+            # the base W0*gamma_2 allocation at the next test.
             second = ledger.record_fdr_decision(scope, "between", 1.0)
             self.assertFalse(second["decision"])
-            self.assertAlmostEqual(second["allocated_alpha"], .05 / 6)
+            self.assertAlmostEqual(second["allocated_alpha"], .025 / 6 + .025 / 2)
 
-            # A second discovery unlocks the alpha reward stream.  At test 4
-            # it contributes alpha*gamma_1 to the base alpha*gamma_4.
+            # A second discovery unlocks the full-alpha reward stream.  At
+            # test 4 both reward streams are visible alongside the base.
             third = ledger.record_fdr_decision(scope, "second", .001)
             self.assertTrue(third["decision"])
             fourth = ledger.next_fdr_allocation(scope)
-            self.assertAlmostEqual(fourth["allocated_alpha"], .05 / 20 + .05 / 2)
+            self.assertAlmostEqual(fourth["allocated_alpha"], .025 / 20 + .025 / 12 + .05 / 2)
             self.assertEqual(fourth["method"], FDR_METHOD)
-            self.assertEqual(fourth["method_version"], "v5")
+            self.assertEqual(fourth["method_version"], "v6")
             self.assertEqual(fourth["algorithm"], "LORD++")
+
+    def test_v5_replay_keeps_w0_alpha_while_v6_starts_w0_alpha_half(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            old_scope = f"{CONFIRMATORY_SCOPE_VERSION_V5}:equity"
+            new_scope = f"{CONFIRMATORY_SCOPE_VERSION}:equity"
+            old = ledger.record_fdr_decision(old_scope, "old", .001)
+            self.assertEqual(old["method"], FDR_METHOD_V5)
+            self.assertEqual(old["method_version"], "v5")
+            self.assertEqual(old["initial_wealth_fraction"],
+                             FDR_INITIAL_WEALTH_FRACTION_V5)
+            self.assertAlmostEqual(old["allocated_alpha"], .05 / 2)
+
+            fresh = ledger.next_fdr_allocation(new_scope)
+            self.assertEqual(fresh["method"], FDR_METHOD)
+            self.assertEqual(fresh["method_version"], "v6")
+            self.assertAlmostEqual(fresh["initial_wealth"], .025)
+            self.assertAlmostEqual(fresh["allocated_alpha"], .025 / 2)
+            self.assertEqual(ledger.fdr_state(old_scope)["tests"], 1)
+            self.assertEqual(ledger.fdr_state(new_scope)["tests"], 0)
+
+    def test_pre_v6_rows_with_method_columns_remain_readable_without_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "edge.sqlite3"
+            ledger = FactoryLedger(path)
+            old_scope = f"{CONFIRMATORY_SCOPE_VERSION_V5}:equity"
+            ledger.record_fdr_decision(old_scope, "old", .001)
+            with sqlite3.connect(path) as db:
+                before = db.execute(
+                    "SELECT method,method_version,allocated_alpha FROM factory_fdr"
+                ).fetchone()
+            restarted = FactoryLedger(path)
+            self.assertEqual(restarted.fdr_state(old_scope)["method_version"], "v5")
+            with sqlite3.connect(path) as db:
+                after = db.execute(
+                    "SELECT method,method_version,allocated_alpha FROM factory_fdr"
+                ).fetchone()
+            self.assertEqual(after, before)
 
     def test_v4_method_identity_is_preserved_and_isolated(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -190,7 +229,7 @@ class FactoryFdrTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
             with self.assertRaisesRegex(FactoryError, "unsupported"):
-                ledger.next_fdr_allocation("shadow-confirmation-v6:equity")
+                ledger.next_fdr_allocation("shadow-confirmation-v7:equity")
 
     def test_qualification_claim_survives_restart_and_rejects_overlap(self):
         with tempfile.TemporaryDirectory() as directory:

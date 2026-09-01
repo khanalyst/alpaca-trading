@@ -22,6 +22,24 @@ def _progress(*, phase="discover", unit="rows", vehicle="equity", done=1,
 
 
 class ResearchProgressTests(unittest.TestCase):
+    def test_readiness_reports_separate_shadow_selection_and_confirmation(self):
+        parsed = scheduler_output.structured_research_readiness({
+            "schema": "research-readiness.v1", "state": "pending",
+            "heldout_min_sessions": 30, "qualification_min_sessions": 30,
+            "offline_required_sessions": 150, "shadow_min_sessions": 60,
+            "shadow_selection_sessions": 30,
+            "shadow_confirmation_sessions": 30,
+            "required_sessions": 210, "recorded_sessions": 4,
+        })
+        readiness = scheduler_output.derive_research_readiness(readiness=parsed,
+                                                                 now=100)
+        self.assertEqual(readiness["offline_required_sessions"], 150)
+        self.assertEqual(readiness["shadow_selection_sessions"], 30)
+        self.assertEqual(readiness["shadow_confirmation_sessions"], 30)
+        self.assertEqual(readiness["shadow_min_sessions"], 60)
+        self.assertEqual(readiness["shadow_tail_sessions"], 60)
+        self.assertEqual(readiness["required_sessions"], 210)
+
     def test_readiness_derives_minimums_and_caps_eta_without_audit_constant(self):
         readiness = scheduler_output.derive_research_readiness(
             {"schema": "research-progress.v1", "phase": "record",

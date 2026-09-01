@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .costs import (
     CostError, CostModel, QUOTE as QUOTE_FILL,
+    RESTING_BRACKET, validate_resting_bracket_fill,
     STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
     risk_unit_report as _risk_unit_report,
 )
@@ -170,10 +171,11 @@ AUTHORIZATION_PROJECTION_SCHEMA = "authorization-projection.v1"
 
 
 def _has_fill_metadata(row: Mapping[str, Any]) -> bool:
-    return any(name in row for name in (
+    return any(row.get(name) is not None for name in (
         "entry_fill_source", "exit_fill_source", "entry_feed", "exit_feed",
         "entry_provider", "exit_provider", "entry_quote_age_seconds",
-        "exit_quote_age_seconds", "entry_option_feed", "exit_option_feed"))
+        "exit_quote_age_seconds", "entry_option_feed", "exit_option_feed",
+        "exit_fill_schema", "exit_fill_claim"))
 
 
 def _finite_age(value: Any) -> bool:
@@ -203,6 +205,8 @@ def _authorization_exclusion_reason(row: Mapping[str, Any], *, vehicle: str,
         return None
     entry_source = str(row.get("entry_fill_source") or "").strip().lower()
     exit_source = str(row.get("exit_fill_source") or "").strip().lower()
+    if exit_source == RESTING_BRACKET:
+        return validate_resting_bracket_fill(row, equity_feed=equity_feed)
     if entry_source != QUOTE_FILL or exit_source != QUOTE_FILL:
         return "non_authorizing_fill_source"
     if not _finite_age(row.get("entry_quote_age_seconds")) or not _finite_age(
@@ -1529,12 +1533,23 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
                     0 <= float(age) <= OPTION_MAX_QUOTE_AGE_SECONDS)
 
         # Equity evidence is bound to the envelope's explicit feed identity.
-        # The envelope identity is checked against every executable leg, so
-        # either configured real-time feed may authorize; delayed SIP remains
-        # diagnostic-only.
+        # A resting bracket exit is the one deliberate non-quote exception:
+        # its entry remains a fresh executable quote, while the exit claim is
+        # validated against the exact-feed bar and is charged full modeled
+        # adverse cost by the replay lanes.
+        def _equity_resting_leg(row: Mapping) -> bool:
+            return (str(row.get("entry_fill_source") or "").strip().lower() ==
+                    QUOTE_FILL and
+                    validate_resting_bracket_fill(
+                        row, equity_feed=equity_feed) is None)
+
         quality_adequate = bool(
-            executed and all(_equity_quote_leg(row, leg)
-                             for row in executed for leg in ("entry", "exit")))
+            executed and all(
+                _equity_resting_leg(row) if str(
+                    row.get("exit_fill_source") or "").strip().lower() ==
+                RESTING_BRACKET else all(_equity_quote_leg(row, leg)
+                                         for leg in ("entry", "exit"))
+                for row in executed))
     else:
         # Options are priced from snapshots rather than the equity quote
         # source field.  Require finite ages and explicit OPRA provenance on

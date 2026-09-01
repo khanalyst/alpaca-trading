@@ -15,8 +15,7 @@ from agent.config import validate_config
 from agent.risk import RiskEngine
 from agent.contracts.rule import validate_rule_spec
 from research.costs import (ReplayPolicy, STRESSED_COST_BASIS,
-                            STRESSED_COST_SCHEMA,
-                            check_stressed_cost_plan)
+                            STRESSED_COST_SCHEMA)
 from research.factory_core import simulate_account
 from research.strategy_factory import null_control_account
 
@@ -43,9 +42,8 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
         cls.quotes = [_quote(index, 100.0, 100.0)
                       for index in range(len(cls.bars))]
 
-        # stop_atr=3 supplies a genuinely runtime-admissible candidate.  The
-        # unchanged compact fixture has the ~30bp stop geometry that the
-        # shipped 25bp stress must reject at a 30% cost/risk limit.
+        # stop_atr=3 is naturally above the effective floor.  stop_atr=1
+        # authors the grammar's ~30bp minimum and exercises policy widening.
         cls.accepted_spec = validate_rule_spec({**SPEC, "stop_atr": 3.0})
         cls.floor_spec = validate_rule_spec({**SPEC, "stop_atr": 1.0})
         cls.no_stress_policy = replace(
@@ -98,60 +96,61 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
         self.assertEqual(row["stressed_cost_schema"], STRESSED_COST_SCHEMA)
         self.assertEqual(row["stressed_cost_basis"], STRESSED_COST_BASIS)
 
-    def test_thirty_bp_floor_is_rejected_by_factory_null_and_runtime(self):
-        # First replay the floor candidate without the veto to obtain the same
-        # reference geometry the null-control lane would receive in a normal
-        # research run.  The stressed run then rejects that geometry.
+    def test_thirty_bp_floor_is_widened_by_factory_null_and_runtime(self):
+        # First replay without stress to retain the authored geometry.  Every
+        # authorizing lane must then widen it to max(grammar, scenario/ratio)
+        # before sizing, rather than rejecting a valid grammar candidate.
         reference = self._factory(
             self.floor_spec, "runtime-parity-floor-reference",
             policy=self.no_stress_policy)
         candidate = self._factory(self.floor_spec, "runtime-parity-floor")
         candidate_row = candidate["rows"][0]
-        self.assertTrue(candidate_row["no_trade"])
-        self.assertEqual(candidate_row["reject_reason"],
-                         "stressed_cost_risk_limit")
-        self.assertGreater(
-            candidate_row["stressed_cost_to_risk_ratio"],
-            self.policy.max_stressed_cost_to_risk_ratio)
+        self.assertEqual(candidate["trades"], 1)
+        self.assertFalse(candidate_row["no_trade"])
+        self.assertTrue(candidate_row["stress_floor_binding"])
+        self.assertAlmostEqual(candidate_row["authored_stop_distance"], .3024)
+        self.assertAlmostEqual(candidate_row["effective_stop_floor_bps"],
+                               25.0 / .30)
+        self.assertLessEqual(candidate_row["stressed_cost_to_risk_ratio"],
+                             self.policy.max_stressed_cost_to_risk_ratio + 1e-12)
 
-        # A rejected row intentionally carries only rejection telemetry, not a
-        # submit-ready quantity.  The no-stress reference is the sized plan
-        # that both runtime and research attempted to submit.
-        plan = self._plan(reference["rows"][0])
-        runtime, runtime_reason = self.risk.check_stressed_cost(
-            plan, cfg=self.config)
-        self.assertIsNone(runtime)
-        self.assertEqual(runtime_reason, candidate_row["reject_reason"])
+        reference_row = reference["rows"][0]
+        runtime, runtime_reason = self.risk.vet_open(
+            {"symbol": "SPY", "direction": reference_row["direction"],
+             "execution_profile": "shares",
+             "entry_price": reference_row["plan_entry"],
+             "stop_price": reference_row["stop_price"],
+             "target_price": reference_row["target_price"],
+             "target_r": self.floor_spec["target_r"]},
+            100_000, [],
+            {"SPY": {"price": reference_row["plan_entry"]}}, {}, 0, now=0)
+        self.assertIsNone(runtime_reason)
+        self.assertTrue(runtime["stress_floor_binding"])
+        for key in ("stop_price", "target_price", "stop_distance",
+                    "effective_stop_floor_bps"):
+            with self.subTest(runtime_key=key):
+                self.assertAlmostEqual(runtime[key], candidate_row[key], places=12)
+        self.assertLessEqual(runtime["stressed_cost_to_risk_ratio"],
+                             self.policy.max_stressed_cost_to_risk_ratio + 1e-12)
 
-        # The pure research seam exposes the same canonical telemetry even on
-        # rejection; compare it with the row so the null lane cannot silently
-        # drop the scenario, basis, or ratio that caused the veto.
-        expected, expected_reason = check_stressed_cost_plan(
-            plan,
-            scenario_bps=self.policy.stressed_cost_scenario_bps,
-            max_ratio=1.0,
-            config=self.config)
-        self.assertIsNotNone(expected)
-        self.assertEqual(expected_reason, None)
-        for key in (
-                "stressed_cost_schema", "stressed_cost_basis",
-                "stressed_cost_entry_notional", "stressed_cost_scenario_bps",
-                "stressed_cost_usd", "stressed_cost_to_risk_ratio"):
-            with self.subTest(candidate_key=key):
-                if isinstance(expected[key], float):
-                    self.assertAlmostEqual(candidate_row[key], expected[key],
-                                           places=12)
-                else:
-                    self.assertEqual(candidate_row[key], expected[key])
-
+        # The compact fixture has no quote at the final force-flat instant, so
+        # keep this null-control check focused on geometry with bar fallback.
         null = null_control_account(
             self.bars, [], self.floor_spec, vehicle="equity",
             reference_rows=reference["rows"], account_id="runtime-parity-floor-null",
-            quotes=self.quotes, policy=self.policy)
-        null_rows = [row for row in null["rows"] if row.get("no_trade") is True]
-        self.assertTrue(null_rows)
-        self.assertTrue(any(row.get("reject_reason") ==
-                            "stressed_cost_risk_limit" for row in null_rows))
+            quotes=self.quotes,
+            policy=replace(self.policy, strict_market_data=False))
+        self.assertEqual(null["trades"], 1)
+        null_row = null["rows"][0]
+        self.assertTrue(null_row["stress_floor_binding"])
+        # The null receives the candidate reference row after broker-tick
+        # normalization; it must preserve that executable 31-cent geometry
+        # before applying the wider stress floor.
+        self.assertAlmostEqual(null_row["authored_stop_distance"], .31)
+        self.assertAlmostEqual(null_row["effective_stop_floor_bps"],
+                               candidate_row["effective_stop_floor_bps"])
+        self.assertLessEqual(null_row["stressed_cost_to_risk_ratio"],
+                             self.policy.max_stressed_cost_to_risk_ratio + 1e-12)
 
 
 if __name__ == "__main__":

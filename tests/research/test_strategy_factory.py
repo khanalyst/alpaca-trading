@@ -17,6 +17,7 @@ from research.edge_lab import EdgeLedger
 from research.edge_discovery_core import DiscoveryError
 from research.edge_identity import candidate_assumptions
 from research.edge_ledger_store import content_hash, provenance_hash
+from research.factory_ledger import CONFIRMATORY_SCOPE_VERSION
 from research import gates
 from research.gates import (
     falsification_gate, heldout_separation, matched_cluster_test,
@@ -332,8 +333,9 @@ def persist_rule_gate(ledger, candidate_id, lane):
             "selection_raw_p_value": control["p_value"],
             "confirmatory_raw_p_value": control["p_value"],
         })
+    scope = f"{CONFIRMATORY_SCOPE_VERSION}:equity"
     fdr_record = (FactoryLedger(ledger.path).record_fdr_decision(
-        "shadow-confirmation-v5:equity", f"{candidate_id}:shadow",
+        scope, f"{candidate_id}:shadow",
         control["p_value"], alpha=.05) if lane == "shadow" else None)
     gate = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
@@ -358,8 +360,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
                       "mean_delta": control["mean_delta"],
                       "mean_delta_lcb": control["mean_delta_lcb"],
                       "p_value": control["p_value"]},
-        online_fdr={"scope": ("shadow-confirmation-v5:equity" if lane == "shadow"
-                              else "test"),
+        online_fdr={"scope": (scope if lane == "shadow" else "test"),
                     "test_id": f"{candidate_id}:{lane}",
                     "p_value": control["p_value"], "raw_p_value": control["p_value"],
                     "selection_raw_p_value": control["p_value"],

@@ -640,6 +640,37 @@ class DeployTests(unittest.TestCase):
             "no_edge": False,
         }])
 
+    def test_scheduler_output_preserves_factory_observability_blocks(self):
+        payload = scheduler_output.structured_research_cycle({
+            "schema": "research-cycle.v1", "status": "completed_no_edge",
+            "reason": "diagnostic", "exit_code": 0,
+            "research_funnel": {
+                "schema": "research-funnel.v1", "diagnostic_only": True,
+                "authorizing": False,
+                "counts": {"opportunities": 4, "admitted": 2, "executed": 2,
+                           "authorizing_eligible": 2, "gated": 2,
+                           "selected": 0},
+                "no_signal": 1, "refused": 2,
+                "dominant_refusal_reason": "no_quote_at_entry",
+            },
+            "research_verdict": {
+                "schema": "research-verdict.v1", "diagnostic_only": True,
+                "authorizing": False, "status": "evidence_available",
+                "effect_estimate": .1, "confidence_interval": {"lower": .01},
+            },
+            "cost_diagnostic": {
+                "schema": "cost-rerun-diagnostic.v1", "diagnostic_only": True,
+                "authorizing": False, "status": "completed",
+                "report_path": "/tmp/cost.json",
+                "delta": {"round_trip_bps_delta": 1.5},
+            },
+        })
+        self.assertEqual(payload["research_funnel"]["counts"]["opportunities"], 4)
+        self.assertEqual(payload["research_funnel"]["dominant_refusal_reason"],
+                         "no_quote_at_entry")
+        self.assertEqual(payload["research_verdict"]["effect_estimate"], .1)
+        self.assertEqual(payload["cost_diagnostic"]["delta"]["round_trip_bps_delta"], 1.5)
+
     def test_scheduler_output_capture_detail_combines_streams(self):
         stdout = scheduler_output._BoundedCapture(4)
         stderr = scheduler_output._BoundedCapture(200)

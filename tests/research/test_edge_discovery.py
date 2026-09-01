@@ -28,7 +28,7 @@ from research.gates import (
     structural_floor, verified_gate_envelope, walk_forward_report,
 )
 from research.costs import SQLiteQuoteIndex, quote_fill
-from research.factory_ledger import FactoryLedger
+from research.factory_ledger import CONFIRMATORY_SCOPE_VERSION, FactoryLedger
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 
 
@@ -301,7 +301,8 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     if lane == "shadow":
         factory = FactoryLedger(ledger.path)
         test_id = f"{candidate_id}:shadow"
-        state = factory.fdr_state("shadow-confirmation-v5:equity")
+        scope = f"{CONFIRMATORY_SCOPE_VERSION}:equity"
+        state = factory.fdr_state(scope)
         fdr_record = next((
             {**item, "tests": index}
             for index, item in enumerate(state["decisions"], start=1)
@@ -309,10 +310,10 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
         ), None)
         if fdr_record is None:
             fdr_record = (factory.record_fdr_decision(
-                "shadow-confirmation-v5:equity", test_id,
+                scope, test_id,
                 control["p_value"], alpha=.05) if record else
                 factory.next_fdr_allocation(
-                    "shadow-confirmation-v5:equity", alpha=.05))
+                    scope, alpha=.05))
     envelope = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         fit_baseline=fit_baseline, heldout_baseline=baseline,
@@ -333,7 +334,8 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                       "mean_delta": control["mean_delta"],
                       "mean_delta_lcb": control["mean_delta_lcb"],
                       "p_value": control["p_value"]},
-        online_fdr={"scope": "shadow-confirmation-v5:equity" if lane == "shadow" else "test",
+        online_fdr={"scope": (f"{CONFIRMATORY_SCOPE_VERSION}:equity"
+                              if lane == "shadow" else "test"),
                     "test_id": f"{candidate_id}:{lane}",
                     "p_value": (control["p_value"] if lane == "shadow" else
                                 (.02 if passes else 1.0)),
@@ -2018,7 +2020,7 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
                 _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20),
                 directory)
             fdr_state = FactoryLedger(database).fdr_state(
-                "shadow-confirmation-v5:equity")
+                f"{CONFIRMATORY_SCOPE_VERSION}:equity")
         gate = result["variants"][0]["gate"]
         for name in ("null_control_available", "null_control_delta_positive",
                      "qualification_net_positive", "qualification_delta_positive"):

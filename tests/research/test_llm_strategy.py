@@ -3,7 +3,8 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
+from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V2,
+                                  RULE_SCHEMA_V3, RULE_SCHEMA_V4,
                                   rule_spec_hash, rule_variant_id,
                                   validate_rule_spec)
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
@@ -70,7 +71,7 @@ class LLMRuleStrategyTests(unittest.TestCase):
                          {"string", "null"})
         self.assertIn("builds_on", tuning["properties"]["variants"]["items"]["required"])
 
-    def test_vehicle_provider_schema_excludes_v3_for_options(self):
+    def test_vehicle_provider_schema_excludes_v3_and_v4_for_options(self):
         equity = RuleProposalAdapter._schema(DISCOVERY_SCHEMA, vehicle="equity")
         option = RuleProposalAdapter._schema(DISCOVERY_SCHEMA, vehicle="option")
         equity_schemas = {
@@ -82,7 +83,7 @@ class LLMRuleStrategyTests(unittest.TestCase):
             for branch in option["properties"]["rule_spec"]["anyOf"]
         }
         self.assertEqual(equity_schemas, {"rule-strategy.v1", "rule-strategy.v2",
-                                          RULE_SCHEMA_V3})
+                                          RULE_SCHEMA_V3, RULE_SCHEMA_V4})
         self.assertEqual(option_schemas, {"rule-strategy.v1", "rule-strategy.v2"})
 
     def test_openai_responses_seam_receives_sanitized_schema(self):

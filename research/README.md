@@ -280,13 +280,14 @@ gates are applied per vehicle and per
 session rather than to a pooled equity/options series. Rolling-origin uses the
 same fixed rule in every fold. The cumulative online-FDR allocation is durable
 per vehicle scope and persists across cycles. The active
-`shadow-confirmation-v5` scope implements the LORD++ construction of
+`shadow-confirmation-v6` scope implements the LORD++ construction of
 [Ramdas, Yang, Wainwright, and Jordan (2017)](https://proceedings.neurips.cc/paper_files/paper/2017/hash/7f018eb7b301a66658931cb8a93fd6e8-Abstract.html): with
-`gamma_k=1/(k*(k+1))`, explicit `W0=alpha`, and discovery indices `tau_j`, the
+`gamma_k=1/(k*(k+1))`, explicit `W0=alpha/2`, and discovery indices `tau_j`, the
 allocation at test `t` is `W0*gamma_t + (alpha-W0)*gamma_(t-tau_1) +
 alpha*sum_(j>=2, tau_j<t) gamma_(t-tau_j)`. Thus pre-discovery spending is
-`alpha*gamma_t`, the first-discovery reward is the explicitly recorded
-`alpha-W0=0`, and subsequent rewards are `alpha`. The cited result controls
+`(alpha/2)*gamma_t`, the first-discovery reward is the explicitly recorded
+`alpha-W0=alpha/2`, and subsequent rewards are `alpha`. v5 rows retain their
+prior `W0=alpha` semantics and are not replayed into v6. The cited result controls
 mFDR under conditionally super-uniform null p-values; its full FDR guarantee
 additionally assumes independent null p-values and predictable test levels
 that are monotone in prior discoveries. The implementation fixes that
@@ -392,13 +393,13 @@ appending the immutable `lane=shadow` proof and live marker. Semantic or
 mid-tail incompleteness fails closed but is repairable: correct the source and
 run the bounded complete parity replay before retrying ingestion. There is no
 unsafe auto-skip: unresolved quarantine blocks the watermark and FDR boundary.
-The `shadow-confirmation-v5` scope splits each tail into older
+The `shadow-confirmation-v6` scope splits each tail into older
 chronological selection sessions and a newer disjoint confirmatory window; BH
 uses the selection p-values, and only the selected candidate's raw confirmatory
 p-value reaches LORD++. Same-tail v3 scopes remain audit-only and cannot
 authorize. Legacy v2/v3/v4 sequences (`lord_balanced_v2` and
-`lord_balanced_raw_p_v3`) remain audit-readable and isolated from v5. Under
-epoch 5, the persisted live proof must match the durable FDR
+`lord_balanced_raw_p_v3`) and v5 LORD++ rows remain audit-readable and isolated
+from v6. Under epoch 6, the persisted live proof must match the durable FDR
 allocation (scope/test id, method/version, p-value, alpha, allocation, and
 decision), not merely repeat those fields in a caller-supplied envelope.
 
@@ -423,7 +424,7 @@ eligibility set fail closed and remain visible in per-symbol diagnostics.
 Research replays one session at a time and the runtime fetches from the session
 open, so the two see the same window either way.
 
-The grammar has three versions. `rule-strategy.v1` is the original field set and
+The grammar has four versions. `rule-strategy.v1` is the original field set and
 is unchanged, so every candidate already in a ledger keeps its exact
 `variant_id`. `rule-strategy.v2` is a strict superset reached only by naming it
 explicitly, and adds four *entry-side* predicates: `confirmations` (a list of
@@ -432,12 +433,14 @@ additional trend/volume/volatility filters, all of which must hold),
 window a signal may fire in), and `min_atr_bps`/`max_atr_bps` (the volatility
 regime the rule may trade). `rule-strategy.v3` keeps those entry predicates and
 adds nullable numeric `breakeven_r` for equity shares; `null` preserves the
-fixed-stop behavior. Options remain on executable v1/v2 schemas. Together the
-extensions let a hypothesis express a *conditional* edge or bounded equity
-exit behavior without changing the signal evaluator. V2 entry predicates stay
-outside sizing/execution; v3 affects only the shared bounded breakeven
-stop-transition path and cannot author arbitrary orders. A v2 spec that admits
-a signal produces exactly the v1 plan, while a v3 spec adds only its declared
+fixed-stop behavior. `rule-strategy.v4` adds bounded equity-only exits: a
+frozen session VWAP or rolling-mean target, a monotone trailing stop, and an
+`exit-before` deadline. Options remain on executable v1/v2 schemas. Together
+the extensions let a hypothesis express a *conditional* edge or bounded
+equity exit behavior without changing the signal evaluator. V2 entry
+predicates stay outside sizing/execution; v3/v4 affect only the shared bounded
+exit-state path and cannot author arbitrary orders. A v2 spec that admits a
+signal produces exactly the v1 plan, while v3/v4 specs add only their declared
 equity exit state.
 
 ### Slots are capacity, not licences
@@ -448,8 +451,8 @@ frozen and must never be re-tuned — so the slot is immediately reseeded with a
 *new* hypothesis in the same cycle. Without that reseed the factory would lose
 one worker per success and eventually have nothing left to search. Reseeding
 prefers a family the slot has not tried, at that family's own template, and
-then continues into the conditional grammar ladder (v2 entry predicates and v3
-equity exits): a slot that has run out of
+then continues into the conditional grammar ladder (v2 entry predicates and
+v3/v4 equity exits): a slot that has run out of
 families has not run out of hypotheses. Each reseed grants one further
 `max_generations` mutation budget and never consumes the separate
 failure-recovery rotation budget.
@@ -570,10 +573,11 @@ root's `schema`:
 - **schema** — `rule-strategy.v2` unlocks whole categories of predicate
   (`confirmations`, an entry-time window, an ATR regime band) that the root was
   never expressed in, while v3 adds the nullable equity `breakeven_r` exit
-  field. Reaching a wider schema is adding structure, not tuning values, so a
-  v1 root is tuned in v1, a v2 root in v2, and a v3 root stays v3 (including
-  when `breakeven_r` changes from `null` to a finite value). Options remain on
-  v1/v2.
+  field and v4 adds bounded target, trailing-stop, and deadline fields.
+  Reaching a wider schema is adding structure, not tuning values, so every
+  root remains on its declared schema while its existing fields are tuned
+  (including when `breakeven_r` changes from `null` to a finite value).
+  Options remain on v1/v2.
 
 What is left is exactly what "tuning the parameters" means: the values of the
 fields the root already has, inside the bounds the grammar already enforces.

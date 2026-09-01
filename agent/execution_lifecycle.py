@@ -13,7 +13,8 @@ from typing import Any, Mapping
 from . import state
 from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
-from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RuleSpecError,
+from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
+                             RuleSpecError,
                              completed_bar_exit_transition,
                              initialize_exit_state)
 from .instruments import validate_instrument
@@ -30,6 +31,7 @@ _PROTECTIVE_TERMINAL_STATUSES = _TERMINAL_ORDER_STATUSES | {
     "done", "closed", "done_for_day",
 }
 _OPTION_PROFILES = frozenset({"option", "options"})
+_RULE_EXIT_SCHEMAS = frozenset({RULE_SCHEMA_V3, RULE_SCHEMA_V4})
 
 
 _EDGE_OUTBOX_WARN = 500
@@ -76,6 +78,20 @@ def _hold_expired(trade: Any, now: datetime) -> bool:
     if deadline != deadline or abs(deadline) == float("inf"):
         return True
     return now.timestamp() >= deadline
+
+
+def _thesis_exit_expired(trade: Any, now: datetime) -> bool:
+    """Check the v4 thesis deadline without conflating safety force-flat."""
+    if not isinstance(trade, Mapping) or "exit_before_ts" not in trade:
+        return False
+    raw = trade.get("exit_before_ts")
+    if raw is None:
+        return False
+    try:
+        deadline = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    return not (deadline == deadline and abs(deadline) != float("inf")) or now.timestamp() >= deadline
 
 
 def _protective_legs(legs: Any) -> list[dict]:
@@ -464,8 +480,8 @@ class ExecutionLifecycleMixin:
                 isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
         existing = current.get("active_trades", {}).get(symbol, {})
         existing = existing if isinstance(existing, Mapping) else {}
-        v3_progressed = (
-            str(existing.get("rule_schema") or "") == RULE_SCHEMA_V3 and
+        rule_exit_progressed = (
+            str(existing.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS and
             (existing.get("last_completed_bar_epoch") is not None or
              isinstance(existing.get("stop_replacement"), Mapping)))
         # The broker's ``filled_avg_price`` is cumulative.  Keep the last
@@ -484,7 +500,7 @@ class ExecutionLifecycleMixin:
                 plan.get("option", {}).get("debit") if _option_profile(profile) and
                 isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
         instrument_entry = fill_price
-        if v3_progressed:
+        if rule_exit_progressed:
             prior_qty = self._number(existing.get("cumulative_filled_qty"))
             prior_entry = self._number(existing.get("entry_price"))
             if (prior_qty is None or prior_entry is None or
@@ -492,7 +508,7 @@ class ExecutionLifecycleMixin:
                     instrument_entry is None or
                     abs(prior_entry - instrument_entry) > 1e-9):
                 raise AlpacaError(
-                    "v3 entry fill changed after completed-bar exit processing")
+                    "rule exit entry fill changed after completed-bar exit processing")
 
         if order_state.get("fill_logged") and "logged_filled_qty" not in order_state:
             # Older state files used a boolean only; avoid duplicating their
@@ -664,15 +680,17 @@ class ExecutionLifecycleMixin:
             "exit_bar_provider": plan.get("exit_bar_provider"),
             "exit_bar_age_seconds": plan.get("exit_bar_age_seconds"),
         }
-        if str(plan.get("rule_schema") or "") == RULE_SCHEMA_V3:
-            if v3_progressed:
+        if str(plan.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS:
+            if rule_exit_progressed:
                 bounded_exit = {
                     key: deepcopy(existing[key]) for key in (
                         "direction", "entry_price", "initial_stop_price",
                         "active_stop_price", "target_price", "initial_risk",
                         "breakeven_r", "breakeven_armed_at",
                         "breakeven_armed_epoch", "entry_bar_pending",
-                        "last_completed_bar_at", "last_completed_bar_epoch")
+                        "last_completed_bar_at", "last_completed_bar_epoch",
+                        "trailing_stop_r", "target_mode", "target_lookback",
+                        "exit_before_ts")
                     if key in existing
                 }
             else:
@@ -681,20 +699,26 @@ class ExecutionLifecycleMixin:
                         direction, instrument_entry,
                         plan.get("underlying_stop_price", plan.get("stop_price")),
                         plan.get("underlying_target_price", plan.get("target_price")),
-                        breakeven_r=plan.get("breakeven_r"))
+                        breakeven_r=plan.get("breakeven_r"),
+                        trailing_stop_r=plan.get("trailing_stop_r"),
+                        target_mode=plan.get("target_mode", "fixed_r"),
+                        target_lookback=plan.get("target_lookback"),
+                        exit_before_ts=plan.get("exit_before_ts"))
                 except RuleSpecError as exc:
-                    raise AlpacaError(f"filled v3 exit state is invalid: {exc}") from exc
+                    label = ("v3" if str(plan.get("rule_schema") or "") == RULE_SCHEMA_V3
+                             else "v4")
+                    raise AlpacaError(f"filled {label} exit state is invalid: {exc}") from exc
             signal_ts = self._number(plan.get("signal_ts"))
             trade.update(bounded_exit)
             trade.update({
-                "rule_schema": RULE_SCHEMA_V3,
+                "rule_schema": plan.get("rule_schema"),
                 "exit_entry_bar_epoch": (
                     signal_ts + BAR_SECONDS if signal_ts is not None else None),
             })
         # The broker-resident bracket legs are the position's real protection.
         # Keep the ids observed at submission; a later reconciliation refreshes
         # their status but must not lose the association.
-        legs = (_leg_rows(existing) if v3_progressed else
+        legs = (_leg_rows(existing) if rule_exit_progressed else
                 (_leg_rows(order_state) or _leg_rows(existing)))
         if legs:
             trade["protective_legs"] = [dict(leg) for leg in legs]
@@ -714,7 +738,9 @@ class ExecutionLifecycleMixin:
                 "max_hold_bars", "hold_deadline_ts", "protective_legs",
                 "rule_schema", "initial_stop_price", "active_stop_price",
                 "breakeven_r", "breakeven_armed_at", "breakeven_armed_epoch",
-                "last_completed_bar_at", "last_completed_bar_epoch")
+                "last_completed_bar_at", "last_completed_bar_epoch",
+                "trailing_stop_r", "target_mode", "target_lookback",
+                "exit_before_ts")
         }
         if incremental_qty > 0:
             incremental_notional, incremental_risk = economics(
@@ -1429,7 +1455,7 @@ class ExecutionLifecycleMixin:
             filled_fraction = (self._number(trade.get("filled_fraction"))
                                if isinstance(trade, Mapping) else None)
             if (isinstance(trade, Mapping) and
-                    str(trade.get("rule_schema") or "") == RULE_SCHEMA_V3 and
+                    str(trade.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS and
                     filled_fraction is not None and filled_fraction >= 1.0 - 1e-9):
                 trade = dict(trade)
                 pending = trade.get("stop_replacement")
@@ -1471,9 +1497,13 @@ class ExecutionLifecycleMixin:
                                 break
                     except RuleSpecError as exc:
                         failed.append({"symbol": symbol,
-                                       "reason": "v3_exit_state_invalid",
+                                       "reason": ("v3_exit_state_invalid"
+                                                  if str(trade.get("rule_schema") or "") == RULE_SCHEMA_V3
+                                                  else "v4_exit_state_invalid"),
                                        "error": str(exc)})
-                        self._event("v3_exit_state_invalid", {
+                        self._event(("v3_exit_state_invalid"
+                                     if str(trade.get("rule_schema") or "") == RULE_SCHEMA_V3
+                                     else "v4_exit_state_invalid"), {
                             "symbol": symbol, "error": str(exc)})
                         continue
                     if stop_changed and transition_reason is None and protected:
@@ -1558,6 +1588,8 @@ class ExecutionLifecycleMixin:
                     reason = "stop"
                 elif target is not None and price <= target:
                     reason = "target"
+            if reason is None and _thesis_exit_expired(trade, now):
+                reason = "exit_before"
             if reason is None and _hold_expired(trade, now):
                 # The validated contract's bounded hold is a time exit; it must
                 # fire without a tradable price rather than be reported as a
@@ -1614,13 +1646,15 @@ class ExecutionLifecycleMixin:
                 protection = dict(runtime.get("protection", {}))
                 for symbol, trade in active.items():
                     if (not isinstance(trade, Mapping) or
-                            str(trade.get("rule_schema") or "") != RULE_SCHEMA_V3):
+                            str(trade.get("rule_schema") or "") not in _RULE_EXIT_SCHEMAS):
                         continue
                     row = dict(protection.get(symbol, {}))
                     for key in ("rule_schema", "initial_stop_price",
                                 "active_stop_price", "breakeven_r",
                                 "breakeven_armed_at", "breakeven_armed_epoch",
                                 "last_completed_bar_at", "last_completed_bar_epoch",
+                                "trailing_stop_r", "target_mode", "target_lookback",
+                                "exit_before_ts",
                                 "desired_stop_price", "stop_replacement",
                                 "protective_legs"):
                         if key in trade:
@@ -1686,7 +1720,7 @@ class ExecutionLifecycleMixin:
         # day time-in-force.
         for symbol, trade in previous.items():
             if (isinstance(trade, dict) and
-                    str(trade.get("rule_schema") or "") == RULE_SCHEMA_V3):
+                    str(trade.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS):
                 self._recover_stop_replacement(symbol, trade, by_id)
             legs = _leg_rows(trade)
             if not legs:
@@ -2120,13 +2154,15 @@ class ExecutionLifecycleMixin:
         protection = dict(current.get("protection", {}))
         for symbol, trade in active.items():
             if (not isinstance(trade, Mapping) or
-                    str(trade.get("rule_schema") or "") != RULE_SCHEMA_V3):
+                    str(trade.get("rule_schema") or "") not in _RULE_EXIT_SCHEMAS):
                 continue
             row = dict(protection.get(symbol, {}))
             for key in ("rule_schema", "initial_stop_price", "active_stop_price",
                         "breakeven_r", "breakeven_armed_at",
                         "breakeven_armed_epoch", "last_completed_bar_at",
                         "last_completed_bar_epoch", "desired_stop_price",
+                        "trailing_stop_r", "target_mode", "target_lookback",
+                        "exit_before_ts",
                         "stop_replacement", "protective_legs"):
                 if key in trade:
                     row[key] = deepcopy(trade[key])

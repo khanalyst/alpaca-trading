@@ -22,7 +22,8 @@ from . import register
 RULE_SCHEMA_V1 = "rule-strategy.v1"
 RULE_SCHEMA_V2 = "rule-strategy.v2"
 RULE_SCHEMA_V3 = "rule-strategy.v3"
-RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3)
+RULE_SCHEMA_V4 = "rule-strategy.v4"
+RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4)
 # ``RULE_SCHEMA`` remains the v1 name so existing callers, stored specs, and
 # content hashes are untouched.  v2 is a strict superset reached only by
 # writing its schema string explicitly.
@@ -134,6 +135,21 @@ V3_DEFAULT_EXTENSIONS: dict[str, Any] = {
 }
 _V3_BOUNDS = {
     "breakeven_r": (0.0, 10.0, float),
+}
+# v4 is an equity-only, auditable exit extension.  Defaults are deliberately
+# neutral so a v4 writer can preserve the fixed-R v3 geometry while making the
+# target/ratchet/deadline policy explicit in the persisted plan.
+V4_DEFAULT_EXTENSIONS: dict[str, Any] = {
+    "target_mode": "fixed_r",
+    "target_lookback": 20,
+    "trailing_stop_r": None,
+    "exit_before_minutes": None,
+}
+_V4_TARGET_MODES = ("fixed_r", "session_vwap", "rolling_mean")
+_V4_BOUNDS = {
+    "target_lookback": (2, 120, int),
+    "trailing_stop_r": (0.0, 10.0, float),
+    "exit_before_minutes": (1, SESSION_MINUTES - 1, int),
 }
 _EXTRA_CONFIRMATIONS = tuple(name for name in CONFIRMATIONS if name != "none")
 MAX_CONFIRMATIONS = len(_EXTRA_CONFIRMATIONS)
@@ -256,13 +272,18 @@ def rule_semantic_signature(value: Mapping[str, Any]) -> str:
     spec = validate_rule_spec(value)
     effective = {name: spec[name] for name in _semantic_fields(spec)
                  if name in spec}
-    if spec.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
+    if spec.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         for name, default in V2_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
                 effective[name] = current
-    if spec.get("schema") == RULE_SCHEMA_V3:
+    if spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         for name, default in V3_DEFAULT_EXTENSIONS.items():
+            current = spec.get(name, default)
+            if current != default:
+                effective[name] = current
+    if spec.get("schema") == RULE_SCHEMA_V4:
+        for name, default in V4_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
                 effective[name] = current
@@ -292,12 +313,15 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
     # local scale for floats, while retaining the audited span for discrete
     # integer coordinates such as lookback. Validation above remains the
     # source of truth for legal ranges.
-    bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS}
+    bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS, **_V4_BOUNDS}
     fields = _semantic_fields(a) | _semantic_fields(b)
     for name, default in V2_DEFAULT_EXTENSIONS.items():
         if a.get(name, default) != default or b.get(name, default) != default:
             fields.add(name)
     for name, default in V3_DEFAULT_EXTENSIONS.items():
+        if a.get(name, default) != default or b.get(name, default) != default:
+            fields.add(name)
+    for name, default in V4_DEFAULT_EXTENSIONS.items():
         if a.get(name, default) != default or b.get(name, default) != default:
             fields.add(name)
     for name in sorted(fields):
@@ -341,7 +365,7 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             "confirmation": {"type": "string", "enum": list(CONFIRMATIONS)},
         }
         required = list(DEFAULT_RULE_SPEC)
-        if name in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
+        if name in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
             common_properties.update({
                 "confirmations": {"type": "array", "maxItems": MAX_CONFIRMATIONS,
                                   "uniqueItems": True,
@@ -354,11 +378,27 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
                 "max_atr_bps": {"type": "number", "minimum": 1.0, "maximum": 5000.0},
             })
             required += list(V2_DEFAULT_EXTENSIONS)
-        if name == RULE_SCHEMA_V3:
+        if name in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
             common_properties["breakeven_r"] = {
                 "type": ["number", "null"], "minimum": 0.0, "maximum": 10.0,
             }
             required += list(V3_DEFAULT_EXTENSIONS)
+        if name == RULE_SCHEMA_V4:
+            common_properties.update({
+                "target_mode": {"type": "string", "enum": list(_V4_TARGET_MODES)},
+                "target_lookback": {"type": "integer", "minimum": 2,
+                                    "maximum": 120},
+                "trailing_stop_r": {"type": ["number", "null"],
+                                     "exclusiveMinimum": 0.0,
+                                     "maximum": 10.0},
+                "exit_before_minutes": {"type": ["integer", "null"],
+                                         "minimum": 1,
+                                         "maximum": SESSION_MINUTES - 1},
+            })
+            # v4 exit policy is backward-compatible when omitted: fixed-R,
+            # the bounded default lookback, no trailing ratchet, and no thesis
+            # deadline are the neutral defaults. Keep all policy extensions optional in the
+            # provider schema (validation fills the same defaults).
         def branch(family: dict[str, Any], *, eligible: bool) -> dict[str, Any]:
             properties = {**common_properties, "family": family}
             if eligible:
@@ -448,10 +488,12 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         raise RuleSpecError(
             f"rule_spec.schema must be one of {', '.join(map(repr, RULE_SCHEMAS))}")
     permitted = set(DEFAULT_RULE_SPEC) | {"eligible_symbols"}
-    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
+    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         permitted |= set(V2_DEFAULT_EXTENSIONS)
-    if schema == RULE_SCHEMA_V3:
+    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         permitted |= set(V3_DEFAULT_EXTENSIONS)
+    if schema == RULE_SCHEMA_V4:
+        permitted |= set(V4_DEFAULT_EXTENSIONS)
     unknown = sorted(set(value) - permitted)
     if unknown:
         # A v1 spec naming a v2 field is a version error, not a typo: say so.
@@ -465,12 +507,19 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
             raise RuleSpecError(
                 f"rule_spec field(s) {', '.join(v2_extensions)} require "
                 f"schema {RULE_SCHEMA_V2!r}")
+        v4_extensions = [name for name in unknown if name in V4_DEFAULT_EXTENSIONS]
+        if v4_extensions:
+            raise RuleSpecError(
+                f"rule_spec field(s) {', '.join(v4_extensions)} require "
+                f"schema {RULE_SCHEMA_V4!r}")
         raise RuleSpecError(f"rule_spec has unknown field(s): {', '.join(unknown)}")
     spec = dict(DEFAULT_RULE_SPEC)
-    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
+    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         spec.update(V2_DEFAULT_EXTENSIONS)
-    if schema == RULE_SCHEMA_V3:
+    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         spec.update(V3_DEFAULT_EXTENSIONS)
+    if schema == RULE_SCHEMA_V4:
+        spec.update(V4_DEFAULT_EXTENSIONS)
     spec.update(value)
     spec["schema"] = schema
     if spec.get("family") not in RULE_FAMILIES:
@@ -536,24 +585,74 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         if "eligible_symbols" in spec:
             spec["eligible_symbols"] = _validate_eligible_symbols(
                 spec["eligible_symbols"])
-        return spec
-    if isinstance(breakeven, bool):
-        raise RuleSpecError("rule_spec.breakeven_r has an invalid type")
-    lower, upper, cast = _V3_BOUNDS["breakeven_r"]
-    try:
-        breakeven = cast(breakeven)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RuleSpecError("rule_spec.breakeven_r must be numeric or null") from exc
-    if not math.isfinite(breakeven) or not lower <= breakeven <= upper:
-        raise RuleSpecError(
-            f"rule_spec.breakeven_r must be between {lower:g} and {upper:g}, or null")
-    if breakeven >= float(spec["target_r"]):
-        raise RuleSpecError("rule_spec.breakeven_r must be below target_r")
-    spec["breakeven_r"] = breakeven
+    else:
+        if isinstance(breakeven, bool):
+            raise RuleSpecError("rule_spec.breakeven_r has an invalid type")
+        lower, upper, cast = _V3_BOUNDS["breakeven_r"]
+        try:
+            breakeven = cast(breakeven)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuleSpecError("rule_spec.breakeven_r must be numeric or null") from exc
+        if not math.isfinite(breakeven) or not lower <= breakeven <= upper:
+            raise RuleSpecError(
+                f"rule_spec.breakeven_r must be between {lower:g} and {upper:g}, or null")
+        if breakeven >= float(spec["target_r"]):
+            raise RuleSpecError("rule_spec.breakeven_r must be below target_r")
+        spec["breakeven_r"] = breakeven
     if "eligible_symbols" in spec:
         spec["eligible_symbols"] = _validate_eligible_symbols(
             spec["eligible_symbols"])
+    if schema == RULE_SCHEMA_V3:
+        return spec
+    # v4 exit policy fields are validated only after all v2/v3 extensions so
+    # old schemas retain their exact normalized maps and content hashes.
+    target_mode = spec.get("target_mode")
+    if target_mode not in _V4_TARGET_MODES:
+        raise RuleSpecError(
+            "rule_spec.target_mode must be fixed_r, session_vwap, or rolling_mean")
+    for name, (lower, upper, cast) in _V4_BOUNDS.items():
+        raw = spec.get(name)
+        if raw is None and name in {"trailing_stop_r", "exit_before_minutes"}:
+            continue
+        if isinstance(raw, bool):
+            raise RuleSpecError(f"rule_spec.{name} has an invalid type")
+        if cast is int and not isinstance(raw, int):
+            raise RuleSpecError(f"rule_spec.{name} must be an integer")
+        try:
+            number = cast(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuleSpecError(f"rule_spec.{name} must be numeric") from exc
+        valid_range = (lower < number <= upper
+                       if name == "trailing_stop_r" else lower <= number <= upper)
+        if not math.isfinite(float(number)) or not valid_range:
+            raise RuleSpecError(
+                f"rule_spec.{name} must be between {lower:g} and {upper:g}, or null")
+        spec[name] = number
     return spec
+
+
+def thesis_exit_deadline(entry_ts: Any, spec: Mapping[str, Any]) -> float | None:
+    """Return the v4 thesis deadline anchored to the entry session.
+
+    This is intentionally separate from the safety force-flat deadline.  A
+    v4 plan persists both timestamps so an operator can distinguish a thesis
+    exit from a regular-session safety flatten even when they happen to share
+    a wall-clock minute.
+    """
+    minutes = spec.get("exit_before_minutes") if isinstance(spec, Mapping) else None
+    if minutes is None:
+        return None
+    if isinstance(minutes, bool) or not isinstance(minutes, int):
+        raise RuleSpecError("rule_spec.exit_before_minutes must be an integer or null")
+    lower, upper, _ = _V4_BOUNDS["exit_before_minutes"]
+    if not lower <= minutes <= upper:
+        raise RuleSpecError(
+            f"rule_spec.exit_before_minutes must be between {lower:g} and {upper:g}, or null")
+    start = _epoch(entry_ts, "entry timestamp")
+    zone = ZoneInfo("America/New_York")
+    local = datetime.fromtimestamp(start, timezone.utc).astimezone(zone)
+    close = datetime.combine(local.date(), time(16, 0), tzinfo=zone)
+    return close.timestamp() - minutes * 60.0
 
 
 def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
@@ -569,7 +668,11 @@ def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
     """
     held = spec.get("max_hold_bars") if isinstance(spec, Mapping) else None
     if held is None:
-        return None
+        deadline = thesis_exit_deadline(entry_ts, spec)
+        if force_flat_ts is not None:
+            force_flat = _epoch(force_flat_ts, "force-flat timestamp")
+            deadline = force_flat if deadline is None else min(deadline, force_flat)
+        return deadline
     lower, upper, _ = _BOUNDS["max_hold_bars"]
     if isinstance(held, bool) or not isinstance(held, int):
         raise RuleSpecError("rule_spec.max_hold_bars must be an integer")
@@ -578,6 +681,9 @@ def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
             f"rule_spec.max_hold_bars must be between {lower:g} and {upper:g}")
     start = _epoch(entry_ts, "entry timestamp")
     deadline = start + (held + 1) * BAR_SECONDS
+    thesis = thesis_exit_deadline(entry_ts, spec)
+    if thesis is not None:
+        deadline = min(deadline, thesis)
     if force_flat_ts is not None:
         deadline = min(deadline, _epoch(force_flat_ts, "force-flat timestamp"))
     return deadline
@@ -611,7 +717,11 @@ def _exit_number(value: Any, field: str, *, positive: bool = False) -> float:
 
 
 def initialize_exit_state(direction: str, entry_price: Any, stop_price: Any,
-                          target_price: Any, *, breakeven_r: Any = None) -> dict[str, Any]:
+                          target_price: Any, *, breakeven_r: Any = None,
+                          trailing_stop_r: Any = None,
+                          target_mode: str = "fixed_r",
+                          target_lookback: Any = None,
+                          exit_before_ts: Any = None) -> dict[str, Any]:
     """Return the canonical durable state for one bounded rule exit.
 
     The entry is the actual fill anchor.  The authored/resting initial stop is
@@ -635,7 +745,26 @@ def initialize_exit_state(direction: str, entry_price: Any, stop_price: Any,
                 f"exit breakeven_r must be between {lower:g} and {upper:g}, or null")
     else:
         breakeven = None
-    return {
+    if target_mode not in _V4_TARGET_MODES:
+        raise RuleSpecError(
+            "exit target_mode must be fixed_r, session_vwap, or rolling_mean")
+    if target_lookback is not None:
+        if isinstance(target_lookback, bool) or not isinstance(target_lookback, int):
+            raise RuleSpecError("exit target_lookback must be an integer")
+        low, high, _ = _V4_BOUNDS["target_lookback"]
+        if not low <= target_lookback <= high:
+            raise RuleSpecError("exit target_lookback is outside its bounded range")
+    if trailing_stop_r is not None:
+        trailing = _exit_number(trailing_stop_r, "exit trailing_stop_r")
+        low, high, _ = _V4_BOUNDS["trailing_stop_r"]
+        if not low < trailing <= high:
+            raise RuleSpecError(
+                f"exit trailing_stop_r must be between {low:g} and {high:g}, or null")
+    else:
+        trailing = None
+    deadline = None if exit_before_ts is None else _epoch(
+        exit_before_ts, "exit_before timestamp")
+    result = {
         "direction": direction,
         "entry_price": entry,
         "initial_stop_price": stop,
@@ -649,6 +778,15 @@ def initialize_exit_state(direction: str, entry_price: Any, stop_price: Any,
         "last_completed_bar_at": None,
         "last_completed_bar_epoch": None,
     }
+    # Do not widen the v1-v3 durable state shape for callers that do not opt
+    # into a v4 exit field.  v4 plans always pass at least target_lookback or
+    # an explicit target mode, making the policy auditable on disk.
+    if (trailing is not None or target_mode != "fixed_r" or
+            target_lookback is not None or deadline is not None):
+        result.update({"trailing_stop_r": trailing, "target_mode": target_mode,
+                       "target_lookback": target_lookback,
+                       "exit_before_ts": deadline})
+    return result
 
 
 def breakeven_stop_price(entry_price: Any, direction: str) -> float:
@@ -715,11 +853,9 @@ def completed_bar_exit_transition(state: Mapping[str, Any], bar: Any) -> dict[st
     target = _exit_number(state.get("target_price"), "exit target_price", positive=True)
     entry_pending = bool(state.get("entry_bar_pending", False))
     if direction == "long":
-        valid = (initial_stop < target and active_stop < target and
-                 (entry_pending or active_stop <= entry < target))
+        valid = initial_stop < target and active_stop < target
     elif direction == "short":
-        valid = (target < initial_stop and target < active_stop and
-                 (entry_pending or target < entry <= active_stop))
+        valid = target < initial_stop and target < active_stop
     else:
         valid = False
     if not valid:
@@ -732,6 +868,18 @@ def completed_bar_exit_transition(state: Mapping[str, Any], bar: Any) -> dict[st
         if not lower <= breakeven <= upper:
             raise RuleSpecError(
                 f"exit breakeven_r must be between {lower:g} and {upper:g}, or null")
+    trailing_raw = state.get("trailing_stop_r")
+    if trailing_raw is not None:
+        trailing = _exit_number(trailing_raw, "exit trailing_stop_r")
+        lower, upper, _cast = _V4_BOUNDS["trailing_stop_r"]
+        if not lower < trailing <= upper:
+            raise RuleSpecError(
+                f"exit trailing_stop_r must be between {lower:g} and {upper:g}, or null")
+    else:
+        trailing = None
+    target_mode = str(state.get("target_mode") or "fixed_r")
+    if target_mode not in _V4_TARGET_MODES:
+        raise RuleSpecError("exit target_mode is invalid")
     opened_epoch, end_epoch = _exit_bar_time(bar)
     previous_epoch = state.get("last_completed_bar_epoch")
     if previous_epoch is not None:
@@ -759,6 +907,11 @@ def completed_bar_exit_transition(state: Mapping[str, Any], bar: Any) -> dict[st
             end_epoch, timezone.utc).isoformat(),
         "last_completed_bar_epoch": end_epoch,
     })
+    if ("trailing_stop_r" in state or "target_mode" in state or
+            "target_lookback" in state or "exit_before_ts" in state):
+        updated.update({"trailing_stop_r": trailing, "target_mode": target_mode,
+                        "target_lookback": state.get("target_lookback"),
+                        "exit_before_ts": state.get("exit_before_ts")})
     if direction == "long":
         gap_stop, gap_target = opened <= active_stop, opened >= target
         hit_stop, hit_target = low <= active_stop, high >= target
@@ -809,6 +962,26 @@ def completed_bar_exit_transition(state: Mapping[str, Any], bar: Any) -> dict[st
                 end_epoch, timezone.utc).isoformat()
             updated["breakeven_armed_epoch"] = end_epoch
             stop_changed = active_stop != updated["active_stop_price"]
+    # A trailing stop is derived only from this completed close and is applied
+    # to the *next* bar.  Ratchets are monotone and never cross the frozen
+    # target; stop/target tie and gap semantics above therefore remain intact.
+    if exit_row is None and trailing is not None:
+        candidate = (close - initial_risk * trailing if direction == "long" else
+                     close + initial_risk * trailing)
+        increment = Decimal("0.01") if candidate >= 1.0 else Decimal("0.0001")
+        rounding = ROUND_FLOOR if direction == "long" else ROUND_CEILING
+        candidate = float(Decimal(str(candidate)).quantize(increment,
+                                                           rounding=rounding))
+        if direction == "long":
+            candidate = min(candidate, target - max(target * 1e-12, 1e-9))
+            if candidate > float(updated["active_stop_price"]):
+                updated["active_stop_price"] = candidate
+                stop_changed = True
+        else:
+            candidate = max(candidate, target + max(target * 1e-12, 1e-9))
+            if candidate < float(updated["active_stop_price"]):
+                updated["active_stop_price"] = candidate
+                stop_changed = True
     return {"state": updated, "exit": exit_row,
             "stop_changed": stop_changed, "duplicate": False}
 
@@ -818,7 +991,7 @@ def rule_vehicle_executable(spec: Mapping[str, Any], vehicle: str) -> bool:
     normalized = validate_rule_spec(spec)
     if normalized["family"] == "cross_sectional_residual":
         return str(vehicle or "").lower() in {"equity", "share", "shares"}
-    return not (normalized["schema"] == RULE_SCHEMA_V3 and
+    return not (normalized["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4} and
                 str(vehicle or "").lower() in {"option", "options"})
 
 
@@ -1095,7 +1268,7 @@ def _session_minutes(stamp: datetime) -> float:
 
 
 def _within_entry_window(spec: Mapping[str, Any], stamp: datetime) -> bool:
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         return True
     elapsed = _session_minutes(stamp)
     return (float(spec["entry_after_minutes"]) <= elapsed <
@@ -1117,7 +1290,7 @@ def entry_window_bounds(value: Mapping[str, Any]) -> tuple[float, float]:
     predicate instead of a copy that can drift away from it.
     """
     spec = validate_rule_spec(value)
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         return 0.0, float(SESSION_MINUTES)
     return (float(spec["entry_after_minutes"]),
             float(spec["entry_before_minutes"]))
@@ -1125,7 +1298,7 @@ def entry_window_bounds(value: Mapping[str, Any]) -> tuple[float, float]:
 
 def _within_volatility_band(spec: Mapping[str, Any], atr: float,
                             close: float) -> bool:
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         return True
     if close <= 0:
         return False
@@ -1208,6 +1381,26 @@ def _vwap(bars: Sequence[Any]) -> float | None:
     if volume <= 0:
         return None
     result = weighted / volume
+    return result if result > 0 and math.isfinite(result) else None
+
+
+def frozen_target_reference(rows: Sequence[Any],
+                            value: Mapping[str, Any]) -> float | None:
+    """Freeze a v4 non-R target from the completed prefix available now."""
+
+    spec = validate_rule_spec(value)
+    target_mode = str(spec.get("target_mode") or "fixed_r")
+    if target_mode == "fixed_r":
+        return None
+    bars = list(rows)
+    if not bars:
+        return None
+    if target_mode == "session_vwap":
+        return _vwap(_session_prefix(bars, bars[-1]))
+    lookback = int(spec.get("target_lookback", 20))
+    if len(bars) < lookback:
+        return None
+    result = mean(_number(row, "close") for row in bars[-lookback:])
     return result if result > 0 and math.isfinite(result) else None
 
 
@@ -1443,8 +1636,23 @@ def _evaluate_rule_signal_staged(
     distance = max(atr * spec["stop_atr"],
                    close * MIN_STOP_DISTANCE_FRACTION)
     stop = close - distance if direction == "long" else close + distance
-    target = (close + distance * spec["target_r"] if direction == "long" else
-              close - distance * spec["target_r"])
+    target_mode = str(spec.get("target_mode") or "fixed_r")
+    target_reference = frozen_target_reference(bars, spec)
+    if target_mode == "fixed_r":
+        target = (close + distance * spec["target_r"] if direction == "long" else
+                  close - distance * spec["target_r"])
+    else:
+        target = float(target_reference) if target_reference is not None else None
+        # A mean/VWAP target is frozen from the completed signal prefix.  If it
+        # lies behind the entry it cannot be a valid one-leg take-profit, so
+        # reject this signal rather than silently substituting an R target.
+        if target is None or ((direction == "long" and target <= close) or
+                              (direction == "short" and target >= close)):
+            if not stage("target", False, "target_reference_unavailable_or_wrong_side"):
+                return None, stages, family_metadata
+    if not stage("target", target is not None and target > 0,
+                 "passed" if target is not None and target > 0 else "target_invalid"):
+        return None, stages, family_metadata
     stamp = _timestamp(current)
     if not stage("timestamp", stamp is not None,
                  "passed" if stamp is not None else "timestamp_unavailable"):
@@ -1469,9 +1677,16 @@ def _evaluate_rule_signal_staged(
         "rule_spec_hash": rule_spec_hash(spec),
         "confidence": 1.0,
     }
-    if spec["schema"] == RULE_SCHEMA_V3:
+    if spec["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
         result.update({"rule_schema": RULE_SCHEMA_V3,
                        "breakeven_r": spec.get("breakeven_r")})
+    if spec["schema"] == RULE_SCHEMA_V4:
+        result.update({"rule_schema": RULE_SCHEMA_V4,
+                       "target_mode": target_mode,
+                       "target_reference": target_reference,
+                       "target_lookback": spec.get("target_lookback"),
+                       "trailing_stop_r": spec.get("trailing_stop_r"),
+                       "exit_before_minutes": spec.get("exit_before_minutes")})
     if spec["family"] == "cross_sectional_residual":
         result.update(family_metadata)
     stage("signal", True, "emitted")
@@ -1594,6 +1809,18 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
         "stop_price": snapshot.get("stop_price"),
         "target_price": snapshot.get("target_price"),
     }
+    if spec["schema"] == RULE_SCHEMA_V4:
+        evidence.update({
+            "target_mode": snapshot.get("target_mode", spec.get("target_mode")),
+            "target_reference": snapshot.get("target_reference"),
+            "target_lookback": snapshot.get("target_lookback",
+                                            spec.get("target_lookback")),
+            "trailing_stop_r": snapshot.get("trailing_stop_r",
+                                             spec.get("trailing_stop_r")),
+            "exit_before_minutes": snapshot.get("exit_before_minutes",
+                                                spec.get("exit_before_minutes")),
+            "exit_before_ts": snapshot.get("exit_before_ts"),
+        })
     if spec["family"] == "cross_sectional_residual":
         evidence.update({
             "benchmark_symbol": snapshot.get(
@@ -1612,8 +1839,8 @@ __all__ = [
     "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
     "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
-           "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "SESSION_MINUTES",
-           "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS",
+           "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "RULE_SCHEMA_V4", "SESSION_MINUTES",
+           "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS", "V4_DEFAULT_EXTENSIONS",
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "OPENING_ANCHORED_FAMILIES",
            "entry_window_bounds", "session_minutes",
@@ -1623,9 +1850,10 @@ __all__ = [
            "rule_semantic_distance", "rule_spec_json_schema",
     "RuleSpecError", "breakeven_stop_price", "completed_bar_exit_transition",
     "evaluate_rule_signal", "evaluate_rule_signal_trace",
-    "evaluate_rule_signal_metadata", "initialize_exit_state",
+    "evaluate_rule_signal_metadata", "frozen_target_reference",
+    "initialize_exit_state",
     "rule_signal_metadata",
-    "generate_rule_signal", "hold_deadline", "rule_spec_hash",
+    "generate_rule_signal", "hold_deadline", "thesis_exit_deadline", "rule_spec_hash",
     "rule_variant_id", "rule_vehicle_executable", "setup_evidence",
     "validate_rule_spec",
 ]

@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     DEFAULT_RULE_SPEC, MAX_CONFIRMATIONS, RULE_FAMILIES, RULE_SCHEMA_V1,
-    RULE_SCHEMA_V2, RULE_SCHEMA_V3, SIDES, CONFIRMATIONS, RuleSpecError,
+    RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, SIDES, CONFIRMATIONS, RuleSpecError,
     evaluate_rule_signal, rule_spec_hash, rule_spec_json_schema,
     rule_variant_id, setup_evidence,
     validate_rule_spec,
@@ -123,7 +123,7 @@ class V1IdentityTests(unittest.TestCase):
 
     def test_unknown_schema_is_refused(self):
         with self.assertRaises(RuleSpecError):
-            validate_rule_spec({"schema": "rule-strategy.v4",
+            validate_rule_spec({"schema": "rule-strategy.v5",
                                 "family": "mean_reversion"})
 
     def test_v2_content_hash_is_frozen_when_v3_is_added(self):
@@ -200,6 +200,44 @@ class V3ValidationTests(unittest.TestCase):
         self.assertEqual(validate_rule_spec({
             "schema": RULE_SCHEMA_V3, "family": "mean_reversion",
             "target_r": 2.0, "breakeven_r": 1.0})["breakeven_r"], 1.0)
+
+
+class V4ValidationTests(unittest.TestCase):
+    def test_v4_defaults_are_explicit_and_fixed_r_is_backward_compatible(self):
+        spec = validate_rule_spec({"schema": RULE_SCHEMA_V4,
+                                   "family": "mean_reversion"})
+        self.assertEqual(spec["target_mode"], "fixed_r")
+        self.assertEqual(spec["target_lookback"], 20)
+        self.assertIsNone(spec["trailing_stop_r"])
+        self.assertIsNone(spec["exit_before_minutes"])
+        v3 = validate_rule_spec({"schema": RULE_SCHEMA_V3,
+                                 "family": "mean_reversion"})
+        self.assertNotIn("target_mode", v3)
+
+    def test_target_mode_and_rolling_mean_lookback_are_bounded(self):
+        for mode in ("nope", "fixed", "vwap"):
+            with self.assertRaises(RuleSpecError):
+                validate_rule_spec({"schema": RULE_SCHEMA_V4,
+                                    "family": "mean_reversion",
+                                    "target_mode": mode})
+        for lookback in (True, 1, 121, 2.5):
+            with self.assertRaises(RuleSpecError):
+                validate_rule_spec({"schema": RULE_SCHEMA_V4,
+                                    "family": "mean_reversion",
+                                    "target_mode": "rolling_mean",
+                                    "target_lookback": lookback})
+        for minutes in (True, 0, 391, 2.5):
+            with self.assertRaises(RuleSpecError):
+                validate_rule_spec({"schema": RULE_SCHEMA_V4,
+                                    "family": "mean_reversion",
+                                    "exit_before_minutes": minutes})
+
+    def test_v4_extensions_are_rejected_by_older_schemas(self):
+        for schema in (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3):
+            with self.subTest(schema=schema), self.assertRaisesRegex(
+                    RuleSpecError, RULE_SCHEMA_V4):
+                validate_rule_spec({"schema": schema, "family": "mean_reversion",
+                                    "target_mode": "fixed_r"})
 
 
 class V2ValidationTests(unittest.TestCase):

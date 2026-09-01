@@ -21,7 +21,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
 from agent.contracts.rule import (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
-                                  rule_spec_hash, rule_variant_id,
+                                  RULE_SCHEMA_V4, rule_spec_hash, rule_variant_id,
                                   rule_spec_json_schema, validate_rule_spec)
 
 
@@ -43,6 +43,18 @@ _TUNING_ZERO_AXIS_LIMITS = {
     "min_atr_bps": 15.0,
     "entry_after_minutes": 60.0,
 }
+# Crossing a stressed-cost execution cliff is a preregistered search lane,
+# not permission for an unconstrained model jump.  These exact coordinates
+# are the only non-local values the adapter may accept for the two economic
+# axes.  The diagnosis still has to establish the execution/cost-stress gate
+# below; otherwise the ordinary 20% neighborhood remains in force.
+STRESSED_STOP_ATR_LADDER = (
+    0.2, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0,
+)
+STRESSED_MIN_ATR_BPS_LADDER = (
+    0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0,
+    75.0, 100.0, 150.0, 200.0, 300.0, 500.0, 1_000.0, 2_000.0,
+)
 _AUTH_ERROR_TOKENS = ("authentication", "authorization", "unauthorized",
                       "forbidden", "invalid api key", "invalid_api_key",
                       "credentials are unavailable", "credential unavailable")
@@ -126,8 +138,13 @@ attributable and a useful value can be retained.  In "interaction" phase it
 must change exactly TWO fields whose one-field lessons were already measured.
 Never bundle extra changes. Numeric moves must remain inside the deterministic
 local neighborhood: at most 20% of the root value (with the factory's declared
-small step for a zero-valued axis). Confirmatory replays are performed without
-you.
+small step for a zero-valued axis). A fit diagnosis explicitly marked
+"execution_blocked" or a cost-stress rejection may use the preregistered
+stressed-cost ladders, and only their exact coordinates, for "stop_atr" and
+"min_atr_bps". The ladders are stop_atr=[0.2,0.5,0.75,1,1.5,2,3,4,6,8,10]
+and min_atr_bps=[0,5,10,15,20,25,30,40,50,75,100,150,200,300,500,1000,2000].
+The diagnosis gate and ladder membership are both required; arbitrary large
+jumps still fail. Confirmatory replays are performed without you.
 
 WHAT YOU MUST LEARN FROM.  You are given the diagnosis of how the root failed
 on fit data only, and the graded lessons from earlier attempts: each lesson's
@@ -341,11 +358,73 @@ def _safe_reason(value: Any) -> str:
     return _safe_text(value, label="reason", limit=MAX_REASON_CHARS)
 
 
+def _cost_stress_diagnosis_authorized(diagnosis: Mapping[str, Any]) -> bool:
+    """Return whether a fit-only diagnosis opens the stressed-cost ladder.
+
+    The provider receives aggregates rather than market rows.  Keep this gate
+    deliberately narrow: an explicit execution block is sufficient, while a
+    cost-stress lane must carry an affirmative marker or rejection label. A
+    mere configured risk value (for example ``stressed_cost_scenario_bps``)
+    is not evidence that the cliff was encountered.
+    """
+    if not isinstance(diagnosis, Mapping):
+        return False
+
+    def walk(value: Any, *, key: str = "") -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+        if normalized in {"execution_blocked", "cost_stress", "cost_stressed",
+                          "stressed_cost_rejection", "stressed_cost_blocked"}:
+            if value is True:
+                return True
+        # ``reject_reason_counts`` commonly carries labels as keys rather
+        # than values (for example ``stressed_cost_risk_limit: 12``).
+        if (any(token in normalized for token in
+                ("cost_stress", "stressed_cost_risk", "stressed_cost_rejection",
+                 "stressed_cost_blocked")) and
+                value is not None and value is not False):
+            if not isinstance(value, (int, float)) or float(value) > 0:
+                return True
+        if isinstance(value, str):
+            text = value.lower().replace("-", "_").replace(" ", "_")
+            if normalized in {"primary_failure", "failure_mode", "reject_stage",
+                              "reject_reason", "reason"} and any(token in text for token in (
+                                  "execution_blocked", "cost_stress",
+                                  "stressed_cost", "stressed_cost_risk")):
+                return True
+            return False
+        if isinstance(value, Mapping):
+            return any(walk(item, key=str(name)) for name, item in value.items())
+        if isinstance(value, (list, tuple)):
+            return any(walk(item, key=normalized) for item in value)
+        return False
+
+    return walk(diagnosis)
+
+
+def _stressed_ladder_value(field: str, value: Any) -> bool:
+    """Check exact membership in the audited stressed-cost coordinate ladder."""
+    ladder = {
+        "stop_atr": STRESSED_STOP_ATR_LADDER,
+        "min_atr_bps": STRESSED_MIN_ATR_BPS_LADDER,
+    }.get(str(field))
+    if ladder is None or isinstance(value, bool):
+        return False
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(candidate) and any(
+        math.isclose(candidate, float(item), rel_tol=0.0, abs_tol=1e-12)
+        for item in ladder)
+
+
 def _validate_vehicle_rule_spec(spec: Mapping[str, Any], vehicle: str) -> None:
     """Apply the vehicle executable-schema gate after grammar validation."""
 
-    if vehicle == "option" and spec.get("schema") == RULE_SCHEMA_V3:
-        raise ValueError("rule-strategy.v3 is not executable for options")
+    if (vehicle == "option" and
+            spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}):
+        raise ValueError(
+            f"{spec.get('schema')} is not executable for options")
 
 
 def _tuning_reason_check(reason: str, root: Mapping[str, Any],
@@ -367,7 +446,8 @@ def _tuning_reason_check(reason: str, root: Mapping[str, Any],
         before = root.get(key)
         after = normalized.get(key)
         nullable_numeric_activation = (
-            key == "breakeven_r" and root.get("schema") == RULE_SCHEMA_V3 and
+            key in {"breakeven_r", "trailing_stop_r", "exit_before_minutes"} and
+            root.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4} and
             before is None and isinstance(after, (int, float)) and
             not isinstance(after, bool))
         if (not nullable_numeric_activation and
@@ -396,9 +476,15 @@ def _tuning_reason_check(reason: str, root: Mapping[str, Any],
             else:
                 limit = max(.25, abs(origin) * .2)
         if moved > limit + 1e-12:
-            raise ValueError(
-                f"tuning change for {key} exceeds the bounded local step "
-                f"({moved:g} > {limit:g})")
+            # The stressed-cost exception is a preregistered finite ladder,
+            # not a general relaxation of the local-neighborhood bound. It
+            # applies independently to each coordinate in an interaction.
+            if not (_cost_stress_diagnosis_authorized(diagnosis) and
+                    key in {"stop_atr", "min_atr_bps"} and
+                    _stressed_ladder_value(key, after)):
+                raise ValueError(
+                    f"tuning change for {key} exceeds the bounded local step "
+                    f"({moved:g} > {limit:g})")
     text = reason.lower()
     missing_cues: list[str] = []
     for key in changed:
@@ -1645,6 +1731,7 @@ def tune_rule(*args: Any, adapter: RuleProposalAdapter | None = None,
 __all__ = [
     "DEFAULT_TOTAL_CALLS", "DISCOVERY_SCHEMA", "DISCOVERY_SYSTEM_PROMPT", "LESSON_REF_CHARS",
     "MAX_REASON_CHARS", "MAX_THESIS_CHARS", "MAX_TUNED_VARIANTS",
+    "STRESSED_STOP_ATR_LADDER", "STRESSED_MIN_ATR_BPS_LADDER",
     "PREFLIGHT_SCHEMA", "PROPOSAL_SCHEMA", "PREFLIGHT_SYSTEM_PROMPT",
     "RESEARCH_SAMPLING_TEMPERATURE", "SYSTEM_PROMPT", "TUNING_SCHEMA",
     "TUNING_SYSTEM_PROMPT",

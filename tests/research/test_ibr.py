@@ -4,7 +4,8 @@ from zoneinfo import ZoneInfo
 
 from research.costs import CostModel, ReplayPolicy
 from research.ibr import IBRConfig, ReplayError, replay_ibr, replay_ibr_vehicles
-from research.costs import BAR, QUOTE
+from research.costs import (BAR, QUOTE, RESTING_BRACKET,
+                             RESTING_BRACKET_FILL_SCHEMA)
 from research.market_data import (normalize_option_snapshot, normalize_quote,
                                   normalize_underlying_bar)
 
@@ -142,6 +143,25 @@ class IBRReplayTests(unittest.TestCase):
                 self.assertAlmostEqual(ranged.stop_price, 99.0, places=9)
                 self.assertAlmostEqual(ranged.target_price, 105.0, places=9)
                 self.assertEqual(percent.entry_reference, 103 if gap else 101)
+
+    def test_equity_stress_floor_widens_fixed_r_geometry_before_replay(self):
+        policy = ReplayPolicy(
+            strict_market_data=False, stressed_cost_scenario_bps=25.0,
+            max_stressed_cost_to_risk_ratio=.30)
+        trade = replay_ibr(
+            bars_for_day(),
+            config=IBRConfig(stop_pct=.003, target_pct=.006,
+                             costs=FREE, policy=policy),
+        ).trades[0]
+        self.assertAlmostEqual(trade.authored_stop_distance, .303)
+        self.assertTrue(trade.stress_floor_binding)
+        self.assertAlmostEqual(trade.effective_stop_floor_bps, 25.0 / .30)
+        self.assertEqual(trade.stop_price, 100.15)
+        self.assertEqual(trade.target_price, 102.7)
+        self.assertAlmostEqual(
+            (trade.target_price - 101.0) / (101.0 - trade.stop_price), 2.0)
+        self.assertEqual(trade.stop_geometry_scenario_bps, 25.0)
+        self.assertEqual(trade.stop_geometry_max_cost_to_risk_ratio, .30)
 
     def test_equity_and_option_results_are_not_pooled(self):
         bars = bars_for_day()
@@ -359,7 +379,9 @@ class IBRQuoteFillTests(unittest.TestCase):
         trade = replay_ibr(bars_for_day(), config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE)).trades[0]
         self.assertEqual(trade.entry_fill_source, BAR)
-        self.assertEqual(trade.exit_fill_source, BAR)
+        self.assertEqual(trade.exit_fill_source, RESTING_BRACKET)
+        self.assertEqual(trade.exit_fill_schema, RESTING_BRACKET_FILL_SCHEMA)
+        self.assertEqual(trade.exit_fill_claim["source"], RESTING_BRACKET)
         self.assertAlmostEqual(trade.entry_reference, 101, places=9)
 
     def test_a_quote_after_the_fill_instant_is_not_used(self):
@@ -402,5 +424,5 @@ class IBRQuoteFillTests(unittest.TestCase):
             stop_pct=.01, target_pct=.02, costs=FREE),
             quotes=[equity_quote(32, 80.0, 80.1)]).trades[0]
         self.assertEqual(trade.exit_reason, "stop")
-        self.assertEqual(trade.exit_fill_source, BAR)
+        self.assertEqual(trade.exit_fill_source, RESTING_BRACKET)
         self.assertAlmostEqual(trade.exit_reference, trade.stop_price, places=9)

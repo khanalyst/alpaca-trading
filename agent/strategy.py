@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 from .contracts import finite as _finite
 from .contracts.ibr import build_ibr_range
-from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RuleSpecError, hold_deadline,
+from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
+                             RuleSpecError, hold_deadline, thesis_exit_deadline,
                              MIN_STOP_DISTANCE_FRACTION, rule_variant_id,
                              validate_rule_spec)
 
@@ -163,6 +164,19 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
         plan.update({
             "rule_schema": RULE_SCHEMA_V3,
             "breakeven_r": spec.get("breakeven_r"),
+        })
+    if spec["schema"] == RULE_SCHEMA_V4:
+        entry_ts = signal_ts + BAR_SECONDS
+        plan.update({
+            "rule_schema": RULE_SCHEMA_V4,
+            "target_mode": str(decision.get("target_mode") or
+                                spec.get("target_mode") or "fixed_r"),
+            "target_reference": decision.get("target_reference"),
+            "target_lookback": decision.get("target_lookback",
+                                            spec.get("target_lookback")),
+            "trailing_stop_r": spec.get("trailing_stop_r"),
+            "exit_before_minutes": spec.get("exit_before_minutes"),
+            "exit_before_ts": thesis_exit_deadline(entry_ts, spec),
         })
     return plan, None
 

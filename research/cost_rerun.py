@@ -28,7 +28,11 @@ import sys
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from agent.contracts.rule import rule_variant_id, validate_rule_spec
+from agent.contracts.risk_geometry import (
+    RiskGeometryError, effective_stop_floor_bps, required_stop_distance_bps,
+)
+from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, rule_variant_id,
+                                  validate_rule_spec)
 from .cost_counterfactual import (_code_bundle_files, _code_bundle_hash,
                                   _cost_decomposition, load_frozen_specs)
 from .costs import CostModel, ReplayPolicy, diagnostic_backfill_policy
@@ -66,6 +70,18 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _collection_count(value: Any) -> int:
+    """Count list-like rows and disk-backed indexes without guessing APIs."""
+
+    count = getattr(value, "count", None)
+    if isinstance(count, int) and not isinstance(count, bool):
+        return max(0, count)
+    try:
+        return max(0, len(value))
+    except (TypeError, ValueError, AttributeError):
+        return 0
 
 
 def _session_hash(sessions: Sequence[Any]) -> str:
@@ -232,6 +248,7 @@ class ArmResult:
     # is unmoved by a better cost fit.  Counting it here is what keeps a
     # zero-trade row from reading as "the strategy found nothing".
     stressed_cost_rejections: int
+    stress_floor_bindings: int
     signal_opportunities: int
     breakdown: list[dict[str, Any]] = field(default_factory=list)
     sample_counts: dict[str, int] = field(default_factory=dict)
@@ -247,6 +264,7 @@ class ArmResult:
             "net_r": self.net_r, "time_expiry_rate": self.time_expiry_rate,
             "target_rate": self.target_rate, "stop_rate": self.stop_rate,
             "stressed_cost_rejections": self.stressed_cost_rejections,
+            "stress_floor_bindings": self.stress_floor_bindings,
             "signal_opportunities": self.signal_opportunities,
             "breakdown": self.breakdown,
             "sample_counts": self.sample_counts,
@@ -299,6 +317,10 @@ def _arm(rows: Sequence[Mapping[str, Any]], *, starting_cash: float) -> ArmResul
         target_rate=summary["target_rate"], stop_rate=summary["stop_rate"],
         stressed_cost_rejections=sum(
             str(row.get("reject_reason") or "") == "stressed_cost_risk_limit"
+            for row in rows),
+        stress_floor_bindings=sum(
+            row.get("no_trade") is not True and
+            row.get("stress_floor_binding") is True
             for row in rows),
         signal_opportunities=sum(
             bool(row.get("signal_opportunity")) for row in rows),
@@ -515,9 +537,13 @@ def run_cost_rerun(
         results.append(row)
 
     try:
-        implied_min_stop_bps = float(scenario) / float(ratio)
-    except (TypeError, ValueError, ZeroDivisionError):
-        implied_min_stop_bps = None
+        stress_implied_min_stop_bps = required_stop_distance_bps(
+            scenario, ratio)
+        effective_min_stop_bps = effective_stop_floor_bps(
+            MIN_STOP_DISTANCE_BPS, scenario, ratio)
+    except (RiskGeometryError, TypeError, ValueError, ZeroDivisionError):
+        stress_implied_min_stop_bps = None
+        effective_min_stop_bps = None
     report = {
         "schema": RERUN_SCHEMA,
         "diagnostic_only": True, "authorizing": False,
@@ -526,9 +552,15 @@ def run_cost_rerun(
         # it implies so a zero-trade cohort is attributable.
         "stressed_cost_gate": {
             "scenario_bps": scenario, "max_cost_to_risk_ratio": ratio,
-            "implied_min_stop_bps": implied_min_stop_bps,
+            "grammar_min_stop_bps": float(MIN_STOP_DISTANCE_BPS),
+            "stress_implied_min_stop_bps": stress_implied_min_stop_bps,
+            # Compatibility alias: this is now the effective policy floor,
+            # not merely the raw scenario/ratio quotient.
+            "implied_min_stop_bps": effective_min_stop_bps,
+            "effective_min_stop_bps": effective_min_stop_bps,
             "note": ("admission gate, not an expected cost; unchanged by the "
-                     "measured model"),
+                     "measured model; calibrated scenarios may vary by "
+                     "symbol and time bucket"),
         },
         "cost_models": {
             "configured": configured.as_dict(),
@@ -558,7 +590,7 @@ def run_cost_rerun(
             stress_calibration, expected_provider=policy_source.equity_provider,
             expected_feed=policy_source.equity_feed),
         "costs_block": schedule_costs_block(schedule, percentile=percentile),
-        "bars": len(bars), "quotes": len(quotes),
+        "bars": len(bars), "quotes": _collection_count(quotes),
         "variants": len(results), "results": results,
         "evidence": _evidence_manifest(
             provenance=provenance, runtime_config=runtime_config,
@@ -689,7 +721,7 @@ def run_cost_calibration(
         "activation": activation_overlay(
             calibration, expected_provider=policy.equity_provider,
             expected_feed=policy.equity_feed),
-        "bars": len(bars), "quotes": len(quotes),
+        "bars": len(bars), "quotes": _collection_count(quotes),
         "evidence": _evidence_manifest(
             provenance=provenance, runtime_config=runtime_config, specs=(),
             schedule=schedule, validation_schedule=validation_schedule,
@@ -728,12 +760,14 @@ def render_text(report: Mapping[str, Any]) -> str:
         "are validation-only",
         "",
         f"  stressed-cost gate: {_fmt(gate.get('scenario_bps'))} bps at ratio "
-        f"{_fmt(gate.get('max_cost_to_risk_ratio'))} implies a minimum stop of "
-        f"{_fmt(gate.get('implied_min_stop_bps'), 1)} bps.",
+        f"{_fmt(gate.get('max_cost_to_risk_ratio'))} plus the grammar floor "
+        f"implies an effective minimum stop of "
+        f"{_fmt(gate.get('effective_min_stop_bps', gate.get('implied_min_stop_bps')), 1)} bps.",
         "  That gate is an admission control, not an expected cost: "
         "the measured model does",
-        "  not move it, and any variant whose stop is tighter is refused in "
-        "both arms.",
+        "  not move it. Equity stops are widened before sizing when needed; "
+        "calibrated cells may use",
+        "  a different active scenario by symbol and time bucket.",
         "",
         f"  empirical stress (fit/validation diagnostic): "
         f"{_fmt(calibration.get('aggregate_conservative_scenario_bps'))} bps "
@@ -760,7 +794,8 @@ def render_text(report: Mapping[str, Any]) -> str:
         "not a result.",
         "",
     ]
-    header = (f"  {'family':<23}{'variant':<22}{'trades':>7}{'gated':>7}"
+    header = (f"  {'family':<23}{'variant':<22}{'trades':>7}{'wide':>7}"
+              f"{'gated':>7}"
               f"{'net $':>11}{'exp $':>9}{'win':>6}{'PF':>6}"
               f"{'refR':>8}{'dragR':>8}{'netR':>8}")
     for arm in ("configured", "measured"):
@@ -769,7 +804,8 @@ def render_text(report: Mapping[str, Any]) -> str:
             row = item[arm]
             lines.append(
                 f"  {item['family']:<23}{item['label'][:21]:<22}"
-                f"{row['trades']:>7}{row['stressed_cost_rejections']:>7}"
+                f"{row['trades']:>7}{row['stress_floor_bindings']:>7}"
+                f"{row['stressed_cost_rejections']:>7}"
                 f"{row['net_pnl']:>11.2f}"
                 f"{row['expectancy']:>9.2f}{row['win_rate']:>6.0%}"
                 f"{_fmt(row['profit_factor'], 2):>6}"
@@ -784,6 +820,12 @@ def render_text(report: Mapping[str, Any]) -> str:
     gated = sum(1 for item in report["results"]
                 if item["measured"]["trades"] == 0 and
                 item["measured"]["stressed_cost_rejections"] > 0)
+    widened = sum(1 for item in report["results"]
+                  if item["measured"]["stress_floor_bindings"] > 0)
+    if widened:
+        lines.append(
+            f"  variants whose equity stops were widened to the effective "
+            f"policy floor: {widened}")
     if gated:
         lines.append(f"  variants with no trades because every opportunity was "
                      f"refused by the stressed-cost gate: {gated}")

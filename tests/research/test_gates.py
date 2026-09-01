@@ -11,6 +11,8 @@ from research.gates import (
     risk_unit_report, verified_gate_envelope, verify_gate_envelope,
     walk_forward_report,
 )
+from research.costs import (RESTING_BRACKET, RESTING_BRACKET_FILL_SCHEMA,
+                             resting_bracket_fill_claim)
 
 
 def _rows(count, *, net, start=2, symbol="SPY", prefix="candidate"):
@@ -69,6 +71,35 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertEqual(candidate["counts"], baseline["counts"])
         self.assertEqual(candidate["reasons"], {
             "no_trade": 1, "non_authorizing_fill_source": 1})
+
+    def test_resting_bracket_source_is_symmetric_for_candidate_and_null(self):
+        from research.gates import authorization_projection
+        row = self._equity_quote_row(
+            exit_fill_source=RESTING_BRACKET,
+            exit_fill_schema=RESTING_BRACKET_FILL_SCHEMA,
+            exit_reason="target", exit_reference=103.0,
+            stop_price=99.0, target_price=103.0, active_stop_price=99.0,
+            tie_broken=False, gap_fill=False, entry_gap_fill=False,
+            exit_gap_fill=False,
+            signal_bar_feed="iex", signal_bar_provider="alpaca",
+            entry_bar_feed="iex", entry_bar_provider="alpaca",
+            exit_bar_feed="iex", exit_bar_provider="alpaca",
+            exit_fill_bar_timestamp="2026-01-02T14:35:00+00:00",
+        )
+        row["exit_fill_claim"] = resting_bracket_fill_claim(
+            exit_reason="target", exit_reference=103.0,
+            stop_price=99.0, target_price=103.0,
+            bar_timestamp=row["exit_fill_bar_timestamp"],
+            bar_feed="iex", bar_provider="alpaca")
+        candidate = authorization_projection([row], vehicle="equity")
+        null = authorization_projection([dict(row)], vehicle="equity")
+        self.assertEqual(candidate["counts"], {"raw": 1, "eligible": 1, "excluded": 0})
+        self.assertEqual(candidate["counts"], null["counts"])
+        malformed = {**row, "exit_fill_claim": {**row["exit_fill_claim"],
+                                                 "planned_level": 104.0}}
+        self.assertEqual(authorization_projection(
+            [malformed], vehicle="equity")["counts"],
+            {"raw": 1, "eligible": 0, "excluded": 1})
 
     def test_cost_stress_report_names_its_entry_notional_basis(self):
         from research.costs import STRESSED_COST_BASIS, STRESSED_COST_SCHEMA

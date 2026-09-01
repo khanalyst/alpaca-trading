@@ -229,7 +229,9 @@ empty proof list or the controlled-change invariant fails. The funnel lists fit,
 qualification, `shadow_selection`, and `shadow_confirmation`, with nominal
 floors of 100/100/100/150/150 trades (30 sessions/clusters each; 600 total);
 every window is `measurement_available: false` without sealed/live
-assignments. Readiness context is 150 offline + 60 shadow = 210 sessions. All
+assignments. Readiness context is 150 offline + 30 shadow-selection + 30
+shadow-confirmation = 210 sessions (60 shadow sessions split into two disjoint
+obligations). All
 output remains diagnostic-only with descriptive P&L and no threshold-selection
 or promotion authority.
 
@@ -241,9 +243,12 @@ sessions/clusters; sealed qualification requires 100 trades and 30 complete
 sessions/clusters; parity-matched live shadow requires 150 trades and 30
 complete sessions. Real signal rates still require sufficient history, and
 floor feasibility fails closed; widen history and/or the configured universe,
-never lower a floor. An expansion requires an operator-approved exact symbol
-list, recorder coverage for that list, and a new candidate identity/proof; it is
-not a parameter-only tuning arm. Effective breadth is a persisted/re-verified matched
+never lower a floor. Multi-symbol expansion is deferred until a known-positive
+end-to-end reproduction; any eventual expansion requires an operator-approved
+exact symbol list, recorder coverage for that list, and a new candidate
+identity/proof, not a parameter-only tuning arm. Partial exits remain
+unimplemented because broker lifecycle and position reconciliation risk are not
+accepted. Effective breadth is a persisted/re-verified matched
 symbol/session diagnostic and never counts as extra independent N. Before each
 factory cycle, completed prior-cycle family deltas are frozen into a
 hash-verified map; strong clusters receive a cluster-level BH veto and runtime
@@ -306,6 +311,12 @@ The scheduled research cycle invokes `edge ingest-shadow` by default when
 `ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a no-op. The consumer
 mounts the same `shadow-data` volume read-only at `/app/shadow` and is the only
 process that writes the live-ingestion authorization marker to EdgeLedger.
+When bars, quotes, and the factory report are available, the cycle also runs
+the configured-vs-measured cost comparison automatically. It persists the
+diagnostic status, artifact path, and measured-minus-configured delta in cycle
+JSON/scheduler history. The comparison is non-authorizing and non-fatal: absent
+inputs or a failed rerun are reported without changing ledgers, FDR, proofs, or
+promotion.
 
 The default Compose lane passes the Alpaca paper endpoint and IEX/indicative
 feed settings explicitly through `ALPACA_PAPER`, `ALPACA_DATA_FEED`, and
@@ -415,14 +426,19 @@ the repair path. There is no unsafe auto-skip of quarantine, and no watermark/FD
 advancement occurs until the repair is complete. A missing or stale recorder calendar is reported as
 `catalog_unavailable`/unknown rather than inferred from weekdays.
 
-The executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
-configured R target, and bar-cap time exit. Fit-only factory diagnostics expose
-signal-prefix/floor binding, planned exits, gross/net/fees/slippage cost/risk,
-planned versus fill-delivered risk, per-leg provider/feed provenance, power,
-behavior aliases, pricing source, configured limits,
-pass/fail/unknown row counts, and aggregate fit-partition execution-rejection
-counts/reasons for operator review; they are non-authorizing and do not expand
-exits. A fit whose opportunities are all explicitly execution-rejected is
+The executable exit grammar is versioned: v3 already provides the bounded equity
+`breakeven_r` transition; v4 adds frozen session VWAP/rolling-mean targets, a
+monotone trailing stop, and an `exit-before` deadline. The effective equity stop
+floor is `max(30 bps, active stressed-cost scenario / max-cost-to-risk ratio)`;
+when it binds, fixed-R targets are recomputed and geometry/binding telemetry is
+retained. Authorizing non-gap resting-bracket evidence remains conservatively
+cost-charged, while gap, time, and deadline exits require a fresh executable
+quote. Fit-only factory diagnostics expose signal-prefix/floor binding, planned
+exits, gross/net/fees/slippage cost/risk, planned versus fill-delivered risk,
+per-leg provider/feed provenance, power, behavior aliases, pricing source,
+configured limits, pass/fail/unknown row counts, and aggregate fit-partition
+execution-rejection counts/reasons for operator review; they are
+non-authorizing and do not expand exits. A fit whose opportunities are all explicitly execution-rejected is
 `execution_blocked`, distinct from sparse/underpowered data; bounded budget
 closure only progresses search exhaustion and is not a powered negative edge.
 The pre-replay signal screen records forward-return/control rows and uses
@@ -488,12 +504,14 @@ gate hashes, family/global BH plus the frozen-dependence-cluster veto and
 durable online FDR, then appends the
 immutable `lane=shadow` proof and live marker. Underpowered, mismatched, or
 incomplete shadow data advances no boundary and is reconsidered. The
-`shadow-confirmation-v5` ingestion scope splits each tail into older
+`shadow-confirmation-v6` ingestion scope splits each tail into older
 chronological selection sessions and a newer disjoint confirmatory window; BH
 uses selection raw p-values, while only the selected candidate's raw
-confirmatory p-value reaches LORD++. With `W0=alpha`, its first-discovery reward
-is zero and later discoveries receive the standard `alpha` stream. Legacy
-v2/v3/v4 rows remain auditable but quarantined; there is no unsafe auto-skip, so an
+confirmatory p-value reaches LORD++. With `W0=alpha/2`, pre-discovery spending is
+`(alpha/2)*gamma_t`, the first-discovery reward is `alpha/2`, and later
+discoveries receive the standard `alpha` stream. Historical v5 rows retain
+`W0=alpha` and are audit-only, isolated from v6. Legacy v2/v3/v4 rows remain
+auditable but quarantined; there is no unsafe auto-skip, so an
 unresolved quarantine blocks watermark/FDR advancement until a bounded parity
 replay repairs it. Simulation resolution scales to the next
 online allocation and stops without spending at its bounded cap. Legacy

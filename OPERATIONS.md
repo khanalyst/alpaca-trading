@@ -475,16 +475,25 @@ once by one preselected candidate alone; other variants remain diagnostic.
 Refinement is coordinate-first: every initial child changes exactly one
 executable field. Bounded two-field interactions are formed only from the best
 measured coordinate lessons, followed by an unchanged confirmation. The
-executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
-configured R target, and bar-cap time exit. Fit-only diagnostics (prefix and
-first-signal rates, floor binding, planned exits, configured/stressed economics,
-power, behavioral aliases, intended-versus-delivered risk, provider/feed
-provenance, pricing source, configured limits, and pass/fail/unknown row counts)
-are operator-review telemetry only; they do not expand exits or authorize proof.
+executable exit grammar is versioned: v3 already provides the bounded equity
+`breakeven_r` transition, while v4 adds frozen session VWAP/rolling-mean
+targets, a monotone trailing stop, and an `exit-before` deadline. The effective
+equity stop floor is `max(30 bps, active stressed-cost scenario /
+max-cost-to-risk ratio)`; when it binds, fixed-R targets are recomputed and
+authored/effective geometry plus binding telemetry are retained. A non-gap
+stop/target resting-bracket leg is conservatively cost-charged even without a
+trigger-time quote; gap, time, and deadline exits still require a fresh
+executable quote. Fit-only diagnostics (prefix and first-signal rates, floor
+binding, planned exits, configured/stressed economics, power, behavioral
+aliases, intended-versus-delivered risk, provider/feed provenance, pricing
+source, configured limits, and pass/fail/unknown row counts) are operator-review
+telemetry only; they do not expand exits or authorize proof.
 immutable floors are 100 trades plus 30 complete sessions/clusters for
 backtest/factory evidence, 100 trades plus 30 complete sessions/clusters for
 the sealed qualification window, and 150 trades plus 30 complete sessions for
-the parity-matched live-shadow tail. Retirement then requires the same powered
+the parity-matched live-shadow tail. Readiness is reported as 150 offline
+sessions plus 30 shadow-selection and 30 disjoint shadow-confirmation sessions
+(210 total; the compatibility shadow count is 60). Retirement then requires the same powered
 floors, a 95% clustered upper-bound rejection of a 0.05R minimum useful edge,
 and at least two negative forward windows for every point. Replay epoch 5
 retains epoch-4 point-in-time, executable-row, vehicle-cost, raw-confirmatory-p,
@@ -569,13 +578,15 @@ complete, parity-matched rows with prior qualification and matching
 source/config/code/provenance/replay/gate hashes; family and global BH plus the
 frozen-dependence-cluster veto and durable online-FDR are applied before an
 immutable `lane=shadow` proof and
-live-ingestion marker are appended. The `shadow-confirmation-v5`
+live-ingestion marker are appended. The `shadow-confirmation-v6`
 ingester first splits the tail into
 older chronological selection sessions and a newer disjoint confirmatory
 window: BH uses selection raw p-values, while only the selected candidate's raw
-confirmatory p-value is sent to LORD++. Its preregistered `W0=alpha` makes the
-first-discovery reward zero; later discoveries receive the standard `alpha`
-reward stream. Legacy v2/v3/v4 rows remain auditable but quarantined. Epoch-5
+confirmatory p-value is sent to LORD++. Its preregistered `W0=alpha/2` spends
+`(alpha/2)*gamma_t` before discovery, rewards the first discovery with
+`alpha/2`, and gives later discoveries the standard `alpha` stream. Historical
+v5 rows retain `W0=alpha` and are audit-only, isolated from v6; legacy
+v2/v3/v4 rows remain auditable but quarantined. Epoch-5
 verification also binds the proof to the durable FDR allocation (scope/test id,
 method/version, p-value, alpha, allocation, and decision). The
 confirmatory p-value resolution scales
@@ -585,6 +596,13 @@ advancing a boundary. A failed/mismatched/incomplete tail likewise leaves the
 candidate unchanged and ineligible. There is no unsafe auto-skip: unresolved
 quarantine blocks the shadow watermark and FDR boundary until source correction
 and a bounded parity replay complete.
+
+The same scheduled cycle automatically runs the configured-vs-measured cost
+comparison when bars, quotes, and the factory report are available. Its cycle
+JSON and scheduler history retain the diagnostic status, artifact path, and
+measured-minus-configured delta. This is non-authorizing and non-fatal: a
+missing input or failed rerun is visible for investigation and cannot mutate
+the ledger, FDR allocation, proof, or promotion state.
 
 Scheduled research evaluates the equity vehicle only by default because the
 shipped trader remains on the `shares` execution profile. Set
@@ -597,6 +615,9 @@ Selecting the separate `options` execution profile remains paper-only and
 requires reviewed OPRA evidence and controls. The dashboard reports proved
 option edges that the default `shares` runtime cannot execute, so that evidence
 is visible rather than silently discarded.
+Multi-symbol expansion remains deferred until a known-positive end-to-end
+reproduction; partial exits remain unimplemented while broker lifecycle and
+position reconciliation risks are unresolved.
 
 Compose defaults a truly empty journal to
 `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1`. The persisted

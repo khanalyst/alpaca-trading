@@ -98,6 +98,20 @@ class CostRerunTests(unittest.TestCase):
             run_cost_rerun([], runtime_config=self.config, specs=(),
                             vehicle="option")
 
+    def test_quote_snapshot_alias_is_measured_end_to_end(self):
+        corpus = [
+            ({**row, "kind": "quote_snapshot"}
+             if str(row.get("kind") or "").lower() == "quote" else row)
+            for row in edge_corpus(25)
+        ]
+        report = run_cost_rerun(
+            corpus, runtime_config=self.config, specs=self.cohort[:1],
+            min_quotes_per_cell=50)
+        self.assertGreater(report["quotes"], 0)
+        self.assertTrue(
+            report["cost_models"]["measured"]["provenance"].startswith(
+                "measured:"))
+
     def test_an_undercovered_requested_bucket_fails_the_rerun_clearly(self):
         # Six sessions leave only 12 quotes in the late exit bucket at the
         # existing 50-quote floor.  The strict measured resolver must surface
@@ -161,20 +175,27 @@ class CostRerunTests(unittest.TestCase):
         gate = self.report["stressed_cost_gate"]
         self.assertEqual(gate["scenario_bps"], 25.0)
         self.assertEqual(gate["max_cost_to_risk_ratio"], 0.30)
+        self.assertEqual(gate["grammar_min_stop_bps"], 30.0)
+        self.assertAlmostEqual(gate["stress_implied_min_stop_bps"],
+                               25.0 / 0.30)
         self.assertAlmostEqual(gate["implied_min_stop_bps"], 25.0 / 0.30)
+        self.assertEqual(gate["effective_min_stop_bps"],
+                         gate["implied_min_stop_bps"])
 
-    def test_a_gate_blocked_cohort_is_attributable_not_silently_empty(self):
-        """A tight-stop cohort trades nothing; the reason must be visible."""
+    def test_a_tight_stop_cohort_is_widened_and_attributable(self):
+        """The reconciled policy widens tight equity stops before sizing."""
         tight = [validate_rule_spec({**spec, "stop_atr": 1.0})
                  for spec in deterministic_cohort()][:2]
         report = run_cost_rerun(edge_corpus(25), runtime_config=self.config,
                                 specs=tight, min_quotes_per_cell=50)
-        blocked = [item for item in report["results"]
-                   if item["measured"]["stressed_cost_rejections"] > 0]
-        self.assertTrue(blocked)
-        for item in blocked:
-            self.assertEqual(item["measured"]["trades"], 0)
-        self.assertIn("refused by the stressed-cost gate", render_text(report))
+        widened = [item for item in report["results"]
+                   if item["measured"]["stress_floor_bindings"] > 0]
+        self.assertTrue(widened)
+        for item in widened:
+            self.assertGreater(item["measured"]["trades"], 0)
+            self.assertEqual(item["measured"]["stressed_cost_rejections"], 0)
+        self.assertIn("stops were widened to the effective policy floor",
+                      render_text(report))
 
     def test_variants_are_labelled_by_what_they_changed(self):
         labels = {item["label"] for item in self.report["results"]}

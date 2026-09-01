@@ -602,6 +602,13 @@ Docker itself. `ALPACA_RESEARCH_SESSION_WINDOW=0` deliberately validates the
 whole corpus. A nonzero window is an explicit evidence-scope decision; do not
 use it merely to hide malformed older data or to lower the configured floors.
 
+When bars, quotes, and the factory report are available, every scheduled cycle
+also runs the configured-vs-measured cost comparison. Its diagnostic status,
+artifact path, and measured-minus-configured delta appear in terminal JSON and
+scheduler history. The comparison is non-authorizing and non-fatal; missing
+inputs or a failed rerun do not stop research or mutate ledgers, FDR, proofs, or
+promotion.
+
 The scheduled cycle runs `edge ingest-shadow` by default when
 `ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a harmless no-op. The
 offline cycle may produce a passing `lane=shadow` candidate, but that status is
@@ -634,11 +641,13 @@ Gate envelopes retain per-arm candidate, baseline, and randomized-null counts,
 fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
 and directional/pair coverage. Quote density can change null/control evidence
 even when the candidate count is unchanged.
-The `shadow-confirmation-v5` ingestion scope uses independent
+The `shadow-confirmation-v6` ingestion scope uses independent
 chronological selection and confirmatory windows: BH uses selection p-values,
 only the selected candidate's raw confirmatory p reaches LORD++, and legacy
-v2/v3/v4 scopes remain audit-only. With `W0=alpha`, the first-discovery reward
-is zero and later discoveries receive the standard `alpha` stream. Epoch-5
+v2/v3/v4 scopes remain audit-only. With `W0=alpha/2`, pre-discovery spending is
+`(alpha/2)*gamma_t`, the first-discovery reward is `alpha/2`, and later
+discoveries receive the standard `alpha` stream. Historical v5 rows retain
+`W0=alpha` and are audit-only, isolated from v6. Epoch-5
 verification binds the live proof to the durable FDR method/version and
 allocation rather than trusting caller-supplied fields.
 
@@ -665,6 +674,9 @@ overrides:
 
 `ALPACA_FACTORY_MIN_TRADES` and `ALPACA_FACTORY_MIN_SESSIONS` only select the
 shipped-compatible worker settings; they cannot weaken these protocol floors.
+Readiness arithmetic is 150 offline sessions plus 30 shadow-selection sessions
+plus 30 disjoint shadow-confirmation sessions: 210 total. The compatibility
+shadow tail count of 60 is the sum of those two obligations, not one window.
 The development windows are themselves fractions of the corpus:
 
 Inference preserves serial dependence with a deterministic, seeded moving-block
@@ -720,12 +732,22 @@ proof instead of rewriting history. These defaults make
 rejection and deployment decisions span market sessions rather than a handful
 of fills.
 
-The rule exit grammar remains fixed to the 30-bps-floor ATR bracket, configured
-R target, and bar-cap time exit. Fit-only diagnostics report first-signal and
-floor-binding rates, planned exits, configured/stressed economics, power,
-behavioral aliases, intended versus delivered risk, provider/feed provenance,
-pricing source, configured limits, and pass/fail/unknown row counts for operator
-review; they do not expand exits or authorize proof.
+The rule exit grammar is versioned: v3 already provides the bounded equity
+`breakeven_r` transition; v4 adds frozen session VWAP/rolling-mean targets, a
+monotone trailing stop, and an `exit-before` deadline. The effective equity stop
+floor is `max(30 bps, active stressed-cost scenario / max-cost-to-risk ratio)`;
+when it binds, fixed-R targets are recomputed and geometry/binding telemetry is
+persisted. Authorizing non-gap resting-bracket evidence remains conservatively
+cost-charged, while gap, time, and deadline exits require a fresh executable
+quote. Fit-only diagnostics report first-signal and floor-binding rates,
+planned exits, configured/stressed economics, power, behavioral aliases,
+intended versus delivered risk, provider/feed provenance, pricing source,
+configured limits, and pass/fail/unknown row counts for operator review; they do
+not expand exits or authorize proof.
+
+Multi-symbol expansion is deferred until a known-positive end-to-end
+reproduction. Partial exits remain unimplemented because broker lifecycle and
+position reconciliation risks have not been accepted for production.
 
 ## 14. Read the reports
 

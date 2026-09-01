@@ -18,7 +18,9 @@ class ObservabilityTests(unittest.TestCase):
             self.assertEqual(state["alpha"], .05)
             self.assertEqual(state["tests"], 0)
             self.assertEqual(state["discoveries"], 0)
-            self.assertAlmostEqual(state["next_allocated_alpha"], .025)
+            self.assertEqual(state["method_version"], "v6")
+            self.assertAlmostEqual(state["initial_wealth_fraction"], .5)
+            self.assertAlmostEqual(state["next_allocated_alpha"], .0125)
             self.assertTrue(state["alpha_immutable"])
             self.assertTrue(state["resolution_available"])
             self.assertFalse(state["depleted"])
@@ -26,9 +28,9 @@ class ObservabilityTests(unittest.TestCase):
             state = ledger.fdr_state(scope)
             self.assertEqual(state["tests"], 1)
             self.assertEqual(state["discoveries"], 1)
-            self.assertAlmostEqual(state["alpha_spent"], .025)
+            self.assertAlmostEqual(state["alpha_spent"], .0125)
             self.assertAlmostEqual(state["next_preview"]["allocated_alpha"],
-                                   .05 / 6)
+                                   .05 / 3)
 
     def test_gate_dependence_groups_shared_statistics_without_redeciding(self):
         report = gate_dependence_report({

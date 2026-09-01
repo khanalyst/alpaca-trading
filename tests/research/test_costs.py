@@ -17,7 +17,8 @@ from agent.contracts.rule import validate_rule_spec
 from agent.config import ConfigError, validate_config
 from agent.risk import RiskEngine
 from research import calibration
-from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
+from research.costs import (BAR, RESTING_BRACKET, RESTING_BRACKET_FILL_SCHEMA,
+                            CostError, CostModel, DEFAULT_FEE_BPS,
                             DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE,
                             DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
                             ENTRY_SLIPPAGE_INVALID_REASON,
@@ -28,6 +29,8 @@ from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
                             check_entry_slippage,
                             index_quotes, quote_fill, quote_fill_record,
                             cost_model_for_vehicle, risk_unit_report,
+                            resting_bracket_fill_claim,
+                            validate_resting_bracket_fill,
                             stressed_cost_usd)
 from research.edge_discovery_core import (DiscoveryError,
                                           _effective_ibr_config,
@@ -633,7 +636,8 @@ class SQLiteQuoteIndexTests(unittest.TestCase):
                               "equity", quotes=index_quotes([_quote(6, 90.0, 90.1)]),
                               policy=PERMISSIVE_POLICY)
         self.assertEqual(row["exit_reason"], "stop")
-        self.assertEqual(row["exit_fill_source"], BAR)
+        self.assertEqual(row["exit_fill_source"], RESTING_BRACKET)
+        self.assertEqual(row["exit_fill_schema"], RESTING_BRACKET_FILL_SCHEMA)
         self.assertAlmostEqual(row["exit_reference"], row["stop_price"], places=9)
 
     def test_a_quoted_fill_is_not_charged_a_modelled_spread_twice(self):
@@ -709,10 +713,10 @@ class NullControlSharesTheFillModelTests(unittest.TestCase):
             account_id="null", risk_pct=.05, policy=PERMISSIVE_POLICY)
         self.assertGreater(free["ending_equity"], priced["ending_equity"])
 
-    def test_candidate_and_null_share_the_stressed_cost_veto(self):
+    def test_candidate_and_null_share_stressed_cost_geometry(self):
         bars = _bars(RISING + FLAT)
-        # Build the null reference without the runtime veto so it has the same
-        # authored geometry the candidate would present to RiskEngine.
+        # Build the null reference without stress so both lanes receive the
+        # same authored geometry before the active policy widens it.
         reference = simulate_account(
             bars, [], SPEC, vehicle="equity", account_id="reference-stress",
             risk_pct=.05, policy=PERMISSIVE_POLICY)["rows"]
@@ -726,13 +730,19 @@ class NullControlSharesTheFillModelTests(unittest.TestCase):
         null = null_control_account(
             bars, [], SPEC, vehicle="equity", reference_rows=reference,
             account_id="null-stress", risk_pct=.05, policy=stressed)
-        self.assertEqual(candidate["rows"][0]["reject_reason"],
-                         "stressed_cost_risk_limit")
-        null_rows = [row for row in null["rows"]
-                     if row.get("no_trade") is True]
-        self.assertTrue(null_rows)
-        self.assertTrue(any(row.get("reject_reason") ==
-                            "stressed_cost_risk_limit" for row in null_rows))
+        self.assertEqual(candidate["trades"], 1)
+        self.assertEqual(null["trades"], 1)
+        candidate_row, null_row = candidate["rows"][0], null["rows"][0]
+        for row in (candidate_row, null_row):
+            self.assertTrue(row["stress_floor_binding"])
+            self.assertAlmostEqual(row["effective_stop_floor_bps"],
+                                   25.0 / .30)
+            self.assertLessEqual(row["stressed_cost_to_risk_ratio"],
+                                 .30 + 1e-12)
+        self.assertAlmostEqual(candidate_row["authored_stop_distance"], .3024)
+        self.assertAlmostEqual(null_row["authored_stop_distance"], .31)
+        self.assertAlmostEqual(candidate_row["stop_distance"],
+                               null_row["stop_distance"])
 
 
 class NotionalCapAnchorTests(unittest.TestCase):
@@ -930,6 +940,59 @@ class CalibrationTests(unittest.TestCase):
         # In-flight evidence is diagnostic, but cannot authorize promotion
         # until the sample reaches the calibration floor.
         self.assertEqual(report["authorization_exit_code"], 2)
+
+
+class RestingBracketEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def _row(**changes):
+        row = {
+            "vehicle": "equity", "entry_fill_source": QUOTE,
+            "entry_quote_age_seconds": 0.0, "entry_feed": "iex",
+            "entry_provider": "alpaca", "exit_fill_source": RESTING_BRACKET,
+            "exit_fill_schema": RESTING_BRACKET_FILL_SCHEMA,
+            "exit_reason": "target", "exit_reference": 103.0,
+            "stop_price": 99.0, "target_price": 103.0,
+            "active_stop_price": 99.0, "tie_broken": False,
+            "gap_fill": False, "entry_gap_fill": False,
+            "exit_gap_fill": False, "signal_bar_feed": "iex",
+            "signal_bar_provider": "alpaca", "entry_bar_feed": "iex",
+            "entry_bar_provider": "alpaca", "exit_bar_feed": "iex",
+            "exit_bar_provider": "alpaca",
+            "exit_fill_bar_timestamp": "2024-01-02T14:35:00+00:00",
+            "exit_fill_claim": resting_bracket_fill_claim(
+                exit_reason="target", exit_reference=103.0,
+                stop_price=99.0, target_price=103.0,
+                bar_timestamp="2024-01-02T14:35:00+00:00",
+                bar_feed="iex", bar_provider="alpaca"),
+        }
+        row.update(changes)
+        return row
+
+    def test_resting_claim_requires_the_complete_exact_feed_contract(self):
+        self.assertIsNone(validate_resting_bracket_fill(self._row()))
+        for changes in (
+                {"exit_fill_claim": None},
+                {"exit_fill_schema": "bar.v1"},
+                {"entry_fill_source": BAR},
+                {"exit_reason": "time"},
+                {"exit_reference": 102.9},
+                {"exit_fill_claim": {**self._row()["exit_fill_claim"],
+                                      "bar_timestamp": "2099-01-01T00:00:00+00:00"}},
+        ):
+            with self.subTest(changes=changes):
+                self.assertIsNotNone(validate_resting_bracket_fill(
+                    self._row(**changes)))
+
+    def test_resting_claim_uses_full_adverse_exit_cost_not_quote_exemption(self):
+        row = self._row(entry_price=100.0, exit_price=103.0,
+                        quantity=1.0, contract_multiplier=1.0,
+                        risk_usd=10.0)
+        model = CostModel(spread_bps=4.0, slippage_bps=6.0, fee_bps=0.0)
+        report = risk_unit_report([row], vehicle="equity", costs=model)
+        self.assertTrue(report["adequate"])
+        observed = report["observations"][0]["round_trip_cost"]
+        expected = model.round_trip_cost(100.0, 103.0, executable_quotes=False)
+        self.assertAlmostEqual(observed, expected, places=12)
 
 
 if __name__ == "__main__":
