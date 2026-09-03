@@ -52,6 +52,8 @@ from .gates import (chronological_split, heldout_separation,
                     matched_cluster_test, matched_pairs, max_drawdown_of,
                     performance_floor, placebo_null_distribution,
                     authorization_projection, arm_evidence_report,
+                    ACTUAL_CONTROL_MIN_COVERAGE, ACTUAL_CONTROL_MIN_MATCHED,
+                    FALSIFICATION_INDEPENDENT_METHOD,
                     RETIREMENT_CONFIDENCE, RETIREMENT_MIN_SESSIONS,
                     RETIREMENT_MIN_USEFUL_R,
                     falsification_gate,
@@ -59,15 +61,17 @@ from .gates import (chronological_split, heldout_separation,
                     validate_protocol_floor,
                     sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
+                    fdr_batch_evidence,
                     walk_forward_report)
 from .llm_strategy import (DISCOVERY_SCHEMA, LESSON_REF_CHARS, PROPOSAL_SCHEMA,
                            TUNING_SCHEMA, ProposalResult, RuleProposalAdapter,
                            _tuning_reason_check)
-from .stats import benjamini_hochberg, stable_seed
+from .stats import benjamini_yekutieli, stable_seed
 from .fit_diagnostics import (bar_coverage_telemetry,
                                collapse_behavior_aliases,
-                               measure_fit_diagnostics)
-from .signal_quality import SIGNAL_QUALITY_SCHEMA, measure_signal_quality
+                               measure_fit_diagnostics, _fit_prefixes)
+from .signal_quality import (SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
+                             SIGNAL_QUALITY_SCHEMA, measure_signal_quality)
 from .factory_report import research_funnel, research_verdict
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
@@ -335,6 +339,7 @@ _FIT_DIAGNOSTIC_KEYS = frozenset({
     "30bps_floor_binding", "planned_effective", "cost_to_risk_stressed",
     "execution_rejections", "historical_backfill", "predicate_funnel",
     "signal_quality", "expected_cost", "target_hold_reachability",
+    "eligibility_provenance",
 })
 _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "eligible", "total", "rate", "needed_prefix_bars", "signals",
@@ -368,6 +373,7 @@ _FIT_SELECTION_AGGREGATE_KEYS = frozenset({
     "adequate", "genuine_mismatch",
     "unreachable_count", "unreachable_rate", "expiry_count", "unavailable",
     "min_usable", "status", "censored", "usable",
+    "eligibility_provenance",
 })
 _FIT_TARGET_HOLD_KEYS = frozenset({
     "schema", "scope", "diagnostic_only", "authorizing", "configured",
@@ -389,7 +395,15 @@ _FIT_SELECTION_SIGNAL_QUALITY_KEYS = frozenset({
     "horizons", "event_count", "session_count", "symbol_count",
     "event_rejection_counts", "event_time_bucket_counts",
     "horizon_metrics",
+    "eligibility_provenance",
     "authorizing", "diagnostic_only",
+})
+_FIT_SELECTION_ELIGIBILITY_KEYS = frozenset({
+    "schema", "scope", "diagnostic_only", "status", "classification",
+    "total_cells", "total_prefixes", "eligible_cells", "eligible_prefixes",
+    "signal_cells", "signal_prefixes", "data_ineligible_cells",
+    "data_incomplete_cells", "predicate_no_actionable_cells",
+    "reason_counts", "prefix_counts", "truncated",
 })
 _FIT_SELECTION_HORIZON_KEYS = frozenset({
     "horizon_minutes", "candidate_count", "matched_count",
@@ -506,6 +520,8 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
         allowed = _FIT_SELECTION_SIGNAL_QUALITY_KEYS
     elif context == "signal_quality_horizon":
         allowed = _FIT_SELECTION_HORIZON_KEYS
+    elif context == "eligibility_provenance":
+        allowed = _FIT_SELECTION_ELIGIBILITY_KEYS
     elif context in {"funnel_stages", "signal_quality_horizons"}:
         allowed = None
     elif context == "reason_counts":
@@ -577,6 +593,8 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
                 child_context = "reason_counts"
             elif key == "signal_quality":
                 child_context = "signal_quality"
+            elif key == "eligibility_provenance":
+                child_context = "eligibility_provenance"
             elif key == "horizon_metrics" and context == "signal_quality":
                 child_context = "signal_quality_horizons"
             elif context == "signal_quality_horizons":
@@ -1402,6 +1420,9 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
         comparison_specs.append(previous_spec)
     proposal: ProposalResult | None = None
     provider_success = False
+    tried_family_names = {
+        str(name) for name in tried_families if str(name) in RULE_FAMILIES}
+    untried_family_names = set(RULE_FAMILIES) - tried_family_names
     if llm_enabled:
         selected = adapter or RuleProposalAdapter(
             provider=str(config.get("provider") or "openai"),
@@ -1436,7 +1457,11 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
                 spec = validate_rule_spec(proposal.rule_spec)
                 if proposal.variant_id != rule_variant_id(spec):
                     raise ValueError("discovery variant id does not match normalized spec")
-                duplicate = (_variant_seen(spec, existing_variant_ids) or
+                repeats_family_before_coverage = bool(
+                    untried_family_names and
+                    str(spec.get("family")) in tried_family_names)
+                duplicate = (repeats_family_before_coverage or
+                             _variant_seen(spec, existing_variant_ids) or
                              _semantic_duplicate(spec, comparison_specs,
                                                  near_distance=near_distance) or
                              not _structurally_distinct(spec, comparison_specs))
@@ -1454,7 +1479,9 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
                 proposal = replace(
                     proposal,
                     evidence={**dict(proposal.evidence),
-                              "rejected": ("near_structure" if
+                              "rejected": ("family_coverage" if
+                                           repeats_family_before_coverage else
+                                           "near_structure" if
                                            not _structurally_distinct(spec, comparison_specs)
                                            else "duplicate"),
                               "structure": structure_signature(spec)})
@@ -1987,7 +2014,10 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                     generation=0, not_before=None,
                     existing_variant_ids=existing_variant_ids,
                     existing_specs=known_specs,
-                    tried_families=set(),
+                    tried_families={
+                        str(item["family"]) for item in
+                        [*latest.values(), *cycle_seeds]
+                        if str(item.get("family") or "") in RULE_FAMILIES},
                     context=_discovery_context(
                         slot=slot, reason="fresh_slot", previous={
                             "family": seed.family},
@@ -2245,10 +2275,69 @@ def _signal_quality_screen_record(
                        "status": "underpowered",
                        "reason": "fit_partition_incomplete"})
         return record
+    eligibility = quality.get("eligibility_provenance")
+    if not isinstance(eligibility, Mapping):
+        record.update({"event_count": event_count,
+                       "status": "unknown",
+                       "reason": "eligibility_provenance_missing"})
+        return record
+    try:
+        eligibility_total = eligibility.get("total_cells")
+        data_ineligible = eligibility.get("data_ineligible_cells", 0)
+        data_incomplete = eligibility.get("data_incomplete_cells", 0)
+        if any(isinstance(value, bool) for value in (
+                eligibility_total, data_ineligible, data_incomplete)):
+            raise ValueError("boolean eligibility count")
+        eligibility_total = int(eligibility_total)
+        data_ineligible = int(data_ineligible)
+        data_incomplete = int(data_incomplete)
+        if any(value < 0 for value in (
+                eligibility_total, data_ineligible, data_incomplete)):
+            raise ValueError("negative eligibility count")
+    except (TypeError, ValueError, OverflowError):
+        record.update({"event_count": event_count,
+                       "status": "unknown",
+                       "reason": "eligibility_provenance_malformed"})
+        return record
+    eligibility_status = str(eligibility.get("status") or "").strip()
+    expected_eligibility_status = (
+        "actionable_signal" if event_count > 0 else
+        "predicate_no_actionable_signal")
+    if (eligibility.get("schema") != SIGNAL_QUALITY_ELIGIBILITY_SCHEMA or
+            eligibility.get("scope") != "fit_only" or
+            eligibility.get("authorizing") is not False or
+            eligibility.get("diagnostic_only") is not True or
+            eligibility.get("truncated") is True or
+            eligibility_total != int(fit_cells) or
+            data_ineligible or data_incomplete or
+            eligibility_status != expected_eligibility_status):
+        record.update({
+            "event_count": event_count,
+            "status": "underpowered",
+            "reason": (eligibility_status or
+                       "eligibility_provenance_incomplete"),
+            "eligibility_provenance": {
+                "schema": eligibility.get("schema"),
+                "status": eligibility_status or None,
+                "total_cells": eligibility_total,
+                "data_ineligible_cells": data_ineligible,
+                "data_incomplete_cells": data_incomplete,
+                "truncated": bool(eligibility.get("truncated")),
+            },
+        })
+        return record
     digest = content_hash(quality)
     record.update({
         "event_count": event_count,
         "event_rejection_counts": dict(sorted(normalized_rejections.items())),
+        "eligibility_provenance": {
+            "schema": SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
+            "status": eligibility_status,
+            "total_cells": eligibility_total,
+            "data_ineligible_cells": 0,
+            "data_incomplete_cells": 0,
+            "truncated": False,
+        },
         "digest": digest,
     })
     market_context = quality.get("market_context")
@@ -2483,8 +2572,16 @@ def _signal_quality_screen_worker(payload: Mapping[str, Any]) -> dict[str, Any]:
             spec = validate_rule_spec(raw_spec)
             variant_id = rule_variant_id(spec)
             try:
-                quality = measure_signal_quality(
+                prefix = _fit_prefixes(
                     fit_bars, spec, policy=payload.get("policy"))
+                quality = measure_signal_quality(
+                    fit_bars, spec, policy=payload.get("policy"),
+                    precomputed_first_signals=(
+                        None if spec["family"] == "cross_sectional_residual" else
+                        prefix["first_signals"]),
+                    eligibility_provenance=(
+                        None if spec["family"] == "cross_sectional_residual" else
+                        prefix["eligibility_provenance"]))
                 record = _signal_quality_screen_record(
                     quality, variant_id=variant_id, fit_cells=fit_cells,
                     primary_horizon=_screen_primary_horizon(spec, quality))
@@ -2583,13 +2680,14 @@ def _freeze_fit_behavior_candidates(
         scheduled: Sequence[dict[str, Any]],
         fit_probe_results: Mapping[str, Mapping[str, Mapping[str, Any]]],
         proposals: Mapping[str, Mapping[str, tuple[Any, str]]]) -> dict[str, Any]:
-    """Freeze one fit-selected representative for each behavior alias group.
+    """Record fit-only behavior aliases without suppressing replay.
 
     This function runs before ``_worker`` can see held-out rows.  Its only
     inputs are validated rule specs, their precomputed fit-only fingerprints,
-    and proposal source labels fixed before evaluation.  The cycle-global
-    record list is intentional: an identical planned behavior authored under
-    another rule family is still one experiment, not a fresh BH entry.
+    and proposal source labels fixed before evaluation.  Fit-only equality is
+    not proof of held-out equality, so every intended variant remains in replay
+    and multiplicity correction.  The cycle-global record is an operator-review
+    proposal only.
 
     Tasks lacking a complete fit probe are retained unchanged.  Failing open
     here is conservative for multiplicity: it may replay an extra candidate,
@@ -2625,13 +2723,7 @@ def _freeze_fit_behavior_candidates(
             })
         if keys:
             task_candidate_keys[hypothesis_id] = keys
-    aliases = collapse_behavior_aliases(records, freeze=True)
-    kept_keys = {
-        str(item.get("candidate_key"))
-        for item in aliases.get("kept", ())
-        if isinstance(item, Mapping) and item.get("candidate_key")
-    }
-    all_exclusions = list(aliases.get("excluded") or ())
+    aliases = collapse_behavior_aliases(records, freeze=False)
     all_proposals = list(aliases.get("proposed_exclusions") or ())
     for task in scheduled:
         if task.get("mode") != "backtest":
@@ -2641,11 +2733,7 @@ def _freeze_fit_behavior_candidates(
         if not own_keys:
             continue
         original_specs = list(task.get("specs", ()))
-        task["specs"] = [
-            spec for spec in original_specs
-            if (f"{hypothesis_id}:{rule_variant_id(spec)}" not in own_keys or
-                f"{hypothesis_id}:{rule_variant_id(spec)}" in kept_keys)
-        ]
+        task["specs"] = original_specs
 
         def relevant(group: Mapping[str, Any]) -> bool:
             members = {str(item) for item in group.get("candidate_keys", ())}
@@ -2660,9 +2748,6 @@ def _freeze_fit_behavior_candidates(
         task_entry_aliases = [
             dict(item) for item in aliases.get("entry_aliases", ())
             if isinstance(item, Mapping) and relevant(item)]
-        task_exclusions = [
-            dict(item) for item in all_exclusions
-            if str(item.get("candidate_key")) in own_keys]
         task_proposals = [
             dict(item) for item in all_proposals
             if (str(item.get("candidate_key")) in own_keys or
@@ -2678,11 +2763,11 @@ def _freeze_fit_behavior_candidates(
             "alias_numeric_decimals": aliases.get("alias_numeric_decimals"),
             "requires_operator_review": aliases.get("requires_operator_review"),
             "intended_variant_count": len(original_specs),
-            "kept_variant_count": len(task["specs"]),
+            "kept_variant_count": len(original_specs),
             "cycle_intended_variant_count": aliases.get("intended_variant_count"),
             "cycle_kept_variant_count": aliases.get("kept_variant_count"),
         }
-        task["excluded_behavior_aliases"] = task_exclusions
+        task["excluded_behavior_aliases"] = []
         task["proposed_behavior_aliases"] = task_proposals
     return aliases
 
@@ -2832,19 +2917,49 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         fit, base_fit, vehicle=vehicle, equity_feed=equity_feed)
         if mode != "shadow" else
                 {"available": True, "actual_control": True, "matched": 0,
-                 "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest"})
+                 "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest",
+                 "adequate": True,
+                 "paired_adequacy": {"adequate": True, "mode": "prior_backtest"}})
     test = matched_cluster_test(
         heldout, base_heldout, vehicle=vehicle, equity_feed=equity_feed)
     placebo = placebo_null_distribution(
         heldout, base_heldout, vehicle=vehicle, equity_feed=equity_feed)
+    independent_seed = stable_seed({
+        "purpose": "independent_placebo_null_tail.v1",
+        "primary_assignments_hash": placebo["assignments_hash"],
+        "draws": int(placebo["draws"]),
+    })
+    if independent_seed == int(placebo["seed"]):
+        independent_seed = stable_seed({
+            "purpose": "independent_placebo_null_tail.v1.retry",
+            "primary_assignments_hash": placebo["assignments_hash"],
+            "draws": int(placebo["draws"]),
+        })
+    independent_placebo = placebo_null_distribution(
+        heldout, base_heldout, vehicle=vehicle,
+        draws=int(placebo["draws"]), seed=independent_seed,
+        equity_feed=equity_feed)
+    independent_falsification = falsification_gate(
+        independent_placebo["observed"], independent_placebo["placebo"],
+        alpha=alpha)
     falsification = {
         **falsification_gate(
             placebo["observed"], placebo["placebo"], alpha=alpha,
-            preregistered_p_value=float(test["p_value"])),
+            preregistered_p_value=float(test["p_value"]),
+            independent_p_value=float(independent_falsification["p_value"]),
+            independent_method=FALSIFICATION_INDEPENDENT_METHOD,
+            independent_result_hash=independent_placebo["assignments_hash"],
+            require_independent=True),
         "method": placebo["method"], "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),
         "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
         "clusters": int(placebo["cluster_count"]),
+        "primary_p_value": float(test["p_value"]),
+        "independent_method": FALSIFICATION_INDEPENDENT_METHOD,
+        "independent_result_hash": independent_placebo["assignments_hash"],
+        "independent_assignments_hash": independent_placebo["assignments_hash"],
+        "independent_draws": int(independent_placebo["draws"]),
+        "independent_seed": int(independent_placebo["seed"]),
     }
 
     separation = (heldout_separation(fit, heldout) if mode != "shadow" else
@@ -2862,7 +2977,8 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                      heldout, null_heldout, vehicle=vehicle,
                      equity_feed=equity_feed))
     null_control = {**null_test, "kind": "randomized_entry_null",
-                    "available": bool(null_test["available"]),
+                    "available": bool(null_test["available"] and
+                                      null_test.get("adequate")),
                     "p_value": float(null_test["p_value"])}
     walk_forward = walk_forward_report(
         heldout, base_heldout, vehicle=vehicle, folds=folds,
@@ -2871,6 +2987,14 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         # held-out partition. Requiring the full aggregate floor in every fold
         # would make the gate mathematically unreachable for ordinary corpora.
         min_test_trades=max(1, int(min_trades) // max(2, int(folds) * 2)),
+        # The full held-out arm still clears the 30-pair control floor. Each
+        # disjoint fold receives its proportional share, avoiding an implicit
+        # 90-pair requirement when three forward windows are requested.
+        min_matched=max(
+            1, (ACTUAL_CONTROL_MIN_MATCHED + max(1, int(folds)) - 1) //
+            max(1, int(folds))),
+        min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
+        requested_min_sessions=max(1, int(min_sessions)),
         equity_feed=equity_feed)
     rejection = expectancy_rejection_report(
         heldout, vehicle=vehicle, equity_feed=equity_feed)
@@ -2891,10 +3015,15 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "fit_structurally_adequate": bool(fit_floor["adequate"]),
         "heldout_structurally_adequate": bool(held_floor["adequate"]),
         "separated": bool(separation["passes"]),
-        "actual_control_available": bool(test.get("available") and test.get("actual_control")),
+        "actual_control_available": bool(test.get("available") and
+                                         test.get("actual_control") and
+                                         test.get("adequate")),
+        "actual_control_adequate": bool(test.get("adequate")),
         "fit_delta_positive": bool(mode == "shadow" or (
-            fit_test.get("mean_delta") is not None and float(fit_test["mean_delta"]) > 0)),
+            fit_test.get("adequate") and fit_test.get("mean_delta") is not None and
+            float(fit_test["mean_delta"]) > 0)),
         "heldout_delta_positive": bool(test.get("mean_delta") is not None and
+                                        test.get("adequate") and
                                         float(test["mean_delta"]) > 0),
         "heldout_delta_lcb_positive": bool(lcb is not None and float(lcb) > 0),
         "heldout_p_significant": float(test["p_value"]) <= float(alpha),
@@ -3970,7 +4099,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     signal_quality_screens: dict[str, dict[str, Any]] = {}
     # Screened-out zero-signal variants retain a deterministic p=1 placeholder
     # in the existing multiple-testing families. They have no gate or
-    # promotion result, but BH/FDR membership stays unchanged.
+    # promotion result, but BY/FDR membership stays unchanged.
     screened_out_candidate_keys: set[str] = set()
     screened_out_candidate_families: dict[str, str] = {}
     worker_failures = []
@@ -4294,7 +4423,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         # backtest candidate on the same fit prefix used for diagnosis.  Full
         # behavioral aliases receive one deterministic representative across
         # the entire cycle.  This choice is frozen exclusively from the fit
-        # prefix before any held-out replay or BH input exists.  Zero-signal
+        # prefix before any held-out replay or BY input exists.  Zero-signal
         # variants and candidates with incomplete probes remain scheduled.
         # The compact summaries persisted below never contain fit trade rows.
         fit_probe_tasks = [task for task in scheduled
@@ -4386,13 +4515,14 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         f"{owner['hypothesis']['hypothesis_id']}:{variant['variant_id']}": gate["p_raw"]
         for owner, variant, gate in candidate_rows}
     global_p_values.update({key: 1.0 for key in screened_out_candidate_keys})
-    global_correction = benjamini_hochberg(global_p_values, alpha=alpha)
+    global_correction = benjamini_yekutieli(global_p_values, alpha=alpha)
     family_rows: dict[str, list[tuple[Mapping, Mapping]]] = {}
     for owner, variant, gate in variant_rows:
         rule_family = str((variant.get("rule_spec") or {}).get(
             "family") or owner["hypothesis"]["family"])
         family_rows.setdefault(rule_family, []).append(
             (variant, gate))
+    family_p_value_batches: dict[str, dict[str, float]] = {}
     family_corrections: dict[str, dict] = {}
     family_names = set(family_rows)
     family_names.update(screened_out_candidate_families.values())
@@ -4409,12 +4539,13 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             for candidate_key, candidate_family in
             screened_out_candidate_families.items()
             if candidate_family == family_name})
-        family_corrections[family_name] = benjamini_hochberg(
+        family_p_value_batches[family_name] = family_p_values
+        family_corrections[family_name] = benjamini_yekutieli(
             family_p_values, alpha=alpha)
     # A second, conservative multiplicity layer groups current-cycle tests by
-    # the frozen *prior-cycle* dependence map.  The existing global BH remains
+    # the frozen *prior-cycle* dependence map.  The existing global BY remains
     # mandatory; this correction can only veto a candidate that global/family
-    # BH would otherwise admit. Unknown/legacy families get singleton groups,
+    # BY would otherwise admit. Unknown/legacy families get singleton groups,
     # preserving their safe fallback without claiming unmeasured dependence.
     frozen_clusters = dict(dependence_policy.get("cluster_map") or {})
     cluster_rows: dict[str, dict[str, float]] = {}
@@ -4434,12 +4565,12 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         cluster_rows.setdefault(cluster_name, {})[candidate_key] = 1.0
     cluster_corrections: dict[str, dict] = {}
     for cluster_name in sorted(cluster_rows):
-        correction = benjamini_hochberg(cluster_rows[cluster_name], alpha=alpha)
+        correction = benjamini_yekutieli(cluster_rows[cluster_name], alpha=alpha)
         for candidate_key, item in correction.items():
             cluster_corrections[candidate_key] = {
                 **item, "cluster": cluster_name,
                 "scope": "frozen_dependence_cluster",
-                "method": "benjamini_hochberg",
+                "method": "benjamini_yekutieli",
                 "policy_hash": dependence_digest,
                 "verified_persisted": dependence_policy.get(
                     "verified_persisted") is True,
@@ -4460,11 +4591,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 "p": gate["p_raw"], "p_adjusted": gate["p_raw"],
                 "significant": float(gate["p_raw"]) <= float(alpha),
                 "family_size": len(global_correction)})
-        gate["multiple_tests"] = {**family, "method": "benjamini_hochberg",
+        gate["multiple_tests"] = {**family, "method": "benjamini_yekutieli",
                                   "scope": "rule_family",
                                   "family": family_name}
         gate["global_multiple_tests"] = {**overall,
-                                         "method": "benjamini_hochberg",
+                                         "method": "benjamini_yekutieli",
                                   "scope": "cycle_global"}
         candidate_key = f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}"
         cluster = cluster_corrections.get(candidate_key, {
@@ -4472,7 +4603,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             "significant": float(gate["p_raw"]) <= float(alpha),
             "cluster": cluster_for_key.get(candidate_key),
             "scope": "frozen_dependence_cluster",
-            "method": "benjamini_hochberg",
+            "method": "benjamini_yekutieli",
             "policy_hash": dependence_digest,
             "verified_persisted": dependence_policy.get(
                 "verified_persisted") is True,
@@ -4574,6 +4705,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 candidate_rows, baseline_rows, vehicle=vehicle,
                 sessions=sessions, candidate_id=selected_variant["variant_id"],
                 preselected=True,
+                max_drawdown=float(starting_cash) * .05,
                 equity_feed=selected_policy.equity_feed)
             qualification_key = selected_test_key
 
@@ -4681,6 +4813,21 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             family_q_value=family["p_adjusted"], alpha=alpha,
             cluster_q_value=gate["cluster_multiple_tests"].get("p_adjusted"),
             cluster_multiple_tests=gate["cluster_multiple_tests"],
+            fdr_batch=fdr_batch_evidence(
+                candidate_id=variant["variant_id"],
+                family_name=family_name,
+                family_candidate_key=(
+                    f"{family_name}|{worker['hypothesis']['hypothesis_id']}|"
+                    f"{variant['variant_id']}"),
+                global_candidate_key=key,
+                family_values=family_p_value_batches,
+                global_values=global_p_values,
+                alpha=alpha,
+                p_value_source="gate",
+                cluster_name=str(gate["cluster_multiple_tests"].get("cluster")),
+                cluster_candidate_key=key,
+                cluster_values=cluster_rows,
+                policy_hash=dependence_digest),
             falsification=gate["falsification"],
             separation=gate["heldout_separation"], checks=checks,
             passes=gate["passes"], walk_forward=gate["walk_forward"],
@@ -4694,6 +4841,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 provenance=run_provenance),
             candidate_id=variant["variant_id"],
             performance={"heldout_delta": gate["test"].get("mean_delta"),
+                         "heldout_r_delta": gate["test"].get("mean_r_delta"),
                          "heldout_delta_lcb": gate["heldout_delta_lcb"],
                          "heldout_net_pnl": gate["heldout_net_pnl"],
                          "heldout_expectancy": gate["heldout_expectancy"],
@@ -5350,7 +5498,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         },
         "unknown_family_behavior": "existing_safe_family_correlation",
         "authorizing": True,
-        "gate_scope": "cluster_level_bh_veto_in_addition_to_family_and_global_bh",
+        "gate_scope": "cluster_level_by_veto_in_addition_to_family_and_global_by",
         "runtime_scope": "one_strongest_edge_per_verified_frozen_cluster",
     }
     result = {

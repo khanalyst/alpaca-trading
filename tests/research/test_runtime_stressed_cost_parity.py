@@ -39,8 +39,12 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
         cls.bars = [replace(bar, session_open=session_open,
                             session_close=session_close)
                     for bar in _bars(RISING + FLAT)]
-        cls.quotes = [_quote(index, 100.0, 100.0)
-                      for index in range(len(cls.bars))]
+        # Keep the executable quote on the boundary bar instead of pinning it
+        # below the already-authored long stop.  A through-stop quote is a
+        # legitimate runtime rejection and is covered by the gap tests; this
+        # fixture is specifically about stressed-cost geometry parity.
+        cls.quotes = [_quote(index, float(bar.open), float(bar.open))
+                      for index, bar in enumerate(cls.bars)]
 
         # stop_atr=3 is naturally above the effective floor.  stop_atr=1
         # authors the grammar's ~30bp minimum and exercises policy widening.

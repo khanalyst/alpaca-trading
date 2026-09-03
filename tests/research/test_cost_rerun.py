@@ -34,7 +34,8 @@ class CostRerunTests(unittest.TestCase):
         cls.config = _config()
         # Stops wide enough to clear the stressed-cost admission gate, as the
         # factory's own tuning had to reach, so both arms actually execute.
-        cls.cohort = [validate_rule_spec({**spec, "stop_atr": 7.0})
+        cls.cohort = [validate_rule_spec({**spec, "stop_atr": 7.0,
+                                          "target_r": 10.0})
                       for spec in deterministic_cohort()][:8]
         cls.report = run_cost_rerun(
             # Keep the existing 50-quote cell floor, but provide enough
@@ -184,7 +185,8 @@ class CostRerunTests(unittest.TestCase):
 
     def test_a_tight_stop_cohort_is_widened_and_attributable(self):
         """The reconciled policy widens tight equity stops before sizing."""
-        tight = [validate_rule_spec({**spec, "stop_atr": 1.0})
+        tight = [validate_rule_spec({**spec, "stop_atr": 1.0,
+                                     "target_r": 10.0})
                  for spec in deterministic_cohort()][:2]
         report = run_cost_rerun(edge_corpus(25), runtime_config=self.config,
                                 specs=tight, min_quotes_per_cell=50)

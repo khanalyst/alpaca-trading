@@ -784,7 +784,7 @@ fi
 # and validates the existing quote schedule without replaying the factory
 # cohort; the resulting artifact remains diagnostic until an operator enables
 # it in runtime risk configuration with its content-addressed path.
-if [ "${ALPACA_RESEARCH_STRESS_CALIBRATION_ENABLED:-1}" = "1" ] && [ -s "$quotes_input" ]; then
+if [ "${ALPACA_RESEARCH_STRESS_CALIBRATION_ENABLED:-0}" = "1" ] && [ -s "$quotes_input" ]; then
   stress_calibration_report="${ALPACA_RESEARCH_STRESS_CALIBRATION_REPORT:-$repo_root/runtime/research/stressed-cost-calibration-latest.json}"
   if [[ "$stress_calibration_report" != /* ]]; then
     stress_calibration_report="$repo_root/$stress_calibration_report"
@@ -828,8 +828,8 @@ run_calibration() {
   local vehicle="$1"
   calibration_authorized=0
   shadow_ingest_allowed=0
-  calibration_reason="disabled"
-  if [ "${ALPACA_RESEARCH_CALIBRATION_ENABLED:-1}" != "1" ]; then
+  calibration_reason="calibration_disabled"
+  if [ "${ALPACA_RESEARCH_CALIBRATION_ENABLED:-0}" != "1" ]; then
     echo '{"schema":"research-calibration.v1","status":"blocked","reason":"calibration_disabled","authorization_exit_code":2}' >&2
     return 0
   fi

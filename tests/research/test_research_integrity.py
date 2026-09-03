@@ -196,6 +196,23 @@ class ScheduledResearchTests(unittest.TestCase):
                     self.assertEqual(research_cli.cmd_llm_preflight(args), expected)
                 self.assertEqual(json.loads(output[-1])["status"], status)
 
+    def test_calibration_cli_propagates_authorization_exit_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal.db"
+            journal.touch()
+            args = Namespace(journal=str(journal), config=None,
+                             vehicle="equity")
+            report = {
+                "schema": "execution-calibration.v1",
+                "verdict": "insufficient_data",
+                "authorization_verdict": "insufficient_data",
+                "authorization_exit_code": 2,
+            }
+            with patch.object(research_cli, "calibration_report",
+                              return_value=report), \
+                 patch.object(research_cli, "print"):
+                self.assertEqual(research_cli.cmd_calibrate(args), 2)
+
     def test_llm_preflight_cli_redacts_configuration_exception_and_signed_url(self):
         args = Namespace(agent_config="config.yaml")
         output = []

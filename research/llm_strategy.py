@@ -20,8 +20,9 @@ from threading import Lock, Thread
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
-from agent.contracts.rule import (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
-                                  RULE_SCHEMA_V4, rule_spec_hash, rule_variant_id,
+from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V1,
+                                  RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
+                                  rule_spec_hash, rule_variant_id,
                                   rule_spec_json_schema, validate_rule_spec)
 
 
@@ -30,6 +31,7 @@ DISCOVERY_SCHEMA = "llm-edge-discovery.v1"
 TUNING_SCHEMA = "llm-variant-tuning.v1"
 PREFLIGHT_SCHEMA = "llm-provider-preflight.v1"
 DEFAULT_RESPONSE_BYTES = 16_384
+DIAGNOSIS_MAX_BYTES = 8_192
 DEFAULT_ATTEMPTS = 2
 DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_TOTAL_CALLS = 64
@@ -162,14 +164,14 @@ credentials, market rows, or fields outside schema, variants, rule_spec,
 reason and builds_on.
 """
 
-# The preflight prompt intentionally asks for no strategy content.  The
-# request still travels through the exact structured-output provider path used
-# by proposal/discovery/tuning calls, which is what catches endpoint,
-# deployment, and API-capability mismatches before a research cycle starts.
-PREFLIGHT_SYSTEM_PROMPT = """Respond with exactly {"status":"ok"}.  This is a
-connectivity probe, not a strategy request; do not return a rule, market data,
-credentials, or instructions.  The response is ignored and never authorizes
-research.
+# The preflight prompt intentionally does not authorize strategy content, but
+# it must still ask for a valid production proposal object.  A status-only toy
+# response would let a provider accept the probe while rejecting the first
+# real rule schema with a structured-output 400.
+PREFLIGHT_SYSTEM_PROMPT = """Return one valid llm-rule-proposal.v1 object using
+the supplied prior_validated_rule_spec unchanged. This is a connectivity
+probe, not a strategy request: do not return market data, credentials, or
+instructions. The response is ignored and never authorizes research.
 """
 
 _FORBIDDEN_KEYS = {
@@ -297,14 +299,169 @@ def _finite_diagnosis(value: Any, *, path: str,
 
 
 def _safe_diagnosis(value: Mapping[str, Any], *,
-                    label: str = "diagnosis") -> dict[str, Any]:
+                    label: str = "diagnosis",
+                    compact: bool = False) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{label} must be an aggregate mapping")
     result = _finite_diagnosis(value, path=label)
     # A bounded aggregate diagnosis should not become an unbounded prompt.
     encoded = canonical_json(result).encode("utf-8")
-    if len(encoded) > 8_192:
+    if len(encoded) > DIAGNOSIS_MAX_BYTES:
+        if compact:
+            return _compact_diagnosis(result, label=label,
+                                      original_bytes=len(encoded))
         raise ValueError(f"{label} exceeds the 8192-byte aggregate bound")
+    return result
+
+
+_DIAGNOSIS_COMPACTION_SCHEMA = "llm-diagnosis-compaction.v1"
+_DIAGNOSIS_PRIORITY_KEYS = frozenset({
+    # Failure and refinement controls directly determine the next bounded
+    # coordinate/interaction lane.
+    "primary_failure", "failure_mode", "fit_classification", "classification",
+    "refinement_phase", "execution_blocked", "cost_stress",
+    "stressed_cost_rejection", "coordinate_candidates_remaining",
+    "interaction_candidates_remaining",
+    # Fit aggregates that explain why a coordinate is worth trying.
+    "fit_diagnostics", "execution_rejections", "predicate_funnel",
+    "signal_quality", "target_hold_reachability", "execution_geometry",
+    "trades", "win_rate", "net_pnl", "expectancy", "profit_factor",
+    "max_drawdown", "target_rate", "stop_rate", "shared_learning",
+    # Provenance and hashes are retained even when the detailed aggregate is
+    # reduced, so an operator can reconcile the compact prompt with the full
+    # persisted diagnosis.
+    "dataset_hash", "config_hash", "code_hash", "provenance_hash",
+    "split_hash", "corpus_hash", "schema_hash", "provenance",
+})
+
+
+def _diagnosis_key_priority(key: Any) -> tuple[int, str]:
+    """Return a stable ordering for lossy diagnosis compaction."""
+
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
+    if normalized in _DIAGNOSIS_PRIORITY_KEYS:
+        return (3, normalized)
+    if ("hash" in normalized or "provenance" in normalized or
+            normalized.endswith("_schema")):
+        return (2, normalized)
+    # Scalar decision fields are more useful than large telemetry collections;
+    # lexical ordering makes equal-priority payloads reproducible.
+    return (1, normalized)
+
+
+def _compact_text(value: str, budget: int) -> str:
+    """Keep a deterministic prefix and digest when one text field is large."""
+
+    encoded = value.encode("utf-8")
+    if len(encoded) <= budget:
+        return value
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    suffix = f"…[{digest}]"
+    suffix_bytes = len(suffix.encode("utf-8"))
+    if budget <= suffix_bytes:
+        return suffix[:max(1, budget)]
+    prefix = encoded[:budget - suffix_bytes].decode("utf-8", errors="ignore")
+    return prefix + suffix
+
+
+def _compact_value(value: Any, budget: int) -> Any:
+    """Recursively compact a finite aggregate under a byte budget.
+
+    Maps retain decision/provenance keys first, arrays retain their stable
+    head and tail, and oversized strings carry a digest suffix.  No random or
+    wall-clock state participates, so identical diagnoses produce identical
+    model requests and hashes.
+    """
+
+    if budget <= 0:
+        return None
+    if isinstance(value, str):
+        return _compact_text(value, budget)
+    if value is None or isinstance(value, (bool, int, float)):
+        try:
+            if len(canonical_json(value).encode("utf-8")) <= budget:
+                return value
+        except (TypeError, ValueError):
+            return None
+        return None
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        # ``str`` keys are guaranteed by _finite_diagnosis.  Stable priority
+        # ordering avoids depending on input insertion order.
+        keys = sorted(value, key=lambda item: (
+            -_diagnosis_key_priority(item)[0],
+            _diagnosis_key_priority(item)[1], str(item)))
+        for key in keys:
+            current_size = len(canonical_json(result).encode("utf-8"))
+            remaining = budget - current_size - 8
+            if remaining <= 0:
+                break
+            child = _compact_value(value[key], remaining)
+            if child is None:
+                continue
+            candidate = {**result, str(key): child}
+            if len(canonical_json(candidate).encode("utf-8")) <= budget:
+                result[str(key)] = child
+        return result
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return []
+        # Preserve the beginning and end of a chronological/graded sequence;
+        # an omitted middle is represented by the compaction provenance below.
+        indices = list(range(len(value)))
+        if len(indices) > 2:
+            indices = [indices[0], indices[-1]]
+        result: list[Any] = []
+        for index in indices:
+            current_size = len(canonical_json(result).encode("utf-8"))
+            remaining = budget - current_size - 4
+            if remaining <= 0:
+                break
+            child = _compact_value(value[index], remaining)
+            if child is None:
+                continue
+            candidate = [*result, child]
+            if len(canonical_json(candidate).encode("utf-8")) <= budget:
+                result.append(child)
+        return result
+    return None
+
+
+def _compact_diagnosis(value: Mapping[str, Any], *, label: str,
+                       original_bytes: int) -> dict[str, Any]:
+    """Summarize an oversized tuning diagnosis without dropping its identity."""
+
+    original_hash = content_hash(value)
+    raw_label = str(label)
+    compact_label = _compact_text(raw_label, 128)
+    metadata = {
+        "schema": _DIAGNOSIS_COMPACTION_SCHEMA,
+        "original_bytes": int(original_bytes),
+        "original_hash": original_hash,
+        "label": compact_label,
+    }
+    if compact_label != raw_label:
+        metadata["label_hash"] = hashlib.sha256(
+            raw_label.encode("utf-8")).hexdigest()
+    # Reserve enough room for provenance even if the detailed payload consumes
+    # nearly all of the provider's aggregate budget.
+    metadata_bytes = len(canonical_json({"_compaction": metadata}).encode("utf-8"))
+    budget = max(256, DIAGNOSIS_MAX_BYTES - metadata_bytes - 1)
+    compacted = _compact_value(value, budget)
+    if not isinstance(compacted, Mapping):
+        compacted = {}
+    result = dict(compacted)
+    result["_compaction"] = metadata
+    # A defensive final pass handles pathological key names/UTF-8 sizes while
+    # retaining the provenance envelope and all highest-priority fields that
+    # fit.  This branch is deterministic and should only be reached for an
+    # unusually dense mapping.
+    if len(canonical_json(result).encode("utf-8")) > DIAGNOSIS_MAX_BYTES:
+        compacted = _compact_value(
+            {key: item for key, item in result.items() if key != "_compaction"},
+            budget=max(128, DIAGNOSIS_MAX_BYTES - metadata_bytes - 1))
+        result = dict(compacted) if isinstance(compacted, Mapping) else {}
+        result["_compaction"] = metadata
     return result
 
 
@@ -1082,6 +1239,11 @@ class RuleProposalAdapter:
         # OpenAI Responses API JSON schema; Anthropic accepts the same schema
         # under ``output_config.format`` on versions supporting structured
         # outputs.  additionalProperties is deliberately false.
+        # The legacy preflight name is an envelope/evidence label only; its
+        # provider schema is deliberately an alias of the production proposal
+        # schema so a preflight cannot succeed against a toy contract.
+        if name == PREFLIGHT_SCHEMA:
+            name = PROPOSAL_SCHEMA
         # Provider structured-output dialects implement a deliberately small
         # JSON Schema subset.  In particular, OpenAI strict schemas reject
         # validation-only keywords such as ``minimum`` and ``pattern`` with a
@@ -1092,6 +1254,27 @@ class RuleProposalAdapter:
             "type", "properties", "required", "items",
             "additionalProperties", "enum", "anyOf",
         ))
+
+        def nullable_schema(value: Mapping[str, Any]) -> dict[str, Any]:
+            """Make an optional property strict-provider compatible.
+
+            OpenAI/Anthropic strict JSON-schema modes require every object
+            property to appear in ``required``.  Optional grammar fields keep
+            their omission semantics by accepting an explicit null instead;
+            the internal rule validator then fills the same defaults as a
+            normal omitted field.
+            """
+
+            if "anyOf" in value:
+                alternatives = list(value["anyOf"])
+                if not any(isinstance(item, Mapping) and
+                           item.get("type") == "null"
+                           for item in alternatives):
+                    alternatives.append({"type": "null"})
+                return {**value, "anyOf": alternatives}
+            if value.get("type") == "null":
+                return dict(value)
+            return {"anyOf": [dict(value), {"type": "null"}]}
 
         def provider_schema(value: Any) -> Any:
             if isinstance(value, Mapping):
@@ -1140,19 +1323,28 @@ class RuleProposalAdapter:
                     if existing is not None:
                         nullable.extend(existing)
                     result["anyOf"] = nullable
+                # Strict structured-output providers reject an object whose
+                # ``required`` list omits a declared property.  Preserve the
+                # authored required order, then append the optional property
+                # names in deterministic schema order and make each nullable
+                # so callers retain the original omission/default semantics.
+                properties = result.get("properties")
+                if isinstance(properties, Mapping):
+                    authored = result.get("required")
+                    required = [str(item) for item in authored] \
+                        if isinstance(authored, list) else []
+                    required_set = set(required)
+                    for property_name in properties:
+                        if property_name not in required_set:
+                            properties[property_name] = nullable_schema(
+                                properties[property_name])
+                            required.append(property_name)
+                            required_set.add(property_name)
+                    result["required"] = required
                 return result
             if isinstance(value, list):
                 return [provider_schema(item) for item in value]
             return value
-
-        if name == PREFLIGHT_SCHEMA:
-            return provider_schema({
-                "type": "object", "additionalProperties": False,
-                "required": ["status"],
-                "properties": {
-                    "status": {"type": "string", "enum": ["ok"]},
-                },
-            })
 
         rule_schema = provider_schema(RuleProposalAdapter._grammar_schema(vehicle))
         if name == TUNING_SCHEMA:
@@ -1205,8 +1397,12 @@ class RuleProposalAdapter:
         request_text = canonical_json(request)
         if self.provider == "openai":
             # Current OpenAI Responses API structured output shape.
-            format_name = ("llm_provider_preflight" if preflight else
-                           "llm_rule_proposal")
+            # Preflight intentionally uses the same named format as a real
+            # proposal.  Provider capability/schema validation must exercise
+            # every recursive rule branch; a tiny status-only format would
+            # report ready while the first production proposal receives a
+            # schema 400.
+            format_name = "llm_rule_proposal"
             request_kwargs: dict[str, Any] = {
                 "model": self._provider_model(), "input": [
                     {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
@@ -1223,14 +1419,17 @@ class RuleProposalAdapter:
             if temperature is not None:
                 request_kwargs["temperature"] = temperature
             if preflight:
-                request_kwargs["max_output_tokens"] = 32
+                # The actual proposal shape is required, so leave enough
+                # output budget for one normalized rule object.  The response
+                # remains non-authorizing and is deliberately not parsed.
+                request_kwargs["max_output_tokens"] = 1200
             response = client.responses.create(**request_kwargs)
             # Connectivity probes intentionally do not inspect/model-parse
             # the response body; a successful HTTP/API return is sufficient.
             return response if preflight else _raw_text(
                 response, max_bytes=self.max_response_bytes)
         response = client.messages.create(
-            model=self._provider_model(), max_tokens=(32 if preflight else 1200),
+            model=self._provider_model(), max_tokens=1200,
             temperature=RESEARCH_SAMPLING_TEMPERATURE,
             system=system_prompt,
             messages=[{"role": "user", "content": request_text}],
@@ -1283,13 +1482,24 @@ class RuleProposalAdapter:
         research.  Its tiny request/output budget and ignored response make
         the operation connectivity-only and non-authorizing.
         """
-        request = {"vehicle": "equity", "purpose": "connectivity_preflight"}
+        request = {
+            "vehicle": "equity",
+            "purpose": "connectivity_preflight",
+            # Give the provider a complete, bounded object it can emit under
+            # the production proposal schema.  The returned object is ignored
+            # and never enters the research ledger.
+            "prior_validated_rule_spec": dict(DEFAULT_RULE_SPEC),
+        }
         request_hash = content_hash(request)
         prompt_hash = content_hash(PREFLIGHT_SYSTEM_PROMPT)
         evidence = self._base_evidence(
-            kind="preflight", schema_name=PREFLIGHT_SCHEMA,
+            # Record/hash the production response schema even though the
+            # externally returned result keeps the stable preflight envelope.
+            kind="preflight", schema_name=PROPOSAL_SCHEMA,
             prompt_hash=prompt_hash, request_hash=request_hash, vehicle="equity")
-        evidence.update({"attempts": 1, "request_kind": "minimal",
+        evidence["preflight_schema_name"] = PROPOSAL_SCHEMA
+        evidence.update({"attempts": 1,
+                         "request_kind": "production_proposal_schema",
                          "response_parsed": False})
         if (self.provider == "openai" and self._azure_endpoint_configured()
                 and not self.deployment):
@@ -1304,7 +1514,7 @@ class RuleProposalAdapter:
             # proposal calls.  No retry loop is intentionally present here.
             _call_with_timeout(
                 lambda system_prompt, request, timeout: self._provider_call(
-                    system_prompt, request, timeout, PREFLIGHT_SCHEMA,
+                    system_prompt, request, timeout, PROPOSAL_SCHEMA,
                     preflight=True),
                 self.timeout_seconds, PREFLIGHT_SYSTEM_PROMPT, request)
         except Exception as exc:  # noqa: BLE001 - classify safely below
@@ -1553,7 +1763,11 @@ class RuleProposalAdapter:
                        "variants_requested": int(count),
                        "family": root["family"], "rule_schema": root["schema"],
                        "root_rule_spec": root,
-                       "diagnosis": _safe_diagnosis(diagnosis),
+                       # Tuning receives production fit telemetry, which can
+                       # exceed the provider's aggregate prompt bound.  Keep
+                       # a deterministic, hashed summary instead of rejecting
+                       # an otherwise valid tuning cycle.
+                       "diagnosis": _safe_diagnosis(diagnosis, compact=True),
                        "lessons": safe_lessons}
             request_hash = content_hash(request)
             system_hash = content_hash(prompt)
@@ -1664,6 +1878,15 @@ class RuleProposalAdapter:
                     "attempt_errors": errors[-3:],
                     "attempt_evidence": attempt_evidence,
                 }
+                compaction = request["diagnosis"].get("_compaction")
+                if isinstance(compaction, Mapping):
+                    evidence.update({
+                        "diagnosis_compacted": True,
+                        "diagnosis_original_bytes": compaction.get(
+                            "original_bytes"),
+                        "diagnosis_original_hash": compaction.get(
+                            "original_hash"),
+                    })
                 return ProposalResult(True, schema=TUNING_SCHEMA,
                                       rule_spec=root, evidence=evidence,
                                       variants=tuple(variants))
@@ -1685,6 +1908,13 @@ class RuleProposalAdapter:
             "lessons_supplied": len(safe_lessons),
             "attempts": len(attempt_evidence),
         })
+        compaction = request.get("diagnosis", {}).get("_compaction")
+        if isinstance(compaction, Mapping):
+            evidence.update({
+                "diagnosis_compacted": True,
+                "diagnosis_original_bytes": compaction.get("original_bytes"),
+                "diagnosis_original_hash": compaction.get("original_hash"),
+            })
         if raw_hash is not None:
             evidence["raw_response_hash"] = raw_hash
         evidence["attempt_errors"] = errors[-3:]
@@ -1729,7 +1959,8 @@ def tune_rule(*args: Any, adapter: RuleProposalAdapter | None = None,
 
 
 __all__ = [
-    "DEFAULT_TOTAL_CALLS", "DISCOVERY_SCHEMA", "DISCOVERY_SYSTEM_PROMPT", "LESSON_REF_CHARS",
+    "DEFAULT_TOTAL_CALLS", "DIAGNOSIS_MAX_BYTES", "DISCOVERY_SCHEMA",
+    "DISCOVERY_SYSTEM_PROMPT", "LESSON_REF_CHARS",
     "MAX_REASON_CHARS", "MAX_THESIS_CHARS", "MAX_TUNED_VARIANTS",
     "STRESSED_STOP_ATR_LADDER", "STRESSED_MIN_ATR_BPS_LADDER",
     "PREFLIGHT_SCHEMA", "PROPOSAL_SCHEMA", "PREFLIGHT_SYSTEM_PROMPT",

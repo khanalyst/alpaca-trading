@@ -33,15 +33,15 @@ runtime decision after OPRA evidence and controls are reviewed.
 The immutable authorizing floors are: 100 trades plus 30 complete
 sessions/clusters for backtest/factory windows; 100 trades plus 30 complete
 sessions/clusters for the sealed qualification window; and 150 trades plus 30
-complete sessions for the parity-matched live-shadow tail. Replay epoch 5
-retains the epoch-4 point-in-time, executable-row, vehicle-cost,
+complete sessions for the parity-matched live-shadow tail. Replay epoch 6
+retains the epoch-5 point-in-time, executable-row, vehicle-cost,
 raw-confirmatory-p, and stressed-cost boundaries and additionally seals paired
 synthetic root-control shadow decisions/replays, diagnostic-only historical-
 backfill provenance with exact calendar metadata, durable live-shadow FDR
-allocation binding, chronological paired inference, finite BH input
-validation, and conservative broker-tick equity rounding. Epoch-4 proofs remain
+allocation binding, chronological paired inference, finite BY input
+validation, and conservative broker-tick equity rounding. Epoch-5 proofs remain
 readable for audit but are quarantined and cannot validate, champion, or
-authorize the paper trader until re-derived under epoch 5.
+authorize the paper trader until re-derived under epoch 6.
 
 The finite rule grammar contains twelve families. The twelfth,
 `cross_sectional_residual`, is shares-only, benchmarks SPY, and requires
@@ -162,7 +162,7 @@ length. Effective breadth is persisted and re-verified as a matched
 symbol-by-session correlation/eigenvalue diagnostic only; it never increases N
 or replaces independent session clusters. Authorizing dependence is separate:
 before each factory cycle, completed prior-cycle family deltas are frozen into a
-hash-verified map. Strong family groups receive an additional cluster-level BH
+hash-verified map. Strong family groups receive an additional cluster-level BY
 veto, while runtime `all_proved` admits at most one strongest edge per verified
 frozen cluster. An unavailable or unknown assignment uses the safe fallback and
 never implies independence.
@@ -323,7 +323,7 @@ book and remains isolated from EdgeLedger lifecycle state. Research-side
 `edge ingest-shadow` opens
 the shadow WAL read-only, requires strictly newer complete parity-matched rows,
 prior qualification, source/config/code/provenance/replay/gate hashes, family
-and global BH plus the frozen-cluster veto and durable online FDR, then appends
+and global BY plus the frozen-cluster veto and durable online FDR, then appends
 the immutable `lane=shadow`
 proof and live marker; only then can the candidate become `validated`/`champion`.
 A semantic or mid-tail incomplete session remains fail-closed until source
@@ -399,7 +399,7 @@ is an explicit non-authorizing mode and emits no proofs.
 The first-signal planned vectors also produce deterministic entry and full
 behavior fingerprints. When the fit contains a signal, full behavioral aliases
 produce a deterministic canonicalization proposal for operator review; all
-intended variants remain in worker replay and BH until that review. Zero-signal
+intended variants remain in worker replay and BY until that review. Zero-signal
 aliases remain visible, and the proposed alias/parameter-collapse summary is
 persisted without raw rows. These are diagnostics only and cannot authorize a
 candidate or read held-out/sealed sessions.
@@ -483,10 +483,17 @@ deltas, cluster-level sign randomisation, and family-local, frozen-dependence-
 cluster, and cycle-global false-discovery correction. Selection compares
 candidates across families, so the q-value that authorizes a champion is the
 global one, subject to the additional cluster veto. Because
-Benjamini-Hochberg is monotone in the number of tests, cycle-global q is never
+Benjamini-Yekutieli is monotone in the number of tests, cycle-global q is never
 less conservative than family q; a family pass/global fail is therefore a
 normal result for a marginal candidate, and proof verification must compare
 each decision flag with its own q-value.
+
+Current v3 proofs retain the complete raw p-value maps and recomputed BY
+results for every family, the cycle-global scope, and any frozen-dependence
+cluster. Verification rebuilds those corrections and binds a cluster batch to
+the persisted dependence-policy hash; a caller-supplied scalar q-value is not
+sufficient evidence. Historical v2 proofs predate this batch record and remain
+audit-readable only under their quarantined replay epoch.
 
 The post-selection test also consumes a durable cumulative online-FDR
 allocation. The active `shadow-confirmation-v6` scope uses the standard LORD++
@@ -506,7 +513,7 @@ where the first reward term is included only when `tau_1 < t` (and each
 The state is append-only per scope and persists across cycles; v2/v3/v4 rows
 retain their legacy method identifiers, while v5 rows retain LORD++ with
 `W0=alpha`; none are reused to seed v6. LORD++ receives the raw confirmatory p-value;
-family/global BH and the frozen-cluster veto select or reject the candidate but
+family/global BY and the frozen-cluster veto select or reject the candidate but
 are not spent as online p-values.
 
 The v6 guarantee is scope-local. Legacy epochs (including v5) remain auditable
@@ -529,7 +536,7 @@ chronologically. The `shadow-confirmation-v6` scope handles each complete new
 tail by splitting it deterministically into an older selection window and a
 newer, disjoint confirmatory window; both windows must independently meet the
 configured trade/session floors before any online allocation is spent.
-Family/global BH and the frozen-cluster veto use only the selection-window raw
+Family/global BY and the frozen-cluster veto use only the selection-window raw
 p-values. At most the selected, preflight-ready candidate is recomputed on the
 confirmatory window, and only that gate's raw p is sent to LORD++. The source
 and provenance persist both session lists, their digests, the disjointness
@@ -550,9 +557,11 @@ The same rule is evaluated in every fold.
 
 The falsification check is a seeded permutation test: at least ten thousand
 cluster-level sign-flip draws form an explicit null distribution, and the
-decision is the empirical one-sided p-value against it. The draw count and
-seed are derived from the matched evidence and persisted, so the distribution
-is reproducible.
+authorizing decision uses the preregistered paired-test p-value. A second,
+separately seeded draw stream is persisted and rechecked as computational
+replication/integrity evidence only. It is not an independent market sample,
+does not count as additional N, and does not impose a second significance
+hurdle. Both draw counts, seeds, and assignment hashes are persisted.
 
 The last sessions of every evaluation corpus are sealed into a final
 qualification window before any worker is scheduled. Selection, mutation and
@@ -596,16 +605,17 @@ the raw held-out delta.
 
 Every run also records the replay generation it was measured under
 (`research/edge_ledger_store.py::REPLAY_ENGINE_EPOCH`), assigned by the ledger
-and never accepted from a caller. The current generation is **epoch 5**. Epoch
-5 retains the epoch-4 point-in-time availability, executable-row-only
+and never accepted from a caller. The current generation is **epoch 6**. Epoch
+6 retains the epoch-5 point-in-time availability, executable-row-only
 statistics, vehicle-specific cost provenance, raw confirmatory p accounting,
 and stressed-cost abstention boundary. It additionally seals paired synthetic
 root-control shadow decisions/replays, marks historical backfill as diagnostic
 non-authorizing evidence with exact calendar metadata, binds live-shadow
 authorization to the durable FDR allocation, orders paired inference
-chronologically, validates finite BH inputs (alpha in `(0,1]`, p-values in
-`[0,1]`), and rounds broker-bound equity prices conservatively to valid ticks
-before sizing.
+chronologically, validates finite BY inputs (alpha in `(0,1]`, p-values in
+`[0,1]`), requires adequately powered paired actual-control evidence and a
+separately seeded, reproducible placebo-null calculation, and rounds
+broker-bound equity prices conservatively to valid ticks before sizing.
 
 A run from a superseded generation cannot authorize `validated`, `champion`, or
 runtime eligibility, and `EdgeLedger.eligibility` names that quarantine rather
@@ -613,9 +623,9 @@ than reporting a bare ineligibility. This is deliberately not a digest check:
 evidence measured under a replay engine that has since been corrected still
 re-hashes and still recomputes, because the recorded rows are exactly what that
 engine produced. Quarantine is not deletion — the rows stay readable and the
-lifecycle history stays intact — so epoch-4 proofs remain audit-readable but
-must be re-derived under epoch 5 to authorize. Authorization requires exact
-equality with current epoch 5; future as well as stale epochs remain audit-only.
+lifecycle history stays intact — so epoch-5 proofs remain audit-readable but
+must be re-derived under epoch 6 to authorize. Authorization requires exact
+equality with current epoch 6; future as well as stale epochs remain audit-only.
 Each current-epoch run seals one immutable verified gate proof; re-derivation
 appends a new proof rather than rewriting history. The constant is raised
 whenever a replay or gate change invalidates evidence recorded before it.
@@ -637,7 +647,7 @@ paired synthetic root-control, and randomized-null replays; mismatched/incomplet
 quarantined. `edge ingest-shadow` is the sole authorization boundary: it opens
 the WAL read-only, requires strictly newer complete parity-matched rows, prior
 qualification, source/config/code/provenance/replay/gate hashes, family/global
-BH plus the frozen-cluster veto, and durable online FDR before appending
+BY plus the frozen-cluster veto, and durable online FDR before appending
 immutable `lane=shadow` proof and
 the live-ingestion marker.
 

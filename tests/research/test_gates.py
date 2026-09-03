@@ -7,9 +7,10 @@ from research.gates import (
     deterministic_placebo_deltas, falsification_gate, matched_cluster_test,
     expectancy_rejection_report, gate_dependence_report, paired_delta, performance_floor,
     placebo_null_distribution,
-    qualification_report, recompute_gate_statistics, seal_final_window, structural_floor,
+    fdr_batch_evidence, qualification_report, recompute_gate_statistics,
+    seal_final_window, structural_floor,
     risk_unit_report, verified_gate_envelope, verify_gate_envelope,
-    walk_forward_report,
+    walk_forward_report, max_drawdown_of, paired_control_adequacy,
 )
 from research.costs import (RESTING_BRACKET, RESTING_BRACKET_FILL_SCHEMA,
                              resting_bracket_fill_claim)
@@ -138,6 +139,31 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertEqual(report["authorization_projection"]["candidate"]["counts"],
                          {"raw": 3, "eligible": 1, "excluded": 2})
 
+    def test_qualification_derives_a_risk_scaled_drawdown_limit(self):
+        from research.gates import qualification_report
+        candidate = self._equity_quote_row(risk_usd=12.5, net_pnl=2.0)
+        baseline = {**candidate, "net_pnl": 0.0}
+        report = qualification_report(
+            [candidate], [baseline], vehicle="equity",
+            sessions=["2026-01-02"], min_trades=1, min_sessions=1,
+            min_clusters=1, max_drawdown_r=10.0)
+        self.assertEqual(report["max_drawdown_limit"], 125.0)
+        self.assertEqual(report["max_drawdown_limit_source"],
+                         "median_risk_usd_times_r")
+        self.assertEqual(report["max_drawdown_limit_r"], 10.0)
+        self.assertTrue(report["drawdown_within_limit"])
+
+        no_risk = qualification_report(
+            [{key: value for key, value in candidate.items()
+              if key != "risk_usd"}],
+            [{key: value for key, value in baseline.items()
+              if key != "risk_usd"}],
+            vehicle="equity", sessions=["2026-01-02"], min_trades=1,
+            min_sessions=1, min_clusters=1)
+        self.assertIsNone(no_risk["max_drawdown_limit"])
+        self.assertFalse(no_risk["drawdown_within_limit"])
+        self.assertFalse(no_risk["adequate"])
+
     def test_opra_option_rows_satisfy_fill_and_risk_evidence(self):
         rows = [{
             "vehicle": "option", "symbol": "SPY",
@@ -232,6 +258,23 @@ class EvidenceGateTests(unittest.TestCase):
             paired_delta(candidate, baseline, vehicle="equity")["matched"], 0)
         self.assertEqual(
             paired_delta(baseline, candidate, vehicle="equity")["matched"], 0)
+
+    def test_matched_cluster_test_materializes_one_shot_inputs(self):
+        candidate = _rows(3, net=2.0)
+        baseline = _rows(3, net=0.0, prefix="baseline")
+        result = matched_cluster_test(
+            (row for row in candidate), (row for row in baseline),
+            vehicle="equity", min_matched=3, min_coverage=1.0)
+        self.assertEqual(result["matched"], 3)
+        self.assertEqual(result["paired_adequacy"]["matched"], 3)
+        self.assertTrue(result["adequate"])
+
+        adequacy = paired_control_adequacy(
+            (row for row in candidate), (row for row in baseline),
+            vehicle="equity", min_matched=3, min_coverage=1.0)
+        self.assertEqual(adequacy["candidate_count"], 3)
+        self.assertEqual(adequacy["control_count"], 3)
+        self.assertTrue(adequacy["adequate"])
 
     def test_chronological_split_never_bisects_a_trading_session(self):
         rows = [
@@ -512,6 +555,106 @@ class EvidenceGateTests(unittest.TestCase):
         envelope["passes"] = True
         self.assertFalse(verify_gate_envelope(envelope))
 
+    def test_verified_envelope_recomputes_complete_fdr_batch(self):
+        heldout = [{"vehicle": "equity", "session_date": "2024-01-03",
+                    "opportunity_id": "held", "net_pnl": 1.0}]
+        candidate_id = "fixture-candidate"
+        batch = fdr_batch_evidence(
+            candidate_id=candidate_id,
+            family_name="fixture",
+            family_candidate_key=candidate_id,
+            global_candidate_key=candidate_id,
+            family_values={"fixture": {candidate_id: .01, "sibling": .04}},
+            global_values={candidate_id: .01, "sibling": .04},
+            alpha=.05,
+            p_value_source="gate")
+        family_q = batch["family_results"]["fixture"][candidate_id]["p_adjusted"]
+        global_q = batch["global_results"][candidate_id]["p_adjusted"]
+        envelope = verified_gate_envelope(
+            lane="backtest", vehicle="equity", fit=[], heldout=heldout,
+            fit_floor=structural_floor(
+                [], vehicle="equity", min_trades=0, min_sessions=0,
+                min_clusters=0, required=False),
+            heldout_floor=structural_floor(
+                heldout, vehicle="equity", min_trades=1, min_sessions=1,
+                min_clusters=1),
+            control={},
+            p_value=.01, q_value=global_q, family_q_value=family_q,
+            alpha=.05, fdr_batch=batch,
+            falsification={}, separation={},
+            checks={"family_fdr_significant": family_q <= .05,
+                    "global_fdr_significant": global_q <= .05},
+            passes=False, candidate_id=candidate_id)
+        self.assertTrue(envelope["checks"]["multiple_testing_batch_bound"])
+        self.assertTrue(verify_gate_envelope(envelope))
+
+        scalar_tamper = copy.deepcopy(envelope)
+        scalar_tamper["statistics"]["q_value"] = .001
+        from research.gates import _content_hash
+        scalar_tamper["content_hash"] = _content_hash({
+            key: value for key, value in scalar_tamper.items()
+            if key != "content_hash"
+        })
+        self.assertFalse(verify_gate_envelope(scalar_tamper))
+
+        batch_tamper = copy.deepcopy(envelope)
+        replacement = fdr_batch_evidence(
+            candidate_id=candidate_id,
+            family_name="fixture",
+            family_candidate_key=candidate_id,
+            global_candidate_key=candidate_id,
+            family_values={"fixture": {candidate_id: .02, "sibling": .04}},
+            global_values={candidate_id: .02, "sibling": .04},
+            alpha=.05,
+            p_value_source="gate")
+        batch_tamper["fdr_batch"] = replacement
+        batch_tamper["content_hash"] = _content_hash({
+            key: value for key, value in batch_tamper.items()
+            if key != "content_hash"
+        })
+        self.assertFalse(verify_gate_envelope(batch_tamper))
+
+    def test_cluster_fdr_batch_is_bound_to_the_frozen_policy(self):
+        from research.gates import _fdr_batch_matches
+
+        batch = fdr_batch_evidence(
+            candidate_id="candidate", family_name="family",
+            family_candidate_key="candidate",
+            global_candidate_key="candidate",
+            family_values={"family": {"candidate": .01}},
+            global_values={"candidate": .01}, alpha=.05,
+            cluster_name="cluster-a", cluster_candidate_key="candidate",
+            cluster_values={"cluster-a": {"candidate": .01}},
+            policy_hash="policy-a")
+        statistics = {
+            "p_value": .01, "family_q_value": .01,
+            "q_value": .01, "cluster_q_value": .01, "alpha": .05,
+        }
+        checks = {
+            "family_fdr_significant": True,
+            "global_fdr_significant": True,
+            "cluster_fdr_significant": True,
+        }
+        self.assertTrue(_fdr_batch_matches(
+            batch, statistics=statistics, checks=checks, provenance={},
+            candidate_id="candidate",
+            cluster_multiple_tests={"policy_hash": "policy-a"}))
+        tampered = copy.deepcopy(batch)
+        tampered["policy_hash"] = "policy-b"
+        self.assertFalse(_fdr_batch_matches(
+            tampered, statistics=statistics, checks=checks, provenance={},
+            candidate_id="candidate",
+            cluster_multiple_tests={"policy_hash": "policy-a"}))
+        with self.assertRaises(ValueError):
+            fdr_batch_evidence(
+                candidate_id="candidate", family_name="family",
+                family_candidate_key="candidate",
+                global_candidate_key="candidate",
+                family_values={"family": {"candidate": .01}},
+                global_values={"candidate": .01}, alpha=.05,
+                cluster_name="cluster-a", cluster_candidate_key="candidate",
+                cluster_values={"cluster-a": {"candidate": .01}})
+
     def test_legacy_envelope_without_feed_rebuilds_under_historical_sip(self):
         from research.gates import _content_hash
 
@@ -546,6 +689,155 @@ class EvidenceGateTests(unittest.TestCase):
             if key != "content_hash"
         })
         self.assertTrue(verify_gate_envelope(legacy))
+
+    def test_v3_null_control_cannot_lower_the_protocol_match_floor(self):
+        """A diagnostic caller cannot turn one null pair into gate evidence."""
+        from research import gates as gates_module
+
+        heldout = _rows(30, net=1.0)
+        baseline = [{**row, "net_pnl": 0.0} for row in heldout]
+        null_source = [dict(baseline[0])]
+        control = matched_cluster_test(heldout, baseline, vehicle="equity")
+        thin_null = matched_cluster_test(
+            heldout, null_source, vehicle="equity",
+            min_matched=1, min_coverage=0.0)
+        thin_null["minimum_matched"] = 1
+        thin_null["minimum_coverage"] = 0.0
+        envelope = verified_gate_envelope(
+            lane="backtest", vehicle="equity", fit=[], heldout=heldout,
+            fit_baseline=[], heldout_baseline=baseline,
+            null_source=null_source,
+            fit_floor=structural_floor(
+                [], vehicle="equity", min_trades=0, min_sessions=0,
+                min_clusters=0, required=False),
+            heldout_floor=structural_floor(
+                heldout, vehicle="equity", min_trades=1, min_sessions=1,
+                min_clusters=1, required=False),
+            control=control, p_value=control["p_value"], q_value=1.0,
+            alpha=.05, falsification={}, separation={}, checks={},
+            passes=False, qualification={}, null_control=thin_null,
+            fit_control={}, online_fdr={
+                "required": False, "status": "deferred_to_live_shadow",
+                "tested": False, "decision": False},
+            candidate_id="thin-null")
+        adequacy = envelope["null_control"]["paired_adequacy"]
+        self.assertEqual(adequacy["matched"], 1)
+        self.assertEqual(
+            adequacy["minimum_matched"], gates_module.NULL_CONTROL_MIN_MATCHED)
+        self.assertFalse(adequacy["adequate"])
+        self.assertTrue(envelope["null_control"]["raw_available"])
+        self.assertFalse(envelope["null_control"]["available"])
+        self.assertFalse(envelope["checks"]["null_control_available"])
+        self.assertTrue(verify_gate_envelope(envelope))
+
+        forged = copy.deepcopy(envelope)
+        weak = paired_control_adequacy(
+            heldout, null_source, vehicle="equity",
+            min_matched=1, min_coverage=0.0)
+        forged["null_control"].update({
+            "paired_adequacy": weak,
+            "coverage": weak["coverage"],
+            "adequate": True,
+            "available": True,
+            "minimum_matched": 1,
+            "minimum_coverage": 0.0,
+        })
+        forged["checks"]["null_control_available"] = True
+        forged["content_hash"] = gates_module._content_hash({
+            key: value for key, value in forged.items()
+            if key != "content_hash"})
+        self.assertFalse(verify_gate_envelope(forged))
+
+    def test_legacy_v2_null_replay_preserves_symmetric_adequacy_and_no_trade(self):
+        """Historical v2 null coverage is not reinterpreted as the v3 estimand."""
+        from research import gates as gates_module
+
+        heldout = _rows(5, net=1.0)
+        baseline = [{**row, "net_pnl": 0.0} for row in heldout]
+        # The old null arm had additional unmatched control rows.  Its v2
+        # symmetric denominator therefore reported 5/10 coverage even though
+        # the current candidate-only rule would report 5/5.
+        null_source = baseline + [{
+            **row, "session_date": f"2024-02-{index + 1:02d}",
+            "opportunity_id": f"null-extra-{index}", "net_pnl": 0.0
+        } for index, row in enumerate(heldout)]
+        fit_floor = structural_floor(
+            [], vehicle="equity", min_trades=0, min_sessions=0,
+            min_clusters=0, required=False)
+        heldout_floor = structural_floor(
+            heldout, vehicle="equity", min_trades=1, min_sessions=1,
+            min_clusters=1, required=False)
+        control = matched_cluster_test(heldout, baseline, vehicle="equity")
+        null_control = matched_cluster_test(
+            heldout, null_source, vehicle="equity")
+        envelope = verified_gate_envelope(
+            lane="backtest", vehicle="equity", fit=[], heldout=heldout,
+            fit_baseline=[], heldout_baseline=baseline,
+            null_source=null_source, fit_floor=fit_floor,
+            heldout_floor=heldout_floor, control=control,
+            p_value=control["p_value"], q_value=1.0, alpha=.05,
+            falsification={}, separation={}, checks={}, passes=False,
+            qualification={}, null_control=null_control, fit_control={},
+            online_fdr={"required": False,
+                        "status": "deferred_to_live_shadow",
+                        "tested": False, "decision": False},
+            candidate_id="legacy-v2-null")
+        self.assertTrue(verify_gate_envelope(envelope))
+        legacy = copy.deepcopy(envelope)
+        legacy["schema"] = gates_module.LEGACY_GATE_ENVELOPE_SCHEMA_V2
+        legacy.pop("fdr_batch", None)
+        legacy["checks"].pop("actual_control_adequate", None)
+        legacy["checks"].pop("multiple_testing_batch_bound", None)
+        # Match the actual v2 report shape.  The current matched-test helper
+        # adds risk-unit and top-level adequacy fields that did not exist in
+        # v2; only the separately persisted v2 paired-adequacy report remains.
+        for key in (
+                "coverage", "adequate", "raw_available", "r_deltas",
+                "r_delta_clusters", "r_matched", "mean_r_delta",
+                "r_delta_lcb", "r_lower_bound"):
+            legacy["null_control"].pop(key, None)
+        for key in (
+                "paired_adequacy", "coverage", "adequate", "r_deltas",
+                "r_delta_clusters", "r_matched", "mean_r_delta",
+                "r_delta_lcb", "r_lower_bound"):
+            legacy["control"].pop(key, None)
+        # v2's actual-control check was descriptive (matched > 0), without
+        # the v3 powered adequacy veto.
+        legacy["checks"]["actual_control_available"] = True
+        legacy_adequacy = gates_module._legacy_v2_paired_control_adequacy(
+            heldout, null_source, vehicle="equity", min_matched=1,
+            min_coverage=.8, equity_feed="iex")
+        legacy["null_control"]["available"] = bool(null_control["available"])
+        legacy["null_control"]["paired_adequacy"] = legacy_adequacy
+        legacy["null_control"]["minimum_matched"] = 1
+        legacy["null_control"]["minimum_coverage"] = .8
+        legacy["passes"] = False
+        legacy["content_hash"] = gates_module._content_hash({
+            key: value for key, value in legacy.items()
+            if key != "content_hash"})
+        self.assertEqual(legacy_adequacy["coverage"], .5)
+        self.assertTrue(verify_gate_envelope(legacy))
+        tampered = copy.deepcopy(legacy)
+        tampered["null_control"]["paired_adequacy"]["coverage"] = 1.0
+        tampered["content_hash"] = gates_module._content_hash({
+            key: value for key, value in tampered.items()
+            if key != "content_hash"})
+        self.assertFalse(verify_gate_envelope(tampered))
+
+        # v2's matched statistic retained no-trade rows while adequacy did
+        # not.  Preserve that deliberate audit quirk independently of v3.
+        no_trade = {**heldout[0], "session_date": "2024-03-01",
+                    "opportunity_id": "legacy-no-trade", "no_trade": True,
+                    "net_pnl": 0.0}
+        legacy_no_trade = gates_module._legacy_v2_paired_control_adequacy(
+            [*heldout, no_trade], [*null_source, no_trade],
+            vehicle="equity", min_matched=1, min_coverage=.8,
+            equity_feed="iex")
+        self.assertEqual(legacy_no_trade["candidate_count"], len(heldout))
+        self.assertEqual(legacy_no_trade["control_count"], len(null_source))
+        self.assertEqual(legacy_no_trade["matched"], len(heldout) + 1)
+        self.assertAlmostEqual(legacy_no_trade["coverage"],
+                               (len(heldout) + 1) / len(null_source))
 
     def test_qualification_source_digests_are_recomputed_and_tampering_fails(self):
         candidate = _rows(3, net=2.0)
@@ -630,6 +922,16 @@ class EvidenceGateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             benjamini_hochberg({"ok": .5}, alpha=float("nan"))
 
+    def test_dependence_safe_fdr_is_stricter_than_bh(self):
+        from research.stats import benjamini_hochberg, benjamini_yekutieli
+        values = {"target": .02, "sibling": .9}
+        bh = benjamini_hochberg(values, alpha=.05)
+        by = benjamini_yekutieli(values, alpha=.05)
+        self.assertTrue(bh["target"]["significant"])
+        self.assertFalse(by["target"]["significant"])
+        self.assertGreater(by["target"]["p_adjusted"],
+                           bh["target"]["p_adjusted"])
+
     def test_matched_pairs_feed_block_bootstrap_in_market_chronology(self):
         from research.gates import matched_pairs
         candidate = []
@@ -661,6 +963,107 @@ class EvidenceGateTests(unittest.TestCase):
             pairs["timestamps"],
             [datetime(2026, 1, 1, 9, 30, tzinfo=timezone.utc).timestamp()],
         )
+
+    def test_actual_baseline_adequacy_fails_closed_for_thirty_vs_five(self):
+        candidate = _rows(30, net=1.0)
+        baseline = [dict(candidate[index], net_pnl=0.0)
+                    for index in range(5)]
+        report = paired_control_adequacy(
+            candidate, baseline, vehicle="equity")
+        self.assertEqual(report["matched"], 5)
+        self.assertLess(report["coverage"], .8)
+        self.assertFalse(report["adequate"])
+        self.assertFalse(matched_cluster_test(
+            candidate, baseline, vehicle="equity", iterations=10)["adequate"])
+
+    def test_extra_baseline_trades_do_not_reduce_complete_candidate_coverage(self):
+        candidate = _rows(30, net=1.0)
+        baseline = [dict(row, net_pnl=0.0) for row in candidate]
+        baseline.extend(_rows(
+            10, net=0.0, symbol="QQQ", prefix="baseline-only"))
+        report = paired_control_adequacy(
+            candidate, baseline, vehicle="equity")
+        self.assertEqual(report["matched"], 30)
+        self.assertEqual(report["candidate_count"], 30)
+        self.assertEqual(report["control_count"], 40)
+        self.assertEqual(report["coverage"], 1.0)
+        self.assertTrue(report["adequate"])
+
+    def test_no_trade_rows_cannot_inflate_paired_coverage(self):
+        candidate = _rows(30, net=1.0)
+        baseline = [dict(row, net_pnl=0.0) for row in candidate]
+        candidate[0]["no_trade"] = True
+        report = paired_control_adequacy(
+            candidate, baseline, vehicle="equity")
+        self.assertEqual(report["matched"], 29)
+        self.assertEqual(report["candidate_count"], 29)
+        self.assertLessEqual(report["coverage"], 1.0)
+        self.assertFalse(report["adequate"])
+
+    def test_drawdown_uses_realized_chronology_and_intraday_marks(self):
+        rows = [
+            {"symbol": "B", "exit_timestamp": "2026-01-03T00:00:00+00:00",
+             "net_pnl": -50.0},
+            {"symbol": "A", "exit_timestamp": "2026-01-01T00:00:00+00:00",
+             "net_pnl": 100.0},
+            {"symbol": "C", "exit_timestamp": "2026-01-02T00:00:00+00:00",
+             "net_pnl": -10.0},
+        ]
+        self.assertEqual(max_drawdown_of(rows), 60.0)
+        marks = [
+            {"timestamp": "2026-01-01T00:00:00+00:00", "account_equity": 100.0},
+            {"timestamp": "2026-01-01T01:00:00+00:00", "account_equity": 80.0},
+            {"timestamp": "2026-01-01T02:00:00+00:00", "account_equity": 95.0},
+        ]
+        self.assertEqual(max_drawdown_of(marks), 20.0)
+
+        untimestamped = [
+            {"opportunity_id": "z", "net_pnl": 100.0},
+            {"opportunity_id": "a", "net_pnl": -50.0},
+            {"opportunity_id": "y", "net_pnl": 100.0},
+            {"opportunity_id": "b", "net_pnl": -120.0},
+        ]
+        self.assertEqual(max_drawdown_of(untimestamped), 120.0)
+
+    def test_falsification_requires_independent_provenance_when_requested(self):
+        rejected = falsification_gate(
+            [2.0, 2.0], [-1.0, -.5, .5, 1.0],
+            preregistered_p_value=.001, require_independent=True)
+        self.assertFalse(rejected["passes"])
+        accepted = falsification_gate(
+            [2.0, 2.0], [-1.0, -.5, .5, 1.0],
+            preregistered_p_value=.001,
+            independent_p_value=.01,
+            independent_method="independent_empirical_null_tail",
+            independent_result_hash="fixture",
+            require_independent=True)
+        self.assertTrue(accepted["independent_supplied"])
+        self.assertEqual(accepted["p_value_source"],
+                         "heldout_paired_cluster_sign_flip")
+        self.assertEqual(accepted["p_value"], .001)
+        # A second Monte Carlo seed over the same held-out deltas is an audit
+        # replication, not a second independent market experiment.  Its tail
+        # estimate therefore cannot create an accidental double-significance
+        # hurdle for the preregistered paired test.
+        noisy_replication = falsification_gate(
+            [2.0, 2.0], [-1.0, -.5, .5, 1.0],
+            preregistered_p_value=.001,
+            independent_p_value=.99,
+            independent_method="independent_empirical_null_tail",
+            independent_result_hash="different-seed",
+            require_independent=True)
+        self.assertTrue(noisy_replication["passes"])
+        self.assertEqual(noisy_replication["p_value"], .001)
+
+    def test_falsification_rejects_nonfinite_samples(self):
+        for observed, placebo in (([float("inf")], [0.0]),
+                                  ([float("nan")], [0.0]),
+                                  ([1.0], [float("-inf")]),
+                                  ([True], [0.0])):
+            with self.subTest(observed=observed, placebo=placebo), \
+                    self.assertRaises(ValueError):
+                falsification_gate(
+                    observed, placebo, preregistered_p_value=.001)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """Conditional forward-return diagnostics stay causal and non-authorizing."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
@@ -168,6 +169,32 @@ class ConditionalForwardReturnTests(unittest.TestCase):
             {"precomputed_event_invalid": 1,
              "no_actionable_signal": len(prefix["first_signals"]) - 1},
         )
+
+    def test_empty_precomputed_backfill_prefix_is_data_ineligible(self):
+        historical = [replace(
+            row,
+            identity=replace(
+                row.identity,
+                as_of=row.timestamp,
+                observed_at=row.timestamp + timedelta(days=30),
+                source_mode="historical_backfill",
+            ),
+        ) for row in self.bars]
+        prefix = _fit_prefixes(historical, ROOT_SPEC)
+        self.assertFalse(prefix["first_signals"])
+        self.assertEqual(prefix["eligibility_provenance"]["status"],
+                         "data_ineligible")
+        quality = measure_signal_quality(
+            historical, ROOT_SPEC,
+            precomputed_first_signals=prefix["first_signals"],
+            eligibility_provenance=prefix["eligibility_provenance"])
+        self.assertEqual(quality["event_count"], 0)
+        self.assertEqual(quality["event_rejection_counts"],
+                         {"data_ineligible": 16})
+        self.assertEqual(quality["eligibility_provenance"]["status"],
+                         "data_ineligible")
+        self.assertNotEqual(
+            quality["event_rejection_counts"], {"no_actionable_signal": 16})
 
 
 class ControlPrefixTests(unittest.TestCase):

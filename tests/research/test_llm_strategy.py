@@ -51,6 +51,10 @@ class LLMRuleStrategyTests(unittest.TestCase):
                     UNSUPPORTED_PROVIDER_SCHEMA_KEYS.isdisjoint(value),
                     f"unsupported provider keywords: "
                     f"{UNSUPPORTED_PROVIDER_SCHEMA_KEYS.intersection(value)}")
+                if value.get("type") == "object" or "properties" in value:
+                    self.assertEqual(set(value.get("properties", {})),
+                                     set(value.get("required", ())))
+                    self.assertFalse(value.get("additionalProperties", True))
                 for child in value.values():
                     walk(child)
             elif isinstance(value, list):
@@ -70,6 +74,16 @@ class LLMRuleStrategyTests(unittest.TestCase):
         self.assertEqual({branch["type"] for branch in builds_on["anyOf"]},
                          {"string", "null"})
         self.assertIn("builds_on", tuning["properties"]["variants"]["items"]["required"])
+
+    def test_v4_optional_grammar_fields_are_required_nullable_provider_values(self):
+        schema = RuleProposalAdapter._schema(PROPOSAL_SCHEMA, vehicle="equity")
+        v4 = next(branch for branch in schema["properties"]["rule_spec"]["anyOf"]
+                  if branch["properties"]["schema"]["enum"] == [RULE_SCHEMA_V4])
+        self.assertEqual(set(v4["properties"]), set(v4["required"]))
+        for field in ("target_mode", "target_lookback", "trailing_stop_r",
+                      "exit_before_minutes"):
+            self.assertTrue(any(option.get("type") == "null"
+                                for option in v4["properties"][field]["anyOf"]))
 
     def test_vehicle_provider_schema_excludes_v3_and_v4_for_options(self):
         equity = RuleProposalAdapter._schema(DISCOVERY_SCHEMA, vehicle="equity")
@@ -168,7 +182,8 @@ class LLMRuleStrategyTests(unittest.TestCase):
         result = adapter.preflight()
         self.assertEqual(result.status, "ready", result.reason)
         self.assertNotIn("temperature", seen)
-        self.assertEqual(seen["max_output_tokens"], 32)
+        self.assertEqual(seen["max_output_tokens"], 1200)
+        self.assertIn("rule_spec", json.dumps(seen["text"]["format"]["schema"]))
 
         expected = content_hash({
             "provider": "openai",

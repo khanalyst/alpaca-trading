@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
-from statistics import mean
+from statistics import mean, median
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -27,6 +27,7 @@ from .costs import (
 )
 from .stats import (
     DEFAULT_BOOTSTRAP_DRAWS, DEFAULT_NULL_DRAWS,
+    benjamini_yekutieli,
     clustered_mde_power, clustered_mde_power_report, effective_breadth_report,
     moving_block_cluster_bootstrap_lower_bound,
     paired_cluster_sign_flip, sign_flip_null_statistics, stable_seed,
@@ -47,12 +48,19 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
         equity_feed=equity_feed)
 
 
-GATE_ENVELOPE_SCHEMA = "verified-research-gate.v2"
+GATE_ENVELOPE_SCHEMA = "verified-research-gate.v3"
+LEGACY_GATE_ENVELOPE_SCHEMA_V2 = "verified-research-gate.v2"
+SUPPORTED_GATE_ENVELOPE_SCHEMAS = frozenset({
+    LEGACY_GATE_ENVELOPE_SCHEMA_V2, GATE_ENVELOPE_SCHEMA,
+})
+FDR_BATCH_SCHEMA = "research-fdr-batch.v1"
+FDR_BATCH_METHOD = "benjamini_yekutieli"
+FDR_BATCH_P_VALUE_SOURCES = frozenset({"gate", "selection_window_gate"})
 RETIREMENT_CONFIDENCE = .95
 RETIREMENT_MIN_SESSIONS = 30
 RETIREMENT_MIN_USEFUL_R = .05
 GATE_REQUIRED_CHECKS = frozenset({
-    "actual_control_available", "fit_delta_positive",
+    "actual_control_available", "actual_control_adequate", "fit_delta_positive",
     "heldout_delta_positive", "heldout_p_significant",
     "heldout_delta_lcb_positive", "heldout_net_pnl_positive",
     "heldout_expectancy_positive", "falsification", "separated",
@@ -60,11 +68,32 @@ GATE_REQUIRED_CHECKS = frozenset({
     "walk_forward_majority_positive", "null_control_available",
     "null_control_delta_positive", "fit_floor_adequate", "heldout_floor_adequate",
     "family_fdr_significant", "global_fdr_significant",
+    "multiple_testing_batch_bound",
     "cumulative_fdr_significant", "qualification_available",
     "qualification_net_positive", "qualification_delta_positive",
     "max_drawdown_supported",
     "risk_unit_adequate", "fill_quality_adequate", "cost_stress_adequate",
     "qualification_floor_adequate", "qualification_confidence_supported",
+    "qualification_drawdown_supported",
+})
+# Exact required-check contract emitted by the v2 builder.  It is retained
+# only to verify quarantined historical evidence under its original semantics;
+# current runs must use v3 and its complete multiple-testing batch binding.
+LEGACY_GATE_REQUIRED_CHECKS_V2 = frozenset({
+    "actual_control_available", "fit_delta_positive",
+    "heldout_delta_positive", "heldout_p_significant",
+    "heldout_delta_lcb_positive", "heldout_net_pnl_positive",
+    "heldout_expectancy_positive", "falsification", "separated",
+    "walk_forward_available", "walk_forward_adequate",
+    "walk_forward_majority_positive", "null_control_available",
+    "null_control_delta_positive", "fit_floor_adequate",
+    "heldout_floor_adequate", "family_fdr_significant",
+    "global_fdr_significant", "cumulative_fdr_significant",
+    "qualification_available", "qualification_net_positive",
+    "qualification_delta_positive", "max_drawdown_supported",
+    "risk_unit_adequate", "fill_quality_adequate",
+    "cost_stress_adequate", "qualification_floor_adequate",
+    "qualification_confidence_supported",
     "qualification_drawdown_supported",
 })
 CLUSTER_SECONDS = 86_400
@@ -91,6 +120,14 @@ PROTOCOL_QUALIFICATION_MIN_CLUSTERS = 30
 # checked against both paired coverage and absolute count.
 NULL_CONTROL_MIN_MATCHED = 30
 NULL_CONTROL_MIN_COVERAGE = 0.80
+# Actual-baseline controls use the same minimum paired evidence contract as
+# randomized null controls.  Keeping this explicit (rather than deriving it
+# from a caller's trade floor) prevents a 30-candidate/5-control comparison
+# from looking authorizing merely because a local diagnostic requested five
+# trades.
+ACTUAL_CONTROL_MIN_MATCHED = 30
+ACTUAL_CONTROL_MIN_COVERAGE = 0.80
+QUALIFICATION_MAX_DRAWDOWN_R = 10.0
 # Readable aliases for callers that want to display the protocol without
 # depending on the internal naming scheme.  Enforcement uses ``PROTOCOL_*``
 # directly so these compatibility names cannot weaken a durable check.
@@ -112,11 +149,215 @@ COST_STRESS_SCENARIOS_BPS = (9.0, 15.0, 25.0, 50.0)
 COST_STRESS_REQUIRED_BPS = 25.0
 # New gate envelopes use the single preregistered held-out paired statistic
 # for both the named significance and falsification checks.  The falsification
-# gate still has independent positive-effect, null-degeneracy, and scale
-# guards; this marker lets old envelopes that recorded a second empirical
-# null-tail p-value remain replayable without giving new runs two chances at
-# significance.
+# gate still has positive-effect, null-degeneracy, scale, and independently
+# seeded replication-integrity guards; this marker lets old envelopes that
+# recorded a second empirical null-tail p-value remain replayable without
+# giving new runs two chances at significance.
 FALSIFICATION_P_VALUE_SOURCE = "heldout_paired_cluster_sign_flip"
+FALSIFICATION_INDEPENDENT_P_VALUE_SOURCE = "independent_placebo_null_tail"
+FALSIFICATION_INDEPENDENT_METHOD = "independent_empirical_null_tail"
+
+
+def fdr_batch_evidence(*, candidate_id: str,
+                       family_name: str,
+                       family_candidate_key: str,
+                       global_candidate_key: str,
+                       family_values: Mapping[str, Mapping[str, Any]],
+                       global_values: Mapping[str, Any],
+                       alpha: float,
+                       p_value_source: str = "gate",
+                       cluster_name: str | None = None,
+                       cluster_candidate_key: str | None = None,
+                       cluster_values: Mapping[str, Mapping[str, Any]] | None = None,
+                       policy_hash: str | None = None) -> dict:
+    """Build complete, replayable BY evidence for one candidate decision.
+
+    Scalar q-values are not sufficient evidence: changing the other p-values
+    in a family can change the candidate's adjusted value.  This record keeps
+    every raw p-value in each relevant scope and the deterministic BY result,
+    while binding the target keys and the source statistic used by the gate.
+    """
+    nominal = float(alpha)
+    source = str(p_value_source)
+    if source not in FDR_BATCH_P_VALUE_SOURCES:
+        raise ValueError("unsupported FDR batch p-value source")
+    normalized_families = {
+        str(name): {str(key): value for key, value in values.items()}
+        for name, values in family_values.items()
+    }
+    normalized_global = {str(key): value for key, value in global_values.items()}
+    family_results = {
+        name: benjamini_yekutieli(values, alpha=nominal)
+        for name, values in normalized_families.items()
+    }
+    body: dict[str, Any] = {
+        "schema": FDR_BATCH_SCHEMA,
+        "method": FDR_BATCH_METHOD,
+        "alpha": nominal,
+        "p_value_source": source,
+        "candidate_id": str(candidate_id),
+        "family_name": str(family_name),
+        "family_candidate_key": str(family_candidate_key),
+        "global_candidate_key": str(global_candidate_key),
+        "family_values": normalized_families,
+        "family_results": family_results,
+        "global_values": normalized_global,
+        "global_results": benjamini_yekutieli(
+            normalized_global, alpha=nominal),
+    }
+    if cluster_values is not None:
+        if (cluster_name is None or cluster_candidate_key is None or
+                policy_hash is None or not str(policy_hash).strip()):
+            raise ValueError(
+                "cluster FDR evidence requires target keys and a policy hash")
+        normalized_clusters = {
+            str(name): {str(key): value for key, value in values.items()}
+            for name, values in cluster_values.items()
+        }
+        body.update({
+            "cluster_name": str(cluster_name),
+            "cluster_candidate_key": str(cluster_candidate_key),
+            "cluster_values": normalized_clusters,
+            "cluster_results": {
+                name: benjamini_yekutieli(values, alpha=nominal)
+                for name, values in normalized_clusters.items()
+            },
+        })
+        body["policy_hash"] = str(policy_hash)
+    return body
+
+
+def _fdr_batch_matches(batch: Mapping | None, *, statistics: Mapping,
+                       checks: Mapping, provenance: Mapping,
+                       candidate_id: str | None,
+                       cluster_multiple_tests: Mapping | None = None) -> bool:
+    """Recompute and bind a complete multiple-testing batch to one gate."""
+    if not isinstance(batch, Mapping) or not isinstance(statistics, Mapping):
+        return False
+    if (batch.get("schema") != FDR_BATCH_SCHEMA or
+            batch.get("method") != FDR_BATCH_METHOD or
+            batch.get("p_value_source") not in FDR_BATCH_P_VALUE_SOURCES):
+        return False
+    if candidate_id is None or batch.get("candidate_id") != str(candidate_id):
+        return False
+    try:
+        alpha = float(statistics.get("alpha"))
+        if (not math.isfinite(alpha) or not 0.0 < alpha <= 1.0 or
+                not _close_number(batch.get("alpha"), alpha)):
+            return False
+        family_values = batch.get("family_values")
+        family_results = batch.get("family_results")
+        global_values = batch.get("global_values")
+        global_results = batch.get("global_results")
+        if (not isinstance(family_values, Mapping) or not family_values or
+                not isinstance(family_results, Mapping) or
+                not isinstance(global_values, Mapping) or not global_values or
+                not isinstance(global_results, Mapping)):
+            return False
+        expected_family: dict[str, dict] = {}
+        for name, values in family_values.items():
+            if not isinstance(name, str) or not isinstance(values, Mapping) or not values:
+                return False
+            expected_family[name] = benjamini_yekutieli(
+                dict(values), alpha=alpha)
+        expected_global = benjamini_yekutieli(dict(global_values), alpha=alpha)
+        if expected_family != dict(family_results) or \
+                expected_global != dict(global_results):
+            return False
+        family_name = batch.get("family_name")
+        family_key = batch.get("family_candidate_key")
+        global_key = batch.get("global_candidate_key")
+        if (not isinstance(family_name, str) or
+                not isinstance(family_key, str) or
+                not isinstance(global_key, str)):
+            return False
+        target_family_values = family_values.get(family_name)
+        target_family_results = family_results.get(family_name)
+        if (not isinstance(target_family_values, Mapping) or
+                not isinstance(target_family_results, Mapping) or
+                family_key not in target_family_values or
+                family_key not in target_family_results or
+                global_key not in global_values or global_key not in global_results):
+            return False
+        family_result = target_family_results[family_key]
+        global_result = global_results[global_key]
+        if not isinstance(family_result, Mapping) or not isinstance(global_result, Mapping):
+            return False
+        family_raw = target_family_values[family_key]
+        global_raw = global_values[global_key]
+        if not _close_number(family_raw, global_raw):
+            return False
+        expected_source_p = (statistics.get("p_value")
+                             if batch.get("p_value_source") == "gate" else
+                             provenance.get("selection_raw_p_value"))
+        if expected_source_p is None or not _close_number(family_raw, expected_source_p):
+            return False
+        family_q = float(statistics.get("family_q_value"))
+        global_q = float(statistics.get("q_value"))
+        if (not _close_number(family_result.get("p_adjusted"), family_q) or
+                not _close_number(global_result.get("p_adjusted"), global_q) or
+                ("family_fdr_significant" in checks and
+                 bool(checks.get("family_fdr_significant")) !=
+                 bool(family_result.get("significant"))) or
+                ("global_fdr_significant" in checks and
+                 bool(checks.get("global_fdr_significant")) !=
+                 bool(global_result.get("significant")))):
+            return False
+        cluster_required = (
+            "cluster_fdr_significant" in checks or
+            statistics.get("cluster_q_value") is not None)
+        if cluster_required:
+            cluster_name = batch.get("cluster_name")
+            cluster_key = batch.get("cluster_candidate_key")
+            cluster_values = batch.get("cluster_values")
+            cluster_results = batch.get("cluster_results")
+            if (not isinstance(cluster_name, str) or
+                    not isinstance(cluster_key, str) or
+                    not isinstance(cluster_values, Mapping) or not cluster_values or
+                    not isinstance(cluster_results, Mapping)):
+                return False
+            expected_clusters: dict[str, dict] = {}
+            for name, values in cluster_values.items():
+                if not isinstance(name, str) or not isinstance(values, Mapping) or not values:
+                    return False
+                expected_clusters[name] = benjamini_yekutieli(
+                    dict(values), alpha=alpha)
+            if expected_clusters != dict(cluster_results):
+                return False
+            target_cluster_values = cluster_values.get(cluster_name)
+            target_cluster_results = cluster_results.get(cluster_name)
+            if (not isinstance(target_cluster_values, Mapping) or
+                    not isinstance(target_cluster_results, Mapping) or
+                    cluster_key not in target_cluster_values or
+                    cluster_key not in target_cluster_results):
+                return False
+            cluster_result = target_cluster_results[cluster_key]
+            if (not isinstance(cluster_result, Mapping) or
+                    not _close_number(target_cluster_values[cluster_key], family_raw) or
+                    not _close_number(cluster_result.get("p_adjusted"),
+                                      statistics.get("cluster_q_value")) or
+                    bool(checks.get("cluster_fdr_significant")) !=
+                    bool(cluster_result.get("significant"))):
+                return False
+            # The raw cluster map is meaningful only under the frozen
+            # dependence policy that produced it.  Bind the batch to the
+            # separately persisted target correction so a re-signed proof
+            # cannot swap policy identities while preserving the same q-value.
+            declared_policy = (
+                cluster_multiple_tests.get("policy_hash")
+                if isinstance(cluster_multiple_tests, Mapping) else None)
+            batch_policy = batch.get("policy_hash")
+            if (not isinstance(declared_policy, str) or not declared_policy or
+                    not isinstance(batch_policy, str) or not batch_policy or
+                    batch_policy != declared_policy):
+                return False
+        elif any(key in batch for key in (
+                "cluster_name", "cluster_candidate_key", "cluster_values",
+                "cluster_results")):
+            return False
+        return True
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 # A gate's booleans often share one underlying source statistic.  Keeping this
 # map explicit makes that overlap visible to reports without changing any
@@ -197,6 +438,10 @@ def _authorization_exclusion_reason(row: Mapping[str, Any], *, vehicle: str,
     if (str(row.get("evidence_mode") or "").strip().lower() ==
             "diagnostic_historical_backfill"):
         return "diagnostic_historical_backfill"
+    if row.get("directional_authorizing") is False:
+        # A censored hold-discontinuity outcome is useful audit telemetry but
+        # cannot enter any directional effect, floor, or control calculation.
+        return "diagnostic_directional_outcome"
     if row.get("no_trade") is True:
         return "no_trade"
     if row.get("vehicle", vehicle) != vehicle:
@@ -691,13 +936,22 @@ def paired_delta(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
     left_by_key = unique(left)
     right_by_key = unique(right)
     deltas = []
+    r_deltas = []
     for key, row in left_by_key.items():
         other = right_by_key.get(key)
         if other is not None:
             deltas.append(float(row.get("net_pnl", 0.0)) - float(other.get("net_pnl", 0.0)))
+            left_r = _risk_multiple(row)
+            right_r = _risk_multiple(other)
+            if left_r is not None and right_r is not None:
+                r_deltas.append(left_r - right_r)
     return {"vehicle": vehicle, "matched": len(deltas),
             "mean_delta": mean(deltas) if deltas else None,
-            "deltas": deltas}
+            "deltas": deltas,
+            "r_deltas": r_deltas,
+            "r_matched": len(r_deltas),
+            "mean_r_delta": mean(r_deltas) if r_deltas else None,
+            "risk_normalized_unit": "R" if r_deltas else None}
 
 
 def _unique_by_match_key(rows: Iterable[Mapping], vehicle: str, *,
@@ -751,6 +1005,8 @@ def matched_pairs(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
         item[0] is None, item[0] if item[0] is not None else 0.0, item[1]))
     keys: list[str] = []
     deltas: list[float] = []
+    r_deltas: list[float] = []
+    r_clusters: list[int] = []
     clusters: list[int] = []
     stamps: list[float] = []
     for index, (timestamp, key, row, other) in enumerate(matched):
@@ -761,19 +1017,32 @@ def matched_pairs(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
         clusters.append(int(timestamp // CLUSTER_SECONDS))
         deltas.append(float(row.get("net_pnl", 0.0)) -
                       float(other.get("net_pnl", 0.0)))
+        left_r = _risk_multiple(row)
+        right_r = _risk_multiple(other)
+        if left_r is not None and right_r is not None:
+            r_deltas.append(left_r - right_r)
+            r_clusters.append(clusters[-1])
     return {"vehicle": vehicle, "keys": keys, "deltas": deltas,
             "clusters": clusters, "timestamps": stamps,
-            "matched": len(deltas)}
+            "matched": len(deltas), "r_deltas": r_deltas,
+            "r_clusters": r_clusters, "r_matched": len(r_deltas)}
 
 
 def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
                          vehicle: str, seed: int = 20260728,
                          confidence: float = LOWER_BOUND_CONFIDENCE,
                          iterations: int = 20_000,
+                         min_matched: int = ACTUAL_CONTROL_MIN_MATCHED,
+                         min_coverage: float = ACTUAL_CONTROL_MIN_COVERAGE,
                          equity_feed: str = "iex") -> dict:
     """Test matched opportunity deltas with deterministic session clustering."""
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
         raise ValueError("iterations must be a positive integer")
+    # The statistic and the adequacy report consume the same evidence twice.
+    # Materialize one-shot iterables once so a generator cannot appear matched
+    # to the test and empty to the authorization floor.
+    candidate = [dict(row) for row in candidate]
+    baseline = [dict(row) for row in baseline]
     pairs = matched_pairs(
         candidate, baseline, vehicle=vehicle, equity_feed=equity_feed)
     triples = [(stamp, delta, 0.0) for stamp, delta
@@ -789,6 +1058,9 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
     result["matched_ids_hash"] = _content_hash(pairs["keys"])
     result["deltas"] = list(pairs["deltas"])
     result["delta_clusters"] = list(pairs["clusters"])
+    result["r_deltas"] = list(pairs.get("r_deltas", ()))
+    result["r_delta_clusters"] = list(pairs.get("r_clusters", ()))
+    result["r_matched"] = int(pairs.get("r_matched", 0))
     result["mean_delta"] = (sum(pairs["deltas"]) / pairs["matched"]
                             if pairs["matched"] else None)
     result["mean_delta_lcb"] = bound["lower_bound"]
@@ -797,6 +1069,36 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
         "block_length", "clusters", "observations")}
     result["actual_control"] = True
     result["available"] = bool(pairs["matched"])
+    adequacy = paired_control_adequacy(
+        candidate, baseline, vehicle=vehicle,
+        min_matched=min_matched, min_coverage=min_coverage,
+        equity_feed=equity_feed)
+    result["paired_adequacy"] = adequacy
+    result["coverage"] = adequacy["coverage"]
+    result["adequate"] = bool(adequacy["adequate"])
+    r_values = result["r_deltas"]
+    result["mean_r_delta"] = (sum(r_values) / len(r_values)
+                               if r_values else None)
+    if r_values:
+        r_bound = moving_block_cluster_bootstrap_lower_bound(
+            r_values, pairs["r_clusters"], confidence=confidence,
+            block_length=min(SERIAL_BLOCK_LENGTH,
+                             max(1, len(set(pairs["r_clusters"])))),
+            min_clusters=max(2, len(set(pairs["r_clusters"]))))
+        result["r_delta_lcb"] = r_bound.get("lower_bound")
+        result["r_lower_bound"] = {
+            key: r_bound.get(key) for key in (
+                "method", "available", "confidence", "draws", "seed",
+                "block_length", "clusters", "observations")}
+    else:
+        result["r_delta_lcb"] = None
+        result["r_lower_bound"] = {"method": "moving_block_cluster_bootstrap",
+                                    "available": False,
+                                    "confidence": confidence,
+                                    "draws": DEFAULT_BOOTSTRAP_DRAWS,
+                                    "seed": None,
+                                    "block_length": 1,
+                                    "clusters": 0, "observations": 0}
     return result
 
 
@@ -810,8 +1112,8 @@ def paired_control_adequacy(candidate: Iterable[Mapping], control: Iterable[Mapp
     authorizing predicate prevents a positive null delta from passing on a
     tiny, selectively matched subset of candidate opportunities.
     """
-    pairs = matched_pairs(candidate, control, vehicle=vehicle,
-                          equity_feed=equity_feed)
+    candidate = [dict(row) for row in candidate]
+    control = [dict(row) for row in control]
     candidate_rows = [row for row in _authorizing_rows(
         candidate, vehicle=vehicle, equity_feed=equity_feed)
                       if row.get("vehicle", vehicle) == vehicle and
@@ -820,7 +1122,18 @@ def paired_control_adequacy(candidate: Iterable[Mapping], control: Iterable[Mapp
         control, vehicle=vehicle, equity_feed=equity_feed)
                     if row.get("vehicle", vehicle) == vehicle and
                     row.get("no_trade") is not True]
-    denominator = max(len(candidate_rows), len(control_rows))
+    # Match exactly the same executed-row universe used by the denominator.
+    # This matters for legacy/diagnostic rows without fill metadata, where the
+    # projection intentionally retains no-trade observations for audit.
+    pairs = matched_pairs(candidate_rows, control_rows, vehicle=vehicle,
+                          equity_feed=equity_feed)
+    # Coverage answers the authorizing question: "what fraction of the
+    # candidate trades being tested has a matched control?"  Extra trades in
+    # a more-active baseline are outside that candidate estimand and cannot
+    # make an otherwise complete comparison inadequate.  The inverse failure
+    # remains closed: if the candidate has 30 trades and only five controls,
+    # coverage is still 5/30, and the absolute matched-pair floor also fails.
+    denominator = len(candidate_rows)
     coverage = pairs["matched"] / denominator if denominator else 0.0
     count_ok = pairs["matched"] >= int(min_matched)
     coverage_ok = coverage >= float(min_coverage)
@@ -834,6 +1147,45 @@ def paired_control_adequacy(candidate: Iterable[Mapping], control: Iterable[Mapp
         "count_adequate": bool(count_ok),
         "coverage_adequate": bool(coverage_ok),
         "adequate": bool(count_ok and coverage_ok),
+    }
+
+
+def _legacy_v2_paired_control_adequacy(
+        candidate: Iterable[Mapping], control: Iterable[Mapping], *,
+        vehicle: str, min_matched: int, min_coverage: float,
+        equity_feed: str) -> dict:
+    """Reproduce the v2 symmetric-coverage rule for audit verification only.
+
+    v2's descriptive matcher retained ``no_trade`` rows in its matched
+    statistic, while its adequacy denominator counted executed rows only.
+    Keep that asymmetric historical quirk here so re-verification neither
+    rewrites old evidence nor silently upgrades it to the v3 estimand.
+    """
+    candidate = [dict(row) for row in candidate]
+    control = [dict(row) for row in control]
+    pairs = matched_pairs(candidate, control, vehicle=vehicle,
+                          equity_feed=equity_feed)
+    candidate_rows = [row for row in _authorizing_rows(
+        candidate, vehicle=vehicle, equity_feed=equity_feed)
+                      if row.get("vehicle", vehicle) == vehicle and
+                      row.get("no_trade") is not True]
+    control_rows = [row for row in _authorizing_rows(
+        control, vehicle=vehicle, equity_feed=equity_feed)
+                    if row.get("vehicle", vehicle) == vehicle and
+                    row.get("no_trade") is not True]
+    denominator = max(len(candidate_rows), len(control_rows))
+    coverage = pairs["matched"] / denominator if denominator else 0.0
+    return {
+        "matched": int(pairs["matched"]),
+        "candidate_count": len(candidate_rows),
+        "control_count": len(control_rows),
+        "coverage": coverage,
+        "minimum_matched": int(min_matched),
+        "minimum_coverage": float(min_coverage),
+        "count_adequate": pairs["matched"] >= int(min_matched),
+        "coverage_adequate": coverage >= float(min_coverage),
+        "adequate": (pairs["matched"] >= int(min_matched) and
+                     coverage >= float(min_coverage)),
     }
 
 
@@ -976,6 +1328,7 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
 
 def placebo_null_distribution(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
                               vehicle: str, draws: int = DEFAULT_NULL_DRAWS,
+                              seed: int | None = None,
                               equity_feed: str = "iex") -> dict:
     """Draw a seeded cluster sign-flip null distribution for matched deltas.
 
@@ -986,7 +1339,7 @@ def placebo_null_distribution(candidate: Iterable[Mapping], baseline: Iterable[M
     pairs = matched_pairs(
         candidate, baseline, vehicle=vehicle, equity_feed=equity_feed)
     null = sign_flip_null_statistics(pairs["deltas"], pairs["clusters"],
-                                     draws=draws)
+                                     draws=draws, seed=seed)
     return {"method": "seeded_cluster_sign_flip_null",
             "available": bool(null["available"]) and len(pairs["deltas"]) >= 2,
             "observed": list(pairs["deltas"]),
@@ -1017,6 +1370,37 @@ def _match_key(row: Mapping, vehicle: str) -> str:
     return str(row.get("opportunity_id") or row.get("entry_timestamp") or "")
 
 
+def _risk_multiple(row: Mapping[str, Any]) -> float | None:
+    """Return one finite risk-normalized outcome when the row carries it.
+
+    ``r_multiple`` is preferred because it is the replay's canonical risk
+    unit.  Older rows often persist only P&L and ``risk_usd``; those remain
+    useful for compatibility and are normalized here without changing the
+    dollar statistic.  Invalid or non-positive risk anchors are omitted from
+    the R effect rather than silently treated as zero.
+    """
+    raw = row.get("r_multiple")
+    if raw is None:
+        raw = row.get("net_pnl")
+        risk = row.get("risk_usd")
+        if risk is None:
+            return None
+        try:
+            risk_value = float(risk)
+            raw_value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(risk_value) or risk_value <= 0:
+            return None
+        value = raw_value / risk_value
+    else:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return value if math.isfinite(value) else None
+
+
 def placebo_ratio(observed: Sequence[float], placebo: Sequence[float]) -> float | None:
     """Return the observed mean over the mean absolute null draw."""
     if not placebo:
@@ -1025,23 +1409,101 @@ def placebo_ratio(observed: Sequence[float], placebo: Sequence[float]) -> float 
     return mean(float(value) for value in observed) / baseline if baseline else None
 
 
-def max_drawdown_of(rows_or_values: Iterable[Mapping] | Iterable[float]) -> float:
-    """Maximum peak-to-trough loss, reported as a non-negative P&L amount."""
-    values = []
-    for row in rows_or_values:
-        value = row.get("net_pnl", row.get("return_value", 0.0)) if isinstance(row, Mapping) else row
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
+def _event_timestamp(row: Mapping[str, Any]) -> tuple[int, float, str]:
+    """Stable chronology key for realized/marked equity events."""
+    for name in ("realized_timestamp", "exit_timestamp", "timestamp",
+                 "observed_at", "entry_timestamp", "session_date"):
+        raw = row.get(name)
+        if raw is None:
             continue
-        if math.isfinite(number):
-            values.append(number)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value):
+                return (0, value, str(row.get("opportunity_id") or ""))
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return (0, parsed.timestamp(), str(row.get("opportunity_id") or ""))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return (1, 0.0, str(row.get("opportunity_id") or ""))
+
+
+def _equity_mark(row: Mapping[str, Any]) -> float | None:
+    """Find an absolute account-equity/mark field, if the replay supplied one."""
+    for name in ("account_equity", "equity", "equity_mark", "mark_equity",
+                 "portfolio_equity", "ending_equity", "cash", "balance"):
+        raw = row.get(name)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def max_drawdown_of(rows_or_values: Iterable[Mapping] | Iterable[float]) -> float:
+    """Maximum chronological peak-to-trough loss.
+
+    Trade rows contribute realized P&L at their exit/realization timestamp,
+    so symbol-major input order cannot change the result.  When an account
+    equity or intraday mark is present it is consumed as an absolute equity
+    event; realized deltas continue from that mark.  Bare numeric iterables
+    retain their historical sequential semantics.
+    """
+    materialized = list(rows_or_values)
+    if not materialized:
+        return 0.0
+    if not all(isinstance(item, Mapping) for item in materialized):
+        events: list[tuple[float, bool, tuple[int, float, str]]] = []
+        for index, item in enumerate(materialized):
+            try:
+                value = float(item)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value):
+                events.append((value, False, (0, float(index), str(index))))
+    else:
+        events = []
+        for index, row in enumerate(materialized):
+            mark = _equity_mark(row)
+            timestamp = _event_timestamp(row)
+            if timestamp[0] != 0:
+                # Untimestamped legacy rows retain their supplied chronology;
+                # opportunity ids are identifiers, not an ordering signal.
+                timestamp = (timestamp[0], float(index), timestamp[2])
+            if mark is not None:
+                events.append((mark, True, timestamp))
+                continue
+            raw = row.get("net_pnl", row.get("return_value", 0.0))
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value):
+                events.append((value, False, timestamp))
+        events.sort(key=lambda item: item[2])
     peak = equity = drawdown = 0.0
-    for value in values:
-        equity += value
-        peak = max(peak, equity)
+    marked_equity = False
+    for value, absolute, _ in events:
+        if absolute:
+            equity = value
+            marked_equity = True
+        else:
+            equity += value
+        if not marked_equity and equity > peak:
+            peak = equity
+        else:
+            peak = max(peak, equity)
         drawdown = max(drawdown, peak - equity)
-    return float(drawdown)
+    return float(drawdown) if math.isfinite(drawdown) else 0.0
 
 
 def heldout_separation(fit: Sequence[Mapping], heldout: Sequence[Mapping]) -> dict:
@@ -1058,15 +1520,35 @@ def heldout_separation(fit: Sequence[Mapping], heldout: Sequence[Mapping]) -> di
 
 def falsification_gate(observed: Sequence[float], placebo: Sequence[float], *,
                        alpha: float = .05, minimum_ratio: float = 1.0,
-                       preregistered_p_value: float | None = None) -> dict:
+                       preregistered_p_value: float | None = None,
+                       independent_p_value: float | None = None,
+                       independent_method: str | None = None,
+                       independent_result_hash: str | None = None,
+                       require_independent: bool = False) -> dict:
     """Place the observed mean delta inside a genuine null distribution.
 
-    ``placebo`` is a sample of null mean deltas.  The decision is an empirical
-    one-sided p-value against that distribution; the ratio is reported for
-    scale but cannot on its own authorize a pass.
+    ``placebo`` is a sample of null mean deltas.  The decision is the
+    preregistered paired-test p-value when supplied; the empirical null tail
+    remains a reproducible falsification diagnostic and the ratio is reported
+    for scale.  A separately seeded stream can be required as integrity
+    evidence, but it is not treated as an independent market sample.
     """
-    draws = [float(value) for value in placebo]
-    observed_values = [float(value) for value in observed]
+    def finite_values(values: Sequence[float], label: str) -> list[float]:
+        result = []
+        for raw in values:
+            if isinstance(raw, bool):
+                raise ValueError(f"{label} values must be finite numbers")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{label} values must be finite numbers") from exc
+            if not math.isfinite(value):
+                raise ValueError(f"{label} values must be finite numbers")
+            result.append(value)
+        return result
+
+    draws = finite_values(placebo, "placebo")
+    observed_values = finite_values(observed, "observed")
     observed_mean = mean(observed_values) if observed_values else 0.0
     placebo_mean = mean(draws) if draws else 0.0
     ratio = placebo_ratio(observed_values, draws)
@@ -1075,27 +1557,70 @@ def falsification_gate(observed: Sequence[float], placebo: Sequence[float], *,
     tolerance = 1e-15 * max(1.0, abs(observed_mean))
     extreme = sum(1 for value in draws if value >= observed_mean - tolerance)
     empirical_p_value = (extreme + 1) / (len(draws) + 1) if draws else 1.0
-    if preregistered_p_value is None:
-        p_value = empirical_p_value
-        p_value_source = "empirical_null_tail"
-    else:
+    independent_empirical_p = empirical_p_value
+    if independent_p_value is not None:
+        if isinstance(independent_p_value, bool):
+            raise ValueError("independent_p_value must be a finite probability")
+        try:
+            independent_empirical_p = float(independent_p_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "independent_p_value must be a finite probability") from exc
+        if (not math.isfinite(independent_empirical_p) or
+                not 0.0 <= independent_empirical_p <= 1.0):
+            raise ValueError("independent_p_value must be in [0,1]")
+    independent_method = (str(independent_method).strip()
+                          if independent_method is not None else "")
+    independent_result_hash = (str(independent_result_hash).strip()
+                               if independent_result_hash is not None else "")
+    independent_supplied = bool(
+        independent_p_value is not None and independent_method and
+        independent_result_hash)
+    primary_p_value = None
+    if preregistered_p_value is not None:
         if isinstance(preregistered_p_value, bool):
             raise ValueError("preregistered_p_value must be a finite probability")
         try:
-            p_value = float(preregistered_p_value)
+            primary_p_value = float(preregistered_p_value)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
                 "preregistered_p_value must be a finite probability") from exc
-        if not math.isfinite(p_value) or not 0.0 <= p_value <= 1.0:
+        if not math.isfinite(primary_p_value) or not 0.0 <= primary_p_value <= 1.0:
             raise ValueError("preregistered_p_value must be in [0,1]")
+    if require_independent and not independent_supplied:
+        # Current proofs require the second seeded calculation to be sealed so
+        # verification can reproduce it, even though it is not a second
+        # authorizing p-value.
+        p_value = 1.0
+        p_value_source = "missing_independent_result"
+    elif primary_p_value is not None:
+        # A differently seeded Monte Carlo stream over the same deltas is a
+        # reproducibility/integrity check, not independent market evidence.
+        # Keep the preregistered paired test as the sole authorizing p-value so
+        # the gate does not accidentally impose an approximately alpha-squared
+        # hurdle on one held-out sample.
+        p_value = primary_p_value
         p_value_source = FALSIFICATION_P_VALUE_SOURCE
+    elif independent_supplied:
+        p_value = independent_empirical_p
+        p_value_source = FALSIFICATION_INDEPENDENT_P_VALUE_SOURCE
+    else:
+        p_value = empirical_p_value
+        p_value_source = "empirical_null_tail"
     positive_mean = observed_mean > 0
     ratio_adequate = ratio is not None and ratio >= minimum_ratio
     p_significant = p_value <= float(alpha)
+    independent_pass = (not require_independent) or independent_supplied
     return {"observed_mean": observed_mean, "placebo_mean": placebo_mean,
             "ratio": ratio, "available": bool(draws),
             "draws": len(draws), "p_value": p_value, "alpha": float(alpha),
             "p_value_source": p_value_source,
+            "primary_p_value": primary_p_value,
+            "independent_p_value": (float(independent_empirical_p)
+                                     if independent_supplied else None),
+            "independent_method": independent_method or None,
+            "independent_result_hash": independent_result_hash or None,
+            "independent_supplied": independent_supplied,
             "minimum_ratio": float(minimum_ratio),
             "positive_mean": positive_mean,
             "ratio_adequate": ratio_adequate,
@@ -1103,7 +1628,7 @@ def falsification_gate(observed: Sequence[float], placebo: Sequence[float], *,
             "zero_placebo": zero_placebo,
             "distinct": not degenerate,
             "passes": bool(draws) and not zero_placebo and not degenerate and
-            positive_mean and p_significant and ratio_adequate}
+            positive_mean and p_significant and ratio_adequate and independent_pass}
 
 
 def sample_counts(rows: Iterable[Mapping], *, vehicle: str,
@@ -1125,6 +1650,8 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
                         min_fit_sessions: int = 1,
                         min_test_sessions: int = 1,
                         min_test_trades: int = 1,
+                        min_matched: int | None = None,
+                        min_coverage: float = ACTUAL_CONTROL_MIN_COVERAGE,
                         requested_min_sessions: int | None = None,
                         equity_feed: str = "iex") -> dict:
     """Return deterministic rolling-origin *forward stability* evidence.
@@ -1162,6 +1689,7 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
     test_min = max(1, min(requested_test_min,
                           max(0, requested_floor - fit_min) // count))
     trade_min = max(1, int(min_test_trades))
+    matched_min = (trade_min if min_matched is None else max(0, int(min_matched)))
     # Keep an initial fit history, then divide the remaining sessions into
     # deterministic contiguous test blocks.  ``divmod`` makes the earliest
     # blocks receive the extra session and is stable across processes.
@@ -1203,15 +1731,25 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
         pairs = matched_pairs(
             test_rows, base_rows, vehicle=vehicle,
             equity_feed=equity_feed)
+        control_adequacy = paired_control_adequacy(
+            test_rows, base_rows, vehicle=vehicle,
+            min_matched=matched_min, min_coverage=min_coverage,
+            equity_feed=equity_feed)
         delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
         net = sum(float(row.get("net_pnl", 0.0)) for row in test_rows)
         test_trades = sum(1 for row in test_rows if row.get("no_trade") is not True)
         adequate = bool(len(fit_sessions) >= fit_min and
                         len(test_sessions) >= test_min and
                         test_trades >= trade_min and pairs["matched"] >= trade_min)
+        # The fold's matched baseline is an authorizing requirement, not a
+        # descriptive statistic.  Existing direct helper callers retain their
+        # historical small-sample default (``min_matched`` omitted), while
+        # discovery/proof callers pass the protocol minimum explicitly.
+        adequate = bool(adequate and control_adequacy["adequate"])
         results.append({"fold": index, "fit_sessions": len(fit_sessions),
                         "test_sessions": sorted(test_sessions),
                         "matched": pairs["matched"], "test_trades": test_trades,
+                        "control_adequacy": control_adequacy,
                         "mean_delta": delta, "net_pnl": net,
                         "adequate": adequate,
                         "adequacy_reason": ("ok" if adequate else
@@ -1230,6 +1768,7 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
                               aggregate_adequate),
             "sessions": len(sessions), "fit_sessions_required": fit_min,
             "test_sessions_required": test_min, "test_trades_required": trade_min,
+            "min_matched": matched_min, "min_coverage": float(min_coverage),
             "requested_min_sessions": requested_floor,
             "effective_min_sessions": requested_floor,
             "requested_test_sessions": requested_test_min,
@@ -1255,6 +1794,7 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
                          min_clusters: int = QUALIFICATION_MIN_CLUSTERS,
                          confidence: float = LOWER_BOUND_CONFIDENCE,
                          max_drawdown: float | None = None,
+                         max_drawdown_r: float = QUALIFICATION_MAX_DRAWDOWN_R,
                          draws: int = DEFAULT_BOOTSTRAP_DRAWS,
                          seed: int | None = None,
                          block_length: int | None = None,
@@ -1276,6 +1816,9 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
         max_drawdown = float(max_drawdown)
         if not math.isfinite(max_drawdown) or max_drawdown < 0:
             raise ValueError("qualification max_drawdown must be finite and non-negative")
+    max_drawdown_r = float(max_drawdown_r)
+    if not math.isfinite(max_drawdown_r) or max_drawdown_r <= 0:
+        raise ValueError("qualification max_drawdown_r must be finite and positive")
     raw_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
     raw_baseline = [dict(row) for row in baseline if isinstance(row, Mapping)]
     strict_projection = any(_has_fill_metadata(row) for row in
@@ -1288,6 +1831,22 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
         equity_feed=equity_feed)
     rows = candidate_projection["eligible"]
     baseline = baseline_projection["eligible"]
+    drawdown_limit_source = "explicit_usd" if max_drawdown is not None else None
+    if max_drawdown is None:
+        risk_values = []
+        for row in rows:
+            raw_risk = row.get("risk_usd")
+            if isinstance(raw_risk, bool):
+                continue
+            try:
+                risk_value = float(raw_risk)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(risk_value) and risk_value > 0:
+                risk_values.append(risk_value)
+        if risk_values:
+            max_drawdown = float(median(risk_values)) * max_drawdown_r
+            drawdown_limit_source = "median_risk_usd_times_r"
     if not rows or not sessions:
         return {"available": False, "sessions": list(sessions), "net_pnl": 0.0,
                 "matched": 0, "mean_delta": None, "trades": 0,
@@ -1306,7 +1865,21 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
                 },
                 "max_drawdown": None, "drawdown_supported": False,
                 "max_drawdown_limit": max_drawdown,
-                "drawdown_within_limit": False, "adequate": False,
+                "max_drawdown_limit_source": drawdown_limit_source,
+                "max_drawdown_limit_r": (max_drawdown_r
+                                         if drawdown_limit_source ==
+                                         "median_risk_usd_times_r" else None),
+                "drawdown_within_limit": False,
+                "drawdown_limit_required": True,
+                "control_adequacy": {
+                    "matched": 0, "candidate_count": 0, "control_count": 0,
+                    "coverage": 0.0,
+                    "minimum_matched": max(1, int(min_trades)),
+                    "minimum_coverage": ACTUAL_CONTROL_MIN_COVERAGE,
+                    "count_adequate": False, "coverage_adequate": False,
+                    "adequate": False,
+                },
+                "adequate": False,
                 "authorization_projection": {
                     "candidate": _projection_summary(candidate_projection),
                     "baseline": _projection_summary(baseline_projection),
@@ -1320,6 +1893,15 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
         raise ValueError("qualification sessions must be unique, non-empty strings")
     pairs = matched_pairs(
         rows, baseline, vehicle=vehicle, equity_feed=equity_feed)
+    control_adequacy = paired_control_adequacy(
+        rows, baseline, vehicle=vehicle,
+        # Qualification's declared trade floor remains the local descriptive
+        # floor; the non-negotiable protection here is matched coverage.  A
+        # 30-candidate/5-control arm therefore still fails (16.7% coverage),
+        # while compact legacy diagnostic windows remain verifiable.
+        min_matched=max(1, int(min_trades)),
+        min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
+        equity_feed=equity_feed)
     absolute = performance_floor(
         rows, vehicle=vehicle, equity_feed=equity_feed)
     delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
@@ -1336,8 +1918,8 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
     confidence_supported = bool(delta_lcb is not None and float(delta_lcb) > 0)
     drawdown_supported = bool(math.isfinite(float(observed_drawdown)))
     drawdown_within_limit = bool(
-        drawdown_supported and (max_drawdown is None or
-                                float(observed_drawdown) <= max_drawdown))
+        drawdown_supported and max_drawdown is not None and
+        float(observed_drawdown) <= max_drawdown)
     candidate_sessions = {
         str(row.get("session_date") or "") for row in rows}
     baseline_sessions = {
@@ -1345,7 +1927,9 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
     adequate = bool(
         absolute["trades"] >= int(min_trades) and
         len(candidate_sessions) >= int(min_sessions) and
-        clusters >= int(min_clusters))
+        clusters >= int(min_clusters) and
+        control_adequacy["adequate"] and
+        drawdown_within_limit)
     # The final window is intentionally outside the run's fit/held-out trades.
     # Carry the source observations and their independent digests in the
     # signed envelope so a proof can be re-verified after it leaves memory.
@@ -1375,6 +1959,11 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
     return {"available": True, "sessions": list(effective_sessions),
             "net_pnl": absolute["net_pnl"], "trades": absolute["trades"],
             "matched": pairs["matched"], "mean_delta": delta,
+            "control_adequacy": control_adequacy,
+            "r_matched": pairs.get("r_matched", 0),
+            "mean_r_delta": (sum(pairs.get("r_deltas", ())) /
+                              pairs["r_matched"]
+                              if pairs.get("r_matched") else None),
             "net_positive": bool(absolute["net_pnl_positive"]),
             "delta_positive": bool(delta is not None and delta > 0),
             "clusters": clusters,
@@ -1387,8 +1976,13 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
             "delta_bootstrap": delta_bound,
             "max_drawdown": observed_drawdown,
             "max_drawdown_limit": max_drawdown,
+            "max_drawdown_limit_source": drawdown_limit_source,
+            "max_drawdown_limit_r": (max_drawdown_r
+                                     if drawdown_limit_source ==
+                                     "median_risk_usd_times_r" else None),
             "drawdown_supported": drawdown_supported,
             "drawdown_within_limit": drawdown_within_limit,
+            "drawdown_limit_required": True,
             "candidate_observations": candidate_observations,
             "baseline_observations": baseline_observations,
             "candidate_observation_digest": candidate_digest,
@@ -1834,8 +2428,15 @@ def gate_dependence_report(envelope: Mapping | None = None, *,
         paths = tuple(_GATE_SOURCE_STATISTICS.get(name, ()))
         if (name == "falsification" and
                 lookup("falsification.p_value_source") !=
-                FALSIFICATION_P_VALUE_SOURCE):
+                FALSIFICATION_P_VALUE_SOURCE and
+                lookup("falsification.independent_supplied") is not True):
             paths = _LEGACY_FALSIFICATION_SOURCE_STATISTICS
+        elif name == "falsification" and lookup(
+                "falsification.independent_supplied") is True:
+            paths = ("falsification.independent_p_value",
+                     "falsification.independent_method",
+                     "falsification.independent_result_hash",
+                     "falsification.alpha")
         if not paths:
             # Unknown/additional checks are still represented, but are not
             # assigned an invented statistic or policy meaning.
@@ -1982,6 +2583,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                            family_q_value: float | None = None,
                            cluster_q_value: float | None = None,
                            cluster_multiple_tests: Mapping | None = None,
+                           fdr_batch: Mapping | None = None,
                            walk_forward: Mapping | None = None,
                            retirement: Mapping | None = None,
                            qualification: Mapping | None = None,
@@ -2053,11 +2655,24 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     reported = dict(performance or {}) if isinstance(performance, Mapping) else {}
     reported.setdefault("heldout_delta", control.get("mean_delta"))
     reported.setdefault("heldout_delta_lcb", control.get("mean_delta_lcb"))
+    if "heldout_r_delta" not in reported and control.get("mean_r_delta") is not None:
+        reported["heldout_r_delta"] = control.get("mean_r_delta")
     reported.setdefault("max_drawdown", max_drawdown_of(heldout))
     derived = {str(key): bool(value) for key, value in checks.items()}
+    control = dict(control) if isinstance(control, Mapping) else {}
+    control_adequacy = paired_control_adequacy(
+        heldout, heldout_baseline, vehicle=vehicle,
+        min_matched=ACTUAL_CONTROL_MIN_MATCHED,
+        min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
+        equity_feed=equity_feed)
+    control["paired_adequacy"] = control_adequacy
+    control["coverage"] = control_adequacy["coverage"]
+    control["adequate"] = bool(control_adequacy["adequate"])
     derived["actual_control_available"] = bool(
         control.get("actual_control") is True and control.get("available") is True and
-        isinstance(control.get("matched"), int) and int(control.get("matched")) > 0)
+        isinstance(control.get("matched"), int) and int(control.get("matched")) > 0 and
+        control_adequacy.get("adequate") is True)
+    derived["actual_control_adequate"] = bool(control_adequacy.get("adequate"))
     delta = control.get("mean_delta")
     lcb = control.get("mean_delta_lcb")
     derived["heldout_delta_positive"] = bool(delta is not None and float(delta) > 0)
@@ -2076,23 +2691,57 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                                                      for row in heldout)))
     derived["heldout_expectancy_positive"] = bool(trades and net / trades > 0)
     derived["falsification"] = bool((falsification or {}).get("passes") is True)
+    if falsification and (heldout_source_raw or heldout_baseline_source_raw):
+        # New production proofs must carry method/result provenance distinct
+        # from the primary paired p-value.  Legacy summary-only envelopes keep
+        # their historical replay semantics.
+        p_value_source = str(falsification.get("p_value_source") or "")
+        independent_hash = str(
+            falsification.get("independent_result_hash") or "")
+        primary_hash = str(falsification.get("assignments_hash") or "")
+        independent_ok = bool(
+            falsification.get("independent_supplied") is True and
+            falsification.get("independent_method") ==
+            FALSIFICATION_INDEPENDENT_METHOD and
+            independent_hash and primary_hash and
+            independent_hash != primary_hash and
+            p_value_source == FALSIFICATION_P_VALUE_SOURCE)
+        derived["falsification"] = bool(derived["falsification"] and independent_ok)
+        if not independent_ok:
+            # Keep the persisted decision and its check synchronized.  This
+            # is a diagnostic veto, not an exception, so legacy evidence can
+            # still be replayed and audited without authorizing.
+            falsification["passes"] = False
     derived["separated"] = bool((separation or {}).get("passes") is True)
     walk = dict(walk_forward or {})
     derived["walk_forward_available"] = bool(walk.get("available"))
     derived["walk_forward_adequate"] = bool(walk.get("adequate"))
     derived["walk_forward_majority_positive"] = bool(walk.get("majority_positive"))
     null = dict(null_control or {})
+    null_min_matched = max(
+        NULL_CONTROL_MIN_MATCHED,
+        int(null.get("minimum_matched", NULL_CONTROL_MIN_MATCHED)))
+    null_min_coverage = max(
+        NULL_CONTROL_MIN_COVERAGE,
+        float(null.get("minimum_coverage", NULL_CONTROL_MIN_COVERAGE)))
     null_adequacy = paired_control_adequacy(
         heldout, null_source, vehicle=vehicle,
-        min_matched=int(null.get("minimum_matched", NULL_CONTROL_MIN_MATCHED)),
-        min_coverage=float(null.get("minimum_coverage", NULL_CONTROL_MIN_COVERAGE)),
+        min_matched=null_min_matched,
+        min_coverage=null_min_coverage,
         equity_feed=equity_feed)
     # Persisted adequacy is recomputed from source rows; a forged summary flag
     # cannot turn a thin null arm into an authorizing control.
+    null_raw_available = bool(
+        null.get("raw_available",
+                 null.get("available", null.get("actual_control", False))))
     null["paired_adequacy"] = null_adequacy
-    derived["null_control_available"] = bool(
-        null.get("available", null.get("actual_control", False)) and
-        null_adequacy["adequate"])
+    null["raw_available"] = null_raw_available
+    null["available"] = bool(null_raw_available and null_adequacy["adequate"])
+    null["coverage"] = null_adequacy["coverage"]
+    null["adequate"] = bool(null_adequacy["adequate"])
+    null["minimum_matched"] = null_min_matched
+    null["minimum_coverage"] = null_min_coverage
+    derived["null_control_available"] = bool(null["available"])
     null_delta = null.get("mean_delta")
     null_p = null.get("p_value")
     derived["null_control_delta_positive"] = bool(
@@ -2149,6 +2798,12 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     derived["qualification_drawdown_supported"] = bool(
         qual.get("available") and qual.get("adequate") and
         qual.get("drawdown_supported") and qual.get("drawdown_within_limit", True))
+    if qual.get("available") and qual.get("drawdown_limit_required") is True:
+        derived["qualification_drawdown_supported"] = bool(
+            derived["qualification_drawdown_supported"] and
+            isinstance(qual.get("max_drawdown_limit"), (int, float)) and
+            not isinstance(qual.get("max_drawdown_limit"), bool) and
+            math.isfinite(float(qual.get("max_drawdown_limit"))))
     derived["max_drawdown_supported"] = bool(
         isinstance(reported.get("max_drawdown"), (int, float)) and
         math.isfinite(float(reported.get("max_drawdown"))))
@@ -2237,6 +2892,22 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                 "null": projections["null"],
             }),
     }
+    statistics = {
+        "p_value": float(p_value), "q_value": float(q_value),
+        "family_q_value": float(q_value if family_q_value is None
+                                 else family_q_value),
+        **({"cluster_q_value": float(cluster_q_value)}
+           if cluster_q_value is not None else {}),
+        "alpha": float(alpha),
+    }
+    batch = dict(fdr_batch) if isinstance(fdr_batch, Mapping) else {}
+    derived["multiple_testing_batch_bound"] = _fdr_batch_matches(
+        batch, statistics=statistics, checks=derived,
+        provenance=(provenance if isinstance(provenance, Mapping) else {}),
+        candidate_id=candidate_id,
+        cluster_multiple_tests=(cluster_multiple_tests
+                                if isinstance(cluster_multiple_tests, Mapping)
+                                else None))
     # Required checks are the minimum schema, not a licence to ignore an
     # additional veto supplied by a caller.  A passing envelope must agree
     # with every persisted boolean decision, exactly as durable proof
@@ -2285,12 +2956,8 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "arm_diagnostics": arm_diagnostics,
         "fit_control": fit_summary,
         "control": dict(control),
-        "statistics": {"p_value": float(p_value), "q_value": float(q_value),
-                       "family_q_value": float(q_value if family_q_value is None
-                                                else family_q_value),
-                       **({"cluster_q_value": float(cluster_q_value)}
-                          if cluster_q_value is not None else {}),
-                       "alpha": float(alpha)},
+        "statistics": statistics,
+        "fdr_batch": batch,
         "cluster_multiple_tests": (dict(cluster_multiple_tests)
                                     if isinstance(cluster_multiple_tests, Mapping)
                                     else {}),
@@ -2303,7 +2970,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "risk_unit_report": risk,
         "cost_stress": stress,
         "effective_breadth": breadth,
-        "null_control": dict(null_control or {}),
+        "null_control": dict(null),
         "online_fdr": online,
         "provenance": dict(provenance or {}),
         "candidate_id": (str(candidate_id) if candidate_id is not None else None),
@@ -2317,6 +2984,12 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
     try:
         if not isinstance(envelope, Mapping):
             return False
+        schema = envelope.get("schema")
+        if schema not in SUPPORTED_GATE_ENVELOPE_SCHEMAS:
+            return False
+        legacy_v2 = schema == LEGACY_GATE_ENVELOPE_SCHEMA_V2
+        required_checks = (LEGACY_GATE_REQUIRED_CHECKS_V2
+                           if legacy_v2 else GATE_REQUIRED_CHECKS)
         has_equity_feed = "equity_feed" in envelope
         # Envelopes created before feed binding used SIP.  Rebuild those exact
         # historical semantics; never reinterpret an omitted field as IEX.
@@ -2382,7 +3055,14 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 min_clusters=int((qualification.get("minimums") or {}).get(
                     "clusters", PROTOCOL_QUALIFICATION_MIN_CLUSTERS)),
                 confidence=float(qualification.get("confidence", LOWER_BOUND_CONFIDENCE)),
-                max_drawdown=qualification.get("max_drawdown_limit"),
+                max_drawdown=(
+                    None if qualification.get("max_drawdown_limit_source") ==
+                    "median_risk_usd_times_r" else
+                    qualification.get("max_drawdown_limit")),
+                max_drawdown_r=float(
+                    qualification.get("max_drawdown_limit_r")
+                    if qualification.get("max_drawdown_limit_r") is not None
+                    else QUALIFICATION_MAX_DRAWDOWN_R),
                 draws=int(((qualification.get("delta_bootstrap") or {}).get(
                     "draws", DEFAULT_BOOTSTRAP_DRAWS))),
                 seed=((qualification.get("delta_bootstrap") or {}).get("seed")
@@ -2396,13 +3076,19 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     if isinstance(projection, dict):
                         projection.pop("equity_feed", None)
             for key in ("sessions", "net_pnl", "trades", "matched", "mean_delta",
+                        "control_adequacy", "r_matched", "mean_r_delta",
                         "net_positive", "delta_positive", "clusters", "minimums",
                         "adequate", "confidence", "delta_lcb",
                         "confidence_supported", "max_drawdown",
-                        "max_drawdown_limit", "drawdown_supported",
-                        "drawdown_within_limit", "authorization_projection",
+                        "max_drawdown_limit", "max_drawdown_limit_source",
+                        "max_drawdown_limit_r", "drawdown_supported",
+                        "drawdown_within_limit", "drawdown_limit_required",
+                        "authorization_projection",
                         "raw_candidate_observations", "raw_baseline_observations"):
-                if expected.get(key) != qualification.get(key):
+                # Newly sealed reports carry explicit adequacy/limit fields;
+                # omitted fields in pre-v2 qualification payloads retain their
+                # historical verification semantics.
+                if key in qualification and expected.get(key) != qualification.get(key):
                     return False
             if "delta_bootstrap" in qualification and (
                     expected.get("delta_bootstrap") != qualification.get(
@@ -2415,8 +3101,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 not all(isinstance(value, bool) for value in checks.values())):
             return False
         if envelope.get("passes") and (
-                not GATE_REQUIRED_CHECKS.issubset(set(checks)) or
-                not all(bool(checks.get(key)) for key in GATE_REQUIRED_CHECKS) or
+                not required_checks.issubset(set(checks)) or
+                not all(bool(checks.get(key)) for key in required_checks) or
                 not all(checks.values())):
             return False
         if envelope.get("passes"):
@@ -2655,6 +3341,15 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     if not _close_number(expected_performance.get(source_key),
                                          performance.get(key)):
                         return False
+            if "heldout_r_delta" in performance:
+                expected_effect = matched_cluster_test(
+                    sources_held_eligible, baseline_held_eligible,
+                    vehicle=vehicle, iterations=int(
+                        (envelope.get("control") or {}).get("resamples") or 20_000),
+                    equity_feed=equity_feed)
+                if not _close_number(expected_effect.get("mean_r_delta"),
+                                     performance.get("heldout_r_delta")):
+                    return False
             if (performance.get("heldout_delta") is not None and
                     sources_held and
                     baseline_held):
@@ -2721,6 +3416,31 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     math.isfinite(global_q) and 0.0 <= global_q <= 1.0 and
                     math.isfinite(family_q) and 0.0 <= family_q <= 1.0):
                 return False
+            if legacy_v2:
+                # v2 predates complete multiple-testing batch evidence.  Its
+                # scalar q-values and decision flags remain recomputable only
+                # to the extent the historical envelope recorded them, so the
+                # proof is audit-readable but is never eligible to authorize a
+                # current replay epoch.
+                if ("fdr_batch" in envelope or
+                        "multiple_testing_batch_bound" in checks or
+                        "actual_control_adequate" in checks):
+                    return False
+            else:
+                batch_matches = _fdr_batch_matches(
+                    envelope.get("fdr_batch"), statistics=statistics,
+                    checks=checks,
+                    provenance=(envelope.get("provenance")
+                                if isinstance(envelope.get("provenance"), Mapping)
+                                else {}),
+                    candidate_id=envelope.get("candidate_id"),
+                    cluster_multiple_tests=(
+                        envelope.get("cluster_multiple_tests")
+                        if isinstance(envelope.get("cluster_multiple_tests"), Mapping)
+                        else None))
+                if (bool(checks.get("multiple_testing_batch_bound")) != batch_matches or
+                        (envelope.get("passes") and not batch_matches)):
+                    return False
             cluster_tests = envelope.get("cluster_multiple_tests")
             if cluster_tests:
                 if not isinstance(cluster_tests, Mapping):
@@ -2766,10 +3486,10 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                             online.get("p_value_kind") != "raw_confirmatory" or
                             not _close_number(online.get("raw_p_value"), online_p)):
                         return False
-            # Rebuild the code-owned decision flags from the persisted source
-            # evidence.  Callers may add stricter custom vetoes, but they may
-            # not override a required gate flag or detach it from the report
-            # that supposedly produced it.
+            # Rebuild code-owned decision flags from persisted source
+            # evidence.  The v3 builder is also useful for v2 audit, but its
+            # two new checks and tightened falsification/control semantics are
+            # translated back to the exact historical v2 contract below.
             rebuilt = verified_gate_envelope(
                 lane=str(envelope.get("lane") or ""), vehicle=vehicle,
                 fit=sources_fit, heldout=sources_held,
@@ -2793,6 +3513,9 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 cluster_multiple_tests=(cluster_tests
                                         if isinstance(cluster_tests, Mapping)
                                         else None),
+                fdr_batch=(envelope.get("fdr_batch")
+                           if isinstance(envelope.get("fdr_batch"), Mapping)
+                           else None),
                 falsification=envelope.get("falsification") or {},
                 separation=envelope.get("separation") or {},
                 checks=checks, passes=bool(envelope.get("passes")),
@@ -2807,18 +3530,59 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 risk_unit_report=risk,
                 equity_feed=equity_feed,
             )
+            rebuilt_checks = dict(rebuilt.get("checks") or {})
             rebuilt_passes = rebuilt.get("passes")
-            if not has_equity_feed:
+            if legacy_v2:
+                rebuilt_checks.pop("actual_control_adequate", None)
+                rebuilt_checks.pop("multiple_testing_batch_bound", None)
+                legacy_control = envelope.get("control") or {}
+                rebuilt_checks["actual_control_available"] = bool(
+                    legacy_control.get("actual_control") is True and
+                    legacy_control.get("available") is True and
+                    isinstance(legacy_control.get("matched"), int) and
+                    int(legacy_control.get("matched")) > 0)
+                rebuilt_checks["falsification"] = bool(
+                    (envelope.get("falsification") or {}).get("passes") is True)
+                legacy_null = envelope.get("null_control") or {}
+                legacy_null_adequacy = _legacy_v2_paired_control_adequacy(
+                    sources_held, null_source, vehicle=vehicle,
+                    min_matched=int(legacy_null.get(
+                        "minimum_matched", NULL_CONTROL_MIN_MATCHED)),
+                    min_coverage=float(legacy_null.get(
+                        "minimum_coverage", NULL_CONTROL_MIN_COVERAGE)),
+                    equity_feed=equity_feed)
+                rebuilt_checks["null_control_available"] = bool(
+                    legacy_null.get("available",
+                                    legacy_null.get("actual_control", False)) and
+                    legacy_null_adequacy["adequate"])
+                rebuilt_checks["null_control_delta_positive"] = bool(
+                    rebuilt_checks["null_control_available"] and
+                    legacy_null.get("mean_delta") is not None and
+                    legacy_null.get("p_value") is not None and
+                    float(legacy_null["mean_delta"]) > 0 and
+                    float(legacy_null["p_value"]) <= alpha)
+                legacy_qualification = envelope.get("qualification") or {}
+                rebuilt_checks["qualification_drawdown_supported"] = bool(
+                    legacy_qualification.get("available") and
+                    legacy_qualification.get("adequate") and
+                    legacy_qualification.get("drawdown_supported") and
+                    legacy_qualification.get("drawdown_within_limit", True))
+                rebuilt_passes = bool(
+                    envelope.get("passes") and
+                    (vehicle != "equity" or equity_feed in {"iex", "sip"}) and
+                    all(rebuilt_checks.get(key, False)
+                        for key in LEGACY_GATE_REQUIRED_CHECKS_V2) and
+                    all(rebuilt_checks.values()))
+            elif not has_equity_feed:
                 # The pre-binding schema authorized the historical SIP view.
                 # Rebuild its exact pre-feed-binding decision; omission is
                 # compatibility, never an inference of the shipped feed.
-                rebuilt_checks = rebuilt.get("checks") or {}
                 rebuilt_passes = bool(
                     envelope.get("passes") and
                     all(rebuilt_checks.get(key, False)
                         for key in GATE_REQUIRED_CHECKS) and
                     all(rebuilt_checks.values()))
-            if (rebuilt.get("checks") != dict(checks) or
+            if (rebuilt_checks != dict(checks) or
                     rebuilt_passes != envelope.get("passes")):
                 return False
         # Recompute source-derived controls for both passing and diagnostic
@@ -2845,6 +3609,9 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             for key in (
                     "matched", "mean_delta", "mean_delta_lcb", "p_value",
                     "matched_ids_hash", "deltas", "delta_clusters",
+                    "paired_adequacy", "adequate", "coverage", "r_deltas",
+                    "r_delta_clusters", "r_matched", "mean_r_delta",
+                    "r_delta_lcb",
                     "lower_bound", "available",
                     "method", "exact", "resamples", "seed", "clusters",
                     "cluster_seconds", "paired_n", "observed_mean"):
@@ -2864,9 +3631,19 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         if (_has_statistical_evidence(control) and sources_held and
                 baseline_held):
             control_iterations = int(control.get("resamples") or 20_000)
+            control_adequacy = (control.get("paired_adequacy")
+                                if isinstance(control.get("paired_adequacy"), Mapping)
+                                else {})
             expected_control = matched_cluster_test(
                 sources_held_eligible, baseline_held_eligible, vehicle=vehicle,
-                iterations=control_iterations, equity_feed=equity_feed)
+                iterations=control_iterations,
+                min_matched=max(ACTUAL_CONTROL_MIN_MATCHED, int(
+                    control_adequacy.get(
+                        "minimum_matched", ACTUAL_CONTROL_MIN_MATCHED))),
+                min_coverage=max(ACTUAL_CONTROL_MIN_COVERAGE, float(
+                    control_adequacy.get(
+                        "minimum_coverage", ACTUAL_CONTROL_MIN_COVERAGE))),
+                equity_feed=equity_feed)
             if not _compare_statistical_report(expected_control, control):
                 return False
         fit_control = envelope.get("fit_control") or {}
@@ -2879,19 +3656,69 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 _has_statistical_evidence(fit_control) and sources_fit and
                 baseline_fit):
             fit_iterations = int(fit_control.get("resamples") or 20_000)
+            fit_adequacy = (fit_control.get("paired_adequacy")
+                            if isinstance(fit_control.get("paired_adequacy"), Mapping)
+                            else {})
             expected_fit_control = matched_cluster_test(
                 sources_fit_eligible, baseline_fit_eligible, vehicle=vehicle,
-                iterations=fit_iterations, equity_feed=equity_feed)
+                iterations=fit_iterations,
+                min_matched=max(ACTUAL_CONTROL_MIN_MATCHED, int(
+                    fit_adequacy.get(
+                        "minimum_matched", ACTUAL_CONTROL_MIN_MATCHED))),
+                min_coverage=max(ACTUAL_CONTROL_MIN_COVERAGE, float(
+                    fit_adequacy.get(
+                        "minimum_coverage", ACTUAL_CONTROL_MIN_COVERAGE))),
+                equity_feed=equity_feed)
             if not _compare_statistical_report(expected_fit_control,
                                                fit_control):
                 return False
         if (_has_statistical_evidence(null_control) and sources_held and
                 null_source):
             null_iterations = int(null_control.get("resamples") or 20_000)
-            expected_null = matched_cluster_test(
-                sources_held_eligible, null_eligible, vehicle=vehicle,
-                iterations=null_iterations, equity_feed=equity_feed)
-            if not _compare_statistical_report(expected_null, null_control):
+            if legacy_v2:
+                # v2's matched statistic had no v3 adequacy/risk fields.  It
+                # did persist the symmetric adequacy report added around that
+                # statistic, so reconstruct that report with the historical
+                # no-trade denominator and compare it when present.
+                expected_null = matched_cluster_test(
+                    sources_held_eligible, null_eligible, vehicle=vehicle,
+                    iterations=null_iterations, equity_feed=equity_feed)
+                persisted_adequacy = null_control.get("paired_adequacy")
+                if isinstance(persisted_adequacy, Mapping):
+                    min_matched = int(persisted_adequacy.get(
+                        "minimum_matched", null_control.get(
+                            "minimum_matched", NULL_CONTROL_MIN_MATCHED)))
+                    min_coverage = float(persisted_adequacy.get(
+                        "minimum_coverage", null_control.get(
+                            "minimum_coverage", NULL_CONTROL_MIN_COVERAGE)))
+                    expected_null["paired_adequacy"] = (
+                        _legacy_v2_paired_control_adequacy(
+                            sources_held, null_source, vehicle=vehicle,
+                            min_matched=min_matched,
+                            min_coverage=min_coverage,
+                            equity_feed=equity_feed))
+            else:
+                expected_null = matched_cluster_test(
+                    sources_held_eligible, null_eligible, vehicle=vehicle,
+                    iterations=null_iterations,
+                    min_matched=max(NULL_CONTROL_MIN_MATCHED, int(null_control.get(
+                        "minimum_matched", NULL_CONTROL_MIN_MATCHED))),
+                    min_coverage=max(NULL_CONTROL_MIN_COVERAGE, float(
+                        null_control.get(
+                            "minimum_coverage", NULL_CONTROL_MIN_COVERAGE))),
+                    equity_feed=equity_feed)
+            # ``null_control.available`` is the authorizing availability
+            # (paired adequacy applied), while the descriptive matched test's
+            # ``available`` only means at least one pair.  Compare the latter
+            # to ``raw_available`` when the enriched arm carries both fields.
+            if "raw_available" in null_control:
+                expected_null["available"] = bool(null_control.get("raw_available"))
+                null_report_for_compare = dict(null_control)
+                null_report_for_compare["available"] = bool(
+                    null_control.get("raw_available"))
+            else:
+                null_report_for_compare = null_control
+            if not _compare_statistical_report(expected_null, null_report_for_compare):
                 return False
         if sources_fit and sources_held:
             expected_separation = (
@@ -2914,20 +3741,61 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 sources_held_eligible, baseline_held_eligible,
                 vehicle=vehicle, draws=draws,
                 equity_feed=equity_feed)
+            independent_mode = bool(
+                falsification.get("independent_supplied") is True or
+                falsification.get("p_value_source") ==
+                FALSIFICATION_INDEPENDENT_P_VALUE_SOURCE)
+            independent_placebo = None
+            expected_independent = None
+            if independent_mode:
+                independent_draws = int(
+                    falsification.get("independent_draws") or draws)
+                independent_seed = int(falsification.get("independent_seed"))
+                independent_placebo = placebo_null_distribution(
+                    sources_held_eligible, baseline_held_eligible,
+                    vehicle=vehicle, draws=independent_draws,
+                    seed=independent_seed, equity_feed=equity_feed)
+                if (independent_placebo["assignments_hash"] ==
+                        placebo["assignments_hash"]):
+                    return False
+                if (falsification.get("independent_result_hash") !=
+                        independent_placebo["assignments_hash"] or
+                        falsification.get("independent_assignments_hash") !=
+                        independent_placebo["assignments_hash"]):
+                    return False
+                expected_independent = falsification_gate(
+                    independent_placebo["observed"],
+                    independent_placebo["placebo"],
+                    alpha=float(falsification.get("alpha", .05)))
             expected_falsification = {
                 **falsification_gate(
                     placebo["observed"], placebo["placebo"],
                     alpha=float(falsification.get("alpha", .05)),
                     preregistered_p_value=(
                         control.get("p_value")
-                        if falsification.get("p_value_source") ==
-                        FALSIFICATION_P_VALUE_SOURCE else None)),
+                        if (independent_mode or
+                            falsification.get("p_value_source") ==
+                            FALSIFICATION_P_VALUE_SOURCE) else None),
+                    independent_p_value=(expected_independent["p_value"]
+                                         if expected_independent is not None else None),
+                    independent_method=(FALSIFICATION_INDEPENDENT_METHOD
+                                        if independent_mode else None),
+                    independent_result_hash=(
+                        independent_placebo["assignments_hash"]
+                        if independent_placebo is not None else None),
+                    require_independent=independent_mode),
                 "method": placebo["method"],
                 "assignments_hash": placebo["assignments_hash"],
                 "observations": len(placebo["observed"]),
                 "draws": int(placebo["draws"]),
                 "seed": int(placebo["seed"]),
                 "clusters": int(placebo["cluster_count"]),
+                **({
+                    "independent_draws": int(independent_placebo["draws"]),
+                    "independent_seed": int(independent_placebo["seed"]),
+                    "independent_assignments_hash":
+                        independent_placebo["assignments_hash"],
+                } if independent_placebo is not None else {}),
             }
             for key, expected in expected_falsification.items():
                 if key not in falsification:
@@ -2948,6 +3816,12 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 min_fit_sessions=int(walk.get("fit_sessions_required", 1)),
                 min_test_sessions=int(walk.get("test_sessions_required", 1)),
                 min_test_trades=int(walk.get("test_trades_required", 1)),
+                min_matched=int(walk.get("min_matched", 1)),
+                min_coverage=float(walk.get(
+                    "min_coverage", ACTUAL_CONTROL_MIN_COVERAGE)),
+                requested_min_sessions=int(walk.get(
+                    "requested_min_sessions", walk.get(
+                        "effective_min_sessions", 1))),
                 equity_feed=equity_feed)
             for key in ("available", "adequate", "majority_positive",
                         "tested_folds", "adequate_folds", "positive_folds"):
@@ -2970,7 +3844,7 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                                       performance.get("heldout_delta_lcb"))):
                 return False
         return bool(
-            envelope.get("schema") == GATE_ENVELOPE_SCHEMA and
+            schema in SUPPORTED_GATE_ENVELOPE_SCHEMAS and
             envelope.get("lane") in {"backtest", "shadow"} and
             envelope.get("vehicle") in {"equity", "option"} and
             isinstance(envelope.get("passes"), bool) and
@@ -2979,6 +3853,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             isinstance(envelope.get("fit_control"), Mapping) and
             isinstance(envelope.get("control"), Mapping) and
             isinstance(envelope.get("statistics"), Mapping) and
+            ((legacy_v2 and "fdr_batch" not in envelope) or
+             (not legacy_v2 and isinstance(envelope.get("fdr_batch"), Mapping))) and
             isinstance(envelope.get("walk_forward"), Mapping) and
             isinstance(envelope.get("qualification"), Mapping) and
             isinstance(envelope.get("cost_stress"), Mapping) and
@@ -3058,6 +3934,28 @@ def recompute_gate_statistics(envelope: Mapping) -> dict:
     shared_preregistered_p = bool(
         isinstance(falsification, Mapping) and
         falsification.get("p_value_source") == FALSIFICATION_P_VALUE_SOURCE)
+    independent_mode = bool(
+        isinstance(falsification, Mapping) and
+        (falsification.get("independent_supplied") is True or
+         falsification.get("p_value_source") ==
+         FALSIFICATION_INDEPENDENT_P_VALUE_SOURCE))
+    independent_null = null
+    if independent_mode:
+        independent_draws = falsification.get("independent_draws")
+        independent_seed = falsification.get("independent_seed")
+        if (not isinstance(independent_draws, int) or
+                isinstance(independent_draws, bool) or independent_draws < 1 or
+                not isinstance(independent_seed, int) or
+                isinstance(independent_seed, bool)):
+            return {"available": False,
+                    "reason": "independent falsification evidence is missing"}
+        independent_null = sign_flip_null_statistics(
+            values, [str(cluster) for cluster in clusters],
+            draws=independent_draws, seed=independent_seed)
+    independent_empirical = falsification_gate(
+        values, independent_null["statistics"],
+        alpha=float(falsification.get("alpha", .05))
+        if isinstance(falsification, Mapping) else .05)
     decision = falsification_gate(
         values, null["statistics"],
         alpha=float(falsification.get("alpha", .05))
@@ -3065,7 +3963,16 @@ def recompute_gate_statistics(envelope: Mapping) -> dict:
         isinstance(falsification.get("alpha"), (int, float)) and
         not isinstance(falsification.get("alpha"), bool) else .05,
         preregistered_p_value=(float(sign_flip["p_value"])
-                               if shared_preregistered_p else None))
+                               if shared_preregistered_p else None),
+        independent_p_value=(independent_empirical["p_value"]
+                             if independent_mode else None),
+        independent_method=(str(falsification.get("independent_method"))
+                            if independent_mode and isinstance(falsification, Mapping)
+                            and falsification.get("independent_method") else None),
+        independent_result_hash=(str(falsification.get("independent_result_hash"))
+                                 if independent_mode and isinstance(falsification, Mapping)
+                                 and falsification.get("independent_result_hash") else None),
+        require_independent=independent_mode)
     return {
         "available": True,
         "matched": len(values),
@@ -3094,8 +4001,13 @@ def _close_number(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
 
 
 __all__ = ["AcceptanceFloor", "ARM_EVIDENCE_SCHEMA", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
+           "LEGACY_GATE_ENVELOPE_SCHEMA_V2", "SUPPORTED_GATE_ENVELOPE_SCHEMAS",
+           "LEGACY_GATE_REQUIRED_CHECKS_V2",
+           "FDR_BATCH_SCHEMA", "FDR_BATCH_METHOD", "fdr_batch_evidence",
            "GATE_REQUIRED_CHECKS", "AUTHORIZATION_PROJECTION_SCHEMA",
            "FALSIFICATION_P_VALUE_SOURCE",
+           "FALSIFICATION_INDEPENDENT_P_VALUE_SOURCE",
+           "FALSIFICATION_INDEPENDENT_METHOD",
            "authorization_projection", "arm_evidence_report", "gate_dependence_report",
            "gate_source_statistic_report", "source_statistic_report",
            "gate_source_dependence_report", "source_statistic_dependence_report",
@@ -3121,6 +4033,8 @@ __all__ = ["AcceptanceFloor", "ARM_EVIDENCE_SCHEMA", "CLUSTER_SECONDS", "GATE_EN
            "heldout_separation", "matched_cluster_test", "matched_effective_breadth",
            "paired_control_adequacy", "NULL_CONTROL_MIN_MATCHED",
            "NULL_CONTROL_MIN_COVERAGE",
+           "ACTUAL_CONTROL_MIN_MATCHED", "ACTUAL_CONTROL_MIN_COVERAGE",
+           "QUALIFICATION_MAX_DRAWDOWN_R",
            "clustered_mde_power_report", "clustered_mde_power",
            "matched_pairs",
            "max_drawdown_of", "paired_delta", "performance_floor",

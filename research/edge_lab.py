@@ -21,7 +21,7 @@ from .gates import (
     expectancy_rejection_report, heldout_separation, matched_cluster_test,
     max_drawdown_of, paired_delta, performance_floor, qualification_report,
     sample_counts, seal_final_window, structural_floor, verified_gate_envelope,
-    authorization_projection, arm_evidence_report,
+    authorization_projection, arm_evidence_report, fdr_batch_evidence,
     walk_forward_report, validate_protocol_floor,
     PROTOCOL_SHADOW_MIN_TRADES, PROTOCOL_SHADOW_MIN_SESSIONS,
     paired_control_adequacy,
@@ -32,7 +32,7 @@ from .market_data import (
     OptionSnapshot, UnderlyingBar, normalize_option_snapshot,
     normalize_quote, normalize_underlying_bar,
 )
-from .stats import benjamini_hochberg
+from .stats import benjamini_yekutieli
 
 
 from .edge_discovery_core import (
@@ -465,8 +465,13 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         mode = modes[variant.variant_id]
         if mode == "skip":
             continue
-        candidate_baseline = (baseline_eval if mode == baseline_mode else
-                              tail(baseline_by_mode[mode], baseline_boundary)
+        boundary = latest_boundary(existing.get(variant.variant_id))
+        # Every forward candidate owns its persisted cutoff.  Reusing the
+        # baseline candidate's cutoff can either drop valid control rows from
+        # a less-advanced candidate or retain stale rows for a more-advanced
+        # one.  Replay the common baseline policy, then slice it to this
+        # candidate's exact evidence interval.
+        candidate_baseline = (tail(baseline_by_mode[mode], boundary)
                               if mode == "shadow" else baseline_by_mode[mode])
         gates[variant.variant_id] = _strengthen_gate(
             _discover_gate(
@@ -480,8 +485,10 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 equity_feed=runtime_policy.equity_feed),
             candidate_baseline, vehicle=vehicle,
             equity_feed=runtime_policy.equity_feed)
-    corrected = benjamini_hochberg(
-        {variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()}, alpha=alpha)
+    correction_values = {
+        variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()
+    }
+    corrected = benjamini_yekutieli(correction_values, alpha=alpha)
 
     ranked_ids = sorted((
         variant_id for variant_id in gates
@@ -572,6 +579,15 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         _finalize_gate(
             gate, lane=modes[variant.variant_id], family=family,
             online_fdr=(cumulative if variant.variant_id == selected_test_id else {}),
+            fdr_batch=fdr_batch_evidence(
+                candidate_id=variant.variant_id,
+                family_name="ibr",
+                family_candidate_key=variant.variant_id,
+                global_candidate_key=variant.variant_id,
+                family_values={"ibr": correction_values},
+                global_values=correction_values,
+                alpha=alpha,
+                p_value_source="gate"),
             provenance=provenance_hash(
                 dataset=raw_rows, config=run_configs[variant.variant_id],
                 code=code_path, provenance=run_provenance),
@@ -616,6 +632,17 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 "significant": baseline_gate["candidate_p_raw"] <= alpha,
                 "family_size": 1},
         online_fdr={},
+        fdr_batch=fdr_batch_evidence(
+            candidate_id=baseline_variant.variant_id,
+            family_name="ibr_baseline",
+            family_candidate_key=baseline_variant.variant_id,
+            global_candidate_key=baseline_variant.variant_id,
+            family_values={"ibr_baseline": {
+                baseline_variant.variant_id: baseline_gate["candidate_p_raw"]}},
+            global_values={
+                baseline_variant.variant_id: baseline_gate["candidate_p_raw"]},
+            alpha=alpha,
+            p_value_source="gate"),
         provenance=provenance_hash(
             dataset=raw_rows,
             config=run_configs[baseline_variant.variant_id],

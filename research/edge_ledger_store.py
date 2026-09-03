@@ -49,7 +49,13 @@ SCHEMA_VERSION = 3
 # Epoch 5 additionally seals the real paired-control shadow path, distinguishes
 # historical backfill as non-authorizing diagnostic evidence, binds live-shadow
 # authorization to durable FDR state, and fixes chronological paired inference.
-REPLAY_ENGINE_EPOCH = 5
+# Epoch 6 additionally uses dependence-safe Benjamini–Yekutieli correction,
+# requires adequately powered paired actual-control evidence (at least 30
+# matched pairs with 80% candidate coverage), and seals a separately seeded
+# placebo-null replication for integrity while retaining one preregistered
+# authorizing p-value.  These checks are part of the authorizing proof and are
+# re-derived rather than inferred from caller-supplied summaries.
+REPLAY_ENGINE_EPOCH = 6
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
 

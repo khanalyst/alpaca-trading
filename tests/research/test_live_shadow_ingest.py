@@ -1,6 +1,7 @@
 """End-to-end authorization tests for the research-side shadow consumer."""
 
 from pathlib import Path
+from contextlib import closing
 import json
 import sqlite3
 import tempfile
@@ -30,12 +31,22 @@ class LiveShadowIngestTests(unittest.TestCase):
             edge_discovery_core, "MIN_PROMOTION_CLUSTERS", 1)
         self.cluster_floor.start()
         self.addCleanup(self.cluster_floor.stop)
+        self.control_floor = patch.object(
+            edge_discovery_core, "ACTUAL_CONTROL_MIN_MATCHED", 1)
+        self.control_floor.start()
+        self.addCleanup(self.control_floor.stop)
+        self.null_control_floor = patch.object(
+            edge_discovery_core, "MIN_NULL_CONTROL_MATCHED", 1)
+        self.null_control_floor.start()
+        self.addCleanup(self.null_control_floor.stop)
         # This module exercises replay/idempotency boundaries with an
         # eight-session tail.  Explicitly lower every immutable protocol
         # constant in this test-only context; production code and the CLI
         # never expose this patch seam.
         self.compact_protocol = patch.multiple(
             gates,
+            ACTUAL_CONTROL_MIN_MATCHED=1,
+            NULL_CONTROL_MIN_MATCHED=1,
             PROTOCOL_BACKTEST_MIN_TRADES=1,
             PROTOCOL_BACKTEST_MIN_SESSIONS=1,
             PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
@@ -199,7 +210,7 @@ class LiveShadowIngestTests(unittest.TestCase):
 
     def test_tampered_persisted_selection_rows_cannot_authorize(self):
         cid, run_id = self._seed_live_run()
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             row = db.execute(
                 "SELECT metrics_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
             metrics = json.loads(row[0])
@@ -272,7 +283,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self._rows(self.baseline["candidate_id"], [0.0] * 16)
         self._rows(f"shadow:null:{cid}", [-1.0] * 16)
         aged = time.time() - 20 * 86400
-        with sqlite3.connect(self.shadow_path) as db:
+        with closing(sqlite3.connect(self.shadow_path)) as db, db:
             db.execute("UPDATE replay_diffs SET created_at=?", (aged,))
         pruned = ShadowStore(self.shadow_path, retention_days=14).prune()
         self.assertEqual(pruned["pruned_replay_diffs"], 48)
@@ -367,7 +378,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(len(self.ledger.trades(cid, lane="shadow")), 8)
         self.assertEqual(self.ledger.candidate(cid)["status"], "validated")
 
-    def test_epoch5_reproof_same_tail_coexists_with_epoch4_run(self):
+    def test_epoch6_reproof_same_tail_coexists_with_epoch5_run(self):
         cid = self.candidate["candidate_id"]
         self._rows(cid, [2.0] * 8)
         self._rows(self.baseline["candidate_id"], [0.0] * 8)
@@ -376,19 +387,19 @@ class LiveShadowIngestTests(unittest.TestCase):
                                     min_trades=1, min_sessions=1)
         # Keep the legacy run fully durable under its own verifier epoch, then
         # prove the exact same tail after the replay engine advances.
-        with patch("research.edge_ledger.REPLAY_ENGINE_EPOCH", 4), \
-                patch("research.edge_ledger_store.REPLAY_ENGINE_EPOCH", 4), \
-                patch("research.live_shadow_ingest.REPLAY_ENGINE_EPOCH", 4):
+        with patch("research.edge_ledger.REPLAY_ENGINE_EPOCH", 5), \
+                patch("research.edge_ledger_store.REPLAY_ENGINE_EPOCH", 5), \
+                patch("research.live_shadow_ingest.REPLAY_ENGINE_EPOCH", 5):
             first = ingest_shadow(config)
         self.assertEqual(first["ingested"], 1, first)
         first_run = self.ledger.runs(cid, lane="shadow")[0]
-        self.assertEqual(first_run["metrics"]["replay_engine_epoch"], 4)
+        self.assertEqual(first_run["metrics"]["replay_engine_epoch"], 5)
 
         second = ingest_shadow(config)
         self.assertEqual(second["ingested"], 1, second)
         runs = self.ledger.runs(cid, lane="shadow")
         self.assertEqual(len(runs), 2)
-        self.assertEqual(runs[-1]["metrics"]["replay_engine_epoch"], 5)
+        self.assertEqual(runs[-1]["metrics"]["replay_engine_epoch"], 6)
         self.assertNotEqual(runs[0]["run_id"], runs[1]["run_id"])
 
     def test_online_fdr_records_raw_p_not_selected_global_q(self):
@@ -444,7 +455,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self._rows(f"shadow:null:{cid}", [-1.0] * 8)
         # Simulate an existing offline/legacy promotion.  It has a valid
         # historical proof but no parity marker and is therefore ineligible.
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             db.execute("UPDATE candidate_state SET status='validated' WHERE candidate_id=?", (cid,))
         self.assertFalse(self.ledger.eligibility(cid)["eligible"])
         result = ingest_shadow(ShadowIngestConfig(
@@ -466,7 +477,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         # Each mutation is on its own fresh database copy so the proof remains
         # independently diagnostic and no mutation can accidentally mask the
         # next check.
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             row = db.execute("SELECT metrics_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
             metrics = json.loads(row[0])
             metrics["shadow_source"]["baseline"]["rows_digest"] = "tampered"
@@ -487,7 +498,7 @@ class LiveShadowIngestTests(unittest.TestCase):
 
     def test_live_authorization_fails_closed_on_replay_digest_tamper(self):
         cid, run_id = self._seed_live_run()
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             row = db.execute("SELECT metrics_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
             metrics = json.loads(row[0])
             metrics["replay_digests"][0] = "tampered"
@@ -498,7 +509,7 @@ class LiveShadowIngestTests(unittest.TestCase):
 
     def test_live_authorization_fails_closed_on_gate_digest_tamper(self):
         cid, run_id = self._seed_live_run()
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             row = db.execute("""SELECT evidence_id,payload_json FROM evidence
                 WHERE run_id=? AND kind='shadow_ingestion'""", (run_id,)).fetchone()
             payload = json.loads(row[1])
@@ -510,7 +521,7 @@ class LiveShadowIngestTests(unittest.TestCase):
 
     def test_live_authorization_fails_closed_on_marker_candidate_proof_tamper(self):
         cid, run_id = self._seed_live_run()
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             row = db.execute("""SELECT evidence_id,payload_json FROM evidence
                 WHERE run_id=? AND kind='shadow_ingestion'""", (run_id,)).fetchone()
             payload = json.loads(row[1])
@@ -523,7 +534,7 @@ class LiveShadowIngestTests(unittest.TestCase):
 
     def test_live_authorization_rejects_duplicate_legacy_markers(self):
         cid, run_id = self._seed_live_run()
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             row = db.execute(
                 "SELECT candidate_id,payload_json,evidence_hash FROM evidence "
                 "WHERE run_id=? AND kind='shadow_ingestion'", (run_id,)).fetchone()
@@ -542,14 +553,14 @@ class LiveShadowIngestTests(unittest.TestCase):
 
     def test_live_authorization_fails_closed_on_config_digest_tamper(self):
         cid, run_id = self._seed_live_run()
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             db.execute("DROP TRIGGER runs_no_update")
             db.execute("UPDATE runs SET config_hash=? WHERE run_id=?", ("tampered", run_id))
         self.assertFalse(self.ledger.eligibility(cid)["eligible"])
 
     def test_live_authorization_fails_closed_when_durable_fdr_is_tampered(self):
         cid, run_id = self._seed_live_run()
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             db.execute("DROP TRIGGER factory_fdr_no_update")
             db.execute(
                 "UPDATE factory_fdr SET allocated_alpha=? "
@@ -560,14 +571,14 @@ class LiveShadowIngestTests(unittest.TestCase):
     def test_manual_offline_promotion_is_rejected_without_live_marker(self):
         cid = self.candidate["candidate_id"]
         _persist_gate(self.ledger, cid, "shadow")
-        with sqlite3.connect(self.edge_path) as db:
+        with closing(sqlite3.connect(self.edge_path)) as db, db:
             db.execute("UPDATE candidate_state SET status='shadow' WHERE candidate_id=?", (cid,))
             db.execute("DROP TRIGGER evidence_no_delete")
             db.execute("DELETE FROM evidence WHERE candidate_id=? AND kind='shadow_ingestion'", (cid,))
         with self.assertRaisesRegex(ValueError, "parity-matched live-shadow"):
             self.ledger.transition(cid, "validated", reason="manual promotion")
 
-    def test_batch_bh_does_not_select_preflight_failed_low_p_candidate(self):
+    def test_batch_by_does_not_select_preflight_failed_low_p_candidate(self):
         candidate_ids = ["low", "marginal", "ready"]
         ingestor = object.__new__(type("FakeIngestor", (), {}))
         # Use a real ingestor so the tested selection path is not duplicated,
@@ -599,7 +610,7 @@ class LiveShadowIngestTests(unittest.TestCase):
                     if not dry and item.get("selected")]
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]["global"]["significant"], True)
-        self.assertAlmostEqual(selected[0]["global"]["p_adjusted"], .0015)
+        self.assertAlmostEqual(selected[0]["global"]["p_adjusted"], .00275)
         self.assertGreater(selected[0]["global"]["p_adjusted"],
                            prepared["ready"]["raw_p"])
         self.assertEqual(result["ingested"], 1)

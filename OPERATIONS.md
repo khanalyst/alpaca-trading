@@ -443,8 +443,8 @@ recorder's mixed bars/quotes/options corpus under
 recent N session partitions), runs the autonomous strategy factory
 plus the explicit IBR baseline, scores shares and single-leg long-option
 vehicles separately, and writes evidence. Each variant has its own simulated
-cash/equity account; default capacity is eleven logical strategy slots and four
-variants per strategy, covering the catalog of eleven rule families on a fresh
+cash/equity account; default capacity is twelve logical strategy slots and four
+variants per strategy, covering the catalog of twelve rule families on a fresh
 ledger. Each isolated book is processed by one
 bounded worker. Paper `selection_mode: all_proved` keeps one strongest proven
 variant per verified frozen prior-cycle dependence cluster under one global risk
@@ -495,15 +495,15 @@ the parity-matched live-shadow tail. Readiness is reported as 150 offline
 sessions plus 30 shadow-selection and 30 disjoint shadow-confirmation sessions
 (210 total; the compatibility shadow count is 60). Retirement then requires the same powered
 floors, a 95% clustered upper-bound rejection of a 0.05R minimum useful edge,
-and at least two negative forward windows for every point. Replay epoch 5
-retains epoch-4 point-in-time, executable-row, vehicle-cost, raw-confirmatory-p,
+and at least two negative forward windows for every point. Replay epoch 6
+retains epoch-5 point-in-time, executable-row, vehicle-cost, raw-confirmatory-p,
 and stressed-cost boundaries, and additionally seals paired synthetic
 root-control shadow decisions/replays, diagnostic historical-backfill provenance
 with exact calendar metadata, durable live-shadow FDR binding, chronological
-paired inference, finite BH input validation, and conservative broker-tick
-equity rounding. Epoch-4 evidence remains readable for audit but is quarantined
-and cannot authorize until re-derived under epoch 5. Authorization requires
-exact epoch equality with current epoch 5; future epochs are audit-only too.
+paired inference, finite BY input validation, and conservative broker-tick
+equity rounding. Epoch-5 evidence remains readable for audit but is quarantined
+and cannot authorize until re-derived under epoch 6. Authorization requires
+exact epoch equality with current epoch 6; future epochs are audit-only too.
 Each current-epoch run seals one immutable verified gate proof, and re-derivation
 appends a new proof instead of rewriting history. A valid bounded LLM replacement
 is registered first when that lane is enabled. Demoted candidates
@@ -546,7 +546,7 @@ seeded moving-block day/session-cluster bootstrap; its draw count, seed, and
 block length are persisted. Effective breadth is persisted/re-verified as a
 matched symbol/session correlation diagnostic and never counts as additional N.
 Before each factory cycle, prior-cycle family deltas are frozen into a
-hash-verified dependence map; the cluster-level BH veto and runtime
+hash-verified dependence map; the cluster-level BY veto and runtime
 one-strongest-per-verified-cluster allocation are authorizing controls, not
 breadth diagnostics.
 
@@ -575,18 +575,18 @@ The scheduled research cycle invokes `edge ingest-shadow` by default when
 from the shared `shadow-data` volume and is a no-op when the WAL is absent. It
 accepts only strictly newer,
 complete, parity-matched rows with prior qualification and matching
-source/config/code/provenance/replay/gate hashes; family and global BH plus the
+source/config/code/provenance/replay/gate hashes; family and global BY plus the
 frozen-dependence-cluster veto and durable online-FDR are applied before an
 immutable `lane=shadow` proof and
 live-ingestion marker are appended. The `shadow-confirmation-v6`
 ingester first splits the tail into
 older chronological selection sessions and a newer disjoint confirmatory
-window: BH uses selection raw p-values, while only the selected candidate's raw
+window: BY uses selection raw p-values, while only the selected candidate's raw
 confirmatory p-value is sent to LORD++. Its preregistered `W0=alpha/2` spends
 `(alpha/2)*gamma_t` before discovery, rewards the first discovery with
 `alpha/2`, and gives later discoveries the standard `alpha` stream. Historical
 v5 rows retain `W0=alpha` and are audit-only, isolated from v6; legacy
-v2/v3/v4 rows remain auditable but quarantined. Epoch-5
+v2/v3/v4 rows remain auditable but quarantined. Epoch-6
 verification also binds the proof to the durable FDR allocation (scope/test id,
 method/version, p-value, alpha, allocation, and decision). The
 confirmatory p-value resolution scales
@@ -619,7 +619,13 @@ Multi-symbol expansion remains deferred until a known-positive end-to-end
 reproduction; partial exits remain unimplemented while broker lifecycle and
 position reconciliation risks are unresolved.
 
-Compose defaults a truly empty journal to
+Execution calibration is disabled by default. Offline discovery/factory work
+continues, but shadow ingestion reports `calibration_disabled` until
+`ALPACA_RESEARCH_CALIBRATION_ENABLED=1` is set deliberately. Stress/quote
+calibration is a separate diagnostic opt-in through
+`ALPACA_RESEARCH_STRESS_CALIBRATION_ENABLED=1`.
+
+When execution calibration is enabled, Compose defaults a truly empty journal to
 `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1`. The persisted
 `bootstrap_unknown` state keeps `authorization_exit_code=2`: it only permits
 shadow evidence collection and never claims measured execution calibration or
@@ -669,7 +675,7 @@ lifecycle state.
 Inspect raw lineage rows and isolated-account counts with
 `python research.py factory status`. Tune bounded capacity with
 `ALPACA_FACTORY_STRATEGIES`, `ALPACA_FACTORY_VARIANTS`, and
-`ALPACA_FACTORY_WORKERS`; hard validation caps these at 11, 8, and 16.
+`ALPACA_FACTORY_WORKERS`; hard validation caps these at 12, 8, and 16.
 
 See how each deployed edge is performing on live paper outcomes:
 

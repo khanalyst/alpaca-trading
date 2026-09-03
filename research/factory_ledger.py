@@ -1825,7 +1825,7 @@ class FactoryLedger:
         confirmatory statistic and the allocation is standard LORD++ under
         that scope's preregistered initial wealth. v2/v3/v4 scopes retain
         their legacy allocation for audit compatibility.
-        Family/global BH q-values are candidate-selection summaries and must
+        Family/global batch-adjusted q-values are candidate-selection summaries and must
         not be passed to a raw-p scope.
 
         Callers claiming FDR control must establish independent null p-values;

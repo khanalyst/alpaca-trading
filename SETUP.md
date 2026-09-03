@@ -27,9 +27,9 @@ fed and readable so that silence is informative rather than worrying.
 | --- | --- |
 | **Edge** | A trading rule with evidence that it makes money after costs. |
 | **Rule spec** | The edge itself, stored as *data* in a fixed grammar — never code. The LLM can only emit these. |
-| **Family** | The kind of signal (opening-range breakout, mean reversion, VWAP reversion, …). There are 11. |
+| **Family** | The kind of signal (opening-range breakout, mean reversion, VWAP reversion, …). There are 12. |
 | **Variant** | One family with specific numbers — a 15-minute range instead of 20, a 2.0R target instead of 1.5R. |
-| **Slot** | One of 11 logical research slots; each isolated book is processed by one bounded worker. |
+| **Slot** | One of 12 logical research slots; each isolated book is processed by one bounded worker. |
 | **Generation** | How many times a slot's hypothesis has been replaced after failing. |
 | **Backtest lane** | First test, on the corpus split into fit and held-out parts. |
 | **Offline shadow lane** | Forward replay on sessions recorded *strictly after* the backtest; it may leave a candidate at `shadow` but never authorizes runtime. |
@@ -318,7 +318,12 @@ explicit `ALPACA_RESEARCH_VEHICLES=all` override runs both lanes. Missing,
 stale, or insufficient calibration blocks shadow authorization while leaving
 offline discovery/factory diagnostics available.
 
-Compose defaults the genuinely empty-journal path to
+Execution calibration is disabled by default. Discovery/factory diagnostics
+still run, but shadow ingestion remains visibly blocked until you set
+`ALPACA_RESEARCH_CALIBRATION_ENABLED=1`. The separate quote-schedule
+measurement pass requires `ALPACA_RESEARCH_STRESS_CALIBRATION_ENABLED=1`.
+
+When execution calibration is enabled, Compose defaults the genuinely empty-journal path to
 `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1`. It persists
 `calibration_state=bootstrap_unknown` with `authorization_exit_code=2`,
 allowing shadow evidence collection without claiming measured execution
@@ -630,7 +635,7 @@ consumes the same events in its own virtual book and remains outside EdgeLedger
 lifecycle state. Mismatch or incomplete rows are quarantined. Ingestion opens that WAL
 read-only, requires strictly newer sessions, prior qualification, complete
 parity, and matching source/config/code/provenance/replay/gate hashes; family
-and global BH plus the frozen-dependence-cluster veto and durable online FDR must
+and global BY plus the frozen-dependence-cluster veto and durable online FDR must
 pass before an immutable live marker
 is appended. Historical and offline-forward selection explicitly defers this
 cumulative test; it cannot consume the budget or authorize deployment. Manual/
@@ -642,12 +647,12 @@ fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
 and directional/pair coverage. Quote density can change null/control evidence
 even when the candidate count is unchanged.
 The `shadow-confirmation-v6` ingestion scope uses independent
-chronological selection and confirmatory windows: BH uses selection p-values,
+chronological selection and confirmatory windows: BY uses selection p-values,
 only the selected candidate's raw confirmatory p reaches LORD++, and legacy
 v2/v3/v4 scopes remain audit-only. With `W0=alpha/2`, pre-discovery spending is
 `(alpha/2)*gamma_t`, the first-discovery reward is `alpha/2`, and later
 discoveries receive the standard `alpha` stream. Historical v5 rows retain
-`W0=alpha` and are audit-only, isolated from v6. Epoch-5
+`W0=alpha` and are audit-only, isolated from v6. Epoch-6
 verification binds the live proof to the durable FDR method/version and
 allocation rather than trusting caller-supplied fields.
 
@@ -685,7 +690,7 @@ count, seed, and block length. Effective breadth is a persisted and
 re-verified diagnostic over matched symbol/session deltas; it never counts as
 extra independent observations or raises the trade/session N. Before a factory
 cycle, completed prior-cycle family deltas are frozen into a hash-verified map;
-strong clusters receive the additional BH veto and runtime admits at most one
+strong clusters receive the additional BY veto and runtime admits at most one
 strongest edge per verified frozen cluster. Missing assignments never imply
 independence.
 
@@ -720,13 +725,13 @@ negative rolling-forward windows. Until then the report says `underpowered` or
 
 Live shadow requires at least 150 trades across 30 complete, parity-matched
 sessions. A separate paper trial is reviewed only after its configured 100
-trades across 30 sessions. Replay epoch 5 retains epoch-4 boundaries and also
+trades across 30 sessions. Replay epoch 6 retains epoch-5 boundaries and also
 seals paired synthetic root-control shadow replays, diagnostic historical-
 backfill provenance with exact calendar metadata, durable live-shadow FDR
-binding, chronological paired inference, finite BH input validation, and
-conservative broker-tick equity rounding. Epoch-4 evidence remains audit-readable
-but cannot authorize and must be re-derived under epoch 5. Exact equality with
-current epoch 5 is required; future epochs are audit-only too. Each current-epoch
+binding, chronological paired inference, finite BY input validation, and
+conservative broker-tick equity rounding. Epoch-5 evidence remains audit-readable
+but cannot authorize and must be re-derived under epoch 6. Exact equality with
+current epoch 6 is required; future epochs are audit-only too. Each current-epoch
 run seals one immutable verified gate proof, and re-derivation appends a new
 proof instead of rewriting history. These defaults make
 rejection and deployment decisions span market sessions rather than a handful

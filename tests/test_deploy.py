@@ -486,6 +486,7 @@ class DeployTests(unittest.TestCase):
             report_path = root / "calibration-%s.json"
             denied = _run_research_cycle(
                 dataset, root / "off",
+                ALPACA_RESEARCH_CALIBRATION_ENABLED="1",
                 ALPACA_RESEARCH_JOURNAL=str(journal),
                 ALPACA_RESEARCH_CALIBRATION_REPORT=str(report_path),
                 ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN="0")
@@ -493,6 +494,7 @@ class DeployTests(unittest.TestCase):
 
             allowed = _run_research_cycle(
                 dataset, root / "on",
+                ALPACA_RESEARCH_CALIBRATION_ENABLED="1",
                 ALPACA_RESEARCH_JOURNAL=str(journal),
                 ALPACA_RESEARCH_CALIBRATION_REPORT=str(root / "on" /
                                                        "calibration-%s.json"),
@@ -751,6 +753,8 @@ class DeployTests(unittest.TestCase):
             '"$python_bin" "$repo_root/research/cost_rerun.py" '
             '--calibration-only', script)
         self.assertIn('ALPACA_RESEARCH_STRESS_CALIBRATION_REPORT', script)
+        self.assertIn('ALPACA_RESEARCH_STRESS_CALIBRATION_ENABLED:-0', script)
+        self.assertIn('ALPACA_RESEARCH_CALIBRATION_ENABLED:-0', script)
 
         for status in ("search_exhausted", "llm_provider_failure"):
             with self.subTest(status=status):

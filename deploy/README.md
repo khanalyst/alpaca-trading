@@ -251,7 +251,7 @@ unimplemented because broker lifecycle and position reconciliation risk are not
 accepted. Effective breadth is a persisted/re-verified matched
 symbol/session diagnostic and never counts as extra independent N. Before each
 factory cycle, completed prior-cycle family deltas are frozen into a
-hash-verified map; strong clusters receive a cluster-level BH veto and runtime
+hash-verified map; strong clusters receive a cluster-level BY veto and runtime
 allocation admits one strongest edge per verified frozen cluster. Serial
 inference uses a deterministic seeded moving-block day/session-cluster
 bootstrap.
@@ -262,15 +262,15 @@ cross-sectional features require explicit replay context and fail closed when
 that context is missing or ambiguous.
 
 Research qualification requires at least 100 trades, 30 complete sessions, and
-30 session-level clusters. Epoch 5 retains epoch-4 point-in-time,
+30 session-level clusters. Epoch 6 retains epoch-5 point-in-time,
 executable-row, vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries,
 and additionally seals paired synthetic root-control shadow decisions/replays,
 diagnostic historical-backfill provenance with exact calendar metadata, durable
-live-shadow FDR binding, chronological paired inference, finite BH input
-validation, and conservative broker-tick equity rounding. Epoch-4 proofs remain
+live-shadow FDR binding, chronological paired inference, finite BY input
+validation, and conservative broker-tick equity rounding. Epoch-5 proofs remain
 readable for audit but cannot validate, champion, or authorize the paper trader;
-they must be re-derived under epoch 5. Authorization requires exact equality
-with current epoch 5; future generations are audit-only too. A current-epoch run
+they must be re-derived under epoch 6. Authorization requires exact equality
+with current epoch 6; future generations are audit-only too. A current-epoch run
 seals one immutable verified gate proof, and re-derivation appends a new proof
 instead of rewriting history.
 
@@ -500,12 +500,12 @@ Offline historical/forward replay defers cumulative online FDR, may leave a
 candidate at `shadow` only, and never authorizes runtime. Research-side `edge
 ingest-shadow` opens the shadow WAL read-only, requires strictly newer complete
 parity-matched rows, prior qualification, source/config/code/provenance/replay/
-gate hashes, family/global BH plus the frozen-dependence-cluster veto and
+gate hashes, family/global BY plus the frozen-dependence-cluster veto and
 durable online FDR, then appends the
 immutable `lane=shadow` proof and live marker. Underpowered, mismatched, or
 incomplete shadow data advances no boundary and is reconsidered. The
 `shadow-confirmation-v6` ingestion scope splits each tail into older
-chronological selection sessions and a newer disjoint confirmatory window; BH
+chronological selection sessions and a newer disjoint confirmatory window; BY
 uses selection raw p-values, while only the selected candidate's raw
 confirmatory p-value reaches LORD++. With `W0=alpha/2`, pre-discovery spending is
 `(alpha/2)*gamma_t`, the first-discovery reward is `alpha/2`, and later

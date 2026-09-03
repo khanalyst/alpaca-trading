@@ -70,12 +70,13 @@ def _quantize_equity_bracket(decision: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _equity_entry_reference(decision: Mapping[str, Any], row: Mapping[str, Any]) -> float | None:
-    """Return the current executable quote side or the authored fallback.
+    """Return the current executable quote side.
 
-    Some signal producers author absolute stop/target legs without repeating
-    an entry price.  Risk sizing has always allowed the market snapshot to
-    supply that price; tick rounding must use the same fail-closed runtime
-    evidence instead of rejecting the signal before risk vetting.
+    The authored signal reference is a planning input, not an executable mark.
+    Never let it stand in for a missing quote: doing so can size a position and
+    submit a bracket against a price the broker cannot currently execute.
+    Signals that omit ``entry_price`` remain valid when the quote supplies the
+    executable side; callers must reject a ``None`` result before risk vetting.
     """
     quote = row.get("quote") if isinstance(row, Mapping) else None
     direction = str(decision.get("direction") or "").lower()
@@ -88,12 +89,7 @@ def _equity_entry_reference(decision: Mapping[str, Any], row: Mapping[str, Any])
             return float(rounded)
         except (TypeError, ValueError, ArithmeticError, OverflowError):
             pass
-    authored = decision.get("entry_price")
-    try:
-        value = float(authored)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return value if value == value and abs(value) != float("inf") and value > 0 else None
+    return None
 
 
 class MarketEntryRiskMixin:
@@ -515,8 +511,13 @@ class MarketEntryRiskMixin:
             return None
         if decision["execution_profile"] == "shares":
             entry_reference = _equity_entry_reference(decision, row)
-            if entry_reference is not None:
-                decision["entry_price"] = entry_reference
+            if entry_reference is None:
+                self._event("execution_reject", {
+                    "symbol": symbol,
+                    "reason": "executable entry quote is unavailable",
+                })
+                return None
+            decision["entry_price"] = entry_reference
             try:
                 # Validate the broker-facing bracket before entering the risk
                 # boundary, but leave normalization to RiskEngine so direct
@@ -649,6 +650,12 @@ class MarketEntryRiskMixin:
         bar_provider = (bar.get("provider") or row.get("bar_provider") or
                         row.get("provider") or provider_default)
         plan.update({
+            # Keep the authored signal reference distinct from the quote that
+            # drove sizing/geometry.  Downstream journal/replay consumers can
+            # now prove which value was executable without reconstructing it
+            # from the overwritten ``entry_price`` field.
+            "authored_entry_reference": authored_entry_reference,
+            "executable_entry_reference": plan.get("entry_price"),
             "entry_fill_source": "quote",
             "exit_fill_source": None,
             "entry_feed": str(entry_feed) if entry_feed is not None else None,

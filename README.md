@@ -74,11 +74,16 @@ is suppressed only after a powered upper-bound rejection; underpowered and
 adequate-but-inconclusive results remain eligible for more evidence.
 A candidate must clear structural trade/session floors, matched controls,
 absolute after-cost profitability, falsification, fixed-rule rolling-origin
-stability, and family-local plus cycle-global false-discovery correction. A
+stability, and dependence-safe family-local plus cycle-global false-discovery
+correction. A
 family can legitimately pass its local test but fail the global one; only the
 global result can authorize cross-family selection. Historical and offline
 forward screens do not spend cumulative alpha. The one durable online-FDR test
 is reserved for the later parity-matched live-shadow tail.
+Current proofs retain and recompute the complete family/global/cluster BY
+batches rather than trusting scalar q-values. A separately seeded placebo
+stream is retained as reproducibility evidence over the same held-out sample;
+it is not independent data and does not create a second significance hurdle.
 
 The exit grammar is versioned. v3 already provides the bounded equity
 `breakeven_r` transition; v4 additionally supports a frozen session VWAP or
@@ -123,7 +128,7 @@ re-verified with the proof, and never counts as extra independent N. It is
 separate from authorizing dependence: before a factory cycle, completed
 prior-cycle family deltas are frozen into a hash-verified dependence map. When
 that map has enough history, its family clusters receive a conservative
-cluster-level BH veto in addition to family-local and cycle-global BH; the
+cluster-level BY veto in addition to family-local and cycle-global BY; the
 cluster veto can only reject. Paper `selection_mode: all_proved` then admits
 the strongest proved edge per verified frozen cluster. Families without a
 verified assignment use the existing held-out correlation fallback and never
@@ -160,7 +165,7 @@ and FDR advancement until the repair completes.
 
 The `shadow-confirmation-v6` live-shadow scope is independent and chronological:
 each complete tail is split into an older selection window and a newer disjoint
-confirmatory window. Batch BH uses selection p-values; only the selected
+confirmatory window. Batch BY uses selection p-values; only the selected
 candidate's raw confirmatory p-value is sent to LORD++. With `W0=alpha/2`,
 pre-discovery spending is `(alpha/2)*gamma_t`, the first-discovery reward is
 `alpha/2`, and later discoveries receive the standard `alpha` reward stream.
@@ -347,7 +352,9 @@ provider/feed, content hash, disjoint chronological held-out sessions, and an
 artifact-wide effective-after boundary. Missing or unusable cells use the
 configured scalar fallback; setting the enable flag without a valid artifact
 does not activate calibration, and calibration never self-authorizes.
-Shadow authorization fails closed when the journal is
+Execution calibration at the shadow-ingestion boundary is also disabled by
+default; set `ALPACA_RESEARCH_CALIBRATION_ENABLED=1` explicitly when that
+read-only check should run. Shadow authorization fails closed when the journal is
 missing or stale, the sample is insufficient, costs are optimistic, a terminal
 fill is materially underfilled (<80% of requested quantity), or the
 partial-cancel rate exceeds 20%. Offline discovery and factory diagnostics may
@@ -642,15 +649,15 @@ evidence gate, not a startup error.
 Backtest/factory evidence requires 100 trades plus 30 complete sessions/clusters;
 sealed qualification requires 100 trades plus 30 complete sessions/clusters;
 and the parity-matched shadow tail requires 150 trades plus 30 complete
-sessions. Replay epoch 5 retains the epoch-4 point-in-time, executable-row,
+sessions. Replay epoch 6 retains the epoch-5 point-in-time, executable-row,
 vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries, and additionally
 seals paired synthetic root-control shadow decisions/replays, diagnostic-only
 historical-backfill provenance with exact calendar metadata, durable live-shadow
-FDR allocation binding, chronological paired inference, finite BH input
-validation, and conservative broker-tick equity rounding. Epoch-4 proofs remain
+FDR allocation binding, chronological paired inference, finite BY input
+validation, and conservative broker-tick equity rounding. Epoch-5 proofs remain
 readable for audit but cannot validate, champion, or authorize the trader; they
-must be re-derived under epoch 5. Authorization requires exact equality with
-current epoch 5, while future epochs are audit-only. Each current-epoch run
+must be re-derived under epoch 6. Authorization requires exact equality with
+current epoch 6, while future epochs are audit-only. Each current-epoch run
 seals one immutable verified gate proof, and re-derivation appends a new proof
 rather than rewriting history.
 

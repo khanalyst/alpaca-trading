@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 from agent.contracts.rule import feature_window_bars, validate_rule_spec
 from research.costs import ReplayPolicy
 from research.edge_lab import _read_discovery_rows
-from research.factory_core import _simulate_trade, _session_bars_valid, simulate_account
+from research.factory_core import (_simulate_trade, _session_bars_valid,
+                                   diagnose, simulate_account)
 
 # These fixtures carry bars but no quotes, so the replay is told explicitly
 # that bar fallback is acceptable.  Pricing is not what is under test here;
@@ -273,6 +274,17 @@ class SessionGapScopeTests(unittest.TestCase):
                            clean_loser["realized_pnl"])
         self.assertTrue(gapped_loser["rows"][0]["hold_discontinuity_exit"])
         self.assertNotIn("pnl", gapped_loser["rows"][0]["hold_exit_reason"])
+
+        # The sparse hold is retained as an executable diagnostic/accounting
+        # row, but it cannot authorize directional P&L or strategy selection.
+        summary = diagnose(gapped_loser["rows"])
+        self.assertEqual(summary["executed_trades"], 1)
+        self.assertEqual(summary["trades"], 0)
+        self.assertEqual(summary["net_pnl"], 0.0)
+        self.assertEqual(summary["hold_telemetry"]["discontinuity_exits"], 1)
+        self.assertEqual(summary["hold_telemetry"]["discontinuity_exit_rate"], 1.0)
+        self.assertEqual(gapped_loser["authorizing_trades"], 0)
+        self.assertEqual(gapped_loser["authorizing_realized_pnl"], 0.0)
 
 
 if __name__ == "__main__":

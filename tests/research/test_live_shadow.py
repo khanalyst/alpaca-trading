@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -115,7 +116,7 @@ class LiveShadowTests(unittest.TestCase):
                                              "variant_id": variant},
                               "risk": {"risk_per_trade_pct": 1},
                               "execution": {}, "session": {}})
-        with sqlite3.connect(self.edge) as db:
+        with closing(sqlite3.connect(self.edge)) as db, db:
             db.execute("UPDATE candidate_state SET status=? WHERE candidate_id=?",
                        (status, row["candidate_id"]))
         return row
@@ -299,7 +300,7 @@ class LiveShadowTests(unittest.TestCase):
         store = ShadowStore(self.shadow)
         digest = store.save_manifest({"event_watermark": {"count": 1}})
         key = f"shadow-manifest.v1:{digest}"
-        with sqlite3.connect(self.shadow) as db:
+        with closing(sqlite3.connect(self.shadow)) as db, db:
             payload = json.loads(db.execute(
                 "SELECT value FROM meta WHERE key=?", (key,)).fetchone()[0])
             payload["event_watermark"]["count"] = 2
@@ -314,7 +315,7 @@ class LiveShadowTests(unittest.TestCase):
         wrong_key = "0" * 64 if digest != "0" * 64 else "1" * 64
         payload = store.manifest(digest)
         self.assertIsNotNone(payload)
-        with sqlite3.connect(self.shadow) as db:
+        with closing(sqlite3.connect(self.shadow)) as db, db:
             db.execute("INSERT INTO meta(key,value) VALUES(?,?)",
                        (f"shadow-manifest.v1:{wrong_key}",
                         json.dumps(payload, sort_keys=True,
@@ -326,7 +327,7 @@ class LiveShadowTests(unittest.TestCase):
         store = ShadowStore(self.shadow)
         digest = store.save_manifest({"event_watermark": {"count": 1}})
         key = f"shadow-manifest.v1:{digest}"
-        with sqlite3.connect(self.shadow) as db:
+        with closing(sqlite3.connect(self.shadow)) as db, db:
             payload = json.loads(db.execute(
                 "SELECT value FROM meta WHERE key=?", (key,)).fetchone()[0])
             payload.pop("replay_code_hash", None)
@@ -346,7 +347,7 @@ class LiveShadowTests(unittest.TestCase):
     def test_latest_manifest_pointer_is_self_verified(self):
         store = ShadowStore(self.shadow)
         store.save_manifest({"event_watermark": {"count": 1}})
-        with sqlite3.connect(self.shadow) as db:
+        with closing(sqlite3.connect(self.shadow)) as db, db:
             payload = json.loads(db.execute(
                 "SELECT value FROM meta WHERE key='shadow-manifest.v1:latest'"
             ).fetchone()[0])
@@ -429,7 +430,7 @@ class LiveShadowTests(unittest.TestCase):
             ending_cash=100_001, realized_pnl=1.0, trades=[row],
             replay_status="match")
         aged = time.time() - 20 * 86400
-        with sqlite3.connect(self.shadow) as db:
+        with closing(sqlite3.connect(self.shadow)) as db, db:
             db.execute("UPDATE replay_diffs SET created_at=?", (aged,))
 
         retained = store.prune()
@@ -535,8 +536,9 @@ class LiveShadowTests(unittest.TestCase):
         before = self.edge.read_bytes()
         self._run(max_events=20)
         self.assertEqual(before, self.edge.read_bytes())
-        books = sqlite3.connect(self.shadow).execute(
-            "SELECT candidate_id FROM virtual_books").fetchall()
+        with closing(sqlite3.connect(self.shadow)) as db:
+            books = db.execute(
+                "SELECT candidate_id FROM virtual_books").fetchall()
         self.assertTrue({row[0] for row in books}.issubset({first["candidate_id"], second["candidate_id"]}))
 
     def test_incomplete_replay_is_diagnostic_and_does_not_touch_edge(self):
@@ -545,9 +547,10 @@ class LiveShadowTests(unittest.TestCase):
         before = self.edge.read_bytes()
         self._run(max_events=20)
         self.assertEqual(before, self.edge.read_bytes())
-        row = sqlite3.connect(self.shadow).execute(
-            "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
-            (candidate["candidate_id"],)).fetchone()
+        with closing(sqlite3.connect(self.shadow)) as db:
+            row = db.execute(
+                "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
+                (candidate["candidate_id"],)).fetchone()
         self.assertIsNotNone(row)
         self.assertIn(row[0], {"incomplete", "mismatch", "match"})
         json.loads(row[1])
@@ -732,9 +735,10 @@ class LiveShadowTests(unittest.TestCase):
         runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
         row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
         runner._replay(candidate, "2026-01-02", [row], [], [])
-        stored = sqlite3.connect(self.shadow).execute(
-            "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
-            (candidate["candidate_id"],)).fetchone()
+        with closing(sqlite3.connect(self.shadow)) as db:
+            stored = db.execute(
+                "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
+                (candidate["candidate_id"],)).fetchone()
         self.assertIsNotNone(stored)
         self.assertNotEqual(stored[0], "incomplete")
         details = json.loads(stored[1])
@@ -857,9 +861,10 @@ class LiveShadowTests(unittest.TestCase):
         complete = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
         runner._replay(candidate, "2026-01-02", [partial], [], [])
         runner._replay(candidate, "2026-01-02", [complete], [], [])
-        rows = sqlite3.connect(self.shadow).execute(
-            "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
-            (candidate["candidate_id"],)).fetchall()
+        with closing(sqlite3.connect(self.shadow)) as db:
+            rows = db.execute(
+                "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
+                (candidate["candidate_id"],)).fetchall()
         self.assertEqual(len(rows), 1)
         self.assertNotEqual(rows[0][0], "incomplete")
         self.assertTrue(json.loads(rows[0][1])["complete"])
@@ -961,7 +966,7 @@ class LiveShadowTests(unittest.TestCase):
         # The production ID is content-derived; use the row's actual ID for
         # the close query just as run_once does.
         actual = store.decisions("candidate")[0]["decision_id"]
-        with sqlite3.connect(self.shadow) as db:
+        with closing(sqlite3.connect(self.shadow)) as db, db:
             db.execute("UPDATE virtual_books SET decision_id=? WHERE decision_id=?",
                        (actual, decision_id))
         self.assertTrue(store.has_open("candidate", "SPY"))
@@ -1020,9 +1025,10 @@ class LiveShadowTests(unittest.TestCase):
             self.assertEqual(replay.call_count, 1)
             self.assertEqual({bar.symbol for bar in replay.call_args.args[0]}, {"SPY", "QQQ"})
 
-        stored = sqlite3.connect(self.shadow).execute(
-            "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
-            (candidate["candidate_id"],)).fetchone()
+        with closing(sqlite3.connect(self.shadow)) as db:
+            stored = db.execute(
+                "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
+                (candidate["candidate_id"],)).fetchone()
         self.assertIsNotNone(stored)
         self.assertEqual(stored[0], "match", stored[1])
         details = json.loads(stored[1])
@@ -1034,9 +1040,10 @@ class LiveShadowTests(unittest.TestCase):
         self.assertEqual(account["starting_cash"], 100_000.0)
         self.assertEqual(account["ending_cash"], 100_000.0)
         self.assertEqual(account["trade_count"], 2)
-        books = sqlite3.connect(self.shadow).execute(
-            "SELECT symbol,status FROM virtual_books WHERE candidate_id=? ORDER BY symbol",
-            (candidate["candidate_id"],)).fetchall()
+        with closing(sqlite3.connect(self.shadow)) as db:
+            books = db.execute(
+                "SELECT symbol,status FROM virtual_books WHERE candidate_id=? ORDER BY symbol",
+                (candidate["candidate_id"],)).fetchall()
         self.assertEqual(books, [("QQQ", "closed_replay"), ("SPY", "closed_replay")])
 
         mismatch_trades = [SimpleNamespace(
@@ -1085,9 +1092,10 @@ class LiveShadowTests(unittest.TestCase):
                    wraps=factory_simulate_account) as factory:
             runner._replay(candidate, "2026-01-02", [row], [], [])
         self.assertTrue(factory.called)
-        stored = sqlite3.connect(self.shadow).execute(
-            "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
-            (candidate["candidate_id"],)).fetchone()
+        with closing(sqlite3.connect(self.shadow)) as db:
+            stored = db.execute(
+                "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
+                (candidate["candidate_id"],)).fetchone()
         self.assertIsNotNone(stored)
         details = json.loads(stored[1])
         self.assertNotIn("rule replay factory unavailable", details.get("reason", ""))

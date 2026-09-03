@@ -336,8 +336,11 @@ class EquityProvenanceTests(unittest.TestCase):
     def test_factory_quote_priced_legs_retain_feed_and_provider(self):
         row = _simulate_trade(
             _bars(RISING + FLAT), SPEC, [], "equity",
-            quotes=index_quotes([_quote(4, 99.0, 100.0),
-                                 _quote(8, 99.0, 100.0)]),
+            # Keep both executable asks above the authored stop. A quote
+            # already through a protective leg is now correctly refused by
+            # the runtime/replay geometry contract.
+            quotes=index_quotes([_quote(4, 99.0, 100.9),
+                                 _quote(8, 99.0, 100.9)]),
             policy=PERMISSIVE_POLICY)
         self.assertEqual((row["entry_fill_source"], row["exit_fill_source"]),
                          (QUOTE, QUOTE))
@@ -748,25 +751,26 @@ class NullControlSharesTheFillModelTests(unittest.TestCase):
 class NotionalCapAnchorTests(unittest.TestCase):
     """Research and the runtime must cap on the same price."""
 
-    def _runtime_cap_shares(self, equity, plan_entry):
+    def _runtime_cap_shares(self, equity, entry):
         risk = RiskEngine({"risk": {"max_position_notional_pct": NOTIONAL_CAP_PCT}})
         # A budget large enough that the notional cap, not the risk term, binds.
-        return risk.size_shares(equity=equity, entry_price=plan_entry,
+        return risk.size_shares(equity=equity, entry_price=entry,
                                 stop_distance=.3, risk_usd=1e9)["shares"]
 
-    def test_a_gapped_entry_caps_on_the_plan_price_like_the_runtime(self):
+    def test_a_gapped_entry_caps_on_the_executable_price_like_the_runtime(self):
         book = simulate_account(_bars(RISING + FLAT, {4: 101.0}), [], SPEC,
                                 vehicle="equity", account_id="cap", risk_pct=50.0,
                                 policy=PERMISSIVE_POLICY)
         row = book["rows"][0]
         self.assertAlmostEqual(row["plan_entry"], 100.8, places=9)
         self.assertAlmostEqual(row["underlying_entry"], 101.0, places=9)
-        # The runtime sizes at plan time from the signal close; it cannot see
-        # the gap, so capping on the fill would size a different position.
+        # The runtime sizes and caps on the executable quote; the authored
+        # signal reference remains telemetry only.
         self.assertEqual(row["quantity"],
-                         self._runtime_cap_shares(100_000.0, row["plan_entry"]))
+                         self._runtime_cap_shares(100_000.0,
+                                                   row["entry_reference"]))
         self.assertNotEqual(row["quantity"],
-                            self._runtime_cap_shares(100_000.0, row["underlying_entry"]))
+                            self._runtime_cap_shares(100_000.0, row["plan_entry"]))
 
     def test_the_cap_percentage_matches_the_runtime_risk_block(self):
         book = simulate_account(_bars(RISING + FLAT), [], SPEC, vehicle="equity",
@@ -774,7 +778,8 @@ class NotionalCapAnchorTests(unittest.TestCase):
                                 policy=PERMISSIVE_POLICY)
         row = book["rows"][0]
         self.assertEqual(row["quantity"],
-                         int(100_000.0 * NOTIONAL_CAP_PCT / 100.0 / row["plan_entry"]))
+                         int(100_000.0 * NOTIONAL_CAP_PCT / 100.0 /
+                             row["entry_reference"]))
 
 
 class CalibrationTests(unittest.TestCase):

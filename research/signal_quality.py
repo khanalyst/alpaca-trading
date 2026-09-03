@@ -24,12 +24,21 @@ from agent.contracts.rule import (
     cross_sectional_symbol_eligibility,
     session_minutes, validate_rule_spec,
 )
-from .market_data import replay_available_at, replay_record_is_available
+from .market_data import (historical_backfill_record, replay_available_at,
+                           replay_record_is_available)
 
 
 SIGNAL_QUALITY_SCHEMA = "signal-quality.v2"
+SIGNAL_QUALITY_ELIGIBILITY_SCHEMA = "signal-quality-eligibility.v1"
 DEFAULT_HORIZONS = (5, 15, 30, 60, 120, 390)
 _NY = ZoneInfo("America/New_York")
+_DATA_INELIGIBLE_REASONS = frozenset({
+    "historical_backfill_excluded", "feature_unavailable",
+})
+_DATA_INCOMPLETE_REASONS = frozenset({
+    "insufficient_history", "signal_end_unavailable", "feature_gap",
+    "entry_not_adjacent", "entry_bar_unavailable", "invalid_session",
+})
 # Intraday returns carry strong time-of-day structure, and every family in the
 # catalog fires on a concentrated part of the session: opening-anchored rules
 # cannot signal before their range completes, the VWAP families need a session
@@ -163,6 +172,150 @@ def _mature_prefix(spec: Mapping[str, Any], window: int | None) -> int:
     return required
 
 
+def _eligibility_classification(reason: Any) -> str:
+    """Map a prefix failure to the conservative screen classification.
+
+    The detailed reason remains in the fit-prefix provenance.  The compact
+    signal-quality hand-off only needs to tell the screen whether a cell was
+    unusable data, incomplete data, or a predicate that was actually tested.
+    """
+    value = str(reason or "").strip()
+    if value in _DATA_INELIGIBLE_REASONS or value == "data_ineligible":
+        return "data_ineligible"
+    if value in _DATA_INCOMPLETE_REASONS or value == "data_incomplete":
+        return "data_incomplete"
+    if value == "no_actionable_signal":
+        return "predicate_no_actionable_signal"
+    if value in {"actionable_signal", "signal"}:
+        return "actionable_signal"
+    return "data_incomplete"
+
+
+def _precomputed_rejection_reason(reason: Any) -> str:
+    """Preserve the legacy predicate rejection key for screen compatibility."""
+    value = str(reason or "").strip()
+    if value in {"no_actionable_signal", "predicate_no_actionable_signal"}:
+        return "no_actionable_signal"
+    return _eligibility_classification(value)
+
+
+def _cell_key(symbol: Any, session: Any) -> str:
+    return f"{str(symbol or '').strip().upper()}|{str(session or '')[:10]}"
+
+
+def _provenance_summary(
+        provenance: Any, *, total_cells: int,
+        fallback_cells: Mapping[str, str] | None = None,
+        ) -> dict[str, Any]:
+    """Return a bounded, JSON-safe eligibility summary.
+
+    ``by_cell`` is an internal worker seam and is intentionally omitted from
+    this public aggregate.  Counts and the bounded reason vocabulary are
+    enough for a screen to fail open without persisting market rows or an
+    unbounded list of cells.
+    """
+    raw = provenance if isinstance(provenance, Mapping) else {}
+    raw_counts = raw.get("prefix_counts", raw.get("status_counts", {}))
+    prefix_counts: Counter[str] = Counter()
+    if isinstance(raw_counts, Mapping):
+        for key, value in raw_counts.items():
+            try:
+                count = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if count >= 0:
+                prefix_counts[str(key)] += count
+    raw_reasons = raw.get("reason_counts", {})
+    reason_counts: Counter[str] = Counter()
+    if isinstance(raw_reasons, Mapping):
+        for key, value in raw_reasons.items():
+            try:
+                count = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if count >= 0:
+                reason_counts[str(key)] += count
+    # A direct scan has no fit-prefix object.  Populate a compact reason
+    # summary from the per-cell fallback classifications collected by the
+    # caller instead of pretending those cells were predicate tests.
+    if fallback_cells:
+        for reason in fallback_cells.values():
+            reason_counts[str(reason)] += 1
+    normalized_total = max(0, int(total_cells))
+    raw_eligible = raw.get("eligible_cells", raw.get("eligible_sessions", 0))
+    raw_signals = raw.get("signal_cells", raw.get("signal_prefixes", 0))
+    try:
+        eligible_cells = max(0, int(raw_eligible))
+    except (TypeError, ValueError, OverflowError):
+        eligible_cells = 0
+    try:
+        signal_cells = max(0, int(raw_signals))
+    except (TypeError, ValueError, OverflowError):
+        signal_cells = 0
+    classifications = Counter()
+    raw_classification = str(raw.get("classification", "")).strip()
+    if raw_classification:
+        classifications[raw_classification] += 1
+    for reason in fallback_cells.values() if fallback_cells else ():
+        classifications[_eligibility_classification(reason)] += 1
+    # Prefix ``reason_counts`` are prefix-level observations, not cell-level
+    # counts.  Prefer the explicit cell totals from the fit hand-off; for a
+    # direct scan derive them from the observed cell classifications.
+    try:
+        raw_data_ineligible = max(0, int(raw.get("data_ineligible_cells", 0)))
+    except (TypeError, ValueError, OverflowError):
+        raw_data_ineligible = 0
+    try:
+        raw_data_incomplete = max(0, int(raw.get("data_incomplete_cells", 0)))
+    except (TypeError, ValueError, OverflowError):
+        raw_data_incomplete = 0
+    fallback_classifications = Counter(
+        _eligibility_classification(reason)
+        for reason in (fallback_cells.values() if fallback_cells else ()))
+    data_ineligible = (raw_data_ineligible or
+                       fallback_classifications.get("data_ineligible", 0))
+    data_incomplete = (raw_data_incomplete or
+                       fallback_classifications.get("data_incomplete", 0))
+    if data_ineligible and data_incomplete:
+        status = "mixed_data_incomplete"
+    elif data_ineligible:
+        status = "data_ineligible"
+    elif data_incomplete:
+        status = "data_incomplete"
+    elif signal_cells or classifications.get("actionable_signal"):
+        status = "actionable_signal"
+    elif normalized_total and (
+            classifications.get("predicate_no_actionable_signal") or
+            raw_classification == "predicate_no_actionable_signal"):
+        status = "predicate_no_actionable_signal"
+    elif not normalized_total:
+        status = "data_incomplete"
+    else:
+        status = "unknown"
+    # Keep only a deterministic, small vocabulary in durable output.  The
+    # full prefix-status counts remain available in fit diagnostics.
+    bounded_reasons = dict(sorted(reason_counts.items())[:32])
+    bounded_prefix = dict(sorted(prefix_counts.items())[:32])
+    truncated = bool(raw.get("truncated")) or (
+        "provenance_cells_truncated" in reason_counts)
+    return {
+        "schema": SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
+        "scope": "fit_only",
+        "authorizing": False,
+        "diagnostic_only": True,
+        "status": status,
+        "classification": status,
+        "total_cells": normalized_total,
+        "eligible_cells": min(eligible_cells, normalized_total),
+        "signal_cells": min(signal_cells, normalized_total),
+        "data_ineligible_cells": int(data_ineligible),
+        "data_incomplete_cells": int(data_incomplete),
+        "truncated": truncated,
+        "reason_counts": bounded_reasons,
+        "prefix_counts": bounded_prefix,
+    }
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False, default=str)
@@ -208,29 +361,67 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
     """Return the first causal signal/entry pair for one symbol-session."""
     window = feature_window_bars(spec)
     context_reason: str | None = None
+    status_counts: Counter[str] = Counter()
+    eligible_prefix = False
+    if not rows:
+        return None, "data_incomplete"
+    # A malformed session is a data refusal, not evidence that its predicate
+    # never fired.  The fit-prefix path performs the same check with richer
+    # per-cell counters; this guard keeps direct signal-quality calls aligned.
+    seen: set[datetime] = set()
+    previous: datetime | None = None
+    for row in rows:
+        stamp = _timestamp(row)
+        try:
+            interval = int(_value(row, "interval_seconds", 60) or 0)
+        except (TypeError, ValueError, OverflowError):
+            interval = 0
+        if stamp is None or interval != 60 or stamp in seen or (
+                previous is not None and stamp <= previous):
+            status_counts["invalid_session"] += 1
+        if stamp is not None:
+            seen.add(stamp)
+            previous = stamp
     for index in range(1, max(1, len(rows) - 1)):
         feature_start = 0 if window is None else max(0, index + 1 - int(window))
         feature_rows = rows[feature_start:index + 1]
         if not _contiguous(rows, feature_start, index + 1):
+            status_counts["feature_gap"] += 1
             continue
         signal_end = _bar_end(rows[index])
         if signal_end is None:
+            status_counts["signal_end_unavailable"] += 1
+            continue
+        if (not allow_backfill and any(historical_backfill_record(row)
+                                       for row in feature_rows)):
+            # A labelled historical backfill is outside the default
+            # diagnostic view.  Do not let its delayed observation timestamp
+            # turn into the less informative ``entry_bar_unavailable``.
+            status_counts["historical_backfill_excluded"] += 1
             continue
         available = [replay_available_at(
             row, allow_historical_backfill_diagnostics=allow_backfill)
             for row in feature_rows]
         if any(item is None for item in available):
+            if (not allow_backfill and any(historical_backfill_record(row)
+                                           for row in feature_rows)):
+                status_counts["historical_backfill_excluded"] += 1
+            else:
+                status_counts["feature_unavailable"] += 1
             continue
         decision = max([signal_end, *(item for item in available if item is not None)])
         next_row = rows[index + 1]
         if _timestamp(next_row) != signal_end and decision <= signal_end:
+            status_counts["entry_not_adjacent"] += 1
             continue
         entry_at = signal_end if decision <= signal_end else decision
         entry_index = next((probe for probe in range(index + 1, len(rows))
                             if (_timestamp(rows[probe]) is not None and
                                 _timestamp(rows[probe]) >= entry_at)), None)
         if entry_index is None:
+            status_counts["entry_bar_unavailable"] += 1
             continue
+        eligible_prefix = True
         if spec["family"] == "cross_sectional_residual":
             trace = evaluate_rule_signal_trace(
                 rows[:index + 1], spec, bars_by_symbol=bars_by_symbol,
@@ -258,7 +449,23 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
         return ({"signal": signal, "signal_index": index,
                  "entry_index": entry_index, "entry_at": entry_at,
                  "entry_price": entry_price}, None)
-    return None, context_reason or "no_actionable_signal"
+    if context_reason:
+        return None, context_reason
+    if eligible_prefix:
+        return None, "no_actionable_signal"
+    if status_counts:
+        # Preserve the category (rather than allowing a data refusal to look
+        # like a predicate result).  Detailed counts are carried by the fit
+        # provenance hand-off when available.
+        priority = (
+            "historical_backfill_excluded", "feature_unavailable",
+            "entry_bar_unavailable", "entry_not_adjacent", "feature_gap",
+            "invalid_session", "signal_end_unavailable",
+        )
+        reason = next((item for item in priority if status_counts.get(item)),
+                      "insufficient_history")
+        return None, _eligibility_classification(reason)
+    return None, "data_incomplete"
 
 
 def _forward_return(rows: Sequence[Any], *, entry_index: int, horizon: int,
@@ -535,6 +742,7 @@ def measure_signal_quality(
         horizons: Sequence[int] = DEFAULT_HORIZONS,
         cost_hurdle_bps: float | None = None,
         precomputed_first_signals: Sequence[Mapping[str, Any]] | None = None,
+        eligibility_provenance: Mapping[str, Any] | None = None,
         bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
         ) -> dict[str, Any]:
     """Measure conditional forward returns and a matched random-entry control.
@@ -544,6 +752,10 @@ def measure_signal_quality(
     historical prefix scan remains authoritative. When supplied, every
     event is validated against its sorted symbol/session rows and malformed
     metadata is rejected rather than silently falling back to a scan.
+    ``eligibility_provenance`` is the matching compact hand-off from that
+    prefix scan.  It is required to distinguish an empty event list caused by
+    unavailable/incomplete data from a genuinely tested predicate with no
+    actionable signal.
     """
     normalized = validate_rule_spec(spec)
     market_context = _immutable_market_context(bars, bars_by_symbol)
@@ -582,8 +794,37 @@ def measure_signal_quality(
     events: list[tuple[str, str, Sequence[Any], dict[str, Any]]] = []
     event_reasons: Counter[str] = Counter()
     event_time_buckets: Counter[str] = Counter()
+    observed_cell_reasons: dict[str, str] = {}
     precomputed_by_cell: dict[tuple[str, str], dict[str, Any]] = {}
     precomputed_invalid_cells: set[tuple[str, str]] = set()
+    # The fit-prefix worker includes a bounded internal cell map so an empty
+    # precomputed event list can retain the true prefix failure category.  A
+    # malformed/missing map is conservative: supplied precomputed metadata
+    # cannot prove a complete no-signal hypothesis without it.
+    provenance_by_cell: dict[tuple[str, str], str] = {}
+    provenance_supplied = eligibility_provenance is not None
+    if isinstance(eligibility_provenance, Mapping):
+        raw_cells = eligibility_provenance.get("by_cell", {})
+        if isinstance(raw_cells, Mapping):
+            for raw_key, raw_value in raw_cells.items():
+                if isinstance(raw_value, Mapping):
+                    if isinstance(raw_key, (tuple, list)) and len(raw_key) == 2:
+                        symbol, session = raw_key
+                    else:
+                        pieces = str(raw_key).split("|", 1)
+                        if len(pieces) != 2:
+                            continue
+                        symbol, session = pieces
+                    cell = (str(symbol).strip().upper(), str(session)[:10])
+                    if cell[0] and cell[1]:
+                        provenance_by_cell[cell] = str(
+                            raw_value.get("reason") or
+                            raw_value.get("classification") or
+                            raw_value.get("status") or "data_incomplete")
+    elif provenance_supplied:
+        # Keep the distinction visible in the output even when an untrusted
+        # caller supplied the wrong shape.
+        event_reasons["data_incomplete"] += 0
     if precomputed_first_signals is not None:
         if isinstance(precomputed_first_signals, Mapping):
             # A mapping is not a supported event sequence. Treating each
@@ -626,7 +867,12 @@ def measure_signal_quality(
             event, reason = None, "precomputed_event_invalid"
         else:
             event = precomputed_by_cell.get((symbol, session))
-            reason = None if event is not None else "no_actionable_signal"
+            reason = None if event is not None else (
+                _precomputed_rejection_reason(
+                    provenance_by_cell.get((symbol, session)))
+                if (symbol, session) in provenance_by_cell else
+                "data_incomplete" if provenance_supplied else
+                "no_actionable_signal")
         if (event is not None and normalized["family"] ==
                 "cross_sectional_residual" and
                 not eligibility_by_symbol.get(symbol, {}).get("eligible", False)):
@@ -637,7 +883,9 @@ def measure_signal_quality(
                       str(eligibility_by_symbol.get(symbol, {}).get(
                           "reason", "symbol_not_in_default_eligibility")))
         if event is None:
-            event_reasons[str(reason or "unknown")] += 1
+            normalized_reason = str(reason or "unknown")
+            event_reasons[normalized_reason] += 1
+            observed_cell_reasons[_cell_key(symbol, session)] = normalized_reason
             continue
         events.append((symbol, session, rows, event))
         if symbol in eligibility_by_symbol:
@@ -751,6 +999,18 @@ def measure_signal_quality(
             "symbol_clusters": len(symbols),
             "session_symbol_cells": len(cells),
         }
+    # Build a compact summary from the actual event rejection categories.  A
+    # precomputed fit hand-off may additionally supply detailed prefix counts;
+    # those are copied only through the bounded summary helper.
+    provenance = dict(eligibility_provenance or {})
+    quality_provenance = _provenance_summary(
+        provenance if provenance else None,
+        total_cells=len(grouped),
+        fallback_cells=(
+            {**observed_cell_reasons,
+             **{_cell_key(symbol, session): str(reason)
+                for (symbol, session), reason in provenance_by_cell.items()}}
+            if (observed_cell_reasons or provenance_by_cell) else None))
     result = {
         "schema": SIGNAL_QUALITY_SCHEMA,
         "scope": "fit_only",
@@ -772,6 +1032,7 @@ def measure_signal_quality(
         "event_time_bucket_counts": dict(sorted(event_time_buckets.items())),
         "event_digest": _digest(sorted(event_vectors, key=_canonical)),
         "horizon_metrics": horizon_metrics,
+        "eligibility_provenance": quality_provenance,
     }
     if normalized["family"] == "cross_sectional_residual":
         context_rejections = {
@@ -809,5 +1070,5 @@ def measure_signal_quality(
     return result
 
 
-__all__ = ["DEFAULT_HORIZONS", "SIGNAL_QUALITY_SCHEMA",
-           "measure_signal_quality"]
+__all__ = ["DEFAULT_HORIZONS", "SIGNAL_QUALITY_ELIGIBILITY_SCHEMA",
+           "SIGNAL_QUALITY_SCHEMA", "measure_signal_quality"]

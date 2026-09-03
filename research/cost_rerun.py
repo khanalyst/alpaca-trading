@@ -39,8 +39,9 @@ from .costs import CostModel, ReplayPolicy, diagnostic_backfill_policy
 from .edge_ledger import content_hash
 from .edge_discovery_core import _read_discovery_rows
 from .factory_core import (DEFAULT_VARIANTS, FAMILY_TEMPLATES,
-                           coordinate_mutation_pool, diagnose, spec_delta,
+                           coordinate_mutation_pool, spec_delta,
                            simulate_account, template_hypothesis)
+from .gates import max_drawdown_of
 from .quote_costs import (measure_quote_costs, cost_model_from_schedule,
                           measured_cost_resolver, schedule_costs_block,
                           bucket_label, QuoteCostError)
@@ -274,7 +275,6 @@ class ArmResult:
 
 def _arm(rows: Sequence[Mapping[str, Any]], *, starting_cash: float) -> ArmResult:
     """Summarize one replay, including the R decomposition the report shows."""
-    summary = diagnose(rows, starting_cash=starting_cash)
     executed = [row for row in rows if row.get("no_trade") is not True]
     net_values: list[float] = []
     drag_values: list[float] = []
@@ -301,20 +301,35 @@ def _arm(rows: Sequence[Mapping[str, Any]], *, starting_cash: float) -> ArmResul
     def average(values: Sequence[float]) -> float | None:
         return sum(values) / len(values) if values else None
 
-    hold = summary.get("hold_telemetry") or {}
+    pnl_values = [value for row in executed
+                  if (value := _finite(row.get("net_pnl"))) is not None]
+    wins = [value for value in pnl_values if value > 0]
+    losses = [value for value in pnl_values if value < 0]
+    profit_factor = (sum(wins) / abs(sum(losses)) if losses else
+                     999.0 if wins else 0.0)
+    # This report is explicitly diagnostic and compares execution-cost
+    # treatments, so censored/discontinuity executions remain in its economics.
+    # Authorizing factory gates continue to exclude those rows via ``diagnose``
+    # and the verified gate envelope.
     breakdown = _breakdown(rows)
     exit_reasons = dict(sorted(Counter(
         str(row.get("exit_reason_detail") or row.get("exit_reason") or "unknown")
         for row in executed).items()))
     return ArmResult(
-        trades=summary["trades"], net_pnl=summary["net_pnl"],
-        expectancy=summary["expectancy"], win_rate=summary["win_rate"],
-        profit_factor=summary["profit_factor"],
-        max_drawdown=summary["max_drawdown"],
+        trades=len(executed), net_pnl=sum(pnl_values),
+        expectancy=(sum(pnl_values) / len(pnl_values) if pnl_values else 0.0),
+        win_rate=(len(wins) / len(pnl_values) if pnl_values else 0.0),
+        profit_factor=profit_factor,
+        max_drawdown=max_drawdown_of(executed),
         reference_r=average(reference_values), drag_r=average(drag_values),
         net_r=average(net_values),
-        time_expiry_rate=float(hold.get("time_expiry_rate") or 0.0),
-        target_rate=summary["target_rate"], stop_rate=summary["stop_rate"],
+        time_expiry_rate=(sum(
+            row.get("hold_exit_reason") == "time_expiry" for row in executed) /
+            len(executed) if executed else 0.0),
+        target_rate=(sum(row.get("exit_reason") == "target" for row in executed) /
+                     len(executed) if executed else 0.0),
+        stop_rate=(sum(row.get("exit_reason") == "stop" for row in executed) /
+                   len(executed) if executed else 0.0),
         stressed_cost_rejections=sum(
             str(row.get("reject_reason") or "") == "stressed_cost_risk_limit"
             for row in rows),

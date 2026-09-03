@@ -81,15 +81,15 @@ closed when a required floor cannot be supported. Widen history and/or
 `universe.symbols`, never lower a floor.
 
 Qualification is powered at a minimum of 100 trades, 30 complete sessions, and
-30 session-level clusters. Replay epoch 5 retains the epoch-4 point-in-time,
+30 session-level clusters. Replay epoch 6 retains the epoch-5 point-in-time,
 executable-row, vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries,
 and additionally seals paired synthetic root-control shadow decisions/replays,
 diagnostic-only historical-backfill provenance with exact calendar metadata,
 durable live-shadow FDR allocation binding, chronological paired inference,
-finite BH input validation, and conservative broker-tick equity rounding.
-Epoch-4 proofs remain readable for audit but are quarantined and cannot validate,
-champion, or authorize the paper trader until re-derived under epoch 5.
-Authorization requires exact epoch equality with current epoch 5; future epochs
+finite BY input validation, and conservative broker-tick equity rounding.
+Epoch-5 proofs remain readable for audit but are quarantined and cannot validate,
+champion, or authorize the paper trader until re-derived under epoch 6.
+Authorization requires exact epoch equality with current epoch 6; future epochs
 are audit-only as well. A verified current-epoch gate is sealed immutably per
 run, and re-derivation appends a new proof instead of rewriting prior evidence.
 
@@ -306,7 +306,7 @@ verified with the proof, but it never counts as additional independent sample
 size; independence still comes from session clusters. Authorizing dependence is
 separate: before each factory cycle, completed prior-cycle family deltas are
 frozen into a hash-verified map. Strong clusters receive an additional
-cluster-level BH veto, and runtime allocation admits at most the strongest edge
+cluster-level BY veto, and runtime allocation admits at most the strongest edge
 per verified frozen cluster; an unavailable map never grants independence.
 
 Remaining extension boundaries are explicit. Universe expansion requires an
@@ -344,6 +344,10 @@ held-out data, fit/held-out trade and session structural floors, matched
 controls, cluster-aware randomisation, family-local, frozen-dependence-cluster,
 and cycle-global FDR,
 sealed qualification observations/digests, and placebo/falsification.
+The v3 proof stores the complete family/global/cluster raw p-value batches and
+recomputes BY during verification; scalar q-values alone cannot authorize.
+Its second placebo seed is an integrity replication over the same held-out
+sample, not independent market evidence or another significance hurdle.
 Underpowered or inconclusive data is not failure. Retirement is allowed only
 after all bounded coordinate/interaction points and the final confirmation
 carry a powered upper-bound rejection across multiple negative windows; a
@@ -387,14 +391,14 @@ credentials, order path, or broker/runtime state authority. The scheduled
 research cycle runs `edge ingest-shadow` by default when enabled; absent shadow
 DB is a no-op. Ingestion opens the WAL read-only and requires strictly newer,
 complete parity-matched rows, prior qualification, source/config/code/
-provenance/replay/gate hashes, family/global BH plus the frozen-dependence-cluster
+provenance/replay/gate hashes, family/global BY plus the frozen-dependence-cluster
 veto, and durable online FDR before
 appending the immutable `lane=shadow` proof and live marker. Semantic or
 mid-tail incompleteness fails closed but is repairable: correct the source and
 run the bounded complete parity replay before retrying ingestion. There is no
 unsafe auto-skip: unresolved quarantine blocks the watermark and FDR boundary.
 The `shadow-confirmation-v6` scope splits each tail into older
-chronological selection sessions and a newer disjoint confirmatory window; BH
+chronological selection sessions and a newer disjoint confirmatory window; BY
 uses the selection p-values, and only the selected candidate's raw confirmatory
 p-value reaches LORD++. Same-tail v3 scopes remain audit-only and cannot
 authorize. Legacy v2/v3/v4 sequences (`lord_balanced_v2` and
@@ -790,7 +794,7 @@ The unmutated root is always variant zero and is never proposed away. It is
 compared with an independent randomized-entry null that preserves the
 candidate's session/symbol/direction distribution and exit rules; it is never
 compared with itself. The root remains a real candidate in the family and
-cycle-global Benjamini–Hochberg denominators, so it consumes multiplicity like
+cycle-global Benjamini–Yekutieli denominators, so it consumes multiplicity like
 any mutation.
 
 Verified gate envelopes carry explainable arm evidence for candidate, baseline,

@@ -31,7 +31,7 @@ from agent.strategy import build_setup_plan
 from research.costs import ReplayPolicy
 from research.edge_discovery_core import null_control_account
 from research.factory_core import _simulate_trade, simulate_account
-from research.market_data import normalize_underlying_bar
+from research.market_data import normalize_quote, normalize_underlying_bar
 
 BASE = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
 SPEC = validate_rule_spec({
@@ -95,6 +95,16 @@ def _payloads(closes, opens=None, ranges=None):
 
 def _bars(closes, opens=None, ranges=None):
     return [normalize_underlying_bar(row) for row in _payloads(closes, opens, ranges)]
+
+
+def _quote(index, bid, ask):
+    timestamp = BASE + timedelta(minutes=index)
+    return normalize_quote({
+        "kind": "quote", "provider": "test", "feed": "sip",
+        "symbol": "SPY", "timestamp": timestamp.isoformat(),
+        "as_of": timestamp.isoformat(), "observed_at": timestamp.isoformat(),
+        "bid": bid, "ask": ask,
+    })
 
 
 class ExitBroker:
@@ -454,6 +464,63 @@ class ExitContractDifferentialTests(unittest.TestCase):
                         current_price=Decimal(str(price)),
                         market_value=Decimal(str(float(price) * 10)))
 
+    def test_risk_order_keeps_authored_reference_but_sizes_at_quote_gap(self):
+        engine = self._engine("runtime-quote-gap-sizing")
+        signal = {"symbol": "SPY", "direction": "long", "entry_price": 100.8,
+                  "stop_price": 100.5, "target_price": 101.4,
+                  "confidence": 1.0, "setup_id": "quote-gap-sizing"}
+        now = BASE + timedelta(minutes=4)
+        row = {"symbol": "SPY", "quote": {
+            "timestamp": now.isoformat(), "bid": 100.9, "ask": 101.0,
+        }}
+        result = engine._risk_order(
+            "SPY", signal, row, self.provider.account(), [], now)
+        self.assertIsNotNone(result)
+        request, plan = result
+        self.assertAlmostEqual(plan["authored_entry_reference"], 100.8)
+        self.assertAlmostEqual(plan["executable_entry_reference"], 101.0)
+        self.assertAlmostEqual(plan["entry_price"], 101.0)
+        self.assertAlmostEqual(plan["stop_distance"], .5)
+        self.assertEqual(request.stop_loss, Decimal("100.50"))
+        self.assertEqual(request.take_profit, Decimal("101.40"))
+
+        replay = _simulate_trade(
+            _bars(RISING + FLAT, opens={4: 101.0}), SPEC, [], "equity",
+            policy=BAR_ONLY_POLICY)
+        self.assertIsNone(replay.get("unpriced_reason"))
+        self.assertAlmostEqual(replay["plan_entry"], 100.8)
+        self.assertAlmostEqual(replay["executable_entry_reference"], 101.0)
+        self.assertAlmostEqual(replay["stop_distance"], .51)
+        self.assertAlmostEqual(replay["risk_per_unit"], .51)
+
+    def test_risk_order_refuses_missing_quote_instead_of_authored_fallback(self):
+        engine = self._engine("runtime-missing-quote")
+        events = []
+        engine._event = lambda kind, payload: events.append((kind, payload))
+        signal = {"symbol": "SPY", "direction": "long", "entry_price": 100.8,
+                  "stop_price": 100.5, "target_price": 101.4,
+                  "confidence": 1.0, "setup_id": "missing-quote"}
+        self.assertIsNone(engine._risk_order(
+            "SPY", signal, {"symbol": "SPY", "quote": {}},
+            self.provider.account(), [], BASE + timedelta(minutes=4)))
+        self.assertEqual(events[-1], ("execution_reject", {
+            "symbol": "SPY", "reason": "executable entry quote is unavailable"}))
+
+    def test_risk_order_refuses_quote_already_through_protective_stop(self):
+        engine = self._engine("runtime-quote-through-stop")
+        events = []
+        engine._event = lambda kind, payload: events.append((kind, payload))
+        signal = {"symbol": "SPY", "direction": "long", "entry_price": 100.8,
+                  "stop_price": 100.5, "target_price": 101.4,
+                  "confidence": 1.0, "setup_id": "quote-through-stop"}
+        now = BASE + timedelta(minutes=4)
+        self.assertIsNone(engine._risk_order(
+            "SPY", signal, {"symbol": "SPY", "quote": {
+                "timestamp": now.isoformat(), "bid": 100.2, "ask": 100.3,
+            }}, self.provider.account(), [], now))
+        self.assertEqual(events[-1][0], "execution_reject")
+        self.assertIn("straddle", events[-1][1]["reason"])
+
     def _drive(self, engine, bars, *, start_index):
         """Return the first (reason, exit timestamp) the monitor produces."""
         for bar in bars[start_index:]:
@@ -558,10 +625,12 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.assertEqual(simulated["exit_reason"], "time")
         self.assertEqual(reason, "max_hold")
         self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
-        # Sizing still uses the nominal distance the runtime sizes on; the gap
-        # shows up only in the risk the fill actually committed.
-        self.assertAlmostEqual(simulated["stop_distance"], expected_distance, places=9)
-        self.assertAlmostEqual(simulated["risk_per_unit"], expected_distance, places=9)
+        # Sizing uses the executable quote-to-stop geometry.  The protective
+        # levels remain authored, but the larger gap consumes more risk/unit.
+        self.assertAlmostEqual(simulated["stop_distance"], 101.0 - expected_stop,
+                               places=9)
+        self.assertAlmostEqual(simulated["risk_per_unit"], 101.0 - expected_stop,
+                               places=9)
         self.assertAlmostEqual(simulated["realized_risk_per_unit"],
                                101.0 - expected_stop, places=9)
 
@@ -575,7 +644,10 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.assertEqual(simulated["exit_reason"], "time")
         self.assertEqual(reason, "max_hold")
         self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
-        self.assertAlmostEqual(simulated["risk_per_unit"], expected_distance, places=9)
+        self.assertAlmostEqual(simulated["stop_distance"], 100.6 - expected_stop,
+                               places=9)
+        self.assertAlmostEqual(simulated["risk_per_unit"], 100.6 - expected_stop,
+                               places=9)
         self.assertAlmostEqual(simulated["realized_risk_per_unit"],
                                100.6 - expected_stop, places=9)
 
@@ -653,11 +725,9 @@ class ExitContractDifferentialTests(unittest.TestCase):
         bars = _bars(RISING + FLAT, opens={4: 100.3}, ranges={4: (100.9, 100.0)})
         simulated = _simulate_trade(
             bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
-        self.assertEqual(simulated["exit_reason"], "stop")
-        self.assertIs(simulated["entry_gap_fill"], True)
-        self.assertEqual(simulated["exit_reference"], 100.3)
-        self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
-        self.assertAlmostEqual(simulated["realized_risk_per_unit"], 0.0, places=9)
+        self.assertEqual(simulated["unpriced_reason"],
+                         "broker_tick_geometry_invalid")
+        self.assertEqual(simulated["reject_stage"], "risk_geometry")
 
     def test_v3_replay_and_runtime_arm_then_stop_on_the_same_completed_bars(self):
         closes = RISING + [101.0, 100.9] + FLAT[:5]
@@ -736,49 +806,43 @@ class GappedEntrySizingTests(unittest.TestCase):
         for opens in (None, {4: 101.0}, {4: 100.6}):
             with self.subTest(opens=opens):
                 row = self._row(opens)
-                # The runtime sizes at plan time from the signal close and the
-                # nominal stop distance; it cannot see the entry gap.
+                # Both lanes size from the executable entry/stop geometry.
                 self.assertEqual(row["quantity"], self._runtime_shares(
-                    row["stop_price"] + row["stop_distance"],
+                    row["entry_reference"],
                     row["stop_distance"]))
 
-    def test_a_gap_against_the_stop_overspends_the_risk_budget(self):
+    def test_a_gap_against_the_stop_is_sized_conservatively(self):
         flat, gapped = self._row(), self._row({4: 101.0})
-        self.assertEqual(gapped["quantity"], flat["quantity"])
+        self.assertLess(gapped["quantity"], flat["quantity"])
         self.assertAlmostEqual(flat["risk_usd"],
                                flat["quantity"] * flat["stop_distance"], places=6)
-        # The gap commits more risk than the plan's nominal budget.
+        # The gap consumes more risk/unit, but never overspends the budget.
         self.assertAlmostEqual(gapped["risk_usd"],
                                gapped["quantity"] * gapped["realized_risk_per_unit"],
                                places=6)
-        self.assertGreater(gapped["risk_usd"], gapped["risk_budget"])
+        self.assertLessEqual(gapped["risk_usd"], gapped["risk_budget"])
         self.assertLess(flat["risk_usd"], flat["risk_budget"] + 1e-9)
 
-    def test_a_gap_toward_the_stop_underspends_the_risk_budget(self):
+    def test_a_gap_toward_the_stop_uses_the_tighter_executable_geometry(self):
         row = self._row({4: 100.6})
         self.assertAlmostEqual(row["risk_usd"],
                                row["quantity"] * row["realized_risk_per_unit"],
                                places=6)
-        self.assertLess(row["risk_usd"], row["risk_budget"])
+        self.assertAlmostEqual(row["risk_per_unit"], row["stop_distance"], places=9)
+        self.assertLessEqual(row["risk_usd"], row["risk_budget"])
 
-    def test_an_entry_through_the_stop_is_booked_as_a_losing_trade(self):
+    def test_an_entry_through_the_stop_is_refused(self):
         book = simulate_account(_bars(RISING + FLAT, {4: 100.3}), [], SPEC,
                                 vehicle="equity", account_id="sizing",
                                 risk_pct=.05, policy=BAR_ONLY_SIZING_POLICY)
         row = book["rows"][0]
-        # The runtime cannot see this gap: it submits, fills at 100.30, and the
-        # resting stop leg triggers on arrival.  That is an executed trade.
-        self.assertIs(row["no_trade"], False)
-        self.assertIs(row["entry_gap_fill"], True)
-        self.assertEqual(row["exit_reason"], "stop")
-        self.assertEqual(row["quantity"], self._runtime_shares(
-            row["stop_price"] + row["stop_distance"], row["stop_distance"]))
-        self.assertEqual(book["trades"], 1)
-        self.assertLess(row["net_pnl"], 0.0)
-        # Exit is the fill, not the unreachable better stop price.
-        self.assertEqual(row["exit_reference"], 100.3)
-        self.assertEqual(row["underlying_entry"], 100.3)
-        self.assertIsNone(row["r_multiple"])
+        # The broker cannot accept a long bracket whose stop is already above
+        # the executable entry.  Replay refuses the same geometry instead of
+        # inventing an immediate gap-through-stop fill.
+        self.assertIs(row["no_trade"], True)
+        self.assertEqual(row["reject_reason"], "broker_tick_geometry_invalid")
+        self.assertEqual(row["reject_stage"], "risk_geometry")
+        self.assertEqual(book["trades"], 0)
 
 
 if __name__ == "__main__":

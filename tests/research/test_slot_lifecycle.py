@@ -413,8 +413,8 @@ class LLMDiscoveryTests(unittest.TestCase):
                     self.assertEqual(source, "deterministic_discovery")
                     self.assertIsNotNone(seeded)
 
-    def test_genesis_slots_are_discovered_not_only_templated(self):
-        """A fresh ledger is where discovery matters most."""
+    def test_genesis_discovery_preserves_family_coverage(self):
+        """Repeated model families fall back until fresh slots cover breadth."""
         with tempfile.TemporaryDirectory() as directory:
             factory, edge = _ledgers(directory)
             briefs = []
@@ -450,10 +450,12 @@ class LLMDiscoveryTests(unittest.TestCase):
                 execution_geometry=execution_geometry)
             self.assertEqual(revived, [])
             self.assertEqual(len(seeded), 3)
-            self.assertEqual({item["source"] for item in seeded},
-                             {"llm_discovery"})
-            self.assertEqual({item["family"] for item in seeded},
-                             {"vwap_reversion"})
+            self.assertEqual(seeded[0]["source"], "llm_discovery")
+            self.assertEqual(seeded[0]["family"], "vwap_reversion")
+            self.assertEqual(len({item["family"] for item in seeded}), 3)
+            self.assertEqual(
+                {item["source"] for item in seeded[1:]},
+                {"template"})
             self.assertEqual([brief["reason"] for brief in briefs],
                              ["fresh_slot"] * 3)
             self.assertEqual(

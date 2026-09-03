@@ -23,10 +23,12 @@ from research.edge_ledger import (
     hash_provenance, init_db, init_ledger,
 )
 from research.gates import (
+    FALSIFICATION_INDEPENDENT_METHOD, fdr_batch_evidence,
     falsification_gate, heldout_separation, matched_cluster_test,
     max_drawdown_of, performance_floor, placebo_null_distribution, qualification_report,
     structural_floor, verified_gate_envelope, walk_forward_report,
 )
+from research.stats import stable_seed
 from research.costs import SQLiteQuoteIndex, quote_fill
 from research.factory_ledger import CONFIRMATORY_SCOPE_VERSION, FactoryLedger
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
@@ -44,11 +46,32 @@ def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex"):
         heldout, baseline, vehicle="equity", equity_feed=equity_feed)
     placebo = placebo_null_distribution(
         heldout, baseline, vehicle="equity", equity_feed=equity_feed)
+    independent_seed = stable_seed({
+        "purpose": "independent_placebo_null_tail.v1",
+        "primary_assignments_hash": placebo["assignments_hash"],
+        "draws": int(placebo["draws"]),
+    })
+    independent = placebo_null_distribution(
+        heldout, baseline, vehicle="equity", draws=int(placebo["draws"]),
+        seed=independent_seed, equity_feed=equity_feed)
+    independent_result = falsification_gate(
+        independent["observed"], independent["placebo"], alpha=alpha)
     falsification = {
-        **falsification_gate(placebo["observed"], placebo["placebo"], alpha=alpha),
+        **falsification_gate(
+            placebo["observed"], placebo["placebo"], alpha=alpha,
+            preregistered_p_value=control["p_value"],
+            independent_p_value=independent_result["p_value"],
+            independent_method=FALSIFICATION_INDEPENDENT_METHOD,
+            independent_result_hash=independent["assignments_hash"],
+            require_independent=True),
         "method": placebo["method"], "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),
         "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
+        "independent_method": FALSIFICATION_INDEPENDENT_METHOD,
+        "independent_result_hash": independent["assignments_hash"],
+        "independent_assignments_hash": independent["assignments_hash"],
+        "independent_draws": int(independent["draws"]),
+        "independent_seed": int(independent["seed"]),
     }
     absolute = performance_floor(
         heldout, vehicle="equity", equity_feed=equity_feed)
@@ -149,7 +172,8 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   scores: list[float] | None = None,
                   r_multiples: list[float] | None = None,
                   equity_feed: str = "iex",
-                  legacy_feedless: bool = False) -> tuple[dict, dict]:
+                  legacy_feedless: bool = False,
+                  legacy_gate_v2: bool = False) -> tuple[dict, dict]:
     def priced(row: dict) -> dict:
         return {
             **row,
@@ -270,7 +294,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
         qualification_rows, qualification_baseline, vehicle="equity",
         sessions=sorted({row["session_date"] for row in qualification_rows}),
         candidate_id=candidate_id, preselected=True,
-        equity_feed=equity_feed)
+        max_drawdown=0.0, equity_feed=equity_feed)
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
     hashes = edge_ledger.provenance_hash(config=candidate_config)
@@ -322,9 +346,23 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
         fit_control=fit_control,
         control={**control, "kind": "matched_actual_baseline"},
         p_value=control["p_value"],
-        q_value=(control["p_value"] if lane == "shadow" else
-                 (.02 if passes else 1.0)), alpha=.05,
+        q_value=(selection_p_value if lane == "shadow" else
+                 control["p_value"]), alpha=.05,
         family_q_value=(selection_p_value if lane == "shadow" else None),
+        fdr_batch=fdr_batch_evidence(
+            candidate_id=candidate_id,
+            family_name="fixture",
+            family_candidate_key=candidate_id,
+            global_candidate_key=candidate_id,
+            family_values={"fixture": {
+                candidate_id: (selection_p_value if lane == "shadow" else
+                               control["p_value"])}},
+            global_values={
+                candidate_id: (selection_p_value if lane == "shadow" else
+                               control["p_value"])},
+            alpha=.05,
+            p_value_source=("selection_window_gate"
+                            if lane == "shadow" else "gate")),
         falsification=falsification,
         separation=separation, checks=checks, passes=passes,
         walk_forward=walk,
@@ -337,18 +375,18 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
         online_fdr={"scope": (f"{CONFIRMATORY_SCOPE_VERSION}:equity"
                               if lane == "shadow" else "test"),
                     "test_id": f"{candidate_id}:{lane}",
-                    "p_value": (control["p_value"] if lane == "shadow" else
-                                (.02 if passes else 1.0)),
-                    "raw_p_value": (control["p_value"] if lane == "shadow" else
-                                    (.02 if passes else 1.0)),
-                    "confirmatory_raw_p_value": (control["p_value"] if lane == "shadow" else
-                                                  (.02 if passes else 1.0)),
-                    "selection_raw_p_value": (selection_p_value if lane == "shadow" else
-                                               (.02 if passes else 1.0)),
-                    "family_q_value": (selection_p_value if lane == "shadow" else
-                                       (.02 if passes else 1.0)),
-                    "global_q_value": (selection_p_value if lane == "shadow" else
-                                       (.02 if passes else 1.0)),
+                    "p_value": control["p_value"],
+                    "raw_p_value": control["p_value"],
+                    "confirmatory_raw_p_value": control["p_value"],
+                    "selection_raw_p_value": (
+                        selection_p_value if lane == "shadow" else
+                        control["p_value"]),
+                    "family_q_value": (
+                        selection_p_value if lane == "shadow" else
+                        control["p_value"]),
+                    "global_q_value": (
+                        selection_p_value if lane == "shadow" else
+                        control["p_value"]),
                     "allocated_alpha": (fdr_record["allocated_alpha"]
                                         if fdr_record is not None else .05),
                     "alpha": .05,
@@ -387,6 +425,17 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
 
         strip_feed(envelope)
         envelope["passes"] = bool(passes and all(envelope["checks"].values()))
+        envelope["content_hash"] = gates._content_hash({
+            key: value for key, value in envelope.items()
+            if key != "content_hash"
+        })
+    if legacy_gate_v2:
+        envelope["schema"] = gates.LEGACY_GATE_ENVELOPE_SCHEMA_V2
+        envelope.pop("fdr_batch", None)
+        envelope["checks"].pop("actual_control_adequate", None)
+        envelope["checks"].pop("multiple_testing_batch_bound", None)
+        envelope["passes"] = bool(
+            passes and all(envelope["checks"].values()))
         envelope["content_hash"] = gates._content_hash({
             key: value for key, value in envelope.items()
             if key != "content_hash"
@@ -767,6 +816,31 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
                            "delta_positive": True})
         self.assertEqual(gate["heldout_floor"]["minimums"]["clusters"], 30)
         self.assertFalse(gate["heldout_floor"]["checks"]["clusters"])
+
+    def test_discovery_actual_baseline_requires_count_and_coverage(self):
+        candidate = [{
+            "vehicle": "equity", "symbol": "SPY",
+            "session_date": f"2026-04-{index + 1:02d}",
+            "opportunity_id": f"candidate:{index}", "net_pnl": 1.0,
+            "return_value": .001, "no_trade": False,
+            "entry_fill_source": "quote", "exit_fill_source": "quote",
+            "entry_feed": "iex", "exit_feed": "iex",
+            "entry_provider": "fixture", "exit_provider": "fixture",
+            "entry_quote_age_seconds": 0.0, "exit_quote_age_seconds": 0.0,
+        } for index in range(30)]
+        baseline = [{**row, "net_pnl": 0.0}
+                    for row in candidate[:5]]
+        # Keep keys aligned for the five matched observations while leaving
+        # 25 candidate opportunities without an actual baseline control.
+        gate = edge_discovery_core._discover_gate(
+            candidate, baseline, vehicle="equity", min_trades=1,
+            min_sessions=1, alpha=.05, test_iterations=10,
+            null_rows=baseline, shadow=True)
+        adequacy = gate["heldout_paired_baseline"]["paired_adequacy"]
+        self.assertEqual(adequacy["matched"], 5)
+        self.assertLess(adequacy["coverage"], .8)
+        self.assertFalse(gate["checks_without_family"]["actual_control_available"])
+        self.assertFalse(gate["checks_without_family"]["actual_control_adequate"])
 
     def test_arm_diagnostics_keep_candidate_fixed_while_null_quotes_fill_gaps(self):
         """Sparse null pricing is visible without changing candidate evidence."""
@@ -1208,19 +1282,42 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             variant_gate["candidate_id"] = candidate["variant_id"]
             variant_gate["qualification"]["post_selection"]["candidate_id"] = \
                 candidate["variant_id"]
+            inconsistent_alias = rehash(copy.deepcopy(variant_gate))
+            self.assertFalse(gates.verify_gate_envelope(inconsistent_alias))
+            # v3 binds the complete multiple-testing batch to the same
+            # candidate identity as the envelope.  Model a producer that used
+            # the historical variant alias consistently throughout the proof,
+            # rather than leaving a contradictory UUID inside the FDR batch.
+            batch = variant_gate["fdr_batch"]
+            original_id = candidate["candidate_id"]
+            alias = candidate["variant_id"]
+            batch["candidate_id"] = alias
+            batch["family_candidate_key"] = alias
+            batch["global_candidate_key"] = alias
+            family = batch["family_name"]
+            batch["family_values"][family][alias] = \
+                batch["family_values"][family].pop(original_id)
+            batch["family_results"][family][alias] = \
+                batch["family_results"][family].pop(original_id)
+            batch["global_values"][alias] = \
+                batch["global_values"].pop(original_id)
+            batch["global_results"][alias] = \
+                batch["global_results"].pop(original_id)
             variant_gate = rehash(variant_gate)
             run_variant = append_gate_run(candidate, variant_gate)
             ledger.record_verified_gate(run_variant["run_id"], variant_gate)
 
-            # A source-backed v2 envelope without either identity is invalid,
-            # even when its outer hash and all statistical evidence are valid.
+            # A source-backed v3 envelope without an identity is internally
+            # invalid before it can reach the ledger's candidate-alias check:
+            # the complete FDR batch is bound to that same identity.
             _, missing_gate = _persist_gate(
                 ledger, candidate["candidate_id"], "backtest", record=False)
             missing_gate = copy.deepcopy(missing_gate)
             missing_gate["candidate_id"] = None
             missing_gate = rehash(missing_gate)
             run_missing = append_gate_run(candidate, missing_gate)
-            with self.assertRaisesRegex(ValueError, "candidate identity"):
+            self.assertFalse(gates.verify_gate_envelope(missing_gate))
+            with self.assertRaisesRegex(ValueError, "envelope/hash is invalid"):
                 ledger.record_verified_gate(run_missing["run_id"], missing_gate)
 
             # A live-shadow run carries an independent source payload.  Its
@@ -1781,10 +1878,16 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             with mock.patch.object(
                     edge_discovery_core, "MIN_PROMOTION_CLUSTERS", 4), \
                     mock.patch.object(
+                        edge_discovery_core, "ACTUAL_CONTROL_MIN_MATCHED", 4), \
+                    mock.patch.object(
+                        edge_discovery_core, "MIN_NULL_CONTROL_MATCHED", 4), \
+                    mock.patch.object(
                         edge_lab, "qualification_report",
                         side_effect=compact_qualification), \
                     mock.patch.multiple(
                         gates,
+                        ACTUAL_CONTROL_MIN_MATCHED=4,
+                        NULL_CONTROL_MIN_MATCHED=4,
                         PROTOCOL_BACKTEST_MIN_TRADES=4,
                         PROTOCOL_BACKTEST_MIN_SESSIONS=4,
                         PROTOCOL_BACKTEST_MIN_CLUSTERS=4,
@@ -1984,10 +2087,16 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         with mock.patch.object(
                 edge_discovery_core, "MIN_PROMOTION_CLUSTERS", 4), \
                 mock.patch.object(
+                    edge_discovery_core, "ACTUAL_CONTROL_MIN_MATCHED", 4), \
+                mock.patch.object(
+                    edge_discovery_core, "MIN_NULL_CONTROL_MATCHED", 4), \
+                mock.patch.object(
                     edge_lab, "qualification_report",
                     side_effect=compact_qualification), \
                 mock.patch.multiple(
                     gates,
+                    ACTUAL_CONTROL_MIN_MATCHED=4,
+                    NULL_CONTROL_MIN_MATCHED=4,
                     PROTOCOL_BACKTEST_MIN_TRADES=4,
                     PROTOCOL_BACKTEST_MIN_SESSIONS=4,
                     PROTOCOL_BACKTEST_MIN_CLUSTERS=4,
@@ -2092,8 +2201,9 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         self.assertEqual(
             lenient_gate["falsification"]["p_value_source"],
             "heldout_paired_cluster_sign_flip")
-        self.assertEqual(lenient_gate["falsification"]["p_value"],
-                         lenient_gate["heldout_paired_baseline"]["p_value"])
+        self.assertTrue(lenient_gate["falsification"]["independent_supplied"])
+        self.assertEqual(lenient_gate["falsification"]["independent_method"],
+                         "independent_empirical_null_tail")
         self.assertTrue(lenient_gate["checks_without_family"]["falsification"])
         self.assertFalse(strict_gate["checks_without_family"]["falsification"])
 

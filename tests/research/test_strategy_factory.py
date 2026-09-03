@@ -20,10 +20,12 @@ from research.edge_ledger_store import content_hash, provenance_hash
 from research.factory_ledger import CONFIRMATORY_SCOPE_VERSION
 from research import gates
 from research.gates import (
+    FALSIFICATION_INDEPENDENT_METHOD, fdr_batch_evidence,
     falsification_gate, heldout_separation, matched_cluster_test,
     performance_floor, placebo_null_distribution, qualification_report,
     structural_floor, verified_gate_envelope, walk_forward_report,
 )
+from research.stats import stable_seed
 from research.llm_strategy import PROPOSAL_SCHEMA, ProposalResult
 import research.factory_core as core_module
 import research.strategy_factory as factory_module
@@ -123,6 +125,21 @@ def _seal_fixture_screen(record):
     }
     return factory_module._seal_signal_quality_screen_record(
         record, quality=quality)
+
+
+def _quality_eligibility(total_cells, *, status="actionable_signal",
+                         data_ineligible=0, data_incomplete=0):
+    return {
+        "schema": "signal-quality-eligibility.v1",
+        "scope": "fit_only", "authorizing": False,
+        "diagnostic_only": True, "status": status,
+        "classification": status, "total_cells": total_cells,
+        "eligible_cells": total_cells,
+        "signal_cells": total_cells if status == "actionable_signal" else 0,
+        "data_ineligible_cells": data_ineligible,
+        "data_incomplete_cells": data_incomplete,
+        "reason_counts": {}, "prefix_counts": {}, "truncated": False,
+    }
 
 
 def fake_signal_quality_screen_worker(payload):
@@ -310,15 +327,39 @@ def persist_rule_gate(ledger, candidate_id, lane):
                                 "matched": 0, "mean_delta": None,
                                 "p_value": 1.0, "mode": "prior_backtest"})
     placebo = placebo_null_distribution(heldout, baseline, vehicle="equity")
+    independent_seed = stable_seed({
+        "purpose": "independent_placebo_null_tail.v1",
+        "primary_assignments_hash": placebo["assignments_hash"],
+        "draws": int(placebo["draws"]),
+    })
+    independent = placebo_null_distribution(
+        heldout, baseline, vehicle="equity", draws=int(placebo["draws"]),
+        seed=independent_seed)
+    independent_result = falsification_gate(
+        independent["observed"], independent["placebo"], alpha=.05)
     falsification = {
-        **falsification_gate(placebo["observed"], placebo["placebo"]),
-        "draws": int(placebo["draws"]), "seed": int(placebo["seed"])}
+        **falsification_gate(
+            placebo["observed"], placebo["placebo"],
+            preregistered_p_value=control["p_value"],
+            independent_p_value=independent_result["p_value"],
+            independent_method=FALSIFICATION_INDEPENDENT_METHOD,
+            independent_result_hash=independent["assignments_hash"],
+            require_independent=True),
+        "method": placebo["method"],
+        "assignments_hash": placebo["assignments_hash"],
+        "observations": len(placebo["observed"]),
+        "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
+        "independent_method": FALSIFICATION_INDEPENDENT_METHOD,
+        "independent_result_hash": independent["assignments_hash"],
+        "independent_assignments_hash": independent["assignments_hash"],
+        "independent_draws": int(independent["draws"]),
+        "independent_seed": int(independent["seed"])}
     absolute = performance_floor(heldout, vehicle="equity")
     walk = walk_forward_report(heldout, baseline, vehicle="equity", folds=3)
     qualification = qualification_report(
         heldout, baseline, vehicle="equity",
         sessions=sorted({row["session_date"] for row in heldout}),
-        candidate_id=candidate_id, preselected=True)
+        candidate_id=candidate_id, preselected=True, max_drawdown=0.0)
     hashes = provenance_hash(config=candidate_config)
     if lane == "shadow":
         hashes.update({
@@ -345,6 +386,15 @@ def persist_rule_gate(ledger, candidate_id, lane):
         fit_control=fit_control,
         control={**control, "kind": "matched_root_baseline"},
         p_value=control["p_value"], q_value=control["p_value"], alpha=.05,
+        fdr_batch=fdr_batch_evidence(
+            candidate_id=candidate_id,
+            family_name="fixture",
+            family_candidate_key=candidate_id,
+            global_candidate_key=candidate_id,
+            family_values={"fixture": {candidate_id: control["p_value"]}},
+            global_values={candidate_id: control["p_value"]},
+            alpha=.05,
+            p_value_source="gate"),
         falsification=falsification, separation=separation,
         checks={"family_fdr_significant": True, "global_fdr_significant": True,
                 "cumulative_fdr_significant": True,
@@ -559,7 +609,7 @@ class StrategyFactoryTests(unittest.TestCase):
             previous, diagnosis, max_generations=4)
         self.assertEqual(replacement_one, replacement_two)
 
-    def test_fit_behavior_freeze_is_cycle_global_and_pre_worker(self):
+    def test_fit_behavior_aliases_are_proposed_without_suppressing_replay(self):
         hypotheses = initial_hypotheses(4)
         first, second, zero_first, zero_second = hypotheses
 
@@ -607,11 +657,11 @@ class StrategyFactoryTests(unittest.TestCase):
             scheduled, probes, proposals)
 
         self.assertEqual(frozen["intended_variant_count"], 4)
-        self.assertEqual(frozen["kept_variant_count"], 3)
+        self.assertEqual(frozen["kept_variant_count"], 4)
         remaining = {
             (task["hypothesis"]["hypothesis_id"], rule_variant_id(spec))
             for task in scheduled for spec in task["specs"]}
-        self.assertNotIn(
+        self.assertIn(
             (first.hypothesis_id, rule_variant_id(first.rule_spec)), remaining)
         self.assertIn(
             (second.hypothesis_id, rule_variant_id(second.rule_spec)), remaining)
@@ -619,9 +669,12 @@ class StrategyFactoryTests(unittest.TestCase):
             (first.hypothesis_id, rule_variant_id(zero_first.rule_spec)), remaining)
         self.assertIn(
             (second.hypothesis_id, rule_variant_id(zero_second.rule_spec)), remaining)
+        self.assertEqual(scheduled[0]["excluded_behavior_aliases"], [])
         self.assertEqual(
-            scheduled[0]["excluded_behavior_aliases"][0]
+            scheduled[0]["proposed_behavior_aliases"][0]
             ["canonical_family"], second.family)
+        self.assertTrue(
+            scheduled[0]["behavior_aliases"]["requires_operator_review"])
         self.assertEqual(
             scheduled[0]["behavior_aliases"]["selection_scope"], "fit_only")
 
@@ -770,6 +823,7 @@ class StrategyFactoryTests(unittest.TestCase):
             "scope": "fit_only", "authorizing": False,
             "diagnostic_only": True, "variant_id": "variant",
             "event_count": 32, "event_rejection_counts": {},
+            "eligibility_provenance": _quality_eligibility(32),
             "horizon_metrics": {
                 "60m": {"candidate_count": 32, "matched_count": 30,
                         "candidate_minus_control_bps": 0.0,
@@ -799,6 +853,27 @@ class StrategyFactoryTests(unittest.TestCase):
         malformed["digest"] = "arbitrary-nonempty-string"
         self.assertFalse(factory_module._screen_record_can_skip(
             malformed, variant_id="variant"))
+
+        incomplete = dict(quality)
+        incomplete["eligibility_provenance"] = _quality_eligibility(
+            32, status="data_incomplete", data_incomplete=1)
+        record = factory_module._signal_quality_screen_record(
+            incomplete, variant_id="variant", fit_cells=32,
+            primary_horizon=60)
+        self.assertEqual(record["status"], "underpowered")
+        self.assertEqual(record["reason"], "data_incomplete")
+        self.assertFalse(factory_module._screen_record_can_skip(
+            record, variant_id="variant"))
+
+        missing = dict(quality)
+        missing.pop("eligibility_provenance")
+        record = factory_module._signal_quality_screen_record(
+            missing, variant_id="variant", fit_cells=32,
+            primary_horizon=60)
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["reason"], "eligibility_provenance_missing")
+        self.assertFalse(factory_module._screen_record_can_skip(
+            record, variant_id="variant"))
 
         underpowered = dict(quality)
         underpowered["horizon_metrics"] = {
@@ -847,6 +922,7 @@ class StrategyFactoryTests(unittest.TestCase):
             "scope": "fit_only", "authorizing": False,
             "diagnostic_only": True, "variant_id": "variant",
             "event_count": 32, "event_rejection_counts": {},
+            "eligibility_provenance": _quality_eligibility(32),
             "market_context": {
                 "status": "partial",
                 "reason": "benchmark_context_missing",
@@ -872,6 +948,7 @@ class StrategyFactoryTests(unittest.TestCase):
                     "scope": "fit_only", "authorizing": False,
                     "diagnostic_only": True, "variant_id": "variant",
                     "event_count": 30, "event_rejection_counts": {},
+                    "eligibility_provenance": _quality_eligibility(30),
                     "horizon_metrics": {
                         "60m": {"candidate_count": 30, "matched_count": 30,
                                 "candidate_minus_control_bps": delta},
@@ -980,7 +1057,7 @@ class StrategyFactoryTests(unittest.TestCase):
                 hypothesis.hypothesis_id, "equity"), "2026-02-14")
 
     def test_run_factory_records_family_pass_global_fail_as_a_failed_gate(self):
-        """A normal BH family pass must not bypass the cycle-global gate."""
+        """A family-level BY pass must not bypass the cycle-global gate."""
         rows = losing_breakouts(sessions=20)
         calls = {"gate": 0}
 
@@ -1234,7 +1311,7 @@ class StrategyFactoryTests(unittest.TestCase):
         # per-family correction alone leaves the cross-family selection effect
         # uncorrected no matter how strict each family's own batch looks.
         scopes = []
-        real = factory_module.benjamini_hochberg
+        real = factory_module.benjamini_yekutieli
 
         def recording(values, **kwargs):
             scopes.append(tuple(sorted(values)))
@@ -1243,7 +1320,7 @@ class StrategyFactoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
                 patch.object(factory_module, "_worker", side_effect=fake_adequate_worker), \
-                patch.object(factory_module, "benjamini_hochberg", side_effect=recording):
+                patch.object(factory_module, "benjamini_yekutieli", side_effect=recording):
             db = Path(directory) / "edge.sqlite3"
             run_factory(losing_breakouts(), db_path=db, strategies=2,
                         variants_per_strategy=2, workers=2, min_trades=1,
@@ -1404,7 +1481,7 @@ class StrategyFactoryTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "retirement requires"):
                 ledger.event(parent["hypothesis_id"], "retired", "manual")
 
-    def test_configured_seven_strategy_shape_freezes_fit_aliases_before_arms(self):
+    def test_configured_seven_strategy_shape_keeps_fit_aliases_in_arms(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(factory_module, "_signal_quality_screen_worker",
                              side_effect=fake_signal_quality_screen_worker):
@@ -1416,15 +1493,14 @@ class StrategyFactoryTests(unittest.TestCase):
             self.assertEqual(result["strategies"], 7)
             aliases = result["fit_behavior_canonicalization"]
             self.assertEqual(aliases["intended_variant_count"], 14)
-            self.assertEqual(aliases["kept_variant_count"], 12)
-            self.assertEqual(len(aliases["excluded"]), 2)
-            self.assertTrue(all(
-                item["selection_scope"] == "fit_only"
-                for item in aliases["excluded"]))
-            self.assertEqual(result["variants"], 12)
-            self.assertEqual(result["accounts"], 12)
+            self.assertEqual(aliases["kept_variant_count"], 14)
+            self.assertEqual(aliases["excluded"], [])
+            self.assertEqual(len(aliases["proposed_exclusions"]), 2)
+            self.assertTrue(aliases["requires_operator_review"])
+            self.assertEqual(result["variants"], 14)
+            self.assertEqual(result["accounts"], 14)
             self.assertEqual(
-                len({row["account_id"] for row in result["results"]}), 12)
+                len({row["account_id"] for row in result["results"]}), 14)
 
     def test_validated_generated_rule_is_the_only_runtime_activation_path(self):
         spec = validate_rule_spec({"family": "momentum_continuation",

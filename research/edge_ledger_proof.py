@@ -236,6 +236,10 @@ class EdgeLedgerProofMixin:
     def _gate_envelope_error(self, run: Mapping, envelope: Mapping) -> str | None:
         if envelope.get("lane") != run.get("lane") or envelope.get("vehicle") != run.get("vehicle"):
             return "verified gate lane/vehicle does not match the persisted run"
+        from .gates import GATE_ENVELOPE_SCHEMA
+        if (run_engine_epoch_current(run) and
+                envelope.get("schema") != GATE_ENVELOPE_SCHEMA):
+            return "current replay epoch requires the current verified gate schema"
         equity_feed = str(
             envelope.get("equity_feed", "sip")
         ).strip().lower().replace("-", "_")
@@ -243,17 +247,18 @@ class EdgeLedgerProofMixin:
             equity_feed = "delayed_sip"
         if equity_feed not in {"iex", "sip", "delayed_sip"}:
             return "verified gate equity feed is invalid"
-        # V2 source-backed proofs must identify the immutable run candidate.
+        # Source-backed proofs must identify the immutable run candidate.
         # During the historical transition producers used the candidate's
         # stable variant id before the UUID-backed ledger record existed, so
         # accept exactly that alias as well; arbitrary/missing identities are
         # never allowed to cross candidate boundaries.
-        source_backed_v2 = (
-            envelope.get("schema") == "verified-research-gate.v2" and
+        source_backed_gate = (
+            envelope.get("schema") in {
+                "verified-research-gate.v2", "verified-research-gate.v3"} and
             isinstance(envelope.get("fit_source"), list) and
             isinstance(envelope.get("heldout_source"), list))
         allowed_candidate_ids: set[str] = set()
-        if source_backed_v2:
+        if source_backed_gate:
             candidate = self.candidate(run.get("candidate_id"))
             if not isinstance(candidate, Mapping):
                 return "verified gate candidate record is missing"
@@ -285,12 +290,14 @@ class EdgeLedgerProofMixin:
             if isinstance(recorded_gate, Mapping):
                 recorded_envelope = recorded_gate.get("verified_gate")
                 if (not isinstance(recorded_envelope, Mapping) and
-                        recorded_gate.get("schema") == "verified-research-gate.v2"):
+                        recorded_gate.get("schema") in {
+                            "verified-research-gate.v2",
+                            "verified-research-gate.v3"}):
                     recorded_envelope = recorded_gate
             if isinstance(recorded_envelope, Mapping):
                 if recorded_envelope.get("content_hash") != envelope.get("content_hash"):
                     return "verified gate envelope does not match immutable run proof"
-            if source_backed_v2 and run_engine_epoch_current(run):
+            if source_backed_gate and run_engine_epoch_current(run):
                 if (not isinstance(recorded_envelope, Mapping) or
                         recorded_envelope.get("content_hash") != envelope.get(
                             "content_hash")):
@@ -430,9 +437,15 @@ class EdgeLedgerProofMixin:
         if envelope.get("passes") != all(checks.values()):
             return "verified gate pass decision is inconsistent"
         if envelope.get("passes"):
-            from .gates import GATE_REQUIRED_CHECKS
-            if (not GATE_REQUIRED_CHECKS.issubset(set(checks)) or
-                    not all(bool(checks.get(key)) for key in GATE_REQUIRED_CHECKS)):
+            from .gates import (GATE_REQUIRED_CHECKS,
+                                LEGACY_GATE_ENVELOPE_SCHEMA_V2,
+                                LEGACY_GATE_REQUIRED_CHECKS_V2)
+            required_checks = (
+                LEGACY_GATE_REQUIRED_CHECKS_V2
+                if envelope.get("schema") == LEGACY_GATE_ENVELOPE_SCHEMA_V2
+                else GATE_REQUIRED_CHECKS)
+            if (not required_checks.issubset(set(checks)) or
+                    not all(bool(checks.get(key)) for key in required_checks)):
                 return "passing verified gate is missing a required decision check"
             provenance = envelope.get("provenance")
             if (not isinstance(provenance, Mapping) or
@@ -478,8 +491,17 @@ class EdgeLedgerProofMixin:
         for key in ("actual_control", "available"):
             if key in control and not isinstance(control[key], bool):
                 return "verified gate control decision is inconsistent"
-        if "actual_control_available" in checks and bool(checks["actual_control_available"]) != bool(
-                control.get("actual_control") is True and control.get("available") is True):
+        expected_control_available = bool(
+            control.get("actual_control") is True and
+            control.get("available") is True)
+        if envelope.get("schema") == GATE_ENVELOPE_SCHEMA:
+            paired = control.get("paired_adequacy")
+            expected_control_available = bool(
+                expected_control_available and isinstance(paired, Mapping) and
+                paired.get("adequate") is True)
+        if ("actual_control_available" in checks and
+                bool(checks["actual_control_available"]) !=
+                expected_control_available):
             return "verified gate control decision is inconsistent"
         no_control_failure = (
             matched == 0 and control["available"] is False and
@@ -520,8 +542,28 @@ class EdgeLedgerProofMixin:
             if bool(checks["separated"]) != bool(separation.get("passes")):
                 return "verified gate separation decision is inconsistent"
         if envelope.get("passes"):
-            if not (control.get("actual_control") is True and control.get("available") is True and
-                    matched is not None and matched > 0):
+            from .gates import (ACTUAL_CONTROL_MIN_COVERAGE,
+                                ACTUAL_CONTROL_MIN_MATCHED)
+            paired_adequacy = control.get("paired_adequacy")
+            current_schema = envelope.get("schema") == GATE_ENVELOPE_SCHEMA
+            actual_control_ok = bool(
+                control.get("actual_control") is True and
+                control.get("available") is True and
+                matched is not None and matched > 0)
+            if current_schema:
+                actual_control_ok = bool(
+                    actual_control_ok and
+                    isinstance(paired_adequacy, Mapping) and
+                    paired_adequacy.get("adequate") is True and
+                    _nonnegative_integer(paired_adequacy.get(
+                        "minimum_matched")) is not None and
+                    int(paired_adequacy["minimum_matched"]) >=
+                    int(ACTUAL_CONTROL_MIN_MATCHED) and
+                    _finite_number(paired_adequacy.get(
+                        "minimum_coverage")) is not None and
+                    float(paired_adequacy["minimum_coverage"]) >=
+                    float(ACTUAL_CONTROL_MIN_COVERAGE))
+            if not actual_control_ok:
                 return "passing verified gate lacks an actual matched control"
             if not isinstance(falsification, Mapping) or not bool(falsification.get("passes")):
                 return "passing verified gate lacks a passing falsification"
@@ -830,7 +872,7 @@ class EdgeLedgerProofMixin:
             return False
         # Rebuild the adaptive selection statistic from persisted selection
         # rows.  Session/row digests are checked first, then the exact gate
-        # computation and the complete batch BH inputs/results are replayed;
+        # computation and the complete batch correction inputs/results are replayed;
         # a consistently rewritten digest cannot authorize by itself.
         selection_candidate = selection.get("candidate_source")
         selection_baseline = selection.get("baseline_source")
@@ -884,7 +926,7 @@ class EdgeLedgerProofMixin:
         if not isinstance(batch, Mapping):
             return False
         try:
-            from .stats import benjamini_hochberg
+            from .stats import benjamini_hochberg, benjamini_yekutieli
             family_values = batch.get("family_values")
             family_results = batch.get("family_results")
             global_values = batch.get("global_values")
@@ -894,14 +936,23 @@ class EdgeLedgerProofMixin:
                     not isinstance(global_values, Mapping) or
                     not isinstance(global_results, Mapping)):
                 return False
+            method = str(batch.get("method") or "benjamini_hochberg")
+            if method == "benjamini_yekutieli":
+                correction = benjamini_yekutieli
+            elif method == "benjamini_hochberg":
+                # Durable records written before the dependence-safe upgrade
+                # remain replayable under their original declared semantics.
+                correction = benjamini_hochberg
+            else:
+                return False
             expected_family = {}
             for family_name, values in family_values.items():
                 if not isinstance(values, Mapping):
                     return False
-                expected_family.update(benjamini_hochberg(
+                expected_family.update(correction(
                     {str(key): float(value) for key, value in values.items()},
                     alpha=float(selection.get("alpha"))))
-            expected_global = benjamini_hochberg(
+            expected_global = correction(
                 {str(key): float(value) for key, value in global_values.items()},
                 alpha=float(selection.get("alpha")))
             if dict(expected_family) != dict(family_results) or \

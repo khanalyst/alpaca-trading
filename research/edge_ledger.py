@@ -303,7 +303,8 @@ class EdgeLedger(EdgeLedgerProofMixin):
         gate = metrics.get("gate") if isinstance(metrics, Mapping) else None
         envelope = gate.get("verified_gate") if isinstance(gate, Mapping) else None
         if (not isinstance(envelope, Mapping) and isinstance(gate, Mapping) and
-                gate.get("schema") == "verified-research-gate.v2"):
+                gate.get("schema") in {
+                    "verified-research-gate.v2", "verified-research-gate.v3"}):
             envelope = gate
         if (not isinstance(envelope, Mapping) or
                 payload.get("gate_hash") != envelope.get("content_hash")):

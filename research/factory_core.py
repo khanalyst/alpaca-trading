@@ -607,7 +607,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         # field (and therefore keeps existing report contracts); the parity
         # check in ``simulate_account`` compares this boundary reference to
         # the quote before pricing the fill.
-        entry_slippage_reference: float | None = entry_underlying
+        # Slippage is measured from the authored signal reference to the
+        # executable quote.  Keep this distinct from ``entry_ref`` so a gap
+        # cannot be mistaken for an ordinary bar/quote mark.
+        entry_slippage_reference: float | None = None
         entry_source = BAR
         entry_feed = entry_provider = None
         entry_age = 0.0
@@ -676,20 +679,34 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 entry_timestamp=entry_at)
             continue
         authored_distance = float(signal["stop_distance"])
-        distance = authored_distance
-        # The runtime submits the bracket legs with the entry order, before any
-        # fill exists, so the only anchor it can use is the signal bar's close.
-        # Research must use the same levels and let the entry gap show up as
-        # real sizing/R error rather than silently re-anchoring them.
+        # ``plan_entry`` is the authored signal reference.  The executable
+        # quote/bar mark is a separate anchor: runtime sizes and validates the
+        # broker bracket against that value, while preserving authored legs.
         plan_entry = float(signal["entry_price"])
+        entry_slippage_reference = plan_entry
         authored_stop = float(signal["stop_price"])
         authored_target = float(signal["target_price"])
         stop = authored_stop
         target = authored_target
+        distance = authored_distance
         stop_floor_bps = MIN_STOP_DISTANCE_BPS
         stop_floor_binding = False
         stop_geometry_scenario = None
         stop_geometry_activation_reason = "stress_disabled"
+        if vehicle == "equity":
+            # Quantization is broker-facing geometry.  Anchor it to the same
+            # executable quote used by ``_risk_order``; a quote gap may make
+            # the authored bracket invalid, in which case fail closed rather
+            # than replaying a trade the runtime cannot submit.
+            try:
+                stop, target, distance = quantize_equity_bracket(
+                    entry_ref, stop, target, direction)
+            except RiskGeometryError:
+                return _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date, direction,
+                    "broker_tick_geometry_invalid", stage="risk_geometry",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at)
         if (vehicle == "equity" and
                 (resolved_policy.stressed_cost_scenario_bps is not None or
                  resolved_policy.stressed_cost_calibration_enabled) and
@@ -704,31 +721,35 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     decision_timestamp=signal_ready,
                     entry_timestamp=entry_at)
             try:
+                broker_normalized_distance = distance
                 distance, stop_floor_bps = effective_stop_distance(
-                    plan_entry, authored_distance,
+                    entry_ref, distance,
                     base_floor_bps=MIN_STOP_DISTANCE_BPS,
                     scenario_bps=stop_geometry_scenario,
                     max_cost_to_risk_ratio=(
                         resolved_policy.max_stressed_cost_to_risk_ratio),
-                    minimum_increment=equity_price_increment(plan_entry))
+                    minimum_increment=equity_price_increment(entry_ref))
             except RiskGeometryError:
                 return _unpriced(
                     signal_bar, entry_bar, signal_bar.session_date, direction,
                     "stressed_cost_invalid", stage="risk_geometry",
                     decision_timestamp=signal_ready,
                     entry_timestamp=entry_at)
-            stop_floor_binding = distance > authored_distance + 1e-12
+            # Binding is about the stressed floor widening the already
+            # quote-anchored broker distance, not about an entry gap making
+            # that distance larger than the authored signal distance.
+            stop_floor_binding = distance > broker_normalized_distance + 1e-12
             if stop_floor_binding:
-                stop = (plan_entry - distance if direction == "long" else
-                        plan_entry + distance)
+                stop = (entry_ref - distance if direction == "long" else
+                        entry_ref + distance)
                 if str(spec.get("target_mode") or "fixed_r") == "fixed_r":
-                    target = (plan_entry + distance * float(spec["target_r"])
+                    target = (entry_ref + distance * float(spec["target_r"])
                               if direction == "long" else
-                              plan_entry - distance * float(spec["target_r"]))
+                              entry_ref - distance * float(spec["target_r"]))
             if (not math.isfinite(stop) or stop <= 0 or
                     not math.isfinite(target) or target <= 0 or
-                    (direction == "long" and not (stop < plan_entry < target)) or
-                    (direction == "short" and not (target < plan_entry < stop))):
+                    (direction == "long" and not (stop < entry_ref < target)) or
+                    (direction == "short" and not (target < entry_ref < stop))):
                 return _unpriced(
                     signal_bar, entry_bar, signal_bar.session_date, direction,
                     "stressed_cost_invalid", stage="risk_geometry",
@@ -737,17 +758,16 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         if vehicle == "equity":
             try:
                 stop, target, distance = quantize_equity_bracket(
-                    plan_entry, stop, target, direction)
+                    entry_ref, stop, target, direction)
             except RiskGeometryError:
                 return _unpriced(
                     signal_bar, entry_bar, signal_bar.session_date, direction,
                     "broker_tick_geometry_invalid", stage="risk_geometry",
                     decision_timestamp=signal_ready,
                     entry_timestamp=entry_at)
-        # Sizing reproduces `RiskEngine.size_shares`, which divides the budget by
-        # this same nominal distance at plan time.  Accounting uses the distance
-        # from the real fill to that stop, which is what the account actually
-        # risked once the entry gapped.
+        # Sizing reproduces ``RiskEngine.size_shares`` against the executable
+        # entry/stop geometry.  A quote gap therefore reduces quantity before
+        # the trade is admitted instead of overspending the authored budget.
         real_risk = max(0.0, entry_underlying - stop if direction == "long"
                         else stop - entry_underlying)
         deadline = hold_deadline(entry_at, spec)
@@ -1041,6 +1061,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # The price the runtime plans and caps notional against; the fill
             # reference above may have gapped away from it.
             "plan_entry": plan_entry,
+            "authored_entry_reference": plan_entry,
+            "executable_entry_reference": entry_ref,
             "risk_per_unit": (entry_ref * multiplier if vehicle == "option"
                               else distance),
             # A long option's maximum loss is the premium actually paid, so its
@@ -1253,7 +1275,9 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             drawdown = max(drawdown, peak - cash)
             active.remove(item)
 
-    def mark_active(timestamp: datetime) -> float:
+    mark_diagnostics: list[dict[str, Any]] = []
+
+    def mark_active(timestamp: datetime) -> float | None:
         """Mark open positions from information visible at ``timestamp``.
 
         Equity marks prefer the executable side of a fresh recorded quote and
@@ -1263,6 +1287,7 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         unrealized P&L cannot be counted twice.
         """
         unrealized = 0.0
+        missing: list[str] = []
         for item in active:
             symbol = str(item.get("symbol", "")).upper()
             direction = str(item.get("direction", "long"))
@@ -1287,10 +1312,12 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                         resolved_policy,
                     )
             if mark is None:
-                # No visible mark is a zero-move assumption, not permission to
-                # inspect a future exit price.  Entry-side fees still reduce
-                # equity immediately, as they do in the runtime account.
-                mark = float(item["entry_price"])
+                # Do not substitute entry price (or a future exit) when the
+                # active position has no visible mark. Account capacity and
+                # open-risk are unknown; fail closed until a fresh mark is
+                # observable.
+                missing.append(symbol)
+                continue
             quantity = float(item.get("quantity", 0.0))
             multiplier = float(item.get("contract_multiplier", 1))
             entry = float(item["entry_price"])
@@ -1300,6 +1327,13 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             entry_fees = active_model.fees(
                 entry, entry, quantity, multiplier, vehicle=vehicle) / 2.0
             unrealized += gross - entry_fees
+        if missing:
+            mark_diagnostics.append({
+                "timestamp": timestamp.isoformat(),
+                "symbols": sorted(set(missing)),
+                "reason": "active position mark unavailable",
+            })
+            return None
         return unrealized
 
     for raw in sorted(candidates, key=lambda item: (
@@ -1309,7 +1343,23 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         symbol, day, opportunity = raw["_symbol"], raw["_day"], raw["opportunity_id"]
         day_key = day.isoformat()
         day_start_equity.setdefault(day_key, cash)
-        current_equity = cash + mark_active(entry_at)
+        unrealized = mark_active(entry_at)
+        if unrealized is None:
+            rows.append({
+                "vehicle": vehicle, "symbol": symbol,
+                "session_date": day.isoformat(), "opportunity_id": opportunity,
+                "no_trade": True,
+                "execution_disposition": "refused",
+                "signal_opportunity": True,
+                "reject_stage": "mark_data",
+                "reject_reason": "active position mark unavailable",
+                "diagnostic_only": True,
+                "authorizing": False,
+                "mark_data_unavailable": True,
+                "mark_data_diagnostics": list(mark_diagnostics[-1:]),
+            })
+            continue
+        current_equity = cash + unrealized
         effective_risk_pct = float(resolved_policy.risk_per_trade_pct)
         risk_budget = max(0.0, current_equity * effective_risk_pct / 100.0)
         per_unit = max(float(raw["risk_per_unit"]), 1e-9)
@@ -1325,7 +1375,7 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 0.0, current_equity * float(notional_pct) / 100.0)
             notional_cap_quantity = math.floor(
                 position_notional_cap_usd /
-                max(float(raw["plan_entry"]), 1e-9))
+                max(float(raw["entry_reference"]), 1e-9))
             quantity = min(quantity, notional_cap_quantity)
         elif resolved_policy.max_position_notional_pct is not None:
             position_notional_cap_usd = max(
@@ -1339,10 +1389,11 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         multiplier = int(raw["contract_multiplier"])
         nominal_risk_usd = quantity * float(raw["risk_per_unit"])
         realized_risk_usd = quantity * float(raw["realized_risk_per_unit"])
-        # Runtime brackets size and stress-check against the authored signal
-        # plan, not a next-bar gap fill.  Equity notional therefore uses
-        # ``plan_entry`` while options use premium × multiplier × contracts.
-        entry_notional = ((float(raw["plan_entry"]) * quantity)
+        # Runtime brackets size and stress-check against the executable quote
+        # (the authored reference remains available as telemetry). Equity
+        # notional therefore uses ``entry_reference`` while options use
+        # premium × multiplier × contracts.
+        entry_notional = ((float(raw["entry_reference"]) * quantity)
                           if vehicle == "equity" else
                           (float(raw["entry_reference"]) * quantity * multiplier))
         stress_enabled = (
@@ -1562,6 +1613,13 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                             if key.startswith("stressed_cost_") or
                             key == "max_stressed_cost_to_risk_ratio"})
                 row["stressed_cost_activation_reason"] = stress_activation_reason
+        if bool(row.get("hold_discontinuity_exit", row.get("hold_discontinuity"))):
+            # Sparse-hold exits remain executable/accounting diagnostics, but
+            # cannot authorize directional P&L or strategy selection.
+            row.update({"diagnostic_only": True, "authorizing": False,
+                        "directional_authorizing": False})
+        else:
+            row.setdefault("directional_authorizing", True)
         rows.append(row)
         active.append(row)
     if active:
@@ -1579,20 +1637,31 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         if disposition == "no_signal" and row.get("signal_opportunity") is not False:
             raise RuntimeError("no-signal row is marked as a signal opportunity")
     executed = [row for row in rows if row.get("no_trade") is not True]
+    authorizing = [row for row in executed
+                   if row.get("directional_authorizing", True) is not False]
+    authorizing_pnl = sum(float(row.get("net_pnl", 0.0)) for row in authorizing)
     return {"account_id": account_id, "starting_cash": float(starting_cash),
             "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
+            "authorizing_realized_pnl": authorizing_pnl,
+            "authorizing_trades": len(authorizing),
+            "mark_diagnostics": mark_diagnostics,
             "max_drawdown": drawdown, "trades": len(executed), "rows": rows}
 
 
 def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> dict:
-    trades = [row for row in rows if row.get("no_trade") is not True]
+    all_trades = [row for row in rows if row.get("no_trade") is not True]
+    trades = [row for row in all_trades
+              if row.get("directional_authorizing", True) is not False]
     pnl = [float(row.get("net_pnl", 0.0)) for row in trades]
     wins = [value for value in pnl if value > 0]
     losses = [value for value in pnl if value < 0]
     sessions = {row.get("session_date") for row in rows}
     expectancy = mean(pnl) if pnl else 0.0
     profit_factor = (sum(wins) / abs(sum(losses))) if losses else (float("inf") if wins else 0.0)
-    drawdown = max_drawdown_of(rows)
+    # Directional authorization excludes sparse-hold diagnostics just like
+    # expectancy/P&L; retain their telemetry below without letting their sign
+    # alter the gate's drawdown decision.
+    drawdown = max_drawdown_of(trades)
     # A fit can have plenty of actionable opportunities while every one is
     # refused by an explicit execution/risk boundary.  Preserve that signal
     # for the bounded search loop; a plain zero-signal stream has no reason
@@ -1628,14 +1697,16 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
         failure = "excess_drawdown"
     else:
         failure = "none"
-    discontinuity_exits = sum(
-        bool(row.get("hold_discontinuity_exit", row.get("hold_discontinuity")))
-        for row in trades)
+    discontinuity_rows = [row for row in all_trades if bool(
+        row.get("hold_discontinuity_exit", row.get("hold_discontinuity")))]
+    discontinuity_exits = len(discontinuity_rows)
     time_expiry_exits = sum(
         row.get("hold_exit_reason") == "time_expiry" for row in trades)
     return {
         "primary_failure": failure, "trades": len(trades),
+        "executed_trades": len(all_trades),
         "sessions": len(sessions), "net_pnl": sum(pnl), "expectancy": expectancy,
+        "directional_authorizing": True,
         "execution_blocked": execution_blocked,
         "execution_rejection_count": len(refused_rows),
         "no_signal_count": len(no_signal_rows),
@@ -1649,8 +1720,9 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
                         if trades else 0.0),
         "hold_telemetry": {
             "discontinuity_exits": discontinuity_exits,
-            "discontinuity_exit_rate": (discontinuity_exits / len(trades)
-                                         if trades else 0.0),
+            "discontinuity_exit_rate": (
+                discontinuity_exits / len(all_trades) if all_trades else 0.0),
+            "diagnostic_trade_count": len(discontinuity_rows),
             "time_expiry_exits": time_expiry_exits,
             "time_expiry_rate": (time_expiry_exits / len(trades)
                                   if trades else 0.0),
@@ -2299,7 +2371,7 @@ def discovery_spec(index: int, *, family: str,
                    vehicle: str = "equity") -> dict[str, Any]:
     """Return the deterministic *index*-th conditional variant of a family.
 
-    The ladder dimensions have mixed lengths (5, 5, 4, 7 against an 11-family
+    The ladder dimensions have mixed lengths (5, 5, 4, 7 against a 12-family
     rotation). ``_DISCOVERY_SHAPES`` is the fastest-varying dimension so
     consecutive indices probe payoff geometry before repeating a window or
     confirmation predicate.

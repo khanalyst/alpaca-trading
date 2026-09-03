@@ -59,7 +59,7 @@ def deterministic_dependence_map(rows, *, cutoff: float | None = None,
     traversed in lexical order by a deterministic union-find, making cluster
     identifiers reproducible and independent of input order.
 
-    This helper is policy-only: it does not alter BH or any gate.  An
+    This helper is policy-only: it does not alter batch correction or any gate.  An
     unavailable map is returned with its evidence and explicit reason so the
     caller can persist that conservative decision before a new cycle starts.
     """
@@ -1018,7 +1018,7 @@ def cross_family_dependence_report(
     The input is interpreted as one statistic per family/session cell (or a
     short vector whose finite mean is used for that cell).  Correlations are
     pairwise Pearson correlations over complete shared sessions and are
-    strictly diagnostic: this function never changes a gate, BH correction,
+    strictly diagnostic: this function never changes a gate, batch correction,
     allocation, or runtime grouping.  Missing cells, duplicate cells, and
     degenerate vectors are reported explicitly instead of being imputed.
     """
@@ -1230,6 +1230,25 @@ def benjamini_hochberg(pvalues: dict, alpha: float = 0.05) -> dict:
     }
 
 
+def benjamini_yekutieli(pvalues: dict, alpha: float = 0.05) -> dict:
+    """Control FDR when candidate p-values may have arbitrary dependence."""
+    corrected = benjamini_hochberg(pvalues, alpha=alpha)
+    total = len(corrected)
+    if not total:
+        return {}
+    harmonic = sum(1.0 / rank for rank in range(1, total + 1))
+    nominal = float(alpha)
+    return {
+        name: {
+            **item,
+            "p_adjusted": min(1.0, float(item["p_adjusted"]) * harmonic),
+            "significant": min(
+                1.0, float(item["p_adjusted"]) * harmonic) <= nominal,
+        }
+        for name, item in corrected.items()
+    }
+
+
 __all__ = ["DEPENDENCE_POLICY_SCHEMA", "DEPENDENCE_MIN_COMPLETE_SESSIONS",
            "DEPENDENCE_MIN_PRIOR_CYCLES", "DEPENDENCE_CORRELATION_THRESHOLD",
            "DEPENDENCE_MIN_SESSIONS", "DEPENDENCE_MIN_CYCLES",
@@ -1239,7 +1258,7 @@ __all__ = ["DEPENDENCE_POLICY_SCHEMA", "DEPENDENCE_MIN_COMPLETE_SESSIONS",
            "DEFAULT_BREADTH_MIN_CLUSTERS", "DEFAULT_BREADTH_MIN_SESSIONS",
            "DEFAULT_BOOTSTRAP_DRAWS", "DEFAULT_NULL_DRAWS",
            "DEFAULT_CLUSTER_BLOCK_LENGTH",
-           "benjamini_hochberg",
+           "benjamini_hochberg", "benjamini_yekutieli",
            "cluster_bootstrap_lower_bound", "cluster_contributions",
            "clustered_mde_power_report", "clustered_mde_report",
            "clustered_mde_power", "mde_power_report",

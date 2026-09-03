@@ -14,6 +14,7 @@ the current engine is the only route back to ``validated``.
 """
 
 from pathlib import Path
+import copy
 import tempfile
 import unittest
 from unittest import mock
@@ -21,6 +22,7 @@ from unittest import mock
 from research.edge_lab import EdgeLedger
 from research.edge_ledger_proof import run_engine_epoch, run_engine_epoch_current
 from research.edge_ledger_store import REPLAY_ENGINE_EPOCH
+from research import gates
 from tests.research.test_edge_discovery import _persist_gate
 
 
@@ -37,18 +39,62 @@ def superseded_engine():
 
 
 class ReplayEngineEpochTests(unittest.TestCase):
-    def test_epoch_four_evidence_is_legacy_readable_but_quarantined(self):
+    def test_epoch_five_evidence_is_legacy_readable_but_quarantined(self):
         # Legacy rows are intentionally interpreted, not rewritten.  The
-        # epoch-4 payload remains auditable while the current engine (epoch 5)
+        # epoch-5 payload remains auditable while the current engine (epoch 6)
         # refuses to treat it as authorizing evidence.
-        legacy = {"metrics": {"replay_engine_epoch": 4}}
-        self.assertEqual(run_engine_epoch(legacy), 4)
+        legacy = {"metrics": {"replay_engine_epoch": 5}}
+        self.assertEqual(run_engine_epoch(legacy), 5)
         self.assertFalse(run_engine_epoch_current(legacy))
 
-    def test_epoch_five_is_the_current_authorizing_generation(self):
-        current = {"metrics": {"replay_engine_epoch": 5}}
-        self.assertEqual(REPLAY_ENGINE_EPOCH, 5)
-        self.assertEqual(run_engine_epoch(current), 5)
+    def test_v2_gate_is_auditable_only_for_a_stale_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity",
+                hypothesis="v2 audit compatibility", config={})
+            candidate_id = candidate["candidate_id"]
+            with mock.patch("research.edge_ledger.REPLAY_ENGINE_EPOCH", 5):
+                stale_run, legacy = _persist_gate(
+                    ledger, candidate_id, "backtest", record=False,
+                    legacy_gate_v2=True)
+            self.assertTrue(gates.verify_gate_envelope(legacy))
+            ledger.record_verified_gate(stale_run["run_id"], legacy)
+            self.assertIsNotNone(ledger.verified_run(stale_run["run_id"]))
+            self.assertFalse(run_engine_epoch_current(stale_run))
+
+            # A re-signed legacy decision cannot change a source-derived
+            # check merely because the proof is quarantined from deployment.
+            tampered = copy.deepcopy(legacy)
+            tampered["checks"]["walk_forward_majority_positive"] = False
+            tampered["passes"] = False
+            tampered["content_hash"] = gates._content_hash({
+                key: value for key, value in tampered.items()
+                if key != "content_hash"
+            })
+            self.assertFalse(gates.verify_gate_envelope(tampered))
+
+            hash_tampered = copy.deepcopy(legacy)
+            hash_tampered["falsification"]["independent_result_hash"] = "forged"
+            hash_tampered["content_hash"] = gates._content_hash({
+                key: value for key, value in hash_tampered.items()
+                if key != "content_hash"
+            })
+            self.assertFalse(gates.verify_gate_envelope(hash_tampered))
+
+            current_run, current_v2 = _persist_gate(
+                ledger, candidate_id, "backtest", record=False,
+                legacy_gate_v2=True)
+            self.assertTrue(run_engine_epoch_current(current_run))
+            self.assertTrue(gates.verify_gate_envelope(current_v2))
+            with self.assertRaisesRegex(
+                    ValueError, "current replay epoch requires"):
+                ledger.record_verified_gate(current_run["run_id"], current_v2)
+
+    def test_epoch_six_is_the_current_authorizing_generation(self):
+        current = {"metrics": {"replay_engine_epoch": 6}}
+        self.assertEqual(REPLAY_ENGINE_EPOCH, 6)
+        self.assertEqual(run_engine_epoch(current), 6)
         self.assertTrue(run_engine_epoch_current(current))
 
     def test_future_epoch_is_quarantined_until_this_verifier_understands_it(self):
@@ -57,7 +103,7 @@ class ReplayEngineEpochTests(unittest.TestCase):
         self.assertEqual(run_engine_epoch(future), REPLAY_ENGINE_EPOCH + 1)
         self.assertFalse(run_engine_epoch_current(future))
 
-    def test_epoch_four_run_can_be_read_then_reproved_under_epoch_five(self):
+    def test_epoch_five_run_can_be_read_then_reproved_under_epoch_six(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
             candidate = ledger.register_candidate(
@@ -65,12 +111,12 @@ class ReplayEngineEpochTests(unittest.TestCase):
                 config={"strategy": {"target_r": 1.5}})
             candidate_id = candidate["candidate_id"]
 
-            # Simulate an immutable run written before the epoch-5 bump.  The
+            # Simulate an immutable run written before the epoch-6 bump.  The
             # run remains in the ledger and readable, but it cannot advance
             # lifecycle state under the current engine.
-            with mock.patch("research.edge_ledger.REPLAY_ENGINE_EPOCH", 4):
+            with mock.patch("research.edge_ledger.REPLAY_ENGINE_EPOCH", 5):
                 stale, _ = _persist_gate(ledger, candidate_id, "backtest")
-            self.assertEqual(run_engine_epoch(ledger.run(stale["run_id"])), 4)
+            self.assertEqual(run_engine_epoch(ledger.run(stale["run_id"])), 5)
             # Offline lifecycle bookkeeping remains readable even for a
             # legacy proof; the live authorization boundary is where epoch
             # quarantine is enforced.
@@ -78,25 +124,25 @@ class ReplayEngineEpochTests(unittest.TestCase):
                 ledger.transition(candidate_id, "backtest_passed",
                                   reason="legacy backtest remains readable")["status"],
                 "backtest_passed")
-            with mock.patch("research.edge_ledger.REPLAY_ENGINE_EPOCH", 4):
+            with mock.patch("research.edge_ledger.REPLAY_ENGINE_EPOCH", 5):
                 stale_shadow, _ = _persist_gate(ledger, candidate_id, "shadow")
-            self.assertEqual(run_engine_epoch(stale_shadow), 4)
+            self.assertEqual(run_engine_epoch(stale_shadow), 5)
             self.assertEqual(
                 ledger.transition(candidate_id, "shadow",
                                   reason="legacy shadow remains readable")["status"],
                 "shadow")
             with self.assertRaises(ValueError):
                 ledger.transition(candidate_id, "validated",
-                                  reason="epoch-4 evidence is quarantined")
+                                  reason="epoch-5 evidence is quarantined")
 
-            # Re-deriving appends a new immutable proof stamped by epoch 5;
+            # Re-deriving appends a new immutable proof stamped by epoch 6;
             # that latest proof is the one lifecycle/live authorization consumes.
             fresh, _ = _persist_gate(ledger, candidate_id, "shadow")
             self.assertEqual(run_engine_epoch(fresh), REPLAY_ENGINE_EPOCH)
             self.assertTrue(run_engine_epoch_current(fresh))
             self.assertEqual(
                 ledger.transition(candidate_id, "validated",
-                                  reason="epoch-5 reproof")["status"],
+                                  reason="epoch-6 reproof")["status"],
                 "validated")
 
     def test_an_unstamped_run_reports_the_pre_stamp_epoch(self):

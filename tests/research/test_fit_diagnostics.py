@@ -10,7 +10,7 @@ from research.edge_lab import _read_discovery_rows
 from research.costs import CostModel, diagnostic_backfill_policy
 from research.fit_diagnostics import (
     BAR_COVERAGE_SCHEMA, FIT_BEHAVIOR_ALIAS_DECIMALS, FIT_BEHAVIOR_ALIAS_SCHEMA,
-    _planned_vector, bar_coverage_telemetry,
+    _fit_prefixes, _planned_vector, bar_coverage_telemetry,
     collapse_behavior_aliases,
     measure_fit_diagnostics,
 )
@@ -127,6 +127,41 @@ class FitDiagnosticsTests(unittest.TestCase):
                           for item in _fit_prefixes(altered, ROOT_SPEC)["first_signals"]])
         self.assertLessEqual(diagnostic["first_signal"]["signals"],
                              baseline["first_signal"]["signals"])
+
+    def test_entry_unavailable_prefixes_fail_open_as_incomplete_data(self):
+        bars, _snapshots, _quotes = self._fit()
+        # Keep exactly one mature signal prefix per cell, then delay the
+        # signal bar's observation beyond the only following bar.  The
+        # decision timestamp therefore has no available entry row; it must
+        # not be reclassified as a predicate-level no-actionable result.
+        grouped = {}
+        for row in bars:
+            grouped.setdefault((row.symbol, row.session_date), []).append(row)
+        altered = []
+        for rows in grouped.values():
+            rows = sorted(rows, key=lambda item: item.timestamp)[:17]
+            delayed = replace(
+                rows[15],
+                identity=replace(
+                    rows[15].identity,
+                    observed_at=rows[15].end + timedelta(days=1),
+                ),
+            )
+            altered.extend(rows[:15] + [delayed, rows[16]])
+        prefix = _fit_prefixes(altered, ROOT_SPEC)
+        self.assertEqual(prefix["eligible_prefixes"], 0)
+        self.assertGreater(prefix["prefix_status_counts"].get(
+            "entry_bar_unavailable", 0), 0)
+        self.assertEqual(prefix["eligibility_provenance"]["status"],
+                         "data_incomplete")
+        diagnostic = measure_fit_diagnostics(altered, ROOT_SPEC)
+        self.assertEqual(diagnostic["first_signal"]["signals"], 0)
+        self.assertNotEqual(
+            diagnostic["signal_quality"]["event_rejection_counts"],
+            {"no_actionable_signal": len(grouped)})
+        self.assertEqual(
+            diagnostic["signal_quality"]["eligibility_provenance"]["status"],
+            "data_incomplete")
 
     def test_alias_canonicalization_is_review_only_and_zero_signal_is_kept(self):
         bars, _snapshots, _quotes = self._fit()

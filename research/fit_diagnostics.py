@@ -31,7 +31,8 @@ from .market_data import (historical_backfill_record, record_available_at,
                            record_is_available, replay_available_at,
                            replay_record_is_available)
 from .stats import clustered_mde_power_report
-from .signal_quality import measure_signal_quality
+from .signal_quality import (SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
+                              measure_signal_quality)
 from .path_telemetry import (aggregate_path_telemetry, compute_path_telemetry,
                              target_hold_reachability)
 
@@ -555,6 +556,107 @@ def _diagnostic_backfill_enabled(policy: Any | None) -> bool:
     return bool(getattr(policy, "allow_historical_backfill_diagnostics", False))
 
 
+_PREFIX_DATA_INELIGIBLE_REASONS = frozenset({
+    "historical_backfill_excluded", "feature_unavailable",
+})
+_PREFIX_DATA_INCOMPLETE_REASONS = frozenset({
+    "insufficient_history", "signal_end_unavailable", "feature_gap",
+    "entry_not_adjacent", "entry_bar_unavailable", "invalid_session",
+})
+
+
+def _prefix_cell_classification(*, eligible: int, signals: int,
+                                reasons: Mapping[str, int]) -> str:
+    """Classify one cell without turning missing data into no-edge evidence."""
+    if signals > 0:
+        return "actionable_signal"
+    if eligible > 0:
+        return "predicate_no_actionable_signal"
+    if any(reasons.get(key, 0) for key in _PREFIX_DATA_INELIGIBLE_REASONS):
+        return "data_ineligible"
+    if any(reasons.get(key, 0) for key in _PREFIX_DATA_INCOMPLETE_REASONS):
+        return "data_incomplete"
+    return "data_incomplete"
+
+
+def _prefix_provenance(
+        *, cell_records: Mapping[str, Mapping[str, Any]],
+        total_prefixes: int, eligible_prefixes: int,
+        signal_prefixes: int, prefix_status: Mapping[str, int],
+        ) -> dict[str, Any]:
+    """Create bounded prefix eligibility provenance for downstream screens."""
+    classifications = Counter(
+        str(item.get("classification") or "data_incomplete")
+        for item in cell_records.values())
+    reason_counts: Counter[str] = Counter()
+    for item in cell_records.values():
+        raw = item.get("reason_counts", {})
+        if isinstance(raw, Mapping):
+            for reason, count in raw.items():
+                try:
+                    normalized = int(count)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if normalized > 0:
+                    reason_counts[str(reason)] += normalized
+    if classifications.get("data_ineligible") and classifications.get("data_incomplete"):
+        status = "mixed_data_incomplete"
+    elif classifications.get("data_ineligible"):
+        status = "data_ineligible"
+    elif classifications.get("data_incomplete"):
+        status = "data_incomplete"
+    elif classifications.get("actionable_signal"):
+        status = "actionable_signal"
+    elif classifications.get("predicate_no_actionable_signal"):
+        status = "predicate_no_actionable_signal"
+    else:
+        status = "data_incomplete"
+    # ``by_cell`` is an internal hand-off and remains bounded even when a fit
+    # partition contains thousands of symbol/session cells.  Aggregate counts
+    # retain the complete evidence needed for screen fail-open behavior.
+    bounded_cells = {
+        str(key): {
+            "classification": str(value.get("classification") or
+                                  "data_incomplete"),
+            "reason": str(value.get("reason") or "data_incomplete"),
+            "eligible_prefixes": int(value.get("eligible_prefixes", 0)),
+            "signal_prefixes": int(value.get("signal_prefixes", 0)),
+        }
+        for key, value in sorted(cell_records.items())[:512]
+    }
+    truncated = len(cell_records) > len(bounded_cells)
+    if truncated:
+        reason_counts["provenance_cells_truncated"] += (
+            len(cell_records) - len(bounded_cells))
+    return {
+        "schema": SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
+        "scope": "fit_only",
+        "authorizing": False,
+        "diagnostic_only": True,
+        "status": status,
+        "classification": status,
+        "total_cells": len(cell_records),
+        "total_prefixes": int(total_prefixes),
+        "eligible_cells": sum(
+            item.get("eligible_prefixes", 0) > 0
+            for item in cell_records.values()),
+        "eligible_prefixes": int(eligible_prefixes),
+        "signal_cells": sum(
+            item.get("signal_prefixes", 0) > 0
+            for item in cell_records.values()),
+        "signal_prefixes": int(signal_prefixes),
+        "data_ineligible_cells": int(classifications.get("data_ineligible", 0)),
+        "data_incomplete_cells": int(classifications.get("data_incomplete", 0)),
+        "predicate_no_actionable_cells": int(
+            classifications.get("predicate_no_actionable_signal", 0)),
+        "reason_counts": dict(sorted(reason_counts.items())[:64]),
+        "prefix_counts": dict(sorted((str(key), int(value))
+                                      for key, value in prefix_status.items())),
+        "truncated": truncated,
+        "by_cell": bounded_cells,
+    }
+
+
 def _immutable_market_context(
         bars: Sequence[Any],
         bars_by_symbol: Mapping[str, Sequence[Any]] | None,
@@ -610,10 +712,23 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
     terminal_stages: Counter[str] = Counter()
     terminal_reasons: Counter[str] = Counter()
     signal_prefixes = 0
+    cell_records: dict[str, dict[str, Any]] = {}
     for (day, symbol), rows in sorted(grouped.items()):
+        cell = f"{symbol}|{day}"
+        cell_status: Counter[str] = Counter()
+        cell_eligible = 0
+        cell_signals = 0
         if not _session_bars_valid(rows) or not _session_metadata_valid(rows):
             total_prefixes += max(0, len(rows) - 2)
             prefix_status["invalid_session"] += max(0, len(rows) - 2)
+            cell_status["invalid_session"] += max(0, len(rows) - 2)
+            cell_records[cell] = {
+                "classification": "data_incomplete",
+                "reason": "invalid_session",
+                "reason_counts": dict(cell_status),
+                "eligible_prefixes": 0,
+                "signal_prefixes": 0,
+            }
             continue
         rows = sorted(rows, key=lambda item: _timestamp(item) or datetime.min.replace(tzinfo=timezone.utc))
         first = None
@@ -625,32 +740,45 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             total_prefixes += 1
             if index + 1 < int(needed):
                 prefix_status["insufficient_history"] += 1
+                cell_status["insufficient_history"] += 1
                 continue
             signal_end = _bar_end(rows[index])
             if signal_end is None:
                 prefix_status["signal_end_unavailable"] += 1
+                cell_status["signal_end_unavailable"] += 1
                 continue
             feature_start = (0 if feature_window is None else
                              max(0, index + 1 - int(feature_window)))
             feature_rows = rows[feature_start:index + 1]
+            if (not allow_backfill and any(
+                    historical_backfill_record(item)
+                    for item in feature_rows)):
+                prefix_status["historical_backfill_excluded"] += 1
+                cell_status["historical_backfill_excluded"] += 1
+                continue
             available = [replay_available_at(
                             item,
                             allow_historical_backfill_diagnostics=allow_backfill)
-                         for item in feature_rows
-                         if replay_available_at(
-                             item,
-                             allow_historical_backfill_diagnostics=allow_backfill)
-                         is not None]
-            if len(available) != len(feature_rows):
-                prefix_status["feature_unavailable"] += 1
+                         for item in feature_rows]
+            if any(item is None for item in available):
+                reason = (
+                    "historical_backfill_excluded"
+                    if (not allow_backfill and any(
+                        historical_backfill_record(item)
+                        for item in feature_rows)) else
+                    "feature_unavailable")
+                prefix_status[reason] += 1
+                cell_status[reason] += 1
                 continue
             decision_timestamp = max([signal_end, *available])
             if not _contiguous(rows, feature_start, index + 1):
                 prefix_status["feature_gap"] += 1
+                cell_status["feature_gap"] += 1
                 continue
             entry = rows[index + 1]
             if _timestamp(entry) != signal_end and decision_timestamp <= signal_end:
                 prefix_status["entry_not_adjacent"] += 1
+                cell_status["entry_not_adjacent"] += 1
                 continue
             entry_at = signal_end if decision_timestamp <= signal_end else decision_timestamp
             entry_index = next((probe for probe in range(index + 1, len(rows))
@@ -658,9 +786,11 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                                     _timestamp(rows[probe]) >= entry_at)), None)
             if entry_index is None:
                 prefix_status["entry_bar_unavailable"] += 1
+                cell_status["entry_bar_unavailable"] += 1
                 continue
             entry = rows[entry_index]
             eligible_prefixes += 1
+            cell_eligible += 1
             prefix_status["eligible"] += 1
             session_had_eligible_prefix = True
             if spec["family"] == "cross_sectional_residual":
@@ -681,6 +811,7 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 terminal_reasons[str(terminal.get("reason") or "unknown")] += 1
             if trace.get("signal") is not None:
                 signal_prefixes += 1
+                cell_signals += 1
             if trace.get("signal") is not None and first is None:
                 metadata = (evaluate_rule_signal_metadata(
                     rows[:index + 1], spec, bars_by_symbol=market_context,
@@ -716,6 +847,23 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             first_signals.append(first)
         if session_had_eligible_prefix:
             eligible_sessions += 1
+        cell_records[cell] = {
+            "classification": _prefix_cell_classification(
+                eligible=cell_eligible, signals=cell_signals,
+                reasons=cell_status),
+            "reason": ("actionable_signal" if cell_signals else
+                       "no_actionable_signal" if cell_eligible else
+                       next((reason for reason in (
+                           "historical_backfill_excluded", "feature_unavailable",
+                           "entry_bar_unavailable", "entry_not_adjacent",
+                           "feature_gap", "invalid_session",
+                           "signal_end_unavailable", "insufficient_history")
+                            if cell_status.get(reason)),
+                            "data_incomplete")),
+            "reason_counts": dict(cell_status),
+            "eligible_prefixes": cell_eligible,
+            "signal_prefixes": cell_signals,
+        }
     eligibility_by_symbol: dict[str, dict[str, Any]] = {}
     if spec["family"] == "cross_sectional_residual":
         symbol_rows: dict[str, list[Any]] = {}
@@ -739,6 +887,12 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                              if counts["tested"] else None)}
         for name, counts in stage_counts.items()
     }
+    eligibility_provenance = _prefix_provenance(
+        cell_records=cell_records,
+        total_prefixes=total_prefixes,
+        eligible_prefixes=eligible_prefixes,
+        signal_prefixes=signal_prefixes,
+        prefix_status=prefix_status)
     return {"total_prefixes": total_prefixes,
             "eligible_prefixes": eligible_prefixes,
             "eligible_sessions": eligible_sessions,
@@ -749,7 +903,8 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             "predicate_funnel": funnel,
             "terminal_stage_counts": dict(sorted(terminal_stages.items())),
             "terminal_reason_counts": dict(sorted(terminal_reasons.items())),
-            "eligibility_by_symbol": eligibility_by_symbol}
+            "eligibility_by_symbol": eligibility_by_symbol,
+            "eligibility_provenance": eligibility_provenance}
 
 
 def _risk_value(row: Mapping[str, Any]) -> float | None:
@@ -1286,6 +1441,9 @@ def measure_fit_diagnostics(
         precomputed_first_signals=(
             None if normalized["family"] == "cross_sectional_residual" else
             signals),
+        eligibility_provenance=(
+            None if normalized["family"] == "cross_sectional_residual" else
+            prefix.get("eligibility_provenance")),
         bars_by_symbol=market_context)
     expected_cost = {
         "bar_reference_round_trip_bps": _expected_cost_hurdle_bps(
@@ -1316,7 +1474,11 @@ def measure_fit_diagnostics(
             "rate": eligible / total if total else 0.0,
             "needed_prefix_bars": prefix["needed_prefix_bars"],
             "status_counts": prefix["prefix_status_counts"],
+            "eligibility_provenance": dict(
+                prefix.get("eligibility_provenance") or {}),
         },
+        "eligibility_provenance": dict(
+            prefix.get("eligibility_provenance") or {}),
         "first_signal": {
             "signals": len(signals),
             "eligible_sessions": int(prefix["eligible_sessions"]),

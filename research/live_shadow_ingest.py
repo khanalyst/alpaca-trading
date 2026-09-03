@@ -5,7 +5,7 @@ module is the research-side write boundary: it opens the shadow WAL read-only,
 requires a complete replay tail (including the paired control and null
 sources), splits it into disjoint chronological selection and confirmatory
 windows, rebuilds the existing verified-gate envelope, and only then appends
-an immutable ``lane='shadow'`` run to EdgeLedger. Batch family/global BH
+an immutable ``lane='shadow'`` run to EdgeLedger. Batch family/global BY
 q-values select the candidate; the active v6 LORD++ scope receives only the newer
 confirmatory gate's raw p-value. A missing, mismatched,
 or already-consumed session is a no-op.
@@ -26,14 +26,15 @@ from .edge_lab import _strengthen_gate
 from .edge_ledger import EdgeLedger, VEHICLES, provenance_hash
 from .edge_ledger_store import REPLAY_ENGINE_EPOCH, content_hash
 from .costs import ReplayPolicy
-from .gates import sample_counts, verify_gate_envelope, validate_protocol_floor
+from .gates import (fdr_batch_evidence, sample_counts, verify_gate_envelope,
+                    validate_protocol_floor)
 from .live_shadow import (
     REPLAY_QUARANTINE_OVERFLOW_KEY, ShadowError, ShadowStore,
     _opportunity_capacity,
 )
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from .factory_ledger import CONFIRMATORY_SCOPE_VERSION, FactoryLedger
-from .stats import benjamini_hochberg
+from .stats import benjamini_yekutieli
 
 
 INGEST_SCHEMA = "shadow-ingest.v1"
@@ -42,7 +43,7 @@ DEFAULT_MIN_SESSIONS = 30
 DEFAULT_ALPHA = 0.05
 DEFAULT_CONFIRMATORY_ITERATIONS = 20_000
 MAX_CONFIRMATORY_ITERATIONS = 2_000_000
-# Selection rows are retained so the adaptive p and BH inputs can be
+# Selection rows are retained so the adaptive p and BY inputs can be
 # re-verified from durable evidence. Keep this audit payload bounded; a larger
 # tail is a diagnostic/no-op and must be replayed in smaller chronological
 # cycles rather than silently truncating the selection source.
@@ -58,7 +59,7 @@ def _confirmatory_scope(vehicle: str) -> str:
 
 
 def _confirmatory_iterations(allocated_alpha: float, batch_size: int) -> int:
-    """Resolve a BH-adjusted p-value below the next online allocation."""
+    """Resolve a raw confirmatory p-value below the next online allocation."""
     allocated = float(allocated_alpha)
     if not math.isfinite(allocated) or allocated <= 0:
         raise ValueError("confirmatory allocation must be positive and finite")
@@ -78,7 +79,7 @@ def _digest(value: Any) -> str:
 def _confirmatory_test_id(candidate_id: str, source: Mapping[str, Any]) -> str:
     """Build the crash-safe active-FDR idempotency key.
 
-    Resolution, alpha, p-values, and BH metadata may legitimately differ when
+    Resolution, alpha, p-values, and batch-correction metadata may legitimately differ when
     a process retries the same uncommitted tail.  Only the candidate lineage
     and the immutable chronological/session evidence identify the hypothesis
     being spent, so keep those fields explicit and exclude all computation
@@ -316,10 +317,10 @@ def _session_continuity(store: ShadowStore, boundary: str,
 def _preflight_ready(gate: Mapping[str, Any]) -> tuple[bool, dict[str, bool]]:
     """Report non-multiplicity requirements before selecting an online test.
 
-    A raw p-value is still useful for the batch BH correction when a candidate
+    A raw p-value is still useful for the batch BY correction when a candidate
     is underpowered or fails a control check, but such a candidate must not
     consume the single online allocation.  The candidate-level p-significance
-    check is intentionally excluded here; BH supplies that multiplicity gate
+    check is intentionally excluded here; BY supplies that multiplicity gate
     across the complete tested family.
     """
     checks = gate.get("checks_without_family")
@@ -946,7 +947,7 @@ class ShadowIngestor:
                     "ingested": False, "boundary": boundary}
         try:
             # Selection is computed only on the older half.  Its raw p-value
-            # is the sole input to family/global BH; no confirmatory statistic
+            # is the sole input to family/global BY; no confirmatory statistic
             # is available at this stage.
             selection_gate = _discover_gate(
                 selection_rows, selection_baseline_rows, vehicle=vehicle,
@@ -1014,7 +1015,7 @@ class ShadowIngestor:
 
             # The selected candidate gets one and only one new gate on the
             # disjoint newer half.  LORD receives this confirmatory raw p;
-            # selection p and BH q-values never enter the online ledger.
+            # selection p and BY q-values never enter the online ledger.
             gate = _discover_gate(
                 confirmatory_rows, confirmatory_baseline_rows, vehicle=vehicle,
                 min_trades=self.config.min_trades,
@@ -1119,9 +1120,20 @@ class ShadowIngestor:
                 "selection_raw_p_value": selection_p_value,
                 "confirmatory_raw_p_value": p_value,
             })
+            fdr_batch = (fdr_batch_evidence(
+                candidate_id=candidate_id,
+                family_name=self._family(candidate),
+                family_candidate_key=candidate_id,
+                global_candidate_key=candidate_id,
+                family_values=batch_bh.get("family_values") or {},
+                global_values=batch_bh.get("global_values") or {},
+                alpha=float(self.config.alpha),
+                p_value_source="selection_window_gate")
+                if isinstance(batch_bh, Mapping) else {})
             _finalize_gate(
                 gate, lane="shadow", family=family, global_fdr=global_data,
                 online_fdr=online,
+                fdr_batch=fdr_batch,
                 provenance=hashes, candidate_id=candidate_id,
                 equity_feed=equity_feed)
             envelope = gate.get("verified_gate")
@@ -1321,11 +1333,13 @@ class ShadowIngestor:
             by_family.setdefault(str(row["family"]), {})[str(row["candidate_id"])] = float(row["raw_p"])
         family_results: dict[str, dict] = {}
         for family, values in by_family.items():
-            corrected = benjamini_hochberg(values, alpha=float(self.config.alpha))
+            corrected = benjamini_yekutieli(
+                values, alpha=float(self.config.alpha))
             family_results.update({cid: {**item, "family_size": len(values)}
                                    for cid, item in corrected.items()})
         global_values = {str(row["candidate_id"]): float(row["raw_p"]) for row in eligible}
-        global_results = benjamini_hochberg(global_values, alpha=float(self.config.alpha))
+        global_results = benjamini_yekutieli(
+            global_values, alpha=float(self.config.alpha))
         preflight_by_id = {
             str(item.get("candidate_id")): bool(item.get("preflight_ready"))
             for item in prepared
@@ -1350,6 +1364,7 @@ class ShadowIngestor:
                 "global": global_results.get(cid, {}),
                 "selected": cid == selected_id,
                 "bh": {
+                    "method": "benjamini_yekutieli",
                     "family_values": by_family,
                     "family_results": family_results,
                     "global_values": global_values,

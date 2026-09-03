@@ -39,6 +39,10 @@ from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           replay_open_is_available,
                           replay_record_is_available)
 from .stats import stable_seed
+from .gates import (
+    ACTUAL_CONTROL_MIN_COVERAGE, ACTUAL_CONTROL_MIN_MATCHED,
+    FALSIFICATION_INDEPENDENT_METHOD,
+)
 
 MIN_PROMOTION_CLUSTERS = 30
 # A randomized-entry null is only useful when it covers nearly all of the
@@ -1500,22 +1504,69 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     delta_all = paired_delta(
         ordered, baseline, vehicle=vehicle, equity_feed=equity_feed)
     delta_fit = (matched_cluster_test(
-        fit, base_fit, vehicle=vehicle, equity_feed=equity_feed) if not shadow else
+        fit, base_fit, vehicle=vehicle,
+        min_matched=ACTUAL_CONTROL_MIN_MATCHED,
+        min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
+        equity_feed=equity_feed) if not shadow else
                  {"available": True, "actual_control": True, "matched": 0,
                   "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest"})
     delta_held = matched_cluster_test(
         heldout, base_heldout, vehicle=vehicle, iterations=test_iterations,
+        min_matched=ACTUAL_CONTROL_MIN_MATCHED,
+        min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
         equity_feed=equity_feed)
     delta_fit["actual_control"] = bool(actual_control)
     delta_held["actual_control"] = bool(actual_control)
+    fit_adequacy = paired_control_adequacy(
+        fit, base_fit, vehicle=vehicle,
+        min_matched=ACTUAL_CONTROL_MIN_MATCHED,
+        min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
+        equity_feed=equity_feed) if not shadow else {
+            "matched": 0, "candidate_count": 0, "control_count": 0,
+            "coverage": 0.0, "minimum_matched": ACTUAL_CONTROL_MIN_MATCHED,
+            "minimum_coverage": ACTUAL_CONTROL_MIN_COVERAGE,
+            "count_adequate": False, "coverage_adequate": False,
+            "adequate": False,
+        }
+    held_adequacy = paired_control_adequacy(
+        heldout, base_heldout, vehicle=vehicle,
+        min_matched=ACTUAL_CONTROL_MIN_MATCHED,
+        min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
+        equity_feed=equity_feed)
+    delta_fit["paired_adequacy"] = fit_adequacy
+    delta_fit["adequate"] = bool(fit_adequacy["adequate"])
+    delta_held["paired_adequacy"] = held_adequacy
+    delta_held["adequate"] = bool(held_adequacy["adequate"])
     placebo = deterministic_placebo_deltas(
         heldout, base_heldout, vehicle=vehicle,
         equity_feed=equity_feed)
     candidate_p = float(delta_held.get("p_value", 1.0))
+    independent_seed = stable_seed({
+        "purpose": "independent_placebo_null_tail.v1",
+        "primary_assignments_hash": placebo["assignments_hash"],
+        "draws": int(placebo["draws"]),
+    })
+    if independent_seed == int(placebo["seed"]):
+        independent_seed = stable_seed({
+            "purpose": "independent_placebo_null_tail.v1.retry",
+            "primary_assignments_hash": placebo["assignments_hash"],
+            "draws": int(placebo["draws"]),
+        })
+    independent_placebo = deterministic_placebo_deltas(
+        heldout, base_heldout, vehicle=vehicle,
+        draws=int(placebo["draws"]), seed=independent_seed,
+        equity_feed=equity_feed)
+    independent_falsification = falsification_gate(
+        independent_placebo["observed"], independent_placebo["placebo"],
+        alpha=alpha)
     falsification = {
         **falsification_gate(
             placebo["observed"], placebo["placebo"], alpha=alpha,
-            preregistered_p_value=candidate_p),
+            preregistered_p_value=candidate_p,
+            independent_p_value=independent_falsification["p_value"],
+            independent_method=FALSIFICATION_INDEPENDENT_METHOD,
+            independent_result_hash=independent_placebo["assignments_hash"],
+            require_independent=True),
         "method": placebo["method"],
         "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),
@@ -1524,6 +1575,12 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
         # always persisted them and re-verification reads them.
         "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
         "clusters": int(placebo["cluster_count"]),
+        "primary_p_value": candidate_p,
+        "independent_method": FALSIFICATION_INDEPENDENT_METHOD,
+        "independent_result_hash": independent_placebo["assignments_hash"],
+        "independent_assignments_hash": independent_placebo["assignments_hash"],
+        "independent_draws": int(independent_placebo["draws"]),
+        "independent_seed": int(independent_placebo["seed"]),
     }
     # A randomized-entry null asks "did this beat chance", which the matched
     # baseline above cannot: the baseline only asks "did this beat the config
@@ -1537,7 +1594,10 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
         equity_feed=equity_feed)
     null_adequacy = paired_control_adequacy(
         heldout, null_heldout, vehicle=vehicle,
-        min_matched=max(1, int(min_trades)),
+        # A caller may ask for a stricter local trade floor, but cannot reduce
+        # the protocol's absolute randomized-null evidence requirement.
+        min_matched=max(MIN_NULL_CONTROL_MATCHED, int(min_trades)),
+        min_coverage=MIN_NULL_CONTROL_COVERAGE,
         equity_feed=equity_feed)
     null_control = {**null_test, "kind": "randomized_entry_null",
                     "available": bool(null_test["available"] and
@@ -1558,10 +1618,15 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "heldout_structurally_adequate": bool(held_floor["adequate"]),
         "separated": bool(separation["passes"]),
         "actual_control_available": bool(delta_held.get("available") and
-                                         delta_held.get("actual_control")),
+                                         delta_held.get("actual_control") and
+                                         held_adequacy["adequate"]),
+        "actual_control_adequate": bool(held_adequacy["adequate"]),
         "fit_delta_positive": bool(shadow or (
-            delta_fit.get("mean_delta") is not None and float(delta_fit["mean_delta"]) > 0)),
+            fit_adequacy["adequate"] and
+            delta_fit.get("mean_delta") is not None and
+            float(delta_fit["mean_delta"]) > 0)),
         "heldout_delta_positive": bool(delta_held.get("mean_delta") is not None and
+                                        held_adequacy["adequate"] and
                                         float(delta_held["mean_delta"]) > 0),
         "heldout_p_significant": candidate_p <= float(alpha),
         "falsification": bool(falsification["passes"]),
@@ -1674,6 +1739,7 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
 def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
                    online_fdr: Mapping | None = None,
                    global_fdr: Mapping | None = None,
+                   fdr_batch: Mapping | None = None,
                    provenance: Mapping | None = None,
                    candidate_id: str | None = None,
                    costs: CostModel | None = None,
@@ -1692,7 +1758,7 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
     passes = bool(gate["passes_without_family"] and all(checks.values()))
     gate["multiple_tests"] = {"candidate": dict(family),
                               "global": dict(global_data),
-                              "method": "benjamini_hochberg"}
+                              "method": "benjamini_yekutieli"}
     gate["passes"] = passes
     gate["cumulative_multiple_tests"] = online
     fit = gate.pop("_fit_rows")
@@ -1711,6 +1777,9 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
     absolute = gate.get("heldout_performance") or {}
     performance = {"heldout_delta": gate["heldout_paired_baseline"].get("mean_delta"),
                    "max_drawdown": gate["max_drawdown"]}
+    if gate["heldout_paired_baseline"].get("mean_r_delta") is not None:
+        performance["heldout_r_delta"] = gate["heldout_paired_baseline"].get(
+            "mean_r_delta")
     if gate.get("heldout_delta_lcb") is not None:
         performance["heldout_delta_lcb"] = gate["heldout_delta_lcb"]
     for key in ("net_pnl", "expectancy"):
@@ -1730,6 +1799,7 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
         q_value=float(global_data.get("p_adjusted",
                                      family.get("p_adjusted", 1.0))),
         family_q_value=float(family.get("p_adjusted", 1.0)),
+        fdr_batch=fdr_batch,
         alpha=gate.get("alpha", 0.05),
         falsification=gate["falsification"], separation=gate["heldout_separation"],
         checks=checks, passes=passes,

@@ -27,7 +27,7 @@ from research.factory_core import (
 from research.factory_ledger import FactoryError, FactoryLedger
 from research.llm_strategy import (
     MAX_REASON_CHARS, MAX_TUNED_VARIANTS, PROPOSAL_SCHEMA, TUNING_SCHEMA,
-    ProposalResult,
+    DIAGNOSIS_MAX_BYTES, ProposalResult, _safe_diagnosis,
     RuleProposalAdapter,
 )
 import research.gates as gates
@@ -143,6 +143,66 @@ class TuningContractTests(unittest.TestCase):
         refused = adapter.tune("equity", 0, ROOT, unsafe, count=1)
         self.assertFalse(refused.success)
         self.assertIn("non-negative integer count", refused.error or "")
+
+    def test_production_sized_diagnosis_is_compacted_deterministically(self):
+        seen = []
+
+        def caller(*, system_prompt, request, timeout):
+            seen.append(request)
+            return _reply(_tuned({"threshold_bps": 6.0}))
+
+        diagnosis = {
+            **DIAGNOSIS,
+            "provenance_hash": "a" * 64,
+            "fit_diagnostics": {
+                "execution_rejections": {
+                    "execution_blocked": True,
+                    "rows": 126,
+                    "executed_rows": 0,
+                },
+                "target_hold_reachability": {
+                    "recommendation": "inspect the long-horizon decay",
+                    "matrix": [{"horizon": index, "rate": .25}
+                               for index in range(200)],
+                },
+            },
+            # Representative telemetry from a production replay: finite and
+            # aggregate, but far larger than one provider prompt allowance.
+            "telemetry": ["aggregate-%04d-%s" % (index, "x" * 240)
+                          for index in range(120)],
+        }
+        adapter = RuleProposalAdapter(model="test", caller=caller,
+                                      max_attempts=1)
+        first = adapter.tune("equity", 0, ROOT, diagnosis, count=1)
+        second = adapter.tune("equity", 0, ROOT, diagnosis, count=1)
+        self.assertTrue(first.success, first.error)
+        self.assertTrue(second.success, second.error)
+        self.assertEqual(seen[0]["diagnosis"], seen[1]["diagnosis"])
+        compact = seen[0]["diagnosis"]
+        self.assertLessEqual(len(json.dumps(compact, sort_keys=True).encode("utf-8")),
+                             8192)
+        self.assertEqual(compact["primary_failure"], "negative_expectancy")
+        self.assertIn("fit_diagnostics", compact)
+        self.assertEqual(compact["provenance_hash"], "a" * 64)
+        metadata = compact["_compaction"]
+        self.assertEqual(metadata["schema"], "llm-diagnosis-compaction.v1")
+        self.assertGreater(metadata["original_bytes"], 30_000)
+        self.assertRegex(metadata["original_hash"], r"^[0-9a-f]{64}$")
+        self.assertTrue(first.evidence["diagnosis_compacted"])
+        self.assertEqual(first.evidence["diagnosis_original_hash"],
+                         metadata["original_hash"])
+
+    def test_compaction_bounds_pathological_metadata_labels(self):
+        compact = _safe_diagnosis(
+            {"telemetry": ["x" * 512 for _ in range(40)]},
+            label="label-" * 2_000, compact=True)
+        self.assertLessEqual(
+            len(json.dumps(compact, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8")),
+            DIAGNOSIS_MAX_BYTES)
+        metadata = compact["_compaction"]
+        self.assertLessEqual(len(metadata["label"].encode("utf-8")), 128)
+        self.assertRegex(metadata["label_hash"], r"^[0-9a-f]{64}$")
 
     def test_tuning_may_not_change_the_family(self):
         """Changing the idea is discovery's job; tuning changes its numbers."""
@@ -387,7 +447,7 @@ class TuningContractTests(unittest.TestCase):
         self.assertFalse(result.evidence["response_parsed"])
         self.assertEqual(result.evidence["attempts"], 1)
 
-    def test_preflight_uses_a_tiny_dedicated_provider_schema(self):
+    def test_preflight_uses_the_production_proposal_provider_schema(self):
         calls = []
 
         class Responses:
@@ -401,11 +461,12 @@ class TuningContractTests(unittest.TestCase):
             provider="openai", model="gpt-test", client=client).preflight()
         self.assertEqual(result.status, "ready")
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["max_output_tokens"], 32)
+        self.assertEqual(calls[0]["max_output_tokens"], 1200)
         output_format = calls[0]["text"]["format"]
-        self.assertEqual(output_format["name"], "llm_provider_preflight")
-        self.assertEqual(output_format["schema"]["required"], ["status"])
-        self.assertNotIn("rule_spec", json.dumps(output_format["schema"]))
+        self.assertEqual(output_format["name"], "llm_rule_proposal")
+        self.assertIn("rule_spec", json.dumps(output_format["schema"]))
+        self.assertEqual(set(output_format["schema"]["required"]),
+                         {"schema", "rule_spec"})
 
     def test_preflight_fatal_deployment_is_one_call_and_safe(self):
         class DeploymentMissing(RuntimeError):
@@ -1204,7 +1265,19 @@ class FitSelectionSanitizerTests(unittest.TestCase):
             "heldout": [{"net_pnl": 9999}],
             "fit_diagnostics": {
                 "scope": "fit_only",
-                "eligible_prefix": {"eligible": 4, "heldout": 99},
+                "eligible_prefix": {
+                    "eligible": 4, "heldout": 99,
+                    "eligibility_provenance": {
+                        "schema": "signal-quality-eligibility.v1",
+                        "scope": "fit_only",
+                        "status": "data_ineligible",
+                        "classification": "data_ineligible",
+                        "total_cells": 5,
+                        "data_ineligible_cells": 5,
+                        "reason_counts": {"historical_backfill_excluded": 5},
+                        "by_cell": {"SPY|2026-08-01": {"close": 999}},
+                    },
+                },
                 "risk": {
                     "configured": {"median": 500.0},
                     "planned": {"median": 117.5},
@@ -1223,6 +1296,11 @@ class FitSelectionSanitizerTests(unittest.TestCase):
                       "raw_rows", "close"):
             self.assertNotIn(token, encoded)
         self.assertEqual(projected["fit_diagnostics"]["eligible_prefix"]["eligible"], 4)
+        provenance = projected["fit_diagnostics"]["eligible_prefix"][
+            "eligibility_provenance"]
+        self.assertEqual(provenance["status"], "data_ineligible")
+        self.assertEqual(provenance["data_ineligible_cells"], 5)
+        self.assertNotIn("by_cell", provenance)
         risk = projected["fit_diagnostics"]["risk"]
         self.assertEqual(risk["configured"]["median"], 500.0)
         self.assertEqual(risk["planned"]["median"], 117.5)
@@ -1287,7 +1365,7 @@ class SharedLearningTests(unittest.TestCase):
 
     A per-family brief can only say what happened to one idea. Some of what
     research learns is not about one idea at all, and sharing that is what
-    stops eleven slots rediscovering the same thing eleven times.
+    stops twelve slots rediscovering the same thing twelve times.
     """
 
     def _graded(self, factory, hypothesis, *, family, changes, passed,

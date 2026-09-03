@@ -134,6 +134,8 @@ class LiveShadowRepairTests(unittest.TestCase):
             compose)
         self.assertIn("ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1", env)
         self.assertIn("Set to 0", env)
+        script = Path("deploy/research-cycle.sh").read_text(encoding="utf-8")
+        self.assertIn('calibration_reason="calibration_disabled"', script)
 
     def test_baseline_quarantine_blocks_tail_before_fdr_or_boundary_advance(self):
         with tempfile.TemporaryDirectory() as directory:

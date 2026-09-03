@@ -385,9 +385,17 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             required += list(V3_DEFAULT_EXTENSIONS)
         if name == RULE_SCHEMA_V4:
             common_properties.update({
-                "target_mode": {"type": "string", "enum": list(_V4_TARGET_MODES)},
-                "target_lookback": {"type": "integer", "minimum": 2,
-                                    "maximum": 120},
+                # Strict structured-output providers require every property
+                # to be listed in ``required``.  These v4 fields remain
+                # optional to callers through nullable provider values; the
+                # validator fills the documented defaults when a provider
+                # returns null (see ``validate_rule_spec`` below).
+                "target_mode": {"anyOf": [
+                    {"type": "string", "enum": list(_V4_TARGET_MODES)},
+                    {"type": "null"},
+                ]},
+                "target_lookback": {"type": ["integer", "null"],
+                                    "minimum": 2, "maximum": 120},
                 "trailing_stop_r": {"type": ["number", "null"],
                                      "exclusiveMinimum": 0.0,
                                      "maximum": 10.0},
@@ -397,24 +405,30 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             })
             # v4 exit policy is backward-compatible when omitted: fixed-R,
             # the bounded default lookback, no trailing ratchet, and no thesis
-            # deadline are the neutral defaults. Keep all policy extensions optional in the
-            # provider schema (validation fills the same defaults).
+            # deadline are the neutral defaults.  The provider-facing schema
+            # represents omission as null because strict providers do not
+            # permit an optional property; validation fills these defaults.
         def branch(family: dict[str, Any], *, eligible: bool) -> dict[str, Any]:
             properties = {**common_properties, "family": family}
             if eligible:
-                # Optional and deliberately not required: omitting this field
-                # is the legacy cross-sectional identity.  The property lives
+                # Optional to normal callers, but represented as required and
+                # nullable for strict provider schemas.  The property lives
                 # only on this branch so non-cross-sectional providers cannot
                 # emit a field runtime rejects.
                 properties["eligible_symbols"] = {
-                    "type": "array",
+                    "type": ["array", "null"],
                     "maxItems": CROSS_SECTIONAL_MAX_ELIGIBLE_SYMBOLS,
                     "uniqueItems": True,
                     "items": {"type": "string",
                               "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,14}$"},
                 }
+            branch_required = list(required)
+            if eligible:
+                branch_required.append("eligible_symbols")
+            if name == RULE_SCHEMA_V4:
+                branch_required.extend(V4_DEFAULT_EXTENSIONS)
             return {"type": "object", "additionalProperties": False,
-                    "required": required, "properties": properties}
+                    "required": branch_required, "properties": properties}
 
         non_cross = [family for family in RULE_FAMILIES
                      if family != "cross_sectional_residual"]
@@ -520,7 +534,15 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         spec.update(V3_DEFAULT_EXTENSIONS)
     if schema == RULE_SCHEMA_V4:
         spec.update(V4_DEFAULT_EXTENSIONS)
-    spec.update(value)
+    # Strict provider schemas encode legacy-optional properties as required
+    # nullable values.  Treat null as omission for fields whose documented
+    # defaults preserve the old caller contract.  ``breakeven_r`` and the two
+    # genuinely nullable exit controls intentionally remain present as null.
+    provided = dict(value)
+    for optional_name in ("eligible_symbols", "target_mode", "target_lookback"):
+        if provided.get(optional_name, object()) is None:
+            provided.pop(optional_name, None)
+    spec.update(provided)
     spec["schema"] = schema
     if spec.get("family") not in RULE_FAMILIES:
         raise RuleSpecError(f"unsupported rule family: {spec.get('family')!r}")

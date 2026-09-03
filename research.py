@@ -963,7 +963,11 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         report = calibration_report(db, CostModel.from_config(config),
                                     vehicle=getattr(args, "vehicle", None))
     print(json.dumps(report, sort_keys=True, allow_nan=False))
-    return 2 if report["verdict"] == "optimistic" else 0
+    # The calibration module owns the authorization result.  Preserve its
+    # machine-readable exit code so shell callers cannot mistake insufficient
+    # or otherwise blocked evidence for success merely because the cost model
+    # was not classified as optimistic.
+    return int(report.get("authorization_exit_code", 0) or 0)
 
 
 def cmd_factory_status(args: argparse.Namespace) -> int:
