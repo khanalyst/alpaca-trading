@@ -1378,8 +1378,22 @@ class RuleProposalAdapter:
                         continue
                     result[key] = provider_schema(item)
                 if type_values is not None:
-                    nullable = [{"type": provider_schema(item)}
-                                for item in type_values]
+                    # JSON-Schema keywords that describe a concrete type must
+                    # live inside that type's union branch.  Leaving ``items``
+                    # beside ``anyOf`` makes the array alternative incomplete
+                    # for OpenAI strict structured outputs (notably the
+                    # nullable ``eligible_symbols`` allowlist).
+                    branch_constraints = {
+                        key: item for key, item in result.items()
+                        if key != "anyOf"
+                    }
+                    nullable = []
+                    for item in type_values:
+                        normalized_type = provider_schema(item)
+                        branch = {"type": normalized_type}
+                        if normalized_type != "null":
+                            branch.update(branch_constraints)
+                        nullable.append(branch)
                     # A type-array and oneOf are not emitted by the audited
                     # grammar together.  If a future schema does combine
                     # them, retain both alternatives rather than silently
@@ -1387,7 +1401,7 @@ class RuleProposalAdapter:
                     existing = result.get("anyOf")
                     if existing is not None:
                         nullable.extend(existing)
-                    result["anyOf"] = nullable
+                    result = {"anyOf": nullable}
                 # Strict structured-output providers reject an object whose
                 # ``required`` list omits a declared property.  Preserve the
                 # authored required order, then append the optional property

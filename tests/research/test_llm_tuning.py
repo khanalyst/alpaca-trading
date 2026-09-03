@@ -501,6 +501,23 @@ class TuningContractTests(unittest.TestCase):
         self.assertEqual(set(output_format["schema"]["required"]),
                          {"schema", "rule_spec"})
 
+    def test_nullable_array_keeps_items_inside_provider_union_branch(self):
+        schema = RuleProposalAdapter._schema(vehicle="equity")
+        rule_branches = schema["properties"]["rule_spec"]["anyOf"]
+        eligible = [
+            branch["properties"]["eligible_symbols"]
+            for branch in rule_branches
+            if "eligible_symbols" in branch["properties"]
+        ]
+
+        self.assertTrue(eligible)
+        for allowlist in eligible:
+            array_branch = next(
+                branch for branch in allowlist["anyOf"]
+                if branch.get("type") == "array")
+            self.assertEqual(array_branch["items"], {"type": "string"})
+            self.assertNotIn("items", allowlist)
+
     def test_preflight_fatal_deployment_is_one_call_and_safe(self):
         class DeploymentMissing(RuntimeError):
             status_code = 404
