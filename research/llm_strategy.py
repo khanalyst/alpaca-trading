@@ -72,10 +72,10 @@ research process.  Return one JSON object and nothing else, exactly:
 {"schema":"llm-rule-proposal.v1","rule_spec":{...}}
 The rule_spec must include every required key of the explicit grammar; schema
 is never inferred. The request includes a vehicle: equity may use
-rule-strategy.v1, rule-strategy.v2, or rule-strategy.v3 (with nullable
-"breakeven_r" in v3), while options may use only executable v1/v2 and never
-"breakeven_r". The vehicle-specific provider schema and validator are
-authoritative.
+rule-strategy.v1, rule-strategy.v2, rule-strategy.v3, or rule-strategy.v4
+(with nullable equity-only exit controls such as "breakeven_r" in v3/v4),
+while options may use only executable v1/v2 and never those exit controls. The
+vehicle-specific provider schema and validator are authoritative.
 All numeric bounds and enum values are exactly those shown in the provider JSON
 schema. Never return
 markdown, Python/source code, executable instructions, credentials, market
@@ -97,8 +97,9 @@ all of which must hold), "entry_after_minutes" and "entry_before_minutes"
 "min_atr_bps"/"max_atr_bps" (the volatility regime the rule is allowed to
 trade). Use them to express a conditional edge, not just retuned numbers.
 rule-strategy.v3 extends v2 with equity-only exit control via nullable
-"breakeven_r". The request vehicle controls versions: equity may use v1/v2/v3;
-options remain on executable v1/v2 and never use "breakeven_r". The
+"breakeven_r" and rule-strategy.v4 adds the audited target/trailing/window
+controls. The request vehicle controls versions: equity may use v1-v4;
+options remain on executable v1/v2 and never use those exit controls. The
 vehicle-specific provider schema and validator are authoritative.
 Propose something structurally different from the already-tried and
 already-proved rules you are shown; a near-duplicate is rejected.  "thesis" is
@@ -129,10 +130,10 @@ how each is computed from the bars — are fixed code that you are tuning, not
 designing.  You cannot introduce a new signal, indicator or data source, and a
 reply that tries to is rejected outright.  Changing which idea is being tested
 is a different job, done elsewhere.
-For an equity root using rule-strategy.v3, the nullable numeric
-"breakeven_r" may be activated by changing null to one finite in-bounds number
-as a single coordinate change. Options remain on their executable schema and
-may never use rule-strategy.v3 or "breakeven_r".
+For an equity root using rule-strategy.v3 or rule-strategy.v4, a nullable
+numeric exit control may be activated by changing null to one finite
+in-bounds number as a single coordinate change. Options remain on their
+executable schema and may never use rule-strategy.v3/v4 or those exit controls.
 
 EXPERIMENT PHASE.  The request names a refinement_phase.  In "coordinate"
 phase every returned variant must change exactly ONE field, so its effect is
@@ -315,6 +316,7 @@ def _safe_diagnosis(value: Mapping[str, Any], *,
 
 
 _DIAGNOSIS_COMPACTION_SCHEMA = "llm-diagnosis-compaction.v1"
+_LESSONS_COMPACTION_SCHEMA = "llm-lessons-compaction.v1"
 _DIAGNOSIS_PRIORITY_KEYS = frozenset({
     # Failure and refinement controls directly determine the next bounded
     # coordinate/interaction lane.
@@ -465,8 +467,45 @@ def _compact_diagnosis(value: Mapping[str, Any], *, label: str,
     return result
 
 
-def _safe_lessons(value: Any) -> list[dict[str, Any]]:
-    """Bound the graded history a tuning request is allowed to carry.
+def _compact_lessons(value: Sequence[Mapping[str, Any]], *,
+                     original_bytes: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Compact a finite lesson brief while retaining its immutable identity.
+
+    Lesson briefs are prompt context, not ledger state.  They can grow as the
+    factory records attempts, so the adapter keeps a deterministic head/tail
+    sample and binds the omitted history by its byte count and content hash.
+    The returned value remains a plain list of mappings because that is the
+    provider request contract; provenance travels beside it in the request
+    and result evidence.
+    """
+
+    original_hash = content_hash(value)
+    metadata: dict[str, Any] = {
+        "schema": _LESSONS_COMPACTION_SCHEMA,
+        "original_bytes": int(original_bytes),
+        "original_hash": original_hash,
+    }
+    metadata_bytes = len(canonical_json({"lessons_compaction": metadata})
+                        .encode("utf-8"))
+    budget = max(256, DIAGNOSIS_MAX_BYTES - metadata_bytes - 1)
+    compacted = _compact_value(value, budget)
+    if not isinstance(compacted, list):
+        compacted = []
+    # ``_compact_value`` only receives finite mappings, but assert the shape
+    # here so no future compactor change can widen the lesson contract.
+    compacted = [dict(item) for item in compacted if isinstance(item, Mapping)]
+    while (len(canonical_json(compacted).encode("utf-8")) >
+           DIAGNOSIS_MAX_BYTES):
+        if len(compacted) <= 1:
+            compacted = []
+            break
+        compacted = compacted[:max(1, len(compacted) // 2)]
+    return compacted, metadata
+
+
+def _safe_lessons_payload(value: Any, *, compact: bool = False
+                          ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Validate and optionally compact a lesson list for a provider request.
 
     Lessons are the feedback half of the loop, so they grow with every cycle.
     The same aggregate bound the diagnosis obeys applies here: a prompt that
@@ -474,14 +513,39 @@ def _safe_lessons(value: Any) -> list[dict[str, Any]]:
     """
 
     if value is None:
-        return []
+        return [], None
     if not isinstance(value, (list, tuple)):
         raise TypeError("lessons must be a sequence of aggregate mappings")
     result = [_finite(dict(item), path=f"lessons[{index}]")
               for index, item in enumerate(value)]
-    if len(canonical_json(result).encode("utf-8")) > 8_192:
-        raise ValueError("lessons exceed the 8192-byte aggregate bound")
+    encoded_bytes = len(canonical_json(result).encode("utf-8"))
+    if encoded_bytes <= DIAGNOSIS_MAX_BYTES:
+        return result, None
+    if not compact:
+        raise ValueError(
+            f"lessons exceed the {DIAGNOSIS_MAX_BYTES}-byte aggregate bound")
+    return _compact_lessons(result, original_bytes=encoded_bytes)
+
+
+def _safe_lessons(value: Any, *, compact: bool = False) -> list[dict[str, Any]]:
+    """Validate a bounded lesson brief, optionally compacting oversized input."""
+
+    result, _metadata = _safe_lessons_payload(value, compact=compact)
     return result
+
+
+def _compaction_evidence(evidence: dict[str, Any], *, label: str,
+                         value: Any) -> None:
+    """Attach stable compaction telemetry for one request context."""
+
+    metadata = value.get("_compaction") if isinstance(value, Mapping) else None
+    if not isinstance(metadata, Mapping):
+        return
+    evidence.update({
+        f"{label}_compacted": True,
+        f"{label}_original_bytes": metadata.get("original_bytes"),
+        f"{label}_original_hash": metadata.get("original_hash"),
+    })
 
 
 def _safe_text(value: Any, *, label: str, limit: int) -> str:
@@ -1129,10 +1193,11 @@ class RuleProposalAdapter:
             "kind": kind,
             "config_hash": self._config_hash(),
             "response_schema_hash": self._schema_hash(schema_name, vehicle),
-            # This remains the complete audited grammar fingerprint; the
-            # vehicle-specific provider shape is captured separately by
-            # ``response_schema_hash``.
-            "grammar_schema_hash": content_hash(rule_spec_json_schema()),
+            # Bind evidence to the exact rule grammar exposed for this
+            # vehicle. Options deliberately receive only executable v1/v2;
+            # hashing the full equity grammar would misstate what the model
+            # was actually allowed to return.
+            "grammar_schema_hash": content_hash(self._grammar_schema(vehicle)),
         }
         if prompt_hash is not None:
             evidence["system_prompt_hash"] = prompt_hash
@@ -1178,7 +1243,7 @@ class RuleProposalAdapter:
             "system_prompt_hash": prompt_hash,
             "config_hash": self._config_hash(),
             "response_schema_hash": self._schema_hash(schema_name, vehicle),
-            "grammar_schema_hash": content_hash(rule_spec_json_schema()),
+            "grammar_schema_hash": content_hash(self._grammar_schema(vehicle)),
         }
 
     def _schema_hash(self, name: str, vehicle: str | None = None) -> str:
@@ -1548,7 +1613,11 @@ class RuleProposalAdapter:
             prior = validate_rule_spec(_finite(prior_validated_rule_spec,
                                                path="prior_validated_rule_spec"))
             _validate_vehicle_rule_spec(prior, vehicle)
-            safe_diagnosis = _safe_diagnosis(diagnosis)
+            # Fit/replacement diagnostics are finite aggregate context, but
+            # their telemetry can exceed one provider prompt allowance.  Use
+            # deterministic compaction so an oversized diagnostic degrades to
+            # a hashed summary rather than hard-failing the replacement lane.
+            safe_diagnosis = _safe_diagnosis(diagnosis, compact=True)
             request = {"vehicle": vehicle, "generation": generation,
                        "prior_validated_rule_spec": prior,
                        "diagnosis": safe_diagnosis}
@@ -1601,6 +1670,8 @@ class RuleProposalAdapter:
                     "attempt_errors": errors[-3:],
                     "attempt_evidence": attempt_evidence,
                 }
+                _compaction_evidence(evidence, label="diagnosis",
+                                     value=safe_diagnosis)
                 return ProposalResult(True, schema=PROPOSAL_SCHEMA,
                                       rule_spec=normalized, variant_id=variant,
                                       spec_id=spec_hash, evidence=evidence)
@@ -1622,6 +1693,11 @@ class RuleProposalAdapter:
             evidence["raw_response_hash"] = raw_hash
         evidence["attempt_errors"] = errors[-3:]
         evidence["attempt_evidence"] = attempt_evidence
+        # ``safe_diagnosis`` is only defined after input validation; on a
+        # provider failure it is still available and keeps compaction
+        # telemetry durable alongside the error.
+        _compaction_evidence(evidence, label="diagnosis",
+                             value=safe_diagnosis)
         return ProposalResult(False, error="; ".join(errors), evidence=evidence)
 
     def discover(self, vehicle: str, slot: int,
@@ -1642,7 +1718,7 @@ class RuleProposalAdapter:
                 raise ValueError("vehicle must be equity or option")
             if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
                 raise ValueError("slot must be a non-negative integer")
-            safe_context = _safe_diagnosis(context, label="context")
+            safe_context = _safe_diagnosis(context, label="context", compact=True)
             request = {"vehicle": vehicle, "slot": slot, "context": safe_context}
             request_hash = content_hash(request)
             system_hash = content_hash(prompt)
@@ -1692,6 +1768,8 @@ class RuleProposalAdapter:
                     "attempt_errors": errors[-3:],
                     "attempt_evidence": attempt_evidence,
                 }
+                _compaction_evidence(evidence, label="context",
+                                     value=safe_context)
                 return ProposalResult(True, schema=DISCOVERY_SCHEMA,
                                       rule_spec=normalized, variant_id=variant,
                                       spec_id=spec_hash, evidence=evidence,
@@ -1714,6 +1792,7 @@ class RuleProposalAdapter:
             evidence["raw_response_hash"] = raw_hash
         evidence["attempt_errors"] = errors[-3:]
         evidence["attempt_evidence"] = attempt_evidence
+        _compaction_evidence(evidence, label="context", value=safe_context)
         return ProposalResult(False, error="; ".join(errors),
                               schema=DISCOVERY_SCHEMA, evidence=evidence)
 
@@ -1755,10 +1834,12 @@ class RuleProposalAdapter:
                     f"count must be between 1 and {MAX_TUNED_VARIANTS}")
             root = validate_rule_spec(_finite(rule_spec, path="rule_spec"))
             _validate_vehicle_rule_spec(root, vehicle)
-            safe_lessons = _safe_lessons(lessons)
+            safe_lessons, lessons_compaction = _safe_lessons_payload(
+                lessons, compact=True)
             known_lessons = frozenset(
                 str(item["id"]) for item in safe_lessons
                 if isinstance(item, Mapping) and item.get("id"))
+            safe_diagnosis = _safe_diagnosis(diagnosis, compact=True)
             request = {"vehicle": vehicle, "slot": slot,
                        "variants_requested": int(count),
                        "family": root["family"], "rule_schema": root["schema"],
@@ -1767,8 +1848,12 @@ class RuleProposalAdapter:
                        # exceed the provider's aggregate prompt bound.  Keep
                        # a deterministic, hashed summary instead of rejecting
                        # an otherwise valid tuning cycle.
-                       "diagnosis": _safe_diagnosis(diagnosis, compact=True),
+                       "diagnosis": safe_diagnosis,
                        "lessons": safe_lessons}
+            if lessons_compaction is not None:
+                # Keep provenance in the hashed request without changing the
+                # provider-facing lesson list contract.
+                request["lessons_compaction"] = lessons_compaction
             request_hash = content_hash(request)
             system_hash = content_hash(prompt)
         except Exception as exc:
@@ -1837,7 +1922,7 @@ class RuleProposalAdapter:
                         raise ValueError(
                             f"variants[{index}].rule_spec must explicitly pin family and schema")
                     _tuning_reason_check(
-                        entry["reason"], root, normalized, diagnosis,
+                        entry["reason"], root, normalized, safe_diagnosis,
                         safe_lessons)
                     # The signal primitives are fixed code.  Tuning changes the
                     # values inside one of them; it may not swap the family for
@@ -1887,6 +1972,14 @@ class RuleProposalAdapter:
                         "diagnosis_original_hash": compaction.get(
                             "original_hash"),
                     })
+                if lessons_compaction is not None:
+                    evidence.update({
+                        "lessons_compacted": True,
+                        "lessons_original_bytes": lessons_compaction.get(
+                            "original_bytes"),
+                        "lessons_original_hash": lessons_compaction.get(
+                            "original_hash"),
+                    })
                 return ProposalResult(True, schema=TUNING_SCHEMA,
                                       rule_spec=root, evidence=evidence,
                                       variants=tuple(variants))
@@ -1914,6 +2007,14 @@ class RuleProposalAdapter:
                 "diagnosis_compacted": True,
                 "diagnosis_original_bytes": compaction.get("original_bytes"),
                 "diagnosis_original_hash": compaction.get("original_hash"),
+            })
+        if lessons_compaction is not None:
+            evidence.update({
+                "lessons_compacted": True,
+                "lessons_original_bytes": lessons_compaction.get(
+                    "original_bytes"),
+                "lessons_original_hash": lessons_compaction.get(
+                    "original_hash"),
             })
         if raw_hash is not None:
             evidence["raw_response_hash"] = raw_hash

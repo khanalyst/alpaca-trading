@@ -53,6 +53,7 @@ def losing_breakouts(sessions=12):
             observed = timestamp + timedelta(minutes=1)
             rows.append({
                 "kind": "bar", "provider": "test", "feed": "iex",
+                "source_mode": "forward_observed",
                 "symbol": "SPY", "timestamp": timestamp.isoformat(),
                 "as_of": observed.isoformat(), "observed_at": observed.isoformat(),
                 "open": open_, "high": high, "low": low, "close": close,
@@ -118,10 +119,22 @@ def fake_adequate_worker(payload):
 
 def _seal_fixture_screen(record):
     """Produce the same bound compact handoff as a real quality worker."""
+    fit_cells = int(record["fit_cells"])
+    quality_status = ("actionable_signal" if int(record.get("event_count", 0))
+                      > 0 else "predicate_no_actionable_signal")
     quality = {
         "schema": "signal-quality.v2", "scope": "fit_only",
         "authorizing": False, "diagnostic_only": True,
         "variant_id": record["variant_id"], "fixture": dict(record),
+        "eligibility_provenance": {
+            "schema": "signal-quality-eligibility.v1",
+            "scope": "fit_only", "authorizing": False,
+            "diagnostic_only": True, "status": quality_status,
+            "total_cells": fit_cells, "eligible_cells": fit_cells,
+            "mature_prefixes": fit_cells,
+            "evaluator_prefixes": fit_cells,
+            "truncated": False,
+        },
     }
     return factory_module._seal_signal_quality_screen_record(
         record, quality=quality)
@@ -134,8 +147,11 @@ def _quality_eligibility(total_cells, *, status="actionable_signal",
         "scope": "fit_only", "authorizing": False,
         "diagnostic_only": True, "status": status,
         "classification": status, "total_cells": total_cells,
+        "total_prefixes": total_cells,
         "eligible_cells": total_cells,
         "signal_cells": total_cells if status == "actionable_signal" else 0,
+        "mature_prefixes": total_cells,
+        "evaluator_prefixes": total_cells,
         "data_ineligible_cells": data_ineligible,
         "data_incomplete_cells": data_incomplete,
         "reason_counts": {}, "prefix_counts": {}, "truncated": False,
@@ -847,7 +863,7 @@ class StrategyFactoryTests(unittest.TestCase):
                           "provenance": {**record["provenance"],
                                          "scope": "heldout"}}
         self.assertFalse(factory_module._screen_record_can_skip(
-            tampered_scope, variant_id="variant"))
+        tampered_scope, variant_id="variant"))
         malformed = {key: value for key, value in record.items()
                      if key != "provenance"}
         malformed["digest"] = "arbitrary-nonempty-string"
@@ -883,6 +899,27 @@ class StrategyFactoryTests(unittest.TestCase):
             underpowered, variant_id="variant", fit_cells=32,
             primary_horizon=60)
         self.assertEqual(record["status"], "underpowered_control")
+        self.assertFalse(factory_module._screen_record_can_skip(
+            record, variant_id="variant"))
+
+    def test_screen_does_not_skip_immature_prefix_evidence(self):
+        quality = {
+            "schema": "signal-quality.v2",
+            "scope": "fit_only", "authorizing": False,
+            "diagnostic_only": True, "variant_id": "variant",
+            "event_count": 0,
+            "event_rejection_counts": {"no_actionable_signal": 2},
+            "eligibility_provenance": {
+                **_quality_eligibility(2, status="predicate_no_actionable_signal"),
+                "total_prefixes": 2,
+                "mature_prefixes": 0,
+                "evaluator_prefixes": 0,
+            },
+        }
+        record = factory_module._signal_quality_screen_record(
+            quality, variant_id="variant", fit_cells=2,
+            primary_horizon=60)
+        self.assertEqual(record["status"], "underpowered")
         self.assertFalse(factory_module._screen_record_can_skip(
             record, variant_id="variant"))
 
@@ -1495,7 +1532,25 @@ class StrategyFactoryTests(unittest.TestCase):
             self.assertEqual(aliases["intended_variant_count"], 14)
             self.assertEqual(aliases["kept_variant_count"], 14)
             self.assertEqual(aliases["excluded"], [])
-            self.assertEqual(len(aliases["proposed_exclusions"]), 2)
+            exit_only_ids = set()
+            for hypothesis in initial_hypotheses(7):
+                root = hypothesis.rule_spec
+                exit_only = mutate_from_diagnosis(
+                    root, {"primary_failure": "none"}, 2)[1]
+                self.assertIn(
+                    set(core_module.spec_delta(root, exit_only)),
+                    ({"target_mode"}, {"trailing_stop_r"}),
+                )
+                exit_only_ids.add(rule_variant_id(exit_only))
+            replayed_ids = {row["variant_id"] for row in result["results"]}
+            self.assertTrue(exit_only_ids <= replayed_ids)
+            proposed = aliases["proposed_exclusions"]
+            proposed_ids = {row["variant_id"] for row in proposed}
+            canonical_ids = {row["canonical_variant_id"] for row in proposed}
+            self.assertTrue(exit_only_ids & (proposed_ids | canonical_ids))
+            self.assertEqual(len(proposed), len({
+                row["candidate_key"] for row in proposed
+            }))
             self.assertTrue(aliases["requires_operator_review"])
             self.assertEqual(result["variants"], 14)
             self.assertEqual(result["accounts"], 14)
@@ -1644,6 +1699,31 @@ class CorpusDescriptorTests(unittest.TestCase):
                 variant.pop("worker_pid")
         self.assertEqual(first, second)
         self.assertTrue(first["variants"][0]["account"]["rows"])
+
+    def test_non_strict_workers_keep_bar_fallback_diagnosis_non_authorizing(self):
+        rows = losing_breakouts()
+        _, bars, snapshot_map, quotes = factory_module._read_discovery_rows(rows)
+        hypothesis = {**vars(initial_hypotheses(1, vehicle="equity")[0]),
+                      "status": "queued"}
+        policy = factory_module.ReplayPolicy(strict_market_data=False)
+        task = {
+            "hypothesis": hypothesis, "vehicle": "equity", "mode": "backtest",
+            "existing_specs": [], "variants_per_strategy": 1,
+            "starting_cash": 100_000.0, "costs": factory_module.CostModel(),
+            "policy": policy,
+            "bars": bars, "snapshots": list(snapshot_map.values()), "quotes": quotes,
+        }
+        root_diagnostic = factory_module._diagnose_worker(task)["diagnostic"]
+        self.assertTrue(root_diagnostic["diagnostic_only"])
+        self.assertFalse(root_diagnostic["authorizing"])
+        self.assertFalse(root_diagnostic["directional_authorizing"])
+        task["diagnostic"] = root_diagnostic
+        task["specs"] = [hypothesis["rule_spec"]]
+        result = factory_module._worker(task)
+        variant_diagnostic = result["variants"][0]["diagnostic"]
+        self.assertTrue(variant_diagnostic["diagnostic_only"])
+        self.assertFalse(variant_diagnostic["authorizing"])
+        self.assertFalse(variant_diagnostic["directional_authorizing"])
 
     def test_a_path_corpus_produces_the_same_cycle_on_both_backends(self):
         rows = losing_breakouts()

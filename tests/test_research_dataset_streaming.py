@@ -32,6 +32,129 @@ def _outputs(root: Path) -> dict[str, Path]:
 
 
 class ResearchDatasetStreamingTests(unittest.TestCase):
+    def test_trusted_recorder_unmarked_partition_gets_explicit_forward_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99, "close": 100,
+                "volume": 10,
+            }])
+            outputs = _outputs(root)
+
+            build_views(
+                partition_root=sessions, input_format="csv",
+                normalized=outputs["normalized"], bars=outputs["bars"],
+                quotes=outputs["quotes"], options=outputs["options"],
+                replay=outputs["replay"], from_recorder=True)
+
+            rows = [json.loads(line) for line in outputs["normalized"].read_text(
+                encoding="utf-8").splitlines()]
+            self.assertEqual(rows[0]["source_mode"], "forward_observed")
+
+    def test_crash_safe_historical_source_sidecar_overrides_stale_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            sessions = corpus / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99, "close": 100,
+                "volume": 10,
+            }])
+            # Simulate a crash after the authoritative partition and source
+            # marker were fsynced but before .recorder-index.json was rebuilt.
+            partition.with_name(partition.name + ".source.json").write_text(
+                json.dumps({
+                    "schema": "recorder-partition-source.v1",
+                    "partition": partition.name,
+                    "source_mode": "historical_backfill",
+                }), encoding="utf-8")
+            (corpus / ".recorder-index.json").write_text(json.dumps({
+                "partition_sources": {
+                    partition.name: {"source_mode": "forward_observed"},
+                },
+            }), encoding="utf-8")
+            outputs = _outputs(root)
+
+            build_views(
+                partition_root=sessions, input_format="csv",
+                normalized=outputs["normalized"], bars=outputs["bars"],
+                quotes=outputs["quotes"], options=outputs["options"],
+                replay=outputs["replay"], recorded_root=corpus,
+                from_recorder=True)
+
+            row = json.loads(outputs["normalized"].read_text(
+                encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["source_mode"], "historical_backfill")
+
+    def test_recorded_root_cannot_classify_same_named_partition_from_other_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / "selected" / "sessions"
+            metadata_root = root / "metadata"
+            partition = selected / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99, "close": 100,
+                "volume": 10,
+            }])
+            metadata_root.mkdir(parents=True)
+            (metadata_root / ".recorder-index.json").write_text(json.dumps({
+                "partition_sources": {
+                    partition.name: {"source_mode": "historical_backfill"},
+                },
+            }), encoding="utf-8")
+            outputs = _outputs(root)
+
+            with self.assertRaisesRegex(ValueError, "recorded_root does not contain"):
+                build_views(
+                    partition_root=selected, input_format="csv",
+                    normalized=outputs["normalized"], bars=outputs["bars"],
+                    quotes=outputs["quotes"], options=outputs["options"],
+                    replay=outputs["replay"], recorded_root=metadata_root,
+                    from_recorder=True)
+
+    def test_recorder_source_list_cannot_merge_sidecars_across_corpus_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first" / "sessions" / "market-2026-01-05.csv"
+            second = root / "second" / "sessions" / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            row = {
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99, "close": 100,
+                "volume": 10,
+            }
+            _write_partition(first, [row])
+            _write_partition(second, [row])
+            (second.parent.parent / ".recorder-index.json").write_text(
+                json.dumps({"partition_sources": {
+                    second.name: {"source_mode": "historical_backfill"},
+                }}), encoding="utf-8")
+            outputs = _outputs(root)
+
+            with self.assertRaisesRegex(ValueError, "one corpus root"):
+                build_views(
+                    source=[first, second], input_format="csv",
+                    normalized=outputs["normalized"], bars=outputs["bars"],
+                    quotes=outputs["quotes"], options=outputs["options"],
+                    replay=outputs["replay"], from_recorder=True)
+
     def test_exact_calendar_quarantines_extended_hours_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -154,6 +277,9 @@ class ResearchDatasetStreamingTests(unittest.TestCase):
                     "require_exact_calendar": True}},
                 recorded_root=corpus, from_recorder=True)
             self.assertEqual(report["view_counts"]["bars"], 1)
+            row = json.loads(outputs["normalized"].read_text(
+                encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["source_mode"], "historical_backfill")
 
             marker.write_text(json.dumps({
                 "schema": "recorder-partition-calendar.v1",

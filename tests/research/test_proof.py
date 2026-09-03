@@ -47,6 +47,14 @@ class FakeLedger:
 
 
 class ProofTests(unittest.TestCase):
+    def test_nested_diagnostic_telemetry_without_run_reason_is_not_tainted(self):
+        self.assertIsNone(proof_payload._diagnostic_evidence_mode({
+            "hold_telemetry": {
+                "diagnostic_only": True,
+                "authorizing": False,
+            },
+        }))
+
     def test_authorized_proof_refuses_diagnostic_historical_backfill(self):
         class DiagnosticLedger(FakeLedger):
             def runs(self, candidate_id):
@@ -81,6 +89,71 @@ class ProofTests(unittest.TestCase):
                 ValueError, "diagnostic historical backfill"):
             build_proof_payload(
                 DiagnosticLedger(), "candidate-1",
+                {"authorized_run_id": "run-1"},
+            )
+
+    def test_authorized_proof_refuses_diagnostic_bar_fallback(self):
+        class DiagnosticBarLedger(FakeLedger):
+            def runs(self, candidate_id):
+                run = super().runs(candidate_id)[0]
+                run["metrics"]["gate"]["authorization_projection"] = {
+                    "heldout": {"reasons": {"diagnostic_bar_fallback": 1}},
+                }
+                return [run]
+
+            def evidence(self, candidate_id):
+                return [{
+                    "evidence_id": "gate-1", "run_id": "run-1",
+                    "kind": "verified_gate", "evidence_hash": "g" * 64,
+                    "payload": {"run_id": "run-1", "gate": {
+                        "passes": False,
+                        "authorization_projection": {
+                            "heldout": {"reasons": {
+                                "diagnostic_bar_fallback": 1,
+                            }}}}},
+                }]
+
+            def trades(self, candidate_id):
+                return [{"run_id": "run-1", "trade_id": "trade-1",
+                         "evidence_mode": "diagnostic_bar_fallback"}]
+
+        with self.assertRaisesRegex(ValueError, "diagnostic bar fallback"):
+            build_proof_payload(
+                DiagnosticBarLedger(), "candidate-1",
+                {"authorized_run_id": "run-1"},
+            )
+
+    def test_authorized_proof_refuses_explicit_diagnostic_policy(self):
+        class DiagnosticPolicyLedger(FakeLedger):
+            def runs(self, candidate_id):
+                run = super().runs(candidate_id)[0]
+                run["metrics"]["diagnostic_only"] = True
+                run["metrics"]["diagnostic_reason"] = \
+                    "diagnostic_backfill_policy"
+                return [run]
+
+            def evidence(self, candidate_id):
+                return [{
+                    "evidence_id": "gate-1", "run_id": "run-1",
+                    "kind": "verified_gate", "evidence_hash": "g" * 64,
+                    "payload": {"run_id": "run-1", "gate": {
+                        "passes": False,
+                        "diagnostic_only": True,
+                        "diagnostic_reason": "diagnostic_backfill_policy",
+                    }},
+                }]
+
+            def trades(self, candidate_id):
+                return [{"run_id": "run-1", "trade_id": "trade-1",
+                         "evidence_mode": "forward_observed",
+                         "diagnostic_only": True,
+                         "diagnostic_reason":
+                             "diagnostic_backfill_policy"}]
+
+        with self.assertRaisesRegex(
+                ValueError, "diagnostic backfill policy"):
+            build_proof_payload(
+                DiagnosticPolicyLedger(), "candidate-1",
                 {"authorized_run_id": "run-1"},
             )
 

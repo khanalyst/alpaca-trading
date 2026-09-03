@@ -120,6 +120,7 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
                     "volume": 1, "provider": "alpaca", "feed": "iex",
+                    "source_mode": "forward_observed",
                 })
                 rows.append({
                     "kind": "quote", "symbol": symbol,
@@ -135,6 +136,7 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                     "bid": (high if minute == 3 else open_) + shift - .01,
                     "ask": (high if minute == 3 else open_) + shift + .01,
                     "provider": "alpaca", "feed": "iex",
+                    "source_mode": "forward_observed",
                 })
             # The 2R baseline can remain open after this compact four-minute
             # fixture.  Supply its exact force-flat IEX quote so the baseline
@@ -148,6 +150,7 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                 "bid": values[-1][3] + shift - .01,
                 "ask": values[-1][3] + shift + .01,
                 "provider": "alpaca", "feed": "iex",
+                "source_mode": "forward_observed",
             })
             # The baseline (2R) remains open through this compact session and
             # is force-flat on the final completed bar.  Supply a distinct
@@ -162,6 +165,7 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                 "observed_at": final_timestamp.isoformat(),
                 "bid": final_close - .01, "ask": final_close + .01,
                 "provider": "alpaca", "feed": "iex",
+                "source_mode": "forward_observed",
             })
     return rows
 
@@ -1972,6 +1976,7 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
                     "volume": 1, "provider": "alpaca", "feed": "iex",
+                    "source_mode": "forward_observed",
                 })
                 rows.append({
                     "kind": "quote", "symbol": symbol,
@@ -1980,6 +1985,7 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
                     "observed_at": timestamp.isoformat(),
                     "bid": open_ + shift - .01, "ask": open_ + shift + .01,
                     "provider": "alpaca", "feed": "iex",
+                    "source_mode": "forward_observed",
                 })
             final_quote = session + timedelta(minutes=len(values))
             rows.append({
@@ -1990,6 +1996,7 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
                 "bid": values[-1][3] + shift - .01,
                 "ask": values[-1][3] + shift + .01,
                 "provider": "alpaca", "feed": "iex",
+                "source_mode": "forward_observed",
             })
     return rows
 
@@ -2032,6 +2039,7 @@ def _drift_sessions(start: datetime, count: int,
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
                     "volume": 1, "provider": "alpaca", "feed": "iex",
+                    "source_mode": "forward_observed",
                 })
                 rows.append({
                     "kind": "quote", "symbol": symbol,
@@ -2040,6 +2048,7 @@ def _drift_sessions(start: datetime, count: int,
                     "observed_at": timestamp.isoformat(),
                     "bid": open_ + shift - .01, "ask": open_ + shift + .01,
                     "provider": "alpaca", "feed": "iex",
+                    "source_mode": "forward_observed",
                 })
             final_quote = session + timedelta(minutes=len(values))
             rows.append({
@@ -2050,6 +2059,7 @@ def _drift_sessions(start: datetime, count: int,
                 "bid": values[-1][3] + shift - .01,
                 "ask": values[-1][3] + shift + .01,
                 "provider": "alpaca", "feed": "iex",
+                "source_mode": "forward_observed",
             })
     return rows
 
@@ -2238,6 +2248,47 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
 
 
 class NullAdmissibilityTests(unittest.TestCase):
+    def test_opening_range_null_waits_for_complete_anchor_and_signal_bar(self):
+        from agent.contracts.rule import validate_rule_spec
+
+        spec = validate_rule_spec({
+            **ROOT_SPEC, "family": "opening_range_breakout",
+            "range_minutes": 15, "lookback": 3, "atr_period": 3,
+            "slow_lookback": 5, "confirmation": "none",
+            "confirmations": [], "entry_after_minutes": 0,
+            "entry_before_minutes": 390,
+        })
+        opening = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
+        bars = [SimpleNamespace(
+            symbol="SPY", session_date=date(2026, 1, 5),
+            timestamp=opening + timedelta(minutes=index),
+            end=opening + timedelta(minutes=index + 1),
+            open=100.0, close=100.0,
+        ) for index in range(30)]
+        policy = edge_discovery_core.ReplayPolicy(strict_market_data=False)
+        dependencies = {
+            "feature_window_bars": lambda _spec: None,
+            "_contiguous": lambda _rows, _start, _stop: True,
+            "_available": lambda bar, _policy: bar.end,
+        }
+        with mock.patch.object(
+                edge_discovery_core, "_simulation_dependency",
+                side_effect=lambda name: dependencies[name]), \
+                mock.patch.object(edge_discovery_core, "quote_fill_record",
+                                  return_value=None), \
+                mock.patch.object(edge_discovery_core,
+                                  "replay_open_is_available", return_value=True), \
+                mock.patch.object(edge_discovery_core,
+                                  "replay_available_at",
+                                  side_effect=lambda bar, **_kwargs: bar.end):
+            entries = edge_discovery_core._null_admissible_entry_indices(
+                bars, spec, direction="long", policy=policy,
+                vehicle="equity", snapshots=(), quote_index=None)
+
+        self.assertTrue(entries)
+        # Fifteen anchor bars plus the signal bar are complete before entry.
+        self.assertGreaterEqual(min(index for index, _at in entries), 16)
+
     def test_null_clock_does_not_require_the_candidate_predicate(self):
         """Admissible controls stay available even when no signal fires."""
         from agent.contracts.rule import validate_rule_spec

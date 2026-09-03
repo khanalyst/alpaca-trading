@@ -8,20 +8,24 @@ cannot silently diverge again.
 """
 
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
+from zoneinfo import ZoneInfo
 
 from agent import state
 from agent.alpaca_domain import Account, Order, OrderRequest, Position, Quote
 from agent.config import validate_config
 from agent.contracts.risk_geometry import quantize_equity_bracket
-from agent.contracts.rule import (BAR_SECONDS, RuleSpecError,
+from agent.contracts.rule import (BAR_SECONDS, CANONICAL_EXIT_REASONS,
+                                  RuleSpecError,
                                   MIN_STOP_DISTANCE_FRACTION,
                                   RULE_SCHEMA_V3, RULE_SCHEMA_V4,
+                                  canonical_exit_reason,
                                   completed_bar_exit_transition,
+                                  evaluate_rule_signal_trace, exit_deadline,
                                   generate_rule_signal, hold_deadline,
                                   initialize_exit_state, thesis_exit_deadline,
                                   rule_variant_id, validate_rule_spec)
@@ -41,6 +45,18 @@ SPEC = validate_rule_spec({
 })
 V3_SPEC = validate_rule_spec({
     **SPEC, "schema": RULE_SCHEMA_V3, "breakeven_r": 0.5,
+})
+FIXED_V4_SPEC = validate_rule_spec({
+    **SPEC, "schema": RULE_SCHEMA_V4,
+})
+SESSION_VWAP_SPEC = validate_rule_spec({
+    **SPEC, "schema": RULE_SCHEMA_V4, "family": "mean_reversion",
+    "lookback": 3, "zscore": 1.0, "target_mode": "session_vwap",
+    "target_lookback": 2, "trailing_stop_r": None,
+})
+ROLLING_MEAN_SPEC = validate_rule_spec({
+    **SESSION_VWAP_SPEC, "target_mode": "rolling_mean",
+    "target_lookback": 2,
 })
 # Four rising bars produce the signal at index 3, so the simulated entry bar
 # is index 4 and the bounded hold expires at the end of index 7.
@@ -182,6 +198,36 @@ class HoldDeadlineTests(unittest.TestCase):
         self.assertEqual(hold_deadline(entry, {"max_hold_bars": 1},
                                        force_flat_ts=entry + 10_000.0),
                          entry + 2 * BAR_SECONDS)
+
+    def test_deadline_cause_uses_runtime_precedence(self):
+        entry = BASE.timestamp()
+        tied = exit_deadline(
+            entry, {"max_hold_bars": 3},
+            force_flat_ts=entry + 4 * BAR_SECONDS)
+        self.assertEqual(tied, {
+            "timestamp": entry + 4 * BAR_SECONDS,
+            "reason": "session_force_flat",
+        })
+        thesis = exit_deadline(entry, {
+            "max_hold_bars": 390, "exit_before_minutes": 385,
+        })
+        self.assertEqual(thesis["reason"], "thesis_deadline")
+
+    def test_exit_aliases_share_one_canonical_vocabulary(self):
+        self.assertEqual(canonical_exit_reason("time"), "max_hold")
+        self.assertEqual(canonical_exit_reason("max_hold"), "max_hold")
+        self.assertEqual(canonical_exit_reason("before_close"),
+                         "session_force_flat")
+        self.assertEqual(canonical_exit_reason("force_flat"),
+                         "session_force_flat")
+        self.assertEqual(canonical_exit_reason("exit_before"),
+                         "thesis_deadline")
+
+    def test_unknown_operational_reason_cannot_escape_canonical_vocabulary(self):
+        """Persisted canonical causes must stay within the cross-lane enum."""
+        canonical = canonical_exit_reason("protection_fill")
+        self.assertEqual(canonical, "unknown")
+        self.assertIn(canonical, CANONICAL_EXIT_REASONS)
 
     def test_malformed_inputs_are_rejected_rather_than_ignored(self):
         entry = BASE.timestamp()
@@ -340,12 +386,36 @@ class PlanCarriesTheHoldTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         snapshot = {"price": signal["entry_price"], "signal_ts": signal["signal_ts"],
                     "session": signal["session"], "spread_bps": 1.0,
-                    "stale": False, "quote_stale": False}
+                    "stale": False, "quote_stale": False,
+                    "force_flat_at": (BASE + timedelta(hours=6)).isoformat(),
+                    "force_flat_ts": (BASE + timedelta(hours=6)).timestamp()}
         plan, why = build_setup_plan(signal, snapshot, self.cfg)
         self.assertIsNone(why)
         self.assertEqual(plan["max_hold_bars"], 3)
         self.assertEqual(plan["hold_deadline_ts"],
                          bars[7].end.timestamp())
+
+    def test_rule_plan_requires_an_exact_calendar_boundary(self):
+        bars = _bars(RISING + FLAT)
+        signal = self._signal(bars[:4])
+        snapshot = {"price": signal["entry_price"],
+                    "signal_ts": signal["signal_ts"],
+                    "session": signal["session"], "spread_bps": 1.0,
+                    "stale": False, "quote_stale": False}
+        plan, why = build_setup_plan(signal, snapshot, self.cfg)
+        self.assertIsNone(plan)
+        self.assertEqual(why,
+                         "exact session force-flat timestamp is unavailable")
+
+        fallback_cfg = validate_config({
+            "session": {"require_exact_calendar": False},
+            "strategy": {"id": "rule", "version": "v1",
+                         "variant_id": self.variant_id,
+                         "rule_spec": SPEC},
+        })
+        plan, why = build_setup_plan(signal, snapshot, fallback_cfg)
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan["force_flat_ts"])
 
     def test_ibr_plan_has_no_time_exit(self):
         cfg = {"strategy": {"id": "ibr", "version": "v1", "target_r": 2.0,
@@ -428,7 +498,7 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.engine.market.should_force_flat = lambda now=None: False
         return self.engine
 
-    def _open_runtime_trade(self, bars, name, *, spec=SPEC):
+    def _open_runtime_trade(self, bars, name, *, spec=SPEC, filled_at=None):
         """Persist the same signal through plan, risk, and fill activation."""
         engine = self._engine(name)
         cfg = validate_config({"strategy": {
@@ -439,7 +509,9 @@ class ExitContractDifferentialTests(unittest.TestCase):
             now=datetime.now(timezone.utc))
         snapshot = {"price": signal["entry_price"], "signal_ts": signal["signal_ts"],
                     "session": signal["session"], "spread_bps": 1.0,
-                    "stale": False, "quote_stale": False}
+                    "stale": False, "quote_stale": False,
+                    "force_flat_at": (BASE + timedelta(hours=6)).isoformat(),
+                    "force_flat_ts": (BASE + timedelta(hours=6)).timestamp()}
         plan, why = build_setup_plan(signal, snapshot, cfg)
         self.assertIsNone(why)
         risk_plan, why = engine.risk.vet_open(
@@ -454,7 +526,9 @@ class ExitContractDifferentialTests(unittest.TestCase):
         engine._record_open_order(request, order, risk_plan)
         self.provider.orders_by_id[order.id] = replace(
             order, status="filled", filled_qty=Decimal("10"),
-            filled_avg_price=Decimal(str(plan["entry_price"])))
+            filled_avg_price=Decimal(str(plan["entry_price"])),
+            updated_at=(filled_at if filled_at is not None
+                        else bars[4].timestamp))
         self.provider.positions_live = [self._position(plan["entry_price"])]
         engine.reconcile()
         return engine, risk_plan
@@ -523,19 +597,31 @@ class ExitContractDifferentialTests(unittest.TestCase):
 
     def _drive(self, engine, bars, *, start_index):
         """Return the first (reason, exit timestamp) the monitor produces."""
+        self.last_runtime_exit = None
         for bar in bars[start_index:]:
             result = engine._monitor_positions(
                 bar.end, [self._position(bar.close)],
                 market_rows={"SPY": {"bars": [bar]}})
             if result["closed"]:
+                self.last_runtime_exit = dict(result["closed"][0])
+                persisted = state.load_state().get("active_trades", {}).get(
+                    result["closed"][0]["symbol"], {})
+                self.last_runtime_exit["exit_reason"] = persisted.get(
+                    "closing_exit_reason")
                 return result["closed"][0]["reason"], bar.end
         return None, None
 
     def _differential(self, closes, name, *, force_flat_from=None, opens=None,
                       ranges=None, start_index=5, spec=SPEC):
         bars = _bars(closes, opens, ranges)
+        replay_policy = BAR_ONLY_POLICY
+        if force_flat_from is not None:
+            replay_policy = replace(
+                BAR_ONLY_POLICY,
+                force_flat_time=bars[force_flat_from].end.astimezone(
+                    ZoneInfo("America/New_York")).time())
         simulated = _simulate_trade(
-            bars, spec, [], "equity", policy=BAR_ONLY_POLICY)
+            bars, spec, [], "equity", policy=replay_policy)
         self.assertIsNotNone(simulated)
         engine, plan = self._open_runtime_trade(bars, name, spec=spec)
         if force_flat_from is not None:
@@ -582,7 +668,253 @@ class ExitContractDifferentialTests(unittest.TestCase):
             closes, "runtime-flat", force_flat_from=5)
         self.assertEqual(simulated["exit_reason"], "time")
         self.assertEqual(reason, "before_close")
+        self.assertEqual(simulated["canonical_exit_reason"],
+                         "session_force_flat")
+        self.assertEqual(self.last_runtime_exit["exit_reason"],
+                         "session_force_flat")
         self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+
+    def test_delayed_poll_stops_replay_at_the_max_hold_deadline(self):
+        bars = _bars(RISING + [100.8, 100.8, 100.8, 100.8, 101.5])
+        engine, _ = self._open_runtime_trade(
+            bars, "runtime-delayed-hold", spec=FIXED_V4_SPEC)
+        result = engine._monitor_positions(
+            bars[8].end, [self._position(bars[8].close)],
+            market_rows={"SPY": {"bars": bars[4:9]}})
+        self.assertEqual([row["reason"] for row in result["closed"]],
+                         ["max_hold"])
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["canonical_exit_reason"], "max_hold")
+        self.assertEqual(trade["last_completed_bar_epoch"],
+                         bars[7].end.timestamp())
+
+    def test_delayed_poll_keeps_protective_exit_before_force_flat(self):
+        bars = _bars(RISING + [100.8, 101.5, 100.8, 100.8])
+        engine, _ = self._open_runtime_trade(
+            bars, "runtime-before-flat", spec=FIXED_V4_SPEC)
+        deadline = bars[6].end
+        state.update_state(lambda current: {
+            **current,
+            "active_trades": {"SPY": {
+                **current["active_trades"]["SPY"],
+                "force_flat_at": deadline.isoformat(),
+                "force_flat_ts": deadline.timestamp(),
+            }},
+        })
+        engine.market.should_force_flat = lambda now=None: True
+        result = engine._monitor_positions(
+            bars[7].end, [self._position(bars[7].close)],
+            market_rows={"SPY": {"bars": bars[4:8]}})
+        self.assertEqual([row["reason"] for row in result["closed"]],
+                         ["target"])
+        self.assertEqual(
+            state.load_state()["active_trades"]["SPY"]["canonical_exit_reason"],
+            "target")
+
+    def test_delayed_poll_rejects_a_protective_bar_after_force_flat(self):
+        bars = _bars(RISING + [100.8, 100.8, 100.8, 101.5])
+        engine, _ = self._open_runtime_trade(
+            bars, "runtime-after-flat", spec=FIXED_V4_SPEC)
+        deadline = bars[6].end
+        state.update_state(lambda current: {
+            **current,
+            "active_trades": {"SPY": {
+                **current["active_trades"]["SPY"],
+                "force_flat_at": deadline.isoformat(),
+                "force_flat_ts": deadline.timestamp(),
+            }},
+        })
+        result = engine._monitor_positions(
+            bars[7].end, [self._position(bars[7].close)],
+            market_rows={"SPY": {"bars": bars[4:8]}})
+        self.assertEqual([row["reason"] for row in result["closed"]],
+                         ["before_close"])
+        self.assertEqual(
+            state.load_state()["active_trades"]["SPY"]["canonical_exit_reason"],
+            "session_force_flat")
+
+    def test_runtime_deadline_tie_uses_session_then_thesis_then_hold(self):
+        bars = _bars(RISING + [100.8, 100.8, 100.8, 100.8])
+        engine, _ = self._open_runtime_trade(
+            bars, "runtime-deadline-tie", spec=FIXED_V4_SPEC)
+        deadline = bars[7].end
+        state.update_state(lambda current: {
+            **current,
+            "active_trades": {"SPY": {
+                **current["active_trades"]["SPY"],
+                "force_flat_at": deadline.isoformat(),
+                "force_flat_ts": deadline.timestamp(),
+                "exit_before_ts": deadline.timestamp(),
+                "hold_deadline_ts": deadline.timestamp(),
+            }},
+        })
+        result = engine._monitor_positions(
+            deadline, [self._position(bars[7].close)],
+            market_rows={"SPY": {"bars": bars[4:8]}})
+        self.assertEqual([row["reason"] for row in result["closed"]],
+                         ["before_close"])
+        self.assertEqual(
+            state.load_state()["active_trades"]["SPY"]["canonical_exit_reason"],
+            "session_force_flat")
+
+    def test_delayed_poll_rejects_a_protective_bar_after_thesis_deadline(self):
+        spec = validate_rule_spec({
+            **SPEC, "schema": RULE_SCHEMA_V4, "max_hold_bars": 10,
+            "exit_before_minutes": 385,
+        })
+        bars = _bars(RISING + [100.8, 101.5, 101.5])
+        engine, _ = self._open_runtime_trade(
+            bars, "runtime-after-thesis", spec=spec)
+        result = engine._monitor_positions(
+            bars[6].end, [self._position(bars[6].close)],
+            market_rows={"SPY": {"bars": bars[4:7]}})
+        self.assertEqual([row["reason"] for row in result["closed"]],
+                         ["exit_before"])
+        self.assertEqual(
+            state.load_state()["active_trades"]["SPY"]["canonical_exit_reason"],
+            "thesis_deadline")
+
+    def test_runtime_hold_is_reanchored_to_the_actual_fill(self):
+        bars = _bars(RISING + FLAT + [100.8])
+        engine, plan = self._open_runtime_trade(
+            bars, "runtime-fill-anchor", spec=FIXED_V4_SPEC,
+            filled_at=bars[5].timestamp)
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(plan["hold_deadline_ts"], bars[7].end.timestamp())
+        self.assertEqual(trade["entry_filled_at_ts"],
+                         bars[5].timestamp.timestamp())
+        self.assertEqual(trade["exit_entry_bar_epoch"],
+                         bars[5].timestamp.timestamp())
+        self.assertEqual(trade["hold_deadline_ts"], bars[8].end.timestamp())
+
+        first = engine._monitor_positions(
+            bars[7].end, [self._position(bars[7].close)],
+            market_rows={"SPY": {"bars": bars[5:8]}})
+        self.assertEqual(first["closed"], [])
+        second = engine._monitor_positions(
+            bars[8].end, [self._position(bars[8].close)],
+            market_rows={"SPY": {"bars": [bars[8]]}})
+        self.assertEqual([row["reason"] for row in second["closed"]],
+                         ["max_hold"])
+
+    def test_minute_gap_exits_as_data_discontinuity(self):
+        bars = _bars(RISING + [100.8, 100.8, 100.8, 100.8])
+        engine, _ = self._open_runtime_trade(
+            bars, "runtime-gap", spec=FIXED_V4_SPEC)
+        result = engine._monitor_positions(
+            bars[6].end, [self._position(bars[6].close)],
+            market_rows={"SPY": {"bars": [bars[4], bars[6]]}})
+        self.assertEqual([row["reason"] for row in result["closed"]],
+                         ["data_discontinuity"])
+        self.assertEqual(
+            state.load_state()["active_trades"]["SPY"]["canonical_exit_reason"],
+            "data_discontinuity")
+
+    def test_session_vwap_target_is_frozen_across_replay_and_runtime(self):
+        closes = [100.0, 100.0, 100.0, 95.0, 95.5, 100.0, 100.0]
+        expected = evaluate_rule_signal_trace(
+            _bars(closes[:4]), SESSION_VWAP_SPEC)["signal"]["target_reference"]
+        simulated, plan, reason, exit_at = self._differential(
+            closes, "runtime-v4-session-vwap", start_index=4,
+            spec=SESSION_VWAP_SPEC)
+        self.assertEqual(simulated["exit_reason"], "target")
+        self.assertEqual(reason, "target")
+        self.assertEqual(self.last_runtime_exit["exit_reason"], "target")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+        self.assertAlmostEqual(simulated["target_reference"], expected, places=6)
+        self.assertAlmostEqual(plan["target_reference"], expected, places=6)
+        self.assertAlmostEqual(simulated["target_price"],
+                               plan["target_price"], places=9)
+        self.assertLessEqual(simulated["target_price"], expected)
+
+    def test_v4_target_reference_survives_activation_and_reconcile(self):
+        bars = _bars([100.0, 100.0, 100.0, 95.0, 95.5, 95.5, 95.5])
+        engine, plan = self._open_runtime_trade(
+            bars, "runtime-v4-target-state", spec=SESSION_VWAP_SPEC)
+        first = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(first["target_reference"], plan["target_reference"])
+        self.assertEqual(
+            state.load_state()["protection"]["SPY"]["target_reference"],
+            plan["target_reference"])
+        engine.reconcile()
+        recovered = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(recovered["target_reference"],
+                         plan["target_reference"])
+
+    def test_rolling_mean_target_is_frozen_across_replay_and_runtime(self):
+        closes = [100.0, 100.0, 100.0, 95.0, 95.5, 99.0, 99.0]
+        simulated, plan, reason, exit_at = self._differential(
+            closes, "runtime-v4-rolling-mean", start_index=4,
+            spec=ROLLING_MEAN_SPEC)
+        self.assertEqual(simulated["exit_reason"], "target")
+        self.assertEqual(reason, "target")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+        self.assertAlmostEqual(simulated["target_reference"], 97.5, places=6)
+        self.assertAlmostEqual(simulated["target_price"], 97.5, places=6)
+        self.assertAlmostEqual(plan["target_reference"], 97.5, places=6)
+        self.assertAlmostEqual(plan["target_price"], 97.5, places=6)
+
+    def test_non_fixed_target_trailing_ratchet_still_honors_deadline(self):
+        spec = validate_rule_spec({
+            **ROLLING_MEAN_SPEC, "max_hold_bars": 3,
+            "trailing_stop_r": 1.0,
+        })
+        closes = [100.0, 100.0, 100.0, 95.0,
+                  95.5, 95.6, 95.6, 95.6, 95.6]
+        simulated, plan, reason, exit_at = self._differential(
+            closes, "runtime-v4-target-trailing-deadline", start_index=4,
+            spec=spec)
+        self.assertEqual(simulated["canonical_exit_reason"], "max_hold")
+        self.assertEqual(reason, "max_hold")
+        self.assertEqual(self.last_runtime_exit["exit_reason"], "max_hold")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+        self.assertAlmostEqual(simulated["target_price"],
+                               plan["target_price"], places=9)
+        self.assertGreater(simulated["active_stop_price"],
+                           simulated["initial_stop_price"])
+
+    def test_non_fixed_target_rejections_are_explicit(self):
+        underpowered = validate_rule_spec({
+            **ROLLING_MEAN_SPEC, "target_lookback": 20,
+        })
+        trace = evaluate_rule_signal_trace(
+            _bars([100.0, 100.0, 100.0, 95.0]), underpowered)
+        self.assertIsNone(trace["signal"])
+        self.assertEqual(trace["stages"][-1]["reason"],
+                         "insufficient_prefix")
+
+        wrong_side = validate_rule_spec({
+            **SPEC, "schema": RULE_SCHEMA_V4,
+            "target_mode": "session_vwap", "target_lookback": 2,
+        })
+        trace = evaluate_rule_signal_trace(_bars(RISING), wrong_side)
+        self.assertIsNone(trace["signal"])
+        self.assertEqual(trace["stages"][-1]["reason"],
+                         "target_reference_unavailable_or_wrong_side")
+
+    def test_strict_force_flat_requires_quote_and_prices_from_it(self):
+        bars = _bars(RISING + FLAT[:4])
+        policy = ReplayPolicy(strict_market_data=True,
+                              force_flat_time=time(9, 36))
+        entry_quote = _quote(4, 100.79, 100.80)
+        refused = _simulate_trade(
+            bars, SPEC, [], "equity", quotes={"SPY": [entry_quote]},
+            policy=policy)
+        self.assertEqual(refused["unpriced_reason"],
+                         "no fresh equity quote at exit")
+
+        exit_quote = _quote(6, 100.70, 100.71)
+        account = simulate_account(
+            bars, [], SPEC, vehicle="equity", account_id="strict-force-flat",
+            quotes=[entry_quote, exit_quote], policy=policy)
+        priced = account["rows"][0]
+        self.assertEqual(priced["canonical_exit_reason"],
+                         "session_force_flat")
+        self.assertEqual(priced["exit_fill_source"], "quote")
+        self.assertAlmostEqual(priced["exit_reference"], 100.70)
+        expected_gross = ((priced["exit_price"] - priced["entry_price"]) *
+                          priced["quantity"])
+        self.assertAlmostEqual(priced["gross_pnl"], expected_gross, places=9)
 
     def test_time_exit_does_not_need_a_tradable_price(self):
         bars = _bars(RISING + FLAT)

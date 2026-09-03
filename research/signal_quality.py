@@ -26,6 +26,7 @@ from agent.contracts.rule import (
 )
 from .market_data import (historical_backfill_record, replay_available_at,
                            replay_record_is_available)
+from .maturity import causal_maturity_bars
 
 
 SIGNAL_QUALITY_SCHEMA = "signal-quality.v2"
@@ -149,27 +150,9 @@ def _contiguous(rows: Sequence[Any], start: int, stop: int) -> bool:
 
 
 def _mature_prefix(spec: Mapping[str, Any], window: int | None) -> int:
-    """Return the exact causal prefix required by the executable rule.
-
-    ``feature_window_bars`` covers bounded family windows, while
-    opening/session-anchored families intentionally return ``None``.  Their
-    active confirmations still have dependencies, however, so include those
-    explicitly alongside the evaluator's base ATR/lookback prefix.  Do not
-    use the normalized-but-inactive ``slow_lookback`` field as a blanket
-    requirement.
-    """
-    required = max(int(spec["lookback"]) + 1,
-                   int(spec["atr_period"]) + 1,
-                   int(window or 0))
-    confirmations = {str(spec.get("confirmation") or "none")}
-    confirmations.update(str(item) for item in spec.get("confirmations") or ())
-    if "trend" in confirmations:
-        required = max(required, int(spec["slow_lookback"]))
-    if "volume" in confirmations:
-        required = max(required, int(spec["lookback"]) + 1)
-    if "volatility" in confirmations:
-        required = max(required, int(spec["atr_period"]) + 1)
-    return required
+    """Backward-compatible wrapper around the shared maturity contract."""
+    del window
+    return causal_maturity_bars(spec)
 
 
 def _eligibility_classification(reason: Any) -> str:
@@ -180,10 +163,22 @@ def _eligibility_classification(reason: Any) -> str:
     unusable data, incomplete data, or a predicate that was actually tested.
     """
     value = str(reason or "").strip()
+    if value.startswith("subject_context_ineligible:"):
+        # Structural universe policy is a predicate refusal, not missing
+        # market data.  In particular SPY's self-reference is expected when a
+        # synchronized residual corpus includes the benchmark rows.
+        return "predicate_no_actionable_signal"
+    if value.startswith(("benchmark_context_", "subject_context_")):
+        # Context failures remain explicitly unknown to screening.  They must
+        # not be collapsed into generic incomplete history, which can obscure
+        # a missing benchmark alongside otherwise complete subject data.
+        return "context_unknown"
     if value in _DATA_INELIGIBLE_REASONS or value == "data_ineligible":
         return "data_ineligible"
     if value in _DATA_INCOMPLETE_REASONS or value == "data_incomplete":
         return "data_incomplete"
+    if value == "context_unknown":
+        return "context_unknown"
     if value == "no_actionable_signal":
         return "predicate_no_actionable_signal"
     if value in {"actionable_signal", "signal"}:
@@ -276,6 +271,14 @@ def _provenance_summary(
                        fallback_classifications.get("data_ineligible", 0))
     data_incomplete = (raw_data_incomplete or
                        fallback_classifications.get("data_incomplete", 0))
+    context_unknown = fallback_classifications.get("context_unknown", 0)
+    if raw_classification == "context_unknown":
+        context_unknown = max(context_unknown, 1)
+    raw_context_unknown = raw.get("context_unknown_cells", 0)
+    try:
+        context_unknown = max(context_unknown, int(raw_context_unknown))
+    except (TypeError, ValueError, OverflowError):
+        pass
     if data_ineligible and data_incomplete:
         status = "mixed_data_incomplete"
     elif data_ineligible:
@@ -290,6 +293,8 @@ def _provenance_summary(
         status = "predicate_no_actionable_signal"
     elif not normalized_total:
         status = "data_incomplete"
+    elif context_unknown:
+        status = "context_unknown"
     else:
         status = "unknown"
     # Keep only a deterministic, small vocabulary in durable output.  The
@@ -298,6 +303,15 @@ def _provenance_summary(
     bounded_prefix = dict(sorted(prefix_counts.items())[:32])
     truncated = bool(raw.get("truncated")) or (
         "provenance_cells_truncated" in reason_counts)
+    def _safe_count(key: str) -> int:
+        value = raw.get(key, 0)
+        try:
+            if isinstance(value, bool):
+                return 0
+            parsed = int(value)
+            return max(0, parsed) if float(parsed) == float(value) else 0
+        except (TypeError, ValueError, OverflowError):
+            return 0
     return {
         "schema": SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
         "scope": "fit_only",
@@ -310,6 +324,9 @@ def _provenance_summary(
         "signal_cells": min(signal_cells, normalized_total),
         "data_ineligible_cells": int(data_ineligible),
         "data_incomplete_cells": int(data_incomplete),
+        "context_unknown_cells": int(context_unknown),
+        "mature_prefixes": _safe_count("mature_prefixes"),
+        "evaluator_prefixes": _safe_count("evaluator_prefixes"),
         "truncated": truncated,
         "reason_counts": bounded_reasons,
         "prefix_counts": bounded_prefix,
@@ -360,6 +377,7 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
                  ) -> tuple[dict[str, Any] | None, str | None]:
     """Return the first causal signal/entry pair for one symbol-session."""
     window = feature_window_bars(spec)
+    minimum_prefix = causal_maturity_bars(spec)
     context_reason: str | None = None
     status_counts: Counter[str] = Counter()
     eligible_prefix = False
@@ -370,6 +388,7 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
     # per-cell counters; this guard keeps direct signal-quality calls aligned.
     seen: set[datetime] = set()
     previous: datetime | None = None
+    invalid_session = False
     for row in rows:
         stamp = _timestamp(row)
         try:
@@ -379,10 +398,20 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
         if stamp is None or interval != 60 or stamp in seen or (
                 previous is not None and stamp <= previous):
             status_counts["invalid_session"] += 1
+            invalid_session = True
         if stamp is not None:
             seen.add(stamp)
             previous = stamp
+    if invalid_session:
+        # Once a session's chronology/interval contract is broken, no prefix
+        # can be interpreted as an admissible predicate observation.  Stop
+        # before evaluating the rule so malformed data cannot look like a
+        # clean no-actionable-signal result.
+        return None, "data_incomplete"
     for index in range(1, max(1, len(rows) - 1)):
+        if index + 1 < minimum_prefix:
+            status_counts["insufficient_history"] += 1
+            continue
         feature_start = 0 if window is None else max(0, index + 1 - int(window))
         feature_rows = rows[feature_start:index + 1]
         if not _contiguous(rows, feature_start, index + 1):
@@ -419,6 +448,13 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
                             if (_timestamp(rows[probe]) is not None and
                                 _timestamp(rows[probe]) >= entry_at)), None)
         if entry_index is None:
+            status_counts["entry_bar_unavailable"] += 1
+            continue
+        selected_entry = rows[entry_index]
+        entry_cutoff = _bar_end(selected_entry) or _timestamp(selected_entry)
+        if not replay_record_is_available(
+                selected_entry, entry_cutoff,
+                allow_historical_backfill_diagnostics=allow_backfill):
             status_counts["entry_bar_unavailable"] += 1
             continue
         eligible_prefix = True
@@ -460,7 +496,7 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
         priority = (
             "historical_backfill_excluded", "feature_unavailable",
             "entry_bar_unavailable", "entry_not_adjacent", "feature_gap",
-            "invalid_session", "signal_end_unavailable",
+            "invalid_session", "signal_end_unavailable", "insufficient_history",
         )
         reason = next((item for item in priority if status_counts.get(item)),
                       "insufficient_history")

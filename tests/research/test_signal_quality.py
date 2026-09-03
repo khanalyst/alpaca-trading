@@ -11,8 +11,9 @@ from agent.contracts.rule import (
 from research.costs import diagnostic_backfill_policy
 from research.edge_lab import _read_discovery_rows
 from research.fit_diagnostics import _fit_prefixes
-from research.signal_quality import (_ControlPolicy, _forward_return,
-                                     measure_signal_quality)
+from research.maturity import causal_maturity_bars
+from research.signal_quality import (_ControlPolicy, _first_event,
+                                     _forward_return, measure_signal_quality)
 from research.strategy_factory import _sanitize_fit_selection
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 
@@ -198,6 +199,33 @@ class ConditionalForwardReturnTests(unittest.TestCase):
 
 
 class ControlPrefixTests(unittest.TestCase):
+    def test_short_corpus_is_insufficient_history_not_predicate_no_signal(self):
+        rows = [{
+            "timestamp": (self._opening() + timedelta(minutes=index)).isoformat(),
+            "interval_seconds": 60,
+            "open": 100.0, "high": 100.1, "low": 99.9, "close": 100.0,
+            "symbol": "SPY",
+        } for index in range(5)]
+        event, reason = _first_event(rows, ROOT_SPEC, allow_backfill=False)
+        self.assertIsNone(event)
+        self.assertEqual(reason, "data_incomplete")
+        prefix = _fit_prefixes(rows, ROOT_SPEC)
+        self.assertEqual(prefix["prefix_status_counts"].get(
+            "insufficient_history"), 3)
+        self.assertEqual(prefix["eligibility_provenance"]["status"],
+                         "data_incomplete")
+
+    def test_opening_range_anchor_adds_signal_bar_to_maturity(self):
+        spec = validate_rule_spec({**ROOT_SPEC,
+                                   "family": "opening_range_breakout",
+                                   "range_minutes": 30,
+                                   "lookback": 3,
+                                   "atr_period": 3,
+                                   "slow_lookback": 5,
+                                   "confirmation": "none",
+                                   "confirmations": []})
+        self.assertEqual(causal_maturity_bars(spec), 31)
+
     def test_inactive_slow_lookback_does_not_delay_a_control(self):
         spec = validate_rule_spec({**ROOT_SPEC,
                                    "family": "momentum_continuation",
@@ -220,6 +248,7 @@ class ControlPrefixTests(unittest.TestCase):
                                    "atr_period": 14})
         policy = _ControlPolicy(spec)
         self.assertEqual(policy.minimum_prefix, 40)
+        self.assertEqual(causal_maturity_bars(spec), 40)
 
     def test_underpowered_corpus_does_not_fall_back_to_shorter_prefix(self):
         spec = validate_rule_spec({**ROOT_SPEC,

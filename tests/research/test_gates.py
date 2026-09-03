@@ -73,6 +73,15 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertEqual(candidate["reasons"], {
             "no_trade": 1, "non_authorizing_fill_source": 1})
 
+    def test_authorization_projection_excludes_forward_bar_fallback_label(self):
+        from research.gates import authorization_projection
+        row = {**self._equity_quote_row(),
+               "evidence_mode": "diagnostic_bar_fallback"}
+        projection = authorization_projection([row], vehicle="equity")
+        self.assertEqual(projection["eligible"], [])
+        self.assertEqual(projection["reasons"], {
+            "diagnostic_bar_fallback": 1})
+
     def test_resting_bracket_source_is_symmetric_for_candidate_and_null(self):
         from research.gates import authorization_projection
         row = self._equity_quote_row(

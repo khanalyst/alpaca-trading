@@ -36,11 +36,68 @@ class LLMRuleStrategyTests(unittest.TestCase):
         adapter = RuleProposalAdapter()
         for prompt in (SYSTEM_PROMPT, adapter.discovery_prompt):
             self.assertIn("rule-strategy.v3", prompt)
+            self.assertIn("rule-strategy.v4", prompt)
             self.assertIn("breakeven_r", prompt)
             self.assertIn("options", prompt)
 
         self.assertIn("rule-strategy.v3", adapter.discovery_prompt)
         self.assertIn("options remain on executable v1/v2", adapter.discovery_prompt)
+
+    def test_oversized_proposal_diagnosis_is_compacted_with_provenance(self):
+        seen = []
+
+        def caller(*, system_prompt, request, timeout):
+            seen.append(request)
+            return proposal()
+
+        diagnosis = {
+            "primary_failure": "negative_expectancy",
+            "provenance_hash": "a" * 64,
+            "telemetry": ["aggregate-%04d-%s" % (index, "x" * 300)
+                          for index in range(100)],
+        }
+        result = RuleProposalAdapter(caller=caller, max_attempts=1).propose(
+            vehicle="equity", generation=0,
+            prior_validated_rule_spec=DEFAULT_RULE_SPEC,
+            diagnosis=diagnosis)
+        self.assertTrue(result.success, result.error)
+        compact = seen[0]["diagnosis"]
+        self.assertLessEqual(len(canonical_json(compact).encode("utf-8")),
+                             8192)
+        metadata = compact["_compaction"]
+        self.assertEqual(metadata["original_bytes"],
+                         len(canonical_json(diagnosis).encode("utf-8")))
+        self.assertEqual(metadata["original_hash"], content_hash(diagnosis))
+        self.assertTrue(result.evidence["diagnosis_compacted"])
+        self.assertEqual(result.evidence["diagnosis_original_hash"],
+                         metadata["original_hash"])
+
+    def test_oversized_discovery_context_is_compacted_deterministically(self):
+        seen = []
+
+        def caller(*, system_prompt, request, timeout):
+            seen.append(request)
+            return discovery()
+
+        context = {
+            "tried_families": ["mean_reversion"],
+            "telemetry": ["context-%04d-%s" % (index, "y" * 300)
+                          for index in range(100)],
+        }
+        adapter = RuleProposalAdapter(caller=caller, max_attempts=1)
+        first = adapter.discover(vehicle="equity", slot=0, context=context)
+        second = adapter.discover(vehicle="equity", slot=0, context=context)
+        self.assertTrue(first.success, first.error)
+        self.assertTrue(second.success, second.error)
+        self.assertEqual(seen[0]["context"], seen[1]["context"])
+        compact = seen[0]["context"]
+        self.assertLessEqual(len(canonical_json(compact).encode("utf-8")),
+                             8192)
+        metadata = compact["_compaction"]
+        self.assertEqual(metadata["original_hash"], content_hash(context))
+        self.assertTrue(first.evidence["context_compacted"])
+        self.assertEqual(first.evidence["context_original_bytes"],
+                         metadata["original_bytes"])
 
     def test_provider_schema_is_recursive_strict_subset(self):
         schema = RuleProposalAdapter._schema()
@@ -99,6 +156,28 @@ class LLMRuleStrategyTests(unittest.TestCase):
         self.assertEqual(equity_schemas, {"rule-strategy.v1", "rule-strategy.v2",
                                           RULE_SCHEMA_V3, RULE_SCHEMA_V4})
         self.assertEqual(option_schemas, {"rule-strategy.v1", "rule-strategy.v2"})
+
+    def test_evidence_hashes_the_vehicle_specific_rule_grammar(self):
+        adapter = RuleProposalAdapter()
+        equity = adapter._base_evidence(
+            kind="proposal", schema_name=PROPOSAL_SCHEMA, vehicle="equity")
+        option = adapter._base_evidence(
+            kind="proposal", schema_name=PROPOSAL_SCHEMA, vehicle="option")
+
+        self.assertEqual(
+            equity["grammar_schema_hash"],
+            content_hash(adapter._grammar_schema("equity")))
+        self.assertEqual(
+            option["grammar_schema_hash"],
+            content_hash(adapter._grammar_schema("option")))
+        self.assertNotEqual(equity["grammar_schema_hash"],
+                            option["grammar_schema_hash"])
+
+        attempt = adapter._attempt_evidence(
+            attempt=1, schema_name=PROPOSAL_SCHEMA,
+            prompt_hash="prompt", request_hash="request", vehicle="option")
+        self.assertEqual(attempt["grammar_schema_hash"],
+                         option["grammar_schema_hash"])
 
     def test_openai_responses_seam_receives_sanitized_schema(self):
         seen = {}

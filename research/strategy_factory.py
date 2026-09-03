@@ -73,6 +73,7 @@ from .fit_diagnostics import (bar_coverage_telemetry,
 from .signal_quality import (SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
                              SIGNAL_QUALITY_SCHEMA, measure_signal_quality)
 from .factory_report import research_funnel, research_verdict
+from .source_validation import SourceValidationError, validate_source
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
@@ -134,15 +135,18 @@ def _automatic_cost_diagnostic(
         specs: Sequence[Mapping[str, Any]],
         bars: Sequence[Any] | None,
         quotes: Any,
+        persist: bool = True,
         cycle_id: str | None = None,
         ) -> dict[str, Any]:
     """Run the configured-vs-measured cost rerun as non-authorizing telemetry.
 
     The cost-rerun module owns quote fitting and replay arithmetic. This
     wrapper only controls the bounded lifecycle: skip when the corpus/report
-    prerequisites are absent, persist an immutable artifact when available,
-    and convert every failure into a visible diagnostic status rather than a
-    factory failure.
+    prerequisites are absent, optionally persist an immutable artifact when
+    available, and convert every failure into a visible diagnostic status
+    rather than a factory failure.  Diagnostic-only factory runs set
+    ``persist=False`` so their telemetry cannot create a runtime artifact;
+    the measured report is still reduced to the in-memory delta below.
     """
     result: dict[str, Any] = {
         "schema": "cost-rerun-diagnostic.v1", "diagnostic_only": True,
@@ -201,6 +205,16 @@ def _automatic_cost_diagnostic(
                                   if net_deltas else None),
             "sign_changes_to_positive": sign_changes,
         }
+        result.update({"status": "completed", "delta": delta,
+                       "bars": bar_count, "quotes": quote_count,
+                       "variants": len(report.get("results") or ())})
+        if not persist:
+            # Keep the diagnostic useful to callers while making the
+            # side-effect boundary explicit: no path resolution, directory
+            # creation, or immutable-evidence write occurs in this mode.
+            result["reason"] = "persistence_disabled"
+            return result
+
         root = os.getenv("ALPACA_RESEARCH_COST_RERUN_REPORT")
         if root:
             root = root.replace("%s", str(vehicle))
@@ -224,12 +238,9 @@ def _automatic_cost_diagnostic(
             result["reason"] = f"persist_failed:{str(exc)[:180]}"
             result["path"] = str(target)
             result["report_path"] = str(target)
-            result["delta"] = delta
             return result
-        result.update({"status": "completed", "path": str(target),
-                       "report_path": str(target), "content_hash": persisted.get("content_hash"),
-                       "delta": delta, "bars": bar_count, "quotes": quote_count,
-                       "variants": len(report.get("results") or ())})
+        result.update({"path": str(target),
+                       "report_path": str(target), "content_hash": persisted.get("content_hash")})
         return result
     except Exception as exc:  # diagnostic path must never fail the factory
         result["status"] = "failed"
@@ -260,6 +271,46 @@ def _screen_record_binding_payload(record: Mapping[str, Any]) -> dict[str, Any]:
             if str(key) != "digest"}
 
 
+def _screen_maturity_provenance(
+        quality: Mapping[str, Any], *, fit_cells: Any) -> dict[str, int] | None:
+    """Extract the minimum causal evidence required for terminal screening."""
+    eligibility = quality.get("eligibility_provenance")
+    if not isinstance(eligibility, Mapping):
+        return None
+    if (eligibility.get("schema") != SIGNAL_QUALITY_ELIGIBILITY_SCHEMA or
+            eligibility.get("scope") != "fit_only" or
+            eligibility.get("authorizing") is not False or
+            eligibility.get("diagnostic_only") is not True or
+            eligibility.get("truncated") is True):
+        return None
+
+    def exact_count(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            result = int(value)
+            if result < 0 or float(result) != float(value):
+                return None
+            return result
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    expected = exact_count(fit_cells)
+    total = exact_count(eligibility.get("total_cells"))
+    eligible = exact_count(eligibility.get("eligible_cells"))
+    mature = exact_count(eligibility.get("mature_prefixes"))
+    evaluator = exact_count(eligibility.get("evaluator_prefixes"))
+    if None in (expected, total, eligible, mature, evaluator):
+        return None
+    assert expected is not None and total is not None
+    assert eligible is not None and mature is not None and evaluator is not None
+    if (expected <= 0 or total != expected or eligible != expected or
+            mature < expected or evaluator < expected or evaluator > mature):
+        return None
+    return {"total_cells": total, "eligible_cells": eligible,
+            "mature_prefixes": mature, "evaluator_prefixes": evaluator}
+
+
 def _seal_signal_quality_screen_record(
         record: Mapping[str, Any], *, quality: Mapping[str, Any] | None = None,
         quality_digest: str | None = None) -> dict[str, Any]:
@@ -286,6 +337,10 @@ def _seal_signal_quality_screen_record(
             return sealed
     except (TypeError, ValueError, OverflowError):
         return sealed
+    maturity = (_screen_maturity_provenance(quality, fit_cells=fit_cells)
+                if isinstance(quality, Mapping) else None)
+    if maturity is None:
+        return sealed
     provenance = {
         "schema": _SCREEN_PROVENANCE_SCHEMA,
         "quality_schema": SIGNAL_QUALITY_SCHEMA,
@@ -293,6 +348,7 @@ def _seal_signal_quality_screen_record(
         "variant_id": variant,
         "scope": scope,
         "fit_cells": fit_cells,
+        **maturity,
     }
     sealed["provenance"] = provenance
     sealed["digest"] = content_hash(_screen_record_binding_payload(sealed))
@@ -401,6 +457,7 @@ _FIT_SELECTION_SIGNAL_QUALITY_KEYS = frozenset({
 _FIT_SELECTION_ELIGIBILITY_KEYS = frozenset({
     "schema", "scope", "diagnostic_only", "status", "classification",
     "total_cells", "total_prefixes", "eligible_cells", "eligible_prefixes",
+    "mature_prefixes", "evaluator_prefixes", "context_unknown_cells",
     "signal_cells", "signal_prefixes", "data_ineligible_cells",
     "data_incomplete_cells", "predicate_no_actionable_cells",
     "reason_counts", "prefix_counts", "truncated",
@@ -2203,9 +2260,11 @@ def _signal_quality_screen_record(
     """Project one signal-quality result to a deterministic screen record.
 
     Only a complete all-cell ``no_actionable_signal`` or adequately powered
-    nonpositive-control outcome can suppress replay.  Everything else is
-    deliberately fail-open: malformed, partial, underpowered, and unknown
-    values remain scheduled for the normal worker.
+    nonpositive-control outcome can suppress replay.  The compact provenance
+    must also prove at least one mature, evaluator-tested prefix per fit cell;
+    missing counts are fail-open. Everything else is deliberately fail-open:
+    malformed, partial, underpowered, and unknown values remain scheduled for
+    the normal worker.
     The digest covers the complete API result but the durable record carries
     only status/reason/counts, keeping this hand-off non-authorizing and
     compact.
@@ -2244,6 +2303,23 @@ def _signal_quality_screen_record(
             quality.get("diagnostic_only") is not True or
             str(quality.get("variant_id") or "") != str(variant_id)):
         return record
+    # Cross-sectional results carry an explicit benchmark/context status.  A
+    # missing or stale benchmark is an unknown context outcome, never generic
+    # incomplete history and never a predicate-level negative that could be
+    # screened out.  Evaluate this before aggregate eligibility so context
+    # provenance cannot mask the actionable/unknown distinction.
+    market_context = quality.get("market_context")
+    if market_context is not None:
+        if not isinstance(market_context, Mapping):
+            record.update({"status": "unknown",
+                           "reason": "market_context_malformed"})
+            return record
+        context_status = str(market_context.get("status") or "").strip().lower()
+        if context_status not in {"complete", "usable"}:
+            record.update({"status": "unknown",
+                           "reason": str(market_context.get("reason") or
+                                         "market_context_incomplete")})
+            return record
     try:
         raw_event_count = quality.get("event_count")
         if isinstance(raw_event_count, bool):
@@ -2283,16 +2359,24 @@ def _signal_quality_screen_record(
         return record
     try:
         eligibility_total = eligibility.get("total_cells")
+        eligibility_cells = eligibility.get("eligible_cells", 0)
+        mature_prefixes = eligibility.get("mature_prefixes", 0)
+        evaluator_prefixes = eligibility.get("evaluator_prefixes", 0)
         data_ineligible = eligibility.get("data_ineligible_cells", 0)
         data_incomplete = eligibility.get("data_incomplete_cells", 0)
         if any(isinstance(value, bool) for value in (
-                eligibility_total, data_ineligible, data_incomplete)):
+                eligibility_total, eligibility_cells, mature_prefixes,
+                evaluator_prefixes, data_ineligible, data_incomplete)):
             raise ValueError("boolean eligibility count")
         eligibility_total = int(eligibility_total)
+        eligibility_cells = int(eligibility_cells)
+        mature_prefixes = int(mature_prefixes)
+        evaluator_prefixes = int(evaluator_prefixes)
         data_ineligible = int(data_ineligible)
         data_incomplete = int(data_incomplete)
         if any(value < 0 for value in (
-                eligibility_total, data_ineligible, data_incomplete)):
+                eligibility_total, eligibility_cells, mature_prefixes,
+                evaluator_prefixes, data_ineligible, data_incomplete)):
             raise ValueError("negative eligibility count")
     except (TypeError, ValueError, OverflowError):
         record.update({"event_count": event_count,
@@ -2309,6 +2393,10 @@ def _signal_quality_screen_record(
             eligibility.get("diagnostic_only") is not True or
             eligibility.get("truncated") is True or
             eligibility_total != int(fit_cells) or
+            eligibility_cells != int(fit_cells) or
+            mature_prefixes < int(fit_cells) or
+            evaluator_prefixes < int(fit_cells) or
+            evaluator_prefixes > mature_prefixes or
             data_ineligible or data_incomplete or
             eligibility_status != expected_eligibility_status):
         record.update({
@@ -2320,6 +2408,9 @@ def _signal_quality_screen_record(
                 "schema": eligibility.get("schema"),
                 "status": eligibility_status or None,
                 "total_cells": eligibility_total,
+                "eligible_cells": eligibility_cells,
+                "mature_prefixes": mature_prefixes,
+                "evaluator_prefixes": evaluator_prefixes,
                 "data_ineligible_cells": data_ineligible,
                 "data_incomplete_cells": data_incomplete,
                 "truncated": bool(eligibility.get("truncated")),
@@ -2334,28 +2425,15 @@ def _signal_quality_screen_record(
             "schema": SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
             "status": eligibility_status,
             "total_cells": eligibility_total,
+            "eligible_cells": eligibility_cells,
+            "mature_prefixes": mature_prefixes,
+            "evaluator_prefixes": evaluator_prefixes,
             "data_ineligible_cells": 0,
             "data_incomplete_cells": 0,
             "truncated": False,
         },
         "digest": digest,
     })
-    market_context = quality.get("market_context")
-    if market_context is not None:
-        # Cross-sectional quality carries an explicit context status.  Only a
-        # fully usable context may support a fit-only skip; partial, unknown,
-        # or malformed context must remain fail-open so missing benchmark or
-        # subject bars cannot masquerade as a negative result.
-        if not isinstance(market_context, Mapping):
-            record.update({"status": "unknown",
-                           "reason": "market_context_malformed"})
-            return record
-        context_status = str(market_context.get("status") or "").strip().lower()
-        if context_status not in {"complete", "usable"}:
-            record.update({"status": "unknown",
-                           "reason": str(market_context.get("reason") or
-                                         "market_context_incomplete")})
-            return record
     if (event_count == 0 and
             normalized_rejections == {"no_actionable_signal": int(fit_cells)}):
         record.update({"status": "complete_zero_actionable_signal",
@@ -2453,6 +2531,23 @@ def _screen_record_can_skip(record: Any, *, variant_id: str) -> bool:
             provenance.get("scope") != "fit_only" or
             provenance.get("scope") != record.get("scope") or
             provenance.get("fit_cells") != record.get("fit_cells")):
+        return False
+    # A valid digest alone is not sufficient: terminal suppression requires
+    # explicit proof that every fit cell had at least one mature, available
+    # evaluator-tested prefix.  Older/sealed compact records lacking these
+    # fields remain fail-open.
+    maturity = _screen_maturity_provenance(
+        {"eligibility_provenance": {
+            "schema": SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
+            "scope": "fit_only", "authorizing": False,
+            "diagnostic_only": True,
+            "truncated": False,
+            "total_cells": provenance.get("total_cells"),
+            "eligible_cells": provenance.get("eligible_cells"),
+            "mature_prefixes": provenance.get("mature_prefixes"),
+            "evaluator_prefixes": provenance.get("evaluator_prefixes"),
+        }}, fit_cells=record.get("fit_cells"))
+    if maturity is None:
         return False
     if content_hash(_screen_record_binding_payload(record)) != digest:
         return False
@@ -2579,9 +2674,7 @@ def _signal_quality_screen_worker(payload: Mapping[str, Any]) -> dict[str, Any]:
                     precomputed_first_signals=(
                         None if spec["family"] == "cross_sectional_residual" else
                         prefix["first_signals"]),
-                    eligibility_provenance=(
-                        None if spec["family"] == "cross_sectional_residual" else
-                        prefix["eligibility_provenance"]))
+                    eligibility_provenance=prefix["eligibility_provenance"])
                 record = _signal_quality_screen_record(
                     quality, variant_id=variant_id, fit_cells=fit_cells,
                     primary_horizon=_screen_primary_horizon(spec, quality))
@@ -2624,6 +2717,11 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
         hypothesis = dict(payload["hypothesis"])
         vehicle = str(payload["vehicle"])
         starting_cash = float(payload["starting_cash"])
+        worker_policy = payload.get("policy")
+        diagnostic_only = (
+            worker_policy.get("strict_market_data", True) is False
+            if isinstance(worker_policy, Mapping) else
+            getattr(worker_policy, "strict_market_data", True) is False)
         fit_bars, _fit_sessions, _total_sessions = _fit_partition(bars)
         root_account = simulate_account(
             fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
@@ -2638,7 +2736,8 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
             policy=payload.get("policy"))
         return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
                 "diagnostic": {
-                    **diagnose(root_account["rows"], starting_cash=starting_cash),
+                    **diagnose(root_account["rows"], starting_cash=starting_cash,
+                               diagnostic_only=diagnostic_only),
                     "fit_diagnostics": fit_diagnostics,
                 },
                 "worker_pid": os.getpid()}
@@ -2781,6 +2880,10 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         starting_cash = float(payload["starting_cash"])
         costs = payload["costs"]
         policy = payload.get("policy")
+        diagnostic_only = (
+            policy.get("strict_market_data", True) is False
+            if isinstance(policy, Mapping) else
+            getattr(policy, "strict_market_data", True) is False)
         diagnostic = dict(payload["diagnostic"])
         # The orchestrator decided which specs to evaluate — deterministically
         # mutated, model-tuned, or carried forward for forward validation — so
@@ -2811,7 +2914,8 @@ def _worker(payload: Mapping[str, Any]) -> dict:
                 "variant_id": variant_id, "rule_spec": spec, "vehicle": vehicle,
                 "account": account,
                 "diagnostic": {
-                    **diagnose(account["rows"], starting_cash=starting_cash),
+                    **diagnose(account["rows"], starting_cash=starting_cash,
+                               diagnostic_only=diagnostic_only),
                     "fit_diagnostics": dict(
                         (payload.get("fit_diagnostics") or {}).get(variant_id) or {}),
                 },
@@ -3384,6 +3488,7 @@ def _run_diagnostic_factory(
         costs: CostModel | None,
         runtime_config: Mapping[str, Any] | None,
         proposal_adapter: RuleProposalAdapter | None,
+        source_report: Mapping[str, Any] | None = None,
         ) -> dict[str, Any]:
     """Evaluate an explicitly diagnostic corpus without touching ledgers.
 
@@ -3419,6 +3524,13 @@ def _run_diagnostic_factory(
     raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
         data, require_provenance=False,
         expected_equity_feed=policy.equity_feed)
+    actual_source_hash = content_hash(raw_rows)
+    expected_source_hash = (source_report or {}).get("content_hash")
+    if (expected_source_hash is not None and
+            str(expected_source_hash) != actual_source_hash):
+        if callable(getattr(quote_rows, "close", None)):
+            quote_rows.close()
+        raise FactoryError("research source changed after provenance validation")
     bar_coverage = bar_coverage_telemetry(bars)
     quotes = quote_rows if callable(getattr(quote_rows, "quote_fill", None)) \
         else list(quote_rows)
@@ -3444,7 +3556,8 @@ def _run_diagnostic_factory(
                          if isinstance(runtime_config, Mapping) else None),
             policy=policy)
         root_diagnostic = {
-            **diagnose(root_account["rows"], starting_cash=float(starting_cash)),
+            **diagnose(root_account["rows"], starting_cash=float(starting_cash),
+                       diagnostic_only=True),
             "fit_diagnostics": root_fit,
             "authorizing": False,
             "diagnostic_only": True,
@@ -3490,7 +3603,8 @@ def _run_diagnostic_factory(
             costs=model, vehicle=vehicle, risk_config=risk_config,
             policy=policy)
         diagnosis = {
-            **diagnose(root_account["rows"], starting_cash=float(starting_cash)),
+            **diagnose(root_account["rows"], starting_cash=float(starting_cash),
+                       diagnostic_only=True),
             "fit_diagnostics": root_fit,
             "authorizing": False,
             "diagnostic_only": True,
@@ -3552,7 +3666,8 @@ def _run_diagnostic_factory(
                 "novel_tuning": selected.novel_tuning,
                 "diagnostic": {
                     **diagnose(account["rows"],
-                               starting_cash=float(starting_cash)),
+                               starting_cash=float(starting_cash),
+                               diagnostic_only=True),
                     "fit_diagnostics": fit,
                 },
                 "account": account,
@@ -3589,7 +3704,7 @@ def _run_diagnostic_factory(
                for variant in (report.get("variants") or ())
                if isinstance(variant, Mapping) and
                isinstance(variant.get("rule_spec"), Mapping)],
-        bars=bars, quotes=quote_rows)
+        bars=bars, quotes=quote_rows, persist=False)
     if callable(close) and isinstance(quote_rows, SQLiteQuoteIndex):
         close()
     llm_attempted = len(llm_observations)
@@ -3668,13 +3783,20 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     """Run one cycle and always release its parent-owned quote index."""
     if not isinstance(diagnostic_only, bool):
         raise FactoryError("diagnostic_only must be true or false")
+    try:
+        source_report = validate_source(data, diagnostic_only=diagnostic_only)
+    except SourceValidationError as exc:
+        raise FactoryError(str(exc)) from exc
     if diagnostic_only:
-        return _run_diagnostic_factory(
+        result = _run_diagnostic_factory(
             data, vehicle=vehicle, strategies=strategies,
             variants_per_strategy=variants_per_strategy,
             starting_cash=starting_cash, strategy_llm=strategy_llm,
             costs=costs, runtime_config=runtime_config,
-            proposal_adapter=proposal_adapter)
+            proposal_adapter=proposal_adapter, source_report=source_report)
+        result["source_mode_counts"] = source_report.get("source_mode_counts", {})
+        result["future_observed_rows"] = source_report.get("future_observed_rows", 0)
+        return result
     resources: list[SQLiteQuoteIndex] = []
     try:
         return _run_factory(
@@ -3689,7 +3811,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             costs=costs, runtime_config=runtime_config,
             proposal_adapter=proposal_adapter, worker_data=worker_data,
             progress_callback=progress_callback,
-            backtest_bar_fallback=backtest_bar_fallback, _resources=resources)
+            backtest_bar_fallback=backtest_bar_fallback,
+            _source_report=source_report, _resources=resources)
     finally:
         for resource in reversed(resources):
             resource.close()
@@ -3712,6 +3835,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 worker_data: str | Path | None = None,
                 progress_callback: Any | None = None,
                 backtest_bar_fallback: bool = False,
+                _source_report: Mapping[str, Any] | None = None,
                 _resources: list[SQLiteQuoteIndex]) -> dict:
     """Run one autonomous cycle and persist every account, diagnosis and edge."""
     if vehicle not in {"equity", "option"}:
@@ -3743,6 +3867,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             f"rotation_budget<={ROTATION_BUDGET}")
     if not isinstance(backtest_bar_fallback, bool):
         raise FactoryError("backtest_bar_fallback must be true or false")
+    if _source_report is None:
+        try:
+            _source_report = validate_source(data, diagnostic_only=False)
+        except SourceValidationError as exc:
+            raise FactoryError(str(exc)) from exc
     worker_data_path = None
     if worker_data is not None:
         if not isinstance(data, (str, Path)):
@@ -3756,6 +3885,13 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         elif (not worker_data_path.is_file() or
               worker_data_path.stat().st_size <= 0):
             raise FactoryError("worker_data must be a non-empty JSONL file")
+        try:
+            worker_source_report = validate_source(
+                worker_data_path, diagnostic_only=False)
+        except SourceValidationError as exc:
+            raise FactoryError(f"worker_data: {exc}") from exc
+    else:
+        worker_source_report = None
     # The envelope, replay workers, and provenance must all use one identical
     # cost schedule. When a caller does not pass an explicit model, derive it
     # from the validated runtime config for this vehicle rather than silently
@@ -3837,6 +3973,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             data, force_quote_index=isinstance(data, (str, Path)),
             require_provenance=True,
             expected_equity_feed=policy.equity_feed)
+    dataset_hash = content_hash(raw_rows)
+    if str(_source_report.get("content_hash")) != dataset_hash:
+        if callable(getattr(quote_rows, "close", None)):
+            quote_rows.close()
+        raise FactoryError("research source changed after provenance validation")
     bar_coverage = bar_coverage_telemetry(bars)
     parent_quote_index = (quote_rows if isinstance(quote_rows, SQLiteQuoteIndex)
                           else None)
@@ -3847,6 +3988,9 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         projection_digest = validate_worker_projection(
             worker_data_path, bars=bars, snapshots=snapshot_map,
             expected_equity_feed=policy.equity_feed)
+        if (worker_source_report is not None and
+                str(worker_source_report.get("content_hash")) != projection_digest):
+            raise FactoryError("worker_data changed after provenance validation")
     quote_descriptor = (parent_quote_index.descriptor()
                         if parent_quote_index is not None and worker_data_path is not None
                         else None)
@@ -3860,7 +4004,6 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             # Progress is an observability hook and must never alter research
             # outcomes or persistence semantics.
             return
-    dataset_hash = content_hash(raw_rows)
     gate_assumptions = {
         "min_trades": int(min_trades), "min_sessions": int(min_sessions),
         "min_promotion_clusters": MIN_PROMOTION_CLUSTERS,

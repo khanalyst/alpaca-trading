@@ -7,9 +7,9 @@ import unittest
 from unittest.mock import patch
 
 from deploy.research_dataset import build_views
-from research.costs import (SQLiteQuoteIndex, SQLiteQuoteIndexDescriptor,
+from research.costs import (CostError, SQLiteQuoteIndex, SQLiteQuoteIndexDescriptor,
                              quote_fill)
-from research.edge_discovery_core import DiscoveryError
+from research.factory_ledger import FactoryError
 import research.gates as gates
 import research.strategy_factory as factory_module
 from research.strategy_factory import run_factory
@@ -30,6 +30,51 @@ def _quote(minute: int, bid: float, ask: float, *, as_of_minute: int | None = No
 
 
 class QuoteIndexDescriptorTests(unittest.TestCase):
+    def test_writable_reopen_of_populated_legacy_schema_fails_closed(self):
+        """A populated index cannot be reopened without its symbol map."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quotes.sqlite3"
+            db = sqlite3.connect(path)
+            try:
+                db.execute("""
+                    CREATE TABLE quotes (
+                        symbol_id INTEGER NOT NULL,
+                        timestamp REAL NOT NULL,
+                        as_of REAL NOT NULL,
+                        bid REAL NOT NULL,
+                        ask REAL NOT NULL,
+                        provider TEXT NOT NULL,
+                        feed TEXT NOT NULL,
+                        session_day INTEGER NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        PRIMARY KEY (symbol_id, timestamp, sequence)
+                    ) WITHOUT ROWID
+                """)
+                db.execute(
+                    "INSERT INTO quotes VALUES (?,?,?,?,?,?,?,?,?)",
+                    (1, BASE.timestamp(), BASE.timestamp(), 100.0, 100.1,
+                     "test", "sip", BASE.date().toordinal(), 0),
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            with self.assertRaisesRegex(CostError, "cannot be reopened for writing"):
+                SQLiteQuoteIndex(directory=directory)
+
+            # Refusal happens before a legacy file is migrated or otherwise
+            # changed.  A caller holding the matching descriptor can still
+            # open it through the read-only path below.
+            db = sqlite3.connect(path)
+            try:
+                columns = {str(row[1]) for row in db.execute(
+                    "PRAGMA table_info(quotes)")}
+                self.assertNotIn("observed_at", columns)
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM quotes").fetchone()[0], 1)
+            finally:
+                db.close()
+
     def test_read_only_descriptor_opens_legacy_schema_without_observed_at(self):
         # Version-1 indexes predate local observation metadata.  They remain
         # auditable by treating the old as_of column as observed_at.
@@ -159,7 +204,7 @@ class QuoteIndexDescriptorTests(unittest.TestCase):
                     PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
                     PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1), \
                     patch.object(factory_module, "MIN_PROMOTION_CLUSTERS", 1), \
-                    self.assertRaises(DiscoveryError):
+                    self.assertRaises(FactoryError):
                 run_factory(full, worker_data=replay,
                             db_path=root / "factory.sqlite3", strategies=1,
                             variants_per_strategy=2, workers=1, min_trades=1,

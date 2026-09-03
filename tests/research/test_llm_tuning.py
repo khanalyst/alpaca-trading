@@ -409,10 +409,43 @@ class TuningContractTests(unittest.TestCase):
     def test_the_lesson_brief_is_bounded(self):
         huge = [{"reason": "x" * 500, "tried": {"threshold_bps": i}}
                 for i in range(100)]
-        result = _adapter(_reply(_tuned({"threshold_bps": 40.0}))).tune(
+        result = _adapter(_reply(_tuned({"threshold_bps":
+                                          ROOT["threshold_bps"] + 1.0}))).tune(
             "equity", 0, ROOT, DIAGNOSIS, count=1, lessons=huge)
-        self.assertFalse(result.success)
-        self.assertIn("8192-byte", result.error)
+        self.assertTrue(result.success, result.error)
+        self.assertTrue(result.evidence["lessons_compacted"])
+        self.assertGreater(result.evidence["lessons_original_bytes"], 8192)
+        self.assertRegex(result.evidence["lessons_original_hash"],
+                         r"^[0-9a-f]{64}$")
+
+    def test_oversized_lessons_keep_finite_compact_request_and_hash(self):
+        seen = []
+
+        def caller(*, system_prompt, request, timeout):
+            seen.append(request)
+            spec, reason = _tuned({"threshold_bps":
+                                   ROOT["threshold_bps"] + 1.0})
+            return json.dumps({"schema": TUNING_SCHEMA, "variants": [{
+                "rule_spec": spec, "reason": reason,
+                "builds_on": request["lessons"][0]["id"],
+            }]})
+
+        huge = [{"id": f"{index:012x}", "reason": "x" * 500,
+                 "tried": {"threshold_bps": index}}
+                for index in range(100)]
+        result = RuleProposalAdapter(model="test", caller=caller,
+                                     max_attempts=1).tune(
+                                         "equity", 0, ROOT, DIAGNOSIS,
+                                         count=1, lessons=huge)
+        self.assertTrue(result.success, result.error)
+        compact = seen[0]["lessons"]
+        self.assertLessEqual(len(json.dumps(compact, sort_keys=True,
+                                            separators=(",", ":"),
+                                            allow_nan=False).encode("utf-8")),
+                             8192)
+        self.assertEqual(seen[0]["lessons_compaction"]["original_hash"],
+                         result.evidence["lessons_original_hash"])
+        self.assertGreater(result.evidence["lessons_original_bytes"], 8192)
 
     def test_missing_provider_deployment_stops_retries_and_is_recorded(self):
         class DeploymentMissing(RuntimeError):

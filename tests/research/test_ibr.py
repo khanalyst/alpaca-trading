@@ -1,8 +1,11 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import unittest
 from zoneinfo import ZoneInfo
 
-from research.costs import CostModel, ReplayPolicy
+from research.costs import CostModel, ReplayPolicy, diagnostic_backfill_policy
+from research.edge_discovery_core import _opportunity_rows
+from research.gates import authorization_projection
 from research.ibr import IBRConfig, ReplayError, replay_ibr, replay_ibr_vehicles
 from research.costs import (BAR, QUOTE, RESTING_BRACKET,
                              RESTING_BRACKET_FILL_SCHEMA)
@@ -66,6 +69,102 @@ def bars_to_close():
 
 
 class IBRReplayTests(unittest.TestCase):
+    def test_source_preflight_rejects_historical_default_and_accepts_diagnostic(self):
+        historical = [replace(
+            bar,
+            identity=replace(bar.identity, source_mode="historical_backfill"),
+        ) for bar in bars_for_day()]
+        rejected = replay_ibr(
+            historical,
+            config=IBRConfig(stop_pct=.01, target_pct=.02, costs=FREE),
+        )
+        self.assertEqual([], rejected.trades)
+        self.assertFalse(rejected.authorizing)
+        self.assertEqual("source_preflight_failed", rejected.refusals[0].reason)
+
+        diagnostic = replay_ibr(
+            historical,
+            config=IBRConfig(
+                stop_pct=.01, target_pct=.02, costs=FREE,
+                policy=diagnostic_backfill_policy(ReplayPolicy()),
+            ),
+        )
+        self.assertEqual(1, len(diagnostic.trades))
+        self.assertFalse(diagnostic.authorizing)
+        self.assertTrue(diagnostic.diagnostic_only)
+        self.assertEqual(
+            "diagnostic_historical_backfill",
+            diagnostic.trades[0].evidence_mode,
+        )
+
+    def test_ibr_trade_and_projection_persist_canonical_exit_reason(self):
+        result = replay_ibr(bars_for_day(), config=permissive_config(
+            stop_pct=.01, target_pct=.02, costs=FREE))
+        trade = result.trades[0]
+        self.assertEqual("target", trade.exit_reason)
+        self.assertEqual("target", trade.canonical_exit_reason)
+        row = _opportunity_rows(result, bars_for_day(), "equity")[0]
+        self.assertEqual("target", row["canonical_exit_reason"])
+        self.assertEqual({"target": 1}, result.summary()["canonical_exit_reasons"])
+
+    def test_non_strict_bar_fallback_result_is_non_authorizing(self):
+        result = replay_ibr(bars_for_day(), config=permissive_config(
+            stop_pct=.01, target_pct=.02, costs=FREE))
+        self.assertEqual(1, len(result.trades))
+        self.assertEqual("diagnostic_bar_fallback",
+                         result.trades[0].evidence_mode)
+        self.assertFalse(result.authorizing)
+        self.assertTrue(result.diagnostic_only)
+        summary = result.summary()
+        self.assertFalse(summary["authorizing"])
+        self.assertTrue(summary["diagnostic_only"])
+
+    def test_permissive_quote_entry_resting_bracket_exit_remains_forward(self):
+        result = replay_ibr(
+            bars_for_day(),
+            config=permissive_config(stop_pct=.01, target_pct=.02, costs=FREE),
+            quotes=[equity_quote(31, 100.9, 101.1)],
+        )
+        self.assertEqual(1, len(result.trades))
+        trade = result.trades[0]
+        self.assertEqual(QUOTE, trade.entry_fill_source)
+        self.assertEqual(RESTING_BRACKET, trade.exit_fill_source)
+        self.assertEqual("forward_observed", trade.evidence_mode)
+        self.assertTrue(result.authorizing)
+        self.assertFalse(result.diagnostic_only)
+
+    def test_explicit_diagnostic_policy_does_not_forge_historical_provenance(self):
+        result = replay_ibr(
+            bars_for_day(),
+            config=IBRConfig(
+                stop_pct=.01, target_pct=.02, costs=FREE,
+                policy=diagnostic_backfill_policy(ReplayPolicy()),
+            ),
+            quotes=[equity_quote(31, 100.9, 101.1)],
+        )
+        self.assertEqual(1, len(result.trades))
+        trade = result.trades[0]
+        self.assertEqual(QUOTE, trade.entry_fill_source)
+        self.assertEqual(RESTING_BRACKET, trade.exit_fill_source)
+        self.assertEqual("forward_observed", trade.evidence_mode)
+        self.assertTrue(trade.diagnostic_only)
+        self.assertFalse(trade.authorizing)
+        self.assertFalse(trade.directional_authorizing)
+        self.assertEqual("diagnostic_backfill_policy",
+                         trade.diagnostic_reason)
+        self.assertFalse(result.authorizing)
+        self.assertTrue(result.diagnostic_only)
+        projection = authorization_projection([vars(trade)], vehicle="equity")
+        self.assertEqual([], projection["eligible"])
+        self.assertEqual({"diagnostic_backfill_policy": 1},
+                         projection["reasons"])
+        row = _opportunity_rows(result, bars_for_day(), "equity")[0]
+        self.assertEqual("forward_observed", row["evidence_mode"])
+        self.assertTrue(row["diagnostic_only"])
+        self.assertFalse(row["authorizing"])
+        self.assertEqual("diagnostic_backfill_policy",
+                         row["diagnostic_reason"])
+
     def test_omitted_policy_is_strict_for_bar_only_equity(self):
         result = replay_ibr(bars_for_day(), config=IBRConfig(
             stop_pct=.01, target_pct=.02, costs=FREE))

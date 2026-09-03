@@ -5,21 +5,28 @@ from datetime import datetime, timedelta, timezone
 import unittest
 
 from agent.config import ConfigError, validate_config
-from research.costs import ReplayPolicy, diagnostic_backfill_policy
+from research.costs import (ReplayPolicy, SQLiteQuoteIndex,
+                             diagnostic_backfill_policy)
 from research.costs import index_quotes
 from research.edge_discovery_core import _null_reference_rows
 from research.edge_lab import _read_discovery_rows
-from research.factory_core import _simulate_trade
+from research.factory_core import _simulate_trade, diagnose, simulate_account
 from research.fit_diagnostics import _fit_prefixes, measure_fit_diagnostics
 from research.ibr import IBRConfig, IBRResult, replay_ibr
 from research.gates import authorization_projection
-from research.market_data import normalize_underlying_bar
+from research.market_data import normalize_quote, normalize_underlying_bar
 from research.strategy_factory import null_control_account
 
 from tests.research.test_bar_gap_scope import BAR_FALLBACK, SPEC, _bars
+from tests.research.test_costs import (
+    FLAT as COST_FLAT, RISING as COST_RISING, SPEC as COST_SPEC,
+    _bars as cost_bars,
+)
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 from tests.research.test_ibr import (FREE, bars_for_day, equity_quote,
                                      option_quote, permissive_config)
+from tests.research.test_option_exit_tolerance import (
+    CONTRACT as OPTION_CONTRACT, SPEC as OPTION_SPEC, _rising_session, _snap)
 
 
 def _available_at(bar, timestamp):
@@ -38,7 +45,324 @@ def _delayed(bar, minutes=5):
     )
 
 
+def _historical(record):
+    return replace(
+        record,
+        identity=replace(record.identity, source_mode="historical_backfill"),
+    )
+
+
+def _shifted_symbol_bars(bars, symbol, minutes=0):
+    shift = timedelta(minutes=minutes)
+    return [replace(
+        bar, symbol=symbol, timestamp=bar.timestamp + shift,
+        identity=replace(
+            bar.identity,
+            as_of=bar.identity.as_of + shift,
+            observed_at=bar.identity.observed_at + shift,
+        ),
+    ) for bar in bars]
+
+
+def _equity_mark(symbol, timestamp, bid):
+    return normalize_quote({
+        "symbol": symbol, "timestamp": timestamp.isoformat(),
+        "as_of": timestamp.isoformat(), "observed_at": timestamp.isoformat(),
+        "bid": bid, "ask": bid + .01, "provider": "alpaca", "feed": "iex",
+    })
+
+
 class EntryBarVisibilityTests(unittest.TestCase):
+    def test_ibr_historical_equity_quote_marks_forward_bars_diagnostic(self):
+        bars = bars_for_day()
+        quotes = [_historical(equity_quote(31, 100.9, 101.1)),
+                  _historical(equity_quote(32, 102.9, 103.1))]
+        policy = diagnostic_backfill_policy(ReplayPolicy())
+        result = replay_ibr(
+            bars, config=IBRConfig(policy=policy), quotes=quotes)
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].entry_fill_source, "quote")
+        self.assertEqual(result.trades[0].evidence_mode,
+                         "diagnostic_historical_backfill")
+
+    def test_ibr_historical_option_snapshots_mark_forward_bars_diagnostic(self):
+        bars = bars_for_day()
+        snapshots = {
+            bar.timestamp: _historical(option_quote(
+                bar.timestamp, bid=2.0, ask=2.1))
+            for bar in bars[31:]
+        }
+        result = replay_ibr(
+            bars,
+            config=IBRConfig(
+                policy=diagnostic_backfill_policy(ReplayPolicy())),
+            vehicle="option", option_snapshots=snapshots)
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].exit_fill_source, "quote")
+        self.assertEqual(result.trades[0].evidence_mode,
+                         "diagnostic_historical_backfill")
+
+    def test_factory_historical_equity_fills_mark_forward_bars_diagnostic(self):
+        _raw, bars, snapshots, quotes = _read_discovery_rows(edge_corpus(1))
+        symbol_bars = [bar for bar in bars if bar.symbol == "AAA"]
+        historical_quotes = index_quotes(
+            _historical(quote) for quote in quotes if quote.symbol == "AAA")
+        trade = _simulate_trade(
+            symbol_bars, ROOT_SPEC, snapshots, "equity",
+            quotes=historical_quotes,
+            policy=diagnostic_backfill_policy(ReplayPolicy()),
+        )
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade["entry_fill_source"], "quote")
+        self.assertEqual(trade["exit_fill_source"], "quote")
+        self.assertEqual(trade["evidence_mode"],
+                         "diagnostic_historical_backfill")
+
+    def test_factory_non_strict_bar_fallback_is_non_authorizing(self):
+        book = simulate_account(
+            cost_bars(COST_RISING + COST_FLAT), [], COST_SPEC,
+            vehicle="equity", account_id="non-strict-bar-fallback",
+            policy=ReplayPolicy(strict_market_data=False),
+        )
+        row = book["rows"][0]
+        self.assertFalse(row["no_trade"])
+        self.assertEqual(row["evidence_mode"],
+                         "diagnostic_bar_fallback")
+        self.assertFalse(row["directional_authorizing"])
+        self.assertFalse(row["authorizing"])
+        self.assertEqual(book["authorizing_trades"], 0)
+        self.assertEqual(diagnose(book["rows"])["trades"], 0)
+        self.assertEqual(
+            diagnose(book["rows"], diagnostic_only=True)["trades"], 1)
+
+    def test_factory_explicit_diagnostic_policy_never_authorizes_forward_quotes(self):
+        _raw, bars, snapshots, quotes = _read_discovery_rows(edge_corpus(1))
+        symbol_bars = [bar for bar in bars if bar.symbol == "AAA"]
+        symbol_quotes = [quote for quote in quotes if quote.symbol == "AAA"]
+        book = simulate_account(
+            symbol_bars, snapshots, ROOT_SPEC, vehicle="equity",
+            account_id="forward-diagnostic-policy", quotes=symbol_quotes,
+            policy=diagnostic_backfill_policy(ReplayPolicy()),
+        )
+        row = next(item for item in book["rows"] if not item["no_trade"])
+        self.assertEqual("forward_observed", row["evidence_mode"])
+        self.assertTrue(row["diagnostic_only"])
+        self.assertFalse(row["authorizing"])
+        self.assertFalse(row["directional_authorizing"])
+        self.assertEqual("diagnostic_backfill_policy",
+                         row["diagnostic_reason"])
+        self.assertEqual(0, book["authorizing_trades"])
+        self.assertEqual(0, diagnose(book["rows"])["trades"])
+        self.assertEqual(1, diagnose(
+            book["rows"], diagnostic_only=True)["trades"])
+
+    def test_null_historical_entry_exit_quote_taints_row(self):
+        bars = bars_for_day()
+        references = [{
+            "symbol": "SPY", "session_date": bars[0].session_date.isoformat(),
+            "underlying_entry": 101.0, "stop_price": 100.0,
+            "stop_distance": 1.0, "direction": "long", "no_trade": False,
+        }]
+        historical_quotes = [
+            _historical(equity_quote(
+                index, bar.open - .01, bar.open + .01))
+            for index, bar in enumerate(bars)
+        ]
+        book = null_control_account(
+            bars, [], {"target_r": 2, "max_hold_bars": 2},
+            vehicle="equity", reference_rows=references,
+            account_id="null-historical-equity-quotes", fixed_quantity=1,
+            quotes=historical_quotes,
+            policy=diagnostic_backfill_policy(ReplayPolicy()),
+        )
+        row = book["rows"][0]
+        self.assertFalse(row["no_trade"])
+        self.assertEqual(row["evidence_mode"],
+                         "diagnostic_historical_backfill")
+        self.assertFalse(row["directional_authorizing"])
+        self.assertFalse(row["authorizing"])
+
+    def test_null_historical_option_snapshots_taint_row(self):
+        bars = bars_for_day()
+        references = [{
+            "symbol": "SPY", "session_date": bars[0].session_date.isoformat(),
+            "underlying_entry": 101.0, "stop_price": 100.0,
+            "stop_distance": 1.0, "direction": "long", "no_trade": False,
+        }]
+        historical_snapshots = [
+            _historical(option_quote(bar.timestamp, bid=2.0, ask=2.1))
+            for bar in bars
+        ]
+        book = null_control_account(
+            bars, historical_snapshots,
+            {"target_r": 2, "max_hold_bars": 2},
+            vehicle="option", reference_rows=references,
+            account_id="null-historical-option-snapshots", fixed_quantity=1,
+            policy=diagnostic_backfill_policy(ReplayPolicy()),
+        )
+        row = book["rows"][0]
+        self.assertFalse(row["no_trade"])
+        self.assertEqual(row["evidence_mode"],
+                         "diagnostic_historical_backfill")
+        self.assertFalse(row["directional_authorizing"])
+        self.assertFalse(row["authorizing"])
+
+    def test_ibr_resolver_historical_quote_mode_is_non_authorizing(self):
+        bars = bars_for_day()
+        quotes = SQLiteQuoteIndex()
+        try:
+            for index in (31, 32):
+                quotes.add(_historical(equity_quote(
+                    index, bars[index].open - .01, bars[index].open + .01)))
+            quotes.finalize()
+            rejected = replay_ibr(
+                bars,
+                config=IBRConfig(stop_pct=.01, target_pct=.02, costs=FREE),
+                quotes=quotes,
+            )
+            self.assertEqual([], rejected.trades)
+            self.assertFalse(rejected.authorizing)
+            self.assertEqual("source_preflight_failed",
+                             rejected.refusals[0].reason)
+            self.assertFalse(rejected.source_report["authorizing"])
+            self.assertEqual({"forward_observed": 33,
+                              "historical_backfill": 2},
+                             rejected.source_report["source_mode_counts"])
+
+            diagnostic = replay_ibr(
+                bars,
+                config=IBRConfig(
+                    stop_pct=.01, target_pct=.02, costs=FREE,
+                    policy=diagnostic_backfill_policy(ReplayPolicy()),
+                ),
+                quotes=quotes,
+            )
+            self.assertEqual(1, len(diagnostic.trades))
+            self.assertFalse(diagnostic.authorizing)
+            self.assertTrue(diagnostic.diagnostic_only)
+            self.assertFalse(diagnostic.source_report["authorizing"])
+            self.assertTrue(diagnostic.source_report["diagnostic_only"])
+        finally:
+            quotes.close()
+
+    def test_ibr_malformed_resolver_provenance_fails_closed_in_diagnostic_mode(self):
+        class MalformedResolver:
+            def quote_fill(self, **_kwargs):
+                return None
+
+            def quote_fill_record(self, **_kwargs):
+                return None
+
+            def source_mode_counts(self):
+                return {"future_mode": 1}
+
+        result = replay_ibr(
+            bars_for_day(),
+            config=IBRConfig(
+                stop_pct=.01, target_pct=.02, costs=FREE,
+                policy=diagnostic_backfill_policy(ReplayPolicy()),
+            ),
+            quotes=MalformedResolver(),
+        )
+        self.assertEqual([], result.trades)
+        self.assertFalse(result.authorizing)
+        self.assertTrue(result.source_report["preflight_failed"])
+        self.assertFalse(result.source_report["authorizing"])
+
+    def test_factory_historical_option_fills_mark_forward_bars_diagnostic(self):
+        snapshots = []
+        for minute in range(1, 40):
+            snapshots.append(_historical(_snap(minute)))
+        book = simulate_account(
+            _rising_session(), snapshots, OPTION_SPEC, vehicle="option",
+            account_id="historical-option-fills",
+            policy=diagnostic_backfill_policy(ReplayPolicy()),
+        )
+        self.assertEqual(len(book["rows"]), 1)
+        self.assertFalse(book["rows"][0]["no_trade"])
+        self.assertEqual(book["rows"][0]["evidence_mode"],
+                         "diagnostic_historical_backfill")
+        self.assertFalse(book["rows"][0]["directional_authorizing"])
+        self.assertFalse(book["rows"][0]["authorizing"])
+        self.assertEqual(book["authorizing_trades"], 0)
+        self.assertEqual(book["authorizing_realized_pnl"], 0.0)
+        self.assertEqual(diagnose(book["rows"])["trades"], 0)
+        diagnostic = diagnose(book["rows"], diagnostic_only=True)
+        self.assertEqual(diagnostic["trades"], 1)
+        self.assertFalse(diagnostic["directional_authorizing"])
+
+    def test_factory_historical_equity_mark_taints_later_sizing_only(self):
+        base = cost_bars(COST_RISING + COST_FLAT)
+        bars = (_shifted_symbol_bars(base, "AAA") +
+                _shifted_symbol_bars(base, "BBB", minutes=1))
+        policy = diagnostic_backfill_policy(
+            ReplayPolicy(strict_market_data=False))
+        baseline = simulate_account(
+            bars, [], COST_SPEC, vehicle="equity", account_id="mark-baseline",
+            policy=policy)
+        baseline_rows = {row["symbol"]: row for row in baseline["rows"]}
+        mark_at = datetime.fromisoformat(
+            baseline_rows["BBB"]["entry_timestamp"])
+        historical_mark = _historical(_equity_mark("AAA", mark_at, 150.0))
+
+        marked = simulate_account(
+            bars, [], COST_SPEC, vehicle="equity", account_id="mark-historical",
+            quotes=[historical_mark], policy=policy)
+        marked_rows = {row["symbol"]: row for row in marked["rows"]}
+        self.assertEqual(marked_rows["AAA"]["evidence_mode"],
+                         "diagnostic_bar_fallback")
+        self.assertFalse(marked_rows["AAA"]["directional_authorizing"])
+        self.assertEqual(marked_rows["BBB"]["evidence_mode"],
+                         "diagnostic_historical_backfill")
+        self.assertGreater(marked_rows["BBB"]["quantity"],
+                           baseline_rows["BBB"]["quantity"])
+
+    def test_factory_historical_option_mark_taints_later_sizing_only(self):
+        base = _rising_session()
+        bars = (list(base) +
+                _shifted_symbol_bars(base, "QQQ", minutes=1))
+        qqq_contract = replace(
+            OPTION_CONTRACT, symbol="QQQ240119C00500000", underlying="QQQ")
+        spy_snapshots = [_snap(minute) for minute in range(1, 40)]
+        qqq_snapshots = []
+        for minute in range(1, 40):
+            snap = _snap(minute)
+            shift = timedelta(minutes=1)
+            qqq_snapshots.append(replace(
+                snap, contract=qqq_contract,
+                timestamp=snap.timestamp + shift,
+                identity=replace(
+                    snap.identity,
+                    as_of=snap.identity.as_of + shift,
+                    observed_at=snap.identity.observed_at + shift,
+                ),
+            ))
+        policy = diagnostic_backfill_policy(ReplayPolicy())
+        baseline = simulate_account(
+            bars, spy_snapshots + qqq_snapshots, OPTION_SPEC,
+            vehicle="option", account_id="option-mark-baseline",
+            policy=policy)
+        baseline_rows = {row["symbol"]: row for row in baseline["rows"]}
+        mark_at = datetime.fromisoformat(
+            baseline_rows["QQQ"]["entry_timestamp"])
+        marked_spy_snapshots = [
+            _historical(replace(snap, bid=200.0, ask=200.1, last=200.0))
+            if snap.timestamp == mark_at else snap
+            for snap in spy_snapshots
+        ]
+
+        marked = simulate_account(
+            bars, marked_spy_snapshots + qqq_snapshots, OPTION_SPEC,
+            vehicle="option", account_id="option-mark-historical",
+            policy=policy)
+        marked_rows = {row["symbol"]: row for row in marked["rows"]}
+        self.assertEqual(marked_rows["SPY"]["evidence_mode"],
+                         "forward_observed")
+        self.assertEqual(marked_rows["QQQ"]["evidence_mode"],
+                         "diagnostic_historical_backfill")
+        self.assertGreater(marked_rows["QQQ"]["quantity"],
+                           baseline_rows["QQQ"]["quantity"])
+
     def test_backfill_label_comes_from_provenance_and_null_visibility_is_policy_bound(self):
         historical = [replace(
             bar, identity=replace(bar.identity,
@@ -311,7 +635,7 @@ class EntryBarVisibilityTests(unittest.TestCase):
         self.assertIsNotNone(trade)
         self.assertEqual(trade["entry_fill_source"], "quote")
 
-    def test_fit_counts_recorder_signal_at_observed_end_plus_five_seconds(self):
+    def test_fit_rejects_entry_row_observed_after_entry_boundary(self):
         _raw, bars, _snapshots, _quotes = _read_discovery_rows(edge_corpus(1))
         delayed = [replace(
             bar,
@@ -319,10 +643,11 @@ class EntryBarVisibilityTests(unittest.TestCase):
                              observed_at=bar.end + timedelta(seconds=5)),
         ) for bar in bars]
         diagnostic = measure_fit_diagnostics(delayed, ROOT_SPEC)
-        self.assertGreater(diagnostic["first_signal"]["signals"], 0)
+        self.assertEqual(diagnostic["first_signal"]["signals"], 0)
         prefixes = _fit_prefixes(delayed, ROOT_SPEC)
-        self.assertEqual(prefixes["first_signals"][0]["entry_pricing"],
-                         "quote_required")
+        self.assertFalse(prefixes["first_signals"])
+        self.assertEqual(prefixes["eligibility_provenance"]["status"],
+                         "data_incomplete")
 
     def test_randomized_null_and_reference_use_availability_time(self):
         start = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)

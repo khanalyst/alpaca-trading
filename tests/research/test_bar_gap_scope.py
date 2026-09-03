@@ -13,11 +13,13 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from zoneinfo import ZoneInfo
 
-from agent.contracts.rule import feature_window_bars, validate_rule_spec
+from agent.contracts.rule import (evaluate_rule_signal_trace,
+                                  feature_window_bars, validate_rule_spec)
 from research.costs import ReplayPolicy
 from research.edge_lab import _read_discovery_rows
 from research.factory_core import (_simulate_trade, _session_bars_valid,
                                    diagnose, simulate_account)
+from research.maturity import causal_maturity_bars
 
 # These fixtures carry bars but no quotes, so the replay is told explicitly
 # that bar fallback is acceptable.  Pricing is not what is under test here;
@@ -87,10 +89,76 @@ def _outcome(drop_bar: int | None = None):
 
 
 class FeatureWindowTests(unittest.TestCase):
+    def test_momentum_maturity_matches_the_first_evaluable_prefix(self):
+        spec = validate_rule_spec({
+            "family": "momentum_continuation", "lookback": 3,
+            "atr_period": 3, "threshold_bps": 1.0,
+        })
+        self.assertEqual(feature_window_bars(spec), 4)
+        self.assertEqual(causal_maturity_bars(spec), 4)
+
+        rows = _read_discovery_rows([
+            {
+                "kind": "bar", "provider": "test", "feed": "sip",
+                "symbol": "AAA",
+                "timestamp": (datetime(2026, 1, 5, 14, 30,
+                                       tzinfo=timezone.utc) +
+                              timedelta(minutes=index)).isoformat(),
+                "as_of": (datetime(2026, 1, 5, 14, 30,
+                                   tzinfo=timezone.utc) +
+                          timedelta(minutes=index)).isoformat(),
+                "observed_at": (datetime(2026, 1, 5, 14, 30,
+                                         tzinfo=timezone.utc) +
+                                timedelta(minutes=index)).isoformat(),
+                "open": 100.0 + index * .2,
+                "high": 100.25 + index * .2,
+                "low": 99.95 + index * .2,
+                "close": 100.2 + index * .2,
+                "volume": 1000,
+            }
+            for index in range(5)
+        ])[1]
+        self.assertIsNotNone(evaluate_rule_signal_trace(rows[:4], spec)["signal"])
+        replay = _simulate_trade(
+            rows, spec, [], "equity", quotes=None, policy=BAR_FALLBACK)
+        self.assertNotEqual(replay.get("execution_disposition"), "no_signal")
+
     def test_session_accumulating_families_have_no_bounded_window(self):
         for family in ("vwap_reversion", "vwap_trend"):
             spec = validate_rule_spec({"family": family})
             self.assertIsNone(feature_window_bars(spec), family)
+
+    def test_causal_maturity_uses_only_active_family_dependencies(self):
+        opening = validate_rule_spec({
+            "family": "opening_range_breakout", "range_minutes": 3,
+            "lookback": 120, "slow_lookback": 121, "atr_period": 3,
+        })
+        self.assertEqual(causal_maturity_bars(opening), 4)
+
+        mean_reversion = validate_rule_spec({
+            "family": "mean_reversion", "lookback": 10,
+            "atr_period": 3,
+        })
+        self.assertEqual(causal_maturity_bars(mean_reversion), 10)
+        self.assertEqual(feature_window_bars(mean_reversion), 10)
+
+    def test_rolling_mean_target_extends_maturity_to_target_lookback(self):
+        spec = validate_rule_spec({
+            "schema": "rule-strategy.v4", "family": "mean_reversion",
+            "lookback": 10, "atr_period": 3,
+            "target_mode": "rolling_mean", "target_lookback": 60,
+        })
+        self.assertEqual(causal_maturity_bars(spec), 60)
+        self.assertEqual(feature_window_bars(spec), 60)
+
+    def test_session_vwap_target_retains_the_session_open_anchor(self):
+        spec = validate_rule_spec({
+            "schema": "rule-strategy.v4", "family": "mean_reversion",
+            "lookback": 10, "atr_period": 3,
+            "target_mode": "session_vwap", "target_lookback": 60,
+        })
+        self.assertEqual(causal_maturity_bars(spec), 10)
+        self.assertIsNone(feature_window_bars(spec))
 
     def test_trailing_window_covers_the_widest_input_the_family_reads(self):
         # ``trend_pullback`` reads ``slow_lookback`` closes, which is wider
@@ -110,6 +178,14 @@ class FeatureWindowTests(unittest.TestCase):
 class SessionGapScopeTests(unittest.TestCase):
     def test_a_clean_session_trades(self):
         self.assertIsNotNone(_trade())
+
+    def test_short_opening_range_is_insufficient_history_not_no_signal(self):
+        outcome = _simulate_trade(
+            _bars()[:10], SPEC, [], "equity", quotes=None,
+            policy=BAR_FALLBACK)
+        self.assertEqual(outcome["execution_disposition"], "refused")
+        self.assertEqual(outcome["unpriced_reason"], "insufficient_history")
+        self.assertEqual(outcome["reject_detail"]["needed_prefix_bars"], 16)
 
     def test_a_malformed_stream_is_still_refused_outright(self):
         bars = _bars()
@@ -241,7 +317,9 @@ class SessionGapScopeTests(unittest.TestCase):
                 BAR_FALLBACK, force_flat_minutes_before_close=0))
         self.assertEqual(closed["exit_reason"], "time")
         self.assertFalse(closed["hold_discontinuity_exit"])
-        self.assertEqual(closed["hold_exit_reason"], "time_expiry")
+        self.assertEqual(closed["hold_exit_reason"], "session_force_flat")
+        self.assertEqual(closed["canonical_exit_reason"],
+                         "session_force_flat")
 
     def test_gap_telemetry_is_direction_neutral_when_gap_changes_returns(self):
         # Missing the target bar worsens an otherwise profitable hold.

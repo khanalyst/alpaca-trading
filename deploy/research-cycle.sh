@@ -630,8 +630,12 @@ fi
 feed="${configured_feed:-iex}"
 emit_progress "validation" 0 1 "steps" "both"
 set +e
+validation_diagnostic_flag=""
+if [ "${ALPACA_FACTORY_DIAGNOSTIC_ONLY:-0}" = "1" ]; then
+  validation_diagnostic_flag="--diagnostic-only"
+fi
 "$python_bin" "$repo_root/research.py" validate-data "$validated_input" \
-  --provider alpaca --feed "$feed"
+  --provider alpaca --feed "$feed" $validation_diagnostic_flag
 validation_status=$?
 set -e
 if [ "$validation_status" -ne 0 ]; then
@@ -771,7 +775,7 @@ if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
   set +e
   "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
     --provider alpaca --feed "$feed" --vehicle equity \
-    --quotes "$quotes_input" --quotes-from-mixed
+    --quotes "$quotes_input" --quotes-from-mixed $validation_diagnostic_flag
   backtest_status=$?
   set -e
   if [ "$backtest_status" -ne 0 ]; then

@@ -30,6 +30,7 @@ from .costs import (STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
 from .market_data import (historical_backfill_record, record_available_at,
                            record_is_available, replay_available_at,
                            replay_record_is_available)
+from .maturity import causal_maturity_bars
 from .stats import clustered_mde_power_report
 from .signal_quality import (SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
                               measure_signal_quality)
@@ -565,11 +566,21 @@ _PREFIX_DATA_INCOMPLETE_REASONS = frozenset({
 })
 
 
+def _has_context_failure(reasons: Mapping[str, int]) -> bool:
+    return any(
+        count > 0 and str(key).startswith(("benchmark_context_",
+                                           "subject_context_")) and
+        not str(key).startswith("subject_context_ineligible:")
+        for key, count in reasons.items())
+
+
 def _prefix_cell_classification(*, eligible: int, signals: int,
                                 reasons: Mapping[str, int]) -> str:
     """Classify one cell without turning missing data into no-edge evidence."""
     if signals > 0:
         return "actionable_signal"
+    if _has_context_failure(reasons):
+        return "context_unknown"
     if eligible > 0:
         return "predicate_no_actionable_signal"
     if any(reasons.get(key, 0) for key in _PREFIX_DATA_INELIGIBLE_REASONS):
@@ -583,6 +594,7 @@ def _prefix_provenance(
         *, cell_records: Mapping[str, Mapping[str, Any]],
         total_prefixes: int, eligible_prefixes: int,
         signal_prefixes: int, prefix_status: Mapping[str, int],
+        mature_prefixes: int = 0, evaluator_prefixes: int | None = None,
         ) -> dict[str, Any]:
     """Create bounded prefix eligibility provenance for downstream screens."""
     classifications = Counter(
@@ -607,6 +619,8 @@ def _prefix_provenance(
         status = "data_incomplete"
     elif classifications.get("actionable_signal"):
         status = "actionable_signal"
+    elif classifications.get("context_unknown"):
+        status = "context_unknown"
     elif classifications.get("predicate_no_actionable_signal"):
         status = "predicate_no_actionable_signal"
     else:
@@ -641,12 +655,16 @@ def _prefix_provenance(
             item.get("eligible_prefixes", 0) > 0
             for item in cell_records.values()),
         "eligible_prefixes": int(eligible_prefixes),
+        "mature_prefixes": int(mature_prefixes),
+        "evaluator_prefixes": int(
+            eligible_prefixes if evaluator_prefixes is None else evaluator_prefixes),
         "signal_cells": sum(
             item.get("signal_prefixes", 0) > 0
             for item in cell_records.values()),
         "signal_prefixes": int(signal_prefixes),
         "data_ineligible_cells": int(classifications.get("data_ineligible", 0)),
         "data_incomplete_cells": int(classifications.get("data_incomplete", 0)),
+        "context_unknown_cells": int(classifications.get("context_unknown", 0)),
         "predicate_no_actionable_cells": int(
             classifications.get("predicate_no_actionable_signal", 0)),
         "reason_counts": dict(sorted(reason_counts.items())[:64]),
@@ -699,12 +717,9 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                      else getattr(row, "symbol", "")).upper()
         if day and symbol:
             grouped.setdefault((day, symbol), []).append(row)
-    needed = feature_window_bars(spec)
-    if needed is None:
-        needed = max(int(spec["lookback"]) + 1,
-                     int(spec["atr_period"]) + 1)
+    needed = causal_maturity_bars(spec)
     feature_window = feature_window_bars(spec)
-    total_prefixes = eligible_prefixes = 0
+    total_prefixes = eligible_prefixes = mature_prefixes = 0
     first_signals: list[dict[str, Any]] = []
     eligible_sessions = 0
     prefix_status: Counter[str] = Counter()
@@ -742,6 +757,7 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 prefix_status["insufficient_history"] += 1
                 cell_status["insufficient_history"] += 1
                 continue
+            mature_prefixes += 1
             signal_end = _bar_end(rows[index])
             if signal_end is None:
                 prefix_status["signal_end_unavailable"] += 1
@@ -789,6 +805,17 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 cell_status["entry_bar_unavailable"] += 1
                 continue
             entry = rows[entry_index]
+            entry_cutoff = _bar_end(entry) or _timestamp(entry)
+            if not replay_record_is_available(
+                    entry, entry_cutoff,
+                    allow_historical_backfill_diagnostics=allow_backfill):
+                # The selected immediate entry row is part of the causal
+                # hand-off.  Do not mark a signal prefix eligible when that
+                # row cannot be observed under the same policy used by the
+                # direct signal-quality path.
+                prefix_status["entry_bar_unavailable"] += 1
+                cell_status["entry_bar_unavailable"] += 1
+                continue
             eligible_prefixes += 1
             cell_eligible += 1
             prefix_status["eligible"] += 1
@@ -808,7 +835,11 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             if stages:
                 terminal = stages[-1]
                 terminal_stages[str(terminal.get("stage") or "unknown")] += 1
-                terminal_reasons[str(terminal.get("reason") or "unknown")] += 1
+                terminal_reason = str(terminal.get("reason") or "unknown")
+                terminal_reasons[terminal_reason] += 1
+                if terminal_reason.startswith(("benchmark_context_",
+                                               "subject_context_")):
+                    cell_status[terminal_reason] += 1
             if trace.get("signal") is not None:
                 signal_prefixes += 1
                 cell_signals += 1
@@ -847,11 +878,18 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             first_signals.append(first)
         if session_had_eligible_prefix:
             eligible_sessions += 1
+        context_reason = next(
+            (reason for reason in sorted(cell_status)
+             if reason.startswith(("benchmark_context_", "subject_context_"))
+             and not reason.startswith("subject_context_ineligible:")
+             and cell_status.get(reason)),
+            None)
         cell_records[cell] = {
             "classification": _prefix_cell_classification(
                 eligible=cell_eligible, signals=cell_signals,
                 reasons=cell_status),
             "reason": ("actionable_signal" if cell_signals else
+                       context_reason if context_reason else
                        "no_actionable_signal" if cell_eligible else
                        next((reason for reason in (
                            "historical_backfill_excluded", "feature_unavailable",
@@ -892,9 +930,13 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
         total_prefixes=total_prefixes,
         eligible_prefixes=eligible_prefixes,
         signal_prefixes=signal_prefixes,
-        prefix_status=prefix_status)
+        prefix_status=prefix_status,
+        mature_prefixes=mature_prefixes,
+        evaluator_prefixes=eligible_prefixes)
     return {"total_prefixes": total_prefixes,
             "eligible_prefixes": eligible_prefixes,
+            "mature_prefixes": mature_prefixes,
+            "evaluator_prefixes": eligible_prefixes,
             "eligible_sessions": eligible_sessions,
             "first_signals": first_signals,
             "needed_prefix_bars": int(needed),
@@ -1441,9 +1483,7 @@ def measure_fit_diagnostics(
         precomputed_first_signals=(
             None if normalized["family"] == "cross_sectional_residual" else
             signals),
-        eligibility_provenance=(
-            None if normalized["family"] == "cross_sectional_residual" else
-            prefix.get("eligibility_provenance")),
+        eligibility_provenance=prefix.get("eligibility_provenance"),
         bars_by_symbol=market_context)
     expected_cost = {
         "bar_reference_round_trip_bps": _expected_cost_hurdle_bps(

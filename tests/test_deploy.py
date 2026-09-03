@@ -230,7 +230,10 @@ def _replay_corpus_csv(*, quotes: bool = True, sessions: int = 1) -> str:
     from deploy.recorder_market import _event_key
     from zoneinfo import ZoneInfo
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=recorder.FIELDS)
+    # These rows model data captured by the forward recorder.  Keep the
+    # provenance label explicit so research-cycle authorization exercises the
+    # executable path rather than the diagnostic compatibility fallback.
+    writer = csv.DictWriter(buffer, fieldnames=(*recorder.FIELDS, "source_mode"))
     writer.writeheader()
     open_bell = datetime(2026, 8, 3, 9, 30, tzinfo=ZoneInfo("America/New_York"))
     for session in range(sessions):
@@ -248,6 +251,7 @@ def _replay_corpus_csv(*, quotes: bool = True, sessions: int = 1) -> str:
                 "event_key": _event_key("bar_1m", "SPY", stamp), "observed_at": stamp,
                 "provider": "alpaca", "feed": "iex", "event_type": "bar_1m",
                 "symbol": "SPY", "timestamp": stamp, "as_of": stamp,
+                "source_mode": "forward_observed",
                 "open": values[0], "high": values[1], "low": values[2],
                 "close": values[3], "volume": 1000})
             if quotes:
@@ -255,6 +259,7 @@ def _replay_corpus_csv(*, quotes: bool = True, sessions: int = 1) -> str:
                     "event_key": _event_key("quote", "SPY", stamp), "observed_at": stamp,
                     "provider": "alpaca", "feed": "iex", "event_type": "quote",
                     "symbol": "SPY", "timestamp": stamp, "as_of": stamp,
+                    "source_mode": "forward_observed",
                     "bid": values[0] - 0.5, "ask": values[0] + 0.5,
                     "bid_size": 10, "ask_size": 10})
     return buffer.getvalue()
@@ -883,9 +888,9 @@ class DeployTests(unittest.TestCase):
     def test_research_cycle_uses_recorded_csv_and_initializes_edge_ledger(self):
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,"
-            "open,high,low,close,volume,bid,ask,last\n"
+            "open,high,low,close,volume,bid,ask,last,source_mode\n"
             "k,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY,"
-            "2026-08-08T13:30:00+00:00,100,101,99,100.5,10,,,,\n")
+            "2026-08-08T13:30:00+00:00,100,101,99,100.5,10,,,,forward_observed\n")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "market.csv"
@@ -902,10 +907,10 @@ class DeployTests(unittest.TestCase):
     def test_research_cycle_reuses_only_explicitly_identified_preprocessing(self):
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
-            "open,high,low,close,volume\n"
+            "open,high,low,close,volume,source_mode\n"
             "k,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY,"
             "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
-            "100,101,99,100.5,10\n")
+            "100,101,99,100.5,10,forward_observed\n")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "market.csv"
@@ -942,13 +947,13 @@ class DeployTests(unittest.TestCase):
     def test_research_cycle_quarantines_legacy_observation_inversions(self):
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
-            "open,high,low,close,volume,bid,ask,bid_size,ask_size\n"
+            "open,high,low,close,volume,bid,ask,bid_size,ask_size,source_mode\n"
             "bar,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY,"
             "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
-            "100,101,99,100.5,10,,,,\n"
+            "100,101,99,100.5,10,,,,,forward_observed\n"
             "quote,2026-08-08T13:31:00+00:00,alpaca,iex,quote,SPY,"
             "2026-08-08T13:31:00+00:00,2026-08-08T13:32:00+00:00,"
-            ",,,,,100,101,10,10\n")
+            ",,,,,100,101,10,10,forward_observed\n")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "market.csv"
@@ -978,10 +983,10 @@ class DeployTests(unittest.TestCase):
     def test_research_cycle_keeps_other_integrity_errors_fail_closed(self):
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
-            "open,high,low,close,volume\n"
+            "open,high,low,close,volume,source_mode\n"
             "bad,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY/QQQ,"
             "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
-            "100,101,99,100.5,10\n")
+            "100,101,99,100.5,10,forward_observed\n")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "market.csv"
@@ -1000,10 +1005,10 @@ class DeployTests(unittest.TestCase):
         """A SIP row cannot be promoted under the shipped IEX configuration."""
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
-            "open,high,low,close,volume\n"
+            "open,high,low,close,volume,source_mode\n"
             "sip,2026-08-08T13:31:00+00:00,alpaca,sip,bar_1m,SPY,"
             "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
-            "100,101,99,100.5,10\n")
+            "100,101,99,100.5,10,forward_observed\n")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "market.csv"
@@ -1020,10 +1025,10 @@ class DeployTests(unittest.TestCase):
         """Configured SIP must survive feed guard and corpus validation."""
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
-            "open,high,low,close,volume\n"
+            "open,high,low,close,volume,source_mode\n"
             "sip,2026-08-08T13:31:00+00:00,alpaca,sip,bar_1m,SPY,"
             "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
-            "100,101,99,100.5,10\n")
+            "100,101,99,100.5,10,forward_observed\n")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "market.csv"
@@ -1325,7 +1330,7 @@ class DeployTests(unittest.TestCase):
     def test_research_cycle_sends_recorded_options_to_autonomous_discovery(self):
         expiry = (datetime.now(timezone.utc).date() + timedelta(days=30)).isoformat()
         contract_symbol = f"SPY{datetime.fromisoformat(expiry):%y%m%d}C00100000"
-        fields = list(recorder.FIELDS)
+        fields = [*recorder.FIELDS, "source_mode"]
         csv_buffer = io.StringIO()
         writer = csv.DictWriter(csv_buffer, fieldnames=fields)
         writer.writeheader()
@@ -1334,6 +1339,7 @@ class DeployTests(unittest.TestCase):
             "provider": "alpaca", "feed": "iex", "event_type": "bar_1m",
             "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
             "as_of": "2026-08-08T13:30:00+00:00", "open": 100, "high": 101,
+            "source_mode": "forward_observed",
             "low": 99, "close": 100.5, "volume": 10,
         })
         writer.writerow({
@@ -1343,6 +1349,7 @@ class DeployTests(unittest.TestCase):
             "contract": contract_symbol,
             "timestamp": "2026-08-08T13:30:02+00:00",
             "as_of": "2026-08-08T13:30:02+00:00", "volume": 100, "bid": 1,
+            "source_mode": "forward_observed",
             "ask": 1.1, "underlying": "SPY", "expiration": expiry,
             "strike": 100, "right": "call", "multiplier": 100,
             "bid_size": 10, "ask_size": 11, "open_interest": 200,
@@ -1376,6 +1383,7 @@ class DeployTests(unittest.TestCase):
             edge_db = root / "edge.sqlite3"
             dataset.write_text("\n".join(json.dumps(row) for row in (
                 {"kind": "bar", "provider": "alpaca", "feed": "iex",
+                 "source_mode": "forward_observed",
                  "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
                  "as_of": "2026-08-08T13:30:00+00:00",
                  "observed_at": "2026-08-08T13:31:00+00:00",
@@ -1383,6 +1391,7 @@ class DeployTests(unittest.TestCase):
                  "volume": 10},
                 {"kind": "option_snapshot", "provider": "alpaca",
                  "feed": "opra", "symbol": "SPY260918C00100000",
+                 "source_mode": "forward_observed",
                  "contract": "SPY260918C00100000",
                  "timestamp": "2026-08-08T13:30:02+00:00",
                  "as_of": "2026-08-08T13:30:02+00:00",
@@ -1421,6 +1430,7 @@ class DeployTests(unittest.TestCase):
             dataset = root / "market.jsonl"
             rows = [
                 {"kind": "bar", "provider": "alpaca", "feed": "iex",
+                 "source_mode": "forward_observed",
                  "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
                  "as_of": "2026-08-08T13:30:00+00:00",
                  "observed_at": "2026-08-08T13:31:00+00:00",
@@ -1428,6 +1438,7 @@ class DeployTests(unittest.TestCase):
                  "volume": 10},
                 {"kind": "option_snapshot", "provider": "alpaca",
                  "feed": "indicative", "symbol": "SPY260918C00100000",
+                 "source_mode": "forward_observed",
                  "contract": "SPY260918C00100000",
                  "timestamp": "2026-08-08T13:30:02+00:00",
                  "as_of": "2026-08-08T13:30:02+00:00",
@@ -1492,6 +1503,7 @@ class DeployTests(unittest.TestCase):
             dataset = root / "market.jsonl"
             dataset.write_text(json.dumps({
                 "kind": "bar", "provider": "alpaca", "feed": "iex",
+                "source_mode": "forward_observed",
                 "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
                 "as_of": "2026-08-08T13:30:00+00:00",
                 "observed_at": "2026-08-08T13:31:00+00:00",

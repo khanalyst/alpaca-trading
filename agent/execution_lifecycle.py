@@ -15,7 +15,10 @@ from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
 from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
                              RuleSpecError,
+                             canonical_exit_reason,
                              completed_bar_exit_transition,
+                             exit_deadline,
+                             thesis_exit_deadline,
                              initialize_exit_state)
 from .instruments import validate_instrument
 from research.costs import CostError, CostModel
@@ -35,6 +38,50 @@ _RULE_EXIT_SCHEMAS = frozenset({RULE_SCHEMA_V3, RULE_SCHEMA_V4})
 
 
 _EDGE_OUTBOX_WARN = 500
+
+
+def _epoch_seconds(value: Any) -> float:
+    """Parse one durable absolute timestamp without accepting local time."""
+    if isinstance(value, bool):
+        raise ValueError("timestamp must not be boolean")
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("timestamp is empty")
+        try:
+            number = float(text)
+        except ValueError:
+            stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        else:
+            if number != number or abs(number) == float("inf"):
+                raise ValueError("timestamp must be finite")
+            return number
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("timestamp is unavailable") from exc
+        if number != number or abs(number) == float("inf"):
+            raise ValueError("timestamp must be finite")
+        return number
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone")
+    return stamp.timestamp()
+
+
+def _order_fill_epoch(order: Any) -> float | None:
+    """Return the broker's first available fill-time anchor."""
+    for field in ("filled_at", "updated_at"):
+        raw = _value(order, field, None)
+        if raw is None:
+            continue
+        try:
+            return _epoch_seconds(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
 
 
 def _outbox_entry_id(outcome: Mapping) -> str:
@@ -57,41 +104,37 @@ def _plain(value):
     return value
 
 
-def _hold_expired(trade: Any, now: datetime) -> bool:
-    """Decide the bounded-hold time exit from durable state alone.
+def _runtime_exit_deadline(trade: Any, now: datetime,
+                           force_flat: bool) -> dict[str, Any] | None:
+    """Resolve durable runtime deadlines with the research tie precedence."""
+    if not isinstance(trade, Mapping):
+        return ({"timestamp": now.timestamp(), "reason": "before_close"}
+                if force_flat else None)
+    candidates: list[tuple[float, int, str]] = []
 
-    A trade persisted before this field existed, or an IBR trade, has no
-    deadline and keeps its historical stop/target/close-only behavior.  A
-    present but unusable deadline is treated as expired.
-    """
-    if not isinstance(trade, Mapping) or "hold_deadline_ts" not in trade:
-        return False
-    raw = trade.get("hold_deadline_ts")
-    if raw is None:
-        return False
-    if isinstance(raw, bool):
-        return True
-    try:
-        deadline = float(raw)
-    except (TypeError, ValueError, OverflowError):
-        return True
-    if deadline != deadline or abs(deadline) == float("inf"):
-        return True
-    return now.timestamp() >= deadline
+    def add(raw: Any, priority: int, reason: str) -> None:
+        if raw is None:
+            return
+        try:
+            timestamp = _epoch_seconds(raw)
+        except (TypeError, ValueError, OverflowError):
+            # A present but malformed safety boundary is due immediately.
+            timestamp = float("-inf")
+        candidates.append((timestamp, priority, reason))
 
-
-def _thesis_exit_expired(trade: Any, now: datetime) -> bool:
-    """Check the v4 thesis deadline without conflating safety force-flat."""
-    if not isinstance(trade, Mapping) or "exit_before_ts" not in trade:
-        return False
-    raw = trade.get("exit_before_ts")
-    if raw is None:
-        return False
-    try:
-        deadline = float(raw)
-    except (TypeError, ValueError, OverflowError):
-        return True
-    return not (deadline == deadline and abs(deadline) != float("inf")) or now.timestamp() >= deadline
+    force_raw = (trade.get("force_flat_ts")
+                 if trade.get("force_flat_ts") is not None
+                 else trade.get("force_flat_at"))
+    add(force_raw, 0, "before_close")
+    add(trade.get("exit_before_ts"), 1, "exit_before")
+    add(trade.get("hold_deadline_ts"), 2, "max_hold")
+    if force_flat:
+        candidates.append((now.timestamp(), 0, "before_close"))
+    if not candidates:
+        return None
+    timestamp, _priority, reason = min(candidates, key=lambda item: (item[0], item[1]))
+    return {"timestamp": timestamp, "reason": reason,
+            "due": now.timestamp() >= timestamp}
 
 
 def _protective_legs(legs: Any) -> list[dict]:
@@ -342,6 +385,7 @@ class ExecutionLifecycleMixin:
         if status == "filled" and filled_qty <= 0:
             filled_qty = float(request.qty)
         fill_price = self._number(getattr(order, "filled_avg_price", None))
+        filled_at_ts = _order_fill_epoch(order) if filled_qty > 0 else None
         profile = str(risk_plan.get("execution_profile", "shares") or "shares").lower()
         vehicle = "option" if _option_profile(profile) else "equity"
         option = risk_plan.get("option") if isinstance(risk_plan.get("option"), Mapping) else {}
@@ -413,6 +457,7 @@ class ExecutionLifecycleMixin:
             "protective_legs": _protective_legs(getattr(order, "legs", ())),
             "risk_plan": _plain(risk_plan), "fill_logged": False,
             "logged_filled_qty": 0.0, "logged_filled_avg_price": None,
+            "filled_at_ts": filled_at_ts,
             "updated_ts": time.time(),
         }
         order_state.update(provenance_fields)
@@ -621,6 +666,50 @@ class ExecutionLifecycleMixin:
             "planned_to_configured_risk_ratio": planned_to_configured,
             "delivered_to_configured_risk_ratio": delivered_to_configured,
         })
+        signal_ts = self._number(plan.get("signal_ts"))
+        provisional_entry_ts = (signal_ts + BAR_SECONDS
+                                if signal_ts is not None else None)
+        fill_anchor_ts = self._number(existing.get("entry_filled_at_ts"))
+        if fill_anchor_ts is None:
+            fill_anchor_ts = self._number(order_state.get("filled_at_ts"))
+        entry_anchor_ts = fill_anchor_ts
+        if entry_anchor_ts is None:
+            entry_anchor_ts = self._number(existing.get("exit_entry_bar_epoch"))
+        if entry_anchor_ts is None:
+            entry_anchor_ts = provisional_entry_ts
+        force_flat_raw = (existing.get("force_flat_ts")
+                          if existing.get("force_flat_ts") is not None
+                          else existing.get("force_flat_at"))
+        if force_flat_raw is None:
+            force_flat_raw = (plan.get("force_flat_ts")
+                              if plan.get("force_flat_ts") is not None
+                              else plan.get("force_flat_at"))
+        try:
+            force_flat_ts = (_epoch_seconds(force_flat_raw)
+                             if force_flat_raw is not None else None)
+        except (TypeError, ValueError, OverflowError):
+            force_flat_ts = None
+        resolved_hold_deadline = plan.get(
+            "hold_deadline_ts", existing.get("hold_deadline_ts"))
+        resolved_exit_before = plan.get(
+            "exit_before_ts", existing.get("exit_before_ts"))
+        if (str(plan.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS and
+                entry_anchor_ts is not None and not rule_exit_progressed):
+            deadline_spec = {
+                "max_hold_bars": plan.get("max_hold_bars"),
+                "exit_before_minutes": plan.get("exit_before_minutes"),
+            }
+            try:
+                resolved = exit_deadline(
+                    entry_anchor_ts, deadline_spec,
+                    force_flat_ts=force_flat_ts)
+                resolved_hold_deadline = (
+                    resolved.get("timestamp") if resolved is not None else None)
+                resolved_exit_before = thesis_exit_deadline(
+                    entry_anchor_ts, deadline_spec)
+            except RuleSpecError as exc:
+                raise AlpacaError(
+                    f"filled rule deadline state is invalid: {exc}") from exc
         trade = {
             "symbol": symbol, "underlying_symbol": underlying,
             "execution_profile": profile, "vehicle": vehicle,
@@ -637,15 +726,23 @@ class ExecutionLifecycleMixin:
             "reference_price": entry_reference, "entry_reference": entry_reference,
             "exit_reference": self._number(plan.get("exit_reference")),
             "market_price": market_price, "mid_price": mid_price,
-            "opened_at": existing.get("opened_at", time.time()),
+            "opened_at": existing.get(
+                "opened_at", entry_anchor_ts if entry_anchor_ts is not None
+                else time.time()),
+            "entry_filled_at_ts": (existing.get("entry_filled_at_ts")
+                                   if existing.get("entry_filled_at_ts") is not None
+                                   else fill_anchor_ts),
             "setup_type": plan.get("setup_type", "ibr"),
             "setup_id": plan.get("setup_id"), "order_id": order_state.get("order_id"),
             "status": "open", "stop_price": plan.get("underlying_stop_price", plan.get("stop_price")),
             "target_price": plan.get("underlying_target_price", plan.get("target_price")),
-            "force_flat_at": plan.get("force_flat_at"),
+            "force_flat_at": existing.get(
+                "force_flat_at", plan.get("force_flat_at")),
+            "force_flat_ts": force_flat_ts,
             "max_hold_bars": plan.get("max_hold_bars", existing.get("max_hold_bars")),
-            "hold_deadline_ts": plan.get("hold_deadline_ts",
-                                         existing.get("hold_deadline_ts")),
+            "hold_deadline_ts": (existing.get("hold_deadline_ts")
+                                 if rule_exit_progressed else
+                                 resolved_hold_deadline),
             "risk_usd": delivered_risk,
             "intended_risk_usd": intended_risk,
             "delivered_risk_usd": delivered_risk,
@@ -679,6 +776,10 @@ class ExecutionLifecycleMixin:
             "exit_bar_feed": plan.get("exit_bar_feed"),
             "exit_bar_provider": plan.get("exit_bar_provider"),
             "exit_bar_age_seconds": plan.get("exit_bar_age_seconds"),
+            "target_reference": existing.get(
+                "target_reference", plan.get("target_reference")),
+            "exit_before_minutes": existing.get(
+                "exit_before_minutes", plan.get("exit_before_minutes")),
         }
         if str(plan.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS:
             if rule_exit_progressed:
@@ -690,7 +791,9 @@ class ExecutionLifecycleMixin:
                         "breakeven_armed_epoch", "entry_bar_pending",
                         "last_completed_bar_at", "last_completed_bar_epoch",
                         "trailing_stop_r", "target_mode", "target_lookback",
-                        "exit_before_ts")
+                        "target_reference", "exit_before_minutes",
+                        "exit_before_ts", "exit_entry_bar_epoch",
+                        "entry_filled_at_ts")
                     if key in existing
                 }
             else:
@@ -703,17 +806,19 @@ class ExecutionLifecycleMixin:
                         trailing_stop_r=plan.get("trailing_stop_r"),
                         target_mode=plan.get("target_mode", "fixed_r"),
                         target_lookback=plan.get("target_lookback"),
-                        exit_before_ts=plan.get("exit_before_ts"))
+                        exit_before_ts=resolved_exit_before)
                 except RuleSpecError as exc:
                     label = ("v3" if str(plan.get("rule_schema") or "") == RULE_SCHEMA_V3
                              else "v4")
                     raise AlpacaError(f"filled {label} exit state is invalid: {exc}") from exc
-            signal_ts = self._number(plan.get("signal_ts"))
             trade.update(bounded_exit)
             trade.update({
                 "rule_schema": plan.get("rule_schema"),
-                "exit_entry_bar_epoch": (
-                    signal_ts + BAR_SECONDS if signal_ts is not None else None),
+                "target_reference": existing.get(
+                    "target_reference", plan.get("target_reference")),
+                "exit_before_minutes": existing.get(
+                    "exit_before_minutes", plan.get("exit_before_minutes")),
+                "exit_entry_bar_epoch": entry_anchor_ts,
             })
         # The broker-resident bracket legs are the position's real protection.
         # Keep the ids observed at submission; a later reconciliation refreshes
@@ -735,11 +840,13 @@ class ExecutionLifecycleMixin:
         current.setdefault("protection", {})[symbol] = {
             key: trade.get(key) for key in (
                 "underlying_symbol", "stop_price", "target_price", "force_flat_at",
+                "force_flat_ts", "entry_filled_at_ts", "exit_entry_bar_epoch",
                 "max_hold_bars", "hold_deadline_ts", "protective_legs",
                 "rule_schema", "initial_stop_price", "active_stop_price",
                 "breakeven_r", "breakeven_armed_at", "breakeven_armed_epoch",
                 "last_completed_bar_at", "last_completed_bar_epoch",
-                "trailing_stop_r", "target_mode", "target_lookback",
+                "trailing_stop_r", "target_mode", "target_reference",
+                "target_lookback", "exit_before_minutes",
                 "exit_before_ts")
         }
         if incremental_qty > 0:
@@ -1093,8 +1200,14 @@ class ExecutionLifecycleMixin:
                                         if key in {"status", "filled_qty",
                                                    "filled_avg_price", "cancel_race"}})
                         if leg_id in filled:
+                            filled_reason = str(leg.get("role") or
+                                                "protection_fill")
                             row["status"] = "closing"
-                            row.setdefault("closing_reason", "protection_fill")
+                            row.setdefault("closing_reason", filled_reason)
+                            row.setdefault("closing_exit_reason",
+                                           canonical_exit_reason(filled_reason))
+                            row.setdefault("canonical_exit_reason",
+                                           canonical_exit_reason(filled_reason))
                             row.setdefault("closing_order_id", leg_id)
             return current
         try:
@@ -1209,9 +1322,11 @@ class ExecutionLifecycleMixin:
         })
         return price, provenance
 
-    def _completed_exit_bars(self, trade: Mapping, now: datetime,
-                             market_rows: Mapping[str, Any] | None) -> list[Any]:
-        """Return ordered unseen completed bars for one durable v3 exit."""
+    def _completed_exit_bars(
+            self, trade: Mapping, now: datetime,
+            market_rows: Mapping[str, Any] | None, *,
+            deadline_ts: float | None = None) -> tuple[list[Any], bool]:
+        """Return the contiguous unseen bars and whether a minute gap follows."""
         underlying = str(trade.get("underlying_symbol") or
                          trade.get("symbol") or "").upper()
         row = market_rows.get(underlying, {}) if isinstance(market_rows, Mapping) else {}
@@ -1228,7 +1343,7 @@ class ExecutionLifecycleMixin:
                     [underlying], timeframe="1m", start=start, end=now)
                 bars = fetched.get(underlying, []) if isinstance(fetched, Mapping) else []
             except Exception:  # noqa: BLE001
-                return []
+                return [], False
         prepared: list[tuple[datetime, Any]] = []
         entry_epoch = self._number(trade.get("exit_entry_bar_epoch"))
         last_epoch = self._number(trade.get("last_completed_bar_epoch"))
@@ -1241,17 +1356,30 @@ class ExecutionLifecycleMixin:
             if stamp is None:
                 continue
             end = stamp + timedelta(seconds=BAR_SECONDS)
-            if end > now or (entry_epoch is not None and
-                             stamp.timestamp() < entry_epoch - 1e-9):
+            if (end > now or
+                    (deadline_ts is not None and
+                     end.timestamp() > deadline_ts + 1e-9) or
+                    (entry_epoch is not None and
+                     stamp.timestamp() < entry_epoch - 1e-9)):
                 continue
             if last_epoch is not None and end.timestamp() <= last_epoch + 1e-9:
                 continue
             prepared.append((stamp, bar))
         prepared.sort(key=lambda item: item[0])
-        if any(right[0] - left[0] != timedelta(seconds=BAR_SECONDS)
-               for left, right in zip(prepared, prepared[1:])):
-            return []
-        return [bar for _stamp, bar in prepared]
+        if prepared and last_epoch is None and entry_epoch is not None:
+            remainder = entry_epoch % BAR_SECONDS
+            expected_epoch = (entry_epoch if remainder <= 1e-9 else
+                              entry_epoch + (BAR_SECONDS - remainder))
+            if prepared[0][0].timestamp() > expected_epoch + 1e-9:
+                return [], True
+        if (prepared and last_epoch is not None and
+                prepared[0][0].timestamp() > last_epoch + 1e-9):
+            return [], True
+        for index, (left, right) in enumerate(
+                zip(prepared, prepared[1:]), start=1):
+            if right[0] - left[0] != timedelta(seconds=BAR_SECONDS):
+                return [bar for _stamp, bar in prepared[:index]], True
+        return [bar for _stamp, bar in prepared], False
 
     @staticmethod
     def _replacement_leg(order: Any, stop_price: float) -> dict[str, Any]:
@@ -1344,6 +1472,8 @@ class ExecutionLifecycleMixin:
                 })
                 if new_leg["status"] in _FILLED_ORDER_STATUSES:
                     row.update({"status": "closing", "closing_reason": "stop",
+                                "closing_exit_reason": "stop",
+                                "canonical_exit_reason": "stop",
                                 "closing_order_id": new_leg["order_id"],
                                 "closing_price": new_leg.get("filled_avg_price")})
             return current
@@ -1415,6 +1545,8 @@ class ExecutionLifecycleMixin:
         })
         if new_leg["status"] in _FILLED_ORDER_STATUSES:
             trade.update({"status": "closing", "closing_reason": "stop",
+                          "closing_exit_reason": "stop",
+                          "canonical_exit_reason": "stop",
                           "closing_order_id": new_id,
                           "closing_price": new_leg.get("filled_avg_price")})
         self._event("breakeven_stop_recovered", {
@@ -1449,6 +1581,10 @@ class ExecutionLifecycleMixin:
                 # it.  Sending anything here would double-close.
                 continue
             protected = _broker_protected(legs)
+            deadline = _runtime_exit_deadline(trade, now, force_flat)
+            deadline_ts = (float(deadline["timestamp"])
+                           if isinstance(deadline, Mapping) else None)
+            deadline_due = bool(deadline and deadline.get("due"))
             transition_reason = None
             transition_bar = None
             transition_exit = None
@@ -1478,7 +1614,8 @@ class ExecutionLifecycleMixin:
                         continue
                     legs = _leg_rows(trade)
                     protected = _broker_protected(legs)
-                bars = self._completed_exit_bars(trade, now, market_rows)
+                bars, discontinuity = self._completed_exit_bars(
+                    trade, now, market_rows, deadline_ts=deadline_ts)
                 if bars:
                     old_active_stop = self._number(trade.get("active_stop_price"))
                     stop_changed = False
@@ -1506,6 +1643,10 @@ class ExecutionLifecycleMixin:
                                      else "v4_exit_state_invalid"), {
                             "symbol": symbol, "error": str(exc)})
                         continue
+                    if discontinuity and transition_reason is None:
+                        transition_reason = "data_discontinuity"
+                        transition_exit = {"reason": transition_reason}
+                        trade["completed_bar_exit"] = dict(transition_exit)
                     if stop_changed and transition_reason is None and protected:
                         desired_stop = self._number(trade.get("active_stop_price"))
                         if desired_stop is None:
@@ -1535,6 +1676,13 @@ class ExecutionLifecycleMixin:
                         # broker leg is the exit; never fall through to the
                         # local protection poller and submit a second close.
                         continue
+                elif discontinuity:
+                    trade["completed_bar_exit"] = {
+                        "reason": "data_discontinuity"}
+                    transition_reason = "data_discontinuity"
+                    transition_exit = dict(trade["completed_bar_exit"])
+                    active[symbol] = trade
+                    changed = True
             exit_updates = self._empty_exit_observation()
             if (transition_reason is not None and
                     isinstance(transition_bar, Mapping) and
@@ -1562,8 +1710,15 @@ class ExecutionLifecycleMixin:
                                           trade.get("stop_price")))
             target = self._number(trade.get("target_price"))
             reason = None
-            if force_flat:
-                reason = "before_close"
+            if (transition_reason is not None and
+                    (transition_reason == "data_discontinuity" or
+                     not protected or deadline_due)):
+                # A completed-bar event before a later delayed-poll deadline
+                # owns the canonical cause.  When broker legs are live, only
+                # the due deadline justifies cancelling them and closing.
+                reason = transition_reason
+            elif deadline_due:
+                reason = str(deadline.get("reason"))
             elif not trade or stop is None or target is None:
                 reason = "protection_missing"
             elif legs and not protected and not _option_trade(trade):
@@ -1572,8 +1727,6 @@ class ExecutionLifecycleMixin:
                 self._event("unprotected_position", {"symbol": symbol,
                                                       "reason": "protective_legs_terminal"})
                 reason = "protection_missing"
-            elif transition_reason is not None and not protected:
-                reason = transition_reason
             elif protected:
                 # The broker owns the stop and target exits.  A local price
                 # crossing must not race its own resting legs.
@@ -1588,18 +1741,12 @@ class ExecutionLifecycleMixin:
                     reason = "stop"
                 elif target is not None and price <= target:
                     reason = "target"
-            if reason is None and _thesis_exit_expired(trade, now):
-                reason = "exit_before"
-            if reason is None and _hold_expired(trade, now):
-                # The validated contract's bounded hold is a time exit; it must
-                # fire without a tradable price rather than be reported as a
-                # market-data outage.
-                reason = "max_hold"
             if reason is None and price is None and not protected:
                 # Missing local prices are only an emergency while the local
                 # poller is the protection.
                 reason = "protection_data_unavailable"
             if reason:
+                exit_reason = canonical_exit_reason(reason)
                 try:
                     if not self._cancel_protective_legs(symbol, legs):
                         failed.append({"symbol": symbol, "reason": reason,
@@ -1609,6 +1756,8 @@ class ExecutionLifecycleMixin:
                         if isinstance(trade, Mapping) else None
                     attempt = int(prior_attempt) + 1 if prior_attempt is not None else 0
                     order = self._close_position(position, reason, attempt=attempt)
+                    # Preserve the watchdog's historical response shape; the
+                    # canonical cause is durable on the trade/order records.
                     closed.append({"symbol": symbol, "reason": reason})
                     if isinstance(trade, dict):
                         trade.update(exit_updates)
@@ -1617,6 +1766,9 @@ class ExecutionLifecycleMixin:
                                              self._client_id("close", {
                                                  "symbol": symbol, "reason": reason}))
                         trade.update({"status": "closing", "closing_reason": reason,
+                                      "closing_exit_reason": exit_reason,
+                                      "canonical_exit_reason": exit_reason,
+                                      "exit_reason_detail": exit_reason,
                                       "closing_price": close_fill,
                                       "closing_trigger_price": price,
                                       "closing_order_id": close_order_id,
@@ -1632,6 +1784,7 @@ class ExecutionLifecycleMixin:
                             "side": "sell" if str(_value(position, "side", "long")).lower()
                             in {"long", "buy"} else "buy",
                             "action": "close", "reason": reason,
+                            "exit_reason": exit_reason,
                             "attempt": attempt, "closing_attempt": attempt,
                             "updated_ts": time.time(),
                         }
@@ -1653,8 +1806,12 @@ class ExecutionLifecycleMixin:
                                 "active_stop_price", "breakeven_r",
                                 "breakeven_armed_at", "breakeven_armed_epoch",
                                 "last_completed_bar_at", "last_completed_bar_epoch",
-                                "trailing_stop_r", "target_mode", "target_lookback",
-                                "exit_before_ts",
+                                "trailing_stop_r", "target_mode",
+                                "target_reference", "target_lookback",
+                                "exit_before_minutes", "exit_before_ts",
+                                "hold_deadline_ts", "force_flat_at",
+                                "force_flat_ts", "entry_filled_at_ts",
+                                "exit_entry_bar_epoch",
                                 "desired_stop_price", "stop_replacement",
                                 "protective_legs"):
                         if key in trade:
@@ -1739,8 +1896,12 @@ class ExecutionLifecycleMixin:
                     # never add a second close for the same position.
                     continue
                 leg_id = str(leg.get("order_id"))
+                leg_reason = str(leg.get("role"))
+                exit_reason = canonical_exit_reason(leg_reason)
                 trade.update({
-                    "status": "closing", "closing_reason": str(leg.get("role")),
+                    "status": "closing", "closing_reason": leg_reason,
+                    "closing_exit_reason": exit_reason,
+                    "canonical_exit_reason": exit_reason,
                     "closing_price": self._number(
                         getattr(broker_leg, "filled_avg_price", None)),
                     "closing_order_id": leg_id, "updated_ts": time.time()})
@@ -1748,7 +1909,8 @@ class ExecutionLifecycleMixin:
                     "order_id": leg_id, "symbol": symbol,
                     "status": leg["status"], "qty": str(getattr(broker_leg, "qty", "")),
                     "side": str(getattr(broker_leg, "side", "")),
-                    "action": "close", "reason": str(leg.get("role")),
+                    "action": "close", "reason": leg_reason,
+                    "exit_reason": exit_reason,
                     "updated_ts": time.time()})
             if (not trade.get("closing_order_id") and not _broker_protected(legs) and
                     not _option_trade(trade) and
@@ -1798,6 +1960,9 @@ class ExecutionLifecycleMixin:
             if fill_price is None or broker_filled_qty < saved_filled_qty:
                 fill_price = saved_fill_price or fill_price
             fill_growth = filled_qty > saved_filled_qty
+            if (filled_qty > 0 and saved_filled_qty <= 0 and
+                    saved.get("filled_at_ts") is None):
+                saved["filled_at_ts"] = _order_fill_epoch(broker_order)
             saved.update({"status": status, "filled_qty": filled_qty,
                           "filled_avg_price": fill_price, "not_found_count": 0,
                           "updated_ts": time.time()})
@@ -1905,12 +2070,18 @@ class ExecutionLifecycleMixin:
             # win for protection and any close it just observed.
             if isinstance(refreshed_item, Mapping):
                 for key in ("protective_legs", "closing_order_id",
-                            "closing_reason", "closing_price", "rule_schema",
+                            "closing_reason", "closing_exit_reason",
+                            "canonical_exit_reason", "closing_price", "rule_schema",
                             "initial_stop_price", "active_stop_price",
                             "breakeven_r", "breakeven_armed_at",
                             "breakeven_armed_epoch", "last_completed_bar_at",
                             "last_completed_bar_epoch", "desired_stop_price",
-                            "stop_replacement"):
+                            "stop_replacement", "target_reference",
+                            "target_mode", "target_lookback",
+                            "trailing_stop_r", "exit_before_minutes",
+                            "exit_before_ts", "hold_deadline_ts",
+                            "force_flat_at", "force_flat_ts",
+                            "entry_filled_at_ts", "exit_entry_bar_epoch"):
                     if key in refreshed_item:
                         item[key] = deepcopy(refreshed_item[key])
             pending = next((row for row in pending_by_symbol.get(symbol, [])
@@ -2161,8 +2332,11 @@ class ExecutionLifecycleMixin:
                         "breakeven_r", "breakeven_armed_at",
                         "breakeven_armed_epoch", "last_completed_bar_at",
                         "last_completed_bar_epoch", "desired_stop_price",
-                        "trailing_stop_r", "target_mode", "target_lookback",
-                        "exit_before_ts",
+                        "trailing_stop_r", "target_mode", "target_reference",
+                        "target_lookback", "exit_before_minutes",
+                        "exit_before_ts", "hold_deadline_ts",
+                        "force_flat_at", "force_flat_ts",
+                        "entry_filled_at_ts", "exit_entry_bar_epoch",
                         "stop_replacement", "protective_legs"):
                 if key in trade:
                     row[key] = deepcopy(trade[key])
@@ -2255,6 +2429,9 @@ class ExecutionLifecycleMixin:
             "entry_price": self._number(trade.get("entry_price")),
             "exit_price": self._number(exit_price),
             "reason": trade.get("closing_reason", "broker_reconcile"),
+            "exit_reason": trade.get("canonical_exit_reason") or
+                           canonical_exit_reason(
+                               trade.get("closing_reason", "broker_reconcile")),
             "close_evidence": ("broker_order_fill"
                                if trade.get("closing_order_id") else
                                "local_trigger"),

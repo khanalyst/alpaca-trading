@@ -37,24 +37,40 @@ _NEW_YORK = ZoneInfo("America/New_York")
 
 def apply_partition_source(payload: dict, session_day: str,
                            partition_sources: Mapping[str, object] | None,
-                           *, row_number: int | None = None) -> dict:
+                           *, row_number: int | None = None,
+                           trusted_recorder: bool = False) -> dict:
     """Annotate a temporary view from recorder sidecar source metadata."""
-    if not isinstance(partition_sources, Mapping):
-        return payload
-    source = partition_sources.get(f"market-{session_day}.csv")
-    if source is None:
-        return payload
     label = f"row {row_number}" if row_number is not None else "row"
-    if not isinstance(source, Mapping):
-        raise ValueError(f"source metadata for {session_day} is malformed")
-    source_mode = str(source.get("source_mode") or "").strip().lower()
-    if source_mode != "historical_backfill":
-        raise ValueError(f"source metadata for {session_day} is unsupported")
     row_mode = str(payload.get("source_mode") or "").strip().lower()
-    if row_mode and row_mode != source_mode:
-        raise ValueError(
-            f"{label} conflicts with recorder source metadata for {session_day}")
-    payload["source_mode"] = source_mode
+    source = (partition_sources.get(f"market-{session_day}.csv")
+              if isinstance(partition_sources, Mapping) else None)
+    if source is not None:
+        if not isinstance(source, Mapping):
+            raise ValueError(f"source metadata for {session_day} is malformed")
+        source_mode = str(source.get("source_mode") or "").strip().lower()
+        if source_mode != "historical_backfill":
+            raise ValueError(f"source metadata for {session_day} is unsupported")
+        if row_mode and row_mode != source_mode:
+            raise ValueError(
+                f"{label} conflicts with recorder source metadata for {session_day}")
+        payload["source_mode"] = source_mode
+        return payload
+
+    # Recorder CSV rows predate the source_mode field.  Once the crash-safe
+    # historical sidecar has been consulted, an unmarked trusted partition is
+    # explicitly forward-observed so scheduled authorizing research never
+    # falls back to an ambiguous implicit mode.  A row that claims historical
+    # provenance without its durable marker is rejected rather than silently
+    # relabelled.
+    if trusted_recorder:
+        if row_mode == "historical_backfill":
+            raise ValueError(
+                f"{label} claims historical_backfill without recorder source "
+                f"metadata for {session_day}")
+        if row_mode and row_mode != "forward_observed":
+            raise ValueError(
+                f"{label} has unsupported recorder source_mode {row_mode!r}")
+        payload["source_mode"] = "forward_observed"
     return payload
 
 
@@ -311,6 +327,79 @@ def _partition_calendar_sidecars(source_paths: Sequence[Path],
     return result or None
 
 
+def _partition_source_sidecars(source_paths: Sequence[Path],
+                               recorded_root: Path | None) -> dict | None:
+    """Load crash-safe historical provenance markers for selected partitions.
+
+    The aggregate recorder index can lag a durable CSV after a crash.  Source
+    markers are therefore authoritative for the selected partitions and are
+    merged below with the index only after validating their exact filename,
+    schema, and referenced partition.
+    """
+    roots = []
+    if recorded_root is not None:
+        roots.append(Path(recorded_root) / "sessions")
+    roots.extend(path.parent for path in source_paths)
+    roots = list(dict.fromkeys(root.resolve() for root in roots
+                               if root.is_dir()))
+    sidecars: set[Path] = set()
+    for source in source_paths:
+        if _PARTITION_NAME.fullmatch(source.name) is None:
+            continue
+        for root in roots:
+            candidate = root / f"{source.name}.source.json"
+            if candidate.is_file():
+                sidecars.add(candidate)
+
+    result: dict[str, dict[str, str]] = {}
+    for path in sorted(sidecars):
+        root = path.parent
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read source provenance sidecar {path}") from exc
+        partition = payload.get("partition") if isinstance(payload, dict) else None
+        source_mode = payload.get("source_mode") if isinstance(payload, dict) else None
+        if (not isinstance(payload, dict) or
+                payload.get("schema") != "recorder-partition-source.v1" or
+                not isinstance(partition, str) or
+                path.name != partition + ".source.json" or
+                source_mode != "historical_backfill"):
+            raise ValueError(f"invalid source provenance sidecar {path}")
+        # Marker-before-partition ordering leaves a harmless orphan after a
+        # crash; never let that orphan classify a replacement future partition.
+        if not (root / partition).is_file():
+            continue
+        result[partition] = {"source_mode": source_mode}
+    return result or None
+
+
+def _assert_recorded_root_binding(source_paths: Sequence[Path],
+                                  recorded_root: Path | None) -> None:
+    """Ensure recorder metadata belongs to the exact selected corpus root."""
+    if recorded_root is None:
+        return
+    root = Path(recorded_root).resolve()
+    allowed_parents = {root, root / "sessions"}
+    mismatched = [path for path in source_paths
+                  if path.resolve().parent not in allowed_parents]
+    if mismatched:
+        names = ", ".join(str(path) for path in mismatched[:3])
+        raise ValueError(
+            "recorded_root does not contain selected source path(s): " + names)
+
+
+def _assert_single_recorder_root(source_paths: Sequence[Path]) -> None:
+    """Reject recorder source lists spanning roots with colliding basenames."""
+    roots = set()
+    for path in source_paths:
+        parent = path.resolve().parent
+        roots.add(parent.parent if parent.name == "sessions" else parent)
+    if len(roots) > 1:
+        raise ValueError(
+            "from_recorder source paths must belong to one corpus root")
+
+
 def _validate_csv_headers(paths: Sequence[Path], *, csv_mode: str,
                           identities: Mapping[Path, tuple[object, ...]]) -> list[str]:
     del csv_mode  # Kept in the helper signature to document the CSV contract.
@@ -368,10 +457,12 @@ def _config_and_sidecars(agent_config: Path | Mapping[str, object] | None,
                          source_paths: Sequence[Path]) -> tuple[bool, dict | None,
                                                                  dict | None]:
     """Load exact-calendar policy and optional recorder sidecars."""
-    if agent_config is None:
+    if agent_config is None and not from_recorder:
         return False, None, None
     try:
-        if isinstance(agent_config, Mapping):
+        if agent_config is None:
+            config = {}
+        elif isinstance(agent_config, Mapping):
             config = dict(agent_config)
         else:
             # When invoked as ``python /repo/deploy/research_dataset.py`` the
@@ -389,12 +480,15 @@ def _config_and_sidecars(agent_config: Path | Mapping[str, object] | None,
         raise ValueError("configuration validation failed: expected an object")
     session = config.get("session")
     required = (bool(session.get("require_exact_calendar", True))
-                if isinstance(session, dict) else True)
+                if isinstance(session, dict) else agent_config is not None)
 
     calendar = None
     partition_sources = None
     if from_recorder:
         sidecar_root = Path(recorded_root) if recorded_root is not None else None
+        if sidecar_root is None:
+            _assert_single_recorder_root(source_paths)
+        _assert_recorded_root_binding(source_paths, sidecar_root)
         if sidecar_root is None and source_paths:
             sidecar_root = source_paths[0].parent
         sidecar = (sidecar_root / ".recorder-index.json"
@@ -437,6 +531,15 @@ def _config_and_sidecars(agent_config: Path | Mapping[str, object] | None,
                             f"conflicting recorder calendar metadata for {day}")
                 aggregate[day] = marker
             calendar = aggregate
+        marker_sources = _partition_source_sidecars(source_paths, sidecar_root)
+        if marker_sources:
+            aggregate_sources = partition_sources or {}
+            for partition, marker in marker_sources.items():
+                # The tiny sidecar is committed with the partition before the
+                # aggregate index.  It therefore wins when an index rewrite
+                # was interrupted (including a stale forward projection).
+                aggregate_sources[partition] = marker
+            partition_sources = aggregate_sources
     return required, calendar, partition_sources
 
 
@@ -459,7 +562,8 @@ def _calendar_timestamp(value) -> datetime | None:
 def _apply_calendar(payload: dict, *, row_number: int,
                     calendar: dict | None,
                     partition_sources: Mapping[str, object] | None,
-                    required: bool) -> bool:
+                    required: bool,
+                    trusted_recorder: bool = False) -> bool:
     """Validate exact session metadata and report whether a row is usable.
 
     A row outside a valid exact session is a known legacy extended-hours row,
@@ -473,7 +577,9 @@ def _apply_calendar(payload: dict, *, row_number: int,
                 f"row {row_number} has no timestamp for exact calendar validation")
         return True
     day = stamp.astimezone(_NEW_YORK).date().isoformat()
-    apply_partition_source(payload, day, partition_sources, row_number=row_number)
+    apply_partition_source(
+        payload, day, partition_sources, row_number=row_number,
+        trusted_recorder=trusted_recorder)
 
     opened = _calendar_timestamp(payload.get("session_open"))
     closed = _calendar_timestamp(payload.get("session_close"))
@@ -638,11 +744,12 @@ def build_views(
                     continue
 
                 transformed_row += 1
-                if agent_config is not None:
+                if agent_config is not None or from_recorder:
                     in_session = _apply_calendar(
                         payload, row_number=transformed_row, calendar=calendar,
                         partition_sources=partition_sources,
-                        required=required_calendar)
+                        required=required_calendar,
+                        trusted_recorder=from_recorder)
                     if not in_session:
                         calendar_skipped[kind or "unknown"] += 1
                         if calendar_first_source_row is None:

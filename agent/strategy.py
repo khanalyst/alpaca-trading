@@ -73,6 +73,62 @@ def _default_force_flat(signal_ts: float, strategy: Mapping) -> str | None:
         return None
 
 
+def _exact_force_flat(decision: Mapping, symbol_snapshot: Mapping,
+                      cfg: Mapping, signal_ts: float) -> tuple[str | None,
+                                                               float | None,
+                                                               str | None]:
+    """Resolve an aware calendar boundary or fail closed when it is required."""
+    session_cfg = cfg.get("session", {}) if isinstance(cfg, Mapping) else {}
+    session_cfg = session_cfg if isinstance(session_cfg, Mapping) else {}
+    require_exact = session_cfg.get("require_exact_calendar", True)
+    raw_at = (decision.get("force_flat_at")
+              if decision.get("force_flat_at") is not None
+              else symbol_snapshot.get("force_flat_at"))
+    raw_ts = (decision.get("force_flat_ts")
+              if decision.get("force_flat_ts") is not None
+              else symbol_snapshot.get("force_flat_ts"))
+    if raw_at is None and raw_ts is None:
+        if require_exact:
+            return None, None, "exact session force-flat timestamp is unavailable"
+        fallback_cfg = {
+            "timezone": session_cfg.get("timezone", "America/New_York"),
+            "force_flat_minutes_before_close": session_cfg.get(
+                "force_flat_minutes_before_close", 5),
+        }
+        raw_at = _default_force_flat(signal_ts, fallback_cfg)
+        if raw_at is None:
+            return None, None, "session force-flat timestamp is unavailable"
+    parsed_at = None
+    if raw_at is not None:
+        try:
+            parsed_at = datetime.fromisoformat(
+                str(raw_at).strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return None, None, "session force-flat timestamp is invalid"
+        if parsed_at.tzinfo is None or parsed_at.utcoffset() is None:
+            return None, None, "session force-flat timestamp must include a timezone"
+    parsed_ts = None
+    if raw_ts is not None:
+        if isinstance(raw_ts, bool):
+            return None, None, "session force-flat timestamp is invalid"
+        try:
+            parsed_ts = float(raw_ts)
+        except (TypeError, ValueError, OverflowError):
+            return None, None, "session force-flat timestamp is invalid"
+        if not math.isfinite(parsed_ts):
+            return None, None, "session force-flat timestamp is invalid"
+    if parsed_at is not None:
+        at_ts = parsed_at.timestamp()
+        if parsed_ts is not None and abs(parsed_ts - at_ts) > 1e-6:
+            return None, None, "session force-flat timestamps disagree"
+        parsed_ts = at_ts
+    if parsed_ts is None:
+        return None, None, "session force-flat timestamp is unavailable"
+    normalized_at = (parsed_at.isoformat() if parsed_at is not None else
+                     datetime.fromtimestamp(parsed_ts, timezone.utc).isoformat())
+    return normalized_at, parsed_ts, None
+
+
 def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
                            cfg: Mapping):
     """Validate a content-addressed autonomous rule signal for paper risk."""
@@ -121,14 +177,10 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
                        "variant_id": variant_id, "symbol": decision.get("symbol"),
                        "direction": direction, "setup_type": setup_type,
                        "session": session})
-    force_flat_at = (decision.get("force_flat_at") or
-                     symbol_snapshot.get("force_flat_at") or
-                     _default_force_flat(signal_ts, strategy))
-    try:
-        force_flat_ts = datetime.fromisoformat(str(force_flat_at)).timestamp() \
-            if force_flat_at else None
-    except (TypeError, ValueError, OverflowError):
-        force_flat_ts = None
+    force_flat_at, force_flat_ts, force_flat_error = _exact_force_flat(
+        decision, symbol_snapshot, cfg, signal_ts)
+    if force_flat_error is not None:
+        return None, force_flat_error
     # The simulated entry is the bar after the signal bar; the runtime holds
     # for the same bounded number of bars beyond it.
     try:

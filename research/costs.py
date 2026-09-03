@@ -25,7 +25,7 @@ import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from .market_data import record_is_available
+from .market_data import (record_is_available, replay_record_is_available)
 
 # The shipped runtime schedule assumes a conservative quoted spread for the
 # configured ETF universe, including its less liquid members, not only the
@@ -773,6 +773,15 @@ class CostModel:
 
 BAR = "bar"
 QUOTE = "quote"
+# Evidence labels are intentionally distinct: historical backfill identifies
+# source provenance, while bar fallback identifies a forward source priced
+# from bars under an explicitly non-strict policy.  Both are diagnostic-only,
+# but callers must not conflate the two in telemetry or source validation.
+DIAGNOSTIC_HISTORICAL_BACKFILL = "diagnostic_historical_backfill"
+DIAGNOSTIC_BAR_FALLBACK = "diagnostic_bar_fallback"
+DIAGNOSTIC_EVIDENCE_MODES = frozenset({
+    DIAGNOSTIC_HISTORICAL_BACKFILL, DIAGNOSTIC_BAR_FALLBACK,
+})
 # A broker-resident stop/target can be observed as touched by a completed
 # exact-feed bar, but it has no point-in-time executable quote at the trigger.
 # Keep this source distinct from both a diagnostic bar fallback and a quote so
@@ -798,6 +807,9 @@ class QuoteFill:
     as_of: datetime
     provider: str
     feed: str
+    # Historical rows are only visible through an explicit diagnostic policy.
+    # Keep a default so older positional consumers remain source-compatible.
+    source_mode: str = "forward_observed"
 
 
 def resting_bracket_fill_claim(*, exit_reason: Any, exit_reference: Any,
@@ -954,9 +966,9 @@ def validate_resting_bracket_fill(row: Mapping[str, Any], *,
     entry_provider = str(row.get("entry_provider") or "").strip()
     if entry_feed != feed or not entry_provider:
         return "resting_bracket_entry_provenance"
-    if str(row.get("evidence_mode") or "forward_observed").strip().lower() == \
-            "diagnostic_historical_backfill":
-        return "diagnostic_historical_backfill"
+    evidence_mode = str(row.get("evidence_mode") or "forward_observed").strip().lower()
+    if evidence_mode in DIAGNOSTIC_EVIDENCE_MODES:
+        return evidence_mode
     # Every bar participating in the claim must carry explicit exact-feed
     # identity.  Missing metadata is not upgraded from the quote identity.
     for leg in ("signal_bar", "entry_bar", "exit_bar"):
@@ -994,11 +1006,13 @@ def _quote_fill_from_record(quote: Any, *, side: str) -> QuoteFill | None:
         as_of = identity.as_of
         provider = str(identity.provider).strip()
         feed = str(identity.feed).strip()
+        source_mode = str(getattr(identity, "source_mode", "forward_observed") or
+                          "forward_observed").strip().lower()
     except (AttributeError, TypeError, ValueError):
         return None
     if not provider or not feed:
         return None
-    return QuoteFill(price, timestamp, as_of, provider, feed)
+    return QuoteFill(price, timestamp, as_of, provider, feed, source_mode)
 
 
 def cost_model_for_vehicle(costs: Any, vehicle: str) -> CostModel:
@@ -1365,10 +1379,10 @@ class SQLiteQuoteIndexDescriptor:
     symbols: tuple[tuple[str, int], ...]
     count: int
     max_session_date: str | None
-    # Version 1 indexes predate the local observation timestamp.  The field is
-    # optional so descriptors serialized by older workers remain loadable;
-    # the reader still inspects the SQLite schema before selecting columns.
-    schema_version: int = 2
+    # Version 1 indexes predate local observation metadata and version 3 adds
+    # the source-mode label.  The reader inspects the SQLite schema so older
+    # descriptors remain loadable without a destructive migration.
+    schema_version: int = 3
 
 
 class SQLiteQuoteIndex:
@@ -1382,7 +1396,7 @@ class SQLiteQuoteIndex:
     """
 
     _BATCH_SIZE = 10_000
-    _SCHEMA_VERSION = 2
+    _SCHEMA_VERSION = 3
 
     def __init__(self, directory: str | Path | None = None):
         import sqlite3
@@ -1400,24 +1414,60 @@ class SQLiteQuoteIndex:
         self._db.execute("PRAGMA journal_mode=OFF")
         self._db.execute("PRAGMA synchronous=OFF")
         self._db.execute("PRAGMA temp_store=FILE")
-        self._db.execute("""
-            CREATE TABLE quotes (
-                symbol_id INTEGER NOT NULL,
-                timestamp REAL NOT NULL,
-                as_of REAL NOT NULL,
-                observed_at REAL NOT NULL,
-                bid REAL NOT NULL,
-                ask REAL NOT NULL,
-                provider TEXT NOT NULL,
-                feed TEXT NOT NULL,
-                session_day INTEGER NOT NULL,
-                sequence INTEGER NOT NULL,
-                PRIMARY KEY (symbol_id, timestamp, sequence)
-            ) WITHOUT ROWID
-        """)
+        existing = {str(row[1]) for row in self._db.execute(
+            "PRAGMA table_info(quotes)")}
+        if existing:
+            stored_rows = int(self._db.execute(
+                "SELECT COUNT(*) FROM quotes").fetchone()[0])
+            if stored_rows:
+                # The symbol-id map is deliberately carried by the finalized
+                # descriptor rather than duplicated in SQLite.  Reopening a
+                # populated index for writing therefore cannot reconstruct
+                # which symbol each integer names.  Starting from an empty
+                # in-memory map would silently hide old rows and may reuse an
+                # existing id for a different symbol, corrupting quote
+                # resolution.  Existing indexes must be consumed through
+                # ``open_read_only(descriptor)``; fail before migrating or
+                # mutating their schema.
+                self._db.close()
+                raise CostError(
+                    "a populated quote index cannot be reopened for writing; "
+                    "use open_read_only with its descriptor")
+            # A caller may reuse a finalized index directory.  Migrate only
+            # an empty shell.  v1/v2 data-bearing indexes must be opened with
+            # their descriptor so their symbol map remains authoritative.
+            if "observed_at" not in existing:
+                self._db.execute(
+                    "ALTER TABLE quotes ADD COLUMN observed_at REAL NOT NULL DEFAULT 0")
+                self._db.execute("UPDATE quotes SET observed_at=as_of")
+                existing.add("observed_at")
+            if "source_mode" not in existing:
+                self._db.execute(
+                    "ALTER TABLE quotes ADD COLUMN source_mode TEXT NOT NULL "
+                    "DEFAULT 'forward_observed'")
+                existing.add("source_mode")
+            self._db.commit()
+        else:
+            self._db.execute("""
+                CREATE TABLE quotes (
+                    symbol_id INTEGER NOT NULL,
+                    timestamp REAL NOT NULL,
+                    as_of REAL NOT NULL,
+                    observed_at REAL NOT NULL,
+                    bid REAL NOT NULL,
+                    ask REAL NOT NULL,
+                    provider TEXT NOT NULL,
+                    feed TEXT NOT NULL,
+                    source_mode TEXT NOT NULL DEFAULT 'forward_observed',
+                    session_day INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    PRIMARY KEY (symbol_id, timestamp, sequence)
+                ) WITHOUT ROWID
+            """)
         self._has_observed_at = True
+        self._has_source_mode = True
         self._symbols: dict[str, int] = {}
-        self._pending: list[tuple[int, float, float, float, float, float, str, str, int, int]] = []
+        self._pending: list[tuple[int, float, float, float, float, float, str, str, str, int, int]] = []
         self._sequence = 0
         self._count = 0
         self._max_session_day: int | None = None
@@ -1455,6 +1505,9 @@ class SQLiteQuoteIndex:
         obj._has_observed_at = (
             "observed_at" in columns and
             int(getattr(descriptor, "schema_version", cls._SCHEMA_VERSION)) >= 2)
+        obj._has_source_mode = (
+            "source_mode" in columns and
+            int(getattr(descriptor, "schema_version", cls._SCHEMA_VERSION)) >= 3)
         obj._symbols = dict(descriptor.symbols)
         obj._pending = []
         obj._sequence = 0
@@ -1477,7 +1530,8 @@ class SQLiteQuoteIndex:
             count=self._count,
             max_session_date=(None if self.max_session_date is None
                               else self.max_session_date.isoformat()),
-            schema_version=(self._SCHEMA_VERSION if self._has_observed_at else 1),
+            schema_version=(self._SCHEMA_VERSION if self._has_source_mode else
+                            (2 if self._has_observed_at else 1)),
         )
 
     def add(self, quote: Any) -> None:
@@ -1495,12 +1549,16 @@ class SQLiteQuoteIndex:
         observed_at = float(quote.identity.observed_at.timestamp())
         provider = str(quote.identity.provider).strip()
         feed = str(quote.identity.feed).strip()
+        source_mode = str(getattr(quote.identity, "source_mode", "forward_observed") or
+                          "forward_observed").strip().lower()
         if not provider or not feed:
             raise CostError("quote provider and feed are required")
+        if source_mode not in {"forward_observed", "historical_backfill"}:
+            raise CostError("quote source_mode is unsupported")
         session_day = int(quote.session_date.toordinal())
         self._pending.append((
             symbol_id, timestamp, as_of, observed_at, float(quote.bid), float(quote.ask),
-            provider, feed, session_day, self._sequence,
+            provider, feed, source_mode, session_day, self._sequence,
         ))
         self._sequence += 1
         self._count += 1
@@ -1514,8 +1572,11 @@ class SQLiteQuoteIndex:
             return
         if self._read_only:
             raise RuntimeError("read-only quote index cannot write")
+        columns = ("symbol_id, timestamp, as_of, observed_at, bid, ask, "
+                   "provider, feed, source_mode, session_day, sequence")
         self._db.executemany(
-            "INSERT INTO quotes VALUES (?,?,?,?,?,?,?,?,?,?)", self._pending)
+            f"INSERT INTO quotes ({columns}) VALUES "
+            f"({','.join('?' for _ in range(11))})", self._pending)
         self._db.commit()
         self._pending.clear()
 
@@ -1533,9 +1594,27 @@ class SQLiteQuoteIndex:
         return (date.fromordinal(self._max_session_day)
                 if self._max_session_day is not None else None)
 
+    def source_mode_counts(self) -> dict[str, int]:
+        """Return provenance counts for every quote retained by the index."""
+        if self._closed:
+            raise RuntimeError("quote index is closed")
+        if not self._read_only:
+            self._flush()
+        source_column = ("source_mode" if self._has_source_mode else
+                         "'forward_observed'")
+        rows = self._db.execute(
+            f"SELECT {source_column} AS source_mode, COUNT(*) "
+            "FROM quotes GROUP BY source_mode ORDER BY source_mode"
+        )
+        return {
+            str(mode or "forward_observed").strip().lower(): int(count)
+            for mode, count in rows
+        }
+
     def quote_fill_record(self, *, symbol: str, at: datetime, side: str,
                    max_age_seconds: float | None = 30.0,
-                   session_date: date | None = None) -> QuoteFill | None:
+                   session_date: date | None = None,
+                   allow_historical_backfill_diagnostics: bool = False) -> QuoteFill | None:
         """Resolve the latest-visible quote, retaining its provenance."""
         if self._closed or self._count == 0:
             return None
@@ -1549,22 +1628,29 @@ class SQLiteQuoteIndex:
         session_day = (None if session_date is None else
                        int(session_date.toordinal()))
         observed_column = "observed_at" if self._has_observed_at else "as_of"
+        source_column = "source_mode" if self._has_source_mode else "'forward_observed'"
         cursor = self._db.execute(
             f"""SELECT timestamp, as_of, {observed_column} AS observed_at,
-                        bid, ask, provider, feed, session_day
+                        bid, ask, provider, feed, {source_column} AS source_mode,
+                        session_day
                  FROM quotes
                 WHERE symbol_id=? AND timestamp<=?
                 ORDER BY timestamp DESC, sequence DESC""",
             (symbol_id, at_ts),
         )
-        for timestamp, as_of, observed_at, bid, ask, provider, feed, row_session_day in cursor:
+        for timestamp, as_of, observed_at, bid, ask, provider, feed, source_mode, row_session_day in cursor:
             age = at_ts - float(timestamp)
             if age > limit:
                 # Rows are newest first, so all remaining rows are stale.
                 break
             if session_day is not None and int(row_session_day) != session_day:
                 continue
-            if max(float(timestamp), float(as_of), float(observed_at)) > at_ts:
+            mode = str(source_mode or "forward_observed").strip().lower()
+            if mode == "historical_backfill" and allow_historical_backfill_diagnostics:
+                visible_at = max(float(timestamp), float(as_of))
+            else:
+                visible_at = max(float(timestamp), float(as_of), float(observed_at))
+            if visible_at > at_ts:
                 continue
             price = float(ask if side == "buy" else bid)
             if not math.isfinite(price) or price <= 0:
@@ -1573,16 +1659,19 @@ class SQLiteQuoteIndex:
                 price=price,
                 timestamp=datetime.fromtimestamp(float(timestamp), timezone.utc),
                 as_of=datetime.fromtimestamp(float(as_of), timezone.utc),
-                provider=str(provider), feed=str(feed),
+                provider=str(provider), feed=str(feed), source_mode=mode,
             )
         return None
 
     def quote_fill(self, *, symbol: str, at: datetime, side: str,
                    max_age_seconds: float | None = 30.0,
-                   session_date: date | None = None) -> float | None:
+                   session_date: date | None = None,
+                   allow_historical_backfill_diagnostics: bool = False) -> float | None:
         record = self.quote_fill_record(symbol=symbol, at=at, side=side,
                                         max_age_seconds=max_age_seconds,
-                                        session_date=session_date)
+                                        session_date=session_date,
+                                        allow_historical_backfill_diagnostics=(
+                                            allow_historical_backfill_diagnostics))
         return None if record is None else record.price
 
     def close(self) -> None:
@@ -1622,7 +1711,8 @@ def index_quotes(quotes: Iterable[Any] | None) -> dict[str, list] | SQLiteQuoteI
 
 def quote_fill(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | None, *, symbol: str,
                at: datetime, side: str, max_age_seconds: float | None = 30.0,
-               session_date: date | None = None) -> float | None:
+               session_date: date | None = None,
+               allow_historical_backfill_diagnostics: bool = False) -> float | None:
     """Return the executable side of the last quote visible at a fill instant.
 
     ``None`` means no quote was recorded for that instant; the caller must
@@ -1630,14 +1720,17 @@ def quote_fill(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | None, *
     """
     record = quote_fill_record(indexed, symbol=symbol, at=at, side=side,
                                max_age_seconds=max_age_seconds,
-                               session_date=session_date)
+                               session_date=session_date,
+                               allow_historical_backfill_diagnostics=(
+                                   allow_historical_backfill_diagnostics))
     return None if record is None else record.price
 
 
 def quote_fill_record(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | None,
                       *, symbol: str, at: datetime, side: str,
                       max_age_seconds: float | None = 30.0,
-                      session_date: date | None = None) -> QuoteFill | None:
+                      session_date: date | None = None,
+                      allow_historical_backfill_diagnostics: bool = False) -> QuoteFill | None:
     """Return the latest visible quote and preserve feed/provider identity."""
     if indexed is None:
         return None
@@ -1645,7 +1738,9 @@ def quote_fill_record(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | 
     if callable(resolver):
         return resolver(symbol=symbol, at=at, side=side,
                         max_age_seconds=max_age_seconds,
-                        session_date=session_date)
+                        session_date=session_date,
+                        allow_historical_backfill_diagnostics=(
+                            allow_historical_backfill_diagnostics))
     if not indexed:
         return None
     rows = indexed.get(str(symbol).upper())
@@ -1656,7 +1751,10 @@ def quote_fill_record(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | 
         if quote.timestamp > at:
             break
         identity = getattr(quote, "identity", None)
-        if identity is None or not record_is_available(quote, at):
+        if identity is None or not replay_record_is_available(
+                quote, at,
+                allow_historical_backfill_diagnostics=(
+                    allow_historical_backfill_diagnostics)):
             continue
         if session_date is not None and getattr(quote, "session_date", None) != session_date:
             continue
@@ -1676,6 +1774,8 @@ __all__ = [
     "check_entry_slippage", "DEFAULT_FEE_BPS",
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_SPREAD_BPS", "QUOTE", "RESTING_BRACKET",
+    "DIAGNOSTIC_HISTORICAL_BACKFILL", "DIAGNOSTIC_BAR_FALLBACK",
+    "DIAGNOSTIC_EVIDENCE_MODES",
     "RESTING_BRACKET_FILL_SCHEMA", "RESTING_BRACKET_SCHEMA",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS",
     "COST_STRESS_SCENARIOS_BPS", "STRESSED_COST_SCHEMA", "STRESSED_COST_BASIS",

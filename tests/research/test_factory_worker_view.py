@@ -49,6 +49,7 @@ class FactoryWorkerViewTests(unittest.TestCase):
                 "feed": row.get("feed", "sip"), "symbol": row["symbol"],
                 "timestamp": row["timestamp"], "as_of": row["as_of"],
                 "observed_at": row.get("observed_at", row["as_of"]),
+                "source_mode": row.get("source_mode", "forward_observed"),
                 "bid": float(row["close"]) - .01,
                 "ask": float(row["close"]) + .01,
             }

@@ -154,6 +154,27 @@ _V4_BOUNDS = {
 _EXTRA_CONFIRMATIONS = tuple(name for name in CONFIRMATIONS if name != "none")
 MAX_CONFIRMATIONS = len(_EXTRA_CONFIRMATIONS)
 
+# Durable, cross-lane exit causes.  Runtime keeps its historical operational
+# close reasons (``before_close``, ``max_hold``, ``exit_before``) and research
+# keeps the long-standing ``exit_reason`` aliases (``time``, ``exit_before``),
+# but both publish one of these values as ``canonical_exit_reason``.
+EXIT_REASON_STOP = "stop"
+EXIT_REASON_TARGET = "target"
+EXIT_REASON_MAX_HOLD = "max_hold"
+EXIT_REASON_THESIS_DEADLINE = "thesis_deadline"
+EXIT_REASON_SESSION_FORCE_FLAT = "session_force_flat"
+EXIT_REASON_DATA_DISCONTINUITY = "data_discontinuity"
+EXIT_REASON_UNKNOWN = "unknown"
+CANONICAL_EXIT_REASONS = frozenset({
+    EXIT_REASON_STOP,
+    EXIT_REASON_TARGET,
+    EXIT_REASON_MAX_HOLD,
+    EXIT_REASON_THESIS_DEADLINE,
+    EXIT_REASON_SESSION_FORCE_FLAT,
+    EXIT_REASON_DATA_DISCONTINUITY,
+    EXIT_REASON_UNKNOWN,
+})
+
 # Fields that affect the executable signal or its bounded exits.  ``schema``
 # is deliberately not part of this set: v1 and v2 are aliases when every v2
 # extension is at its documented no-op default.
@@ -189,17 +210,29 @@ SESSION_ACCUMULATING_FAMILIES = frozenset(("vwap_reversion", "vwap_trend"))
 # a single interval, so the safe representation is the full session prefix.
 OPENING_ANCHORED_FAMILIES = frozenset((
     "opening_range_breakout", "opening_range_fade", "opening_drive"))
-# Trailing completed bars each remaining family reads, beyond the prefix
-# ``evaluate_rule_signal`` always consumes.  Opening-anchored families are
-# absent on purpose: their window is selected by clock time and is already
-# guarded by an explicit minimum-bar count, not by adjacency.
+# The causal prefix each family reads before it can evaluate its predicate.
+# These counts are intentionally family-specific: a mean-reversion rule uses
+# exactly ``lookback`` closes, while momentum/breakout predicates compare the
+# current close with a prior lookback and therefore consume ``lookback + 1``
+# bars.  Opening/VWAP families retain session-anchored continuity below, but
+# still have an exact causal maturity count here.
 _FAMILY_FEATURE_BARS = {
-    "momentum_continuation": lambda spec: spec["lookback"] + 2,
+    "opening_range_breakout": lambda spec: spec["range_minutes"] + 1,
+    "opening_range_fade": lambda spec: spec["range_minutes"] + 1,
+    # The predicate compares the current close with closes[-lookback - 1]
+    # (and the immediately preceding close), so a lookback of N consumes
+    # exactly N + 1 completed bars.  Counting an additional bar here delayed
+    # factory evaluation past a valid first signal while the runtime evaluator
+    # correctly emitted it.
+    "momentum_continuation": lambda spec: spec["lookback"] + 1,
     "mean_reversion": lambda spec: spec["lookback"],
     "trend_pullback": lambda spec: spec["slow_lookback"],
     "volatility_breakout": lambda spec: spec["lookback"] + 1,
     "volume_breakout": lambda spec: spec["lookback"] + 1,
+    "vwap_reversion": lambda spec: spec["lookback"] + 1,
+    "vwap_trend": lambda spec: spec["lookback"] + 1,
     "range_expansion": lambda spec: spec["lookback"] + 1,
+    "opening_drive": lambda spec: spec["range_minutes"] + 1,
     "cross_sectional_residual": lambda spec: spec["lookback"] + 1,
 }
 _CONFIRMATION_FEATURE_BARS = {
@@ -209,11 +242,48 @@ _CONFIRMATION_FEATURE_BARS = {
 }
 
 
+def _causal_maturity_bars(spec: Mapping[str, Any]) -> int:
+    """Return the exact completed-bar prefix required by a normalized spec."""
+    family = str(spec["family"])
+    resolve = _FAMILY_FEATURE_BARS.get(family)
+    # ``validate_rule_spec`` bounds families to the table above.  Keep a
+    # conservative fallback for forward-compatible callers that add a family
+    # before adding its explicit dependency declaration.
+    needed = int(resolve(spec) if resolve is not None
+                 else spec["lookback"] + 1)
+    # ATR is an active evaluator dependency for every family, even where it is
+    # wider or narrower than the family's own predicate window.
+    needed = max(needed, int(spec["atr_period"]) + 1)
+    confirmations = {str(spec.get("confirmation") or "none")}
+    confirmations.update(str(item) for item in spec.get("confirmations") or ())
+    for kind in confirmations:
+        resolve = _CONFIRMATION_FEATURE_BARS.get(kind)
+        if resolve is not None:
+            needed = max(needed, int(resolve(spec)))
+    # A rolling-mean v4 target is frozen from the final T completed closes.
+    # Other target modes do not consume ``target_lookback`` as a trailing
+    # dependency (session VWAP is session anchored instead).
+    if (spec.get("target_mode") == "rolling_mean" and
+            spec.get("target_lookback") is not None):
+        needed = max(needed, int(spec["target_lookback"]))
+    return max(1, int(needed))
+
+
+def causal_maturity_bars(value: Mapping[str, Any]) -> int:
+    """Return the exact completed-bar prefix required for causal evaluation.
+
+    This is the single dependency contract shared by the executable evaluator,
+    replay maturity, and runtime gates.  It deliberately does not add an
+    unrelated ``lookback + 1`` requirement to every family.
+    """
+    return _causal_maturity_bars(validate_rule_spec(value))
+
+
 def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     """Trailing completed bars :func:`evaluate_rule_signal` reads for a spec.
 
-    ``None`` means the family retains a session-open anchor and cannot be
-    represented by one bounded trailing window.
+    ``None`` means the family or its active target retains a session-open
+    anchor and cannot be represented by one bounded trailing window.
 
     Replay uses this to require adjacency over exactly the bars a signal is
     computed from.  A fixed lookback silently stretched across an outage is a
@@ -223,20 +293,10 @@ def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     """
     spec = validate_rule_spec(value)
     family = str(spec["family"])
-    if family in SESSION_ACCUMULATING_FAMILIES | OPENING_ANCHORED_FAMILIES:
+    if (family in SESSION_ACCUMULATING_FAMILIES | OPENING_ANCHORED_FAMILIES or
+            spec.get("target_mode") == "session_vwap"):
         return None
-    # The prefix ``evaluate_rule_signal`` consumes before dispatching a family.
-    needed = max(spec["lookback"] + 1, spec["atr_period"] + 1)
-    resolve = _FAMILY_FEATURE_BARS.get(family)
-    if resolve is not None:
-        needed = max(needed, resolve(spec))
-    confirmations = {str(spec.get("confirmation") or "none")}
-    confirmations.update(str(item) for item in spec.get("confirmations") or ())
-    for kind in confirmations:
-        resolve = _CONFIRMATION_FEATURE_BARS.get(kind)
-        if resolve is not None:
-            needed = max(needed, resolve(spec))
-    return int(needed)
+    return _causal_maturity_bars(spec)
 
 
 def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
@@ -677,6 +737,60 @@ def thesis_exit_deadline(entry_ts: Any, spec: Mapping[str, Any]) -> float | None
     return close.timestamp() - minutes * 60.0
 
 
+def canonical_exit_reason(reason: Any, *,
+                          discontinuity: bool = False) -> str:
+    """Normalize research and runtime exit aliases to one durable cause."""
+    if discontinuity:
+        return EXIT_REASON_DATA_DISCONTINUITY
+    normalized = str(reason or "").strip().lower().replace("-", "_")
+    aliases = {
+        "stop": EXIT_REASON_STOP,
+        "target": EXIT_REASON_TARGET,
+        "time": EXIT_REASON_MAX_HOLD,
+        "time_expiry": EXIT_REASON_MAX_HOLD,
+        "max_hold": EXIT_REASON_MAX_HOLD,
+        "exit_before": EXIT_REASON_THESIS_DEADLINE,
+        "thesis_deadline": EXIT_REASON_THESIS_DEADLINE,
+        "before_close": EXIT_REASON_SESSION_FORCE_FLAT,
+        "force_flat": EXIT_REASON_SESSION_FORCE_FLAT,
+        "session_force_flat": EXIT_REASON_SESSION_FORCE_FLAT,
+        "discontinuity": EXIT_REASON_DATA_DISCONTINUITY,
+        "data_discontinuity": EXIT_REASON_DATA_DISCONTINUITY,
+    }
+    return aliases.get(normalized, EXIT_REASON_UNKNOWN)
+
+
+def exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
+                  force_flat_ts: Any = None) -> dict[str, Any] | None:
+    """Return the earliest bounded exit deadline and its canonical cause.
+
+    Equal timestamps use runtime precedence: the session safety flatten wins,
+    then the authored thesis deadline, then the ordinary maximum hold.
+    """
+    held = spec.get("max_hold_bars") if isinstance(spec, Mapping) else None
+    candidates: list[tuple[float, int, str]] = []
+    if held is not None:
+        lower, upper, _ = _BOUNDS["max_hold_bars"]
+        if isinstance(held, bool) or not isinstance(held, int):
+            raise RuleSpecError("rule_spec.max_hold_bars must be an integer")
+        if not lower <= held <= upper:
+            raise RuleSpecError(
+                f"rule_spec.max_hold_bars must be between {lower:g} and {upper:g}")
+        start = _epoch(entry_ts, "entry timestamp")
+        candidates.append((start + (held + 1) * BAR_SECONDS, 2,
+                           EXIT_REASON_MAX_HOLD))
+    thesis = thesis_exit_deadline(entry_ts, spec)
+    if thesis is not None:
+        candidates.append((thesis, 1, EXIT_REASON_THESIS_DEADLINE))
+    if force_flat_ts is not None:
+        candidates.append((_epoch(force_flat_ts, "force-flat timestamp"), 0,
+                           EXIT_REASON_SESSION_FORCE_FLAT))
+    if not candidates:
+        return None
+    timestamp, _priority, reason = min(candidates, key=lambda item: (item[0], item[1]))
+    return {"timestamp": timestamp, "reason": reason}
+
+
 def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
                   force_flat_ts: Any = None) -> float | None:
     """Absolute epoch second by which a bounded rule position must be flat.
@@ -685,30 +799,11 @@ def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
     after the signal bar.  The position is held for at most `max_hold_bars`
     further one-minute bars, so the deadline is the close of the last
     permitted bar.  Research simulation and live execution share this one
-    definition; a session force-flat always clamps it.  A spec without
-    `max_hold_bars` has no time exit.
+    definition; a session force-flat always clamps it.  A spec without any
+    bounded exit has no deadline.
     """
-    held = spec.get("max_hold_bars") if isinstance(spec, Mapping) else None
-    if held is None:
-        deadline = thesis_exit_deadline(entry_ts, spec)
-        if force_flat_ts is not None:
-            force_flat = _epoch(force_flat_ts, "force-flat timestamp")
-            deadline = force_flat if deadline is None else min(deadline, force_flat)
-        return deadline
-    lower, upper, _ = _BOUNDS["max_hold_bars"]
-    if isinstance(held, bool) or not isinstance(held, int):
-        raise RuleSpecError("rule_spec.max_hold_bars must be an integer")
-    if not lower <= held <= upper:
-        raise RuleSpecError(
-            f"rule_spec.max_hold_bars must be between {lower:g} and {upper:g}")
-    start = _epoch(entry_ts, "entry timestamp")
-    deadline = start + (held + 1) * BAR_SECONDS
-    thesis = thesis_exit_deadline(entry_ts, spec)
-    if thesis is not None:
-        deadline = min(deadline, thesis)
-    if force_flat_ts is not None:
-        deadline = min(deadline, _epoch(force_flat_ts, "force-flat timestamp"))
-    return deadline
+    resolved = exit_deadline(entry_ts, spec, force_flat_ts=force_flat_ts)
+    return None if resolved is None else float(resolved["timestamp"])
 
 
 def _epoch(value: Any, field: str) -> float:
@@ -1617,7 +1712,7 @@ def _evaluate_rule_signal_staged(
                            "passed": bool(passed), "reason": str(reason)})
         return passed
 
-    needed = max(spec["lookback"] + 1, spec["atr_period"] + 1)
+    needed = _causal_maturity_bars(spec)
     if not stage("minimum_prefix", len(bars) >= needed,
                  "passed" if len(bars) >= needed else "insufficient_prefix"):
         return None, stages, family_metadata
@@ -1858,7 +1953,12 @@ __all__ = [
     "BAR_SECONDS", "CONFIRMATIONS", "CROSS_SECTIONAL_BENCHMARK",
     "CROSS_SECTIONAL_DEFAULT_ELIGIBLE_SYMBOLS",
     "CROSS_SECTIONAL_MAX_ELIGIBLE_SYMBOLS",
+    "CANONICAL_EXIT_REASONS",
     "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
+    "EXIT_REASON_DATA_DISCONTINUITY", "EXIT_REASON_MAX_HOLD",
+    "EXIT_REASON_SESSION_FORCE_FLAT", "EXIT_REASON_STOP",
+    "EXIT_REASON_TARGET", "EXIT_REASON_THESIS_DEADLINE",
+    "EXIT_REASON_UNKNOWN",
     "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
            "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "RULE_SCHEMA_V4", "SESSION_MINUTES",
@@ -1866,11 +1966,12 @@ __all__ = [
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "OPENING_ANCHORED_FAMILIES",
            "entry_window_bounds", "session_minutes",
-           "feature_window_bars", "rule_behavior_identity",
+           "causal_maturity_bars", "feature_window_bars", "rule_behavior_identity",
            "cross_sectional_symbol_eligibility",
            "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",
-    "RuleSpecError", "breakeven_stop_price", "completed_bar_exit_transition",
+    "RuleSpecError", "breakeven_stop_price", "canonical_exit_reason",
+    "completed_bar_exit_transition", "exit_deadline",
     "evaluate_rule_signal", "evaluate_rule_signal_trace",
     "evaluate_rule_signal_metadata", "frozen_target_reference",
     "initialize_exit_state",

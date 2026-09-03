@@ -21,23 +21,48 @@ from agent.contracts.rule import validate_rule_spec
 PROOF_SCHEMA = "research-proof.v1"
 
 
-def _contains_diagnostic_backfill(value: Any) -> bool:
-    """Return whether persisted proof input contains diagnostic backfill."""
+_DIAGNOSTIC_HISTORICAL_BACKFILL = "diagnostic_historical_backfill"
+_DIAGNOSTIC_BAR_FALLBACK = "diagnostic_bar_fallback"
+_DIAGNOSTIC_EVIDENCE_MODES = frozenset({
+    _DIAGNOSTIC_HISTORICAL_BACKFILL, _DIAGNOSTIC_BAR_FALLBACK,
+})
+
+
+def _diagnostic_evidence_mode(value: Any) -> str | None:
+    """Return the first diagnostic evidence label in persisted proof input."""
     if isinstance(value, Mapping):
-        if (str(value.get("evidence_mode") or "").strip().lower() ==
-                "diagnostic_historical_backfill"):
-            return True
+        mode = str(value.get("evidence_mode") or "").strip().lower()
+        if mode in _DIAGNOSTIC_EVIDENCE_MODES:
+            return mode
+        diagnostic_reason = str(
+            value.get("diagnostic_reason") or "").strip().lower()
+        if diagnostic_reason and (
+                value.get("diagnostic_only") is True or
+                value.get("authorizing") is False):
+            return diagnostic_reason
         reasons = value.get("reasons")
         if isinstance(reasons, Mapping):
-            count = reasons.get("diagnostic_historical_backfill")
-            if (isinstance(count, (int, float)) and
-                    not isinstance(count, bool) and count > 0):
-                return True
-        return any(_contains_diagnostic_backfill(item)
-                   for item in value.values())
+            for candidate in _DIAGNOSTIC_EVIDENCE_MODES:
+                count = reasons.get(candidate)
+                if (isinstance(count, (int, float)) and
+                        not isinstance(count, bool) and count > 0):
+                    return candidate
+        for item in value.values():
+            found = _diagnostic_evidence_mode(item)
+            if found is not None:
+                return found
+        return None
     if isinstance(value, (list, tuple)):
-        return any(_contains_diagnostic_backfill(item) for item in value)
-    return False
+        for item in value:
+            found = _diagnostic_evidence_mode(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _contains_diagnostic_backfill(value: Any) -> bool:
+    """Compatibility predicate for callers that only need a boolean."""
+    return _diagnostic_evidence_mode(value) is not None
 SESSION_ZONE = "America/New_York"
 _HASH_FIELDS = ("dataset_hash", "config_hash", "code_hash", "provenance_hash")
 _FORBIDDEN = {"source", "code", "raw_response", "response", "html", "api_key",
@@ -456,11 +481,18 @@ def build_proof_payload(ledger: Any, candidate_id: str,
         if not evidence or not any(str(item.get("kind") or "") == "verified_gate"
                                    for item in evidence):
             raise ValueError("proof requires evidence from the authorized verified shadow run")
-        if (_contains_diagnostic_backfill(run.get("metrics")) or
-                _contains_diagnostic_backfill(evidence) or
-                _contains_diagnostic_backfill(trades)):
+        diagnostic_mode = (
+            _diagnostic_evidence_mode(run.get("metrics")) or
+            _diagnostic_evidence_mode(evidence) or
+            _diagnostic_evidence_mode(trades))
+        if diagnostic_mode is not None:
+            label = ("diagnostic historical backfill"
+                     if diagnostic_mode == _DIAGNOSTIC_HISTORICAL_BACKFILL
+                     else "diagnostic bar fallback"
+                     if diagnostic_mode == _DIAGNOSTIC_BAR_FALLBACK
+                     else diagnostic_mode.replace("_", " "))
             raise ValueError(
-                "diagnostic historical backfill cannot emit an authorized proof")
+                f"{label} cannot emit an authorized proof")
     evidence_latest = _latest(evidence)
     vehicle = str(context.get("vehicle") or candidate.get("vehicle") or run.get("vehicle") or "")
     if vehicle not in {"equity", "option"}:

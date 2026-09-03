@@ -454,8 +454,9 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(exact["coverage_ratio"],
                                exact["observed_minutes"] /
                                (expected_sessions * 390))
+        first_session = min(row.session_date for row in regular).isoformat()
         self.assertFalse(exact["by_symbol_session"]["AAA"]
-                         ["2026-01-05"]["early_close"])
+                         [first_session]["early_close"])
 
         early = []
         for row in bars:
@@ -467,7 +468,7 @@ class FitDiagnosticsTests(unittest.TestCase):
         early_coverage = bar_coverage_telemetry(early)
         self.assertEqual(early_coverage["expected_minutes"], expected_sessions * 210)
         self.assertTrue(early_coverage["by_symbol_session"]["AAA"]
-                        ["2026-01-05"]["early_close"])
+                        [first_session]["early_close"])
         self.assertIn("early_close_exact_calendar",
                       early_coverage["caveats"])
 
@@ -479,7 +480,8 @@ class FitDiagnosticsTests(unittest.TestCase):
                 row, session_open=opened,
                 session_close=opened.replace(hour=16)))
         delayed_coverage = bar_coverage_telemetry(delayed)
-        delayed_record = delayed_coverage["by_symbol_session"]["AAA"]["2026-01-05"]
+        delayed_record = delayed_coverage["by_symbol_session"]["AAA"][
+            first_session]
         self.assertEqual(delayed_record["expected_minutes"], 360)
         self.assertFalse(delayed_record["early_close"])
         self.assertIn("non_standard_session_open", delayed_record["caveats"])

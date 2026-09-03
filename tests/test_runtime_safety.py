@@ -1968,8 +1968,38 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertIsNone(_rule_runtime_bars(
             bars(), spec, now + timedelta(microseconds=1),
             max_age_seconds=30))
-        self.assertIsNone(_rule_runtime_bars(bars(drop=3), spec, now))
+        # The momentum feature window is the final four completed bars.  A
+        # gap before that causal window is irrelevant; a gap inside it must
+        # still fail closed.
+        self.assertIsNotNone(_rule_runtime_bars(bars(drop=3), spec, now))
+        self.assertIsNone(_rule_runtime_bars(bars(drop=4), spec, now))
         self.assertIsNone(_rule_runtime_bars(bars(partial=True), spec, now))
+
+    def test_rule_runtime_uses_exact_mean_reversion_window(self):
+        from agent.contracts.rule import validate_rule_spec
+
+        opening = datetime(2026, 8, 18, 13, 30, tzinfo=timezone.utc)
+        now = opening + timedelta(minutes=12, seconds=30)
+        spec = validate_rule_spec({"family": "mean_reversion",
+                                   "lookback": 10, "atr_period": 3})
+
+        def bars(drop=None):
+            rows = []
+            for index in range(12):
+                if index == drop:
+                    continue
+                stamp = opening + timedelta(minutes=index)
+                rows.append({"timestamp": stamp,
+                             "open": 100 + index, "high": 101 + index,
+                             "low": 99 + index, "close": 100 + index,
+                             "volume": 1000})
+            return rows
+
+        # The first retained bar is older than the final ten-bar dependency;
+        # its absence must not block a current signal window.  A gap inside
+        # that exact trailing window must still fail closed.
+        self.assertIsNotNone(_rule_runtime_bars(bars(drop=0), spec, now))
+        self.assertIsNone(_rule_runtime_bars(bars(drop=2), spec, now))
 
     def test_stale_broker_clock_blocks_entry_but_runs_cleanup_path(self):
         class StaleClockProvider(FakeProvider):

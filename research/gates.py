@@ -20,7 +20,8 @@ import math
 from typing import Any, Iterable, Mapping, Sequence
 
 from .costs import (
-    CostError, CostModel, QUOTE as QUOTE_FILL,
+    CostError, CostModel, DIAGNOSTIC_BAR_FALLBACK,
+    DIAGNOSTIC_HISTORICAL_BACKFILL, QUOTE as QUOTE_FILL,
     RESTING_BRACKET, validate_resting_bracket_fill,
     STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
     risk_unit_report as _risk_unit_report,
@@ -435,9 +436,13 @@ def _authorization_exclusion_reason(row: Mapping[str, Any], *, vehicle: str,
     ``strict=True``; the first explicit fill field therefore opts a cohort
     into the same strict quality contract as :func:`fill_source_summary`.
     """
-    if (str(row.get("evidence_mode") or "").strip().lower() ==
-            "diagnostic_historical_backfill"):
-        return "diagnostic_historical_backfill"
+    evidence_mode = str(row.get("evidence_mode") or "").strip().lower()
+    if evidence_mode in {DIAGNOSTIC_HISTORICAL_BACKFILL,
+                         DIAGNOSTIC_BAR_FALLBACK}:
+        return evidence_mode
+    diagnostic_reason = str(row.get("diagnostic_reason") or "").strip().lower()
+    if diagnostic_reason:
+        return diagnostic_reason
     if row.get("directional_authorizing") is False:
         # A censored hold-discontinuity outcome is useful audit telemetry but
         # cannot enter any directional effect, floor, or control calculation.

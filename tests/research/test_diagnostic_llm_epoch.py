@@ -78,11 +78,8 @@ class DiagnosticLLMEpochTests(unittest.TestCase):
 
         # The reused root preserves every diagnostic metric and row while its
         # copied envelope keeps the established per-variant account identity.
-        root_metrics = {
-            key: value for key, value in report["root_diagnostic"].items()
-            if key not in {"authorizing", "diagnostic_only"}
-        }
-        self.assertEqual(root_variant["diagnostic"], root_metrics)
+        self.assertEqual(root_variant["diagnostic"],
+                         report["root_diagnostic"])
         self.assertEqual(root_variant["account"]["rows"],
                          report["account"]["rows"])
         self.assertEqual(root_variant["account"]["account_id"],

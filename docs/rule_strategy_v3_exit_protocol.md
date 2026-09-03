@@ -1,53 +1,83 @@
-# Rule strategy v3 exit protocol
+# Rule strategy v3/v4 exit protocol
 
-`rule-strategy.v3` is an opt-in extension of v2. It adds one field:
-`breakeven_r`, either `null` or a finite number from `0` through `10`, strictly
-below `target_r`. `null` is the default and preserves fixed-stop behavior.
-The canonical forms and content hashes of v1 and v2 are unchanged.
+This filename is retained for existing links. The current bounded equity exit
+contract spans `rule-strategy.v3` and `rule-strategy.v4`.
 
-New deterministic equity factory roots use v3 with `breakeven_r: null`, then
-their bounded coordinate neighborhood and discovery ladder traverse finite
-breakeven triggers below `target_r`. Option roots and discovery remain on
-executable v1/v2 schemas;
-the v3 exit is reachable without relying on an LLM-authored proposal.
-The equity provider-facing proposal schema accepts `breakeven_r` as nullable
-number-or-null, while the validator remains authoritative for bounds. Tuning a
-v3 root keeps `schema: rule-strategy.v3`; options remain restricted to v1/v2.
+V3 adds nullable `breakeven_r`. A completed close that reaches the configured
+multiple of initial fill-to-stop risk arms a move to the actual fill price for
+the next bar. `null` preserves the original fixed-stop behavior.
 
-## Executable vehicle boundary
+V4 retains v2 entry predicates and v3 breakeven behavior, then adds:
 
-V3 is executable for equity shares only. A non-null `breakeven_r` requires a
-provider capable of replacing the live broker stop leg. Options are rejected
-by replay, null controls, and runtime risk before contract selection because
-Alpaca's supported option order path does not provide a parity-safe stop
-amendment.
+- `target_mode`: `fixed_r`, `session_vwap`, or `rolling_mean`;
+- `target_lookback`: the bounded completed-bar lookback for `rolling_mean`;
+- `trailing_stop_r`: a nullable completed-close trailing distance;
+- `exit_before_minutes`: a nullable thesis deadline before the New York close.
+
+Options remain on executable v1/v2 schemas. V3/v4 are equity-share only because
+the supported option path has no parity-safe stop-amendment lifecycle.
+
+## Frozen target contract
+
+Non-fixed targets are computed once from the completed signal prefix. Session
+VWAP resets on the bars' New York session date; rolling mean uses exactly the
+configured completed-close lookback. The raw reference is persisted as
+`target_reference`; the broker-valid rounded level is `target_price`. Neither
+research nor runtime recalculates the target after entry.
+
+A missing, non-finite, non-positive, or wrong-side reference rejects the signal
+with `target_reference_unavailable_or_wrong_side`. It never falls back to an R
+target. Entry gaps that place the executable fill beyond the frozen target fail
+the ordinary bracket-geometry check rather than silently moving the target.
 
 ## Deterministic transition
 
-Research replay, randomized null controls, and runtime call the same pure
-completed-bar transition. Its order is fixed:
+Research replay, randomized controls, and runtime use the same pure completed-
+bar transition:
 
-1. On the entry bar, resolve an entry fill already beyond the initial stop or
-   target at the fill anchor.
-2. Resolve a later bar opening beyond the active stop or target at that open.
-3. Resolve intrabar stop/target touches; when both occur, the stop wins.
-4. If still open, compare the completed close with the breakeven trigger. An
-   arm recorded at that close changes the active stop only for the next bar.
+1. Resolve an entry fill already beyond the stop or target at the fill anchor.
+2. Resolve a later opening gap at that open.
+3. Resolve intrabar touches, with the stop winning an unknowable two-sided path.
+4. If still open, arm breakeven and trailing amendments from the completed close;
+   those stop changes apply only to the next bar and ratchet monotonically.
+5. If no protective exit fired, apply deadline precedence: session force-flat,
+   thesis deadline, then maximum hold when timestamps tie.
 
-The risk unit is always the absolute distance from the actual entry fill to
-the initial stop. The initial stop is immutable. The active stop, arm time,
-arm epoch, and last completed bar are durable state.
+The initial risk unit and frozen target never change. Durable state retains the
+initial and active stops, target policy/reference, amendment epochs, and last
+completed bar.
+
+## Canonical reasons and compatibility
+
+Research and runtime publish `canonical_exit_reason` from one vocabulary:
+`stop`, `target`, `max_hold`, `thesis_deadline`, `session_force_flat`, and
+`data_discontinuity`; unrecognized operational causes map to `unknown` rather
+than extending the canonical vocabulary. Runtime keeps operational `reason`
+aliases such as
+`before_close`, `max_hold`, and `exit_before`; research keeps the historical
+`exit_reason` values `time` and `exit_before`. Those compatibility fields are
+not the cross-lane comparison key.
+
+Force-flat replay uses the exact session boundary and, in strict equity lanes,
+requires a fresh executable exit quote. Missing quotes refuse the observation;
+permissive diagnostic lanes may use the bar reference and still apply the shared
+cost model. P&L is always calculated from the selected executable entry and exit
+prices, quantity, multiplier, and fees.
+
+## Family hypotheses and bounded search
+
+New equity roots retain neutral v4 defaults and their stable content identities.
+The coordinate pool promotes one auditable family-specific hypothesis early:
+breakout/trend families try a completed-close trailing ratchet, while reversion
+families try a frozen `rolling_mean` or `session_vwap` target. The neutral root
+and other fixed-R candidates remain in the first batch, so an unavailable fair-
+value reference cannot block the whole batch. Family-aware target and hold
+ladders remain bounded, and discovery keeps its existing attempt cap.
 
 ## Broker amendment and recovery
 
-For protected equity positions, runtime persists replacement intent and arm
-state before asking Alpaca to replace the live stop. It attaches the returned
-successor and advances the active stop only after the broker response is
-validated. Reconciliation follows `replaced_by`/`replaces` links to recover a
-successor after a process failure between broker acceptance and local attach.
-
-A replacement error triggers broker reconciliation before retry or local
-close. If the old or successor stop filled during the race, that broker leg is
-the close and runtime must not submit a duplicate market order. An unresolved
-`replaced` order without its successor is a reconciliation error, not evidence
-that protection may be widened locally.
+For protected equity positions, runtime persists amendment intent before asking
+the broker to replace the live stop. It advances the active stop only after the
+successor response is validated. Reconciliation follows replacement links after
+a process failure. If either stop fills during the race, that broker leg is the
+close; runtime must not submit a duplicate market order.

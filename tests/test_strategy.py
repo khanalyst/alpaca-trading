@@ -184,6 +184,8 @@ class IBRContractTests(unittest.TestCase):
             "price": signal["entry_price"], "signal_ts": signal["signal_ts"],
             "session": signal["session"], "spread_bps": 1.0,
             "stale": False, "quote_stale": False,
+            "force_flat_at": (base + timedelta(hours=8)).isoformat(),
+            "force_flat_ts": (base + timedelta(hours=8)).timestamp(),
         }
         plan, why = strategy.build_setup_plan(signal, snapshot, cfg)
         self.assertIsNone(why)

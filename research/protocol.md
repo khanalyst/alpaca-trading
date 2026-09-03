@@ -67,6 +67,17 @@ may inspect those rows at their provider `as_of` boundary; resulting evidence is
 marked `diagnostic_historical_backfill`, excluded from authorizing statistics,
 and cannot authorize a proof or live deployment.
 
+Source mode is decided before any authorizing ledger is opened. Historical or
+mixed inputs fail closed instead of being evaluated under the forward policy;
+the operator must explicitly select diagnostic mode.
+Every authorizing row must explicitly declare `source_mode: forward_observed`;
+trusted recorder projections add the label, while unlabelled compatibility
+data remains diagnostic-only. Diagnostic mode is not a
+weaker integrity parser: malformed records, unsupported labels, future
+observation times, and a source that changes after preflight are rejected in
+all modes. Every diagnostic result carries `authorizing: false`, writes no edge
+or shadow proof, and preserves the source-mode counts used to route it.
+
 ## Replay gates
 
 Every replay must establish the following invariants:
@@ -102,10 +113,18 @@ Every replay must establish the following invariants:
   fills require OPRA quote provenance on both legs. Provider, feed, quote age,
   and fill source are retained for each leg, and any leg older than 30 seconds,
   bar-only, partial-feed, or missing remains diagnostic;
-- positions are force-flat before the session close;
-- a bounded rule position also carries a `max_hold_bars` time exit, computed by
-  the one helper the runtime uses (`agent/contracts/rule.py::hold_deadline`)
-  and clamped to the force-flat time;
+- positions are force-flat before the session close; strict equity replay
+  requires a fresh executable quote at that boundary and refuses the row rather
+  than manufacturing force-flat P&L;
+- a bounded rule position carries one shared deadline contract
+  (`agent/contracts/rule.py::exit_deadline`) covering `max_hold_bars`, the v4
+  thesis deadline, and session force-flat. Equal timestamps use runtime order:
+  session force-flat, thesis deadline, then maximum hold;
+- research and runtime retain their historical reason aliases but also persist
+  `canonical_exit_reason` as `stop`, `target`, `max_hold`,
+  `thesis_deadline`, `session_force_flat`, `data_discontinuity`, or `unknown`;
+  unrecognized operational causes map to `unknown` rather than extending the
+  canonical vocabulary;
 - equity and single-leg long-option books have separate samples, costs, and
   P&L; multi-leg and short option structures are outside the protocol.
 
@@ -414,8 +433,10 @@ variant must preserve both its root's `family` and its root's grammar
 Selecting a different family, or a wider grammar version, is a discovery
 decision and follows the discovery path with its own gates.
 Equity provider guidance and schemas accept `rule-strategy.v3` with nullable
-numeric `breakeven_r`; options remain on executable v1/v2 schemas. A v3 root
-stays v3 during tuning, including when `breakeven_r` is activated.
+numeric `breakeven_r` and `rule-strategy.v4` with frozen `session_vwap` or
+`rolling_mean` targets, bounded trailing stops, and thesis deadlines; options
+remain on executable v1/v2 schemas. A root stays on its declared schema during
+tuning.
 
 The three LLM request contracts use strict full-schema structured output with
 `additionalProperties: false`; tuning must echo the complete normalized root
@@ -444,7 +465,7 @@ against the same family-local and cycle-global false-discovery budget as a
 mutated one.
 
 Variant identity is de-duplicated by a family-specific executable semantic
-signature, including v1/v2/v3 no-op aliases. Continuous numeric axes use
+signature, including v1/v2/v3/v4 no-op aliases. Continuous numeric axes use
 relative/local scaling for semantic novelty, while integer/topology axes use
 their grammar spans; exact signatures and validation remain unchanged. A graded
 `adequate_negative_rejection` suppresses only that exact failed variant id;
@@ -461,8 +482,14 @@ executable field per child. Interaction phase begins only after every bounded
 coordinate point is closed and combines exactly two of the strongest measured
 one-field values. A final unchanged replay confirms the conclusion before a
 replacement is allowed. Model tuning is schema-validated against the same
-one-field/two-field rule; it cannot hide a bundle of changes inside a reason. For
-v2/v3 roots with measured `min_atr_bps` and `stop_atr` coordinate lessons, an
+one-field/two-field rule; it cannot hide a bundle of changes inside a reason.
+New equity roots retain neutral v4 defaults and stable content identities. One
+family-specific exit coordinate is promoted early without adding a Cartesian
+dimension: breakout/trend families try a trailing ratchet, while reversion
+families try a frozen fair-value target. The neutral root and other fixed-R
+candidates remain in the default first batch, and family-aware target/hold
+ladders remain bounded. For
+v2/v3/v4 roots with measured `min_atr_bps` and `stop_atr` coordinate lessons, an
 `execution_blocked` fit diagnosis makes coordinate exhaustion schedule exactly
 one bounded measured interaction. It uses configured stress geometry when
 available, never invents missing values, changes no risk constants, and does not

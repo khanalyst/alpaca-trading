@@ -1,5 +1,7 @@
 """Runtime/replay entry-slippage parity regressions."""
 
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import unittest
 
 from research.costs import CostModel, ReplayPolicy
@@ -54,6 +56,35 @@ class EntrySlippageParityTests(unittest.TestCase):
         self.assertEqual(result["trades"], 0)
         self.assertEqual(result["rows"][0]["reject_reason"],
                          "entry_slippage_exceeds_limit")
+
+    def test_null_exit_deadline_tie_prefers_force_flat_canonical_reason(self):
+        bars = _bars([100.0] * 12)
+        reference = [{
+            "symbol": "SPY", "session_date": bars[0].session_date.isoformat(),
+            "underlying_entry": 100.0, "stop_price": 99.0,
+            "stop_distance": 1.0, "direction": "long", "no_trade": False,
+        }]
+        spec = {"target_r": 2, "max_hold_bars": 3}
+        baseline = null_control_account(
+            bars, [], spec, vehicle="equity", reference_rows=reference,
+            account_id="deadline-tie",
+            policy=ReplayPolicy(strict_market_data=False),
+        )
+        entry = datetime.fromisoformat(baseline["rows"][0]["entry_timestamp"])
+        force_flat = (entry.astimezone(ZoneInfo("America/New_York")) +
+                      timedelta(minutes=4)).timetz().replace(tzinfo=None)
+        tied = null_control_account(
+            bars, [], spec, vehicle="equity", reference_rows=reference,
+            account_id="deadline-tie",
+            policy=ReplayPolicy(strict_market_data=False,
+                                force_flat_time=force_flat),
+        )
+        row = tied["rows"][0]
+        self.assertFalse(row["no_trade"])
+        self.assertEqual(row["exit_reason"], "time")
+        self.assertEqual(row["canonical_exit_reason"], "session_force_flat")
+        self.assertFalse(row["directional_authorizing"])
+        self.assertFalse(row["authorizing"])
 
 
 if __name__ == "__main__":  # pragma: no cover

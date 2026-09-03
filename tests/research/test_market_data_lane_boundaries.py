@@ -9,7 +9,9 @@ used by the factory rather than in a test-only pricing stub.
 """
 
 from pathlib import Path
+import json
 import tempfile
+from types import SimpleNamespace
 import unittest
 from argparse import Namespace
 import importlib.util
@@ -92,11 +94,13 @@ class BacktestFallbackConfigTests(unittest.TestCase):
             source = Path(directory) / "market.jsonl"
             source.write_text("\n".join((
                 '{"kind":"bar","provider":"alpaca","feed":"iex",'
+                '"source_mode":"forward_observed",'
                 '"symbol":"SPY","timestamp":"2026-01-05T14:30:00+00:00",'
                 '"as_of":"2026-01-05T14:30:00+00:00",'
                 '"observed_at":"2026-01-05T14:30:00+00:00",'
                 '"open":100,"high":101,"low":99,"close":100,"volume":10}',
                 '{"kind":"quote","provider":"alpaca","feed":"iex",'
+                '"source_mode":"forward_observed",'
                 '"symbol":"SPY","timestamp":"2026-01-05T14:30:00+00:00",'
                 '"as_of":"2026-01-05T14:30:00+00:00",'
                 '"observed_at":"2026-01-05T14:30:00+00:00",'
@@ -109,8 +113,62 @@ class BacktestFallbackConfigTests(unittest.TestCase):
             self.assertIsNotNone(index)
             try:
                 self.assertEqual(index.count, 1)
+                self.assertEqual(index.source_mode_counts(), {
+                    "forward_observed": 1,
+                })
             finally:
                 index.close()
+
+    def test_delayed_sip_is_available_only_to_explicit_diagnostics(self):
+        row = {"provider": "alpaca", "feed": "delayed_sip"}
+        with self.assertRaises(research_cli.NormalizationError):
+            research_cli._validated_row_provenance(
+                row, kind="bar", configured_provider="alpaca",
+                configured_feed="delayed_sip")
+        self.assertEqual(research_cli._validated_row_provenance(
+            row, kind="bar", configured_provider="alpaca",
+            configured_feed="delayed_sip", diagnostic_only=True),
+            ("alpaca", "delayed_sip"))
+
+    def test_diagnostic_backtest_output_is_explicitly_non_authorizing(self):
+        bar = SimpleNamespace(identity=SimpleNamespace(
+            source_mode="historical_backfill"))
+        result = SimpleNamespace(summary=lambda: {"trades": 1})
+        args = Namespace(vehicle="equity", symbol=None, diagnostic_only=True)
+        with patch.object(research_cli, "_bars", return_value=[bar]), \
+             patch.object(research_cli, "_quotes", return_value=None), \
+             patch.object(research_cli, "_config", return_value=object()), \
+             patch.object(research_cli, "replay_ibr", return_value=result), \
+             patch.object(research_cli, "print") as emit:
+            self.assertEqual(research_cli.cmd_backtest_ibr(args), 0)
+        payload = json.loads(emit.call_args.args[0])
+        self.assertFalse(payload["authorizing"])
+        self.assertTrue(payload["diagnostic_only"])
+        self.assertEqual(payload["source_mode_counts"], {
+            "historical_backfill": 1,
+        })
+        self.assertEqual(payload["result"], {"trades": 1})
+
+    def test_diagnostic_backtest_counts_quote_source_modes(self):
+        bar = SimpleNamespace(identity=SimpleNamespace(
+            source_mode="forward_observed"))
+        quotes = SimpleNamespace(
+            source_mode_counts=lambda: {"historical_backfill": 2},
+            close=lambda: None,
+        )
+        result = SimpleNamespace(summary=lambda: {"trades": 1})
+        args = Namespace(vehicle="equity", symbol=None, diagnostic_only=True)
+        with patch.object(research_cli, "_bars", return_value=[bar]), \
+             patch.object(research_cli, "_quotes", return_value=quotes), \
+             patch.object(research_cli, "_config", return_value=object()), \
+             patch.object(research_cli, "replay_ibr", return_value=result), \
+             patch.object(research_cli, "print") as emit:
+            self.assertEqual(research_cli.cmd_backtest_ibr(args), 0)
+        payload = json.loads(emit.call_args.args[0])
+        self.assertEqual(payload["source_mode_counts"], {
+            "forward_observed": 1,
+            "historical_backfill": 2,
+        })
 
 
 class ResearchCommandLaneConfigTests(unittest.TestCase):

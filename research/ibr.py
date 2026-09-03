@@ -19,9 +19,12 @@ from agent.contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
     quantize_equity_bracket,
 )
+from agent.contracts.rule import canonical_exit_reason
 from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS,
                                   MIN_STOP_DISTANCE_FRACTION)
 from .costs import (BAR, QUOTE, RESTING_BRACKET,
+                    DIAGNOSTIC_BAR_FALLBACK,
+                    DIAGNOSTIC_HISTORICAL_BACKFILL,
                     RESTING_BRACKET_FILL_SCHEMA, CostError, CostModel,
                     ReplayPolicy, check_entry_slippage, index_quotes,
                     quote_fill_record, replay_policy_for_bars,
@@ -30,8 +33,10 @@ from .costs import (BAR, QUOTE, RESTING_BRACKET,
 RUNTIME_MAX_MARKET_DATA_AGE_SECONDS = 30.0
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, option_has_liquidity,
+                          normalize_underlying_bar,
                           replay_available_at, replay_open_is_available,
                           replay_record_is_available)
+from .source_validation import SOURCE_MODES, SourceValidationError, validate_source
 
 
 class ReplayError(ValueError):
@@ -170,12 +175,22 @@ class IBRTrade:
     # labelled historical backfill. Authorization rejects this marker; replay
     # visibility remains controlled independently by the policy.
     evidence_mode: str = "forward_observed"
+    # Diagnostic execution is an authorization property, not a provenance
+    # label.  In particular, enabling the explicit backfill policy must not
+    # relabel genuinely forward-observed quotes as historical evidence.
+    diagnostic_only: bool = False
+    authorizing: bool = True
+    directional_authorizing: bool = True
+    diagnostic_reason: str | None = None
     authored_stop_distance: float | None = None
     effective_stop_floor_bps: float | None = None
     stress_floor_binding: bool = False
     stop_geometry_scenario_bps: float | None = None
     stop_geometry_max_cost_to_risk_ratio: float | None = None
     stop_geometry_activation_reason: str | None = None
+    # Canonical durable cause; ``exit_reason`` remains the compatibility
+    # alias consumed by legacy research reports.
+    canonical_exit_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -208,6 +223,12 @@ class IBRResult:
     # cannot price, and those demand opposite responses; without the reason
     # the two are indistinguishable downstream.
     refusals: list["IBRRefusal"] = field(default_factory=list)
+    # Source provenance is a first-class result boundary.  Diagnostic replay
+    # may price mechanics, but its rows must never be mistaken for evidence
+    # eligible for authorization.
+    authorizing: bool = True
+    diagnostic_only: bool = False
+    source_report: Mapping[str, object] | None = None
 
     @property
     def net_pnl(self) -> float:
@@ -223,12 +244,20 @@ class IBRResult:
 
     def summary(self) -> dict:
         """A vehicle-local summary; no cross-vehicle P&L is ever calculated."""
+        canonical: dict[str, int] = {}
+        for trade in self.trades:
+            reason = str(getattr(trade, "canonical_exit_reason", "") or
+                         canonical_exit_reason(trade.exit_reason))
+            canonical[reason] = canonical.get(reason, 0) + 1
         return {
             "vehicle": self.vehicle,
             "trades": len(self.trades),
             "gross_pnl": self.gross_pnl,
             "costs": self.costs,
             "net_pnl": self.net_pnl,
+            "authorizing": bool(self.authorizing),
+            "diagnostic_only": bool(self.diagnostic_only),
+            "canonical_exit_reasons": dict(sorted(canonical.items())),
         }
 
 
@@ -255,6 +284,14 @@ def _option_executable(snapshot: OptionSnapshot) -> bool:
     contract = getattr(snapshot, "contract", None)
     return (str(getattr(identity, "feed", "")).strip().lower() == "opra" and
             str(getattr(contract, "feed", "")).strip().lower() == "opra")
+
+
+def _historical_evidence(record: object | None) -> bool:
+    """Recognize normalized records and retained executable quote fills."""
+    return bool(record is not None and (
+        historical_backfill_record(record) or
+        str(getattr(record, "source_mode", "") or "").strip().lower() ==
+        "historical_backfill"))
 
 
 def _session_start(day: date, cfg: IBRConfig, zone: ZoneInfo) -> datetime:
@@ -309,6 +346,125 @@ def _validate_bars(bars: Sequence[UnderlyingBar], cfg: IBRConfig) -> list[Underl
     return ordered
 
 
+def _source_payload(record: object, *, kind: str) -> dict[str, object]:
+    """Project a normalized market record into the source preflight shape."""
+    identity = getattr(record, "identity", None)
+    timestamp = getattr(record, "timestamp", getattr(record, "ts", None))
+    payload: dict[str, object] = {"kind": kind, "timestamp": timestamp}
+    if identity is not None:
+        for name in ("provider", "feed", "source_mode", "as_of",
+                     "observed_at"):
+            value = getattr(identity, name, None)
+            if value is not None:
+                payload[name] = value
+    return payload
+
+
+def _source_records(records: object, *, kind: str) -> list[Mapping]:
+    """Materialize source rows without consuming resolver-backed quote indexes."""
+    if records is None or callable(getattr(records, "quote_fill", None)):
+        return []
+    if isinstance(records, Mapping):
+        values = records.values()
+    else:
+        values = records
+    rows: list[Mapping] = []
+    for record in values:
+        if isinstance(record, Mapping):
+            row = dict(record)
+            row.setdefault("kind", kind)
+            rows.append(row)
+        else:
+            rows.append(_source_payload(record, kind=kind))
+    return rows
+
+
+def _source_preflight(
+        bars: Sequence[object], *,
+        quotes: object = None,
+        option_snapshots: Mapping[datetime, object] | None = None,
+        diagnostic_only: bool = False,
+) -> tuple[list[UnderlyingBar], dict[str, object]]:
+    """Validate provenance before replay can create a top-level result.
+
+    Raw bar mappings are accepted as a convenience for standalone callers so
+    an omitted ``source_mode`` remains observable by :func:`validate_source`
+    instead of being silently manufactured by the normalizer.
+    """
+    raw_bars = list(bars)
+    source_rows: list[Mapping] = []
+    normalized: list[UnderlyingBar] = []
+    for item in raw_bars:
+        if isinstance(item, Mapping):
+            source_rows.append(dict(item))
+            normalized.append(normalize_underlying_bar(item))
+        else:
+            source_rows.append(_source_payload(item, kind="bar"))
+            normalized.append(item)
+    source_rows.extend(_source_records(quotes, kind="quote"))
+    if option_snapshots:
+        source_rows.extend(_source_records(option_snapshots, kind="option"))
+    try:
+        report = validate_source(source_rows, diagnostic_only=diagnostic_only)
+    except SourceValidationError as exc:
+        report = dict(exc.report)
+        report.setdefault("errors", [str(exc)])
+        report["preflight_failed"] = True
+    else:
+        report = dict(report)
+        report["preflight_failed"] = False
+    # Resolver-backed quote indexes intentionally stay opaque to row
+    # materialization.  Their compact provenance aggregate is still part of
+    # the source boundary and must participate in the same authorizing-mode
+    # decision as bars and in-memory quote rows.
+    resolver_counts: dict[str, int] = {}
+    resolver_counter = getattr(quotes, "source_mode_counts", None)
+    if callable(resolver_counter):
+        try:
+            raw_counts = resolver_counter()
+            if not isinstance(raw_counts, Mapping):
+                raise TypeError("source_mode_counts must return a mapping")
+            for mode, count in raw_counts.items():
+                normalized_mode = (str(mode or "forward_observed").strip()
+                                   .lower().replace("-", "_"))
+                if normalized_mode not in SOURCE_MODES:
+                    raise ValueError(
+                        f"unsupported source_mode {normalized_mode!r}")
+                if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                    raise ValueError(
+                        f"source_mode_counts[{normalized_mode!r}] must be a non-negative integer")
+                if count:
+                    resolver_counts[normalized_mode] = count
+        except Exception as exc:
+            report.setdefault("errors", []).append(
+                f"quote resolver provenance preflight failed: {exc}")
+            report["preflight_failed"] = True
+            report["authorizing"] = False
+    if resolver_counts:
+        merged_counts = dict(report.get("source_mode_counts") or {})
+        for mode, count in resolver_counts.items():
+            merged_counts[mode] = int(merged_counts.get(mode, 0)) + count
+        report["source_mode_counts"] = dict(sorted(merged_counts.items()))
+        if not diagnostic_only:
+            errors = list(report.get("errors") or ())
+            if resolver_counts.get("historical_backfill", 0):
+                errors.append(
+                    "historical_backfill source_mode is diagnostic-only; "
+                    "use an explicit diagnostic-only run")
+            if len({mode for mode, count in merged_counts.items() if count}) > 1:
+                errors.append("mixed source_mode values cannot authorize evidence")
+            report["errors"] = errors
+            report["preflight_failed"] = bool(errors)
+            if errors:
+                report["authorizing"] = False
+    if resolver_counts.get("historical_backfill"):
+        report["authorizing"] = False
+        if diagnostic_only:
+            report["diagnostic_only"] = True
+    report["resolver_source_mode_counts"] = resolver_counts
+    return normalized, report
+
+
 def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      range_high: float, range_low: float, signal: UnderlyingBar,
                      entry_bar: UnderlyingBar, entry_reference: float,
@@ -334,6 +490,7 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      stop_geometry_scenario_bps: float | None = None,
                      stop_geometry_max_cost_to_risk_ratio: float | None = None,
                      stop_geometry_activation_reason: str | None = None,
+                     evidence_records: Sequence[object] = (),
                      ) -> IBRTrade:
     # Listed options are always bought to open in the runtime, including puts
     # used for a short-underlying thesis.  Their P&L is therefore long-option
@@ -415,10 +572,10 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                           if underlying_entry is not None else None),
         underlying_quote_feed=underlying_quote_feed,
         evidence_mode=(
-            "diagnostic_historical_backfill"
+            DIAGNOSTIC_HISTORICAL_BACKFILL
             if any(
-                historical_backfill_record(item)
-                for item in (signal, entry_bar, exit_bar))
+                _historical_evidence(item)
+                for item in (signal, entry_bar, exit_bar, *evidence_records))
             else "forward_observed"
         ),
         authored_stop_distance=authored_stop_distance,
@@ -428,6 +585,7 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         stop_geometry_max_cost_to_risk_ratio=(
             stop_geometry_max_cost_to_risk_ratio),
         stop_geometry_activation_reason=stop_geometry_activation_reason,
+        canonical_exit_reason=canonical_exit_reason(reason),
     )
 
 
@@ -580,6 +738,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     underlying_entry = float(entry_bar.open) if entry_bar_visible else None
     entry_ref = underlying_entry
     entry_source = BAR
+    entry_evidence: object | None = None
+    underlying_quote_evidence: object | None = None
     # Option snapshots are selected at/before the entry bar.  A caller may pass
     # a sparse mapping from timestamp to snapshot; absence is explicit no-data.
     selected_contract = None
@@ -599,8 +759,11 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             quotes, symbol=symbol, at=entry_at,
             side="buy" if direction == "long" else "sell",
             max_age_seconds=cfg.policy.max_market_data_age_seconds,
-            session_date=day)
+            session_date=day,
+            allow_historical_backfill_diagnostics=(
+                cfg.policy.allow_historical_backfill_diagnostics))
         if quoted is not None:
+            entry_evidence = quoted
             entry_side = "buy" if direction == "long" else "sell"
             # Compare executable quote evidence with the independent boundary
             # reference before replacing it as the fill anchor.  This is the
@@ -657,9 +820,12 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                 quotes, symbol=symbol, at=entry_at,
                 side="buy" if direction == "long" else "sell",
                 max_age_seconds=cfg.policy.max_market_data_age_seconds,
-                session_date=day)
+                session_date=day,
+                allow_historical_backfill_diagnostics=(
+                    cfg.policy.allow_historical_backfill_diagnostics))
             if spot_quote is None:
                 return refuse("entry_bar_not_visible")
+            underlying_quote_evidence = spot_quote
             underlying_quote_feed = str(
                 spot_quote.feed or "").strip().lower().replace("-", "_")
             if underlying_quote_feed == "delayed":
@@ -676,6 +842,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             (item.ask - item.bid) / ((item.ask + item.bid) / 2.0),
             -item.timestamp.timestamp(), item.contract.symbol))
         entry_snap = snap
+        entry_evidence = snap
         contract = snap.contract
         selected_contract = contract
         entry_ref = snap.ask
@@ -767,12 +934,15 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         snapshot = option_exit_snapshot(cutoff)
         return None if snapshot is None else snapshot.bid
 
+    exit_evidence: object | None = None
+
     def option_exit_fill(cutoff: datetime) -> float | None:
         """Return the exit bid and retain its point-in-time provenance."""
-        nonlocal exit_quote_age_seconds, exit_feed, exit_provider
+        nonlocal exit_quote_age_seconds, exit_feed, exit_provider, exit_evidence
         snapshot = option_exit_snapshot(cutoff)
         if snapshot is None:
             return None
+        exit_evidence = snapshot
         exit_quote_age_seconds = max(
             0.0, (cutoff - snapshot.timestamp).total_seconds())
         exit_feed = str(snapshot.identity.feed)
@@ -783,18 +953,29 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
 
     def boundary_exit(reference: float, at: datetime) -> tuple[float, str, str | None, str | None]:
         """Price a fill that happens at a bar boundary, quote-first."""
-        nonlocal exit_quote_age_seconds
+        nonlocal exit_quote_age_seconds, exit_evidence
         if vehicle != "equity":
             return reference, BAR, None, None
         quoted = quote_fill_record(
             quotes, symbol=symbol, at=at, side=exit_side,
             max_age_seconds=cfg.policy.max_market_data_age_seconds,
-            session_date=day)
+            session_date=day,
+            allow_historical_backfill_diagnostics=(
+                cfg.policy.allow_historical_backfill_diagnostics))
         if quoted is None:
             return reference, BAR, None, None
+        exit_evidence = quoted
         exit_quote_age_seconds = max(
             0.0, (at - quoted.timestamp).total_seconds())
         return quoted.price, QUOTE, quoted.feed, quoted.provider
+
+    def consumed_evidence(exit_bar: UnderlyingBar) -> tuple[object, ...]:
+        consumed_bars = [*range_bars, *(
+            bar for bar in post if bar.timestamp <= exit_bar.timestamp)]
+        return tuple(consumed_bars) + tuple(
+            item for item in (
+                entry_evidence, underlying_quote_evidence, exit_evidence)
+            if item is not None)
 
     for bar in hold:
         if _local(bar.timestamp, zone) >= close_at:
@@ -852,7 +1033,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     stop_geometry_max_cost_to_risk_ratio=(
                                         cfg.policy.max_stressed_cost_to_risk_ratio),
                                     stop_geometry_activation_reason=(
-                                        stop_geometry_activation_reason))
+                                        stop_geometry_activation_reason),
+                                    evidence_records=consumed_evidence(bar))
         if hit_stop or hit_target:
             # Stop wins if both are touched by one candle.
             reason = "stop" if hit_stop else "target"
@@ -898,7 +1080,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     stop_geometry_max_cost_to_risk_ratio=(
                                         cfg.policy.max_stressed_cost_to_risk_ratio),
                                     stop_geometry_activation_reason=(
-                                        stop_geometry_activation_reason))
+                                        stop_geometry_activation_reason),
+                                    evidence_records=consumed_evidence(bar))
     # Force-flat at the last completed bar before the configured close.
     boundary = next((b for b in hold if _local(b.timestamp, zone) >= close_at
                      and _open_visible(b, b.timestamp, cfg.policy)), None)
@@ -949,7 +1132,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                             stop_geometry_max_cost_to_risk_ratio=(
                                 cfg.policy.max_stressed_cost_to_risk_ratio),
                             stop_geometry_activation_reason=(
-                                stop_geometry_activation_reason))
+                                stop_geometry_activation_reason),
+                            evidence_records=consumed_evidence(last))
 
 
 def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
@@ -964,24 +1148,115 @@ def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
     if vehicle not in {"equity", "option"}:
         raise ReplayError("vehicle must be 'equity' or 'option'")
     cfg = config or IBRConfig()
+    # Non-strict bar fallback is a legacy mechanics lane and, like the
+    # explicit backfill policy, cannot authorize evidence.  Keep it usable for
+    # existing diagnostics while exposing the non-authorizing envelope.
+    diagnostic_only = bool(
+        cfg.policy.allow_historical_backfill_diagnostics or
+        not cfg.policy.strict_market_data)
+    # Run the shared source-mode boundary before any session can emit a trade.
+    # A failed authorizing preflight is represented as an unevaluable result,
+    # preserving the standalone replay API's result shape while preventing a
+    # historical/unlabelled/late corpus from looking like evidence.
+    materialized_bars = list(bars)
+    quote_input = (quotes if quotes is not None and
+                   callable(getattr(quotes, "quote_fill", None)) else
+                   list(quotes or ()))
+    rows, source_report = _source_preflight(
+        materialized_bars, quotes=quote_input, option_snapshots=option_snapshots,
+        diagnostic_only=diagnostic_only)
     # A large recorded corpus may provide a disk-backed resolver.  Passing it
     # through avoids materializing every quote just to answer boundary fills;
     # ordinary test/in-memory iterables retain the historical grouping path.
-    quote_index = index_quotes(quotes)
-    rows = _validate_bars(list(bars), cfg)
+    quote_index = index_quotes(quote_input)
+    rows = _validate_bars(rows, cfg)
     if symbol is not None:
         rows = [b for b in rows if b.symbol == symbol]
     sessions: dict[tuple[str, date], list[UnderlyingBar]] = {}
     zone = ZoneInfo(cfg.timezone)
     for bar in rows:
         sessions.setdefault((bar.symbol, _local(bar.timestamp, zone).date()), []).append(bar)
-    result = IBRResult(vehicle=vehicle)
+    source_failed = bool(source_report.get("preflight_failed"))
+    source_diagnostic = bool(
+        source_report.get("source_mode_counts", {}).get("historical_backfill") or
+        source_report.get("implicit_source_mode_rows") or
+        source_report.get("late_forward_observation_rows"))
+    policy_diagnostic = bool(
+        cfg.policy.allow_historical_backfill_diagnostics)
+    run_diagnostic = bool(source_diagnostic or policy_diagnostic)
+    if not run_diagnostic and diagnostic_only:
+        # ``strict_market_data=False`` is retained for ordinary forward
+        # legacy fixtures; its bar fallback alone does not make provenance
+        # diagnostic when every source row is explicitly forward-observed.
+        source_report = dict(source_report)
+        source_report.update({"authorizing": True, "diagnostic_only": False})
+    result = IBRResult(
+        vehicle=vehicle,
+        authorizing=not source_failed and not run_diagnostic,
+        diagnostic_only=run_diagnostic,
+        source_report=source_report,
+    )
+    if run_diagnostic:
+        report = dict(result.source_report or {})
+        report.update({
+            "authorizing": False,
+            "diagnostic_only": True,
+            "diagnostic_reason": (
+                "diagnostic_source_provenance" if source_diagnostic else
+                "diagnostic_backfill_policy"),
+        })
+        result.source_report = report
+    if source_failed:
+        detail = {"errors": list(source_report.get("errors") or ())}
+        for (sym, day), _session_bars in sorted(
+                sessions.items(), key=lambda item: item[0]):
+            result.refusals.append(IBRRefusal(
+                vehicle=vehicle, symbol=sym, session_date=day,
+                reason="source_preflight_failed", detail=detail))
+        return result
+    bar_fallback_diagnostic = False
     for (sym, _), session_bars in sorted(sessions.items(), key=lambda item: item[0]):
         trade = _replay_session(session_bars, vehicle=vehicle, symbol=sym, cfg=cfg,
                                 option_snapshots=option_snapshots,
                                 quotes=quote_index, refusals=result.refusals)
         if trade is not None:
+            # A valid quote-backed entry with a broker-resident resting
+            # bracket exit is still forward evidence.  Only a non-quote,
+            # non-resting-bracket leg indicates actual bar fallback.
+            trade_uses_bar_fallback = (
+                not cfg.policy.strict_market_data and
+                not (trade.entry_fill_source == QUOTE and
+                     trade.exit_fill_source in {QUOTE, RESTING_BRACKET}))
+            if trade_uses_bar_fallback:
+                bar_fallback_diagnostic = True
+            if (trade_uses_bar_fallback and
+                    trade.evidence_mode != DIAGNOSTIC_HISTORICAL_BACKFILL):
+                trade = replace(trade, evidence_mode=DIAGNOSTIC_BAR_FALLBACK)
+            trade_mode = str(trade.evidence_mode or "").strip().lower()
+            trade_diagnostic_reason = (
+                trade_mode if trade_mode in {
+                    DIAGNOSTIC_HISTORICAL_BACKFILL,
+                    DIAGNOSTIC_BAR_FALLBACK,
+                } else
+                "diagnostic_source_provenance" if source_diagnostic else
+                "diagnostic_backfill_policy" if policy_diagnostic else None
+            )
+            if trade_diagnostic_reason is not None:
+                trade = replace(
+                    trade,
+                    diagnostic_only=True,
+                    authorizing=False,
+                    directional_authorizing=False,
+                    diagnostic_reason=trade_diagnostic_reason,
+                )
             result.trades.append(trade)
+    if bar_fallback_diagnostic:
+        result.authorizing = False
+        result.diagnostic_only = True
+        report = dict(result.source_report or {})
+        report.update({"authorizing": False, "diagnostic_only": True,
+                       "bar_fallback": True})
+        result.source_report = report
     return result
 
 

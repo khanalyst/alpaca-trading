@@ -19,9 +19,9 @@ from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
     RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, SESSION_MINUTES,
     V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS, V4_DEFAULT_EXTENSIONS,
-    completed_bar_exit_transition, evaluate_rule_signal,
+    canonical_exit_reason, completed_bar_exit_transition, evaluate_rule_signal,
     evaluate_rule_signal_trace, frozen_target_reference,
-    feature_window_bars, hold_deadline, thesis_exit_deadline,
+    exit_deadline, feature_window_bars, thesis_exit_deadline,
     rule_semantic_signature,
     initialize_exit_state, rule_behavior_identity, rule_variant_id,
     rule_vehicle_executable,
@@ -32,11 +32,12 @@ from agent.contracts.risk_geometry import (
     quantize_equity_bracket,
 )
 from .costs import (BAR, QUOTE, RESTING_BRACKET,
+                    DIAGNOSTIC_BAR_FALLBACK,
+                    DIAGNOSTIC_HISTORICAL_BACKFILL,
                     RESTING_BRACKET_FILL_SCHEMA, STRESSED_COST_BASIS,
                     STRESSED_COST_SCHEMA, CostError, CostModel, ReplayPolicy,
                     check_entry_slippage, check_stressed_cost_plan,
-                    index_quotes, quote_fill,
-                    quote_fill_record, resting_bracket_fill_claim,
+                    index_quotes, quote_fill_record, resting_bracket_fill_claim,
                     stressed_cost_usd,
                     replay_policy_for_bars)
 from .edge_ledger import content_hash
@@ -46,6 +47,7 @@ from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, option_has_liquidity,
                           replay_available_at, replay_open_is_available,
                           replay_record_is_available)
+from .maturity import causal_maturity_bars
 from .path_telemetry import compute_path_telemetry
 
 
@@ -180,6 +182,16 @@ FAMILY_TEMPLATES: tuple[dict[str, Any], ...] = (
      "threshold_bps": 12.0, "confirmation": "none"},
 )
 
+# Exit search axes are grouped by mechanism without changing the neutral root
+# specification or multiplying another discovery dimension.  Reversion
+# families reach fair-value targets and shorter holds first; breakout/trend
+# families reach wider targets, longer holds, and trailing ratchets first.
+REVERSION_FAMILIES = frozenset({
+    "opening_range_fade", "mean_reversion", "vwap_reversion",
+})
+TREND_BREAKOUT_FAMILIES = frozenset(
+    family for family in RULE_FAMILIES if family not in REVERSION_FAMILIES)
+
 
 def family_template(family: str) -> dict[str, Any]:
     for template in FAMILY_TEMPLATES:
@@ -200,16 +212,16 @@ def template_hypothesis(slot: int, *, vehicle: str = "equity",
     if not 0 <= int(slot) < MAX_STRATEGIES:
         raise FactoryError(f"slot must be between 0 and {MAX_STRATEGIES - 1}")
     # The raw catalog remains available above for legacy v1/v2
-    # content-addressed IDs.  New equity roots use v4's neutral no-op form so
-    # the deterministic coordinate neighborhood can reach the complete,
-    # bounded exit grammar without depending on an LLM proposal; option roots
+    # content-addressed IDs. New equity roots use v4's neutral no-op form so
+    # their identity remains stable; deterministic family-aware exit
+    # hypotheses are scheduled by the coordinate pool instead. Option roots
     # stay on executable v2.
     authored = family_template(FAMILY_TEMPLATES[int(slot)]["family"])
     if str(vehicle) == "equity":
         # Equity is the only vehicle with a parity-safe runtime amendment path.
-        # Promote new roots to v4 at its neutral defaults so the ordinary
-        # coordinate neighborhood can deterministically activate every
-        # bounded exit policy, including v3 breakeven semantics.
+        # The ordinary coordinate neighborhood can deterministically activate
+        # every bounded exit policy and v3 breakeven semantics one field at a
+        # time without changing the root's executable behavior.
         authored.update({"schema": RULE_SCHEMA_V4,
                          **V3_DEFAULT_EXTENSIONS,
                          **V4_DEFAULT_EXTENSIONS})
@@ -314,6 +326,14 @@ def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
 def _option_liquid(snapshot: OptionSnapshot) -> bool:
     """Backward-compatible private alias for the shared runtime rule."""
     return option_has_liquidity(snapshot)
+
+
+def _historical_evidence(record: object | None) -> bool:
+    """Recognize normalized records and retained executable quote fills."""
+    return bool(record is not None and (
+        historical_backfill_record(record) or
+        str(getattr(record, "source_mode", "") or "").strip().lower() ==
+        "historical_backfill"))
 
 
 def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
@@ -462,7 +482,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     if not rule_vehicle_executable(spec, vehicle):
         reason = ("cross_sectional_residual is executable only for equity shares"
                   if spec["family"] == "cross_sectional_residual" else
-                  "rule-strategy.v3 is not executable for options")
+                  f"{spec['schema']} is not executable for options")
         return _unpriced(
             session_bars[0], session_bars[0], session_bars[0].session_date,
             "unknown", reason,
@@ -488,8 +508,20 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     # ``None`` means the family retains a session-open anchor, so its window
     # starts at the session's first bar rather than a trailing offset.
     window = feature_window_bars(spec)
-    minimum_prefix = max(int(spec["lookback"]) + 1,
-                         int(spec["atr_period"]) + 1)
+    minimum_prefix = causal_maturity_bars(spec)
+    # A signal needs its complete causal prefix plus an entry bar.  Report a
+    # short session as missing evidence, never as a tested predicate that did
+    # not fire.
+    if len(session_bars) <= minimum_prefix:
+        return _unpriced(
+            session_bars[0], session_bars[-1],
+            session_bars[0].session_date, "unknown",
+            "insufficient_history", stage="data_validation",
+            signal_opportunity=False,
+            detail={"prefix_status": "insufficient_history",
+                    "available_bars": len(session_bars),
+                    "needed_prefix_bars": minimum_prefix,
+                    "entry_bar_required": True})
     last_refusal: dict | None = None
     evaluated_prefixes = 0
     gapped_prefixes = 0
@@ -497,6 +529,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     cross_context_valid_prefixes = 0
     last_cross_reason: str | None = None
     last_cross_metadata: dict[str, Any] = {}
+    context_evidence: list[UnderlyingBar] = []
     for index in range(1, len(session_bars) - 1):
         if index + 1 < minimum_prefix:
             continue
@@ -514,6 +547,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             context = _visible_rule_context(
                 market_context, day=signal_bar.session_date,
                 cutoff=signal_bar.timestamp, policy=resolved_policy)
+            context_evidence.extend(
+                bar for rows in context.values() for bar in rows)
             trace = evaluate_rule_signal_trace(
                 session_bars[:index + 1], spec,
                 bars_by_symbol=context, symbol=signal_bar.symbol)
@@ -615,13 +650,17 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         entry_feed = entry_provider = None
         entry_age = 0.0
         entry_snap: OptionSnapshot | None = None
+        entry_evidence: object | None = None
         if vehicle == "equity":
             quoted = quote_fill_record(
                 quotes, symbol=signal_bar.symbol, at=entry_at,
                 side="buy" if direction == "long" else "sell",
                 max_age_seconds=resolved_policy.max_market_data_age_seconds,
-                session_date=signal_bar.session_date)
+                session_date=signal_bar.session_date,
+                allow_historical_backfill_diagnostics=(
+                    resolved_policy.allow_historical_backfill_diagnostics))
             if quoted is not None:
+                entry_evidence = quoted
                 entry_underlying = quoted.price
                 entry_ref, entry_source = quoted.price, QUOTE
                 entry_feed, entry_provider = quoted.feed, quoted.provider
@@ -666,6 +705,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                  entry_timestamp=entry_at,
                                  stage="entry_pricing")
             entry_ref = entry_snap.ask
+            entry_evidence = entry_snap
             entry_source = QUOTE
             entry_feed = str(entry_snap.identity.feed)
             entry_provider = str(entry_snap.identity.provider)
@@ -770,7 +810,21 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         # the trade is admitted instead of overspending the authored budget.
         real_risk = max(0.0, entry_underlying - stop if direction == "long"
                         else stop - entry_underlying)
-        deadline = hold_deadline(entry_at, spec)
+        force_flat_ts = None
+        if resolved_policy.force_flat_time is not None:
+            local_entry = entry_at.astimezone(ZoneInfo("America/New_York"))
+            force_flat_ts = local_entry.replace(
+                hour=resolved_policy.force_flat_time.hour,
+                minute=resolved_policy.force_flat_time.minute,
+                second=resolved_policy.force_flat_time.second,
+                microsecond=resolved_policy.force_flat_time.microsecond,
+            ).timestamp()
+        deadline_contract = exit_deadline(
+            entry_at, spec, force_flat_ts=force_flat_ts)
+        deadline = (None if deadline_contract is None else
+                    float(deadline_contract["timestamp"]))
+        deadline_reason = (None if deadline_contract is None else
+                           str(deadline_contract["reason"]))
         thesis_deadline = thesis_exit_deadline(entry_at, spec)
         last_index = entry_index
         # The existing replay intentionally resolves a hold on the last
@@ -818,7 +872,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     hold_discontinuity_gap_minutes = max(
                         0.0, hold_discontinuity_gap_seconds / 60.0)
                 break
-            if session_bars[probe].end.timestamp() > deadline:
+            if (deadline is not None and
+                    session_bars[probe].end.timestamp() > deadline):
                 break
             if not _at_or_before_force_flat(session_bars[probe].timestamp,
                                             resolved_policy):
@@ -836,7 +891,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             terminal_end >= terminal_session_close)
         if (not hold_discontinuity and last_index == len(session_bars) - 1 and
                 not terminal_is_calendar_close and
-                terminal_end.timestamp() < deadline and
+                (deadline is None or terminal_end.timestamp() < deadline) and
                 _at_or_before_force_flat(terminal_end, resolved_policy)):
             hold_discontinuity = True
             hold_discontinuity_kind = "observed_data_end"
@@ -845,10 +900,11 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         exit_ref = float(exit_bar.close)
         exit_at = exit_bar.end
         pricing_cutoff = exit_at
-        reason = ("exit_before" if not hold_discontinuity and
-                  thesis_deadline is not None and
-                  abs(float(deadline) - float(thesis_deadline)) <= 1e-9 and
-                  abs(exit_at.timestamp() - float(deadline)) <= 1e-9
+        deadline_reached = (not hold_discontinuity and deadline is not None and
+                            abs(exit_at.timestamp() - deadline) <= 1e-9)
+        canonical_reason = (deadline_reason if deadline_reached else
+                            canonical_exit_reason("time"))
+        reason = ("exit_before" if canonical_reason == "thesis_deadline"
                   else "time")
         tie = False
         gapped = False
@@ -872,6 +928,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             if resolved is None:
                 continue
             reason = str(resolved["reason"])
+            canonical_reason = canonical_exit_reason(reason)
             tie = bool(resolved.get("tie_broken"))
             gapped = bool(resolved.get("entry_gap"))
             exit_gapped = bool(resolved.get("gapped")) and not gapped
@@ -881,6 +938,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             pricing_cutoff = bar.timestamp
             break
         hold_discontinuity_exit = hold_discontinuity and reason == "time"
+        canonical_reason = canonical_exit_reason(
+            canonical_reason, discontinuity=hold_discontinuity_exit)
         day = signal_bar.session_date
         multiplier = 1
         contract = None
@@ -889,14 +948,18 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         exit_fill_claim = None
         exit_feed = exit_provider = None
         exit_age = 0.0
+        exit_evidence: object | None = None
         if vehicle == "equity":
             if reason in {"time", "exit_before"} or gapped or exit_gapped:
                 quoted_exit = quote_fill_record(
                     quotes, symbol=signal_bar.symbol, at=pricing_cutoff,
                     side="sell" if direction == "long" else "buy",
                     max_age_seconds=resolved_policy.max_market_data_age_seconds,
-                    session_date=day)
+                    session_date=day,
+                    allow_historical_backfill_diagnostics=(
+                        resolved_policy.allow_historical_backfill_diagnostics))
                 if quoted_exit is not None:
+                    exit_evidence = quoted_exit
                     exit_ref, exit_source = quoted_exit.price, QUOTE
                     exit_feed, exit_provider = quoted_exit.feed, quoted_exit.provider
                     exit_age = max(
@@ -943,6 +1006,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                  decision_timestamp=signal_ready,
                                  entry_timestamp=entry_at,
                                  stage="exit_pricing")
+            exit_evidence = exit_snap
             contract = entry_snap.contract.symbol
             entry_option_feed = str(entry_snap.contract.feed).lower()
             exit_option_feed = str(exit_snap.contract.feed).lower()
@@ -984,6 +1048,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "active_stop_price": float(
                 exit_state.get("active_stop_price", stop)),
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
+            "canonical_exit_reason": canonical_reason,
             "target_r": float(spec.get("target_r")) if spec.get("target_r") is not None else None,
             "rule_schema": spec.get("schema"),
             "target_mode": spec.get("target_mode", "fixed_r"),
@@ -1020,11 +1085,15 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 if hold_discontinuity_exit else None),
             "hold_exit_reason": ("discontinuity"
                                  if hold_discontinuity_exit else
+                                 "session_force_flat"
+                                 if canonical_reason == "session_force_flat" else
                                  "time_expiry" if reason == "time" else
                                  "thesis_deadline" if reason == "exit_before"
                                  else reason),
             "exit_reason_detail": ("discontinuity"
                                    if hold_discontinuity_exit else
+                                   "session_force_flat"
+                                   if canonical_reason == "session_force_flat" else
                                    "time_expiry" if reason == "time" else
                                    "thesis_deadline" if reason == "exit_before"
                                    else reason),
@@ -1070,10 +1139,16 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "realized_risk_per_unit": (entry_ref * multiplier
                                        if vehicle == "option" else real_risk),
             "evidence_mode": (
-                "diagnostic_historical_backfill"
+                DIAGNOSTIC_HISTORICAL_BACKFILL
                 if any(
-                    historical_backfill_record(item)
-                    for item in (signal_bar, entry_bar, exit_bar))
+                    _historical_evidence(item)
+                    for item in (
+                        *(bar for bar in session_bars
+                          if bar.timestamp <= exit_bar.timestamp),
+                        *context_evidence,
+                        entry_evidence,
+                        exit_evidence,
+                    ))
                 else "forward_observed"
             ),
         }
@@ -1144,9 +1219,11 @@ def _fresh(raw: Mapping[str, Any], leg: str,
     return float(raw.get(f"{leg}_quote_age_seconds") or 0.0) <= limit
 
 
-def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime,
-                      policy: ReplayPolicy | None = None) -> float | None:
-    """Return the last bar price that was observable at ``cutoff``.
+def _visible_bar_mark_record(
+        rows: Sequence[UnderlyingBar], cutoff: datetime,
+        policy: ReplayPolicy | None = None,
+) -> tuple[float, UnderlyingBar] | None:
+    """Return the last observable bar price and its provenance record.
 
     A bar's open is the boundary observation used for an entry at its
     timestamp (the same convention used by :func:`_simulate_trade`).  A
@@ -1155,10 +1232,17 @@ def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime,
     """
     for row in reversed(rows):
         if row.timestamp == cutoff and _open_visible(row, cutoff, policy):
-            return float(row.open)
+            return float(row.open), row
         if row.end <= cutoff and _visible(row, row.end, policy):
-            return float(row.close)
+            return float(row.close), row
     return None
+
+
+def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime,
+                      policy: ReplayPolicy | None = None) -> float | None:
+    """Backward-compatible price-only view of the selected visible bar."""
+    selected = _visible_bar_mark_record(rows, cutoff, policy)
+    return None if selected is None else selected[0]
 
 
 def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSnapshot],
@@ -1261,14 +1345,17 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
     active: list[dict] = []
     realized_by_day: dict[str, float] = {}
     day_start_equity: dict[str, float] = {}
+    cash_has_historical_evidence = False
 
     def realize_until(timestamp: datetime) -> None:
-        nonlocal cash, peak, drawdown
+        nonlocal cash, peak, drawdown, cash_has_historical_evidence
         closing = [item for item in active
                    if datetime.fromisoformat(item["exit_timestamp"]) <= timestamp]
         for item in sorted(closing, key=lambda value: (
                 value["exit_timestamp"], value["symbol"])):
             cash += float(item["net_pnl"])
+            if item.get("evidence_mode") == DIAGNOSTIC_HISTORICAL_BACKFILL:
+                cash_has_historical_evidence = True
             day_key = item["session_date"]
             realized_by_day[day_key] = realized_by_day.get(day_key, 0.0) + float(item["net_pnl"])
             peak = max(peak, cash)
@@ -1277,18 +1364,24 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
 
     mark_diagnostics: list[dict[str, Any]] = []
 
-    def mark_active(timestamp: datetime) -> float | None:
+    def mark_active(timestamp: datetime) -> tuple[float | None, bool]:
         """Mark open positions from information visible at ``timestamp``.
 
         Equity marks prefer the executable side of a fresh recorded quote and
         fall back to the exact bar open/last completed close.  Long options
         use the visible bid for liquidation.  Closed rows are removed by
         ``realize_until`` before this function runs, so realized P&L and
-        unrealized P&L cannot be counted twice.
+        unrealized P&L cannot be counted twice.  The provenance flag follows
+        both the selected market records and any earlier diagnostic sizing
+        already embedded in an active position or realized cash balance.
         """
         unrealized = 0.0
         missing: list[str] = []
+        historical_evidence = cash_has_historical_evidence
         for item in active:
+            historical_evidence = bool(
+                historical_evidence or
+                item.get("evidence_mode") == DIAGNOSTIC_HISTORICAL_BACKFILL)
             symbol = str(item.get("symbol", "")).upper()
             direction = str(item.get("direction", "long"))
             mark: float | None = None
@@ -1300,17 +1393,31 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                     contract_symbol=item.get("contract"), policy=resolved_policy)
                 if snap is not None:
                     mark = float(snap.bid)
+                    historical_evidence = bool(
+                        historical_evidence or _historical_evidence(snap))
             else:
                 side = "sell" if direction == "long" else "buy"
-                mark = quote_fill(
+                quoted_mark = quote_fill_record(
                     quote_index, symbol=symbol, at=timestamp, side=side,
                     max_age_seconds=resolved_policy.max_market_data_age_seconds,
-                    session_date=date.fromisoformat(str(item["session_date"])))
-                if mark is None:
-                    mark = _visible_bar_mark(
+                    session_date=date.fromisoformat(str(item["session_date"])),
+                    allow_historical_backfill_diagnostics=(
+                        resolved_policy.allow_historical_backfill_diagnostics))
+                if quoted_mark is not None:
+                    mark = float(quoted_mark.price)
+                    historical_evidence = bool(
+                        historical_evidence or
+                        _historical_evidence(quoted_mark))
+                else:
+                    bar_mark = _visible_bar_mark_record(
                         market_context.get(symbol, ()), timestamp,
                         resolved_policy,
                     )
+                    if bar_mark is not None:
+                        mark, mark_record = bar_mark
+                        historical_evidence = bool(
+                            historical_evidence or
+                            _historical_evidence(mark_record))
             if mark is None:
                 # Do not substitute entry price (or a future exit) when the
                 # active position has no visible mark. Account capacity and
@@ -1333,8 +1440,8 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 "symbols": sorted(set(missing)),
                 "reason": "active position mark unavailable",
             })
-            return None
-        return unrealized
+            return None, historical_evidence
+        return unrealized, historical_evidence
 
     for raw in sorted(candidates, key=lambda item: (
             item["entry_timestamp"], item["_symbol"], item["_day"])):
@@ -1343,7 +1450,7 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         symbol, day, opportunity = raw["_symbol"], raw["_day"], raw["opportunity_id"]
         day_key = day.isoformat()
         day_start_equity.setdefault(day_key, cash)
-        unrealized = mark_active(entry_at)
+        unrealized, mark_has_historical_evidence = mark_active(entry_at)
         if unrealized is None:
             rows.append({
                 "vehicle": vehicle, "symbol": symbol,
@@ -1580,6 +1687,10 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         fees = entry_fees + exit_fees
         net = gross - fees
         row = {key: value for key, value in raw.items() if not key.startswith("_")}
+        if (mark_has_historical_evidence or
+                str(row.get("evidence_mode") or "").strip().lower() ==
+                DIAGNOSTIC_HISTORICAL_BACKFILL):
+            row["evidence_mode"] = DIAGNOSTIC_HISTORICAL_BACKFILL
         row.update({"quantity": quantity, "entry_price": entry, "exit_price": exit_price,
                     "gross_pnl": gross, "costs": fees, "net_pnl": net,
                     "risk_usd": risk_usd,
@@ -1613,11 +1724,35 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                             if key.startswith("stressed_cost_") or
                             key == "max_stressed_cost_to_risk_ratio"})
                 row["stressed_cost_activation_reason"] = stress_activation_reason
-        if bool(row.get("hold_discontinuity_exit", row.get("hold_discontinuity"))):
+        bar_fallback_diagnostic = (
+            not resolved_policy.strict_market_data and
+            not (str(row.get("entry_fill_source") or "").strip().lower() == QUOTE and
+                 str(row.get("exit_fill_source") or "").strip().lower()
+                 in {QUOTE, RESTING_BRACKET}))
+        if bar_fallback_diagnostic:
+            if str(row.get("evidence_mode") or "").strip().lower() != DIAGNOSTIC_HISTORICAL_BACKFILL:
+                row["evidence_mode"] = DIAGNOSTIC_BAR_FALLBACK
+        if (bool(row.get("hold_discontinuity_exit",
+                       row.get("hold_discontinuity"))) or
+                resolved_policy.allow_historical_backfill_diagnostics or
+                bar_fallback_diagnostic or
+                str(row.get("evidence_mode") or "").strip().lower() ==
+                DIAGNOSTIC_HISTORICAL_BACKFILL or
+                str(row.get("evidence_mode") or "").strip().lower() ==
+                DIAGNOSTIC_BAR_FALLBACK):
             # Sparse-hold exits remain executable/accounting diagnostics, but
-            # cannot authorize directional P&L or strategy selection.
+            # cannot authorize directional P&L or strategy selection.  The
+            # same boundary applies to historical backfill and non-strict bar
+            # fallback evidence even when mechanics produced an ordinary exit.
             row.update({"diagnostic_only": True, "authorizing": False,
                         "directional_authorizing": False})
+            if (resolved_policy.allow_historical_backfill_diagnostics and
+                    str(row.get("evidence_mode") or "").strip().lower() not in {
+                        DIAGNOSTIC_HISTORICAL_BACKFILL,
+                        DIAGNOSTIC_BAR_FALLBACK,
+                    } and not bool(row.get(
+                        "hold_discontinuity_exit", row.get("hold_discontinuity")))):
+                row["diagnostic_reason"] = "diagnostic_backfill_policy"
         else:
             row.setdefault("directional_authorizing", True)
         rows.append(row)
@@ -1648,10 +1783,22 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             "max_drawdown": drawdown, "trades": len(executed), "rows": rows}
 
 
-def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> dict:
+def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0,
+             diagnostic_only: bool = False) -> dict:
+    if not isinstance(diagnostic_only, bool):
+        raise TypeError("diagnostic_only must be boolean")
     all_trades = [row for row in rows if row.get("no_trade") is not True]
-    trades = [row for row in all_trades
-              if row.get("directional_authorizing", True) is not False]
+    authorizing_trades = [row for row in all_trades
+                          if row.get("directional_authorizing", True) is not False and
+                          str(row.get("evidence_mode") or "").strip().lower()
+                          not in {DIAGNOSTIC_HISTORICAL_BACKFILL,
+                                  DIAGNOSTIC_BAR_FALLBACK}]
+    has_non_authorizing = len(authorizing_trades) != len(all_trades)
+    # Diagnostic factory analysis intentionally retains every executed row so
+    # historical reachability/P&L remains useful telemetry.  The separate
+    # authorizing projection above is still what default diagnosis and
+    # promotion-facing summaries consume.
+    trades = all_trades if diagnostic_only else authorizing_trades
     pnl = [float(row.get("net_pnl", 0.0)) for row in trades]
     wins = [value for value in pnl if value > 0]
     losses = [value for value in pnl if value < 0]
@@ -1704,9 +1851,12 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> di
         row.get("hold_exit_reason") == "time_expiry" for row in trades)
     return {
         "primary_failure": failure, "trades": len(trades),
+        "authorizing_trades": len(authorizing_trades),
         "executed_trades": len(all_trades),
         "sessions": len(sessions), "net_pnl": sum(pnl), "expectancy": expectancy,
-        "directional_authorizing": True,
+        "directional_authorizing": not diagnostic_only and not has_non_authorizing,
+        "authorizing": not diagnostic_only and not has_non_authorizing,
+        "diagnostic_only": bool(diagnostic_only),
         "execution_blocked": execution_blocked,
         "execution_rejection_count": len(refused_rows),
         "no_signal_count": len(no_signal_rows),
@@ -1843,6 +1993,38 @@ _TARGET_MODE_LADDER = ("fixed_r", "session_vwap", "rolling_mean")
 _TARGET_LOOKBACK_LADDER = (2, 5, 10, 20, 40, 60, 90, 120)
 _TRAILING_STOP_R_LADDER = (None, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
 _EXIT_BEFORE_MINUTES_LADDER = (None, 30, 60, 120, 180, 240, 300, 360, 389)
+_REVERSION_TARGET_R_LADDER = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+_TREND_TARGET_R_LADDER = (1.0, 1.5, 2.0, 2.5, 3.0, 5.0)
+_REVERSION_HOLD_LADDER = (15, 30, 45, 60, 90)
+_TREND_HOLD_LADDER = (45, 60, 90, 120, 180, 240)
+
+
+def _family_exit_hypothesis(root: Mapping[str, Any]) -> dict | None:
+    """Return one early, auditable family-specific exit coordinate.
+
+    Roots remain at neutral v4 defaults so their content identities and
+    synthetic-control relationship stay stable.  Reversion families spend one
+    early coordinate on a frozen fair-value target; breakout/trend families
+    spend one on a completed-close trailing ratchet.  The neutral root and the
+    remaining first-batch members retain fixed-R behavior, so an unavailable
+    fair-value reference cannot suppress the entire batch.
+    """
+    if root.get("schema") != RULE_SCHEMA_V4:
+        return None
+    family = str(root.get("family") or "")
+    if family == "mean_reversion":
+        change = {"target_mode": "rolling_mean"}
+    elif family in {"opening_range_fade", "vwap_reversion"}:
+        change = {"target_mode": "session_vwap"}
+    elif family in TREND_BREAKOUT_FAMILIES:
+        change = {"trailing_stop_r": 1.5}
+    else:
+        return None
+    try:
+        candidate = _safe_variant(root, **change)
+    except (TypeError, ValueError):
+        return None
+    return candidate if len(spec_delta(root, candidate)) == 1 else None
 
 
 def _stressed_cost_diagnostic(diagnostic: Mapping[str, Any] | None) -> bool:
@@ -1895,17 +2077,25 @@ def _coordinate_values(root: Mapping[str, Any], field: str,
     same rule validator used for every other authored strategy.
     """
     value = root.get(field)
+    family = str(root.get("family") or "")
+    reversion = family in REVERSION_FAMILIES
     if field == "side":
         return [item for item in ("both", "long", "short") if item != value]
     if field == "confirmation":
         return [item for item in ("none", "trend", "volume", "volatility")
                 if item != value]
     if field == "target_mode":
-        return [item for item in _TARGET_MODE_LADDER if item != value]
+        ordered = (("session_vwap", "rolling_mean", "fixed_r") if reversion
+                   else _TARGET_MODE_LADDER)
+        return [item for item in ordered if item != value]
     if field == "target_lookback":
-        return [item for item in _TARGET_LOOKBACK_LADDER if item != value]
+        ordered = ((5, 10, 20, 30, 45, 60) if reversion else
+                   (10, 20, 40, 60, 90, 120))
+        return [item for item in ordered if item != value]
     if field == "trailing_stop_r":
-        return [item for item in _TRAILING_STOP_R_LADDER if item != value]
+        ordered = ((None, 0.5, 1.0, 1.5, 2.0) if reversion else
+                   (None, 1.0, 1.5, 2.0, 3.0, 4.0))
+        return [item for item in ordered if item != value]
     if field == "exit_before_minutes":
         return [item for item in _EXIT_BEFORE_MINUTES_LADDER if item != value]
     if field == "confirmations":
@@ -1929,6 +2119,15 @@ def _coordinate_values(root: Mapping[str, Any], field: str,
     if field == "stop_atr":
         return [value for value in _STOP_ATR_LADDER
                 if float(value) != float(root.get(field))]
+    if field == "target_r":
+        ladder = (_REVERSION_TARGET_R_LADDER if reversion else
+                  _TREND_TARGET_R_LADDER)
+        return [candidate for candidate in ladder
+                if float(candidate) != float(value)]
+    if field == "max_hold_bars":
+        ladder = (_REVERSION_HOLD_LADDER if reversion else
+                  _TREND_HOLD_LADDER)
+        return [candidate for candidate in ladder if int(candidate) != int(value)]
     if field == "min_atr_bps" and _stressed_cost_diagnostic(diagnostic):
         return [candidate for candidate in _MIN_ATR_BPS_LADDER
                 if float(candidate) != float(value)]
@@ -1982,6 +2181,13 @@ def coordinate_mutation_pool(
             seen.add(variant_id)
             variants.append((candidate,
                              mutation_reason(root, candidate, diagnostic)))
+    preferred = _family_exit_hypothesis(root)
+    if preferred is not None:
+        preferred_id = rule_variant_id(preferred)
+        for index, (candidate, _reason) in enumerate(variants[1:], start=1):
+            if rule_variant_id(candidate) == preferred_id:
+                variants.insert(1, variants.pop(index))
+                break
     return variants
 
 

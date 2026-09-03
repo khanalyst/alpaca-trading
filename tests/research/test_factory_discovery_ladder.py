@@ -75,6 +75,35 @@ class DiscoveryLadderTests(unittest.TestCase):
                     candidate.get("target_mode") != root["target_mode"]
                     for candidate, _reason in pool[1:]))
 
+    def test_family_exit_candidates_are_early_without_changing_neutral_roots(self):
+        trend = template_hypothesis(0).rule_spec
+        reversion = template_hypothesis(3).rule_spec
+        for root in (trend, reversion):
+            self.assertEqual(
+                {key: root[key] for key in V4_DEFAULT_EXTENSIONS},
+                V4_DEFAULT_EXTENSIONS)
+        trend_pool = coordinate_mutation_pool(trend, {})
+        reversion_pool = coordinate_mutation_pool(reversion, {})
+        self.assertEqual(spec_delta(trend, trend_pool[1][0]), {
+            "trailing_stop_r": {"from": None, "to": 1.5},
+        })
+        self.assertEqual(spec_delta(reversion, reversion_pool[1][0]), {
+            "target_mode": {"from": "fixed_r", "to": "rolling_mean"},
+        })
+        self.assertGreaterEqual(sum(
+            candidate["target_mode"] == "fixed_r"
+            for candidate, _reason in reversion_pool[:4]), 2)
+        trend_holds = [candidate["max_hold_bars"]
+                       for candidate, _reason in trend_pool
+                       if "max_hold_bars" in spec_delta(trend, candidate)]
+        reversion_holds = [candidate["max_hold_bars"]
+                           for candidate, _reason in reversion_pool
+                           if "max_hold_bars" in spec_delta(reversion, candidate)]
+        self.assertIn(240, trend_holds)
+        self.assertIn(15, reversion_holds)
+        self.assertEqual(
+            discovery_attempt_limit("equity"), MAX_DISCOVERY_ATTEMPTS)
+
     def test_option_roots_and_discovery_remain_executable_v2(self):
         root = template_hypothesis(0, vehicle="option").rule_spec
         discovered = discovery_spec(1, family=root["family"], vehicle="option")

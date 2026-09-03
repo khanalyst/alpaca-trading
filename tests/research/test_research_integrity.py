@@ -1,6 +1,7 @@
 """Regression tests for scheduled research boundaries and portability."""
 
 from argparse import Namespace
+import io
 import importlib.util
 import json
 from pathlib import Path
@@ -258,6 +259,41 @@ class ScheduledResearchTests(unittest.TestCase):
                         research_cli.cmd_factory_run(args)
                 factory.assert_not_called()
 
+    def test_validate_data_stdin_applies_source_mode_and_future_guards(self):
+        base = {
+            "kind": "bar", "provider": "alpaca", "feed": "iex",
+            "symbol": "SPY", "timestamp": "2020-01-02T14:30:00+00:00",
+            "as_of": "2020-01-02T14:30:00+00:00",
+            "observed_at": "2020-01-02T14:30:00+00:00",
+            "open": 100.0, "high": 101.0, "low": 99.0,
+            "close": 100.0, "volume": 10,
+        }
+        rows = [
+            {**base, "source_mode": "forward_observed"},
+            {**base, "symbol": "QQQ", "source_mode": "historical_backfill"},
+            {**base, "symbol": "IWM",
+             "timestamp": "2030-01-02T14:30:00+00:00",
+             "as_of": "2030-01-02T14:30:00+00:00",
+             "observed_at": "2030-01-02T14:30:00+00:00"},
+        ]
+        payload = "\n".join(json.dumps(row) for row in rows) + "\n"
+        with patch.object(research_cli.sys, "stdin", io.StringIO(payload)), \
+             patch.object(research_cli, "print") as emit:
+            status = research_cli.cmd_validate_data(Namespace(
+                input="-", provider="alpaca", feed="iex",
+                diagnostic_only=False))
+        self.assertEqual(status, 2)
+        report = json.loads(emit.call_args.args[0])
+        self.assertFalse(report["valid"])
+        self.assertEqual(report["source_mode_counts"], {
+            # Missing source_mode retains the compatibility default, but the
+            # independently invalid future timestamp still blocks the source.
+            "forward_observed": 2, "historical_backfill": 1,
+        })
+        self.assertEqual(report["future_observed_rows"], 1)
+        self.assertTrue(any("mixed" in error for error in report["errors"]))
+        self.assertTrue(any("future" in error for error in report["errors"]))
+
     def test_factory_diagnostic_only_marks_result_and_emits_no_proof(self):
         row = {"kind": "bar", "provider": "alpaca", "feed": "sip"}
         with tempfile.TemporaryDirectory() as directory:
@@ -320,7 +356,8 @@ class ScheduledResearchTests(unittest.TestCase):
             self.assertFalse(report.with_name(report.name + ".tmp").exists())
 
     def test_factory_iex_default_keeps_proof_emission_path(self):
-        row = {"kind": "bar", "provider": "alpaca", "feed": "iex"}
+        row = {"kind": "bar", "provider": "alpaca", "feed": "iex",
+               "source_mode": "forward_observed"}
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "market.jsonl"
             source.write_text(json.dumps(row) + "\n", encoding="utf-8")

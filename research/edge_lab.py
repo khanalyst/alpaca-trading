@@ -33,6 +33,7 @@ from .market_data import (
     normalize_quote, normalize_underlying_bar,
 )
 from .stats import benjamini_yekutieli
+from .source_validation import SourceValidationError, validate_source
 
 
 from .edge_discovery_core import (
@@ -167,7 +168,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
              variants_path: str | Path | None = None,
              min_trades: int = 100,
              min_sessions: int = 30, alpha: float = .05,
-             backtest_bar_fallback: bool = False) -> dict:
+             backtest_bar_fallback: bool = False,
+             diagnostic_only: bool = False) -> dict:
     """Run every bounded IBR variant on one normalized corpus.
 
     ``backtest`` writes only the fit/held-out replay and can advance a fresh
@@ -183,6 +185,43 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         raise DiscoveryError("lane must be auto, backtest, or shadow")
     if not isinstance(backtest_bar_fallback, bool):
         raise DiscoveryError("backtest_bar_fallback must be true or false")
+    if not isinstance(diagnostic_only, bool):
+        raise DiscoveryError("diagnostic_only must be true or false")
+    try:
+        source_report = validate_source(data, diagnostic_only=diagnostic_only)
+    except SourceValidationError as exc:
+        raise DiscoveryError(str(exc)) from exc
+    if diagnostic_only:
+        # Explicit diagnostics may inspect historical/mixed sources, but they
+        # still pass the ordinary market-row parser.  This keeps malformed
+        # symbols/timestamps and unsupported records from being reported as a
+        # successful diagnostic merely because no authorizing ledger is used.
+        raw_rows, bars, snapshots, quotes = _read_discovery_rows(
+            data, require_provenance=False)
+        dataset_hash = content_hash(raw_rows)
+        if str(source_report.get("content_hash")) != dataset_hash:
+            if callable(getattr(quotes, "close", None)):
+                quotes.close()
+            raise DiscoveryError(
+                "research source changed after provenance validation")
+        quote_count = getattr(quotes, "count", None)
+        if quote_count is None or callable(quote_count):
+            quote_count = len(quotes)
+        if callable(getattr(quotes, "close", None)):
+            quotes.close()
+        # No discovery ledger is opened and no candidate lifecycle advances.
+        return {
+            "schema": "edge-discovery-diagnostic.v1",
+            "status": "diagnostic_only", "authorizing": False,
+            "diagnostic_only": True, "variants": [], "proofs": [],
+            "dataset_hash": dataset_hash,
+            "normalized_counts": {
+                "bars": len(bars), "options": len(snapshots),
+                "quotes": int(quote_count),
+            },
+            "source_mode_counts": source_report.get("source_mode_counts", {}),
+            "future_observed_rows": source_report.get("future_observed_rows", 0),
+        }
     # These values are policy inputs, not harmless replay hints.  Reject bools,
     # fractional counts, non-finite values and out-of-range alpha before any
     # corpus is sealed or a candidate is registered.
@@ -206,6 +245,11 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     raw_rows, bars, snapshots, quotes = _read_discovery_rows(
         data, require_provenance=True,
         expected_equity_feed=str(configured_feed or "iex"))
+    data_hash = content_hash(raw_rows)
+    if str(source_report.get("content_hash")) != data_hash:
+        if callable(getattr(quotes, "close", None)):
+            quotes.close()
+        raise DiscoveryError("research source changed after provenance validation")
     from agent.variants import load_registry
     registry_path = variants_path or Path(__file__).with_name("variants.yaml")
     variants = load_registry(registry_path)
@@ -220,7 +264,6 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                   if variant.variant_id != baseline_variant.variant_id]
     ledger = EdgeLedger(db_path)
     code_path = Path(__file__)
-    data_hash = content_hash(raw_rows)
 
     # The latest sessions are sealed before any variant is replayed, so no
     # gate, correction or champion comparison can reach them; the window is

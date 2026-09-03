@@ -32,8 +32,9 @@ SYMBOLS = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH")
 # (36 held-out) and 30 qualification sessions; eight symbols provide ample
 # trade coverage for the economics gates as well.
 SESSIONS = 150
-# Slot 0 of the shipped catalog. The refinement protocol keeps the root and
-# changes exactly one coordinate in the second arm.
+# Slot 0 of the shipped catalog. The refinement protocol keeps the neutral root
+# and changes exactly one coordinate in the second arm. Breakout/trend roots
+# promote the family-aware trailing hypothesis before generic numeric nudges.
 # Derive the fixture from the canonical factory root. Factory-created roots
 # intentionally use the v2 no-op extension form so every conditional search
 # axis is reachable, while legacy v1 IDs remain frozen for persisted edges.
@@ -41,7 +42,9 @@ ROOT_SPEC = template_hypothesis(0).rule_spec
 WINNING_SPEC = validate_rule_spec({**ROOT_SPEC, "target_r": 2.5})
 ROOT_VARIANT = rule_variant_id(ROOT_SPEC)
 WINNING_VARIANT = rule_variant_id(WINNING_SPEC)
-FIRST_COORDINATE_SPEC = validate_rule_spec({**ROOT_SPEC, "threshold_bps": 4.0})
+FIRST_COORDINATE_SPEC = validate_rule_spec({
+    **ROOT_SPEC, "trailing_stop_r": 1.5,
+})
 FIRST_COORDINATE_VARIANT = rule_variant_id(FIRST_COORDINATE_SPEC)
 # A materially worse, but still runtime-admissible, schedule. The 50 bps
 # slippage is the configured execution cap; it makes the narrow 2.5R edge
@@ -105,7 +108,8 @@ def _session_rows(symbol: str, day: int, opening: datetime) -> list[dict]:
             opened = round(101.70 + _wobble(symbol, day), 4)
         stamp = opening + timedelta(minutes=index)
         rows.append({
-            "kind": "bar", "provider": "test", "feed": "iex", "symbol": symbol,
+            "kind": "bar", "provider": "test", "feed": "iex",
+            "source_mode": "forward_observed", "symbol": symbol,
             "timestamp": stamp.isoformat(),
             "as_of": (stamp + timedelta(minutes=1)).isoformat(),
             "observed_at": (stamp + timedelta(minutes=1)).isoformat(),
@@ -119,6 +123,7 @@ def _session_rows(symbol: str, day: int, opening: datetime) -> list[dict]:
         # silently falling back to a bar price.
         rows.append({
             "kind": "quote", "provider": "test", "feed": "iex",
+            "source_mode": "forward_observed",
             "symbol": symbol, "timestamp": stamp.isoformat(),
             "as_of": stamp.isoformat(), "observed_at": stamp.isoformat(),
             "bid": round(opened - .01, 4), "ask": round(opened + .01, 4),
@@ -131,7 +136,10 @@ def edge_corpus(sessions: int = SESSIONS, *, skip: int = 0) -> list[dict]:
     """Consecutive weekday sessions of the corpus above, ``skip`` days in."""
     rows: list[dict] = []
     day = 0
-    stamp = datetime(2026, 1, 5, 9, 30, tzinfo=NEW_YORK)
+    # Keep this corpus permanently in the past. Source preflight correctly
+    # refuses observations dated beyond the wall clock, so a moving-current-
+    # year fixture would eventually become time-dependent again.
+    stamp = datetime(2025, 1, 6, 9, 30, tzinfo=NEW_YORK)
     while day < skip + sessions:
         if stamp.weekday() < 5:
             if day >= skip:

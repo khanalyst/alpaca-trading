@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -29,6 +31,12 @@ from research.market_data import (
     normalize_underlying_bar,
     parse_timestamp,
 )
+from research.source_validation import (
+    SourceValidationError,
+    scan_source,
+    source_paths,
+    validate_source,
+)
 from research.gates import (
     PROTOCOL_BACKTEST_MIN_SESSIONS, PROTOCOL_BACKTEST_MIN_TRADES,
     PROTOCOL_SHADOW_MIN_SESSIONS, PROTOCOL_SHADOW_MIN_TRADES,
@@ -46,24 +54,34 @@ def _iter_json_rows(path: str | Path):
     """Yield JSONL objects without retaining the complete source in memory."""
     source = Path(path)
     if source == Path("-"):
-        lines = sys.stdin
+        sources = [source]
+    elif source.is_dir():
+        sources = source_paths(source)
     else:
-        lines = source.open(encoding="utf-8")
-    try:
-        for number, line in enumerate(lines, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise SystemExit(f"{source}:{number}: invalid JSON: {exc}") from exc
-            if not isinstance(value, dict):
-                raise SystemExit(f"{source}:{number}: expected an object")
-            yield value
-    finally:
-        if source != Path("-"):
-            lines.close()
+        sources = [source]
+    offset = 0
+    for current in sources:
+        lines = sys.stdin if current == Path("-") else current.open(
+            encoding="utf-8")
+        try:
+            rows_seen = 0
+            for number, line in enumerate(lines, offset + 1):
+                rows_seen += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise SystemExit(
+                        f"{current}:{number}: invalid JSON: {exc}") from exc
+                if not isinstance(value, dict):
+                    raise SystemExit(f"{current}:{number}: expected an object")
+                yield value
+            offset += rows_seen
+        finally:
+            if current != Path("-"):
+                lines.close()
 
 
 def _json_rows(path: str | Path) -> list[dict[str, Any]]:
@@ -71,9 +89,29 @@ def _json_rows(path: str | Path) -> list[dict[str, Any]]:
     return list(_iter_json_rows(path))
 
 
+@contextmanager
+def _replayable_json_source(path: str | Path):
+    """Yield a path that can be scanned and normalized in two bounded passes.
+
+    File-backed validation streams the source directly.  Stdin is copied to a
+    temporary JSONL spool so provenance validation and normalization consume
+    the exact same bytes without retaining the corpus in memory.
+    """
+    if str(path) != "-":
+        yield Path(path)
+        return
+    with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".jsonl") as spool:
+        for line in sys.stdin:
+            spool.write(line)
+        spool.flush()
+        yield Path(spool.name)
+
+
 def _validated_row_provenance(row: Mapping[str, Any], *, kind: str,
                               configured_provider: str | None = None,
-                              configured_feed: str | None = None) -> tuple[str, str]:
+                              configured_feed: str | None = None,
+                              diagnostic_only: bool = False) -> tuple[str, str]:
     """Require provenance to be present on the row before normalizing it.
 
     CLI provider/feed values describe the configured adapter; they are not
@@ -108,7 +146,9 @@ def _validated_row_provenance(row: Mapping[str, Any], *, kind: str,
     # ``validate-data`` is the research authorization preflight.  Keep the
     # exact equity requirement explicit even when a caller supplies a
     # delayed-SIP hint for diagnostics.
-    if expected_feed not in {"iex", "sip"}:
+    allowed_feeds = ({"iex", "sip", "delayed_sip"}
+                     if diagnostic_only else {"iex", "sip"})
+    if expected_feed not in allowed_feeds:
         raise NormalizationError(
             "equity research requires configured real-time feed (iex or sip); "
             f"{expected_feed or '[missing]'} is diagnostic-only")
@@ -130,7 +170,9 @@ def _config(args: argparse.Namespace) -> IBRConfig:
                         slippage_bps=args.slippage_bps,
                         fee_bps=args.fee_bps),
         policy=ReplayPolicy(strict_market_data=bool(
-            getattr(args, "strict_market_data", False))),
+            getattr(args, "strict_market_data", False)),
+            allow_historical_backfill_diagnostics=bool(
+                getattr(args, "diagnostic_only", False))),
         force_flat=args.force_flat,
     )
 
@@ -146,69 +188,104 @@ def _time(value: str):
 
 def cmd_validate_data(args: argparse.Namespace) -> int:
     counts = {"bars": 0, "quotes": 0, "options": 0}
-    errors: list[str] = []
-    for number, row in enumerate(_iter_json_rows(args.input), 1):
-        kind = str(row.get("kind", "bar")).lower()
-        supported = {"bar", "underlying_bar", "underlying", "quote",
-                     "quote_snapshot", "equity_quote", "underlying_quote",
-                     "option", "option_snapshot", "option_quote"}
-        if kind not in supported:
-            errors.append(f"row {number}: unsupported kind {kind!r}")
-            continue
-        # Run structural normalization against the row's own metadata first,
-        # so diagnostics retain useful symbol/value errors even when a second
-        # provenance check also rejects a mismatched or missing-feed row. Missing
-        # fields use CLI values only for this diagnostic attempt; a row cannot
-        # count as valid unless the explicit check below succeeds.
-        raw_provider = row.get("provider")
-        raw_feed = row.get("feed", row.get("feed_id"))
-        diagnostic_provider = (raw_provider if raw_provider not in (None, "")
-                               else getattr(args, "provider", None))
-        diagnostic_feed = (raw_feed if raw_feed not in (None, "")
-                           else getattr(args, "feed", None))
-        structural_error = None
+    with _replayable_json_source(args.input) as source:
         try:
-            if kind in {"bar", "underlying_bar", "underlying"}:
-                normalize_underlying_bar(row, provider=diagnostic_provider,
-                                         feed=diagnostic_feed)
-            elif kind in {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}:
-                normalize_quote(row, provider=diagnostic_provider,
-                                feed=diagnostic_feed)
-            else:
-                normalize_option_snapshot(row, provider=diagnostic_provider,
-                                          feed=diagnostic_feed)
-        except (NormalizationError, ValueError) as exc:
-            structural_error = exc
-            errors.append(f"row {number}: {exc}")
-        provenance_error = None
+            scan = validate_source(
+                source,
+                diagnostic_only=bool(getattr(args, "diagnostic_only", False)))
+            errors: list[str] = []
+        except SourceValidationError as exc:
+            scan = exc.report
+            errors = [f"source: {item}" for item in scan.get("errors", ())]
+        for number, row in enumerate(_iter_json_rows(source), 1):
+            kind = str(row.get("kind", "bar")).lower()
+            supported = {"bar", "underlying_bar", "underlying", "quote",
+                         "quote_snapshot", "equity_quote", "underlying_quote",
+                         "option", "option_snapshot", "option_quote"}
+            if kind not in supported:
+                errors.append(f"row {number}: unsupported kind {kind!r}")
+                continue
+            # Run structural normalization against the row's own metadata first,
+            # so diagnostics retain useful symbol/value errors even when a second
+            # provenance check also rejects a mismatched or missing-feed row. Missing
+            # fields use CLI values only for this diagnostic attempt; a row cannot
+            # count as valid unless the explicit check below succeeds.
+            raw_provider = row.get("provider")
+            raw_feed = row.get("feed", row.get("feed_id"))
+            diagnostic_provider = (raw_provider if raw_provider not in (None, "")
+                                   else getattr(args, "provider", None))
+            diagnostic_feed = (raw_feed if raw_feed not in (None, "")
+                               else getattr(args, "feed", None))
+            structural_error = None
+            try:
+                if kind in {"bar", "underlying_bar", "underlying"}:
+                    normalize_underlying_bar(row, provider=diagnostic_provider,
+                                             feed=diagnostic_feed)
+                elif kind in {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}:
+                    normalize_quote(row, provider=diagnostic_provider,
+                                    feed=diagnostic_feed)
+                else:
+                    normalize_option_snapshot(row, provider=diagnostic_provider,
+                                              feed=diagnostic_feed)
+            except (NormalizationError, ValueError) as exc:
+                structural_error = exc
+                errors.append(f"row {number}: {exc}")
+            provenance_error = None
+            try:
+                provider, feed = _validated_row_provenance(
+                    row, kind=kind,
+                    configured_provider=getattr(args, "provider", None),
+                    configured_feed=getattr(args, "feed", None) or "iex",
+                    diagnostic_only=bool(getattr(args, "diagnostic_only", False)))
+            except (NormalizationError, ValueError) as exc:
+                provenance_error = exc
+                errors.append(f"row {number}: {exc}")
+            if structural_error is None and provenance_error is None:
+                if kind in {"bar", "underlying_bar", "underlying"}:
+                    counts["bars"] += 1
+                elif kind in {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}:
+                    counts["quotes"] += 1
+                else:
+                    counts["options"] += 1
+        # The provenance scan and structural normalization are separate
+        # bounded passes.  Recheck the exact ordered content afterwards so a
+        # mutable file/directory cannot swap bytes between those passes and
+        # receive a validation result for a different corpus snapshot.
         try:
-            provider, feed = _validated_row_provenance(
-                row, kind=kind,
-                configured_provider=getattr(args, "provider", None),
-                configured_feed=getattr(args, "feed", None) or "iex")
-        except (NormalizationError, ValueError) as exc:
-            provenance_error = exc
-            errors.append(f"row {number}: {exc}")
-        if structural_error is None and provenance_error is None:
-            if kind in {"bar", "underlying_bar", "underlying"}:
-                counts["bars"] += 1
-            elif kind in {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}:
-                counts["quotes"] += 1
-            else:
-                counts["options"] += 1
-    output = {"counts": counts, "errors": errors, "valid": not errors}
+            validate_source(
+                source,
+                diagnostic_only=bool(getattr(args, "diagnostic_only", False)),
+                expected_content_hash=str(scan.get("content_hash")),
+            )
+        except SourceValidationError as exc:
+            for item in exc.report.get("errors", ()):
+                message = f"source: {item}"
+                if message not in errors:
+                    errors.append(message)
+    output = {"counts": counts, "errors": errors, "valid": not errors,
+              "source_mode_counts": scan.get("source_mode_counts", {}),
+              "future_observed_rows": int(scan.get("future_observed_rows") or 0),
+              "late_forward_observation_rows": int(
+                  scan.get("late_forward_observation_rows") or 0)}
     print(json.dumps(output, sort_keys=True))
     return 0 if not errors else 2
 
 
 def _bars(args: argparse.Namespace):
+    rows = _json_rows(args.bars)
+    try:
+        validate_source(rows, diagnostic_only=bool(
+            getattr(args, "diagnostic_only", False)))
+    except SourceValidationError as exc:
+        raise SystemExit(str(exc)) from exc
     bars = []
-    for number, row in enumerate(_json_rows(args.bars), 1):
+    for number, row in enumerate(rows, 1):
         try:
             provider, feed = _validated_row_provenance(
                 row, kind=str(row.get("kind", "bar")).lower(),
                 configured_provider=getattr(args, "provider", None),
-                configured_feed=getattr(args, "feed", None) or "iex")
+                configured_feed=getattr(args, "feed", None) or "iex",
+                diagnostic_only=bool(getattr(args, "diagnostic_only", False)))
             bars.append(normalize_underlying_bar(
                 row, provider=provider, feed=feed))
         except (NormalizationError, ValueError) as exc:
@@ -234,33 +311,63 @@ def _quotes(args: argparse.Namespace):
     if not path:
         return None
     source = Path(path)
+    diagnostic_only = bool(getattr(args, "diagnostic_only", False))
+    source_report = None
+    if str(path) == "-":
+        rows = _json_rows(path)
+        try:
+            source_report = validate_source(rows, diagnostic_only=diagnostic_only)
+        except SourceValidationError as exc:
+            raise SystemExit(str(exc)) from exc
+        row_source = enumerate(rows, 1)
+    else:
+        try:
+            source_report = validate_source(source, diagnostic_only=diagnostic_only)
+        except SourceValidationError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        def file_rows():
+            number = 0
+            for partition in source_paths(source):
+                with partition.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        number += 1
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(f"invalid JSON: {exc}") from exc
+                        yield number, row
+
+        row_source = file_rows()
     mixed_source = bool(getattr(args, "quotes_from_mixed", False))
     quote_kinds = {"quote", "quote_snapshot", "equity_quote",
                    "underlying_quote"}
     index = SQLiteQuoteIndex()
     try:
-        with source.open(encoding="utf-8") as handle:
-            for number, line in enumerate(handle, 1):
-                line = line.strip()
-                if not line:
+        for number, row in row_source:
+            try:
+                if not isinstance(row, dict):
+                    raise ValueError("expected an object")
+                kind = str(row.get("kind", "quote")).lower()
+                if mixed_source and kind not in quote_kinds:
                     continue
-                try:
-                    row = json.loads(line)
-                    if not isinstance(row, dict):
-                        raise ValueError("expected an object")
-                    kind = str(row.get("kind", "quote")).lower()
-                    if mixed_source and kind not in quote_kinds:
-                        continue
-                    provider, feed = _validated_row_provenance(
-                        row, kind=kind,
-                        configured_provider=getattr(args, "provider", None),
-                        configured_feed=getattr(args, "feed", None) or "iex")
-                    index.add(normalize_quote(
-                        row, provider=provider, feed=feed))
-                except (json.JSONDecodeError, NormalizationError, ValueError) as exc:
-                    index.close()
-                    raise SystemExit(f"{source}:{number}: invalid quote: {exc}") from exc
-    except OSError as exc:
+                provider, feed = _validated_row_provenance(
+                    row, kind=kind,
+                    configured_provider=getattr(args, "provider", None),
+                    configured_feed=getattr(args, "feed", None) or "iex",
+                    diagnostic_only=diagnostic_only)
+                index.add(normalize_quote(
+                    row, provider=provider, feed=feed))
+            except (json.JSONDecodeError, NormalizationError, ValueError) as exc:
+                index.close()
+                raise SystemExit(f"{source}:{number}: invalid quote: {exc}") from exc
+        if str(path) != "-":
+            validate_source(
+                source, diagnostic_only=diagnostic_only,
+                expected_content_hash=str(source_report.get("content_hash")))
+    except (OSError, SourceValidationError) as exc:
         index.close()
         raise SystemExit(f"{source}: unable to read quotes: {exc}") from exc
     if not index:
@@ -277,12 +384,32 @@ def cmd_backtest_ibr(args: argparse.Namespace) -> int:
         if args.vehicle == "both":
             result = replay_ibr_vehicles(bars, config=cfg, quotes=quotes,
                                          vehicles=("equity", "option"))
-            print(json.dumps({key: value.summary() for key, value in result.items()},
-                             sort_keys=True))
+            summary: Any = {
+                key: value.summary() for key, value in result.items()}
         else:
             result = replay_ibr(bars, config=cfg, vehicle=args.vehicle,
                                 symbol=args.symbol, quotes=quotes)
-            print(json.dumps(result.summary(), sort_keys=True))
+            summary = result.summary()
+        if bool(getattr(args, "diagnostic_only", False)):
+            modes: dict[str, int] = {}
+            for bar in bars:
+                mode = str(getattr(
+                    getattr(bar, "identity", None), "source_mode",
+                    "forward_observed") or "forward_observed")
+                modes[mode] = modes.get(mode, 0) + 1
+            quote_mode_counts = getattr(quotes, "source_mode_counts", None)
+            if callable(quote_mode_counts):
+                for mode, count in quote_mode_counts().items():
+                    modes[str(mode)] = modes.get(str(mode), 0) + int(count)
+            summary = {
+                "schema": "ibr-backtest-diagnostic.v1",
+                "authorizing": False,
+                "diagnostic_only": True,
+                "vehicle": args.vehicle,
+                "source_mode_counts": dict(sorted(modes.items())),
+                "result": summary,
+            }
+        print(json.dumps(summary, sort_keys=True))
         return 0
     finally:
         if quotes is not None and callable(getattr(quotes, "close", None)):
@@ -318,48 +445,30 @@ def _agent_config(args: argparse.Namespace) -> dict:
     return load_agent_config(path)
 
 
-def _dataset_context(path: str | Path) -> dict[str, Any]:
+def _dataset_context(path: str | Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Summarize point-in-time source identity without copying raw rows."""
     if str(path) == "-":
         return {}
     source = Path(path)
-    if not source.is_file():
+    if not source.is_file() and not source.is_dir():
         return {}
-    providers: set[str] = set()
-    feeds: set[str] = set()
-    kinds: set[str] = set()
-    latest: datetime | None = None
-    with source.open(encoding="utf-8") as stream:
-        for line in stream:
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                return {}
-            if not isinstance(row, dict):
-                continue
-            if row.get("provider"):
-                providers.add(str(row["provider"]))
-            raw_feed = row.get("feed", row.get("feed_id"))
-            if raw_feed:
-                feeds.add(str(raw_feed))
-            kinds.add(str(row.get("kind") or "bar").lower())
-            raw_time = row.get("as_of") or row.get("observed_at") or row.get("timestamp")
-            if raw_time is None:
-                continue
-            try:
-                timestamp = parse_timestamp(raw_time)
-            except (NormalizationError, ValueError):
-                continue
-            if latest is None or timestamp > latest:
-                latest = timestamp
+    scan = scan_source(path, now=now)
+    providers = list(scan.get("providers") or ())
+    feeds = list(scan.get("feeds") or ())
+    kinds = list(scan.get("kinds") or ())
     result: dict[str, Any] = {
-        "provider": ",".join(sorted(providers)) or None,
-        "feed": ",".join(sorted(feeds)) or None,
-        "schema": "normalized-market.v1:" + ",".join(sorted(kinds)),
+        "provider": ",".join(providers) or None,
+        "feed": ",".join(feeds) or None,
+        "schema": "normalized-market.v1:" + ",".join(kinds),
+        "source_mode_counts": dict(scan.get("source_mode_counts") or {}),
+        "future_observed_rows": int(scan.get("future_observed_rows") or 0),
+        "late_forward_observation_rows": int(
+            scan.get("late_forward_observation_rows") or 0),
+        "content_hash": scan.get("content_hash"),
     }
-    if latest is not None:
+    latest_raw = scan.get("latest_observed_at")
+    if latest_raw:
+        latest = parse_timestamp(latest_raw)
         result.update({
             "as_of": latest.isoformat(),
             "session_timestamp": latest.isoformat(),
@@ -415,83 +524,92 @@ def _factory_dataset_preflight(
     """
     source = getattr(args, "data", None)
     diagnostic_only = bool(getattr(args, "diagnostic_only", False))
-    context = _dataset_context(source or "-")
+    if source in (None, "-"):
+        raise ValueError(
+            "factory data provenance preflight requires a readable JSONL path; "
+            "materialize stdin before a factory run")
+    path = Path(source)
+    if not path.is_file() and not path.is_dir():
+        raise ValueError(
+            f"factory data provenance preflight cannot read {path}; "
+            "use --diagnostic-only for a non-authorizing run")
+
+    try:
+        source_scan = validate_source(path, diagnostic_only=diagnostic_only)
+    except SourceValidationError as exc:
+        raise ValueError(str(exc)) from exc
+    context = _dataset_context(path)
     if diagnostic_only:
         return {
             "authorizing": False,
             "diagnostic_only": True,
             "source": context,
+            "source_validation": source_scan,
         }
-    if source in (None, "-"):
-        raise ValueError(
-            "factory data provenance preflight requires a readable JSONL path; "
-            "use --diagnostic-only for a non-authorizing run")
-    path = Path(source)
-    if not path.is_file():
-        raise ValueError(
-            f"factory data provenance preflight cannot read {path}; "
-            "use --diagnostic-only for a non-authorizing run")
 
     expected_feed, expected_provider = _factory_feed_contract(config)
-    errors: list[str] = []
+    errors: list[str] = list(source_scan.get("errors") or [])
     rows = 0
     equity_rows = 0
     try:
-        with path.open(encoding="utf-8") as stream:
-            for number, line in enumerate(stream, 1):
-                if not line.strip():
-                    continue
-                rows += 1
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    errors.append(f"row {number}: invalid JSON: {exc}")
-                    continue
-                if not isinstance(row, Mapping):
-                    errors.append(f"row {number}: expected an object")
-                    continue
-                kind = str(row.get("kind") or "bar").strip().lower()
-                if kind in _EQUITY_FACTORY_KINDS:
-                    equity_rows += 1
-                    provider = str(row.get("provider") or "").strip()
-                    feed = (str(row.get("feed", row.get("feed_id")) or "")
-                            .strip().lower().replace("-", "_"))
-                    if feed == "delayed":
-                        feed = "delayed_sip"
-                    if not provider:
-                        errors.append(f"row {number}: {kind} requires explicit provider provenance")
-                    elif expected_provider and provider != expected_provider:
-                        errors.append(
-                            f"row {number}: {kind} provider {provider!r} does not match "
-                            f"configured provider {expected_provider!r}")
-                    if expected_feed not in {"iex", "sip"}:
-                        errors.append(
-                            "configured equity research feed must be real-time "
-                            "(iex or sip); "
-                            f"{expected_feed or '[missing]'} is diagnostic-only")
-                    elif feed != expected_feed:
-                        qualifier = ("; delayed_sip is diagnostic-only"
-                                     if feed == "delayed_sip" else "")
-                        errors.append(
-                            f"row {number}: {kind} feed {feed or '[missing]'!r} "
-                            f"does not match configured executable feed "
-                            f"{expected_feed!r}{qualifier}")
-                elif kind in _OPTION_FACTORY_KINDS:
-                    # A mixed corpus may carry option evidence while an equity
-                    # factory lane is running.  Keep that evidence explicit as
-                    # well, without allowing OPRA rows to satisfy the equity gate.
-                    provider = str(row.get("provider") or "").strip()
-                    feed = str(row.get("feed", row.get("feed_id")) or "").strip().lower()
-                    if not provider:
-                        errors.append(f"row {number}: {kind} requires explicit provider provenance")
-                    elif expected_provider and provider != expected_provider:
-                        errors.append(
-                            f"row {number}: {kind} provider {provider!r} does not match "
-                            f"configured provider {expected_provider!r}")
-                    if feed != "opra":
-                        errors.append(
-                            f"row {number}: {kind} feed {feed or '[missing]'!r} "
-                            "is not executable; expected 'opra'")
+        number = 0
+        for partition in source_paths(path):
+            with partition.open(encoding="utf-8") as stream:
+                for line in stream:
+                    number += 1
+                    if not line.strip():
+                        continue
+                    rows += 1
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        errors.append(f"row {number}: invalid JSON: {exc}")
+                        continue
+                    if not isinstance(row, Mapping):
+                        errors.append(f"row {number}: expected an object")
+                        continue
+                    kind = str(row.get("kind") or "bar").strip().lower()
+                    if kind in _EQUITY_FACTORY_KINDS:
+                        equity_rows += 1
+                        provider = str(row.get("provider") or "").strip()
+                        feed = (str(row.get("feed", row.get("feed_id")) or "")
+                                .strip().lower().replace("-", "_"))
+                        if feed == "delayed":
+                            feed = "delayed_sip"
+                        if not provider:
+                            errors.append(f"row {number}: {kind} requires explicit provider provenance")
+                        elif expected_provider and provider != expected_provider:
+                            errors.append(
+                                f"row {number}: {kind} provider {provider!r} does not match "
+                                f"configured provider {expected_provider!r}")
+                        if expected_feed not in {"iex", "sip"}:
+                            errors.append(
+                                "configured equity research feed must be real-time "
+                                "(iex or sip); "
+                                f"{expected_feed or '[missing]'} is diagnostic-only")
+                        elif feed != expected_feed:
+                            qualifier = ("; delayed_sip is diagnostic-only"
+                                         if feed == "delayed_sip" else "")
+                            errors.append(
+                                f"row {number}: {kind} feed {feed or '[missing]'!r} "
+                                f"does not match configured executable feed "
+                                f"{expected_feed!r}{qualifier}")
+                    elif kind in _OPTION_FACTORY_KINDS:
+                        # A mixed corpus may carry option evidence while an equity
+                        # factory lane is running.  Keep that evidence explicit as
+                        # well, without allowing OPRA rows to satisfy the equity gate.
+                        provider = str(row.get("provider") or "").strip()
+                        feed = str(row.get("feed", row.get("feed_id")) or "").strip().lower()
+                        if not provider:
+                            errors.append(f"row {number}: {kind} requires explicit provider provenance")
+                        elif expected_provider and provider != expected_provider:
+                            errors.append(
+                                f"row {number}: {kind} provider {provider!r} does not match "
+                                f"configured provider {expected_provider!r}")
+                        if feed != "opra":
+                            errors.append(
+                                f"row {number}: {kind} feed {feed or '[missing]'!r} "
+                                "is not executable; expected 'opra'")
     except OSError as exc:
         raise ValueError(f"factory data preflight failed for {path}: {exc}") from exc
 
@@ -504,7 +622,7 @@ def _factory_dataset_preflight(
             "factory data provenance preflight failed; use --diagnostic-only "
             "for an explicitly non-authorizing run: " + "; ".join(errors[:8]))
     return {"authorizing": True, "diagnostic_only": False,
-            "source": context}
+            "source": context, "source_validation": source_scan}
 
 
 def _emit_proofs(args: argparse.Namespace, result: dict,
@@ -751,14 +869,19 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
             runtime_config[block] = {**base, **override}
         else:
             runtime_config[block] = override
+    diagnostic_only = bool(getattr(args, "diagnostic_only", False))
     result = discover(
         args.data, db_path=_db(args), vehicle=args.vehicle, lane=args.lane,
         config=runtime_config, variants_path=args.variants,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha,
         backtest_bar_fallback=bool((agent_config.get("research") or {}).get(
-            "backtest_bar_fallback", True)))
-    _emit_proofs(args, result, agent_config)
+            "backtest_bar_fallback", True)),
+        diagnostic_only=diagnostic_only)
+    if diagnostic_only:
+        result["proofs"] = []
+    else:
+        _emit_proofs(args, result, agent_config)
     stalled = _report_unevaluable(
         result, [item.get("gate") for item in result.get("variants", [])
                  if isinstance(item, Mapping)])
@@ -1108,6 +1231,10 @@ def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("--config", help="optional base runtime config JSON")
         parser.add_argument("--agent-config", default=None,
                             help="validated agent config (default: config.yaml)")
+        parser.add_argument(
+            "--diagnostic-only", action="store_true",
+            help=("inspect historical/mixed sources without opening the edge "
+                  "ledger; result is non-authorizing"))
         parser.add_argument("--variants", help="optional preregistration JSON/YAML path")
         parser.add_argument("--min-trades", type=int,
                             default=PROTOCOL_BACKTEST_MIN_TRADES,
@@ -1131,6 +1258,10 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("input", help="JSONL file, or - for stdin")
     validate.add_argument("--provider", default=None)
     validate.add_argument("--feed", default=None)
+    validate.add_argument("--diagnostic-only", action="store_true",
+                          help=("allow historical or mixed source modes for a "
+                                "non-authorizing diagnostic; malformed and "
+                                "future-observed rows still fail"))
     validate.set_defaults(func=cmd_validate_data)
     ibr = sub.add_parser("backtest-ibr", help="replay IBR on normalized bars JSONL")
     ibr.add_argument("bars", help="underlying bars JSONL, or - for stdin")
@@ -1143,6 +1274,10 @@ def build_parser() -> argparse.ArgumentParser:
               "mixed market JSONL to replace a duplicate quote-only file"))
     ibr.add_argument("--provider", default=None)
     ibr.add_argument("--feed", default=None)
+    ibr.add_argument(
+        "--diagnostic-only", action="store_true",
+        help=("allow historical/mixed sources for an explicitly non-authorizing "
+              "replay"))
     ibr.add_argument("--vehicle", choices=("equity", "option", "both"), default="equity")
     _add_cost_flags(ibr)
     ibr.set_defaults(func=cmd_backtest_ibr)

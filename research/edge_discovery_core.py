@@ -22,11 +22,14 @@ from agent.contracts.risk_geometry import (
     quantize_equity_bracket,
 )
 from agent.contracts.rule import (
-    MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V4, completed_bar_exit_transition,
-    frozen_target_reference, hold_deadline, initialize_exit_state,
+    MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V4, canonical_exit_reason,
+    completed_bar_exit_transition, exit_deadline,
+    frozen_target_reference, initialize_exit_state,
     rule_vehicle_executable, thesis_exit_deadline, validate_rule_spec,
 )
 from .costs import (BAR, QUOTE, RESTING_BRACKET,
+                    DIAGNOSTIC_BAR_FALLBACK,
+                    DIAGNOSTIC_HISTORICAL_BACKFILL,
                     RESTING_BRACKET_FILL_SCHEMA, STRESSED_COST_BASIS,
                     STRESSED_COST_SCHEMA, CostError, CostModel,
                     ReplayPolicy, SQLiteQuoteIndex,
@@ -38,6 +41,7 @@ from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, replay_available_at,
                           replay_open_is_available,
                           replay_record_is_available)
+from .maturity import causal_maturity_bars
 from .stats import stable_seed
 from .gates import (
     ACTUAL_CONTROL_MIN_COVERAGE, ACTUAL_CONTROL_MIN_MATCHED,
@@ -643,6 +647,10 @@ def _opportunity_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) -> li
     # from one that simply held no edge.
     refused = {(refusal.symbol, refusal.session_date): refusal
                for refusal in getattr(result, "refusals", ())}
+    result_diagnostic = bool(getattr(result, "diagnostic_only", False))
+    result_diagnostic_reason = str(
+        (getattr(result, "source_report", None) or {}).get(
+            "diagnostic_reason") or "diagnostic_only")
     rows: list[dict] = []
     for symbol, day in sessions:
         opportunity_id = f"ibr:{vehicle}:{symbol}:{day.isoformat()}"
@@ -651,18 +659,27 @@ def _opportunity_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) -> li
             row = {"vehicle": vehicle, "symbol": symbol,
                    "session_date": day.isoformat(),
                    "opportunity_id": opportunity_id, "net_pnl": 0.0,
-                   "return_value": 0.0, "no_trade": True}
+                   "return_value": 0.0, "no_trade": True,
+                   "canonical_exit_reason": None}
             refusal = refused.get((symbol, day))
             if refusal is not None:
                 row["reject_reason"] = refusal.reason
                 if refusal.detail:
                     row["reject_detail"] = dict(refusal.detail)
+            if result_diagnostic:
+                row.update({"diagnostic_only": True, "authorizing": False,
+                            "directional_authorizing": False,
+                            "diagnostic_reason": result_diagnostic_reason})
             rows.append(row)
             continue
         row = {key: value for key, value in vars(trade).items()}
         row.update({"session_date": trade.session_date.isoformat(),
                     "opportunity_id": opportunity_id, "no_trade": False,
                     "return_value": float(trade.net_pnl)})
+        if result_diagnostic:
+            row.update({"diagnostic_only": True, "authorizing": False,
+                        "directional_authorizing": False})
+            row.setdefault("diagnostic_reason", result_diagnostic_reason)
         for key, value in list(row.items()):
             if isinstance(value, (datetime, date)):
                 row[key] = value.isoformat()
@@ -675,7 +692,7 @@ def _null_row(symbol: str, day: str, opportunity: str, vehicle: str,
               telemetry: Mapping[str, Any] | None = None) -> dict:
     row = {"vehicle": vehicle, "symbol": symbol, "session_date": day,
            "opportunity_id": opportunity, "net_pnl": 0.0, "return_value": 0.0,
-           "no_trade": True}
+           "no_trade": True, "canonical_exit_reason": None}
     if reason:
         row["reject_reason"] = reason
     if telemetry:
@@ -683,20 +700,18 @@ def _null_row(symbol: str, day: str, opportunity: str, vehicle: str,
     return row
 
 
+def _historical_evidence(record: object | None) -> bool:
+    """Recognize historical provenance on bars, quotes, and snapshots."""
+    return bool(record is not None and (
+        historical_backfill_record(record) or
+        str(getattr(record, "source_mode", "") or "").strip().lower() ==
+        "historical_backfill"))
+
+
 def _rule_mature_prefix(spec: Mapping[str, Any], window: int | None) -> int:
-    """Return the executable rule's causal prefix without inactive fields."""
-    required = max(int(spec["lookback"]) + 1,
-                   int(spec["atr_period"]) + 1,
-                   int(window or 0))
-    confirmations = {str(spec.get("confirmation") or "none")}
-    confirmations.update(str(item) for item in spec.get("confirmations") or ())
-    if "trend" in confirmations:
-        required = max(required, int(spec["slow_lookback"]))
-    if "volume" in confirmations:
-        required = max(required, int(spec["lookback"]) + 1)
-    if "volatility" in confirmations:
-        required = max(required, int(spec["atr_period"]) + 1)
-    return required
+    """Compatibility wrapper around the shared executable maturity rule."""
+    del window
+    return causal_maturity_bars(spec)
 
 
 def _null_admissible_entry_indices(session_bars: Sequence[Any], spec: Mapping,
@@ -775,7 +790,9 @@ def _null_admissible_entry_indices(session_bars: Sequence[Any], spec: Mapping,
             quoted = quote_fill_record(
                 quote_index, symbol=entry_bar.symbol, at=entry_at, side=side,
                 max_age_seconds=policy.max_market_data_age_seconds,
-                session_date=entry_bar.session_date)
+                session_date=entry_bar.session_date,
+                allow_historical_backfill_diagnostics=(
+                    policy.allow_historical_backfill_diagnostics))
             if quoted is None and policy.strict_market_data:
                 continue
             if quoted is None and replay_open_is_available(
@@ -790,8 +807,23 @@ def _null_admissible_entry_indices(session_bars: Sequence[Any], spec: Mapping,
                 continue
         # A null position must have at least one observable mark after entry;
         # otherwise the eventual exit would be right-censored rather than an
-        # admissible candidate hold.
-        deadline = hold_deadline(entry_at, spec)
+        # admissible candidate hold.  Resolve the same bounded deadline as the
+        # runtime/factory, including force-flat tie precedence.
+        force_flat_ts = None
+        if policy.force_flat_time is not None:
+            local_entry = entry_at.astimezone(ZoneInfo("America/New_York"))
+            force_flat_ts = local_entry.replace(
+                hour=policy.force_flat_time.hour,
+                minute=policy.force_flat_time.minute,
+                second=policy.force_flat_time.second,
+                microsecond=policy.force_flat_time.microsecond,
+            ).timestamp()
+        deadline_contract = exit_deadline(
+            entry_at, spec, force_flat_ts=force_flat_ts)
+        deadline = (None if deadline_contract is None else
+                    float(deadline_contract["timestamp"]))
+        if deadline is None:
+            continue
         if not any(bar.timestamp > entry_at and
                    bar.end.timestamp() <= deadline and
                    replay_available_at(
@@ -920,13 +952,18 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         entry_feed = entry_provider = None
         entry_age = 0.0
         entry_snap = None
+        entry_evidence: object | None = None
+        exit_evidence: object | None = None
         if vehicle == "equity":
             side = "buy" if direction == "long" else "sell"
             quoted = quote_fill_record(
                 quote_index, symbol=symbol, at=entry_at, side=side,
                 max_age_seconds=policy.max_market_data_age_seconds,
-                session_date=entry_bar.session_date)
+                session_date=entry_bar.session_date,
+                allow_historical_backfill_diagnostics=(
+                    policy.allow_historical_backfill_diagnostics))
             if quoted is not None:
+                entry_evidence = quoted
                 if entry_reference is not None:
                     slippage, slippage_reason = check_entry_slippage(
                         side, entry_reference, quoted.price,
@@ -956,6 +993,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             if entry_snap is None:
                 rows.append(_null_row(symbol, day, opportunity, vehicle))
                 continue
+            entry_evidence = entry_snap
             if entry_snap.underlying_price and entry_snap.underlying_price > 0:
                 entry_underlying = float(entry_snap.underlying_price)
             elif entry_underlying is None:
@@ -1033,8 +1071,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 rows.append(_null_row(symbol, day, opportunity, vehicle,
                                       "broker_tick_geometry_invalid"))
                 continue
-        deadline = hold_deadline(entry_at, spec)
-        thesis_deadline = thesis_exit_deadline(entry_at, spec)
+        force_flat_ts = None
         if policy.force_flat_time is not None:
             force_flat = entry_at.astimezone(
                 ZoneInfo("America/New_York")).replace(
@@ -1042,7 +1079,14 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                     minute=policy.force_flat_time.minute,
                     second=policy.force_flat_time.second,
                     microsecond=policy.force_flat_time.microsecond)
-            deadline = min(deadline, force_flat.timestamp())
+            force_flat_ts = force_flat.timestamp()
+        deadline_contract = exit_deadline(
+            entry_at, spec, force_flat_ts=force_flat_ts)
+        deadline = (None if deadline_contract is None else
+                    float(deadline_contract["timestamp"]))
+        deadline_reason = (None if deadline_contract is None else
+                           str(deadline_contract["reason"]))
+        thesis_deadline = thesis_exit_deadline(entry_at, spec)
         last_index = entry_index
         for probe in range(entry_index + 1, len(session_bars)):
             if session_bars[probe].end.timestamp() > deadline:
@@ -1064,9 +1108,13 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         exit_ref = float(exit_bar.close)
         exit_at = exit_bar.end
         boundary_exit = True
-        exit_reason = ("exit_before" if thesis_deadline is not None and
-                       abs(float(deadline) - float(thesis_deadline)) <= 1e-9 and
-                       abs(exit_at.timestamp() - float(deadline)) <= 1e-9
+        deadline_reached = (deadline is not None and
+                            abs(exit_at.timestamp() - float(deadline)) <= 1e-9)
+        # Keep the legacy reason aliases in this row, while persisting the
+        # shared canonical cause for runtime/factory parity and tie audits.
+        canonical_reason = (deadline_reason if deadline_reached else
+                            canonical_exit_reason("time"))
+        exit_reason = ("exit_before" if canonical_reason == "thesis_deadline"
                        else "time")
         tie_broken = False
         exit_state = initialize_exit_state(
@@ -1092,6 +1140,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 continue
             exit_ref = float(resolved["price"])
             exit_reason = str(resolved["reason"])
+            canonical_reason = canonical_exit_reason(exit_reason)
             tie_broken = bool(resolved.get("tie_broken"))
             exit_bar = bar
             boundary_exit = bool(resolved.get("gapped"))
@@ -1114,7 +1163,9 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 quote_index, symbol=symbol, at=exit_quote_at,
                 side="sell" if direction == "long" else "buy",
                 max_age_seconds=policy.max_market_data_age_seconds,
-                session_date=entry_bar.session_date)
+                session_date=entry_bar.session_date,
+                allow_historical_backfill_diagnostics=(
+                    policy.allow_historical_backfill_diagnostics))
             # A non-gap level trigger is the broker-resident bracket fill; a
             # quote at the bar boundary cannot identify its unknown trigger
             # instant and must never replace the planned resting level.
@@ -1129,6 +1180,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                     bar_feed=exit_bar.feed, bar_provider=exit_bar.provider,
                     tie_broken=tie_broken)
             elif quoted_exit is not None:
+                exit_evidence = quoted_exit
                 exit_ref, exit_source = quoted_exit.price, QUOTE
                 exit_feed, exit_provider = quoted_exit.feed, quoted_exit.provider
                 exit_age = max(0.0, (exit_quote_at -
@@ -1150,6 +1202,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 rows.append(_null_row(symbol, day, opportunity, vehicle))
                 continue
             exit_ref = exit_snap.bid
+            exit_evidence = exit_snap
             exit_feed = str(exit_snap.identity.feed)
             exit_provider = str(exit_snap.identity.provider)
             exit_age = max(0.0, (exit_at -
@@ -1250,6 +1303,16 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         cash += net
         peak = max(peak, cash)
         drawdown = max(drawdown, peak - cash)
+        bar_fallback_diagnostic = (
+            not policy.strict_market_data and
+            not (entry_source == QUOTE and
+                 exit_source in {QUOTE, RESTING_BRACKET}))
+        historical_evidence = any(
+            _historical_evidence(item)
+            for item in (source_entry_bar, entry_bar, exit_bar,
+                         entry_evidence, exit_evidence)
+            if item is not None)
+        diagnostic_evidence = historical_evidence or bar_fallback_diagnostic
         row = {"vehicle": vehicle, "symbol": symbol, "session_date": day,
                      "opportunity_id": opportunity, "direction": direction,
                      "entry_timestamp": entry_bar.timestamp.isoformat(),
@@ -1262,6 +1325,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                      "return_value": net / before if before > 0 else 0.0,
                      "no_trade": False,
                      "exit_reason": exit_reason,
+                     "canonical_exit_reason": canonical_reason,
                      "tie_broken": tie_broken,
                      "gap_fill": bool(boundary_exit),
                      "entry_gap_fill": False,
@@ -1308,12 +1372,13 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                      "exit_bar_feed": exit_bar.feed,
                      "exit_bar_provider": exit_bar.provider,
                      "evidence_mode": (
-                         "diagnostic_historical_backfill"
-                         if any(
-                             historical_backfill_record(item)
-                             for item in (source_entry_bar, entry_bar, exit_bar))
-                         else "forward_observed"
-                     )}
+                         DIAGNOSTIC_HISTORICAL_BACKFILL
+                         if historical_evidence else
+                         DIAGNOSTIC_BAR_FALLBACK
+                         if bar_fallback_diagnostic else "forward_observed")}
+        if diagnostic_evidence:
+            row.update({"diagnostic_only": True, "authorizing": False,
+                        "directional_authorizing": False})
         if stress_enabled:
             row.update({"quantity": quantity, "risk_usd": nominal_risk_usd,
                         "nominal_risk_usd": nominal_risk_usd,
@@ -1389,8 +1454,14 @@ def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str,
                               and bar.timestamp >= entry_at]
                 if candidates:
                     entry_bar = min(candidates, key=lambda bar: bar.timestamp)
-        diagnostic = (trade is not None and getattr(
-            trade, "evidence_mode", "") == "diagnostic_historical_backfill")
+        trade_evidence_mode = (str(getattr(trade, "evidence_mode", "") or "")
+                               if trade is not None else "")
+        diagnostic = bool(
+            getattr(result, "diagnostic_only", False) or
+            getattr(trade, "diagnostic_only", False) or
+            trade_evidence_mode in {
+                DIAGNOSTIC_HISTORICAL_BACKFILL, DIAGNOSTIC_BAR_FALLBACK,
+            })
         bar_visible = (entry_bar is not None and
                        replay_open_is_available(
                            entry_bar, entry_bar.timestamp,
@@ -1408,7 +1479,16 @@ def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str,
         row = {"vehicle": vehicle, "symbol": symbol, "session_date": day.isoformat(),
                "no_trade": not executable}
         if diagnostic:
-            row["evidence_mode"] = "diagnostic_historical_backfill"
+            if trade_evidence_mode:
+                row["evidence_mode"] = trade_evidence_mode
+            row.update({"diagnostic_only": True,
+                        "authorizing": False,
+                        "directional_authorizing": False})
+            diagnostic_reason = str(
+                getattr(trade, "diagnostic_reason", "") or
+                (getattr(result, "source_report", None) or {}).get(
+                    "diagnostic_reason") or "diagnostic_only")
+            row["diagnostic_reason"] = diagnostic_reason
         anchor = None
         if executable:
             anchor = (float(persisted_anchor) if persisted_anchor is not None else

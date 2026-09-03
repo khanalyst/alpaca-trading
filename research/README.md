@@ -68,6 +68,20 @@ backdated. An explicit diagnostic replay policy may inspect these rows and
 labels resulting trades `diagnostic_historical_backfill`; they are excluded from
 authorizing statistics and can never authorize a live-shadow proof.
 
+Every factory, discovery, validation, and standalone replay entry point runs a
+source-mode preflight before opening an authorizing ledger or constructing
+trades. Historical or mixed partitions fail the authorizing path with an
+explicit provenance error and must be requested through `--diagnostic-only`.
+Every authorizing row must explicitly carry `source_mode: forward_observed`;
+trusted recorder projections add that label, while unlabelled compatibility
+data remains diagnostic-only.
+Diagnostic mode still rejects malformed rows, unsupported source labels,
+future observation timestamps, and source changes during the run; its result is
+explicitly marked `authorizing: false` and cannot emit a proof. Forward rows
+observed materially after their market timestamp must be labelled
+`historical_backfill`, preventing a late corpus from silently inheriting the
+forward-observed policy.
+
 The authorizing evidence floors are immutable: backtest/factory windows require
 100 trades, 30 complete sessions, and 30 session clusters; qualification
 requires 100 trades and 30 complete sessions/clusters; the parity-matched
@@ -447,6 +461,17 @@ exit-state path and cannot author arbitrary orders. A v2 spec that admits a
 signal produces exactly the v1 plan, while v3/v4 specs add only their declared
 equity exit state.
 
+Session VWAP and rolling-mean targets are frozen from the completed signal
+prefix and persisted as `target_reference`; the broker-valid rounded level is
+persisted separately as `target_price`. Missing or wrong-side references reject
+the signal instead of falling back to fixed R. Research and runtime compare the
+shared `canonical_exit_reason` values `stop`, `target`, `max_hold`,
+`thesis_deadline`, `session_force_flat`, `data_discontinuity`, and `unknown`;
+unrecognized operational reasons map to `unknown`, while historical
+research `exit_reason` and runtime operational `reason` aliases remain readable.
+Strict equity replay requires a fresh quote for a force-flat fill, while an
+explicit diagnostic bar-fallback lane remains costed and non-authorizing.
+
 ### Slots are capacity, not licences
 
 The factory runs a fixed number of logical slots. A slot's hypothesis leaves
@@ -481,13 +506,19 @@ only after its OPRA evidence and controls have been reviewed.
 On a fresh corpus, each worker diagnoses its baseline only from the
 chronological fit partition, creates bounded variants based on the observed
 failure mode, and evaluates those variants on untouched held-out sessions.
-Every variant has a separate simulated cash/equity account. Coordinate
-refinement changes exactly one executable field at a time. After all such
+Every variant has a separate simulated cash/equity account. New equity roots
+retain neutral v4 defaults and stable content identities. The coordinate pool
+promotes one family-specific exit hypothesis early without expanding the
+Cartesian discovery cap: breakout/trend families try a completed-close trailing
+ratchet, while reversion families try a frozen fair-value target. The neutral
+root and other fixed-R candidates remain in the default first batch. Family-
+aware target and hold ladders and
+all other coordinate refinement change exactly one executable field at a time. After all such
 points are measured, at most two measured fields are combined in a bounded
 interaction phase, followed by one unchanged confirmation. A family is retired
 only when every point explicitly rejects a useful edge with adequate powered
 evidence; if LLM replacement is enabled, a valid bounded proposal is registered first. For
-v2/v3 roots with measured `min_atr_bps` and `stop_atr` coordinate lessons, an
+v2/v3/v4 roots with measured `min_atr_bps` and `stop_atr` coordinate lessons, an
 `execution_blocked` fit diagnosis makes coordinate exhaustion schedule exactly
 one bounded measured interaction. It uses configured stress geometry when
 available, never invents missing values, changes no risk constants, and does not
@@ -512,8 +543,9 @@ counts, and clustered MDE/power, provider/feed provenance for each leg,
 entry-pricing sources, configured limits,
 pass/fail/unknown row counts, behavioral alias fingerprints, and an execution-
 rejection section that passes only aggregate fit-partition counts/reasons to
-proposal generation. The exit grammar stays fixed
-(ATR-floor bracket, configured R target, and bar cap); these measurements are
+proposal generation. The exit grammar stays bounded
+(ATR-floor bracket, fixed or frozen fair-value target, optional completed-close
+breakeven/trailing amendment, thesis deadline, and bar cap); these measurements are
 operator-review diagnostics only and never authorize or expand a candidate.
 When every fit opportunity is explicitly rejected at execution, the fit is
 classified as `execution_blocked`, distinct from sparse/underpowered data. It
@@ -656,7 +688,7 @@ That is the whole loop: propose with a reason and a citation, evaluate under
 unchanged gates, grade the reason, and hand the grade forward.
 
 Across all discovery lanes, executable variants are de-duplicated by a
-family-specific semantic signature, including v1/v2/v3 no-op aliases. Continuous
+family-specific semantic signature, including v1/v2/v3/v4 no-op aliases. Continuous
 numeric axes use relative/local scaling for semantic novelty, while
 integer/topology axes use their grammar spans; exact signatures and validation
 are unchanged. Only a

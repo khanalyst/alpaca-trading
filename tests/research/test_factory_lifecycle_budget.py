@@ -1,9 +1,11 @@
 """Focused durable lifecycle regressions for the strategy factory."""
 
 from dataclasses import asdict
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from research.factory_core import initial_hypotheses
@@ -97,6 +99,50 @@ class VariantBudgetTests(unittest.TestCase):
             report = result["reports"][0]["diagnostic"]
             self.assertTrue(report["diagnostic_only"])
             self.assertFalse(report["authorizing"])
+
+    def test_diagnostic_cost_rerun_keeps_in_memory_delta_without_default_artifact(self):
+        # The cost rerun remains useful telemetry when enabled, but an
+        # explicitly diagnostic factory must not create the helper's default
+        # runtime/research/diagnostics artifact directory.
+        fake_report = {
+            "cost_models": {
+                "configured_round_trip_bps": 4.0,
+                "measured_round_trip_bps": 5.5,
+            },
+            "results": [{
+                "configured": {"net_r": 0.2},
+                "measured": {"net_r": 0.35},
+            }],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            previous_cwd = Path.cwd()
+            os.chdir(directory)
+            try:
+                with patch.dict(
+                        os.environ,
+                        {"ALPACA_RESEARCH_COST_RERUN_ENABLED": "1"},
+                        clear=False), \
+                        patch("research.cost_rerun.run_cost_rerun",
+                              return_value=fake_report), \
+                        patch("research.cost_rerun.write_immutable_evidence") as writer:
+                    result = run_factory(
+                        edge_corpus(1),
+                        db_path=Path(directory) / "diagnostic.sqlite3",
+                        vehicle="equity", strategies=1,
+                        variants_per_strategy=2, workers=1,
+                        diagnostic_only=True)
+            finally:
+                os.chdir(previous_cwd)
+
+            diagnostic = result["cost_diagnostic"]
+            self.assertEqual(diagnostic["status"], "completed")
+            self.assertEqual(diagnostic["delta"]["round_trip_bps_delta"], 1.5)
+            self.assertAlmostEqual(diagnostic["delta"]["mean_net_r_delta"], .15)
+            self.assertIsNone(diagnostic["path"])
+            self.assertIsNone(diagnostic["report_path"])
+            writer.assert_not_called()
+            self.assertFalse(
+                Path(directory, "runtime", "research", "diagnostics").exists())
 
     def test_all_execution_blocked_exhaustion_is_rotation_eligible_not_statistical(self):
         blocked = {

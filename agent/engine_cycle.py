@@ -103,11 +103,21 @@ def _rule_runtime_bars(
     if not session_rows or session_rows[-1][0] != latest_stamp:
         return None
     try:
-        from .contracts.rule import feature_window_bars
+        from .contracts.rule import (causal_maturity_bars,
+                                     feature_window_bars)
         window = feature_window_bars(spec)
+        maturity = causal_maturity_bars(spec)
     except (TypeError, ValueError):
         return None
     feature_rows = session_rows if window is None else session_rows[-int(window):]
+    # The bounded continuity window and the causal maturity prefix are
+    # separate contracts for session-anchored families: their feature window
+    # remains the complete session, while maturity is still the exact family
+    # dependency (opening range + signal bar, ATR, confirmations, and any
+    # rolling target).  This avoids evaluating an underpowered latest prefix
+    # without forcing unrelated older bars for trailing families.
+    if len(session_rows) < int(maturity):
+        return None
     if window is not None and len(feature_rows) < int(window):
         return None
     # The current signal's feature prefix must be one-minute adjacent.  A gap
