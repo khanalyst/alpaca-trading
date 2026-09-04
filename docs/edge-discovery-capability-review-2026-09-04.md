@@ -1,5 +1,10 @@
 # Can this system find a positive edge? Capability review at `6988bdc`
 
+> **Superseded by** [trader-review-and-grading-2026-09-04.md](trader-review-and-grading-2026-09-04.md).
+> That note corrects this one's emphasis: the gate stack is downstream of a
+> broken trade construction, not the primary defect. The arithmetic here
+> stands; the ranking does not.
+
 - **Reviewed commit:** `6988bdc` (`Raise shadow replay memory limit`), tree state only
 - **Perspective:** discretionary intraday trader and quantitative research reviewer
 - **Method:** every claim below was read in Markdown *and* verified against the
