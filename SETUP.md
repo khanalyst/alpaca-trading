@@ -603,9 +603,12 @@ The research Compose service defaults to two factory workers and a 10 GB
 container limit. Override `ALPACA_FACTORY_WORKERS` and
 `ALPACA_RESEARCH_MEMORY_LIMIT` in the deployment environment when the VM is
 smaller or larger; leave headroom for the recorder, trader, watchdog, and
-Docker itself. `ALPACA_RESEARCH_SESSION_WINDOW=0` deliberately validates the
-whole corpus. A nonzero window is an explicit evidence-scope decision; do not
-use it merely to hide malformed older data or to lower the configured floors.
+Docker itself. The shadow service defaults to a separate 2 GB limit because a
+bounded CSV input batch expands while Python validates and compacts its rows;
+override `ALPACA_SHADOW_MEMORY_LIMIT` only after measuring the host workload.
+`ALPACA_RESEARCH_SESSION_WINDOW=0` deliberately validates the whole corpus. A
+nonzero window is an explicit evidence-scope decision; do not use it merely to
+hide malformed older data or to lower the configured floors.
 
 When bars, quotes, and the factory report are available, every scheduled cycle
 also runs the configured-vs-measured cost comparison. Its diagnostic status,

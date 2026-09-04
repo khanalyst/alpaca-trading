@@ -319,7 +319,10 @@ services:
       retries: 5
       start_period: 3m
     cpus: "0.50"
-    mem_limit: 768m
+    # A bounded raw CSV batch can expand substantially while Python validates
+    # and compacts rows. Keep this independently configurable and large enough
+    # to avoid an OOM restart before the durable source offset is advanced.
+    mem_limit: ${ALPACA_SHADOW_MEMORY_LIMIT:-2g}
     pids_limit: 128
     stop_grace_period: 30s
 

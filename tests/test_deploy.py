@@ -599,6 +599,8 @@ class DeployTests(unittest.TestCase):
         self.assertIn("--health-file", shadow)
         self.assertIn("deploy/health.py", shadow)
         self.assertIn('"shadow"', shadow)
+        self.assertIn(
+            "mem_limit: ${ALPACA_SHADOW_MEMORY_LIMIT:-2g}", shadow)
         shadow_init = text.split("  shadow-init:", 1)[1].split("  shadow:", 1)[0]
         self.assertIn('user: "0:0"', shadow_init)
         self.assertIn("chown 10001:10001 /app/shadow", shadow_init)
