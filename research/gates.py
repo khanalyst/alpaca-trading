@@ -1069,9 +1069,9 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
     result["mean_delta"] = (sum(pairs["deltas"]) / pairs["matched"]
                             if pairs["matched"] else None)
     result["mean_delta_lcb"] = bound["lower_bound"]
-    result["lower_bound"] = {key: bound[key] for key in (
+    result["lower_bound"] = {key: bound.get(key) for key in (
         "method", "available", "confidence", "draws", "seed",
-        "block_length", "clusters", "observations")}
+        "block_length", "clusters", "observations", "reason")}
     result["actual_control"] = True
     result["available"] = bool(pairs["matched"])
     adequacy = paired_control_adequacy(
@@ -1094,7 +1094,7 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
         result["r_lower_bound"] = {
             key: r_bound.get(key) for key in (
                 "method", "available", "confidence", "draws", "seed",
-                "block_length", "clusters", "observations")}
+                "block_length", "clusters", "observations", "reason")}
     else:
         result["r_delta_lcb"] = None
         result["r_lower_bound"] = {"method": "moving_block_cluster_bootstrap",
@@ -1102,7 +1102,15 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
                                     "confidence": confidence,
                                     "draws": DEFAULT_BOOTSTRAP_DRAWS,
                                     "seed": None,
-                                    "block_length": 1,
+                                    # Keep the R-unit diagnostic's design
+                                    # metadata aligned with the configured
+                                    # effective block used for the paired
+                                    # dollar-unit statistic.  A literal 1
+                                    # concealed the actual chronology policy
+                                    # whenever no finite R observations were
+                                    # available.
+                                    "block_length": block_length,
+                                    "reason": "no_finite_observations",
                                     "clusters": 0, "observations": 0}
     return result
 
@@ -1853,6 +1861,9 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
             max_drawdown = float(median(risk_values)) * max_drawdown_r
             drawdown_limit_source = "median_risk_usd_times_r"
     if not rows or not sessions:
+        resolved_block_length = (
+            min(SERIAL_BLOCK_LENGTH, max(1, len(sessions)))
+            if block_length is None else int(block_length))
         return {"available": False, "sessions": list(sessions), "net_pnl": 0.0,
                 "matched": 0, "mean_delta": None, "trades": 0,
                 "net_positive": False, "delta_positive": False,
@@ -1864,8 +1875,8 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
                     "method": "moving_block_cluster_bootstrap",
                     "available": False, "confidence": confidence,
                     "draws": max(1, int(draws)), "seed": seed,
-                    "block_length": (min(SERIAL_BLOCK_LENGTH, 1)
-                                     if block_length is None else int(block_length)),
+                    "block_length": resolved_block_length,
+                    "reason": "no_finite_observations",
                     "clusters": 0, "observations": 0,
                 },
                 "max_drawdown": None, "drawdown_supported": False,

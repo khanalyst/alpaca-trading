@@ -22,7 +22,14 @@ This change set replaces the assumption with a measurement fitted to the
 recorded quote corpus, and adds a runner that replays a frozen cohort under
 both models so the difference is attributable per strategy and per variant.
 
-Neither module can promote, authorize, tune, or propose. Both are fit-only.
+The fitter and comparison runner cannot promote, authorize, tune, or propose;
+they remain fit-only. An operator may now explicitly enable a frozen fitted
+schedule in `costs.measured_quote`. Configuration verifies and embeds its
+content hash and feed/provider identity, and the authorizing equity lanes use
+the same strict per-symbol, per-half-hour resolver for candidate, control,
+randomized-null, qualification, and live-shadow entry/exit costs. Missing or
+under-covered cells fail closed. The checked-in block remains disabled because
+no corpus-specific schedule can truthfully serve every deployment by default.
 
 ## `research/quote_costs.py` — the fitted schedule
 
@@ -115,7 +122,9 @@ stop_distance / price  ≥  stressed_cost_scenario_bps / max_cost_to_risk_ratio
 A better expected-cost fit does not touch it. Any variant whose stop is tighter
 than 83.3 bps of price is refused in both arms, while a sufficiently wide-stop
 variant can pass the same geometry gate; the gate does not widen stops for a
-candidate. This is why the factory's own bounded tuning had to reach
+candidate. Tight authored stops are refused as `stressed_cost_risk_limit`
+before sizing/fill, and neither the stop nor a fixed-R target is rewritten.
+This is why the factory's own bounded tuning had to reach
 `stop_atr = 7` before anything could execute — and why the resulting bracket
 never triggers, leaving 71–84% time-expiry exits.
 
@@ -127,8 +136,8 @@ Deciding what the stress scenario should be is a risk decision and is
 deliberately not made here. The shipped 25 bps scenario remains the
 default/fallback until an operator activates a valid artifact; setting one
 flag is not calibration. The schedule now supplies the evidence for it: the
-measured p95 and p99 spread per symbol and per half-hour is what a 25 bps
-stress assumption should be checked against.
+measured p95 and observed maximum spread per symbol and per half-hour are what
+a 25 bps stress assumption should be checked against.
 
 ## Not addressed
 

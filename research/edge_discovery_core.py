@@ -36,7 +36,7 @@ from .costs import (BAR, QUOTE, RESTING_BRACKET,
                     SQLiteQuoteIndexDescriptor, check_stressed_cost_plan,
                     check_entry_slippage, index_quotes, quote_fill,
                     quote_fill_record, resting_bracket_fill_claim,
-                    stressed_cost_usd)
+                    static_cost_config, stressed_cost_usd)
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, replay_available_at,
                           replay_open_is_available,
@@ -597,7 +597,10 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
     # rejection cap, not an expectation: it bounds the model rather than
     # supplying it.  The vehicle is part of the replay boundary, so an
     # option-only schedule can never silently fall back to the flat model.
-    costs = CostModel.from_config(source, vehicle=vehicle)
+    # ``costs.measured_quote`` is a resolver overlay and is not part of the
+    # flat CostModel schema.  Keep it in the effective assumptions below, but
+    # derive the static fallback from the schema-compatible projection.
+    costs = CostModel.from_config(static_cost_config(source), vehicle=vehicle)
     cfg = IBRConfig(
         range_minutes=int(strategy.get("range_minutes", 15)),
         stop_pct=float(strategy.get("stop_pct", .003)),
@@ -627,12 +630,22 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
                            for key in fields if key in effective_costs}
         schedule: dict[str, dict] = {}
         for name in sorted(raw_costs["vehicles"], key=str):
-            scheduled = CostModel.from_config(source, vehicle=str(name))
+            scheduled = CostModel.from_config(
+                static_cost_config(source), vehicle=str(name))
             schedule[str(name)] = {
                 key: getattr(scheduled, key)
                 for key in fields if hasattr(scheduled, key)
             }
         effective_costs["vehicles"] = schedule
+    # The flat model above is the fallback arithmetic, but a measured quote
+    # schedule is part of the executable economics and must survive the
+    # effective-config projection used for candidate identity.  Keep the
+    # already-normalized inline schedule (when present) immutable; the
+    # identity layer deep-copies it before hashing.
+    if (isinstance(raw_costs, Mapping) and
+            isinstance(raw_costs.get("measured_quote"), Mapping) and
+            raw_costs["measured_quote"].get("enabled") is True):
+        effective_costs["measured_quote"] = raw_costs["measured_quote"]
     effective["costs"] = effective_costs
     return cfg, effective
 
@@ -841,6 +854,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                          reference_rows: Sequence[Mapping], account_id: str,
                          starting_cash: float = 100_000.0, risk_pct: float = .5,
                          costs: CostModel | None = None,
+                         cost_resolver: Any | None = None,
                          quotes: Sequence[Any] | None = None,
                          fixed_quantity: float | None = None,
                          policy: ReplayPolicy | Mapping | None = None) -> dict:
@@ -861,7 +875,15 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
     raw_spec = dict(spec)
     spec = validate_rule_spec(spec)
     unsupported_vehicle = not rule_vehicle_executable(spec, vehicle)
-    model = costs or CostModel()
+    base_model = costs or CostModel()
+
+    def resolve_cost_model(context: Mapping[str, Any]) -> CostModel:
+        if cost_resolver is None:
+            return base_model
+        resolved = cost_resolver(context)
+        if not isinstance(resolved, CostModel):
+            raise CostError("cost_resolver must return a CostModel")
+        return resolved
     # Omitted policy is the checked runtime policy.  Historical bar fallback
     # is available only through an explicit ReplayPolicy(strict_market_data=False).
     policy = (ReplayPolicy.from_config(policy) if isinstance(policy, Mapping)
@@ -967,7 +989,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 if entry_reference is not None:
                     slippage, slippage_reason = check_entry_slippage(
                         side, entry_reference, quoted.price,
-                        model.max_slippage_bps)
+                        base_model.max_slippage_bps)
                     if slippage_reason is not None:
                         rows.append(_null_row(
                             symbol, day, opportunity, vehicle,
@@ -1022,10 +1044,18 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         stress_scenario, stress_activation_reason = (
             policy.resolve_stress_scenario(
                 symbol, entry_at, vehicle=vehicle))
-        if (vehicle == "equity" and stress_scenario is not None and
-                policy.max_stressed_cost_to_risk_ratio is not None):
+        stress_geometry_requested = (
+            policy.stressed_cost_scenario_bps is not None or
+            policy.max_stressed_cost_to_risk_ratio is not None or
+            policy.stressed_cost_calibration_enabled)
+        if vehicle == "equity" and stress_geometry_requested:
+            if (stress_scenario is None or
+                    policy.max_stressed_cost_to_risk_ratio is None):
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      "stressed_cost_invalid"))
+                continue
             try:
-                distance, stop_floor_bps = effective_stop_distance(
+                effective_distance, stop_floor_bps = effective_stop_distance(
                     entry_underlying, authored_distance,
                     base_floor_bps=MIN_STOP_DISTANCE_BPS,
                     scenario_bps=stress_scenario,
@@ -1036,7 +1066,28 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 rows.append(_null_row(symbol, day, opportunity, vehicle,
                                       "stressed_cost_invalid"))
                 continue
-            stop_floor_binding = distance > authored_distance + 1e-12
+            # Stressed geometry is an admission veto.  Do not widen the null's
+            # authored stop or recompute its target, since doing so changes the
+            # candidate's exit distribution instead of testing the same rule.
+            stop_floor_binding = effective_distance > authored_distance + 1e-12
+            if stop_floor_binding:
+                geometry_telemetry = {
+                    "reject_stage": "risk_geometry",
+                    "authored_stop_distance": authored_distance,
+                    "authored_stop_distance_bps": (
+                        authored_distance / entry_underlying * 10_000.0),
+                    "effective_stop_floor_bps": stop_floor_bps,
+                    "stress_floor_binding": True,
+                    "stop_geometry_scenario_bps": stress_scenario,
+                    "stop_geometry_max_cost_to_risk_ratio": (
+                        policy.max_stressed_cost_to_risk_ratio),
+                    "stop_geometry_activation_reason": (
+                        stress_activation_reason),
+                }
+                rows.append(_null_row(
+                    symbol, day, opportunity, vehicle,
+                    "stressed_cost_risk_limit", geometry_telemetry))
+                continue
         stop = (entry_underlying - distance if direction == "long" else
                 entry_underlying + distance)
         target_mode = str(spec.get("target_mode") or "fixed_r")
@@ -1232,6 +1283,26 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         entry_notional = ((float(entry_underlying) * quantity)
                           if vehicle == "equity" else
                           (float(entry_ref) * quantity * multiplier))
+        # Resolve measured economics at the same causal boundary as the
+        # candidate account.  A sparse/tampered/foreign schedule is a refused
+        # null opportunity, never a static or universe-wide fallback.
+        cost_context = {
+            "vehicle": vehicle, "symbol": symbol, "session_date": day,
+            "cost_leg": "entry", "cost_timestamp": entry_at.isoformat(),
+            "entry_timestamp": entry_at.isoformat(), "quantity": quantity,
+            "shares": quantity if vehicle == "equity" else None,
+            "contracts": quantity if vehicle == "option" else None,
+            "entry_notional": float(entry_notional),
+        }
+        try:
+            model = resolve_cost_model(cost_context)
+        except (CostError, TypeError, ValueError, OverflowError) as exc:
+            rows.append(_null_row(
+                symbol, day, opportunity, vehicle,
+                "measured_quote_cost_unavailable",
+                {"cost_error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                 "cost_leg": "entry"}))
+            continue
         stress_telemetry: dict[str, Any] = {}
         if stress_enabled:
             plan = {
@@ -1289,15 +1360,31 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 }
         execution_direction = "long" if vehicle == "option" else direction
         executable = vehicle == "option"
+        exit_context = {
+            **cost_context, "cost_leg": "exit",
+            "cost_timestamp": exit_at.isoformat(),
+            "exit_timestamp": exit_at.isoformat(),
+        }
+        try:
+            exit_model = resolve_cost_model(exit_context)
+        except (CostError, TypeError, ValueError, OverflowError) as exc:
+            rows.append(_null_row(
+                symbol, day, opportunity, vehicle,
+                "measured_quote_cost_unavailable",
+                {"cost_error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                 "cost_leg": "exit"}))
+            continue
         entry = model.execution_price(
             entry_ref, execution_direction, entry=True,
             executable_quote=executable or entry_source == QUOTE)
-        exit_price = model.execution_price(
+        exit_price = exit_model.execution_price(
             exit_ref, execution_direction, entry=False,
             executable_quote=executable or exit_source == QUOTE)
         gross = ((exit_price - entry) if execution_direction == "long" else
                  (entry - exit_price)) * quantity * multiplier
-        fees = model.fees(entry, exit_price, quantity, multiplier, vehicle=vehicle)
+        fees = (model.fees(entry, entry, quantity, multiplier, vehicle=vehicle) / 2.0 +
+                exit_model.fees(exit_price, exit_price, quantity, multiplier,
+                                vehicle=vehicle) / 2.0)
         net = gross - fees
         before = cash
         cash += net
@@ -1361,6 +1448,15 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                          if exit_source == RESTING_BRACKET else None),
                      "entry_quote_age_seconds": entry_age,
                      "exit_quote_age_seconds": exit_age,
+                     "cost_model_provenance": model.provenance,
+                     "entry_cost_model_provenance": model.provenance,
+                     "exit_cost_model_provenance": exit_model.provenance,
+                     "entry_cost_model_spread_bps": model.spread_bps,
+                     "entry_cost_model_slippage_bps": model.slippage_bps,
+                     "entry_cost_model_fee_bps": model.fee_bps,
+                     "exit_cost_model_spread_bps": exit_model.spread_bps,
+                     "exit_cost_model_slippage_bps": exit_model.slippage_bps,
+                     "exit_cost_model_fee_bps": exit_model.fee_bps,
                      "entry_feed": entry_feed,
                      "exit_feed": exit_feed,
                      "entry_provider": entry_provider,

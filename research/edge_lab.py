@@ -27,6 +27,7 @@ from .gates import (
     paired_control_adequacy,
 )
 from .costs import CostModel, ReplayPolicy, replay_policy_for_mode
+from .quote_costs import cost_resolver_setup, reprice_ibr_result
 from .ibr import IBRConfig, replay_ibr
 from .market_data import (
     OptionSnapshot, UnderlyingBar, normalize_option_snapshot,
@@ -289,10 +290,16 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                              if snap.session_date.isoformat() not in sealed_sessions}
 
     def replay(variant_bars, variant_snapshots, variant_quotes, cfg):
-        return replay_ibr(
+        result = replay_ibr(
             variant_bars, config=cfg, vehicle=vehicle,
             option_snapshots=variant_snapshots if vehicle == "option" else None,
             quotes=variant_quotes if vehicle == "equity" else None)
+        # IBR mechanics are cost-independent; apply the same per-symbol/time
+        # measured resolver to each realized entry/exit after the mechanical
+        # replay.  The resolver is still causal (it sees only each trade's
+        # own entry/exit timestamps) and quote-backed fills remain spread-free.
+        return reprice_ibr_result(
+            result, resolver=cost_setup.resolver, vehicle=vehicle)
 
     base_results: dict[str, list[dict]] = {}
     null_results: dict[str, list[dict]] = {}
@@ -300,9 +307,13 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     run_configs: dict[str, dict] = {}
     configs: dict[str, object] = {}
     runtime_policy = ReplayPolicy.from_config(config)
+    cost_setup = cost_resolver_setup(config, vehicle=vehicle)
     for variant in selected:
         cfg, effective = _effective_ibr_config(
             config, variant.overrides, vehicle=vehicle)
+        if cost_setup.measured is not None:
+            effective.setdefault("costs", {})["measured_quote"] = dict(
+                cost_setup.measured)
         effective_configs[variant.variant_id] = candidate_assumptions(
             effective, vehicle=vehicle, strategy_id="ibr",
             variant_id=variant.variant_id)
@@ -463,6 +474,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 result, development_bars, vehicle, policy=mode_policy),
             account_id=f"ibr:{vehicle}:{variant_id}", costs=cfg.costs,
             quotes=development_quotes, fixed_quantity=cfg.quantity,
+            cost_resolver=cost_setup.resolver,
             policy=mode_policy)["rows"]
 
         boundary = latest_boundary(existing.get(variant_id))
@@ -612,6 +624,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             "lane": lane, "vehicle": vehicle,
             "replay_mode": modes[variant.variant_id],
             "replay_policy": mode_policies[variant.variant_id].as_dict(),
+            "cost_model_provenance": cost_setup.model.provenance,
+            "measured_quote": (dict(cost_setup.measured)
+                               if cost_setup.measured is not None else None),
             "backtest_bar_fallback": backtest_bar_fallback,
             "selected_test_id": selected_test_id,
             "qualified_test_id": qualification_target,

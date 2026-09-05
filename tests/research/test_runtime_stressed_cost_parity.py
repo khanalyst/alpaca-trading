@@ -47,7 +47,7 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
                       for index, bar in enumerate(cls.bars)]
 
         # stop_atr=3 is naturally above the effective floor.  stop_atr=1
-        # authors the grammar's ~30bp minimum and exercises policy widening.
+        # authors the grammar's ~30bp minimum and exercises the policy veto.
         cls.accepted_spec = validate_rule_spec({**SPEC, "stop_atr": 3.0})
         cls.floor_spec = validate_rule_spec({**SPEC, "stop_atr": 1.0})
         cls.no_stress_policy = replace(
@@ -100,23 +100,24 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
         self.assertEqual(row["stressed_cost_schema"], STRESSED_COST_SCHEMA)
         self.assertEqual(row["stressed_cost_basis"], STRESSED_COST_BASIS)
 
-    def test_thirty_bp_floor_is_widened_by_factory_null_and_runtime(self):
+    def test_thirty_bp_floor_is_vetoed_by_factory_null_and_runtime(self):
         # First replay without stress to retain the authored geometry.  Every
-        # authorizing lane must then widen it to max(grammar, scenario/ratio)
-        # before sizing, rather than rejecting a valid grammar candidate.
+        # authorizing lane must reject it at max(grammar, scenario/ratio)
+        # before sizing, rather than changing the authored candidate.
         reference = self._factory(
             self.floor_spec, "runtime-parity-floor-reference",
             policy=self.no_stress_policy)
         candidate = self._factory(self.floor_spec, "runtime-parity-floor")
         candidate_row = candidate["rows"][0]
-        self.assertEqual(candidate["trades"], 1)
-        self.assertFalse(candidate_row["no_trade"])
+        self.assertEqual(candidate["trades"], 0)
+        self.assertTrue(candidate_row["no_trade"])
+        self.assertEqual(candidate_row["reject_reason"],
+                         "stressed_cost_risk_limit")
         self.assertTrue(candidate_row["stress_floor_binding"])
         self.assertAlmostEqual(candidate_row["authored_stop_distance"], .3024)
         self.assertAlmostEqual(candidate_row["effective_stop_floor_bps"],
                                25.0 / .30)
-        self.assertLessEqual(candidate_row["stressed_cost_to_risk_ratio"],
-                             self.policy.max_stressed_cost_to_risk_ratio + 1e-12)
+        self.assertEqual(candidate_row["reject_stage"], "risk_geometry")
 
         reference_row = reference["rows"][0]
         runtime, runtime_reason = self.risk.vet_open(
@@ -128,14 +129,8 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
              "target_r": self.floor_spec["target_r"]},
             100_000, [],
             {"SPY": {"price": reference_row["plan_entry"]}}, {}, 0, now=0)
-        self.assertIsNone(runtime_reason)
-        self.assertTrue(runtime["stress_floor_binding"])
-        for key in ("stop_price", "target_price", "stop_distance",
-                    "effective_stop_floor_bps"):
-            with self.subTest(runtime_key=key):
-                self.assertAlmostEqual(runtime[key], candidate_row[key], places=12)
-        self.assertLessEqual(runtime["stressed_cost_to_risk_ratio"],
-                             self.policy.max_stressed_cost_to_risk_ratio + 1e-12)
+        self.assertIsNone(runtime)
+        self.assertEqual(runtime_reason, "stressed_cost_risk_limit")
 
         # The compact fixture has no quote at the final force-flat instant, so
         # keep this null-control check focused on geometry with bar fallback.
@@ -144,17 +139,18 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
             reference_rows=reference["rows"], account_id="runtime-parity-floor-null",
             quotes=self.quotes,
             policy=replace(self.policy, strict_market_data=False))
-        self.assertEqual(null["trades"], 1)
+        self.assertEqual(null["trades"], 0)
         null_row = null["rows"][0]
+        self.assertTrue(null_row["no_trade"])
+        self.assertEqual(null_row["reject_reason"],
+                         "stressed_cost_risk_limit")
         self.assertTrue(null_row["stress_floor_binding"])
         # The null receives the candidate reference row after broker-tick
         # normalization; it must preserve that executable 31-cent geometry
-        # before applying the wider stress floor.
+        # before applying the stress veto.
         self.assertAlmostEqual(null_row["authored_stop_distance"], .31)
         self.assertAlmostEqual(null_row["effective_stop_floor_bps"],
                                candidate_row["effective_stop_floor_bps"])
-        self.assertLessEqual(null_row["stressed_cost_to_risk_ratio"],
-                             self.policy.max_stressed_cost_to_risk_ratio + 1e-12)
 
 
 if __name__ == "__main__":

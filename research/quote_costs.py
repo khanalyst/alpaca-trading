@@ -3,9 +3,9 @@
 The shipped cost model carries two constants — a 4 bps quoted spread and a
 6 bps adverse-slippage charge — applied uniformly to every symbol at every
 minute of the session.  They are an assumption, and on the configured ETF
-universe they are the dominant term in every replayed result: a 17 bps
-round trip against a stop the risk gate pins near 83 bps is a fixed 0.17R
-toll that no strategy in the catalog can outrun.
+universe they are the dominant term in every replayed result: 17 bps round
+trip on bar references and 13 bps when executable quote prices already carry
+the spread, before comparing either charge with authored trade risk.
 
 This module replaces the assumption with a measurement.  It streams the
 recorded quotes, fits the quoted spread and displayed depth per symbol and
@@ -24,7 +24,7 @@ own rejection caps.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timezone
 import hashlib
 import json
@@ -33,11 +33,14 @@ from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from .costs import (CostError, CostModel, DEFAULT_FEE_BPS,
-                    RUNTIME_MAX_SLIPPAGE_BPS, RUNTIME_MAX_SPREAD_BPS)
+                    RUNTIME_MAX_SLIPPAGE_BPS, RUNTIME_MAX_SPREAD_BPS,
+                    static_cost_config)
 from .edge_ledger import content_hash
 
 
 QUOTE_COST_SCHEMA = "quote-cost-schedule.v1"
+MEASURED_QUOTE_CONFIG_SCHEMA = "measured-quote-cost.v1"
+MEASURED_QUOTE_COVERAGE_POLICIES = ("strict",)
 _NY = ZoneInfo("America/New_York")
 SESSION_MINUTES = 390
 # Half-hour resolution over the regular session.  Finer buckets split the
@@ -60,6 +63,365 @@ _DIGEST_MODULUS = 1 << 256
 
 class QuoteCostError(ValueError):
     """Raised for a corpus that cannot support a cost measurement."""
+
+
+# Backward-compatible private name retained for the authorizing lanes added
+# with measured-cost support.  The projection itself lives beside CostModel so
+# older flat-cost readers can opt into the same explicit boundary without a
+# quote-cost import cycle.
+_static_cost_config = static_cost_config
+
+
+def _normalized_identity(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    # The runtime names this entitlement ``delayed_sip`` while some corpus
+    # rows/configs use the short provider label ``delayed``.  Treat the alias
+    # identically at the schedule/config boundary so a feed mismatch cannot
+    # be hidden by spelling alone.
+    return "delayed_sip" if normalized == "delayed" else normalized
+
+
+def _read_schedule_path(path: str) -> Mapping[str, Any]:
+    """Load one immutable JSON schedule referenced by configuration."""
+    if not isinstance(path, str) or not path.strip():
+        raise QuoteCostError("measured_quote.schedule_path must be non-empty")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise QuoteCostError(
+            f"measured quote schedule could not be loaded: {path!r}") from exc
+    if not isinstance(value, Mapping):
+        raise QuoteCostError("measured quote schedule file must contain a mapping")
+    return dict(value)
+
+
+def validate_measured_quote_config(
+        value: Mapping[str, Any], *,
+        expected_feed: str | None = None,
+        expected_provider: str | None = None,
+        embed_schedule: bool = True) -> dict[str, Any]:
+    """Validate and normalize the ``costs.measured_quote`` config block.
+
+    An enabled schedule must be frozen either inline or through a path whose
+    content hash is declared and verified immediately.  ``strict`` is the
+    only coverage policy: a requested symbol/time cell may not fall back to a
+    broader aggregate.  The normalized result retains the schedule inline so
+    candidate assumptions can bind the exact evidence rather than a mutable
+    filename.  ``embed_schedule=False`` is available to a lightweight config
+    boundary that wants to retain only an immutable path/hash reference.
+    """
+    if not isinstance(value, Mapping):
+        raise QuoteCostError("costs.measured_quote must be a mapping")
+    allowed = {
+        "schema", "enabled", "schedule", "schedule_path", "schedule_hash",
+        "percentile", "depth_percentile", "min_quotes_per_cell",
+        "max_impact_half_spreads", "coverage_policy", "feed", "provider",
+    }
+    unknown = sorted(set(value) - allowed, key=str)
+    if unknown:
+        raise QuoteCostError(
+            "costs.measured_quote has unknown field(s): " +
+            ", ".join(unknown))
+    enabled = value.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise QuoteCostError("costs.measured_quote.enabled must be true or false")
+    result: dict[str, Any] = {
+        "schema": str(value.get("schema") or MEASURED_QUOTE_CONFIG_SCHEMA),
+        "enabled": enabled,
+        "percentile": str(value.get("percentile", "p75")).strip().lower(),
+        "depth_percentile": str(value.get("depth_percentile", "p25")).strip().lower(),
+        "min_quotes_per_cell": value.get("min_quotes_per_cell", 500),
+        "max_impact_half_spreads": value.get("max_impact_half_spreads", 4.0),
+        "coverage_policy": str(value.get("coverage_policy", "strict")).strip().lower(),
+    }
+    if result["schema"] != MEASURED_QUOTE_CONFIG_SCHEMA:
+        raise QuoteCostError(
+            f"expected {MEASURED_QUOTE_CONFIG_SCHEMA}, got {result['schema']!r}")
+    if result["percentile"] not in PERCENTILES:
+        raise QuoteCostError(
+            f"measured_quote.percentile must be one of {PERCENTILES}")
+    if result["depth_percentile"] not in PERCENTILES:
+        raise QuoteCostError(
+            f"measured_quote.depth_percentile must be one of {PERCENTILES}")
+    try:
+        floor = int(result["min_quotes_per_cell"])
+    except (TypeError, ValueError, OverflowError):
+        floor = -1
+    if isinstance(result["min_quotes_per_cell"], bool) or floor < 1 or floor != result["min_quotes_per_cell"]:
+        raise QuoteCostError(
+            "measured_quote.min_quotes_per_cell must be a positive integer")
+    result["min_quotes_per_cell"] = floor
+    impact = _number(result["max_impact_half_spreads"])
+    if impact is None or impact < 0:
+        raise QuoteCostError(
+            "measured_quote.max_impact_half_spreads must be non-negative")
+    result["max_impact_half_spreads"] = impact
+    if result["coverage_policy"] not in MEASURED_QUOTE_COVERAGE_POLICIES:
+        raise QuoteCostError(
+            "measured_quote.coverage_policy must be 'strict'")
+
+    declared_feed = (_normalized_identity(value.get("feed"))
+                     if value.get("feed") not in (None, "") else None)
+    declared_provider = (_normalized_identity(value.get("provider"))
+                         if value.get("provider") not in (None, "") else None)
+    schedule_value = value.get("schedule")
+    schedule_path = value.get("schedule_path")
+    if schedule_value is not None and schedule_path not in (None, ""):
+        raise QuoteCostError(
+            "measured_quote must provide schedule or schedule_path, not both")
+    if not enabled:
+        # A disabled block is operator documentation for the static fallback,
+        # not a feed entitlement.  Validate its own shape but do not make an
+        # inactive IEX placeholder prevent a legitimate SIP configuration.
+        if declared_feed:
+            result["feed"] = declared_feed
+        if declared_provider:
+            result["provider"] = declared_provider
+        if schedule_path not in (None, ""):
+            if not isinstance(schedule_path, str):
+                raise QuoteCostError("measured_quote.schedule_path must be a string")
+            result["schedule_path"] = schedule_path
+        if value.get("schedule_hash") not in (None, ""):
+            result["schedule_hash"] = str(value["schedule_hash"])
+        return result
+
+    normalized_feed = (_normalized_identity(expected_feed)
+                       if expected_feed not in (None, "") else declared_feed)
+    normalized_provider = (_normalized_identity(expected_provider)
+                           if expected_provider not in (None, "") else declared_provider)
+    if normalized_feed:
+        result["feed"] = normalized_feed
+    if normalized_provider:
+        result["provider"] = normalized_provider
+    if declared_feed and normalized_feed and declared_feed != normalized_feed:
+        raise QuoteCostError(
+            f"measured_quote feed {declared_feed!r} does not match {normalized_feed!r}")
+    if declared_provider and normalized_provider and declared_provider != normalized_provider:
+        raise QuoteCostError(
+            f"measured_quote provider {declared_provider!r} does not match {normalized_provider!r}")
+
+    if schedule_value is None and schedule_path not in (None, ""):
+        schedule_value = _read_schedule_path(schedule_path)
+    if schedule_value is None:
+        raise QuoteCostError(
+            "enabled measured_quote requires an embedded schedule or schedule_path")
+    if not isinstance(schedule_value, Mapping):
+        raise QuoteCostError("measured_quote.schedule must be a mapping")
+    schedule = dict(schedule_value)
+    try:
+        schedule_hash = str(schedule.get("schedule_hash") or "")
+        body = dict(schedule)
+        body.pop("schedule_hash", None)
+        if not schedule_hash or schedule_hash != content_hash(body):
+            raise QuoteCostError("measured_quote schedule hash is missing or invalid")
+        declared_hash = value.get("schedule_hash")
+        if (declared_hash not in (None, "") and
+                str(declared_hash) != schedule_hash):
+            raise QuoteCostError(
+                "measured_quote declared schedule_hash does not match schedule")
+        measured_meta = schedule.get("measured")
+        if not isinstance(measured_meta, Mapping):
+            raise QuoteCostError("measured_quote schedule metadata is missing")
+        if str(schedule.get("schema")) != QUOTE_COST_SCHEMA:
+            raise QuoteCostError("measured_quote schedule schema is invalid")
+        schedule_feed = _normalized_identity(measured_meta.get("feed"))
+        schedule_provider = _normalized_identity(measured_meta.get("provider"))
+        if not schedule_feed or not schedule_provider:
+            raise QuoteCostError(
+                "measured_quote schedule must declare one feed and provider")
+        if normalized_feed and schedule_feed != normalized_feed:
+            raise QuoteCostError(
+                f"schedule feed {schedule_feed!r} does not match {normalized_feed!r}")
+        if normalized_provider and schedule_provider != normalized_provider:
+            raise QuoteCostError(
+                f"schedule provider {schedule_provider!r} does not match {normalized_provider!r}")
+        schedule_floor = measured_meta.get("min_quotes_per_cell")
+        if schedule_floor != result["min_quotes_per_cell"]:
+            raise QuoteCostError(
+                "measured_quote min_quotes_per_cell does not match schedule")
+        # Validate the selected universe model now, including runtime caps.
+        cost_model_from_schedule(schedule, percentile=result["percentile"],
+                                 depth_percentile=result["depth_percentile"],
+                                 max_impact_half_spreads=result["max_impact_half_spreads"])
+    except QuoteCostError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise QuoteCostError("measured_quote schedule is invalid") from exc
+    result.update({
+        "schedule_hash": schedule_hash,
+        "feed": schedule_feed,
+        "provider": schedule_provider,
+    })
+    # Embedding the verified object is the preferred immutable candidate
+    # representation.  Do not retain the path alongside it: a later replay
+    # must not re-open a mutable file or reject its own normalized config as
+    # ambiguously specifying two schedules.  A lightweight caller can opt out
+    # of embedding and retain the path/hash reference instead.
+    if schedule_path not in (None, "") and not embed_schedule:
+        if not isinstance(schedule_path, str):
+            raise QuoteCostError("measured_quote.schedule_path must be a string")
+        result["schedule_path"] = schedule_path
+    if embed_schedule:
+        result["schedule"] = schedule
+    return result
+
+
+@dataclass(frozen=True)
+class CostResolverSetup:
+    """The one fallback model and optional measured resolver for a replay."""
+
+    model: CostModel
+    resolver: Any = None
+    measured: Mapping[str, Any] | None = None
+
+
+def reprice_ibr_result(result: Any, *, resolver: Any,
+                       vehicle: str = "equity") -> Any:
+    """Apply the causal resolver to an already-mechanically replayed IBR run.
+
+    ``research.ibr`` intentionally accepts one immutable ``CostModel`` for
+    backwards-compatible direct callers.  Its signal/exit mechanics do not
+    depend on expected costs, so an authorizing facade can replay mechanics
+    once and then recompute each realized trade's two cost legs at their own
+    symbol/time cells.  Quote sources remain executable prices; the helper
+    therefore uses the model's slippage-only leg cost for those sources and
+    never charges the measured spread twice.
+    """
+    if resolver is None:
+        return result
+    if vehicle != "equity":
+        raise QuoteCostError(
+            "measured quote-cost resolver currently supports equity only")
+    trades = []
+    for trade in getattr(result, "trades", ()):
+        entry_source = str(getattr(trade, "entry_fill_source", "") or "").lower()
+        exit_source = str(getattr(trade, "exit_fill_source", "") or "").lower()
+        quantity = float(getattr(trade, "quantity", 1.0))
+        multiplier = int(getattr(trade, "contract_multiplier", 1))
+        direction = str(getattr(trade, "direction", "long"))
+        execution_direction = direction
+        entry_timestamp = getattr(trade, "entry_timestamp", None)
+        exit_timestamp = getattr(trade, "exit_timestamp", None)
+        common = {
+            "vehicle": vehicle, "symbol": str(getattr(trade, "symbol", "")),
+            "quantity": quantity, "shares": quantity,
+            "entry_timestamp": (entry_timestamp.isoformat()
+                                 if hasattr(entry_timestamp, "isoformat")
+                                 else entry_timestamp),
+            "exit_timestamp": (exit_timestamp.isoformat()
+                                if hasattr(exit_timestamp, "isoformat")
+                                else exit_timestamp),
+        }
+        entry_model = resolver({**common, "cost_leg": "entry",
+                                "cost_timestamp": common["entry_timestamp"]})
+        exit_model = resolver({**common, "cost_leg": "exit",
+                               "cost_timestamp": common["exit_timestamp"]})
+        if not isinstance(entry_model, CostModel) or not isinstance(exit_model, CostModel):
+            raise QuoteCostError("measured cost resolver returned an invalid model")
+        entry_price = entry_model.execution_price(
+            float(trade.entry_reference), execution_direction, entry=True,
+            executable_quote=entry_source == "quote")
+        exit_price = exit_model.execution_price(
+            float(trade.exit_reference), execution_direction, entry=False,
+            executable_quote=exit_source == "quote")
+        gross = ((exit_price - entry_price)
+                 if execution_direction == "long" else
+                 (entry_price - exit_price)) * quantity * multiplier
+        fees = (entry_model.fees(entry_price, entry_price, quantity, multiplier,
+                                 vehicle=vehicle) / 2.0 +
+                exit_model.fees(exit_price, exit_price, quantity, multiplier,
+                                vehicle=vehicle) / 2.0)
+        if vehicle == "option":
+            # Options are long-premium positions in IBR.  The measured
+            # executable entry price is therefore also the risk unit.
+            realized_risk_per_unit = entry_price * multiplier
+            risk_per_unit = realized_risk_per_unit
+        else:
+            # Preserve the authored/planned risk distance while refreshing
+            # realized fill risk to the same measured entry economics used by
+            # the account replay.
+            risk_per_unit = getattr(trade, "risk_per_unit", None)
+            if risk_per_unit is None:
+                risk_per_unit = abs(entry_price - float(trade.stop_price))
+            realized_risk_per_unit = max(
+                0.0,
+                (entry_price - float(trade.stop_price)
+                 if execution_direction == "long" else
+                 float(trade.stop_price) - entry_price),
+            )
+        risk_usd = quantity * realized_risk_per_unit
+        trades.append(replace(
+            trade, entry_price=entry_price, exit_price=exit_price,
+            gross_pnl=gross, costs=fees, net_pnl=gross - fees,
+            risk_per_unit=risk_per_unit,
+            realized_risk_per_unit=realized_risk_per_unit,
+            risk_usd=risk_usd))
+    try:
+        return replace(result, trades=trades)
+    except TypeError:
+        # Keep a clear hard failure for an unexpected result shape; silently
+        # returning an un-repriced result would turn measured mode into a
+        # static-cost claim.
+        raise QuoteCostError("IBR result cannot carry measured cost repricing")
+
+
+def cost_resolver_setup(config: Mapping[str, Any] | None, *,
+                        vehicle: str = "equity",
+                        base_model: CostModel | None = None) -> CostResolverSetup:
+    """Resolve configured static/measured economics for one replay lane.
+
+    Disabled measurement returns the ordinary static model and no resolver.
+    Enabled measurement is equity-only and returns a fail-closed per-opportunity
+    resolver.  All lanes call this function so candidate, control, null,
+    qualification, and shadow arithmetic have identical provenance.
+    """
+    from .costs import CostModel
+    static = (base_model if isinstance(base_model, CostModel) else
+              CostModel.from_config(_static_cost_config(config), vehicle=vehicle))
+    block = ((config or {}).get("costs") if isinstance(config, Mapping) else None)
+    measured_raw = block.get("measured_quote") if isinstance(block, Mapping) else None
+    if measured_raw is None:
+        return CostResolverSetup(model=static)
+    broker = (config or {}).get("broker") if isinstance(config, Mapping) else None
+    expected_feed = (broker.get("data_feed") if isinstance(broker, Mapping)
+                     else None)
+    expected_provider = (broker.get("provider") if isinstance(broker, Mapping)
+                         and "provider" in broker else None)
+    if expected_provider in (None, "") and isinstance(measured_raw, Mapping):
+        expected_provider = measured_raw.get("provider")
+    normalized = validate_measured_quote_config(
+        measured_raw, expected_feed=expected_feed,
+        expected_provider=expected_provider)
+    if not normalized.get("enabled"):
+        # Disabled measurement is behaviorally the ordinary static model.  Do
+        # not bind operator-placeholder metadata into candidate identities or
+        # force a proof epoch when no measured economics were applied.
+        return CostResolverSetup(model=static)
+    if vehicle != "equity":
+        raise QuoteCostError(
+            "measured quote-cost resolver currently supports equity only")
+    schedule = normalized.get("schedule")
+    if not isinstance(schedule, Mapping):
+        # This branch is only reachable for a caller deliberately asking for
+        # a path-only reference; load and revalidate before constructing a
+        # resolver rather than trusting the path's current contents.
+        schedule = _read_schedule_path(str(normalized.get("schedule_path") or ""))
+        normalized = validate_measured_quote_config(
+            {**normalized, "schedule": schedule, "schedule_path": None},
+            expected_feed=expected_feed, expected_provider=expected_provider)
+        schedule = normalized["schedule"]
+    resolver = measured_cost_resolver(
+        schedule, percentile=normalized["percentile"], vehicle=vehicle,
+        depth_percentile=normalized["depth_percentile"],
+        max_impact_half_spreads=normalized["max_impact_half_spreads"],
+        fee_bps=static.fee_bps,
+        max_spread_bps=static.max_spread_bps,
+        max_slippage_bps=static.max_slippage_bps,
+        expected_feed=normalized.get("feed"),
+        expected_provider=normalized.get("provider"),
+        coverage_policy=normalized["coverage_policy"])
+    return CostResolverSetup(model=static, resolver=resolver, measured=normalized)
 
 
 @dataclass
@@ -463,7 +825,10 @@ def cost_model_from_schedule(
         max_impact_half_spreads: float = 4.0,
         fee_bps: float = DEFAULT_FEE_BPS,
         max_spread_bps: float = RUNTIME_MAX_SPREAD_BPS,
-        max_slippage_bps: float = RUNTIME_MAX_SLIPPAGE_BPS) -> CostModel:
+        max_slippage_bps: float = RUNTIME_MAX_SLIPPAGE_BPS,
+        expected_feed: str | None = None,
+        expected_provider: str | None = None,
+        coverage_policy: str = "strict") -> CostModel:
     """Build a :class:`CostModel` from a measured schedule.
 
     ``percentile`` selects how conservative the spread assumption is; the
@@ -490,9 +855,26 @@ def cost_model_from_schedule(
         raise QuoteCostError(f"percentile must be one of {PERCENTILES}")
     if depth_percentile not in PERCENTILES:
         raise QuoteCostError(f"depth_percentile must be one of {PERCENTILES}")
+    if coverage_policy not in MEASURED_QUOTE_COVERAGE_POLICIES:
+        raise QuoteCostError("coverage_policy must be 'strict'")
     impact_cap = _number(max_impact_half_spreads)
     if impact_cap is None or impact_cap < 0:
         raise QuoteCostError("max_impact_half_spreads must be non-negative")
+    measured_meta = schedule.get("measured")
+    if not isinstance(measured_meta, Mapping):
+        raise QuoteCostError("cost schedule metadata is missing")
+    schedule_feed = _normalized_identity(measured_meta.get("feed"))
+    schedule_provider = _normalized_identity(measured_meta.get("provider"))
+    normalized_feed = (_normalized_identity(expected_feed)
+                       if expected_feed not in (None, "") else None)
+    normalized_provider = (_normalized_identity(expected_provider)
+                           if expected_provider not in (None, "") else None)
+    if normalized_feed and schedule_feed != normalized_feed:
+        raise QuoteCostError(
+            f"schedule feed {schedule_feed!r} does not match {normalized_feed!r}")
+    if normalized_provider and schedule_provider != normalized_provider:
+        raise QuoteCostError(
+            f"schedule provider {schedule_provider!r} does not match {normalized_provider!r}")
     section, origin = _cell(schedule, symbol, bucket)
     spread_bps = _percentile(section.get("spread_bps"), percentile)
     half_spread = spread_bps / 2.0
@@ -507,7 +889,9 @@ def cost_model_from_schedule(
         spread_bps=spread_bps, slippage_bps=impact_bps, fee_bps=fee_bps,
         max_spread_bps=max_spread_bps, max_slippage_bps=max_slippage_bps,
         provenance=(f"measured:{schedule.get('schedule_hash', '')[:12]}"
-                    f":{origin}:{percentile}"))
+                    f":{origin}:spread-{percentile}:depth-{depth_percentile}"
+                    f":feed-{schedule_feed}:provider-{schedule_provider}"
+                    f":coverage-{coverage_policy}"))
 
 
 def schedule_costs_block(schedule: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -521,7 +905,15 @@ def schedule_costs_block(schedule: Mapping[str, Any], **kwargs: Any) -> dict[str
 
 def measured_cost_resolver(schedule: Mapping[str, Any], *,
                            percentile: str = "p75",
-                           vehicle: str = "equity"):
+                           vehicle: str = "equity",
+                           depth_percentile: str = "p25",
+                           max_impact_half_spreads: float = 4.0,
+                           fee_bps: float = DEFAULT_FEE_BPS,
+                           max_spread_bps: float = RUNTIME_MAX_SPREAD_BPS,
+                           max_slippage_bps: float = RUNTIME_MAX_SLIPPAGE_BPS,
+                           expected_feed: str | None = None,
+                           expected_provider: str | None = None,
+                           coverage_policy: str = "strict"):
     """Return the causal per-opportunity schedule resolver.
 
     Replay/account code can call this immediately before admission and each
@@ -564,7 +956,11 @@ def measured_cost_resolver(schedule: Mapping[str, Any], *,
         return cost_model_from_schedule(
             schedule, symbol=(None if resolved_symbol in (None, "") else str(resolved_symbol)),
             bucket=resolved_bucket, percentile=percentile,
-            order_shares=order_shares)
+            order_shares=order_shares, depth_percentile=depth_percentile,
+            max_impact_half_spreads=max_impact_half_spreads, fee_bps=fee_bps,
+            max_spread_bps=max_spread_bps, max_slippage_bps=max_slippage_bps,
+            expected_feed=expected_feed, expected_provider=expected_provider,
+            coverage_policy=coverage_policy)
     return resolve
 
 
@@ -580,8 +976,11 @@ from .stressed_cost_calibration import (  # noqa: E402  (late import avoids cycl
 )
 
 __all__ = ["BUCKET_MINUTES", "PERCENTILES", "QUOTE_COST_SCHEMA",
+           "MEASURED_QUOTE_CONFIG_SCHEMA", "MEASURED_QUOTE_COVERAGE_POLICIES",
            "QuoteCostError", "bucket_label", "cost_model_from_schedule",
            "measure_quote_costs", "measured_cost_resolver", "schedule_costs_block",
+           "validate_measured_quote_config", "cost_resolver_setup",
+           "CostResolverSetup", "reprice_ibr_result", "_static_cost_config",
            "DEFAULT_FALLBACK_SCENARIO_BPS", "DEFAULT_MIN_SESSIONS_PER_CELL",
            "STRESS_CALIBRATION_SCHEMA", "StressCalibrationError",
            "calibrate_stress_schedule", "calibrate_stressed_cost",

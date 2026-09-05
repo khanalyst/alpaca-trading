@@ -75,6 +75,16 @@ def candidate_assumptions(
             key: deepcopy(costs_source[key])
             for key in cost_keys if key in costs_source
         }
+        # Measured quote economics are part of the immutable candidate
+        # assumptions.  The normalized block contains the schedule (or its
+        # verified hash/path reference), percentile/depth policy, source
+        # identity, and strict coverage policy.  Omitting it would let a
+        # later shadow/runtime replay silently use different costs while the
+        # candidate hash still matched.
+        if (isinstance(costs_source.get("measured_quote"), Mapping) and
+                costs_source["measured_quote"].get("enabled") is True):
+            source["costs"]["measured_quote"] = deepcopy(
+                costs_source["measured_quote"])
         # An explicitly configured vehicle schedule is part of the immutable
         # proof assumptions.  It is intentionally absent from this projection
         # for legacy flat configs, preserving their historical hashes exactly.

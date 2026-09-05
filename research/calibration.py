@@ -18,7 +18,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Mapping, Sequence
 
-from .costs import CostModel, cost_model_for_vehicle
+from .costs import CostModel, cost_model_for_vehicle, static_cost_config
 
 SCHEMA = 2
 MIN_FILLS = 20
@@ -521,7 +521,8 @@ def main(argv: list[str] | None = None) -> int:
         with closing(sqlite3.connect(args.journal)) as db:
             report = json_report(
                 db,
-                CostModel.from_config(config, vehicle=args.vehicle),
+                CostModel.from_config(
+                    static_cost_config(config), vehicle=args.vehicle),
                 vehicle=args.vehicle)
     except (OSError, sqlite3.Error) as exc:
         print(f"journal read failed: {exc}", file=sys.stderr)

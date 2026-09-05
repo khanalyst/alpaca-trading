@@ -21,7 +21,7 @@ from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
                              thesis_exit_deadline,
                              initialize_exit_state)
 from .instruments import validate_instrument
-from research.costs import CostError, CostModel
+from research.costs import CostError, CostModel, static_cost_config
 
 _FILLED_ORDER_STATUSES = {"filled", "partially_filled"}
 _TERMINAL_ORDER_STATUSES = {
@@ -260,7 +260,8 @@ class ExecutionLifecycleMixin:
         if fees is None or slippage is None:
             try:
                 cfg = getattr(self, "cfg", {})
-                model = CostModel.from_config(cfg, vehicle=vehicle)
+                model = CostModel.from_config(
+                    static_cost_config(cfg), vehicle=vehicle)
                 if entry_price is not None and exit_price is not None:
                     expected_fees = model.fees(
                         entry_price, exit_price, quantity, multiplier,

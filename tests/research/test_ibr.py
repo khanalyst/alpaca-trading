@@ -243,24 +243,59 @@ class IBRReplayTests(unittest.TestCase):
                 self.assertAlmostEqual(ranged.target_price, 105.0, places=9)
                 self.assertEqual(percent.entry_reference, 103 if gap else 101)
 
-    def test_equity_stress_floor_widens_fixed_r_geometry_before_replay(self):
+    def test_equity_stress_floor_vetoes_fixed_r_geometry_before_replay(self):
+        policy = ReplayPolicy(
+            strict_market_data=False, stressed_cost_scenario_bps=25.0,
+            max_stressed_cost_to_risk_ratio=.30)
+        result = replay_ibr(
+            bars_for_day(),
+            config=IBRConfig(stop_pct=.003, target_pct=.006,
+                             costs=FREE, policy=policy),
+        )
+        self.assertEqual([], result.trades)
+        self.assertEqual(1, len(result.refusals))
+        refusal = result.refusals[0]
+        self.assertEqual("stressed_cost_risk_limit", refusal.reason)
+        self.assertEqual("risk_geometry", refusal.detail["reject_stage"])
+        self.assertAlmostEqual(refusal.detail["authored_stop_distance"], .303)
+        self.assertAlmostEqual(refusal.detail["effective_stop_floor_bps"],
+                               25.0 / .30)
+        self.assertTrue(refusal.detail["stress_floor_binding"])
+        self.assertEqual(refusal.detail["stop_geometry_scenario_bps"], 25.0)
+        self.assertEqual(
+            refusal.detail["stop_geometry_max_cost_to_risk_ratio"], .30)
+
+    def test_equity_stress_floor_leaves_explicit_wide_geometry_unchanged(self):
         policy = ReplayPolicy(
             strict_market_data=False, stressed_cost_scenario_bps=25.0,
             max_stressed_cost_to_risk_ratio=.30)
         trade = replay_ibr(
             bars_for_day(),
-            config=IBRConfig(stop_pct=.003, target_pct=.006,
+            config=IBRConfig(stop_pct=.01, target_pct=.02,
                              costs=FREE, policy=policy),
         ).trades[0]
-        self.assertAlmostEqual(trade.authored_stop_distance, .303)
-        self.assertTrue(trade.stress_floor_binding)
+        self.assertAlmostEqual(trade.authored_stop_distance, 1.01)
+        self.assertFalse(trade.stress_floor_binding)
         self.assertAlmostEqual(trade.effective_stop_floor_bps, 25.0 / .30)
-        self.assertEqual(trade.stop_price, 100.15)
-        self.assertEqual(trade.target_price, 102.7)
-        self.assertAlmostEqual(
-            (trade.target_price - 101.0) / (101.0 - trade.stop_price), 2.0)
+        self.assertEqual(trade.stop_price, 99.99)
+        self.assertEqual(trade.target_price, 103.02)
         self.assertEqual(trade.stop_geometry_scenario_bps, 25.0)
-        self.assertEqual(trade.stop_geometry_max_cost_to_risk_ratio, .30)
+
+    def test_partial_stress_geometry_controls_fail_closed_before_replay(self):
+        for policy in (
+                ReplayPolicy(strict_market_data=False,
+                             stressed_cost_scenario_bps=25.0),
+                ReplayPolicy(strict_market_data=False,
+                             max_stressed_cost_to_risk_ratio=.30)):
+            with self.subTest(policy=policy):
+                result = replay_ibr(
+                    bars_for_day(),
+                    config=IBRConfig(stop_pct=.01, target_pct=.02,
+                                     costs=FREE, policy=policy),
+                )
+                self.assertEqual([], result.trades)
+                self.assertEqual("stressed_cost_invalid",
+                                 result.refusals[0].reason)
 
     def test_equity_and_option_results_are_not_pooled(self):
         bars = bars_for_day()

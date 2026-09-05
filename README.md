@@ -89,12 +89,14 @@ The exit grammar is versioned. v3 already provides the bounded equity
 `breakeven_r` transition; v4 additionally supports a frozen session VWAP or
 rolling-mean target, a monotone trailing stop, and an `exit-before` deadline.
 The effective equity stop floor is `max(30 bps, stressed-cost scenario /
-max-cost-to-risk ratio)`. When that floor binds, the fixed-R target is recomputed
-from the widened risk and the authored/effective geometry plus binding decision
-are retained in telemetry. Authorizing resting-bracket stop/target evidence is
-still charged with the ordinary conservative adverse-cost model; gap and
-time/deadline exits require a fresh executable quote. Factory fit-only measurement
-remains diagnostic and reports eligible prefixes/first signals, floor binding,
+max-cost-to-risk ratio)`. A broker-normalized authored stop below that floor is
+vetoed as `stressed_cost_risk_limit` before sizing/fill; the authored stop is
+never widened and a fixed-R target is never recomputed. The floor, authored
+geometry, and binding decision are retained in telemetry. Authorizing
+resting-bracket stop/target evidence is still charged with the ordinary
+conservative adverse-cost model; gap and time/deadline exits require a fresh
+executable quote. Factory fit-only measurement remains diagnostic and reports
+eligible prefixes/first signals, floor binding,
 planned exits, configured/stressed economics, power, configured pre-cap versus
 fill-delivered risk, provider/feed provenance for each leg, pricing source,
 configured limits, pass/fail/unknown row counts, behavioral aliases, and
@@ -129,7 +131,7 @@ separate from authorizing dependence: before a factory cycle, completed
 prior-cycle family deltas are frozen into a hash-verified dependence map. When
 that map has enough history, its family clusters receive a conservative
 cluster-level BY veto in addition to family-local and cycle-global BY; the
-cluster veto can only reject. Paper `selection_mode: all_proved` then admits
+cluster veto can only reject. Explicit paper `selection_mode: all_proved` admits
 the strongest proved edge per verified frozen cluster. Families without a
 verified assignment use the existing held-out correlation fallback and never
 gain independence from missing data.
@@ -320,6 +322,14 @@ The shared vehicle-specific cost model uses explicit `costs.vehicles.equity` or
 `.option` schedules when configured (with provenance); otherwise the shipped
 defaults are 4 bps spread, 6 bps adverse slippage, and 0.5 bps per-side
 notional fee, plus a 0.65 currency-unit listed-option fee per contract per side.
+An explicitly enabled `costs.measured_quote` schedule replaces those equity
+spread/slippage constants at each symbol and half-hour boundary using the
+configured spread/depth percentiles. Its content hash, feed, provider, coverage
+floor, and policy are part of candidate identity, and the same frozen resolver
+prices candidate, control, randomized-null, qualification, and live-shadow
+legs. Missing or under-covered cells fail closed. The checked-in block is
+disabled because the repository does not contain one universal corpus-specific
+schedule that could honestly be activated for every deployment.
 Proofs also persist preregistered all-in stress scenarios of
 9, 15, 25, and 50 bps. The shipped runtime uses 25 bps as its default and
 fail-closed fallback; an explicitly activated, valid held-out calibration
@@ -420,6 +430,11 @@ successful audit clears it.
 
 - Paper mode (`mode: paper`, `broker.paper: true`, `ALPACA_PAPER=true`) and
   Alpaca's paper endpoint are the documented defaults.
+- The shipped paper strategy uses `selection_mode: specific` with
+  `variant_id: auto`: once the evidence gate has eligible records, runtime
+  resolves exactly one globally strongest validated/champion edge. Set
+  `selection_mode: all_proved` explicitly only when the multi-edge paper lane
+  is intended.
 - Live mode is an explicit, separately reviewed configuration only: set
   `mode: live`, `broker.paper: false`, `broker.allow_live: true`, and
   `ALPACA_LIVE_ENABLE=true`; then either `strategy.selection_mode: pinned`

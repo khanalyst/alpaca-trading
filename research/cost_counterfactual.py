@@ -23,7 +23,7 @@ from agent.config import load_config
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 
 from .costs import (CostModel, ReplayPolicy, SQLiteQuoteIndex,
-                    diagnostic_backfill_policy)
+                    diagnostic_backfill_policy, static_cost_config)
 from .edge_lab import _read_discovery_rows, content_hash
 from .factory_core import simulate_account
 from .gates import (
@@ -1296,7 +1296,8 @@ def run_counterfactual(
             config["risk"] = risk
             arm_configs[name] = config
             policy = diagnostic_backfill_policy(ReplayPolicy.from_config(config))
-            costs = CostModel.from_config(config, vehicle=vehicle)
+            costs = CostModel.from_config(
+                static_cost_config(config), vehicle=vehicle)
             combined: list[dict] = []
             per_variant = []
             for spec in frozen:

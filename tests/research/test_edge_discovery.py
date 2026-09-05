@@ -1890,6 +1890,7 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
                         side_effect=compact_qualification), \
                     mock.patch.multiple(
                         gates,
+                        SERIAL_BLOCK_LENGTH=3,
                         ACTUAL_CONTROL_MIN_MATCHED=4,
                         NULL_CONTROL_MIN_MATCHED=4,
                         PROTOCOL_BACKTEST_MIN_TRADES=4,
@@ -2105,6 +2106,7 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
                     side_effect=compact_qualification), \
                 mock.patch.multiple(
                     gates,
+                    SERIAL_BLOCK_LENGTH=3,
                     ACTUAL_CONTROL_MIN_MATCHED=4,
                     NULL_CONTROL_MIN_MATCHED=4,
                     PROTOCOL_BACKTEST_MIN_TRADES=4,

@@ -163,15 +163,30 @@ class RiskEngine:
             return None, None
         scenario = _num(risk.get("stressed_cost_scenario_bps"), None)
         limit = _num(risk.get("max_stressed_cost_to_risk_ratio"), None)
-        if scenario is None:
-            scenario = 25.0 if "stressed_cost_scenario_bps" not in risk else None
-        if limit is None:
-            limit = 0.30 if "max_stressed_cost_to_risk_ratio" not in risk else None
+        # A raw runtime fixture may override only one control and rely on the
+        # shipped default for the other.  Validated production configs carry
+        # both values explicitly; retain this compatibility for unvalidated
+        # callers while treating explicitly supplied malformed values below.
+        if scenario is None and "stressed_cost_scenario_bps" not in risk:
+            scenario = 25.0
+        if limit is None and "max_stressed_cost_to_risk_ratio" not in risk:
+            limit = 0.30
         if scenario not in {9.0, 15.0, 25.0, 50.0}:
             scenario = None
         if limit is not None and (not math.isfinite(limit) or limit < 0):
             limit = None
         return scenario, limit
+
+    @staticmethod
+    def _stress_controls_disabled(cfg: Mapping | None) -> bool:
+        """Return whether this source intentionally has no stress controls."""
+        source = cfg if isinstance(cfg, Mapping) else {}
+        risk = source.get("risk", source)
+        if not isinstance(risk, Mapping):
+            return False
+        return ("stressed_cost_scenario_bps" not in risk and
+                "max_stressed_cost_to_risk_ratio" not in risk and
+                risk.get("stressed_cost_calibration_enabled", False) is not True)
 
     def _resolved_stressed_cost_settings(
             self, plan: Mapping, cfg: Mapping | None = None, *,
@@ -192,6 +207,8 @@ class RiskEngine:
                         vehicle=vehicle)
             except (CostError, TypeError, ValueError, OverflowError):
                 return None, None, "calibration_policy_invalid"
+        if self._stress_controls_disabled(source):
+            return None, None, "activation_disabled"
         return scenario, limit, activation_reason
 
     def check_stressed_cost(self, plan: Mapping,
@@ -203,6 +220,8 @@ class RiskEngine:
         cost schedule fails closed with a stable explicit reason.
         """
         source = cfg if isinstance(cfg, Mapping) else self.cfg
+        if not isinstance(plan, Mapping):
+            return None, "stressed_cost_invalid"
         vehicle = ("option" if isinstance(plan, Mapping) and
                    str(plan.get("execution_profile", "shares")).lower()
                    in {"option", "options", "defined_risk_options",
@@ -210,6 +229,14 @@ class RiskEngine:
         scenario, limit, activation_reason = (
             self._resolved_stressed_cost_settings(
                 plan, source, vehicle=vehicle))
+        stress_requested = (
+            scenario is not None or limit is not None or
+            activation_reason != "activation_disabled")
+        if not stress_requested:
+            # Low-level callers may intentionally omit the optional runtime
+            # stress controls.  Keep that fully-disabled mode distinct from a
+            # malformed one-sided or invalid configuration.
+            return dict(plan), None
         if scenario is None or limit is None:
             return None, "stressed_cost_invalid"
         notional = _num(plan.get("notional"), None)
@@ -676,9 +703,16 @@ class RiskEngine:
             scenario, limit, activation_reason = (
                 self._resolved_stressed_cost_settings(
                     geometry_context, cost_cfg, vehicle="equity"))
-            if scenario is not None and limit is not None:
+            stress_requested = (
+                (scenario is not None or limit is not None or
+                 activation_reason != "activation_disabled"))
+            if not stress_requested:
+                scenario = limit = None
+            elif scenario is None or limit is None:
+                return None, "stressed_cost_invalid"
+            if stress_requested:
                 try:
-                    distance, floor_bps = effective_stop_distance(
+                    effective_distance, floor_bps = effective_stop_distance(
                         entry, broker_normalized_distance,
                         base_floor_bps=MIN_STOP_DISTANCE_BPS,
                         scenario_bps=scenario,
@@ -686,27 +720,7 @@ class RiskEngine:
                         minimum_increment=equity_price_increment(entry))
                 except RiskGeometryError:
                     return None, "stressed_cost_invalid"
-                binding = distance > broker_normalized_distance + 1e-12
-                if binding:
-                    stop = (entry - distance if direction == "long" else
-                            entry + distance)
-                    target_mode = str(
-                        decision.get("target_mode") or "fixed_r")
-                    if target_mode == "fixed_r":
-                        target_r = _num(decision.get("target_r"))
-                        if target_r is None or target_r <= 0:
-                            target_r = (abs(signal_authored_target - entry) /
-                                        signal_authored_distance)
-                        if not math.isfinite(target_r) or target_r <= 0:
-                            return None, "stop/target side validation failed"
-                        target = (entry + target_r * distance
-                                  if direction == "long" else
-                                  entry - target_r * distance)
-                    try:
-                        stop, target, distance = quantize_equity_bracket(
-                            entry, stop, target, direction)
-                    except RiskGeometryError:
-                        return None, "broker_tick_geometry_invalid"
+                binding = effective_distance > broker_normalized_distance + 1e-12
                 geometry_telemetry = {
                     "authored_stop_price": signal_authored_stop,
                     "authored_target_price": signal_authored_target,
@@ -722,11 +736,16 @@ class RiskEngine:
                     "stop_geometry_max_cost_to_risk_ratio": float(limit),
                     "stop_geometry_activation_reason": activation_reason,
                 }
-                if (not math.isfinite(float(stop)) or stop <= 0 or
-                        not math.isfinite(float(target)) or target <= 0 or
-                        (direction == "long" and not (stop < entry < target)) or
-                        (direction == "short" and not (target < entry < stop))):
-                    return None, "stressed_cost_invalid"
+                # The effective stressed-cost floor is a veto boundary, not an
+                # instruction to rewrite the authored stop or fixed-R target.
+                # A binding stop must be refused before risk budgeting/sizing.
+                if binding:
+                    return None, "stressed_cost_risk_limit"
+            if (not math.isfinite(float(stop)) or stop <= 0 or
+                    not math.isfinite(float(target)) or target <= 0 or
+                    (direction == "long" and not (stop < entry < target)) or
+                    (direction == "short" and not (target < entry < stop))):
+                return None, "stressed_cost_invalid"
         try:
             budget = self._risk_usd(equity, decision)
         except ValueError as exc:

@@ -8,14 +8,23 @@ cannot be verified is just a second assumption.
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from zoneinfo import ZoneInfo
 
+from agent.config import ConfigError, validate_config
 from research.costs import CostError
+from research.edge_discovery_core import _effective_ibr_config
+from research.edge_identity import candidate_assumptions
+from research.edge_ledger import content_hash
 from research.quote_costs import (QUOTE_COST_SCHEMA, QuoteCostError,
                                   bucket_label, cost_model_from_schedule,
-                                  measure_quote_costs, measured_cost_resolver,
-                                  schedule_costs_block)
+                                  cost_resolver_setup, measure_quote_costs,
+                                  measured_cost_resolver,
+                                  schedule_costs_block,
+                                  validate_measured_quote_config)
 
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -233,6 +242,129 @@ class CostModelConstructionTests(unittest.TestCase):
         rebuilt = CostModel.from_config({"costs": block})
         self.assertAlmostEqual(rebuilt.spread_bps,
                                self.schedule["symbols"]["SPY"]["spread_bps"]["p75"])
+
+
+class MeasuredConfigIntegrationTests(unittest.TestCase):
+    """The validated schedule is shared by every authorizing replay lane."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.schedule = measure_quote_costs(
+            _quotes("SPY", spread_bps=1.0, minutes=30, sessions=20),
+            feed="iex", provider="test")
+
+    def _config(self, measured=None):
+        return validate_config({
+            "broker": {"data_feed": "iex"},
+            "costs": {"spread_bps": 4.0, "slippage_bps": 6.0,
+                      "fee_bps": 0.5,
+                      "measured_quote": (measured or {
+                          "enabled": True,
+                          "schedule": self.schedule,
+                          "percentile": "p75",
+                          "depth_percentile": "p25",
+                          "min_quotes_per_cell": 500,
+                          "coverage_policy": "strict",
+                      })},
+        })
+
+    def test_enabled_config_embeds_schedule_and_resolver_provenance(self):
+        config = self._config()
+        block = config["costs"]["measured_quote"]
+        self.assertEqual(block["schedule_hash"], self.schedule["schedule_hash"])
+        self.assertNotIn("schedule_path", block)
+        setup = cost_resolver_setup(config, vehicle="equity")
+        model = setup.resolver({
+            "vehicle": "equity", "symbol": "SPY", "shares": 10,
+            "cost_leg": "entry", "cost_timestamp": "2026-01-05T14:45:00+00:00",
+        })
+        self.assertIn("symbol_bucket:SPY:m000_030", model.provenance)
+        self.assertIn("spread-p75", model.provenance)
+        self.assertIn("depth-p25", model.provenance)
+        self.assertIn("feed-iex:provider-test:coverage-strict", model.provenance)
+
+    def test_declared_hash_and_provider_feed_are_checked_at_config_boundary(self):
+        bad_hash = {"enabled": True, "schedule": self.schedule,
+                    "schedule_hash": "not-the-schedule-hash",
+                    "provider": "test"}
+        with self.assertRaisesRegex(ConfigError, "declared schedule_hash"):
+            self._config(bad_hash)
+        with self.assertRaisesRegex(ConfigError, "schedule feed"):
+            validate_config({
+                "broker": {"data_feed": "sip"},
+                "costs": {"measured_quote": {
+                    "enabled": True, "schedule": self.schedule,
+                    "provider": "test"}},
+            })
+
+    def test_disabled_path_is_static_fallback_without_loading_filesystem(self):
+        block = validate_measured_quote_config({
+            "enabled": False,
+            "schedule_path": "/a/path/that/must/not/be/opened.json",
+        })
+        self.assertFalse(block["enabled"])
+        self.assertEqual(block["schedule_path"],
+                         "/a/path/that/must/not/be/opened.json")
+
+    def test_disabled_placeholder_does_not_bind_the_active_broker_feed(self):
+        config = validate_config({
+            "broker": {"data_feed": "sip"},
+            "costs": {"measured_quote": {
+                "enabled": False, "feed": "iex", "provider": "alpaca",
+            }},
+        })
+        self.assertEqual(config["broker"]["data_feed"], "sip")
+        self.assertIsNone(cost_resolver_setup(config).resolver)
+
+    def test_schedule_path_is_verified_once_and_embedded_for_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schedule.json"
+            path.write_text(json.dumps(self.schedule), encoding="utf-8")
+            config = self._config({
+                "enabled": True, "schedule_path": str(path),
+                "schedule_hash": self.schedule["schedule_hash"],
+                "min_quotes_per_cell": 500,
+            })
+            block = config["costs"]["measured_quote"]
+            self.assertNotIn("schedule_path", block)
+            self.assertEqual(block["schedule"], self.schedule)
+            # Later path mutation cannot change replay economics or identity.
+            path.write_text("{}", encoding="utf-8")
+            setup = cost_resolver_setup(config)
+            self.assertEqual(
+                setup.measured["schedule_hash"], self.schedule["schedule_hash"])
+
+    def test_disabled_measurement_does_not_create_a_new_candidate_identity(self):
+        base = validate_config({})
+        disabled = validate_config({"costs": {"measured_quote": {
+            "enabled": False, "feed": "iex", "provider": "alpaca",
+        }}})
+        left = candidate_assumptions(
+            base, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        right = candidate_assumptions(
+            disabled, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        self.assertEqual(content_hash(left), content_hash(right))
+
+    def test_effective_config_and_candidate_identity_retain_measured_economics(self):
+        config = self._config()
+        _cfg, effective = _effective_ibr_config(config, {})
+        self.assertEqual(
+            effective["costs"]["measured_quote"]["schedule_hash"],
+            self.schedule["schedule_hash"])
+        assumptions = candidate_assumptions(
+            effective, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        self.assertEqual(
+            assumptions["costs"]["measured_quote"]["schedule_hash"],
+            self.schedule["schedule_hash"])
+        changed = dict(assumptions)
+        changed["costs"] = dict(assumptions["costs"])
+        changed["costs"]["measured_quote"] = dict(
+            assumptions["costs"]["measured_quote"])
+        changed["costs"]["measured_quote"]["percentile"] = "median"
+        self.assertNotEqual(content_hash(assumptions), content_hash(changed))
 
 
 if __name__ == "__main__":

@@ -32,7 +32,8 @@ from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
 from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     CostModel, ReplayPolicy, SQLiteQuoteIndex,
                     diagnostic_backfill_policy, index_quotes, quote_fill,
-                    replay_policy_for_mode)
+                    replay_policy_for_mode, static_cost_config)
+from .quote_costs import cost_resolver_setup
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
@@ -178,7 +179,11 @@ def _automatic_cost_diagnostic(
         return result
     try:
         from .cost_rerun import run_cost_rerun, write_immutable_evidence
-        config = dict(runtime_config or {})
+        # The legacy rerun is intentionally diagnostic and owns the
+        # configured-vs-measured counterfactual.  Give its flat CostModel
+        # parser the schema-compatible projection; the authorizing lanes
+        # above use ``cost_resolver_setup`` and retain the frozen overlay.
+        config = static_cost_config(runtime_config)
         report = run_cost_rerun(
             corpus, runtime_config=config, specs=specs,
             percentile=str(os.getenv("ALPACA_RESEARCH_COST_RERUN_PERCENTILE", "p75")),
@@ -2723,10 +2728,14 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
             if isinstance(worker_policy, Mapping) else
             getattr(worker_policy, "strict_market_data", True) is False)
         fit_bars, _fit_sessions, _total_sessions = _fit_partition(bars)
+        cost_setup = cost_resolver_setup(
+            payload.get("runtime_config"), vehicle=vehicle,
+            base_model=payload["costs"])
         root_account = simulate_account(
             fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
             account_id=f"diagnostic:{hypothesis['hypothesis_id']}",
             starting_cash=starting_cash, costs=payload["costs"], quotes=quotes,
+            cost_resolver=cost_setup.resolver,
             policy=payload.get("policy"),
         )
         fit_diagnostics = measure_fit_diagnostics(
@@ -2755,6 +2764,9 @@ def _fit_variants_worker(payload: Mapping[str, Any]) -> dict:
     try:
         fit_bars, _fit_sessions, _total_sessions = _fit_partition(bars)
         hypothesis = dict(payload["hypothesis"])
+        cost_setup = cost_resolver_setup(
+            payload.get("runtime_config"), vehicle=str(payload["vehicle"]),
+            base_model=payload["costs"])
         output: dict[str, dict] = {}
         for raw_spec in payload.get("specs", ()):
             spec = validate_rule_spec(raw_spec)
@@ -2763,7 +2775,8 @@ def _fit_variants_worker(payload: Mapping[str, Any]) -> dict:
                 fit_bars, snapshots, spec, vehicle=str(payload["vehicle"]),
                 account_id=f"fit-diagnostic:{hypothesis['hypothesis_id']}:{variant_id}",
                 starting_cash=float(payload["starting_cash"]), costs=payload["costs"],
-                quotes=quotes, policy=payload.get("policy"))
+                cost_resolver=cost_setup.resolver, quotes=quotes,
+                policy=payload.get("policy"))
             output[variant_id] = measure_fit_diagnostics(
                 fit_bars, spec, account_rows=account["rows"],
                 costs=payload["costs"], vehicle=str(payload["vehicle"]),
@@ -2879,6 +2892,10 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         mode = str(payload["mode"])
         starting_cash = float(payload["starting_cash"])
         costs = payload["costs"]
+        cost_setup = cost_resolver_setup(
+            payload.get("runtime_config"), vehicle=vehicle,
+            base_model=costs)
+        cost_resolver = cost_setup.resolver
         policy = payload.get("policy")
         diagnostic_only = (
             policy.get("strict_market_data", True) is False
@@ -2893,6 +2910,7 @@ def _worker(payload: Mapping[str, Any]) -> dict:
             bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
             account_id=f"control:{hypothesis['hypothesis_id']}:{uuid.uuid4().hex[:8]}",
             starting_cash=starting_cash, costs=costs, quotes=quotes,
+            cost_resolver=cost_resolver,
             policy=policy,
         )
         variants = []
@@ -2903,12 +2921,14 @@ def _worker(payload: Mapping[str, Any]) -> dict:
             account = simulate_account(
                 bars, snapshots, spec, vehicle=vehicle, account_id=account_id,
                 starting_cash=starting_cash, costs=costs, quotes=quotes,
+                cost_resolver=cost_resolver,
                 policy=policy,
             )
             null_rows[variant_id] = null_control_account(
                 bars, snapshots, spec, vehicle=vehicle, reference_rows=account["rows"],
                 account_id=f"null:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}",
                 starting_cash=starting_cash, costs=costs, quotes=quotes,
+                cost_resolver=cost_resolver,
                 policy=policy)["rows"]
             variants.append({
                 "variant_id": variant_id, "rule_spec": spec, "vehicle": vehicle,
@@ -3505,7 +3525,10 @@ def _run_diagnostic_factory(
     if not 2 <= int(variants_per_strategy) <= MAX_VARIANTS:
         raise FactoryError(
             f"variants_per_strategy must be between 2 and {MAX_VARIANTS}")
-    model = costs or CostModel.from_config(runtime_config, vehicle=vehicle)
+    cost_setup = cost_resolver_setup(
+        runtime_config, vehicle=vehicle, base_model=costs)
+    model = cost_setup.model
+    cost_resolver = cost_setup.resolver
     base_policy = ReplayPolicy.from_config(runtime_config)
     policy = diagnostic_backfill_policy(base_policy)
     execution_geometry = _execution_geometry_context(
@@ -3548,6 +3571,7 @@ def _run_diagnostic_factory(
             vehicle=vehicle,
             account_id=f"diagnostic-context:{template.hypothesis_id}",
             starting_cash=float(starting_cash), costs=model, quotes=quotes,
+            cost_resolver=cost_resolver,
             policy=policy)
         root_fit = measure_fit_diagnostics(
             bars, template.rule_spec, account_rows=root_account["rows"],
@@ -3597,6 +3621,7 @@ def _run_diagnostic_factory(
             bars, snapshots, hypothesis.rule_spec, vehicle=vehicle,
             account_id=f"diagnostic-root:{hypothesis.hypothesis_id}",
             starting_cash=float(starting_cash), costs=model, quotes=quotes,
+            cost_resolver=cost_resolver,
             policy=policy)
         root_fit = measure_fit_diagnostics(
             bars, hypothesis.rule_spec, account_rows=root_account["rows"],
@@ -3652,6 +3677,7 @@ def _run_diagnostic_factory(
                     bars, snapshots, selected.rule_spec, vehicle=vehicle,
                     account_id=account_id,
                     starting_cash=float(starting_cash), costs=model, quotes=quotes,
+                    cost_resolver=cost_resolver,
                     policy=policy)
                 fit = measure_fit_diagnostics(
                     bars, selected.rule_spec, account_rows=account["rows"],
@@ -3896,8 +3922,12 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     # cost schedule. When a caller does not pass an explicit model, derive it
     # from the validated runtime config for this vehicle rather than silently
     # reverting to the flat spread/slippage schedule.
-    model = (costs if costs is not None else
-             CostModel.from_config(runtime_config, vehicle=vehicle))
+    cost_setup = cost_resolver_setup(
+        runtime_config, vehicle=vehicle, base_model=costs)
+    model = cost_setup.model
+    # The resolver is reconstructed inside each worker from this immutable
+    # runtime config; nested closures are intentionally not sent through the
+    # ProcessPool boundary.
     # Keep the selected effective model in the replay/effective config while
     # retaining every normalized vehicle schedule in the identity source. The
     # latter ensures changing only option economics invalidates option proofs
@@ -3911,11 +3941,14 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         identity_costs["vehicles"] = {
             str(name): {
                 key: getattr(
-                    CostModel.from_config(runtime_config, vehicle=str(name)), key)
+                    CostModel.from_config(static_cost_config(runtime_config),
+                                         vehicle=str(name)), key)
                 for key in cost_fields
             }
             for name in sorted(runtime_costs["vehicles"], key=str)
         }
+    if cost_setup.measured is not None:
+        identity_costs["measured_quote"] = dict(cost_setup.measured)
     # The explicit model is the replay economics actually used by workers.
     # Feed it into the identity envelope so a caller-provided calibration (or
     # the module's conservative default) cannot be hidden behind the shipped
@@ -4042,9 +4075,16 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     identity_hashes = provenance_hash(
         dataset=raw_rows, config=experiment_config, code=Path(__file__),
         provenance={"factory": FACTORY_SCHEMA, "experiment": experiment_config})
+    experiment_cost = model.as_dict()
+    if cost_setup.measured is not None:
+        # Keep the exact schedule/policy in the durable experiment evidence,
+        # not only in config_hash.  This makes an operator-facing provenance
+        # record self-describing and lets a later shadow audit verify that it
+        # used the same measured economics.
+        experiment_cost["measured_quote"] = dict(cost_setup.measured)
     experiment_provenance_body = experiment_provenance(
         dataset=raw_rows, config=experiment_config,
-        code=identity_hashes["code_hash"], cost=model.as_dict(),
+        code=identity_hashes["code_hash"], cost=experiment_cost,
         risk=(risk_assumptions if risk_assumptions is not None
               else policy.as_dict()), gate=gate_assumptions)
     experiment_provenance_body["replay_policies"] = {
@@ -4056,7 +4096,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     identity = experiment_identity(
         dataset_hash=dataset_hash, vehicle=vehicle,
         code_hash=identity_hashes["code_hash"],
-        config_hash=identity_hashes["config_hash"], cost=model.as_dict(),
+        config_hash=identity_hashes["config_hash"], cost=experiment_cost,
         risk=(risk_assumptions if risk_assumptions is not None
               else policy.as_dict()), gate=gate_assumptions,
         provenance=experiment_provenance_body)
@@ -4204,6 +4244,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             "hypothesis": hypothesis, "vehicle": vehicle, "mode": mode,
             "existing_specs": specs, "variants_per_strategy": variants_per_strategy,
             "starting_cash": starting_cash, "costs": model,
+            # The parent has already resolved any schedule_path, checked its
+            # hash, and embedded the immutable measured schedule in this
+            # identity config.  Workers must consume those same bytes rather
+            # than reopening a mutable path after cycle identity was sealed.
+            "runtime_config": identity_runtime_config,
             "risk_config": risk_assumptions,
             "policy": (shadow_policy if mode == "shadow" else backtest_policy),
             "backtest_bar_fallback": backtest_bar_fallback,
@@ -4825,6 +4870,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 selected_worker["hypothesis"]["rule_spec"], vehicle=vehicle,
                 account_id=f"qualification:control:{hypothesis_id}",
                 starting_cash=starting_cash, costs=model, quotes=sealed_quotes,
+                cost_resolver=cost_setup.resolver,
                 policy=selected_policy)["rows"]
             root_variant_id = rule_variant_id(
                 selected_worker["hypothesis"]["rule_spec"])
@@ -4836,6 +4882,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     reference_rows=control_rows,
                     account_id=f"qualification:null:{hypothesis_id}",
                     starting_cash=starting_cash, costs=model,
+                    cost_resolver=cost_setup.resolver,
                     quotes=sealed_quotes, policy=selected_policy)["rows"]
             candidate_rows = simulate_account(
                 qualification_bars, sealed_snapshots,
@@ -4843,6 +4890,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 account_id=(f"qualification:{hypothesis_id}:"
                             f"{selected_variant['variant_id']}"),
                 starting_cash=starting_cash, costs=model, quotes=sealed_quotes,
+                cost_resolver=cost_setup.resolver,
                 policy=selected_policy)["rows"]
             qualification_report = _qualification_report(
                 candidate_rows, baseline_rows, vehicle=vehicle,
@@ -4931,7 +4979,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             },
             "hypothesis_id": worker["hypothesis"]["hypothesis_id"],
             "variant_id": variant["variant_id"],
-            "costs": model.as_dict(),
+            "costs": {
+                **model.as_dict(),
+                **({"measured_quote": dict(cost_setup.measured)}
+                   if cost_setup.measured is not None else {}),
+            },
             "replay_policy": worker_policy.as_dict(),
             "replay_mode": worker["mode"],
             "backtest_bar_fallback": backtest_bar_fallback,

@@ -25,7 +25,7 @@
     "id": "rule",
     "version": "v1",
     "variant_id": "auto",
-    "selection_mode": "all_proved",
+    "selection_mode": "specific",
     "execution_mode": "shares",
     "range_minutes": 15,
     "breakout_buffer_bps": 5,
@@ -67,7 +67,18 @@
     "slippage_bps": 6.0,
     "fee_bps": 0.5,
     "option_fee_per_contract_side": 0.65,
-    "provenance": "shipped_conservative_v1_plus_25bps_stress"
+    "provenance": "shipped_conservative_v1_plus_25bps_stress",
+    "measured_quote": {
+      "schema": "measured-quote-cost.v1",
+      "enabled": false,
+      "percentile": "p75",
+      "depth_percentile": "p25",
+      "min_quotes_per_cell": 500,
+      "max_impact_half_spreads": 4.0,
+      "coverage_policy": "strict",
+      "feed": "iex",
+      "provider": "alpaca"
+    }
   },
   "llm": {
     "enabled": false,

@@ -141,10 +141,23 @@ closed. The pure entry-slippage check applies that cap to quote-versus-reference
 prices in every quote-entry lane and keeps the stable invalid and over-cap
 reasons above. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps; 25
 bps is the authorization requirement and the others remain diagnostics.
+For equity proofs, an explicitly enabled `costs.measured_quote` block replaces
+the flat spread/slippage assumption with one frozen per-symbol, per-half-hour
+schedule. Its verified content hash, feed/provider identity, spread/depth
+percentiles, quote-count floor, and strict coverage policy are proof
+assumptions. Candidate, control, randomized-null, qualification, and
+live-shadow legs use the same entry/exit resolver; missing or under-covered
+cells fail closed. The checked-in block is disabled until a corpus-specific
+schedule is deliberately fitted and frozen.
 Stress bps are charged against entry notional, with listed-option round-trip
 fees added for both per-contract sides; they are not per-side bps. The shipped
 `max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade's 25-bps
 entry-notional stress is about `0.833` of risk and is vetoed before option fees.
+For equity geometry, a broker-normalized authored stop below
+`max(30 bps, scenario / max-cost-to-risk ratio)` is likewise refused as
+`stressed_cost_risk_limit` before sizing or fill. The stop is never widened and
+a fixed-R target is never recomputed; explicitly wide authored brackets pass
+unchanged. The floor and binding decision remain in refusal/trade telemetry.
 For equity orders, bracket legs and limit prices are rounded toward the entry
 to Alpaca's valid price ticks (`$0.01` at or above `$1`, `$0.0001` below) before
 risk sizing and submission; a rounded bracket that no longer straddles entry is
@@ -316,8 +329,11 @@ Candidate registration and every proof run share one canonical assumptions
 hash covering feeds, session/calendar, strategy, risk, execution, and costs.
 The runtime reapplies the candidate and recomputes that hash before selection;
 legacy evidence or any assumption drift fails closed and must be re-researched.
-Paper `selection_mode: all_proved` may run one strongest passing variant per
-verified frozen dependence cluster under one global risk book. Families without
+Paper defaults to `selection_mode: specific` with `variant_id: auto`, resolving
+exactly one globally strongest passing validated/champion variant through the
+ledger's conservative champion ranking. `selection_mode: all_proved` remains an
+explicit paper option and may run one strongest passing variant per verified
+frozen dependence cluster under one global risk book. Families without
 a verified assignment use the held-out correlation-safe fallback. Live mode resolves exactly one
 proved record: preferably one `selection_mode: pinned` entry, or one legacy
 `selection_mode: specific` variant. It never substitutes a different

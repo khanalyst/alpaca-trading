@@ -1,9 +1,7 @@
 # Deployment topology
 
 Installation is in [`../SETUP.md`](../SETUP.md); operation, backup, and
-recovery are in [`../OPERATIONS.md`](../OPERATIONS.md). For an existing VM
-migrating from a legacy SIP corpus, follow the short [VM feed migration
-handoff](../VM_MIGRATION.md) before starting services. This file records
+recovery are in [`../OPERATIONS.md`](../OPERATIONS.md). This file records
 process ownership and the two supported paper launch lanes. The runtime scope
 is US-listed equities/ETFs and listed OCC options only; crypto is rejected.
 Every shipped deployment is paper-only (`ALPACA_PAPER=true`, live disabled),
@@ -145,10 +143,13 @@ N sessions, and `ALPACA_RESEARCH_DATASET` can override the source with
 normalized JSONL. The edge ledger is stored at
 `runtime/research/edge_lab.sqlite3` (override with `ALPACA_EDGE_DB`) and is
 read-only from the dashboard. Research cannot place orders or mutate broker
-state. Paper `selection_mode: all_proved` runs one strongest proven variant per
-verified frozen prior-cycle dependence cluster under one global risk book;
-families without a verified assignment use the held-out correlation-safe
-fallback. Defaults are twelve logical
+state. The shipped paper runtime defaults to `selection_mode: specific` with
+`variant_id: auto`, resolving exactly one globally strongest validated/champion
+variant after the evidence gate. An explicit paper
+`selection_mode: all_proved` runs one strongest proven variant per verified
+frozen prior-cycle dependence cluster under one global risk book; families
+without a verified assignment use the held-out correlation-safe fallback.
+Defaults are twelve logical
 strategy slots over all twelve bounded rule families and four isolated variant
 accounts per strategy; each isolated book is processed by one bounded worker.
 The twelfth family, `cross_sectional_residual`, is shares-only, uses SPY as its

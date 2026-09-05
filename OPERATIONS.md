@@ -180,11 +180,6 @@ Do not delete or edit the SQLite journal to make a reconciliation pass.
 
 ## Backups and recovery
 
-For an existing VM moving from a legacy SIP corpus to the shipped Free Basic
-IEX profile, use the concise [VM feed migration handoff](VM_MIGRATION.md).
-It archives the active corpus and proof volumes, preserves broker
-reconciliation state, and requires a fresh IEX research/shadow proof.
-
 Back up the named volumes or these directories to a different device/off-host
 destination:
 
@@ -446,9 +441,12 @@ vehicles separately, and writes evidence. Each variant has its own simulated
 cash/equity account; default capacity is twelve logical strategy slots and four
 variants per strategy, covering the catalog of twelve rule families on a fresh
 ledger. Each isolated book is processed by one
-bounded worker. Paper `selection_mode: all_proved` keeps one strongest proven
-variant per verified frozen prior-cycle dependence cluster under one global risk
-book; families without a verified assignment use the held-out correlation-safe
+bounded worker. The shipped paper runtime defaults to
+`selection_mode: specific` with `variant_id: auto`, resolving exactly one
+globally strongest validated/champion variant after the evidence gate. An
+explicit paper `selection_mode: all_proved` keeps one strongest proven variant
+per verified frozen prior-cycle dependence cluster under one global risk book;
+families without a verified assignment use the held-out correlation-safe
 fallback. The edge
 ledger is
 initialized at `runtime/research/edge_lab.sqlite3`; inspect it with

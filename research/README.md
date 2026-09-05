@@ -55,11 +55,13 @@ strategy slots over the finite catalog of twelve rule families by default.
 Slot count and worker capacity are independent controls. Each generated
 variant owns an isolated simulated account processed by one bounded worker; no
 capital or P&L is shared between arms.
-Paper runtime selection can then use `selection_mode: all_proved`, which keeps
-one strongest proven variant per verified frozen prior-cycle dependence cluster
-under one global risk book. Families without a verified cluster assignment use
-the held-out correlation-safe fallback; symbol breadth is not an independence
-license.
+The shipped paper runtime defaults to `selection_mode: specific` with
+`variant_id: auto`, which resolves exactly one globally strongest validated or
+champion variant after the evidence gate. `selection_mode: all_proved` remains
+an explicit paper option: it keeps one strongest proven variant per verified
+frozen prior-cycle dependence cluster under one global risk book. Families
+without a verified cluster assignment use the held-out correlation-safe
+fallback; symbol breadth is not an independence license.
 
 Historical `deploy/backfill.py` partitions retain the recorder schema but carry
 `source_mode: historical_backfill` and exact Alpaca session open/close metadata,
@@ -209,6 +211,16 @@ shipped defaults are 4 bps spread, 6 bps adverse slippage, 0.5 bps per-side
 notional fee, and a 0.65 currency-unit option fee per contract per side. These
 are expected costs, not rejection caps.
 
+For equity, an explicitly enabled `costs.measured_quote` block supplies a
+frozen per-symbol, per-half-hour spread/depth schedule. Configuration verifies
+and embeds the declared schedule hash and binds its feed, provider, percentile,
+depth percentile, quote-count floor, and strict coverage policy into candidate
+identity. Candidate, root control, randomized null, sealed qualification, and
+live-shadow paths all resolve entry and exit costs from that same schedule; a
+missing or under-covered cell aborts the lane instead of falling back to a
+broader average. The checked-in block remains disabled until an operator fits
+and freezes a schedule from the corpus actually being proved.
+
 Every proof also persists the preregistered all-in stress scenarios of 9, 15,
 25, and 50 bps. The 25 bps scenario is the authorization requirement; the
 other scenarios remain diagnostics. A stress result that is missing, negative,
@@ -220,6 +232,11 @@ the stress bps are not per-side bps. The shipped
 `max_stressed_cost_to_risk_ratio` is `0.30`; a 30-bps-floor trade has about
 `0.833` cost-to-risk at the 25-bps stress and is therefore vetoed before any
 option fees.
+For equity geometry, a broker-normalized authored stop below
+`max(30 bps, scenario / max-cost-to-risk ratio)` is refused as
+`stressed_cost_risk_limit` before sizing or fill. The stop is never widened and
+a fixed-R target is never recomputed; explicitly wide authored brackets pass
+unchanged. The floor and binding decision remain in refusal/trade telemetry.
 
 The runtime's stressed-cost risk check abstains before order submission when
 the configured 25 bps scenario (or another preregistered 9/15/50 bps choice)

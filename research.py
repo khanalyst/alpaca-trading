@@ -20,7 +20,8 @@ if str(REPO) not in sys.path:
 
 from research.calibration import json_report as calibration_report
 from research.costs import (CostModel, DEFAULT_FEE_BPS, DEFAULT_SLIPPAGE_BPS,
-                            DEFAULT_SPREAD_BPS, ReplayPolicy, SQLiteQuoteIndex)
+                            DEFAULT_SPREAD_BPS, ReplayPolicy, SQLiteQuoteIndex,
+                            static_cost_config)
 from research.ibr import IBRConfig, replay_ibr, replay_ibr_vehicles
 from research.edge_lab import (EdgeLedger, DEFAULT_DB_PATH, discover,
                                init_ledger)
@@ -947,7 +948,7 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha, max_generations=args.max_generations,
         max_confirmatory_attempts=getattr(args, "max_confirmatory_attempts", 3),
-        costs=CostModel.from_config(runtime_config),
+        costs=CostModel.from_config(static_cost_config(runtime_config)),
         runtime_config=runtime_config,
         diagnostic_only=diagnostic_only,
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"),
@@ -1083,7 +1084,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     if not isinstance(config, dict):
         raise ValueError("--config JSON must be an object")
     with closing(sqlite3.connect(journal)) as db:
-        report = calibration_report(db, CostModel.from_config(config),
+        report = calibration_report(
+            db, CostModel.from_config(static_cost_config(config)),
                                     vehicle=getattr(args, "vehicle", None))
     print(json.dumps(report, sort_keys=True, allow_nan=False))
     # The calibration module owns the authorization result.  Preserve its

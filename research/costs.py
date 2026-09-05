@@ -67,6 +67,31 @@ class CostError(ValueError):
     """Raised for a malformed or internally inconsistent cost model."""
 
 
+def static_cost_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project a runtime config onto the flat :class:`CostModel` schema.
+
+    ``costs.measured_quote`` is a separately validated resolver overlay.  A
+    caller that intentionally needs the static fallback must remove that
+    metadata explicitly instead of teaching ``CostModel.from_config`` to
+    ignore an enabled schedule silently.  The returned mapping is a copy.
+    """
+    source = dict(config or {})
+    raw = source.get(CONFIG_BLOCK)
+    if isinstance(raw, Mapping) and "measured_quote" in raw:
+        source[CONFIG_BLOCK] = {
+            key: value for key, value in raw.items()
+            if key != "measured_quote"
+        }
+    elif "measured_quote" in source:
+        # Compatibility APIs also accept a bare costs block. Preserve that
+        # public shape while removing only the separately validated overlay.
+        source = {
+            key: value for key, value in source.items()
+            if key != "measured_quote"
+        }
+    return source
+
+
 # Stable machine-readable reasons shared by runtime and replay entry checks.
 # Keep the human-facing runtime error separate: it retains the historical
 # wording while telemetry/replay rows can be compared without parsing text.
@@ -1024,6 +1049,7 @@ def cost_model_for_vehicle(costs: Any, vehicle: str) -> CostModel:
     if isinstance(costs, CostModel):
         return costs
     if isinstance(costs, Mapping):
+        costs = static_cost_config(costs)
         # A runtime config or a normalized costs block carries its schedule
         # under ``costs``.  Resolve it through the canonical parser so nested
         # overrides inherit the flat values and execution caps.
@@ -1204,7 +1230,8 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
     if equity_feed not in {"iex", "sip", "delayed_sip"}:
         raise CostError("equity_feed must be iex, sip, or delayed_sip")
     if config is not None and costs is None:
-        costs = CostModel.from_config(config, vehicle=vehicle)
+        costs = CostModel.from_config(
+            static_cost_config(config), vehicle=vehicle)
     model = cost_model_for_vehicle(costs, vehicle)
     coverage = float(min_cost_coverage)
     if not math.isfinite(coverage) or coverage < 0:
@@ -1769,7 +1796,7 @@ def quote_fill_record(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | 
 
 
 __all__ = [
-    "BAR", "CONFIG_BLOCK", "CostError", "CostModel",
+    "BAR", "CONFIG_BLOCK", "CostError", "CostModel", "static_cost_config",
     "ENTRY_SLIPPAGE_INVALID_REASON", "ENTRY_SLIPPAGE_REJECT_REASON",
     "check_entry_slippage", "DEFAULT_FEE_BPS",
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",

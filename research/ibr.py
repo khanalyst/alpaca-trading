@@ -880,17 +880,19 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     stop_floor_binding = False
     stop_geometry_scenario = None
     stop_geometry_activation_reason = "stress_disabled"
-    if (vehicle == "equity" and
-            (cfg.policy.stressed_cost_scenario_bps is not None or
-             cfg.policy.stressed_cost_calibration_enabled) and
-            cfg.policy.max_stressed_cost_to_risk_ratio is not None):
+    stress_geometry_requested = (
+        cfg.policy.stressed_cost_scenario_bps is not None or
+        cfg.policy.max_stressed_cost_to_risk_ratio is not None or
+        cfg.policy.stressed_cost_calibration_enabled)
+    if vehicle == "equity" and stress_geometry_requested:
         stop_geometry_scenario, stop_geometry_activation_reason = (
             cfg.policy.resolve_stress_scenario(
                 symbol, entry_at, vehicle="equity"))
-        if stop_geometry_scenario is None:
+        if (stop_geometry_scenario is None or
+                cfg.policy.max_stressed_cost_to_risk_ratio is None):
             return refuse("stressed_cost_invalid")
         try:
-            distance, stop_floor_bps = effective_stop_distance(
+            effective_distance, stop_floor_bps = effective_stop_distance(
                 anchor, authored_distance,
                 base_floor_bps=MIN_STOP_DISTANCE_BPS,
                 scenario_bps=stop_geometry_scenario,
@@ -899,7 +901,26 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                 minimum_increment=equity_price_increment(anchor))
         except RiskGeometryError:
             return refuse("stressed_cost_invalid")
-        stop_floor_binding = distance > authored_distance + 1e-12
+        # Stressed geometry is an admission veto.  Keep the authored stop and
+        # target intact; widening either would change the strategy being
+        # replayed and could make its bracket appear executable by fiat.
+        stop_floor_binding = effective_distance > authored_distance + 1e-12
+        if stop_floor_binding:
+            return refuse(
+                "stressed_cost_risk_limit",
+                {
+                    "reject_stage": "risk_geometry",
+                    "authored_stop_distance": authored_distance,
+                    "authored_stop_distance_bps": (
+                        authored_distance / anchor * 10_000.0),
+                    "effective_stop_floor_bps": stop_floor_bps,
+                    "stress_floor_binding": True,
+                    "stop_geometry_scenario_bps": stop_geometry_scenario,
+                    "stop_geometry_max_cost_to_risk_ratio": (
+                        cfg.policy.max_stressed_cost_to_risk_ratio),
+                    "stop_geometry_activation_reason": (
+                        stop_geometry_activation_reason),
+                })
     stop = anchor - distance if direction == "long" else anchor + distance
     target = (anchor + target_r * distance if direction == "long"
               else anchor - target_r * distance)

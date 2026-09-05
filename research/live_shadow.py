@@ -40,8 +40,8 @@ from agent.contracts.rule import (
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
 from deploy.recorder import INDEX_NAME as RECORDER_INDEX_NAME, corpus_partitions
-from research.costs import (ReplayPolicy, cost_model_for_vehicle,
-                             replay_policy_for_session)
+from research.costs import ReplayPolicy, replay_policy_for_session
+from research.quote_costs import cost_resolver_setup, reprice_ibr_result
 from research.stressed_cost_calibration import (
     load_stress_calibration_artifact, verify_stress_calibration_artifact,
 )
@@ -2310,6 +2310,11 @@ class ShadowRunner:
             cfg, calendar_close, policy=self._shadow_policy(cfg))
         expected_equity_feed = replay_policy.equity_feed
         candidate_vehicle = str(candidate.get("vehicle") or "equity")
+        # Resolve the candidate's immutable measured/static economics once for
+        # this session.  Every arm below receives the same resolver, while a
+        # tampered/foreign/sparse schedule raises and leaves the session
+        # incomplete rather than silently switching economics.
+        cost_setup = cost_resolver_setup(cfg, vehicle=candidate_vehicle)
         feed_mismatches = [
             {"kind": kind,
              "symbol": str(row.get("symbol") or ""),
@@ -2351,6 +2356,10 @@ class ShadowRunner:
                                    "session_close": (calendar_close.isoformat()
                                                      if calendar_close else None),
                                    "calendar_source": calendar_source,
+                                   "cost_model_provenance": cost_setup.model.provenance,
+                                   "measured_quote": (
+                                       dict(cost_setup.measured)
+                                       if cost_setup.measured is not None else None),
                                    "shadow_signatures": shadow_signatures,
                                    "stress_calibration": self._stress_telemetry(
                                        replay_policy,
@@ -2390,6 +2399,9 @@ class ShadowRunner:
                                     vehicle=candidate_vehicle,
                                     option_snapshots=option_index,
                                     quotes=normalized_quotes)
+                result = reprice_ibr_result(
+                    result, resolver=cost_setup.resolver,
+                    vehicle=candidate_vehicle)
                 trades = [_plain(trade) for trade in result.trades]
                 evidence_rows = _opportunity_rows(
                     result, normalized_bars, candidate_vehicle)
@@ -2419,7 +2431,8 @@ class ShadowRunner:
                             str(candidate.get("vehicle") or "equity"),
                             policy=replay_cfg.policy),
                         account_id=f"shadow:null:{candidate_id}:{session}",
-                        starting_cash=float(self.config.equity), costs=replay_cfg.costs,
+                        starting_cash=float(self.config.equity), costs=cost_setup.model,
+                        cost_resolver=cost_setup.resolver,
                         quotes=normalized_quotes, fixed_quantity=replay_cfg.quantity,
                         policy=_policy(cfg))
                     null_rows = list(null_account.get("rows") or [])
@@ -2442,7 +2455,7 @@ class ShadowRunner:
                     account_id=f"shadow:{candidate_id}:{session}",
                     starting_cash=float(self.config.equity),
                     risk_pct=float((cfg.get("risk") or {}).get("risk_per_trade_pct", .5)),
-                    costs=cost_model_for_vehicle(cfg, candidate_vehicle),
+                    costs=cost_setup.model, cost_resolver=cost_setup.resolver,
                     quotes=normalized_quotes, policy=policy)
                 rows = list(account.get("rows") or [])
                 evidence_rows = rows
@@ -2487,7 +2500,8 @@ class ShadowRunner:
                         account_id=f"shadow:null:{candidate_id}:{session}",
                         starting_cash=float(self.config.equity),
                         risk_pct=float((cfg.get("risk") or {}).get("risk_per_trade_pct", .5)),
-                        costs=cost_model_for_vehicle(cfg, candidate_vehicle),
+                        costs=cost_setup.model,
+                        cost_resolver=cost_setup.resolver,
                         quotes=normalized_quotes,
                         policy=policy)
                     null_rows = list(null_account.get("rows") or [])

@@ -94,6 +94,25 @@ class ResearchStatisticsTests(unittest.TestCase):
         self.assertEqual(report["clusters"], 1)
         self.assertEqual(report["observations"], 2)
 
+    def test_full_series_block_is_unavailable_not_a_point_confidence_bound(self):
+        # With one block covering the entire circular series, every replicate
+        # contains each cluster exactly once and the old implementation
+        # returned the observed mean as both confidence quantiles.
+        for cluster_count in range(2, 6):
+            with self.subTest(cluster_count=cluster_count):
+                report = moving_block_cluster_bootstrap_lower_bound(
+                    [float(index + 1) for index in range(cluster_count)],
+                    list(range(cluster_count)), draws=50, block_length=5,
+                    seed=5)
+                self.assertFalse(report["available"])
+                self.assertEqual(report["reason"],
+                                 "block_length_ge_cluster_count")
+                self.assertIsNone(report["lower_bound"])
+                self.assertIsNone(report["upper_bound"])
+                self.assertNotIn("replicate_min", report)
+                self.assertNotIn("replicate_max", report)
+                self.assertEqual(report["block_length"], 5)
+
     def test_effective_breadth_perfect_correlation_is_one(self):
         rows = []
         for session in range(8):

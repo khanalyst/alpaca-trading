@@ -492,9 +492,9 @@ class RiskProfileTests(unittest.TestCase):
         decision = {"symbol": "SPY", "direction": "long", "entry_price": 100,
                     "stop_price": 99, "target_price": 102}
         # At this setup the plan is 50 shares / $5,000 notional / $50 risk,
-        # so the 25 bps stress is exactly a 0.25 ratio.  A stricter ratio now
-        # widens the stop before sizing instead of making the grammar's
-        # otherwise-valid 30 bps floor impossible to trade.
+        # so the 25 bps stress is exactly a 0.25 ratio.  A stricter ratio
+        # rejects the authored stop before sizing instead of rewriting the
+        # grammar's geometry.
         for limit, binding in ((0.250001, False), (0.25, False),
                                (0.249999, True)):
             cfg = {"risk": {**self.cfg["risk"],
@@ -503,9 +503,13 @@ class RiskProfileTests(unittest.TestCase):
                    "execution": {}, "costs": {}}
             plan, why = RiskEngine(cfg).vet_open(
                 decision, 10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
+            if binding:
+                self.assertIsNone(plan)
+                self.assertEqual(why, "stressed_cost_risk_limit")
+                continue
             self.assertIsNotNone(plan)
             self.assertIsNone(why)
-            self.assertEqual(plan["stress_floor_binding"], binding)
+            self.assertFalse(plan["stress_floor_binding"])
             self.assertEqual(plan["authored_stop_distance"], 1.0)
             self.assertAlmostEqual(plan["effective_stop_floor_bps"], 25.0 / limit)
             self.assertEqual(plan["stressed_cost_scenario_bps"], 25.0)
@@ -515,14 +519,11 @@ class RiskProfileTests(unittest.TestCase):
             self.assertEqual(plan["stressed_cost_schema"], STRESSED_COST_SCHEMA)
             self.assertEqual(plan["stressed_cost_basis"], STRESSED_COST_BASIS)
             self.assertEqual(plan["stressed_cost_entry_notional"], 5_000.0)
-            if binding:
-                self.assertEqual(plan["stop_price"], 98.99)
-                self.assertEqual(plan["target_price"], 102.02)
-                self.assertAlmostEqual(
-                    (plan["target_price"] - plan["entry_price"]) /
-                    plan["stop_distance"], 2.0)
+            self.assertEqual(plan["stop_price"], 99.0)
+            self.assertEqual(plan["target_price"], 102.0)
+            self.assertEqual(plan["stop_distance"], 1.0)
 
-    def test_stressed_cost_geometry_is_directional_for_short_equity(self):
+    def test_stressed_cost_geometry_rejects_directional_short_equity(self):
         cfg = {"risk": {**self.cfg["risk"],
                          "stressed_cost_scenario_bps": 25,
                          "max_stressed_cost_to_risk_ratio": 0.249999},
@@ -531,13 +532,37 @@ class RiskProfileTests(unittest.TestCase):
             {"symbol": "SPY", "direction": "short", "entry_price": 100,
              "stop_price": 101, "target_price": 98},
             10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
-        self.assertIsNone(why)
-        self.assertTrue(plan["stress_floor_binding"])
-        self.assertEqual(plan["stop_price"], 101.01)
-        self.assertEqual(plan["target_price"], 97.98)
-        self.assertAlmostEqual(
-            (plan["entry_price"] - plan["target_price"]) /
-            plan["stop_distance"], 2.0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "stressed_cost_risk_limit")
+
+    def test_fully_disabled_stress_controls_allow_authored_geometry(self):
+        for risk_cfg in (
+                {},
+                {"stressed_cost_scenario_bps": None,
+                 "max_stressed_cost_to_risk_ratio": None}):
+            with self.subTest(risk_cfg=risk_cfg):
+                risk = RiskEngine({"risk": risk_cfg})
+                plan, why = risk.vet_open(
+                    {"symbol": "SPY", "direction": "long", "entry_price": 100,
+                     "stop_price": 99, "target_price": 102},
+                    10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
+                self.assertIsNone(why)
+                self.assertEqual(plan["stop_price"], 99.0)
+                self.assertEqual(plan["target_price"], 102.0)
+                self.assertEqual(plan["stop_distance"], 1.0)
+                self.assertNotIn("effective_stop_floor_bps", plan)
+
+    def test_partial_stress_controls_fail_closed_before_sizing(self):
+        risk = RiskEngine({"risk": {
+            "stressed_cost_scenario_bps": None,
+            "max_stressed_cost_to_risk_ratio": 1.0,
+        }})
+        plan, why = risk.vet_open(
+            {"symbol": "SPY", "direction": "long", "entry_price": 100,
+             "stop_price": 99, "target_price": 102},
+            10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "stressed_cost_invalid")
 
     def test_stressed_cost_rejects_malformed_or_zero_intended_risk(self):
         decision = {"symbol": "SPY", "direction": "long", "entry_price": 100,

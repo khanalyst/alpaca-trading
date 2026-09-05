@@ -250,7 +250,8 @@ else:
   "mode": "paper",
   "broker": {"paper": true, "allow_live": false},
   "strategy": {
-    "selection_mode": "all_proved",
+    "selection_mode": "specific",
+    "variant_id": "auto",
     "execution_mode": "shares"
   },
   "execution": {"time_in_force": "day"},
@@ -260,6 +261,10 @@ else:
   }
 }
 ```
+
+The shipped paper default resolves exactly one globally strongest
+validated/champion variant after the evidence gate. Use `selection_mode:
+all_proved` only as an explicit opt-in to the multi-edge paper lane.
 
 Two settings are worth understanding now, because they shape how long step 12
 takes:
@@ -950,11 +955,6 @@ over.
 
 See [OPERATIONS.md](OPERATIONS.md) for reconciliation, backup, recovery, and
 incident procedures.
-
-For an existing VM moving from a legacy SIP corpus to the shipped Free Basic
-IEX profile, follow the concise [VM feed migration handoff](VM_MIGRATION.md)
-before restarting services. It preserves broker reconciliation state, archives
-the old proof state, and requires a fresh IEX research/shadow re-proof.
 
 ## 18. Optional guarded live mode
 

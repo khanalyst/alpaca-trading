@@ -30,6 +30,7 @@ from research.costs import (BAR, RESTING_BRACKET, RESTING_BRACKET_FILL_SCHEMA,
                             index_quotes, quote_fill, quote_fill_record,
                             cost_model_for_vehicle, risk_unit_report,
                             resting_bracket_fill_claim,
+                            static_cost_config,
                             validate_resting_bracket_fill,
                             stressed_cost_usd)
 from research.edge_discovery_core import (DiscoveryError,
@@ -247,6 +248,27 @@ class CostModelTests(unittest.TestCase):
                          config["execution"]["max_slippage_bps"])
         self.assertEqual(cost_model_for_vehicle(config["costs"], "option"), option)
         self.assertEqual(equity.spread_bps, 4.0)
+
+    def test_flat_cost_readers_explicitly_project_the_measured_overlay(self):
+        config = validate_config({"costs": {
+            "spread_bps": 2.0,
+            "measured_quote": {
+                "enabled": False, "feed": "iex", "provider": "alpaca",
+            },
+        }})
+        projected = static_cost_config(config)
+        self.assertNotIn("measured_quote", projected["costs"])
+        self.assertIn("measured_quote", config["costs"])
+        self.assertEqual(
+            cost_model_for_vehicle(config, "equity").spread_bps, 2.0)
+        self.assertEqual(
+            cost_model_for_vehicle(config["costs"], "equity").spread_bps,
+            2.0)
+        # The canonical flat parser itself stays strict: callers must make the
+        # fallback boundary visible rather than silently ignoring an enabled
+        # schedule by accident.
+        with self.assertRaisesRegex(CostError, "measured_quote"):
+            CostModel.from_config(config, vehicle="equity")
 
     def test_vehicle_schedule_rejects_unknown_or_malformed_entries(self):
         for costs in (
@@ -719,7 +741,7 @@ class NullControlSharesTheFillModelTests(unittest.TestCase):
     def test_candidate_and_null_share_stressed_cost_geometry(self):
         bars = _bars(RISING + FLAT)
         # Build the null reference without stress so both lanes receive the
-        # same authored geometry before the active policy widens it.
+        # same authored geometry before the active policy vets it.
         reference = simulate_account(
             bars, [], SPEC, vehicle="equity", account_id="reference-stress",
             risk_pct=.05, policy=PERMISSIVE_POLICY)["rows"]
@@ -733,19 +755,18 @@ class NullControlSharesTheFillModelTests(unittest.TestCase):
         null = null_control_account(
             bars, [], SPEC, vehicle="equity", reference_rows=reference,
             account_id="null-stress", risk_pct=.05, policy=stressed)
-        self.assertEqual(candidate["trades"], 1)
-        self.assertEqual(null["trades"], 1)
+        self.assertEqual(candidate["trades"], 0)
+        self.assertEqual(null["trades"], 0)
         candidate_row, null_row = candidate["rows"][0], null["rows"][0]
         for row in (candidate_row, null_row):
+            self.assertEqual(row["reject_reason"], "stressed_cost_risk_limit")
             self.assertTrue(row["stress_floor_binding"])
             self.assertAlmostEqual(row["effective_stop_floor_bps"],
                                    25.0 / .30)
-            self.assertLessEqual(row["stressed_cost_to_risk_ratio"],
-                                 .30 + 1e-12)
         self.assertAlmostEqual(candidate_row["authored_stop_distance"], .3024)
         self.assertAlmostEqual(null_row["authored_stop_distance"], .31)
-        self.assertAlmostEqual(candidate_row["stop_distance"],
-                               null_row["stop_distance"])
+        self.assertNotIn("stop_distance", candidate_row)
+        self.assertNotIn("stop_distance", null_row)
 
 
 class NotionalCapAnchorTests(unittest.TestCase):

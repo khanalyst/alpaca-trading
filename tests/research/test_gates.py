@@ -285,6 +285,48 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertEqual(adequacy["control_count"], 3)
         self.assertTrue(adequacy["adequate"])
 
+    def test_confidence_gate_rejects_full_series_block_as_available(self):
+        # The default serial block is five sessions.  A five-session window
+        # therefore cannot produce a non-degenerate moving-block confidence
+        # distribution; the raw paired p-value remains descriptive evidence,
+        # but its confidence bound must be unavailable.
+        candidate = _rows(5, net=2.0)
+        baseline = [{**row, "net_pnl": 0.0} for row in candidate]
+        control = matched_cluster_test(candidate, baseline, vehicle="equity")
+        self.assertTrue(control["available"])
+        self.assertFalse(control["lower_bound"]["available"])
+        self.assertEqual(control["lower_bound"]["block_length"], 5)
+        self.assertEqual(control["lower_bound"]["clusters"], 5)
+        self.assertEqual(control["lower_bound"]["reason"],
+                         "block_length_ge_cluster_count")
+        self.assertIsNone(control["mean_delta_lcb"])
+        self.assertEqual(control["r_lower_bound"]["block_length"], 5)
+        self.assertEqual(control["r_lower_bound"]["reason"],
+                         "no_finite_observations")
+
+        qualification = qualification_report(
+            candidate, baseline, vehicle="equity",
+            sessions=[row["session_date"] for row in candidate],
+            min_trades=1, min_sessions=1, min_clusters=1,
+            max_drawdown=100.0)
+        self.assertTrue(qualification["available"])
+        self.assertTrue(qualification["adequate"])
+        self.assertFalse(qualification["delta_bootstrap"]["available"])
+        self.assertEqual(qualification["delta_bootstrap"]["block_length"], 5)
+        self.assertEqual(qualification["delta_bootstrap"]["reason"],
+                         "block_length_ge_cluster_count")
+        self.assertIsNone(qualification["delta_lcb"])
+        self.assertFalse(qualification["confidence_supported"])
+
+        envelope = verified_gate_envelope(
+            lane="backtest", vehicle="equity", fit=[], heldout=candidate,
+            heldout_baseline=baseline, fit_floor={}, heldout_floor={},
+            control=control, p_value=control["p_value"], q_value=1.0,
+            alpha=.05, falsification={}, separation={}, checks={},
+            passes=False, qualification=qualification)
+        self.assertFalse(envelope["checks"]["heldout_delta_lcb_positive"])
+        self.assertFalse(envelope["checks"]["qualification_confidence_supported"])
+
     def test_chronological_split_never_bisects_a_trading_session(self):
         rows = [
             {"session_date": "2024-01-02", "opportunity_id": f"a-{index}"}

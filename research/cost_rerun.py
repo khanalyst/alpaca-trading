@@ -35,7 +35,8 @@ from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, rule_variant_id,
                                   validate_rule_spec)
 from .cost_counterfactual import (_code_bundle_files, _code_bundle_hash,
                                   _cost_decomposition, load_frozen_specs)
-from .costs import CostModel, ReplayPolicy, diagnostic_backfill_policy
+from .costs import (CostModel, ReplayPolicy, diagnostic_backfill_policy,
+                    static_cost_config)
 from .edge_ledger import content_hash
 from .edge_discovery_core import _read_discovery_rows
 from .factory_core import (DEFAULT_VARIANTS, FAMILY_TEMPLATES,
@@ -513,7 +514,8 @@ def run_cost_rerun(
             corpus, runtime_config=runtime_config,
             min_quotes_per_cell=min_quotes_per_cell)
     policy = diagnostic_backfill_policy(policy_source)
-    configured = CostModel.from_config(runtime_config, vehicle=vehicle)
+    configured = CostModel.from_config(
+        static_cost_config(runtime_config), vehicle=vehicle)
     measured = cost_model_from_schedule(schedule, percentile=percentile)
     measured_resolver = measured_cost_resolver(
         schedule, percentile=percentile, vehicle=vehicle)

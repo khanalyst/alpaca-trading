@@ -551,7 +551,7 @@ def _promotions(config: dict, edge_path: Path) -> dict:
     """What the operator pinned, and whether each pin can actually trade."""
     strategy = config.get("strategy") if isinstance(config, dict) else {}
     entries = (strategy or {}).get("pinned") or []
-    mode = str((strategy or {}).get("selection_mode") or "all_proved")
+    mode = str((strategy or {}).get("selection_mode") or "specific")
     unresolved: list[dict] = []
     if entries:
         try:

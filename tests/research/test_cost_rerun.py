@@ -183,21 +183,21 @@ class CostRerunTests(unittest.TestCase):
         self.assertEqual(gate["effective_min_stop_bps"],
                          gate["implied_min_stop_bps"])
 
-    def test_a_tight_stop_cohort_is_widened_and_attributable(self):
-        """The reconciled policy widens tight equity stops before sizing."""
+    def test_a_tight_stop_cohort_is_vetoed_and_attributable(self):
+        """The reconciled policy vetoes tight equity stops before sizing."""
         tight = [validate_rule_spec({**spec, "stop_atr": 1.0,
                                      "target_r": 10.0})
                  for spec in deterministic_cohort()][:2]
         report = run_cost_rerun(edge_corpus(25), runtime_config=self.config,
                                 specs=tight, min_quotes_per_cell=50)
-        widened = [item for item in report["results"]
-                   if item["measured"]["stress_floor_bindings"] > 0]
-        self.assertTrue(widened)
-        for item in widened:
-            self.assertGreater(item["measured"]["trades"], 0)
-            self.assertEqual(item["measured"]["stressed_cost_rejections"], 0)
-        self.assertIn("stops were widened to the effective policy floor",
-                      render_text(report))
+        gated = [item for item in report["results"]
+                 if item["measured"]["stressed_cost_rejections"] > 0]
+        self.assertTrue(gated)
+        for item in gated:
+            self.assertEqual(item["measured"]["trades"], 0)
+        self.assertIn(
+            "no trades because every opportunity was refused by the "
+            "stressed-cost gate", render_text(report))
 
     def test_variants_are_labelled_by_what_they_changed(self):
         labels = {item["label"] for item in self.report["results"]}

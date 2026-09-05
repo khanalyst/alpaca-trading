@@ -399,6 +399,10 @@ def moving_block_cluster_bootstrap_lower_bound(
     Fewer than ``min_clusters`` independent clusters are reported as
     unavailable.  This is deliberately conservative: one cluster cannot
     identify a sampling distribution, even when it contains many observations.
+    The block length must also be strictly shorter than the chronological
+    cluster series.  A block that spans the whole series (or more) produces a
+    single circular rotation of every cluster, so all bootstrap means are the
+    observed point estimate rather than a confidence distribution.
     All result metadata (including the resolved seed and requested draw count)
     is returned so persisted evidence can be recomputed exactly.  The optional
     ``include_replicates`` flag exposes the sorted bootstrap means for
@@ -463,6 +467,8 @@ def moving_block_cluster_bootstrap_lower_bound(
         return {**common, "reason": "no_finite_observations"}
     if cluster_count < minimum:
         return {**common, "reason": "insufficient_clusters"}
+    if length >= cluster_count:
+        return {**common, "reason": "block_length_ge_cluster_count"}
 
     # The moving-block bootstrap has one circular block for every possible
     # starting cluster.  Truncate a concatenation of ceil(n/L) blocks to n

@@ -342,26 +342,33 @@ def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
               entry_timestamp: datetime | None = None,
               stage: str = "pricing",
               signal_opportunity: bool = True,
-              detail: Mapping[str, Any] | None = None) -> dict:
+              detail: Mapping[str, Any] | None = None,
+              telemetry: Mapping[str, Any] | None = None) -> dict:
     """Mark a real signal that has no honest fill price.
 
     Returning ``None`` here would make the observation indistinguishable from a
     session that never signalled, which deletes exactly the trades whose
     contract stopped being quoted — the least random subset there is.
     """
-    return {"unpriced_reason": reason, "direction": direction, "contract": contract,
-            "execution_disposition": "refused",
-            "signal_opportunity": bool(signal_opportunity),
-            "reject_stage": str(stage),
-            "reject_detail": dict(detail or {}),
-            "session_date": day.isoformat(),
-            "signal_bar_feed": signal_bar.feed,
-            "signal_bar_provider": signal_bar.provider,
-            "entry_bar_feed": entry_bar.feed,
-            "entry_bar_provider": entry_bar.provider,
-            "signal_timestamp": signal_bar.end.isoformat(),
-            "decision_timestamp": ((decision_timestamp or signal_bar.end).isoformat()),
-            "entry_timestamp": ((entry_timestamp or entry_bar.timestamp).isoformat())}
+    result = {
+        "unpriced_reason": reason, "direction": direction,
+        "contract": contract, "execution_disposition": "refused",
+        "signal_opportunity": bool(signal_opportunity),
+        "reject_stage": str(stage), "reject_detail": dict(detail or {}),
+        "session_date": day.isoformat(),
+        "signal_bar_feed": signal_bar.feed,
+        "signal_bar_provider": signal_bar.provider,
+        "entry_bar_feed": entry_bar.feed,
+        "entry_bar_provider": entry_bar.provider,
+        "signal_timestamp": signal_bar.end.isoformat(),
+        "decision_timestamp": (
+            (decision_timestamp or signal_bar.end).isoformat()),
+        "entry_timestamp": (
+            (entry_timestamp or entry_bar.timestamp).isoformat()),
+    }
+    if telemetry:
+        result.update(dict(telemetry))
+    return result
 
 
 def _no_signal(session_bars: Sequence[UnderlyingBar], *,
@@ -747,14 +754,16 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     "broker_tick_geometry_invalid", stage="risk_geometry",
                     decision_timestamp=signal_ready,
                     entry_timestamp=entry_at)
-        if (vehicle == "equity" and
-                (resolved_policy.stressed_cost_scenario_bps is not None or
-                 resolved_policy.stressed_cost_calibration_enabled) and
-                resolved_policy.max_stressed_cost_to_risk_ratio is not None):
+        stress_geometry_requested = (
+            resolved_policy.stressed_cost_scenario_bps is not None or
+            resolved_policy.max_stressed_cost_to_risk_ratio is not None or
+            resolved_policy.stressed_cost_calibration_enabled)
+        if vehicle == "equity" and stress_geometry_requested:
             stop_geometry_scenario, stop_geometry_activation_reason = (
                 resolved_policy.resolve_stress_scenario(
                     signal_bar.symbol, entry_at, vehicle="equity"))
-            if stop_geometry_scenario is None:
+            if (stop_geometry_scenario is None or
+                    resolved_policy.max_stressed_cost_to_risk_ratio is None):
                 return _unpriced(
                     signal_bar, entry_bar, signal_bar.session_date, direction,
                     "stressed_cost_invalid", stage="risk_geometry",
@@ -762,7 +771,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     entry_timestamp=entry_at)
             try:
                 broker_normalized_distance = distance
-                distance, stop_floor_bps = effective_stop_distance(
+                effective_distance, stop_floor_bps = effective_stop_distance(
                     entry_ref, distance,
                     base_floor_bps=MIN_STOP_DISTANCE_BPS,
                     scenario_bps=stop_geometry_scenario,
@@ -775,17 +784,29 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     "stressed_cost_invalid", stage="risk_geometry",
                     decision_timestamp=signal_ready,
                     entry_timestamp=entry_at)
-            # Binding is about the stressed floor widening the already
-            # quote-anchored broker distance, not about an entry gap making
-            # that distance larger than the authored signal distance.
-            stop_floor_binding = distance > broker_normalized_distance + 1e-12
+            # Stressed geometry is an admission veto.  The floor calculation
+            # is intentionally never copied back into ``distance`` or used to
+            # rebuild either authored bracket leg: widening a stop changes the
+            # strategy's risk and target semantics.
+            stop_floor_binding = effective_distance > broker_normalized_distance + 1e-12
             if stop_floor_binding:
-                stop = (entry_ref - distance if direction == "long" else
-                        entry_ref + distance)
-                if str(spec.get("target_mode") or "fixed_r") == "fixed_r":
-                    target = (entry_ref + distance * float(spec["target_r"])
-                              if direction == "long" else
-                              entry_ref - distance * float(spec["target_r"]))
+                geometry_telemetry = {
+                    "authored_stop_distance": authored_distance,
+                    "authored_stop_distance_bps": (
+                        authored_distance / plan_entry * 10_000.0),
+                    "effective_stop_floor_bps": stop_floor_bps,
+                    "stress_floor_binding": True,
+                    "stop_geometry_scenario_bps": stop_geometry_scenario,
+                    "stop_geometry_max_cost_to_risk_ratio": (
+                        resolved_policy.max_stressed_cost_to_risk_ratio),
+                    "stop_geometry_activation_reason": (
+                        stop_geometry_activation_reason),
+                }
+                return _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date, direction,
+                    "stressed_cost_risk_limit", stage="risk_geometry",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at, telemetry=geometry_telemetry)
             if (not math.isfinite(stop) or stop <= 0 or
                     not math.isfinite(target) or target <= 0 or
                     (direction == "long" and not (stop < entry_ref < target)) or
