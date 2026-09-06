@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from research.costs import CostModel
-from research.edge_lab import _read_discovery_rows
+from research.edge_lab import EdgeLedger, _read_discovery_rows
 from research.factory_core import simulate_account, template_hypothesis
 from research.strategy_factory import run_factory
 
@@ -50,6 +50,7 @@ FIRST_COORDINATE_VARIANT = rule_variant_id(FIRST_COORDINATE_SPEC)
 # slippage is the configured execution cap; it makes the narrow 2.5R edge
 # unprofitable while the normal schedule remains positive.
 WORSE_COSTS = CostModel(spread_bps=0.0, slippage_bps=50.0, fee_bps=1.0)
+TEST_RUNTIME_CONFIG = {"broker": {"provider": "test", "data_feed": "iex"}}
 
 
 def _wobble(symbol: str, day: int) -> float:
@@ -163,6 +164,7 @@ class EarnedGatePassTests(unittest.TestCase):
         # replayed from these bars through the shared cost model.
         cls.result = run_factory(cls.corpus, db_path=cls.db, strategies=1,
                                  variants_per_strategy=2, workers=1,
+                                 runtime_config=TEST_RUNTIME_CONFIG,
                                  # The same corpus is replayed in the strict
                                  # shadow lane below, whose protocol floor is
                                  # 150 trades; keeping that floor in the
@@ -226,6 +228,13 @@ class EarnedGatePassTests(unittest.TestCase):
         self.assertEqual(self._by_variant(self.result)[ROOT_VARIANT]["status"],
                          "backtest_passed")
 
+    def test_verified_run_persists_the_factory_learning_epoch(self):
+        winner = self._by_variant(self.result)[ROOT_VARIANT]
+        runs = EdgeLedger(self.db).runs(winner["candidate_id"], lane="backtest")
+        self.assertTrue(runs)
+        self.assertEqual(runs[-1]["metrics"]["learning_epoch"],
+                         self.result["learning_epoch"])
+
     def test_the_lifecycle_reaches_validated_and_a_champion(self):
         # A backtest pass is not runtime eligibility.  A second cycle over
         # strictly later, never-simulated sessions must carry the same variant
@@ -235,7 +244,8 @@ class EarnedGatePassTests(unittest.TestCase):
             result = run_factory(edge_corpus(SESSIONS, skip=SESSIONS),
                                  db_path=Path(forward) / "edge.sqlite3",
                                  strategies=1, variants_per_strategy=2,
-                                 workers=1, min_trades=150)
+                                 workers=1, min_trades=150,
+                                 runtime_config=TEST_RUNTIME_CONFIG)
         rows = self._by_variant(result)
         self.assertEqual(list(rows), [ROOT_VARIANT])
         self.assertEqual(rows[ROOT_VARIANT]["mode"], "shadow")
@@ -255,7 +265,8 @@ class EarnedGatePassTests(unittest.TestCase):
             result = run_factory(self.corpus,
                                  db_path=Path(directory) / "edge.sqlite3",
                                  strategies=1, variants_per_strategy=2,
-                                 workers=1, costs=WORSE_COSTS, min_trades=150)
+                                 workers=1, costs=WORSE_COSTS, min_trades=150,
+                                 runtime_config=TEST_RUNTIME_CONFIG)
         self.assertEqual(result["status"], "complete")
         self.assertEqual([row["variant_id"] for row in result["results"]
                           if row["gate"]["passes"]], [])

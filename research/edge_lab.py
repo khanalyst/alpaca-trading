@@ -106,7 +106,8 @@ def _classification(gate: Mapping) -> str:
 
 
 def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str,
-                     equity_feed: str = "iex") -> dict:
+                     equity_feed: str = "iex",
+                     equity_provider: str | None = "alpaca") -> dict:
     """Add absolute profitability, lower-bound and walk-forward requirements.
 
     Beating a control is necessary but not sufficient: an accepted variant
@@ -118,16 +119,18 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str,
     base_heldout = [row for row in baseline
                     if str(row.get("session_date") or "") in sessions]
     absolute = performance_floor(
-        heldout, vehicle=vehicle, equity_feed=equity_feed)
+        heldout, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     minimums = (gate.get("heldout_floor") or {}).get("minimums") or {}
     folds = 3
     walk = walk_forward_report(
         heldout, base_heldout, vehicle=vehicle, folds=folds,
         min_test_sessions=max(1, int(minimums.get("sessions", 1)) // folds),
         min_test_trades=max(1, int(minimums.get("trades", 1)) // (folds * 2)),
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     rejection = expectancy_rejection_report(
-        heldout, vehicle=vehicle, equity_feed=equity_feed)
+        heldout, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     negative_folds = [item for item in walk.get("results", ())
                       if item.get("adequate") and
                       float(item.get("net_pnl", 0.0)) <= 0.0]
@@ -240,12 +243,11 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         raise DiscoveryError("alpha must be finite and in (0,1]")
     # Discovery is an authorizing boundary: preserve each equity row's own
     # provider/feed identity and require the configured IEX feed.
-    broker = (config or {}).get("broker") if isinstance(config, Mapping) else {}
-    configured_feed = ((broker or {}).get("data_feed", "iex")
-                       if isinstance(broker, Mapping) else "iex")
+    source_policy = ReplayPolicy.from_config(config)
     raw_rows, bars, snapshots, quotes = _read_discovery_rows(
         data, require_provenance=True,
-        expected_equity_feed=str(configured_feed or "iex"))
+        expected_equity_feed=source_policy.equity_feed,
+        expected_provider=source_policy.equity_provider)
     data_hash = content_hash(raw_rows)
     if str(source_report.get("content_hash")) != data_hash:
         if callable(getattr(quotes, "close", None)):
@@ -306,7 +308,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     effective_configs: dict[str, dict] = {}
     run_configs: dict[str, dict] = {}
     configs: dict[str, object] = {}
-    runtime_policy = ReplayPolicy.from_config(config)
+    runtime_policy = source_policy
     cost_setup = cost_resolver_setup(config, vehicle=vehicle)
     for variant in selected:
         cfg, effective = _effective_ibr_config(
@@ -392,7 +394,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             rows, control, vehicle=vehicle,
             sessions=sorted({str(row.get("session_date") or "") for row in rows}),
             candidate_id=candidate_id, preselected=preselected,
-            equity_feed=runtime_policy.equity_feed)
+            equity_feed=runtime_policy.equity_feed,
+            equity_provider=runtime_policy.equity_provider)
 
     modes: dict[str, str] = {}
     eval_rows: dict[str, list[dict]] = {}
@@ -537,9 +540,11 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 shadow=(mode == "shadow"),
                 null_rows=null_results[variant.variant_id],
                 qualification=window_reports[variant.variant_id],
-                equity_feed=runtime_policy.equity_feed),
+                equity_feed=runtime_policy.equity_feed,
+                equity_provider=runtime_policy.equity_provider),
             candidate_baseline, vehicle=vehicle,
-            equity_feed=runtime_policy.equity_feed)
+            equity_feed=runtime_policy.equity_feed,
+            equity_provider=runtime_policy.equity_provider)
     correction_values = {
         variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()
     }
@@ -651,7 +656,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 code=code_path, provenance=run_provenance),
             candidate_id=variant.variant_id,
             costs=configs[variant.variant_id].costs,
-            equity_feed=mode_policies[variant.variant_id].equity_feed)
+            measured_costs=cost_setup.measured,
+            equity_feed=mode_policies[variant.variant_id].equity_feed,
+            equity_provider=mode_policies[variant.variant_id].equity_provider)
     forward_success = any(
         modes[variant.variant_id] == "shadow" and
         gates.get(variant.variant_id, {}).get("passes", False)
@@ -680,9 +687,11 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             control_kind="synthetic_zero_reference",
             null_rows=null_results[baseline_variant.variant_id],
             qualification=baseline_window,
-            equity_feed=runtime_policy.equity_feed),
+            equity_feed=runtime_policy.equity_feed,
+            equity_provider=runtime_policy.equity_provider),
         baseline_zero, vehicle=vehicle,
-        equity_feed=runtime_policy.equity_feed)
+        equity_feed=runtime_policy.equity_feed,
+        equity_provider=runtime_policy.equity_provider)
     _finalize_gate(
         baseline_gate, lane=baseline_mode,
         family={"p": baseline_gate["candidate_p_raw"],
@@ -712,7 +721,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                         "selected_test_id": selected_test_id}),
         candidate_id=baseline_variant.variant_id,
         costs=configs[baseline_variant.variant_id].costs,
-        equity_feed=mode_policies[baseline_variant.variant_id].equity_feed)
+        measured_costs=cost_setup.measured,
+        equity_feed=mode_policies[baseline_variant.variant_id].equity_feed,
+        equity_provider=mode_policies[baseline_variant.variant_id].equity_provider)
     baseline_run = None
     # A control arm is never post-selection qualified, so its reusable
     # development run must not be labelled underpowered merely because the

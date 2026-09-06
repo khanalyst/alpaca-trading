@@ -56,6 +56,33 @@ class CandidateIdentityTests(unittest.TestCase):
                   "config": sip, "config_hash": content_hash(sip)}
         self.assertFalse(_runtime_identity_matches(record, iex_runtime))
 
+    def test_broker_provider_is_part_of_candidate_identity_and_runtime_match(self):
+        base = {
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                         "execution_mode": "shares"},
+            "research": {"enabled": False},
+        }
+        alpaca_runtime = validate_config({
+            **base, "broker": {"provider": "alpaca"},
+        })
+        foreign_runtime = validate_config({
+            **base, "broker": {"provider": "foreign"},
+        })
+        alpaca = candidate_assumptions(
+            alpaca_runtime, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        foreign = candidate_assumptions(
+            foreign_runtime, vehicle="equity", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        self.assertEqual(alpaca["broker"]["provider"], "alpaca")
+        self.assertEqual(foreign["broker"]["provider"], "foreign")
+        self.assertNotEqual(content_hash(alpaca), content_hash(foreign))
+        record = {"status": "validated", "strategy_id": "ibr",
+                  "vehicle": "equity", "variant_id": "ibr.baseline",
+                  "config": alpaca, "config_hash": content_hash(alpaca)}
+        self.assertTrue(_runtime_identity_matches(record, alpaca_runtime))
+        self.assertFalse(_runtime_identity_matches(record, foreign_runtime))
+
     def test_factory_rule_identity_carries_explicit_model_and_is_lane_stable(self):
         model = CostModel(spread_bps=4, slippage_bps=6, fee_bps=.5,
                           provenance="test-calibration")

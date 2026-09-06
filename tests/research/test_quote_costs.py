@@ -7,7 +7,7 @@ cannot be verified is just a second assumption.
 """
 
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import tempfile
@@ -19,10 +19,13 @@ from research.costs import CostError
 from research.edge_discovery_core import _effective_ibr_config
 from research.edge_identity import candidate_assumptions
 from research.edge_ledger import content_hash
-from research.quote_costs import (QUOTE_COST_SCHEMA, QuoteCostError,
-                                  bucket_label, cost_model_from_schedule,
+from research.ibr import IBRResult, IBRTrade
+from research.quote_costs import (BUCKET_MINUTES, QUOTE_COST_SCHEMA,
+                                  QuoteCostError, bucket_label,
+                                  cost_model_from_schedule,
                                   cost_resolver_setup, measure_quote_costs,
                                   measured_cost_resolver,
+                                  reprice_ibr_result,
                                   schedule_costs_block,
                                   validate_measured_quote_config)
 
@@ -127,6 +130,98 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(entry["buckets"], {})
         self.assertGreater(entry["sparse_buckets"], 0)
 
+    def test_missing_sizes_preserve_spread_but_fail_positive_size_pricing(self):
+        rows = _quotes("SPY", spread_bps=1.0, minutes=30, sessions=2)
+        for row in rows:
+            row.pop("bid_size")
+            row.pop("ask_size")
+        schedule = measure_quote_costs(rows, min_quotes_per_cell=1)
+        entry = schedule["symbols"]["SPY"]
+        self.assertEqual(entry["spread_quote_count"], 60)
+        self.assertEqual(entry["depth_quote_count"], 0)
+        self.assertEqual(schedule["measured"]["depth_rows_used"], 0)
+        for order_shares in (None, 0, -1):
+            with self.subTest(order_shares=order_shares):
+                model = cost_model_from_schedule(
+                    schedule, symbol="SPY", order_shares=order_shares)
+                self.assertEqual(model.slippage_bps, 0.0)
+        with self.assertRaisesRegex(QuoteCostError, "under-covered depth"):
+            cost_model_from_schedule(schedule, symbol="SPY", order_shares=1)
+
+    def test_zero_sizes_are_not_depth_observations(self):
+        rows = _quotes("SPY", spread_bps=1.0, minutes=30, sessions=2)
+        for row in rows:
+            row["bid_size"] = 0
+            row["ask_size"] = 0
+        schedule = measure_quote_costs(rows, min_quotes_per_cell=1)
+        entry = schedule["symbols"]["SPY"]
+        self.assertEqual(entry["spread_bps"]["count"], 60)
+        self.assertEqual(entry["touch_shares"]["count"], 0)
+        with self.assertRaisesRegex(QuoteCostError, "under-covered depth"):
+            cost_model_from_schedule(schedule, symbol="SPY", order_shares=10)
+
+    def test_one_sided_sizes_are_not_depth_observations(self):
+        rows = _quotes("SPY", spread_bps=1.0, minutes=30, sessions=2)
+        for row in rows:
+            row["ask_size"] = None
+        schedule = measure_quote_costs(rows, min_quotes_per_cell=1)
+        entry = schedule["symbols"]["SPY"]
+        self.assertEqual(entry["spread_quote_count"], 60)
+        self.assertEqual(entry["depth_quote_count"], 0)
+        with self.assertRaisesRegex(QuoteCostError, "under-covered depth"):
+            cost_model_from_schedule(schedule, symbol="SPY", order_shares=10)
+
+    def test_minority_depth_does_not_satisfy_cell_coverage(self):
+        rows = _quotes("SPY", spread_bps=1.0, minutes=30, sessions=20)
+        for row in rows[10:]:
+            row["bid_size"] = None
+            row["ask_size"] = None
+        schedule = measure_quote_costs(rows, min_quotes_per_cell=500)
+        bucket = schedule["symbols"]["SPY"]["buckets"]["m000_030"]
+        self.assertEqual(bucket["spread_quote_count"], 600)
+        self.assertEqual(bucket["depth_quote_count"], 10)
+        # Spread-only measurement remains usable from this well-covered cell.
+        self.assertGreater(
+            cost_model_from_schedule(schedule, symbol="SPY",
+                                     bucket="m000_030").spread_bps, 0)
+        with self.assertRaisesRegex(QuoteCostError, "under-covered depth"):
+            cost_model_from_schedule(schedule, symbol="SPY",
+                                     bucket="m000_030", order_shares=10)
+
+    def test_required_coverage_metadata_and_bucket_resolution_are_immutable(self):
+        for field, value, message in (
+                ("min_quotes_per_cell", None, "min_quotes_per_cell"),
+                ("bucket_minutes", BUCKET_MINUTES + 1, "bucket_minutes")):
+            with self.subTest(field=field):
+                tampered = deepcopy(
+                    measure_quote_costs(
+                        _quotes("SPY", spread_bps=1.0, minutes=30,
+                                sessions=2), min_quotes_per_cell=1))
+                if value is None:
+                    tampered["measured"].pop(field)
+                else:
+                    tampered["measured"][field] = value
+                body = dict(tampered)
+                body.pop("schedule_hash", None)
+                tampered["schedule_hash"] = content_hash(body)
+                with self.assertRaisesRegex(QuoteCostError, message):
+                    cost_model_from_schedule(tampered, symbol="SPY")
+
+    def test_tampered_depth_count_cannot_exceed_spread_coverage(self):
+        tampered = deepcopy(
+            measure_quote_costs(
+                _quotes("SPY", spread_bps=1.0, minutes=30, sessions=2),
+                min_quotes_per_cell=1))
+        entry = tampered["symbols"]["SPY"]
+        impossible = entry["spread_quote_count"] + 1
+        entry["depth_quote_count"] = impossible
+        entry["touch_shares"]["count"] = impossible
+        body = dict(tampered)
+        body.pop("schedule_hash", None)
+        tampered["schedule_hash"] = content_hash(body)
+        with self.assertRaisesRegex(QuoteCostError, "invalid depth coverage"):
+            cost_model_from_schedule(tampered, symbol="SPY", order_shares=1)
+
     def test_a_requested_sparse_bucket_fails_closed_instead_of_using_symbol_aggregate(self):
         schedule = measure_quote_costs(
             _quotes("SPY", spread_bps=1.0, minutes=30, sessions=20) +
@@ -163,8 +258,8 @@ class MeasurementTests(unittest.TestCase):
 class CostModelConstructionTests(unittest.TestCase):
     def setUp(self):
         self.schedule = measure_quote_costs(
-            _quotes("SPY", spread_bps=0.18, size=2_000.0) +
-            _quotes("XLE", spread_bps=1.1, size=600.0))
+            _quotes("SPY", spread_bps=0.18, size=2_000.0, sessions=5) +
+            _quotes("XLE", spread_bps=1.1, size=600.0, sessions=5))
 
     def test_a_model_built_from_the_schedule_carries_traceable_provenance(self):
         model = cost_model_from_schedule(self.schedule, symbol="SPY")
@@ -255,7 +350,7 @@ class MeasuredConfigIntegrationTests(unittest.TestCase):
 
     def _config(self, measured=None):
         return validate_config({
-            "broker": {"data_feed": "iex"},
+            "broker": {"provider": "test", "data_feed": "iex"},
             "costs": {"spread_bps": 4.0, "slippage_bps": 6.0,
                       "fee_bps": 0.5,
                       "measured_quote": (measured or {
@@ -267,6 +362,48 @@ class MeasuredConfigIntegrationTests(unittest.TestCase):
                           "coverage_policy": "strict",
                       })},
         })
+
+    def test_legacy_data_provider_alias_sets_canonical_broker_identity(self):
+        config = validate_config({"data": {"provider": " TEST "}})
+        self.assertEqual(config["broker"]["provider"], "test")
+        self.assertEqual(config["data"]["provider"], "test")
+
+    def test_broker_and_legacy_data_provider_conflict_fails_closed(self):
+        with self.assertRaisesRegex(
+                ConfigError, "broker.provider and data.provider"):
+            validate_config({
+                "broker": {"provider": "alpaca"},
+                "data": {"provider": "other"},
+            })
+
+    def test_unbound_schedule_provider_cannot_self_authorize(self):
+        with self.assertRaisesRegex(QuoteCostError, "schedule provider"):
+            validate_measured_quote_config({
+                "enabled": True, "schedule": self.schedule,
+            })
+
+    def test_cost_resolver_uses_legacy_data_provider_authority(self):
+        config = {
+            "data": {"provider": " TEST "},
+            "costs": {"measured_quote": {
+                "enabled": True, "schedule": self.schedule,
+            }},
+        }
+        setup = cost_resolver_setup(config, vehicle="equity")
+        self.assertEqual(setup.measured["provider"], "test")
+        model = setup.resolver({"symbol": "SPY"})
+        self.assertIn("provider-test", model.provenance)
+
+    def test_cost_resolver_rejects_conflicting_provider_aliases(self):
+        with self.assertRaisesRegex(
+                QuoteCostError, "broker.provider and data.provider"):
+            cost_resolver_setup({
+                "broker": {"provider": "test"},
+                "data": {"provider": "other"},
+                "costs": {"measured_quote": {
+                    "enabled": True, "schedule": self.schedule,
+                }},
+            })
 
     def test_enabled_config_embeds_schedule_and_resolver_provenance(self):
         config = self._config()
@@ -282,6 +419,66 @@ class MeasuredConfigIntegrationTests(unittest.TestCase):
         self.assertIn("spread-p75", model.provenance)
         self.assertIn("depth-p25", model.provenance)
         self.assertIn("feed-iex:provider-test:coverage-strict", model.provenance)
+        with self.assertRaisesRegex(QuoteCostError, "row provider"):
+            setup.resolver({
+                "vehicle": "equity", "symbol": "SPY", "shares": 10,
+                "provider": "foreign", "feed": "iex",
+                "cost_timestamp": "2026-01-05T14:45:00+00:00",
+            })
+        with self.assertRaisesRegex(QuoteCostError, "row feed"):
+            setup.resolver({
+                "vehicle": "equity", "symbol": "SPY", "shares": 10,
+                "provider": "test", "feed": "sip",
+                "cost_timestamp": "2026-01-05T14:45:00+00:00",
+            })
+        with self.assertRaisesRegex(QuoteCostError, "entry provider"):
+            setup.resolver({
+                "vehicle": "equity", "symbol": "SPY", "shares": 10,
+                "entry_provider": "foreign", "entry_feed": "iex",
+                "cost_leg": "entry",
+                "cost_timestamp": "2026-01-05T14:45:00+00:00",
+            })
+
+    def test_reprice_propagates_and_persists_canonical_per_leg_identity(self):
+        config = self._config()
+        setup = cost_resolver_setup(config, vehicle="equity")
+        contexts = []
+
+        def recording_resolver(context):
+            contexts.append(dict(context))
+            return setup.resolver(context)
+
+        trade = IBRTrade(
+            vehicle="equity", session_date=date(2026, 1, 5), symbol="SPY",
+            direction="long", range_high=101.0, range_low=99.0,
+            signal_timestamp=datetime(2026, 1, 5, 14, 40, tzinfo=timezone.utc),
+            entry_timestamp=datetime(2026, 1, 5, 14, 45, tzinfo=timezone.utc),
+            entry_reference=100.0, entry_price=100.0, stop_price=99.0,
+            target_price=102.0,
+            exit_timestamp=datetime(2026, 1, 5, 14, 50, tzinfo=timezone.utc),
+            exit_reference=101.0, exit_price=101.0, exit_reason="target",
+            gross_pnl=1.0, costs=0.0, net_pnl=1.0,
+            entry_fill_source="quote", exit_fill_source="quote",
+            entry_feed="IEX", exit_feed="iex",
+            entry_provider="TEST", exit_provider="test",
+        )
+        repriced = reprice_ibr_result(
+            IBRResult(vehicle="equity", trades=[trade]),
+            resolver=recording_resolver)
+        self.assertEqual(len(contexts), 2)
+        self.assertEqual(contexts[0]["cost_leg"], "entry")
+        self.assertEqual(contexts[0]["feed"], "iex")
+        self.assertEqual(contexts[0]["provider"], "test")
+        self.assertEqual(contexts[0]["entry_feed"], "iex")
+        self.assertEqual(contexts[0]["exit_feed"], "iex")
+        self.assertEqual(contexts[1]["cost_leg"], "exit")
+        self.assertEqual(contexts[1]["feed"], "iex")
+        self.assertEqual(contexts[1]["provider"], "test")
+        persisted = repriced.trades[0]
+        self.assertEqual(
+            (persisted.entry_feed, persisted.exit_feed), ("iex", "iex"))
+        self.assertEqual(
+            (persisted.entry_provider, persisted.exit_provider), ("test", "test"))
 
     def test_declared_hash_and_provider_feed_are_checked_at_config_boundary(self):
         bad_hash = {"enabled": True, "schedule": self.schedule,
@@ -291,10 +488,16 @@ class MeasuredConfigIntegrationTests(unittest.TestCase):
             self._config(bad_hash)
         with self.assertRaisesRegex(ConfigError, "schedule feed"):
             validate_config({
-                "broker": {"data_feed": "sip"},
+                "broker": {"provider": "test", "data_feed": "sip"},
                 "costs": {"measured_quote": {
                     "enabled": True, "schedule": self.schedule,
                     "provider": "test"}},
+            })
+        with self.assertRaisesRegex(ConfigError, "schedule provider"):
+            validate_config({
+                "broker": {"provider": "other", "data_feed": "iex"},
+                "costs": {"measured_quote": {
+                    "enabled": True, "schedule": self.schedule}},
             })
 
     def test_disabled_path_is_static_fallback_without_loading_filesystem(self):

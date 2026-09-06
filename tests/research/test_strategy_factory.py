@@ -52,7 +52,7 @@ def losing_breakouts(sessions=12):
             timestamp = start + timedelta(minutes=minute)
             observed = timestamp + timedelta(minutes=1)
             rows.append({
-                "kind": "bar", "provider": "test", "feed": "iex",
+                "kind": "bar", "provider": "alpaca", "feed": "iex",
                 "source_mode": "forward_observed",
                 "symbol": "SPY", "timestamp": timestamp.isoformat(),
                 "as_of": observed.isoformat(), "observed_at": observed.isoformat(),
@@ -278,7 +278,8 @@ def unknown_signal_quality_screen_worker(payload):
             "screens": dict(sorted(screens.items())), "worker_pid": 1}
 
 
-def persist_rule_gate(ledger, candidate_id, lane):
+def persist_rule_gate(ledger, candidate_id, lane, *, learning_epoch=None,
+                      first_heldout=None):
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
     symbols = ("SPY", "QQQ", "IWM", "DIA")
@@ -304,8 +305,8 @@ def persist_rule_gate(ledger, candidate_id, lane):
         row(symbol, (datetime(2025, 11, 20) + timedelta(days=offset)).date().isoformat(),
             f"{lane}-fit-{offset}-{symbol}", 1.0)
         for offset in range(session_count) for symbol in symbols]
-    first_heldout = (datetime(2025, 11, 27) if lane == "shadow"
-                     else datetime(2026, 1, 6))
+    first_heldout = first_heldout or (
+        datetime(2025, 11, 27) if lane == "shadow" else datetime(2026, 1, 6))
     all_heldout = [
         row(symbol, (first_heldout + timedelta(days=offset)).date().isoformat(),
             f"{lane}-held-{offset}-{symbol}", 1.0)
@@ -465,6 +466,8 @@ def persist_rule_gate(ledger, candidate_id, lane):
                                      "confidence": .99,
                                      "heldout_delta": 1.0, "max_drawdown": 0.0,
                                      "heldout_trades": len(heldout),
+                                     **({"learning_epoch": learning_epoch}
+                                        if learning_epoch is not None else {}),
                                      **({"shadow_source": {
                                          "schema": "shadow-ingest.v1",
                                          "candidate_id": candidate_id,
@@ -1092,6 +1095,60 @@ class StrategyFactoryTests(unittest.TestCase):
             persist_rule_gate(EdgeLedger(path), candidate["candidate_id"], "shadow")
             self.assertEqual(factory.last_boundary(
                 hypothesis.hypothesis_id, "equity"), "2026-02-14")
+
+    def test_shadow_boundary_is_scoped_to_the_learning_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "edge_lab.sqlite3"
+            edge = EdgeLedger(path)
+            factory = FactoryLedger(path)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+
+            def register_candidate(variant_id):
+                return edge.register_candidate(
+                    variant_id, strategy_id="rule", vehicle="equity",
+                    hypothesis="h", config={"strategy": {"rule_spec":
+                        hypothesis.rule_spec}},
+                    axes={"hypothesis_id": hypothesis.hypothesis_id})
+
+            epoch_a = "learning-epoch-a"
+            epoch_b = "learning-epoch-b"
+            persist_rule_gate(
+                edge, register_candidate("rule.synthetic.epoch-a-old")["candidate_id"],
+                "shadow", learning_epoch=epoch_a,
+                first_heldout=datetime(2026, 4, 1))
+            persist_rule_gate(
+                edge, register_candidate("rule.synthetic.epoch-a-new")["candidate_id"],
+                "shadow", learning_epoch=epoch_a,
+                first_heldout=datetime(2026, 5, 1))
+            persist_rule_gate(
+                edge, register_candidate("rule.synthetic.epoch-b")["candidate_id"],
+                "shadow", learning_epoch=epoch_b,
+                first_heldout=datetime(2026, 8, 1))
+            # A pre-epoch run has no learning_epoch key at all, matching the
+            # shape of legacy persisted metrics.
+            persist_rule_gate(
+                edge, register_candidate("rule.synthetic.legacy")["candidate_id"],
+                "shadow", first_heldout=datetime(2026, 10, 1))
+
+            # Both same-epoch proofs contribute; later proofs from another
+            # epoch and the legacy row do not.
+            scoped = factory.last_boundary(
+                hypothesis.hypothesis_id, "equity", learning_epoch=epoch_a)
+            self.assertEqual(scoped, "2026-07-19")
+            self.assertEqual(factory.last_boundary(
+                hypothesis.hypothesis_id, "equity",
+                epoch_fingerprint=epoch_a), scoped)
+            self.assertEqual(factory.last_boundary(
+                hypothesis.hypothesis_id, "equity", learning_epoch=epoch_b),
+                             "2026-10-19")
+            self.assertIsNone(factory.last_boundary(
+                hypothesis.hypothesis_id, "equity",
+                learning_epoch="learning-epoch-missing"))
+            # Omitting the epoch retains the historical behavior and can
+            # still see the legacy proof.
+            self.assertEqual(factory.last_boundary(
+                hypothesis.hypothesis_id, "equity"), "2026-12-19")
 
     def test_run_factory_records_family_pass_global_fail_as_a_failed_gate(self):
         """A family-level BY pass must not bypass the cycle-global gate."""

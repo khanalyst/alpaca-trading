@@ -60,8 +60,7 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
             raise AlpacaError(str(exc)) from exc
         strategy_cfg = cfg.get("strategy", {}) if isinstance(cfg.get("strategy"), Mapping) else {}
         self._edge_selection_mode = str(
-            strategy_cfg.get("selection_mode") or
-            ("specific" if self.mode == "live" else "all_proved"))
+            strategy_cfg.get("selection_mode") or "specific")
         llm_cfg = cfg.get("llm", {})
         llm_enabled = bool(llm_cfg.get("enabled", False)) if isinstance(llm_cfg, Mapping) else False
         if self.mode == "live":

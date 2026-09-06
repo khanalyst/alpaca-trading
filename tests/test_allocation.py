@@ -339,6 +339,30 @@ class AllocationTests(unittest.TestCase):
         self.assertTrue(any(name == "allocation" for name, _p in engine.events))
         self.assertTrue(all(item in configs for item in admitted))
 
+    def test_cycle_allocation_telemetry_records_dependence_policy_hash(self):
+        records = [
+            {"candidate_id": "candidate-a", "variant_id": "variant-a"},
+            {"candidate_id": "candidate-b", "variant_id": "variant-b"},
+        ]
+        configs = [(record, {"strategy": {}}) for record in records]
+        policy_hash = "p" * 64
+        engine = _Stub(self.db)
+        with patch("agent.allocation.allocate", return_value={
+                "admitted": [records[0]],
+                "rejected": [{"candidate_id": "candidate-b",
+                              "variant_id": "variant-b",
+                              "reason": "frozen dependence cluster"}],
+                "dependence_policy": {"policy_hash": policy_hash},
+                "dependence_policy_hash": policy_hash}):
+            admitted = engine._allocate_edges(configs, free_slots=1)
+
+        self.assertEqual(admitted, [configs[0]])
+        allocation_events = [payload for name, payload in engine.events
+                             if name == "allocation"]
+        self.assertEqual(len(allocation_events), 1)
+        self.assertEqual(allocation_events[0]["dependence_policy_hash"],
+                         policy_hash)
+
     def test_specific_selection_and_live_never_reach_the_allocator(self):
         self._prove(_fixture_variant("alpha"), "alpha", lcb=.20)
         self._prove(_fixture_variant("beta"), "beta", lcb=.10)

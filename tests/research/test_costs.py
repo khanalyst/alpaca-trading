@@ -185,6 +185,21 @@ class CostModelTests(unittest.TestCase):
         self.assertAlmostEqual(model.per_side_bps(executable_quote=True), 3.0,
                                places=12)
 
+    def test_round_trip_cost_prices_quote_and_resting_legs_independently(self):
+        model = CostModel(spread_bps=4.0, slippage_bps=6.0, fee_bps=0.5)
+        cost = model.round_trip_cost(
+            100.0, 100.0, entry_executable_quote=True,
+            exit_executable_quote=False)
+        self.assertAlmostEqual(cost / 100.0 * 10_000.0, 15.0, places=12)
+        # The compatibility switch still describes the all-quote/all-modelled
+        # cases, while explicit per-leg flags own a mixed execution path.
+        self.assertAlmostEqual(
+            model.round_trip_cost(100.0, 100.0, executable_quotes=True) /
+            100.0 * 10_000.0, 13.0, places=12)
+        self.assertAlmostEqual(
+            model.round_trip_cost(100.0, 100.0) / 100.0 * 10_000.0,
+            17.0, places=12)
+
     def test_execution_price_is_adverse_on_both_sides_and_both_directions(self):
         model = CostModel(spread_bps=2.0, slippage_bps=3.0)
         rate = 4.0 / 10_000.0
@@ -344,6 +359,12 @@ class EquityProvenanceTests(unittest.TestCase):
 
     def test_iex_quote_sources_and_providers_are_adequate(self):
         self.assertTrue(self._report(self._row())["adequate"])
+
+    def test_foreign_provider_is_not_authorizing_even_when_both_legs_match(self):
+        foreign = self._row(entry_provider="foreign", exit_provider="foreign")
+        report = self._report(foreign)
+        self.assertFalse(report["adequate"])
+        self.assertTrue(report["failure_reasons"])
 
     def test_sip_quote_source_is_diagnostic_only(self):
         report = self._report(self._row(entry_feed="sip", exit_feed="sip"))
@@ -1009,7 +1030,7 @@ class RestingBracketEvidenceTests(unittest.TestCase):
                 self.assertIsNotNone(validate_resting_bracket_fill(
                     self._row(**changes)))
 
-    def test_resting_claim_uses_full_adverse_exit_cost_not_quote_exemption(self):
+    def test_resting_claim_uses_quote_entry_and_full_adverse_exit_cost(self):
         row = self._row(entry_price=100.0, exit_price=103.0,
                         quantity=1.0, contract_multiplier=1.0,
                         risk_usd=10.0)
@@ -1017,8 +1038,26 @@ class RestingBracketEvidenceTests(unittest.TestCase):
         report = risk_unit_report([row], vehicle="equity", costs=model)
         self.assertTrue(report["adequate"])
         observed = report["observations"][0]["round_trip_cost"]
-        expected = model.round_trip_cost(100.0, 103.0, executable_quotes=False)
+        expected = model.round_trip_cost(
+            100.0, 103.0, entry_executable_quote=True,
+            exit_executable_quote=False)
         self.assertAlmostEqual(observed, expected, places=12)
+
+    def test_resting_claim_binds_entry_bars_and_claim_to_expected_provider(self):
+        row = self._row()
+        for field in ("entry_provider", "signal_bar_provider",
+                      "entry_bar_provider", "exit_bar_provider"):
+            with self.subTest(field=field):
+                changed = dict(row)
+                changed[field] = "foreign"
+                if field == "exit_bar_provider":
+                    changed["exit_fill_claim"] = {
+                        **row["exit_fill_claim"], "bar_provider": "foreign"}
+                self.assertEqual(
+                    validate_resting_bracket_fill(changed),
+                    "resting_bracket_entry_provenance"
+                    if field == "entry_provider" else
+                    "resting_bracket_bar_provenance")
 
 
 if __name__ == "__main__":

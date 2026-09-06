@@ -25,6 +25,7 @@ never promotes anything in its place — the replacement still has to earn
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 from typing import Any, Mapping, Sequence
 
 from .edge_lab import DEFAULT_DB_PATH, EdgeLedger
@@ -122,6 +123,31 @@ def _hypothesis_of(record: Mapping[str, Any]) -> str | None:
     return str(value) if value else None
 
 
+def _learning_epoch_of(ledger: EdgeLedger, candidate_id: str) -> str | None:
+    """Read the exact epoch from the candidate's latest verified proof.
+
+    Candidate provenance is intentionally stored as a hash, so trial review
+    must not reconstruct an epoch from ambient configuration.  Factory proof
+    runs persist the token in their immutable metrics; candidates without that
+    durable stamp remain legacy/audit-only rather than being relabeled.
+    """
+    try:
+        proof = ledger.latest_verified_run(candidate_id, lane="shadow")
+    except (TypeError, ValueError, KeyError, sqlite3.Error):
+        return None
+    if not isinstance(proof, Mapping):
+        return None
+    gate = proof.get("verified_gate")
+    if not isinstance(gate, Mapping) or gate.get("passes") is not True:
+        return None
+    metrics = proof.get("metrics")
+    value = metrics.get("learning_epoch") if isinstance(metrics, Mapping) else None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
                   config: Mapping[str, Any] | None = None,
                   vehicle: str | None = None,
@@ -151,10 +177,12 @@ def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
         is_pinned = (variant_id, candidate_vehicle) in frozen
         performance = ledger.paper_performance(candidate_id)
         verdict = _verdict(performance, policy)
+        learning_epoch = _learning_epoch_of(ledger, candidate_id)
         review = {
             "candidate_id": candidate_id, "variant_id": variant_id,
             "vehicle": candidate_vehicle, "status": candidate.get("status"),
             "pinned": is_pinned, "verdict": verdict,
+            "learning_epoch": learning_epoch,
             "family": _family_of(ledger, candidate),
         }
         if verdict["state"] == "passed":
@@ -186,7 +214,8 @@ def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
                                      "vehicle": candidate_vehicle}
                                     if is_pinned else {}),
                 })
-            _record_live_lesson(factory, ledger, candidate, verdict, reason)
+            _record_live_lesson(factory, ledger, candidate, verdict, reason,
+                                learning_epoch=learning_epoch)
             parked.append({"candidate_id": candidate_id,
                            "variant_id": variant_id,
                            "vehicle": candidate_vehicle,
@@ -204,7 +233,7 @@ def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
 
 def _record_live_lesson(factory: FactoryLedger, ledger: EdgeLedger,
                         candidate: Mapping[str, Any], verdict: Mapping[str, Any],
-                        reason: str) -> None:
+                        reason: str, *, learning_epoch: str | None = None) -> None:
     """Write the trial result into the lesson ledger as live evidence.
 
     This is the point of the lane.  A parked edge whose failure is only a
@@ -229,13 +258,15 @@ def _record_live_lesson(factory: FactoryLedger, ledger: EdgeLedger,
                        "trades": verdict["trades"],
                        "total_r": verdict["total_r"],
                        "mean_r": verdict["mean_r"]},
-            evidence={"schema": TRIAL_SCHEMA})
+            evidence={"schema": TRIAL_SCHEMA},
+            learning_epoch=learning_epoch)
         factory.grade_lesson(
             hypothesis_id, variant_id, kind="trial",
             outcome={"passed": False, "underpowered": False,
                      "heldout_delta": verdict["mean_r"],
                      "heldout_net_pnl": verdict.get("net_pnl"),
-                     "failed_checks": ["live_paper_total_r_positive"]})
+                     "failed_checks": ["live_paper_total_r_positive"]},
+            learning_epoch=learning_epoch)
     except (FactoryError, KeyError, Exception):  # noqa: BLE001
         # The lifecycle change already happened and is the safety-relevant
         # half.  Losing its annotation must not raise into a scheduled job.

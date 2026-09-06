@@ -212,7 +212,10 @@ class EngineCycleMixin:
         self._event("allocation", {
             "free_slots": max(0, free_slots),
             "admitted": [record.get("variant_id") for record, _cfg in admitted],
-            "rejected": [row.get("variant_id") for row in result["rejected"]]})
+            "rejected": [row.get("variant_id") for row in result["rejected"]],
+            # Keep the durable evidence bounded while making the exact
+            # frozen dependence policy that governed admission auditable.
+            "dependence_policy_hash": result.get("dependence_policy_hash")})
         return admitted
 
     def _run_once_impl(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:

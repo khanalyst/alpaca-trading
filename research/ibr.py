@@ -191,6 +191,23 @@ class IBRTrade:
     # Canonical durable cause; ``exit_reason`` remains the compatibility
     # alias consumed by legacy research reports.
     canonical_exit_reason: str = ""
+    # Per-leg execution-cost provenance is part of the durable replay row.
+    # These fields intentionally match the account/factory row contract so a
+    # gate can price an IBR observation with the exact model selected at its
+    # entry and exit boundaries.  They are optional at the end of the record
+    # to preserve positional construction of legacy equity fixtures.
+    entry_cost_model_provenance: str | None = None
+    exit_cost_model_provenance: str | None = None
+    entry_cost_model_spread_bps: float | None = None
+    entry_cost_model_slippage_bps: float | None = None
+    entry_cost_model_fee_bps: float | None = None
+    exit_cost_model_spread_bps: float | None = None
+    exit_cost_model_slippage_bps: float | None = None
+    exit_cost_model_fee_bps: float | None = None
+    # When a measured resolver reprices a row, this immutable block records
+    # the exact round-trip arithmetic and its inputs.  Static/legacy rows may
+    # omit it and continue to use the CostModel fallback in research gates.
+    cost_economics: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)

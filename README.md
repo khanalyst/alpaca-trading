@@ -327,7 +327,12 @@ spread/slippage constants at each symbol and half-hour boundary using the
 configured spread/depth percentiles. Its content hash, feed, provider, coverage
 floor, and policy are part of candidate identity, and the same frozen resolver
 prices candidate, control, randomized-null, qualification, and live-shadow
-legs. Missing or under-covered cells fail closed. The checked-in block is
+legs. Spread and executable-depth coverage are separate: only rows with both
+positive `bid_size` and `ask_size` count toward executable depth. For positive
+`order_shares`, the selected section must meet `min_quotes_per_cell` for both
+spread and depth and provide a usable selected depth percentile; otherwise
+measured pricing fails closed. Omitted or nonpositive order size remains
+spread-only. Missing or under-covered cells fail closed. The checked-in block is
 disabled because the repository does not contain one universal corpus-specific
 schedule that could honestly be activated for every deployment.
 Proofs also persist preregistered all-in stress scenarios of

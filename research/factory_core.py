@@ -38,7 +38,7 @@ from .costs import (BAR, QUOTE, RESTING_BRACKET,
                     STRESSED_COST_SCHEMA, CostError, CostModel, ReplayPolicy,
                     check_entry_slippage, check_stressed_cost_plan,
                     index_quotes, quote_fill_record, resting_bracket_fill_claim,
-                    stressed_cost_usd,
+                    row_cost_economics_claim, stressed_cost_usd,
                     replay_policy_for_bars)
 from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
@@ -1776,6 +1776,12 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 row["diagnostic_reason"] = "diagnostic_backfill_policy"
         else:
             row.setdefault("directional_authorizing", True)
+        # Persist the exact dynamic per-leg arithmetic alongside measured
+        # model provenance. Static/legacy rows receive no row-specific block;
+        # measured rows without this claim are rejected by gate recomputation.
+        economics = row_cost_economics_claim(row, vehicle=vehicle)
+        if economics is not None:
+            row["cost_economics"] = economics
         rows.append(row)
         active.append(row)
     if active:

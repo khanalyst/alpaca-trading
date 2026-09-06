@@ -101,7 +101,7 @@ class LiveShadowControlTests(unittest.TestCase):
                     "event_type": "bar_1m", "symbol": "SPY", "timestamp": stamp,
                     "as_of": "2026-01-02T21:00:00+00:00",
                     "observed_at": "2026-01-02T21:01:00+00:00",
-                    "provider": "recorded", "feed": "iex", "open": "100",
+                    "provider": "alpaca", "feed": "iex", "open": "100",
                     "high": "103", "low": "99", "close": "100", "volume": "1000",
                 })
 
@@ -129,6 +129,7 @@ class LiveShadowControlTests(unittest.TestCase):
                 return ("open_incomplete", "paired test open", {
                     "session_date": "2026-01-02", "strategy_id": "rule",
                     "variant_id": paired["variant_id"], "equity_feed": "iex",
+                    "equity_provider": "alpaca",
                     "signal": signal,
                     "setup_plan": plan, "risk_plan": plan,
                 }, {**plan, "entry_price": 100.0, "shares": 1.0,

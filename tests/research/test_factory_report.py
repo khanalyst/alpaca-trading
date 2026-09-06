@@ -365,7 +365,11 @@ class ReportRenderingTests(unittest.TestCase):
                     payload["classification"] = classification
                     payload["variant_id"] = f"report-fixture-{index}"
                     connection.execute(
-                        "INSERT INTO factory_accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        """INSERT INTO factory_accounts
+                           (account_id,cycle_id,hypothesis_id,variant_id,vehicle,
+                            starting_cash,ending_equity,realized_pnl,max_drawdown,
+                            trades,worker_pid,result_json,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (f"report-fixture-account-{index}", cycle_id,
                          hypothesis_id, payload["variant_id"], vehicle,
                          starting_cash, ending_equity, realized_pnl,

@@ -76,6 +76,9 @@ DEFAULT_RETENTION_DAYS = 180
 MAX_PENDING_CORPUS_BYTES = 64 * 1024 * 1024
 MAX_QUARANTINE_EVENTS = 1024
 QUARANTINE_OVERFLOW_KEY = "__quarantine_overflow__"
+# Provider mismatches are a fail-closed replay condition.  Keep the persisted
+# sample bounded even when a corrupt/foreign corpus contains a large tail.
+MAX_PROVIDER_MISMATCHES = 64
 # Replay metadata is immutable evidence; these bounded meta projections make
 # an incomplete/mismatched middle session visible to operators and require an
 # explicit repaired replay before ingestion may advance its boundary.
@@ -397,6 +400,37 @@ def _canonical_equity_feed(value: Any) -> str | None:
     return feed if feed in {"iex", "sip", "delayed_sip"} else None
 
 
+def _canonical_equity_provider(value: Any) -> str | None:
+    """Normalize a row provider using the :class:`ReplayPolicy` identity."""
+    if value in (None, ""):
+        return None
+    provider = str(value).strip().lower()
+    return provider or None
+
+
+def _provider_mismatch_telemetry(
+        rows_by_kind: Sequence[tuple[str, Sequence[Mapping]]], *,
+        expected_provider: str) -> tuple[list[dict[str, Any]], int]:
+    """Return a bounded mismatch sample and the total mismatch count."""
+    mismatches: list[dict[str, Any]] = []
+    count = 0
+    for kind, rows in rows_by_kind:
+        for row in rows:
+            observed_provider = _canonical_equity_provider(row.get("provider"))
+            if observed_provider == expected_provider:
+                continue
+            count += 1
+            if len(mismatches) >= MAX_PROVIDER_MISMATCHES:
+                continue
+            mismatches.append({
+                "kind": kind,
+                "symbol": str(row.get("symbol") or ""),
+                "timestamp": str(row.get("timestamp") or ""),
+                "observed_provider": observed_provider,
+            })
+    return mismatches, count
+
+
 def _opportunity_capacity(rows: Sequence[Mapping[str, Any]], *,
                           vehicle: str | None = None,
                           min_trades: int | None = None,
@@ -565,6 +599,15 @@ def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
     equity_feed = _canonical_equity_feed(
         payload.get("equity_feed") or plan.get("equity_feed") or
         snapshot.get("equity_feed"))
+    # Prefer the top-level immutable binding, then the nested legacy shapes.
+    # Presence (rather than truthiness) matters: an explicit blank/invalid
+    # provider must remain a mismatch instead of being masked by a fallback.
+    provider_value: Any = None
+    for source in (payload, plan, risk_plan, snapshot):
+        if "equity_provider" in source:
+            provider_value = source["equity_provider"]
+            break
+    equity_provider = _canonical_equity_provider(provider_value)
     signal_ts = _finite(plan.get("signal_ts", signal.get("signal_ts")))
     decision_ts = plan.get("decision_timestamp", signal.get("decision_timestamp"))
     entry_ts = plan.get("entry_timestamp", signal.get("entry_timestamp"))
@@ -592,6 +635,7 @@ def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
                      in {"option", "options"} else "equity"),
         "profile": execution_profile,
         "equity_feed": equity_feed,
+        "equity_provider": equity_provider,
     }
     family = str(plan.get("family") or signal.get("family") or
                  payload.get("family") or "").lower()
@@ -608,6 +652,7 @@ def _replay_signature(row: Mapping[str, Any], *, vehicle: str,
                       strategy_id: str, target_r: float | None = None,
                       setup_type: str | None = None,
                       equity_feed: str | None = None,
+                      equity_provider: str | None = None,
                       context_defaults: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
     """Project a factory/IBR replay trade into the same semantic contract."""
     if row.get("no_trade") is True:
@@ -647,6 +692,12 @@ def _replay_signature(row: Mapping[str, Any], *, vehicle: str,
         "vehicle": "option" if vehicle in {"option", "options"} else "equity",
         "profile": "options" if vehicle in {"option", "options"} else "shares",
         "equity_feed": _canonical_equity_feed(equity_feed),
+        # Replay trades do not necessarily carry their source event identity;
+        # bind the canonical provider supplied by the immutable replay policy.
+        # Falling back to a row identity keeps direct legacy callers readable.
+        "equity_provider": _canonical_equity_provider(
+            equity_provider if equity_provider is not None else
+            row.get("equity_provider", row.get("provider"))),
     }
     context = _cross_sectional_context(
         (row,),
@@ -663,7 +714,7 @@ def _signature_diffs(expected: Sequence[Mapping[str, Any]],
     key_fields = ("symbol", "session_date", "direction", "setup_type")
     compare_fields = ("signal_ts", "decision_ts", "entry_ts", "stop_price", "target_price",
                       "stop_distance", "range_high", "range_low", "target_r",
-                      "vehicle", "profile", "equity_feed",
+                      "vehicle", "profile", "equity_feed", "equity_provider",
                       *_CROSS_SECTIONAL_CONTEXT_FIELDS)
     left = sorted((dict(item) for item in expected),
                   key=lambda item: tuple(str(item.get(key) or "") for key in key_fields))
@@ -2020,11 +2071,16 @@ class ShadowRunner:
 
     @staticmethod
     def _latest_quote(rows: Sequence[Mapping], at: datetime, *,
-                      expected_feed: str | None = None) -> Mapping | None:
+                      expected_feed: str | None = None,
+                      expected_provider: str | None = None) -> Mapping | None:
         valid = []
         for row in rows:
             if (expected_feed is not None and
                     _canonical_equity_feed(row.get("feed")) != expected_feed):
+                continue
+            if (expected_provider is not None and
+                    _canonical_equity_provider(row.get("provider")) !=
+                    expected_provider):
                 continue
             stamp = _timestamp(row.get("timestamp"))
             if stamp is not None and stamp <= at and _row_visible(row, at):
@@ -2058,6 +2114,13 @@ class ShadowRunner:
         policy = _session_policy(
             cfg, close_at, policy=self._shadow_policy(cfg))
         expected_equity_feed = policy.equity_feed
+        expected_equity_provider = policy.equity_provider
+        observed_equity_provider = _canonical_equity_provider(event.get("provider"))
+        if observed_equity_provider != expected_equity_provider:
+            return ("no_data", "equity provider mismatch",
+                    {"session_date": session,
+                     "equity_provider": expected_equity_provider,
+                     "observed_equity_provider": observed_equity_provider}, None)
         observed_equity_feed = _canonical_equity_feed(event.get("feed"))
         if observed_equity_feed != expected_equity_feed:
             return ("no_data", "equity feed mismatch",
@@ -2078,6 +2141,8 @@ class ShadowRunner:
                          "calendar_source": calendar_source}, None)
         stream = [row for row in bars.get(symbol, [])
                   if _canonical_equity_feed(row.get("feed")) == expected_equity_feed
+                  and (_canonical_equity_provider(row.get("provider")) ==
+                       expected_equity_provider)
                   and _row_visible(row, event_at)
                   and (close_at is None or (
                       (calendar_bounds is None or
@@ -2111,6 +2176,8 @@ class ShadowRunner:
                     row for row in bars.get(CROSS_SECTIONAL_BENCHMARK, ())
                     if (_canonical_equity_feed(row.get("feed")) ==
                         expected_equity_feed)
+                    and (_canonical_equity_provider(row.get("provider")) ==
+                         expected_equity_provider)
                     and _row_visible(row, event_at)
                     and (_event_end(row) or event_at) <= event_at
                     and ((_timestamp(row.get("timestamp")) or market_at)
@@ -2134,6 +2201,7 @@ class ShadowRunner:
             return "reject", f"signal exception: {type(exc).__name__}", {"error": str(exc)[:240]}, None
         base = {"session_date": session, "strategy_id": strategy_id,
                 "equity_feed": expected_equity_feed,
+                "equity_provider": expected_equity_provider,
                 "variant_id": candidate.get("variant_id"), "signal": signal,
                 "stress_calibration": self._stress_telemetry(
                     policy, symbol=symbol, timestamp=event_at,
@@ -2162,7 +2230,8 @@ class ShadowRunner:
         base["signal"] = signal
         quote = self._latest_quote(
             quotes.get(symbol, ()), event_at,
-            expected_feed=expected_equity_feed)
+            expected_feed=expected_equity_feed,
+            expected_provider=expected_equity_provider)
         snap: dict[str, Any] = {"price": _finite(event.get("close")) or _finite(event.get("open")),
                                 "close": _finite(event.get("close")),
                                 "spread_bps": None, "stale": True, "quote_stale": True,
@@ -2309,6 +2378,7 @@ class ShadowRunner:
         replay_policy = _session_policy(
             cfg, calendar_close, policy=self._shadow_policy(cfg))
         expected_equity_feed = replay_policy.equity_feed
+        expected_equity_provider = replay_policy.equity_provider
         candidate_vehicle = str(candidate.get("vehicle") or "equity")
         # Resolve the candidate's immutable measured/static economics once for
         # this session.  Every arm below receives the same resolver, while a
@@ -2325,10 +2395,15 @@ class ShadowRunner:
             for row in rows
             if _canonical_equity_feed(row.get("feed")) != expected_equity_feed
         ]
+        provider_mismatches, provider_mismatch_count = _provider_mismatch_telemetry(
+            (("bar", in_session_bars), ("quote", in_session_quotes),
+             ("option", in_session_options)),
+            expected_provider=expected_equity_provider)
         source_digest = _digest({"bars": in_session_bars,
                                  "quotes": in_session_quotes,
                                  "options": in_session_options,
                                  "equity_feed": expected_equity_feed,
+                                 "equity_provider": expected_equity_provider,
                                  "session_close": (calendar_close.isoformat()
                                                    if calendar_close else None),
                                  "calendar_source": calendar_source})
@@ -2352,7 +2427,10 @@ class ShadowRunner:
         realized_pnl = 0.0
         details: dict[str, Any] = {"complete": False, "trade_count": 0,
                                    "equity_feed": expected_equity_feed,
+                                   "equity_provider": expected_equity_provider,
                                    "feed_mismatches": feed_mismatches,
+                                   "provider_mismatches": provider_mismatches,
+                                   "provider_mismatch_count": provider_mismatch_count,
                                    "session_close": (calendar_close.isoformat()
                                                      if calendar_close else None),
                                    "calendar_source": calendar_source,
@@ -2371,6 +2449,10 @@ class ShadowRunner:
                         any((_event_end(row) or datetime.min.replace(tzinfo=UTC)) >=
                             calendar_close for row in in_session_bars))
         try:
+            if provider_mismatches:
+                raise ShadowError(
+                    "equity provider mismatch: expected "
+                    f"{expected_equity_provider}")
             if feed_mismatches:
                 raise ShadowError(
                     f"equity feed mismatch: expected {expected_equity_feed}")
@@ -2412,7 +2494,8 @@ class ShadowRunner:
                                      if (signature := _replay_signature(
                                          trade, vehicle=candidate_vehicle,
                                          strategy_id="ibr", target_r=replay_cfg.target_r,
-                                         equity_feed=expected_equity_feed)) is not None]
+                                         equity_feed=expected_equity_feed,
+                                         equity_provider=expected_equity_provider)) is not None]
                 details.update(complete=complete, trade_count=len(trades),
                                opportunity_count=len(evidence_rows), trades=trades,
                                replay_signatures=replay_signatures)
@@ -2487,6 +2570,7 @@ class ShadowRunner:
                                          strategy_id="rule", target_r=float(spec.get("target_r", 2.0)),
                                          setup_type=f"rule_{spec.get('family', 'signal')}",
                                          equity_feed=expected_equity_feed,
+                                         equity_provider=expected_equity_provider,
                                          context_defaults=replay_context_defaults(trade))) is not None]
                 details.update(complete=complete, trade_count=len(replay_signatures),
                                replay_signatures=replay_signatures, account=account)
@@ -2579,6 +2663,7 @@ class ShadowRunner:
                 replay_digest=null_digest, status="match",
                 details={"complete": True, "signature_match": True,
                          "equity_feed": expected_equity_feed,
+                         "equity_provider": expected_equity_provider,
                          "null_control": True, "replay_signatures": [],
                          "null_rows_digest": null_digest})
             self.store.record_replay_evidence(

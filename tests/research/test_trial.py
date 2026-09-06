@@ -13,6 +13,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from research.edge_lab import EdgeLedger
 from research.factory_core import initial_hypotheses
@@ -26,6 +27,8 @@ POLICY = {"research": {"trial": {"enabled": True, "min_sessions": 5,
                                  "min_trades": 10, "min_mean_r": 0.0,
                                  "min_total_r": 0.0}},
           "strategy": {"execution_mode": "shares"}}
+
+CURRENT_EPOCH = "factory-learning-epoch.current"
 
 
 def _ledgers(directory):
@@ -229,14 +232,65 @@ class LiveLessonTests(unittest.TestCase):
             candidate = _candidate(ledger, "rule.lose.1",
                                    hypothesis_id=hypothesis.hypothesis_id)
             _outcomes(ledger, candidate, [-0.4] * 12)
-            review_trials(ledger.path, config=POLICY)
+            # The trial epoch comes from the durable verified proof, not from
+            # the ambient review config.  This mock models that proof seam
+            # while keeping this focused test independent of gate construction.
+            with patch.object(
+                    EdgeLedger, "latest_verified_run",
+                    return_value={"metrics": {"learning_epoch": CURRENT_EPOCH},
+                                  "verified_gate": {"passes": True}}):
+                review_trials(ledger.path, config=POLICY)
             brief = _lesson_brief(factory, vehicle="equity",
-                                  family="opening_range_breakout")
+                                  family="opening_range_breakout",
+                                  learning_epoch=CURRENT_EPOCH)
             self.assertTrue(brief)
             self.assertTrue(any("Live paper trial" in item["reason"]
                                 for item in brief))
             self.assertTrue(any(item["proposed_by"] == "live_paper"
                                 for item in brief))
+
+    def test_trial_lessons_follow_proof_epoch_and_quarantine_cross_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, factory, hypothesis = _ledgers(directory)
+            first = _candidate(ledger, "rule.lose.a",
+                               hypothesis_id=hypothesis.hypothesis_id)
+            second = _candidate(ledger, "rule.lose.b",
+                                hypothesis_id=hypothesis.hypothesis_id)
+            _outcomes(ledger, first, [-0.4] * 12, prefix="a")
+            _outcomes(ledger, second, [-0.4] * 12, prefix="b")
+            epochs = {first: "factory-learning-epoch.a",
+                      second: "factory-learning-epoch.b"}
+
+            def verified_proof(candidate_id, *, lane=None):
+                self.assertEqual(lane, "shadow")
+                return {"metrics": {"learning_epoch": epochs[candidate_id]},
+                        "verified_gate": {"passes": True}}
+
+            with patch.object(EdgeLedger, "latest_verified_run",
+                              side_effect=verified_proof):
+                result = review_trials(ledger.path, config=POLICY)
+            self.assertEqual(len(result["parked"]), 2)
+            lessons = [item for item in factory.lessons(vehicle="equity")
+                       if item["kind"] == "trial"]
+            self.assertEqual({item["learning_epoch"] for item in lessons},
+                             set(epochs.values()))
+            self.assertEqual(len(factory.lessons(
+                vehicle="equity", graded_only=True,
+                learning_epoch=epochs[first])), 1)
+            self.assertEqual(len(factory.lessons(
+                vehicle="equity", graded_only=True,
+                learning_epoch=epochs[second])), 1)
+            self.assertEqual(len(factory.lessons(
+                vehicle="equity", graded_only=True,
+                learning_epoch="factory-learning-epoch.other")), 0)
+            audit = factory.lessons(
+                vehicle="equity", graded_only=True,
+                learning_epoch=epochs[first], include_quarantined=True)
+            self.assertEqual(len(audit), 2)
+            mismatched = [item for item in audit
+                          if item["learning_epoch"] == epochs[second]]
+            self.assertEqual(len(mismatched), 1)
+            self.assertTrue(mismatched[0]["quarantined"])
 
     def test_a_candidate_without_lineage_parks_without_a_lesson(self):
         """No hypothesis to attach to is not a reason to fail the review."""

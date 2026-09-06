@@ -22,7 +22,7 @@ _RUNTIME_CONFIG_KEYS = {
 # Paper/live is a deployment mode, not a strategy assumption.  Keeping it out
 # lets one proved edge move through paper qualification into a separately
 # guarded live process while still binding the complete feed entitlement.
-_BROKER_KEYS = ("data_feed", "options_feed")
+_BROKER_KEYS = ("provider", "data_feed", "options_feed")
 _STRATEGY_SELECTION_KEYS = {"selection_mode", "pinned"}
 
 

@@ -220,6 +220,15 @@ live-shadow paths all resolve entry and exit costs from that same schedule; a
 missing or under-covered cell aborts the lane instead of falling back to a
 broader average. The checked-in block remains disabled until an operator fits
 and freezes a schedule from the corpus actually being proved.
+The validated `broker.provider` is authoritative (default `alpaca`): the
+schedule may not self-declare a different provider, and explicit row-level
+provider/feed contradictions fail closed in the resolver and live shadow.
+Spread and executable-depth coverage are separate: only rows with both
+positive `bid_size` and `ask_size` count toward executable depth. For positive
+`order_shares`, the selected section must meet `min_quotes_per_cell` for both
+spread and depth and provide a usable selected depth percentile; otherwise
+measured pricing fails closed. Omitted or nonpositive order size remains
+spread-only.
 
 Every proof also persists the preregistered all-in stress scenarios of 9, 15,
 25, and 50 bps. The 25 bps scenario is the authorization requirement; the

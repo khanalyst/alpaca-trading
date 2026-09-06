@@ -3,6 +3,7 @@
   "broker": {
     "paper": true,
     "allow_live": false,
+    "provider": "alpaca",
     "data_feed": "iex",
     "options_feed": "indicative"
   },

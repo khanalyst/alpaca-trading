@@ -70,9 +70,16 @@ def _feed(value: Any, *, options: bool = False) -> str:
     return raw
 
 
+def _provider(value: Any, *, path: str = "broker.provider") -> str:
+    """Return one normalized market-data provider identity."""
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{path} must be a non-empty string")
+    return value.strip().lower().replace("-", "_")
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "mode": "paper",
-    "broker": {"paper": True, "allow_live": False, "data_feed": "iex", "options_feed": "indicative"},
+    "broker": {"paper": True, "allow_live": False, "provider": "alpaca", "data_feed": "iex", "options_feed": "indicative"},
     "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "require_exact_calendar": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
     "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO", "VB", "EFA", "EEM", "TLT", "HYG", "GLD", "SLV", "SMH"], "asset_classes": ["us_equity"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
     "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "specific", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 0.5, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
@@ -123,8 +130,10 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
             out[key] = value
     out["mode"] = mode
 
+    raw_broker = cfg.get("broker")
+    raw_broker = raw_broker if isinstance(raw_broker, Mapping) else {}
     broker = _map(out.get("broker"), "broker")
-    _unknown(broker, {"paper", "allow_live", "data_feed", "options_feed", "api_key", "secret_key", "endpoint"}, "broker")
+    _unknown(broker, {"paper", "allow_live", "provider", "data_feed", "options_feed", "api_key", "secret_key", "endpoint"}, "broker")
     paper = _bool(broker, "paper", "broker", mode == "paper")
     allow_live = _bool(broker, "allow_live", "broker", False)
     paper_env = os.getenv("ALPACA_PAPER")
@@ -144,6 +153,7 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     if broker.get("endpoint"):
         raise ConfigError("broker.endpoint overrides are disabled")
     broker.update(paper=paper, allow_live=allow_live)
+    broker["provider"] = _provider(broker.get("provider"))
     broker["data_feed"] = _feed(os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED") or broker.get("data_feed"))
     broker["options_feed"] = _feed(os.getenv("ALPACA_OPTIONS_FEED") or broker.get("options_feed"), options=True)
     out["broker"] = broker
@@ -151,7 +161,21 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     data = out.get("data")
     if data is not None:
         data = _map(data, "data")
-        _unknown(data, {"feed", "options_feed"}, "data")
+        _unknown(data, {"feed", "options_feed", "provider"}, "data")
+        if "provider" in data:
+            data_provider = _provider(data["provider"], path="data.provider")
+            data["provider"] = data_provider
+            broker_provider = broker["provider"]
+            # ``data.provider`` is a compatibility alias.  It can supply the
+            # provider only when the broker block did not explicitly choose
+            # one; once both are declared, disagreement is a configuration
+            # conflict rather than an opportunity to guess which source won.
+            if "provider" in raw_broker:
+                if broker_provider != data_provider:
+                    raise ConfigError(
+                        "broker.provider and data.provider must match")
+            else:
+                broker["provider"] = data_provider
         if "feed" in data:
             data["feed"] = _feed(data["feed"])
         if "options_feed" in data:
@@ -405,19 +429,10 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
             # and retain the frozen schedule/hash so candidate assumptions can
             # bind the exact economics used by later replays.
             try:
-                # ``broker.provider`` is optional for legacy/runtime config;
-                # when it is absent, the schedule's declared provider is the
-                # only honest expectation.  A hardcoded Alpaca identity would
-                # reject valid non-Alpaca research fixtures before replay.
-                broker_provider = (broker.get("provider")
-                                   if "provider" in broker else
-                                   (measured_quote.get("provider")
-                                    if isinstance(measured_quote, Mapping)
-                                    else None))
                 measured_normalized = validate_measured_quote_config(
                     measured_quote,
                     expected_feed=broker.get("data_feed"),
-                    expected_provider=broker_provider,
+                    expected_provider=broker.get("provider"),
                     embed_schedule=True)
             except QuoteCostError as exc:
                 raise ConfigError(f"costs.measured_quote: {exc}") from exc

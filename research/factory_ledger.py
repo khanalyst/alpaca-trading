@@ -180,6 +180,67 @@ class FactoryError(ValueError):
     """Raised when a factory operation cannot preserve research boundaries."""
 
 
+LEARNING_EPOCH_SCHEMA = "factory-learning-epoch.v1"
+
+
+def learning_epoch_fingerprint(*, economics: Any = None,
+                               geometry: Any = None,
+                               feed: Any = None,
+                               grammar: Any = None) -> str:
+    """Return the stable fingerprint for the assumptions a lesson learned.
+
+    The four inputs are deliberately kept separate at the API boundary.  A
+    caller can pass its already-normalized economics/geometry/feed/grammar
+    descriptors, while canonical JSON and ``content_hash`` make equivalent
+    mappings produce the same epoch.  The resulting token is safe to persist
+    as the immutable lesson identity.
+    """
+    return content_hash({
+        "schema": LEARNING_EPOCH_SCHEMA,
+        "economics": economics,
+        "geometry": geometry,
+        "feed": feed,
+        "grammar": grammar,
+    })
+
+
+def _normalize_learning_epoch(value: Any) -> str | None:
+    """Normalize an epoch token without silently accepting an empty value.
+
+    Mapping inputs are treated as the four-part epoch descriptor and hashed;
+    string inputs are already fingerprints and are retained verbatim after
+    whitespace normalization.  ``None`` is the intentional legacy lane.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        if not value:
+            raise FactoryError("learning epoch must not be empty")
+        if set(value) <= {"economics", "geometry", "feed", "grammar"}:
+            return learning_epoch_fingerprint(
+                economics=value.get("economics"),
+                geometry=value.get("geometry"),
+                feed=value.get("feed"),
+                grammar=value.get("grammar"),
+            )
+        return content_hash({"schema": LEARNING_EPOCH_SCHEMA,
+                             "descriptor": dict(value)})
+    text = str(value).strip()
+    if not text:
+        raise FactoryError("learning epoch must not be empty")
+    return text
+
+
+def _resolve_learning_epoch(*, learning_epoch: Any = None,
+                            epoch_fingerprint: Any = None) -> str | None:
+    """Resolve the public aliases and reject contradictory epoch inputs."""
+    left = _normalize_learning_epoch(learning_epoch)
+    right = _normalize_learning_epoch(epoch_fingerprint)
+    if left is not None and right is not None and left != right:
+        raise FactoryError("learning epoch and epoch fingerprint disagree")
+    return left if left is not None else right
+
+
 def _fdr_method_version(method: str) -> str:
     if method == FDR_METHOD_V5:
         return FDR_METHOD_VERSION_V5
@@ -491,6 +552,192 @@ def _migrate_cycle_identity(db: sqlite3.Connection) -> None:
     db.execute("DROP TABLE factory_cycles_legacy")
 
 
+def _migrate_learning_epoch(db: sqlite3.Connection) -> None:
+    """Add the immutable learning epoch without deleting legacy evidence.
+
+    The original lesson table had a table-level three-column uniqueness
+    constraint.  Rebuilding both lesson tables lets one proposal key be
+    recorded once per epoch while preserving the old one-row legacy lane via
+    a partial unique index.  Existing rows copy a ``NULL`` epoch and are thus
+    quarantined until an active campaign explicitly asks for a matching
+    fingerprint.
+    """
+    lesson_exists = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='factory_lessons'"
+    ).fetchone()
+    outcome_exists = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='factory_lesson_outcomes'"
+    ).fetchone()
+    if not lesson_exists or not outcome_exists:
+        return
+    lesson_columns = {str(row["name"]) for row in
+                      db.execute("PRAGMA table_info(factory_lessons)")}
+    outcome_columns = {str(row["name"]) for row in
+                       db.execute("PRAGMA table_info(factory_lesson_outcomes)")}
+    if "learning_epoch" in lesson_columns:
+        if "learning_epoch" not in outcome_columns:
+            db.execute("ALTER TABLE factory_lesson_outcomes ADD COLUMN learning_epoch TEXT")
+        return
+
+    # ``foreign_keys`` must be disabled before the first DDL statement.  The
+    # connection has not performed a write yet in the constructor's context.
+    db.execute("PRAGMA foreign_keys=OFF")
+    for trigger in (
+            "factory_lessons_no_update", "factory_lessons_no_delete",
+            "factory_lesson_outcomes_no_update", "factory_lesson_outcomes_no_delete"):
+        db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for index in (
+            "factory_lessons_family", "factory_lessons_parent",
+            "factory_lessons_legacy_key", "factory_lessons_epoch_key"):
+        db.execute(f"DROP INDEX IF EXISTS {index}")
+    db.execute("ALTER TABLE factory_lesson_outcomes RENAME TO "
+               "factory_lesson_outcomes_legacy_epoch")
+    db.execute("ALTER TABLE factory_lessons RENAME TO factory_lessons_legacy_epoch")
+    db.execute("""CREATE TABLE factory_lessons (
+        lesson_id TEXT PRIMARY KEY,
+        hypothesis_id TEXT NOT NULL REFERENCES factory_hypotheses(hypothesis_id),
+        vehicle TEXT NOT NULL CHECK(vehicle IN ('equity','option')),
+        family TEXT NOT NULL,
+        variant_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        source TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        changed_json TEXT NOT NULL,
+        diagnosis_json TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        parent_lesson_id TEXT REFERENCES factory_lessons(lesson_id),
+        learning_epoch TEXT
+    )""")
+    db.execute("""CREATE TABLE factory_lesson_outcomes (
+        outcome_id TEXT PRIMARY KEY,
+        lesson_id TEXT NOT NULL REFERENCES factory_lessons(lesson_id),
+        passed INTEGER NOT NULL,
+        underpowered INTEGER NOT NULL,
+        classification TEXT NOT NULL,
+        fit_delta REAL,
+        heldout_delta REAL,
+        heldout_net_pnl REAL,
+        q_value REAL,
+        failed_checks_json TEXT NOT NULL,
+        gate_hash TEXT,
+        learning_epoch TEXT,
+        created_at REAL NOT NULL,
+        UNIQUE(lesson_id)
+    )""")
+    db.execute("""INSERT INTO factory_lessons
+        (lesson_id,hypothesis_id,vehicle,family,variant_id,kind,source,reason,
+         changed_json,diagnosis_json,evidence_json,created_at,parent_lesson_id,
+         learning_epoch)
+        SELECT lesson_id,hypothesis_id,vehicle,family,variant_id,kind,source,reason,
+               changed_json,diagnosis_json,evidence_json,created_at,parent_lesson_id,
+               NULL
+          FROM factory_lessons_legacy_epoch""")
+    db.execute("""INSERT INTO factory_lesson_outcomes
+        (outcome_id,lesson_id,passed,underpowered,classification,fit_delta,
+         heldout_delta,heldout_net_pnl,q_value,failed_checks_json,gate_hash,
+         learning_epoch,created_at)
+        SELECT outcome_id,lesson_id,passed,underpowered,classification,fit_delta,
+               heldout_delta,heldout_net_pnl,q_value,failed_checks_json,gate_hash,
+               NULL,created_at
+          FROM factory_lesson_outcomes_legacy_epoch""")
+    db.execute("DROP TABLE factory_lesson_outcomes_legacy_epoch")
+    db.execute("DROP TABLE factory_lessons_legacy_epoch")
+    db.execute("""CREATE INDEX factory_lessons_family
+        ON factory_lessons(vehicle,family,created_at)""")
+    db.execute("""CREATE UNIQUE INDEX factory_lessons_legacy_key
+        ON factory_lessons(hypothesis_id,variant_id,kind)
+        WHERE learning_epoch IS NULL""")
+    db.execute("""CREATE UNIQUE INDEX factory_lessons_epoch_key
+        ON factory_lessons(hypothesis_id,variant_id,kind,learning_epoch)
+        WHERE learning_epoch IS NOT NULL""")
+    db.execute("""CREATE INDEX factory_lessons_parent
+        ON factory_lessons(parent_lesson_id)""")
+    db.executescript("""
+        CREATE TRIGGER factory_lessons_no_update
+            BEFORE UPDATE ON factory_lessons BEGIN
+            SELECT RAISE(ABORT, 'factory lessons are immutable');
+        END;
+        CREATE TRIGGER factory_lessons_no_delete
+            BEFORE DELETE ON factory_lessons BEGIN
+            SELECT RAISE(ABORT, 'factory lessons are immutable');
+        END;
+        CREATE TRIGGER factory_lesson_outcomes_no_update
+            BEFORE UPDATE ON factory_lesson_outcomes BEGIN
+            SELECT RAISE(ABORT, 'factory lesson outcomes are immutable');
+        END;
+        CREATE TRIGGER factory_lesson_outcomes_no_delete
+            BEFORE DELETE ON factory_lesson_outcomes BEGIN
+            SELECT RAISE(ABORT, 'factory lesson outcomes are immutable');
+        END;
+    """)
+    db.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_variant_closure_epoch(db: sqlite3.Connection) -> None:
+    """Scope immutable variant closures to the same assumptions epoch.
+
+    Closures are lifecycle evidence rather than lessons, but an old scientific
+    or budget closure can otherwise remove a current-epoch candidate before
+    its new economics are evaluated.  Existing closures remain intact with a
+    ``NULL`` epoch and are audit-only, exactly like legacy lesson rows.
+    """
+    exists = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='factory_variant_closures'"
+    ).fetchone()
+    if not exists:
+        return
+    columns = {str(row["name"]) for row in
+               db.execute("PRAGMA table_info(factory_variant_closures)")}
+    if "learning_epoch" in columns:
+        return
+    db.execute("PRAGMA foreign_keys=OFF")
+    for trigger in ("factory_variant_closures_no_update",
+                    "factory_variant_closures_no_delete"):
+        db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    db.execute("DROP INDEX IF EXISTS factory_variant_closures_vehicle")
+    db.execute("ALTER TABLE factory_variant_closures RENAME TO "
+               "factory_variant_closures_legacy_epoch")
+    db.execute("""CREATE TABLE factory_variant_closures (
+        closure_id TEXT PRIMARY KEY,
+        hypothesis_id TEXT NOT NULL REFERENCES factory_hypotheses(hypothesis_id),
+        vehicle TEXT NOT NULL CHECK(vehicle IN ('equity','option')),
+        variant_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('scientific','budget','recenter')),
+        reason TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        evidence_json TEXT NOT NULL,
+        learning_epoch TEXT,
+        created_at REAL NOT NULL
+    )""")
+    db.execute("""INSERT INTO factory_variant_closures
+        (closure_id,hypothesis_id,vehicle,variant_id,mode,reason,attempts,
+         evidence_json,learning_epoch,created_at)
+        SELECT closure_id,hypothesis_id,vehicle,variant_id,mode,reason,attempts,
+               evidence_json,NULL,created_at
+          FROM factory_variant_closures_legacy_epoch""")
+    db.execute("DROP TABLE factory_variant_closures_legacy_epoch")
+    db.execute("""CREATE INDEX factory_variant_closures_vehicle
+        ON factory_variant_closures(vehicle,variant_id)""")
+    db.execute("""CREATE UNIQUE INDEX factory_variant_closures_legacy_key
+        ON factory_variant_closures(hypothesis_id,variant_id)
+        WHERE learning_epoch IS NULL""")
+    db.execute("""CREATE UNIQUE INDEX factory_variant_closures_epoch_key
+        ON factory_variant_closures(hypothesis_id,variant_id,learning_epoch)
+        WHERE learning_epoch IS NOT NULL""")
+    db.executescript("""
+        CREATE TRIGGER factory_variant_closures_no_update
+            BEFORE UPDATE ON factory_variant_closures BEGIN
+            SELECT RAISE(ABORT, 'factory variant closures are immutable');
+        END;
+        CREATE TRIGGER factory_variant_closures_no_delete
+            BEFORE DELETE ON factory_variant_closures BEGIN
+            SELECT RAISE(ABORT, 'factory variant closures are immutable');
+        END;
+    """)
+    db.execute("PRAGMA foreign_keys=ON")
+
+
 class FactoryLedger:
     """Store immutable hypotheses, accounts, events, and completed cycles."""
 
@@ -535,6 +782,7 @@ class FactoryLedger:
                     trades INTEGER NOT NULL,
                     worker_pid INTEGER NOT NULL,
                     result_json TEXT NOT NULL,
+                    learning_epoch TEXT,
                     created_at REAL NOT NULL,
                     UNIQUE(cycle_id,variant_id,vehicle)
                 );
@@ -547,8 +795,8 @@ class FactoryLedger:
                     reason TEXT NOT NULL,
                     attempts INTEGER NOT NULL,
                     evidence_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    UNIQUE(hypothesis_id,variant_id)
+                    learning_epoch TEXT,
+                    created_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS factory_variant_closures_vehicle
                     ON factory_variant_closures(vehicle,variant_id);
@@ -605,7 +853,7 @@ class FactoryLedger:
                     -- chain of learning is a durable edge in the ledger rather
                     -- than an assertion in a prompt.
                     parent_lesson_id TEXT REFERENCES factory_lessons(lesson_id),
-                    UNIQUE(hypothesis_id,variant_id,kind)
+                    learning_epoch TEXT
                 );
                 CREATE TABLE IF NOT EXISTS factory_lesson_outcomes (
                     outcome_id TEXT PRIMARY KEY,
@@ -619,6 +867,7 @@ class FactoryLedger:
                     q_value REAL,
                     failed_checks_json TEXT NOT NULL,
                     gate_hash TEXT,
+                    learning_epoch TEXT,
                     created_at REAL NOT NULL,
                     UNIQUE(lesson_id)
                 );
@@ -711,6 +960,27 @@ class FactoryLedger:
                 db.execute(
                     "ALTER TABLE factory_lesson_outcomes ADD COLUMN "
                     "classification TEXT NOT NULL DEFAULT 'legacy_unclassified'")
+            _migrate_learning_epoch(db)
+            account_columns = {str(row["name"]) for row in
+                               db.execute("PRAGMA table_info(factory_accounts)")}
+            if account_columns and "learning_epoch" not in account_columns:
+                # Existing account rows remain immutable audit records.  A
+                # NULL epoch deliberately cannot count toward a later active
+                # campaign's retry/closure budget.
+                db.execute("ALTER TABLE factory_accounts ADD COLUMN learning_epoch TEXT")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS factory_lessons_legacy_key
+                ON factory_lessons(hypothesis_id,variant_id,kind)
+                WHERE learning_epoch IS NULL""")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS factory_lessons_epoch_key
+                ON factory_lessons(hypothesis_id,variant_id,kind,learning_epoch)
+                WHERE learning_epoch IS NOT NULL""")
+            _migrate_variant_closure_epoch(db)
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS factory_variant_closures_legacy_key
+                ON factory_variant_closures(hypothesis_id,variant_id)
+                WHERE learning_epoch IS NULL""")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS factory_variant_closures_epoch_key
+                ON factory_variant_closures(hypothesis_id,variant_id,learning_epoch)
+                WHERE learning_epoch IS NOT NULL""")
             db.execute("""CREATE TABLE IF NOT EXISTS factory_fdr (
                 decision_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
                 test_id TEXT NOT NULL, p_value REAL NOT NULL,
@@ -875,7 +1145,9 @@ class FactoryLedger:
     def retire_hypothesis(self, hypothesis_id: str, *, cycle_id: str,
                           expected_variants: int, reason: str,
                           payload: Mapping | None = None,
-                          mode: str = "scientific") -> None:
+                          mode: str = "scientific",
+                          learning_epoch: Any = None,
+                          epoch_fingerprint: Any = None) -> None:
         """Close a hypothesis after mode-specific durable verification.
 
         ``scientific`` preserves the historical strict retirement guard: every
@@ -884,29 +1156,77 @@ class FactoryLedger:
         an immutable closure row (scientific or budget), while ``recenter``
         requires a same-family successor and a fit-only child selection.  The
         latter two modes never relabel underpowered evidence as a statistical
-        rejection.
+        rejection.  When multiple successor rows exist, ``payload`` must bind
+        the exact child through ``replacement_hypothesis_id``.
         """
         if not reason.strip():
             raise FactoryError("factory retirement reason is required")
         mode = str(mode)
         if mode not in {"scientific", "budget", "recenter"}:
             raise FactoryError("unknown hypothesis retirement mode")
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
+        payload_body = dict(payload or {})
+        replacement_value = payload_body.get("replacement_hypothesis_id")
+        replacement_id = (str(replacement_value).strip()
+                          if replacement_value is not None else "")
+        if replacement_value is not None and not replacement_id:
+            raise FactoryError("retirement replacement_hypothesis_id is required")
         with closing(_connect(self.path)) as db:
-            child = db.execute("""SELECT * FROM factory_hypotheses
-                WHERE parent_hypothesis_id=? ORDER BY created_at DESC LIMIT 1""",
-                (hypothesis_id,)).fetchone()
-            rows = db.execute("""SELECT result_json FROM factory_accounts
-                WHERE cycle_id=? AND hypothesis_id=? ORDER BY variant_id""",
-                (cycle_id, hypothesis_id)).fetchall()
+            children = db.execute("""SELECT * FROM factory_hypotheses
+                WHERE parent_hypothesis_id=?
+                ORDER BY created_at DESC,hypothesis_id DESC""",
+                (hypothesis_id,)).fetchall()
+            if replacement_id:
+                child = next((row for row in children
+                              if str(row["hypothesis_id"]) == replacement_id), None)
+                if child is None:
+                    raise FactoryError(
+                        "retirement replacement successor is not a child of hypothesis")
+            elif len(children) == 1:
+                # Preserve the old call shape only while the successor is
+                # unambiguous.  Once multiple campaigns have produced
+                # children, silently choosing the newest row can retire a
+                # parent against the wrong campaign's replacement.
+                child = children[0]
+            elif len(children) > 1:
+                raise FactoryError(
+                    "retirement requires explicit replacement_hypothesis_id "
+                    "when multiple successors exist")
+            else:
+                child = None
+            # Retirement is an active-campaign decision.  Account rows from a
+            # different assumptions epoch (or legacy NULL rows) must not
+            # satisfy its intended-variant count, regardless of retirement
+            # mode.  With no epoch, retain the legacy lane explicitly rather
+            # than treating NULL as an unscoped wildcard.
+            account_query = (
+                """SELECT result_json FROM factory_accounts
+                    WHERE cycle_id=? AND hypothesis_id=? """
+                + ("AND learning_epoch=? " if epoch is not None
+                   else "AND learning_epoch IS NULL ")
+                + "ORDER BY variant_id")
+            account_parameters: tuple[Any, ...] = (cycle_id, hypothesis_id)
+            if epoch is not None:
+                account_parameters += (epoch,)
+            rows = db.execute(account_query, account_parameters).fetchall()
         if child is None:
             raise FactoryError("hypothesis cannot retire before its replacement is registered")
         if len(rows) != int(expected_variants) or int(expected_variants) < 1:
             raise FactoryError("hypothesis retirement requires every intended variant account")
         if mode == "budget":
             with closing(_connect(self.path)) as db:
-                closures = db.execute(
+                closure_query = (
                     "SELECT variant_id,mode FROM factory_variant_closures "
-                    "WHERE hypothesis_id=?", (hypothesis_id,)).fetchall()
+                    "WHERE hypothesis_id=? "
+                    + ("AND learning_epoch=?" if epoch is not None
+                       else "AND learning_epoch IS NULL"))
+                closure_parameters: tuple[Any, ...] = (hypothesis_id,)
+                if epoch is not None:
+                    closure_parameters += (epoch,)
+                closures = db.execute(
+                    closure_query, closure_parameters).fetchall()
             closed = {str(row["variant_id"]): str(row["mode"]) for row in closures}
             account_ids = set()
             for row in rows:
@@ -916,7 +1236,9 @@ class FactoryLedger:
                     raise FactoryError("hypothesis budget closure evidence is incomplete") from exc
             if not account_ids.issubset(closed) or len(account_ids) != int(expected_variants):
                 raise FactoryError("hypothesis budget retirement requires every variant closure")
-            detail = {**dict(payload or {}), "mode": mode, "cycle_id": cycle_id,
+            detail = {**payload_body,
+                      "replacement_hypothesis_id": str(child["hypothesis_id"]),
+                      "mode": mode, "cycle_id": cycle_id,
                       "expected_variants": int(expected_variants),
                       "closed_variant_ids": sorted(account_ids),
                       "closure_modes": {key: closed[key] for key in sorted(account_ids)}}
@@ -947,7 +1269,9 @@ class FactoryLedger:
                 raise FactoryError("recenter successor rule spec is invalid") from exc
             if to_variant != child_variant:
                 raise FactoryError("recenter target variant does not match successor spec")
-            detail = {**detail_payload, "mode": mode, "cycle_id": cycle_id,
+            detail = {**detail_payload,
+                      "replacement_hypothesis_id": str(child["hypothesis_id"]),
+                      "mode": mode, "cycle_id": cycle_id,
                       "expected_variants": int(expected_variants),
                       "from_variant_id": from_variant,
                       "to_variant_id": to_variant}
@@ -984,7 +1308,9 @@ class FactoryLedger:
                     "hypothesis retirement requires a powered upper-bound "
                     "rejection across multiple negative windows")
             gate_hashes.append(str(envelope["content_hash"]))
-        detail = {**dict(payload or {}), "cycle_id": cycle_id,
+        detail = {**payload_body,
+                  "replacement_hypothesis_id": str(child["hypothesis_id"]),
+                  "cycle_id": cycle_id,
                   "expected_variants": int(expected_variants),
                   "verified_gate_hashes": sorted(gate_hashes)}
         self._append_event(hypothesis_id, "retired", reason, detail)
@@ -1047,12 +1373,35 @@ class FactoryLedger:
                        if int(item["slot"]) == int(slot)]
         return max(generations) + 1 if generations else 0
 
-    def slot_families(self, vehicle: str, slot: int) -> set[str]:
-        return {str(item["family"]) for item in self.hypotheses(vehicle=vehicle)
-                if int(item["slot"]) == int(slot)}
+    def slot_families(self, vehicle: str, slot: int, *,
+                      learning_epoch: Any = None,
+                      epoch_fingerprint: Any = None) -> set[str]:
+        """Return families tried by a slot, scoped for active discovery.
+
+        With an explicit epoch, only immutable lessons written in that exact
+        epoch count as tried.  Historical hypothesis rows remain available to
+        audit, but an old false-negative family cannot block rediscovery after
+        feed/economics/geometry/grammar assumptions change.
+        """
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
+        if epoch is None:
+            return {str(item["family"])
+                    for item in self.hypotheses(vehicle=vehicle)
+                    if int(item["slot"]) == int(slot)}
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                """SELECT DISTINCT h.family
+                   FROM factory_hypotheses h
+                   JOIN factory_lessons l ON l.hypothesis_id=h.hypothesis_id
+                   WHERE h.vehicle=? AND h.slot=? AND l.learning_epoch=?""",
+                (str(vehicle), int(slot), epoch)).fetchall()
+        return {str(row["family"]) for row in rows}
 
     def novel_tuning_values(self, *, hypothesis_id: str, vehicle: str,
-                            family: str) -> set[str]:
+                            family: str, learning_epoch: Any = None,
+                            epoch_fingerprint: Any = None) -> set[str]:
         """Return model-authored novel values already spent in this lineage.
 
         Prompt briefs are intentionally short, so counting only their latest
@@ -1073,13 +1422,22 @@ class FactoryLedger:
             current = str(parent) if parent else ""
         if not lineage:
             return set()
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
+        # The old call shape has no assumptions boundary.  Do not let it
+        # consume quarantined history; a current caller must opt into the
+        # exact epoch explicitly.
+        if epoch is None:
+            return set()
         placeholders = ",".join("?" for _ in lineage)
-        parameters: list[Any] = [str(vehicle), str(family), *sorted(lineage)]
+        parameters: list[Any] = [str(vehicle), str(family), epoch, *sorted(lineage)]
         values: set[str] = set()
         with closing(_connect(self.path)) as db:
             rows = db.execute(
                 "SELECT lesson_id,changed_json,evidence_json FROM factory_lessons "
-                "WHERE vehicle=? AND family=? AND hypothesis_id IN (" +
+                "WHERE vehicle=? AND family=? AND learning_epoch=? "
+                "AND hypothesis_id IN (" +
                 placeholders + ")", parameters).fetchall()
         for row in rows:
             try:
@@ -1121,7 +1479,9 @@ class FactoryLedger:
                       changed: Mapping | None = None,
                       diagnosis: Mapping | None = None,
                       evidence: Mapping | None = None,
-                      parent_lesson_id: str | None = None) -> str:
+                      parent_lesson_id: str | None = None,
+                      learning_epoch: Any = None,
+                      epoch_fingerprint: Any = None) -> str:
         """Record why something was tried, before anyone knows if it worked.
 
         Writing the reason at proposal time is what makes it evidence rather
@@ -1138,11 +1498,22 @@ class FactoryLedger:
             raise FactoryError("vehicle must be equity or option")
         if self.hypothesis(hypothesis_id) is None:
             raise KeyError(hypothesis_id)
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
         with closing(_connect(self.path)) as db, db:
-            existing = db.execute(
-                """SELECT lesson_id FROM factory_lessons
-                   WHERE hypothesis_id=? AND variant_id=? AND kind=?""",
-                (hypothesis_id, str(variant_id), kind)).fetchone()
+            if epoch is None:
+                existing = db.execute(
+                    """SELECT lesson_id FROM factory_lessons
+                       WHERE hypothesis_id=? AND variant_id=? AND kind=?
+                         AND learning_epoch IS NULL""",
+                    (hypothesis_id, str(variant_id), kind)).fetchone()
+            else:
+                existing = db.execute(
+                    """SELECT lesson_id FROM factory_lessons
+                       WHERE hypothesis_id=? AND variant_id=? AND kind=?
+                         AND learning_epoch=?""",
+                    (hypothesis_id, str(variant_id), kind, epoch)).fetchone()
             if existing is not None:
                 # Replaying an exact underpowered/inconclusive point is
                 # scientifically retryable, but the immutable first lesson
@@ -1151,22 +1522,40 @@ class FactoryLedger:
                 # the authoritative confirmatory budget.
                 if parent_lesson_id and kind == "tuning":
                     retry_kind = "tuning_retry"
-                    retry = db.execute(
+                    retry_query = (
                         "SELECT lesson_id FROM factory_lessons WHERE "
-                        "hypothesis_id=? AND variant_id=? AND kind=?",
-                        (hypothesis_id, str(variant_id), retry_kind)).fetchone()
+                        "hypothesis_id=? AND variant_id=? AND kind=? "
+                        + ("AND learning_epoch IS NULL" if epoch is None
+                           else "AND learning_epoch=?"))
+                    retry_parameters = (hypothesis_id, str(variant_id), retry_kind)
+                    if epoch is not None:
+                        retry_parameters += (epoch,)
+                    retry = db.execute(retry_query, retry_parameters).fetchone()
                     if retry is not None:
                         return str(retry["lesson_id"])
                     kind = retry_kind
                 else:
                     return str(existing["lesson_id"])
+            if parent_lesson_id:
+                parent = db.execute(
+                    "SELECT learning_epoch FROM factory_lessons WHERE lesson_id=?",
+                    (str(parent_lesson_id),)).fetchone()
+                if parent is None:
+                    raise KeyError(parent_lesson_id)
+                parent_epoch = (str(parent["learning_epoch"])
+                                if parent["learning_epoch"] is not None else None)
+                # A proposal in one assumptions epoch may not cite a lesson
+                # from another epoch.  Drop the edge rather than allowing a
+                # stale citation to enter the active chain.
+                if parent_epoch != epoch:
+                    parent_lesson_id = None
             lesson_id = uuid.uuid4().hex
             db.execute(
                 """INSERT INTO factory_lessons
                    (lesson_id,hypothesis_id,vehicle,family,variant_id,kind,
                     source,reason,changed_json,diagnosis_json,evidence_json,
-                    created_at,parent_lesson_id)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    created_at,parent_lesson_id,learning_epoch)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     lesson_id, hypothesis_id, vehicle, str(family),
                     str(variant_id), kind, source,
                     " ".join(str(reason).split()),
@@ -1175,10 +1564,13 @@ class FactoryLedger:
                     canonical_json(dict(evidence or {})),
                     datetime.now().timestamp(),
                     str(parent_lesson_id) if parent_lesson_id else None,
+                    epoch,
                 ))
             return lesson_id
 
-    def resolve_lesson_ref(self, ref: str) -> str | None:
+    def resolve_lesson_ref(self, ref: str, *, learning_epoch: Any = None,
+                           epoch_fingerprint: Any = None,
+                           include_quarantined: bool = False) -> str | None:
         """Map a short citation back to the lesson it names, or ``None``.
 
         Proposals cite the truncated id the brief carried, so the citation has
@@ -1189,21 +1581,38 @@ class FactoryLedger:
         text = str(ref or "").strip().lower()
         if not text:
             return None
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
+        if epoch is None and not include_quarantined:
+            return None
         with closing(_connect(self.path)) as db:
-            rows = db.execute(
-                "SELECT lesson_id FROM factory_lessons WHERE lesson_id LIKE ? || '%'"
-                " LIMIT 2", (text,)).fetchall()
+            query = ("SELECT lesson_id FROM factory_lessons "
+                     "WHERE lesson_id LIKE ? || '%' ")
+            parameters: list[Any] = [text]
+            if epoch is not None:
+                query += "AND learning_epoch=? "
+                parameters.append(epoch)
+            query += "LIMIT 2"
+            rows = db.execute(query, parameters).fetchall()
         return str(rows[0]["lesson_id"]) if len(rows) == 1 else None
 
     def failed_variant_ids(self, *, vehicle: str,
-                           family: str | None = None) -> set[str]:
+                           family: str | None = None,
+                           learning_epoch: Any = None,
+                           epoch_fingerprint: Any = None) -> set[str]:
         """Variants whose powered evidence rejected a useful edge.
 
         A merely adequate non-pass can still be positive or statistically
         inconclusive. Only an explicit upper-bound rejection closes a parameter
         point; legacy, underpowered and inconclusive results remain retestable.
         """
-        parameters: list[Any] = [vehicle]
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
+        if epoch is None:
+            return set()
+        parameters: list[Any] = [vehicle, epoch, epoch]
         clause = ""
         if family is not None:
             clause = " AND l.family=?"
@@ -1213,6 +1622,8 @@ class FactoryLedger:
                 """SELECT DISTINCT l.variant_id FROM factory_lessons l
                    JOIN factory_lesson_outcomes o ON o.lesson_id=l.lesson_id
                    WHERE l.vehicle=?
+                     AND l.learning_epoch=?
+                     AND o.learning_epoch=?
                      AND o.classification='adequate_negative_rejection'"""
                 + clause, parameters).fetchall()
             # Budget-closed exact variants are also terminal for selection,
@@ -1220,22 +1631,39 @@ class FactoryLedger:
             closed = db.execute(
                 "SELECT DISTINCT c.variant_id FROM factory_variant_closures c "
                 "JOIN factory_hypotheses h ON h.hypothesis_id=c.hypothesis_id "
-                "WHERE c.vehicle=? AND c.mode IN ('budget','scientific')" +
+                "WHERE c.vehicle=? AND c.learning_epoch=? "
+                "AND c.mode IN ('budget','scientific')" +
                 (" AND h.family=?" if family is not None else ""),
-                parameters).fetchall()
+                [vehicle, epoch] + ([family] if family is not None else [])).fetchall()
         return ({str(row["variant_id"]) for row in rows} |
                 {str(row["variant_id"]) for row in closed})
 
-    def account_attempts(self, hypothesis_id: str, variant_id: str) -> int:
-        """Count all durable account rows for one exact variant."""
+    def account_attempts(self, hypothesis_id: str, variant_id: str,
+                         *, learning_epoch: Any = None,
+                         epoch_fingerprint: Any = None) -> int:
+        """Count durable account rows, optionally scoped to an active epoch.
+
+        The unscoped form remains an audit/backward-compatible total.  Factory
+        active-budget callers must provide the exact epoch; legacy or other
+        epoch rows then cannot re-close a newly reopened variant.
+        """
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
+        where = "hypothesis_id=? AND variant_id=?"
+        parameters: list[Any] = [str(hypothesis_id), str(variant_id)]
+        if epoch is not None:
+            where += " AND learning_epoch=?"
+            parameters.append(epoch)
         with closing(_connect(self.path)) as db:
             row = db.execute(
                 "SELECT COUNT(*) AS n FROM factory_accounts "
-                "WHERE hypothesis_id=? AND variant_id=?",
-                (str(hypothesis_id), str(variant_id))).fetchone()
+                "WHERE " + where, parameters).fetchone()
         return int(row["n"] if row else 0)
 
-    def variant_attempts(self, hypothesis_id: str, variant_id: str) -> int:
+    def variant_attempts(self, hypothesis_id: str, variant_id: str, *,
+                         learning_epoch: Any = None,
+                         epoch_fingerprint: Any = None) -> int:
         """Count eligible confirmatory attempts for one exact variant.
 
         Underpowered accounts are diagnostic observations and do not spend the
@@ -1244,11 +1672,18 @@ class FactoryLedger:
         from each immutable account result, so a restart cannot lose or
         inflate the eligible prefix.
         """
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
+        clause = "hypothesis_id=? AND variant_id=?"
+        parameters: list[Any] = [str(hypothesis_id), str(variant_id)]
+        if epoch is not None:
+            clause += " AND learning_epoch=?"
+            parameters.append(epoch)
         with closing(_connect(self.path)) as db:
             rows = db.execute(
                 "SELECT result_json FROM factory_accounts "
-                "WHERE hypothesis_id=? AND variant_id=?",
-                (str(hypothesis_id), str(variant_id))).fetchall()
+                "WHERE " + clause, parameters).fetchall()
         eligible = 0
         for row in rows:
             try:
@@ -1267,7 +1702,9 @@ class FactoryLedger:
     def close_variant(self, hypothesis_id: str, variant_id: str, *,
                       vehicle: str, mode: str, reason: str,
                       attempts: int | None = None,
-                      evidence: Mapping | None = None) -> dict[str, Any]:
+                      evidence: Mapping | None = None,
+                      learning_epoch: Any = None,
+                      epoch_fingerprint: Any = None) -> dict[str, Any]:
         """Persist one exact variant's terminal closure idempotently.
 
         Closure is append-only and intentionally separate from lessons: a
@@ -1282,7 +1719,11 @@ class FactoryLedger:
             raise FactoryError("variant closure reason is required")
         if self.hypothesis(hypothesis_id) is None:
             raise KeyError(hypothesis_id)
-        eligible_count = self.variant_attempts(hypothesis_id, variant_id)
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
+        eligible_count = self.variant_attempts(
+            hypothesis_id, variant_id, learning_epoch=epoch)
         if attempts is not None:
             try:
                 requested_count = int(attempts)
@@ -1293,11 +1734,19 @@ class FactoryLedger:
                     "variant closure attempts must match durable eligible "
                     f"confirmatory count ({eligible_count})")
         count = eligible_count
-        total_count = self.account_attempts(hypothesis_id, variant_id)
+        total_count = self.account_attempts(
+            hypothesis_id, variant_id, learning_epoch=epoch)
         with closing(_connect(self.path)) as db, db:
-            existing = db.execute(
-                "SELECT * FROM factory_variant_closures WHERE hypothesis_id=? AND variant_id=?",
-                (str(hypothesis_id), str(variant_id))).fetchone()
+            closure_query = (
+                "SELECT * FROM factory_variant_closures "
+                "WHERE hypothesis_id=? AND variant_id=? "
+                + ("AND learning_epoch=?" if epoch is not None
+                   else "AND learning_epoch IS NULL"))
+            closure_parameters: tuple[Any, ...] = (
+                str(hypothesis_id), str(variant_id))
+            if epoch is not None:
+                closure_parameters += (epoch,)
+            existing = db.execute(closure_query, closure_parameters).fetchone()
             if existing is not None:
                 return dict(existing) | {"evidence": json.loads(existing["evidence_json"]),
                                          "account_attempts_total": total_count}
@@ -1305,17 +1754,19 @@ class FactoryLedger:
             db.execute(
                 """INSERT INTO factory_variant_closures
                    (closure_id,hypothesis_id,vehicle,variant_id,mode,reason,
-                    attempts,evidence_json,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                    attempts,evidence_json,learning_epoch,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (closure_id, str(hypothesis_id), str(vehicle), str(variant_id),
                  str(mode), " ".join(str(reason).split()), count,
-                    canonical_json({**dict(evidence or {}),
+                 canonical_json({**dict(evidence or {}),
                                     "eligible_confirmatory_attempts": count,
                                     "account_attempts_total": total_count}),
+                 epoch,
                  datetime.now().timestamp()))
             return {"closure_id": closure_id, "hypothesis_id": str(hypothesis_id),
                     "vehicle": str(vehicle), "variant_id": str(variant_id),
                     "mode": str(mode), "reason": " ".join(str(reason).split()),
+                    "learning_epoch": epoch,
                     "attempts": count,
                     "account_attempts_total": total_count,
                     "evidence": {**dict(evidence or {}),
@@ -1323,12 +1774,22 @@ class FactoryLedger:
                                   "account_attempts_total": total_count}}
 
     def variant_closures(self, *, vehicle: str | None = None,
-                         hypothesis_id: str | None = None) -> list[dict[str, Any]]:
+                         hypothesis_id: str | None = None,
+                         learning_epoch: Any = None,
+                         epoch_fingerprint: Any = None,
+                         include_quarantined: bool = False) -> list[dict[str, Any]]:
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
         where, params = [], []
         if vehicle is not None:
             where.append("vehicle=?"); params.append(str(vehicle))
         if hypothesis_id is not None:
             where.append("hypothesis_id=?"); params.append(str(hypothesis_id))
+        if epoch is not None:
+            if not include_quarantined:
+                where.append("learning_epoch=?")
+                params.append(epoch)
         clause = " WHERE " + " AND ".join(where) if where else ""
         with closing(_connect(self.path)) as db:
             rows = db.execute("SELECT * FROM factory_variant_closures" + clause +
@@ -1337,38 +1798,76 @@ class FactoryLedger:
         for row in rows:
             item = dict(row)
             item["evidence"] = json.loads(item.pop("evidence_json"))
+            item["active_for_epoch"] = (
+                None if epoch is None else item.get("learning_epoch") == epoch)
+            item["quarantined"] = (
+                item.get("learning_epoch") is None or
+                (epoch is not None and item.get("learning_epoch") != epoch))
             output.append(item)
         return output
 
     def closed_variant_ids(self, *, vehicle: str,
-                           hypothesis_id: str | None = None) -> set[str]:
+                           hypothesis_id: str | None = None,
+                           learning_epoch: Any = None,
+                           epoch_fingerprint: Any = None) -> set[str]:
+        if _resolve_learning_epoch(
+                learning_epoch=learning_epoch,
+                epoch_fingerprint=epoch_fingerprint) is None:
+            return set()
         return {str(item["variant_id"]) for item in self.variant_closures(
-            vehicle=vehicle, hypothesis_id=hypothesis_id)}
+            vehicle=vehicle, hypothesis_id=hypothesis_id,
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)}
 
     def grade_lesson(self, hypothesis_id: str, variant_id: str, *, kind: str,
-                     outcome: Mapping) -> str | None:
+                     outcome: Mapping, learning_epoch: Any = None,
+                     epoch_fingerprint: Any = None) -> str | None:
         """Attach the gate's verdict to the reason that predicted it.
 
         Returns ``None`` when nothing proposed this variant with a reason, so
         grading a deterministic path that predates lessons is a no-op rather
         than an error.
         """
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
         with closing(_connect(self.path)) as db, db:
-            lesson = db.execute(
-                """SELECT lesson_id FROM factory_lessons
-                   WHERE hypothesis_id=? AND variant_id=? AND kind=?""",
-                (hypothesis_id, str(variant_id), kind)).fetchone()
+            lesson_query = (
+                """SELECT lesson_id,learning_epoch FROM factory_lessons
+                   WHERE hypothesis_id=? AND variant_id=? AND kind=? """
+                + ("AND learning_epoch IS NULL" if epoch is None
+                   else "AND learning_epoch=?"))
+            lesson_parameters: tuple[Any, ...] = (
+                hypothesis_id, str(variant_id), kind)
+            if epoch is not None:
+                lesson_parameters += (epoch,)
+            lesson = db.execute(lesson_query, lesson_parameters).fetchone()
             if lesson is None and kind == "tuning":
-                lesson = db.execute(
-                    """SELECT lesson_id FROM factory_lessons
-                       WHERE hypothesis_id=? AND variant_id=? AND kind='tuning_retry'
-                       ORDER BY created_at DESC LIMIT 1""",
-                    (hypothesis_id, str(variant_id))).fetchone()
+                retry_query = (
+                    """SELECT lesson_id,learning_epoch FROM factory_lessons
+                       WHERE hypothesis_id=? AND variant_id=? AND kind='tuning_retry' """
+                    + ("AND learning_epoch IS NULL" if epoch is None
+                       else "AND learning_epoch=?")
+                    + " ORDER BY created_at DESC LIMIT 1")
+                retry_parameters: tuple[Any, ...] = (
+                    hypothesis_id, str(variant_id))
+                if epoch is not None:
+                    retry_parameters += (epoch,)
+                lesson = db.execute(retry_query, retry_parameters).fetchone()
             if lesson is None:
                 return None
             lesson_id = str(lesson["lesson_id"])
-            if db.execute("SELECT 1 FROM factory_lesson_outcomes WHERE lesson_id=?",
-                          (lesson_id,)).fetchone() is not None:
+            existing_outcome = db.execute(
+                "SELECT learning_epoch FROM factory_lesson_outcomes "
+                "WHERE lesson_id=?", (lesson_id,)).fetchone()
+            if existing_outcome is not None:
+                stored_epoch = (str(existing_outcome["learning_epoch"])
+                                if existing_outcome["learning_epoch"] is not None
+                                else None)
+                if stored_epoch != epoch:
+                    # Immutable historical grades are never rewritten under a
+                    # new campaign's assumptions.
+                    return None
                 return lesson_id
             classification = str(outcome.get("classification") or (
                 "proved" if outcome.get("passed") else
@@ -1377,7 +1876,8 @@ class FactoryLedger:
             db.execute("""INSERT INTO factory_lesson_outcomes (
                     outcome_id,lesson_id,passed,underpowered,classification,
                     fit_delta,heldout_delta,heldout_net_pnl,q_value,failed_checks_json,
-                    gate_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    gate_hash,learning_epoch,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 uuid.uuid4().hex, lesson_id,
                 1 if outcome.get("passed") else 0,
                 1 if outcome.get("underpowered") else 0,
@@ -1387,14 +1887,31 @@ class FactoryLedger:
                 _real(outcome.get("q_value")),
                 canonical_json(list(outcome.get("failed_checks") or [])),
                 str(outcome["gate_hash"]) if outcome.get("gate_hash") else None,
+                epoch,
                 datetime.now().timestamp(),
             ))
             return lesson_id
 
     def lessons(self, *, vehicle: str | None = None, family: str | None = None,
                 hypothesis_id: str | None = None, graded_only: bool = False,
+                learning_epoch: Any = None,
+                epoch_fingerprint: Any = None,
+                include_quarantined: bool = False,
+                audit: bool = False,
                 limit: int = 50) -> list[dict]:
-        """Return graded proposal reasons, most recent first."""
+        """Return proposal reasons, optionally scoped to one learning epoch.
+
+        A campaign-scoped query is exact-match only.  Calling the graded API
+        without an epoch is intentionally fail-closed (unless the caller
+        explicitly asks for quarantined audit rows); this prevents an older
+        worker from feeding legacy or differently-priced outcomes into a new
+        proposal.  Unfiltered, ungraded reads remain available for existing
+        audit/report callers.
+        """
+        include_quarantined = bool(include_quarantined or audit)
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
         where = []
         parameters: list[Any] = []
         for column, value in (("l.vehicle", vehicle), ("l.family", family),
@@ -1402,8 +1919,20 @@ class FactoryLedger:
             if value is not None:
                 where.append(f"{column}=?")
                 parameters.append(value)
+        if epoch is not None:
+            if not include_quarantined:
+                where.append("l.learning_epoch=?")
+                parameters.append(epoch)
+        elif graded_only and not include_quarantined:
+            # No current assumptions were supplied.  Legacy rows remain
+            # queryable through the explicit audit lane, never as active
+            # graded material.
+            where.append("1=0")
         if graded_only:
             where.append("o.outcome_id IS NOT NULL")
+            if epoch is not None and not include_quarantined:
+                where.append("o.learning_epoch=?")
+                parameters.append(epoch)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         parameters.append(max(1, int(limit)))
         with closing(_connect(self.path)) as db:
@@ -1411,7 +1940,8 @@ class FactoryLedger:
                 """SELECT l.*, o.passed, o.underpowered, o.classification,
                           o.fit_delta, o.heldout_delta,
                           o.heldout_net_pnl, o.q_value, o.failed_checks_json,
-                          o.gate_hash, o.outcome_id
+                          o.gate_hash, o.learning_epoch AS outcome_learning_epoch,
+                          o.outcome_id
                    FROM factory_lessons l
                    LEFT JOIN factory_lesson_outcomes o ON o.lesson_id=l.lesson_id"""
                 + clause + " ORDER BY l.created_at DESC, l.lesson_id DESC LIMIT ?",
@@ -1422,6 +1952,12 @@ class FactoryLedger:
             item["changed"] = json.loads(item.pop("changed_json"))
             item["diagnosis"] = json.loads(item.pop("diagnosis_json"))
             item["evidence"] = json.loads(item.pop("evidence_json"))
+            item["epoch_fingerprint"] = item.get("learning_epoch")
+            item["active_for_epoch"] = (
+                None if epoch is None else item.get("learning_epoch") == epoch)
+            item["quarantined"] = (
+                item.get("learning_epoch") is None or
+                (epoch is not None and item.get("learning_epoch") != epoch))
             failed = item.pop("failed_checks_json")
             graded = item.pop("outcome_id") is not None
             item["outcome"] = ({
@@ -1434,21 +1970,35 @@ class FactoryLedger:
                 "q_value": item["q_value"],
                 "failed_checks": json.loads(failed) if failed else [],
                 "gate_hash": item["gate_hash"],
+                "learning_epoch": item["outcome_learning_epoch"],
             } if graded else None)
             for key in ("passed", "underpowered", "classification", "fit_delta", "heldout_delta",
-                        "heldout_net_pnl", "q_value", "gate_hash"):
+                        "heldout_net_pnl", "q_value", "gate_hash",
+                        "outcome_learning_epoch"):
                 item.pop(key, None)
             output.append(item)
         return output
 
-    def add_account(self, cycle_id: str, hypothesis_id: str, result: Mapping) -> None:
+    def add_account(self, cycle_id: str, hypothesis_id: str, result: Mapping,
+                    *, learning_epoch: Any = None,
+                    epoch_fingerprint: Any = None) -> None:
+        epoch = _resolve_learning_epoch(
+            learning_epoch=(learning_epoch if learning_epoch is not None else
+                            result.get("learning_epoch") if isinstance(result, Mapping)
+                            else None),
+            epoch_fingerprint=epoch_fingerprint)
         account = result["account"]
         with closing(_connect(self.path)) as db, db:
-            db.execute("INSERT INTO factory_accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            db.execute("""INSERT INTO factory_accounts
+                (account_id,cycle_id,hypothesis_id,variant_id,vehicle,
+                 starting_cash,ending_equity,realized_pnl,max_drawdown,trades,
+                 worker_pid,result_json,learning_epoch,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 account["account_id"], cycle_id, hypothesis_id, result["variant_id"],
                 result["vehicle"], account["starting_cash"], account["ending_equity"],
                 account["realized_pnl"], account["max_drawdown"], account["trades"],
-                result["worker_pid"], canonical_json(dict(result)), datetime.now().timestamp(),
+                result["worker_pid"], canonical_json(dict(result)), epoch,
+                datetime.now().timestamp(),
             ))
             gate = result.get("gate") if isinstance(result, Mapping) else None
             envelope = gate.get("verified_gate") if isinstance(gate, Mapping) else None
@@ -1576,12 +2126,17 @@ class FactoryLedger:
                 output.update(str(item) for item in values if str(item))
         return output
 
-    def last_boundary(self, hypothesis_id: str, vehicle: str) -> str | None:
+    def last_boundary(self, hypothesis_id: str, vehicle: str, *,
+                      learning_epoch: Any = None,
+                      epoch_fingerprint: Any = None) -> str | None:
         # A factory account is diagnostic evidence, not a consumed forward
         # boundary: it is written before the gate knows whether all intended
         # shadow variants were adequately powered.  Read boundaries only from
         # durable EdgeLedger proof runs, so an underpowered sibling cannot make
         # the next cycle skip unseen observations.
+        epoch = _resolve_learning_epoch(
+            learning_epoch=learning_epoch,
+            epoch_fingerprint=epoch_fingerprint)
         with closing(_connect(self.path)) as db:
             try:
                 rows = db.execute("""SELECT r.run_id, r.candidate_id,
@@ -1616,10 +2171,21 @@ class FactoryLedger:
                         payload.get("gate_hash") != gate.get("content_hash") or
                         not verify_gate_envelope(gate)):
                     continue
+                # A current cycle may only consume proof from the exact
+                # assumptions epoch that produced it.  Legacy runs (including
+                # rows with no learning_epoch key) remain readable through the
+                # unscoped call, but are audit-only once an epoch is supplied.
+                metrics = None
+                if epoch is not None:
+                    metrics = json.loads(row["metrics_json"] or "{}")
+                    if (not isinstance(metrics, Mapping) or
+                            metrics.get("learning_epoch") != epoch):
+                        continue
                 for value in (row["heldout_end"], row["fit_end"]):
                     if value:
                         values.append(str(value))
-                metrics = json.loads(row["metrics_json"] or "{}")
+                if metrics is None:
+                    metrics = json.loads(row["metrics_json"] or "{}")
                 run_gate = metrics.get("gate") if isinstance(metrics, Mapping) else None
                 qualification = (run_gate.get("qualification")
                                  if isinstance(run_gate, Mapping) else None)

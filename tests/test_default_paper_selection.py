@@ -11,12 +11,24 @@ from unittest.mock import patch
 from agent.config import DEFAULT_CONFIG, load_config, validate_config
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from agent.edge import resolve_validated_variant, resolve_validated_variants
+from agent.engine import Engine
 from deploy import dashboard
 from research.edge_identity import candidate_assumptions
 from research.edge_lab import EdgeLedger
 
 
 class DefaultPaperSelectionTests(unittest.TestCase):
+    def test_engine_public_paper_fallback_is_specific_when_omitted(self):
+        class PaperProvider:
+            paper = True
+
+        engine = Engine({
+            "mode": "paper",
+            "broker": {"paper": True, "allow_live": False},
+        }, light=True, provider=PaperProvider())
+        self.addCleanup(engine.close)
+        self.assertEqual(engine._edge_selection_mode, "specific")
+
     def test_shipped_and_code_defaults_select_one_auto_variant(self):
         self.assertEqual(DEFAULT_CONFIG["strategy"]["selection_mode"],
                          "specific")

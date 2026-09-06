@@ -627,7 +627,8 @@ def _prepare_cost_calibration(
     policy_source = ReplayPolicy.from_config(runtime_config)
     raw, bars, snapshot_map, quote_rows = _read_discovery_rows(
         corpus, require_provenance=True,
-        expected_equity_feed=policy_source.equity_feed)
+        expected_equity_feed=policy_source.equity_feed,
+        expected_provider=policy_source.equity_provider)
     quotes = (quote_rows if callable(getattr(quote_rows, "quote_fill", None))
               else list(quote_rows))
     def raw_quotes():

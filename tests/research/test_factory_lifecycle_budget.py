@@ -296,6 +296,7 @@ class VariantBudgetTests(unittest.TestCase):
             ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
             hypothesis = initial_hypotheses(1)[0]
             ledger.register(hypothesis)
+            learning_epoch = "budget-learning-v1"
             variant_id = rule_variant_id(hypothesis.rule_spec)
             gate = {
                 "passes": False,
@@ -314,19 +315,26 @@ class VariantBudgetTests(unittest.TestCase):
                 ledger.add_account(
                     f"cycle-{attempt}", hypothesis.hypothesis_id,
                     _account_result(hypothesis.hypothesis_id, variant_id,
-                                    cycle=str(attempt), gate=gate))
+                                    cycle=str(attempt), gate=gate),
+                    learning_epoch=learning_epoch)
                 self.assertEqual(ledger.variant_attempts(
-                    hypothesis.hypothesis_id, variant_id), attempt)
+                    hypothesis.hypothesis_id, variant_id,
+                    learning_epoch=learning_epoch), attempt)
                 if attempt < 3:
                     self.assertNotIn(variant_id,
-                                     ledger.closed_variant_ids(vehicle="equity"))
+                                     ledger.closed_variant_ids(
+                                         vehicle="equity",
+                                         learning_epoch=learning_epoch))
             closure = ledger.close_variant(
                 hypothesis.hypothesis_id, variant_id, vehicle="equity",
                 mode="budget", reason="confirmatory budget exhausted",
-                attempts=3, evidence={"classification": "adequate_negative_inconclusive"})
+                attempts=3,
+                evidence={"classification": "adequate_negative_inconclusive"},
+                learning_epoch=learning_epoch)
             self.assertEqual(closure["mode"], "budget")
             self.assertEqual(closure["attempts"], 3)
-            self.assertIn(variant_id, ledger.failed_variant_ids(vehicle="equity"))
+            self.assertIn(variant_id, ledger.failed_variant_ids(
+                vehicle="equity", learning_epoch=learning_epoch))
             restarted = FactoryLedger(Path(directory) / "edge.sqlite3")
             self.assertEqual(restarted.variant_closures(vehicle="equity")[0]["mode"],
                              "budget")

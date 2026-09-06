@@ -59,6 +59,7 @@ _DEPTH_LOG_CEILING = 7.0          # 10**7 shares
 _DEPTH_LOG_BIN = .02
 _SUM_SCALE = 1_000_000_000_000
 _DIGEST_MODULUS = 1 << 256
+_DEFAULT_PROVIDER = "alpaca"
 
 
 class QuoteCostError(ValueError):
@@ -72,6 +73,24 @@ class QuoteCostError(ValueError):
 _static_cost_config = static_cost_config
 
 
+def _canonical_identity(value: Any) -> str | None:
+    """Normalize one optional persisted feed/provider identity."""
+    if value in (None, ""):
+        return None
+    return _normalized_identity(value)
+
+
+def _positive_integer(value: Any, name: str) -> int:
+    """Return one positive integer metadata value or refuse it."""
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        result = -1
+    if (isinstance(value, bool) or result < 1 or result != value):
+        raise QuoteCostError(f"{name} must be a positive integer")
+    return result
+
+
 def _normalized_identity(value: Any) -> str:
     normalized = str(value or "").strip().lower().replace("-", "_")
     # The runtime names this entitlement ``delayed_sip`` while some corpus
@@ -79,6 +98,40 @@ def _normalized_identity(value: Any) -> str:
     # identically at the schedule/config boundary so a feed mismatch cannot
     # be hidden by spelling alone.
     return "delayed_sip" if normalized == "delayed" else normalized
+
+
+def _authoritative_provider(config: Mapping[str, Any] | None) -> str:
+    """Resolve the one configured market-data provider identity.
+
+    ``broker.provider`` is canonical.  ``data.provider`` is retained as a
+    compatibility alias for pre-provider configs, but it may not silently
+    override a broker declaration.  This helper is intentionally local to the
+    measured-cost boundary so a schedule's persisted provider can only be
+    compared with authority; it can never become authority itself.
+    """
+    source = config if isinstance(config, Mapping) else {}
+    broker = source.get("broker")
+    data = source.get("data")
+    if broker is not None and not isinstance(broker, Mapping):
+        raise QuoteCostError("broker must be a mapping")
+    if data is not None and not isinstance(data, Mapping):
+        raise QuoteCostError("data must be a mapping")
+
+    def declared(block: Mapping[str, Any] | None, path: str) -> str | None:
+        if not isinstance(block, Mapping) or "provider" not in block:
+            return None
+        value = block.get("provider")
+        if not isinstance(value, str) or not value.strip():
+            raise QuoteCostError(f"{path} must be a non-empty string")
+        return _normalized_identity(value)
+
+    broker_provider = declared(broker, "broker.provider")
+    data_provider = declared(data, "data.provider")
+    if (broker_provider is not None and data_provider is not None and
+            broker_provider != data_provider):
+        raise QuoteCostError(
+            "broker.provider and data.provider must match")
+    return broker_provider or data_provider or _DEFAULT_PROVIDER
 
 
 def _read_schedule_path(path: str) -> Mapping[str, Any]:
@@ -188,8 +241,12 @@ def validate_measured_quote_config(
 
     normalized_feed = (_normalized_identity(expected_feed)
                        if expected_feed not in (None, "") else declared_feed)
+    # Missing authority means the canonical broker default, never the
+    # schedule's declaration.  The latter is evidence to compare, not a
+    # permission to authorize its own provider.
     normalized_provider = (_normalized_identity(expected_provider)
-                           if expected_provider not in (None, "") else declared_provider)
+                           if expected_provider not in (None, "")
+                           else _DEFAULT_PROVIDER)
     if normalized_feed:
         result["feed"] = normalized_feed
     if normalized_provider:
@@ -241,9 +298,12 @@ def validate_measured_quote_config(
             raise QuoteCostError(
                 "measured_quote min_quotes_per_cell does not match schedule")
         # Validate the selected universe model now, including runtime caps.
-        cost_model_from_schedule(schedule, percentile=result["percentile"],
-                                 depth_percentile=result["depth_percentile"],
-                                 max_impact_half_spreads=result["max_impact_half_spreads"])
+        cost_model_from_schedule(
+            schedule, percentile=result["percentile"],
+            depth_percentile=result["depth_percentile"],
+            max_impact_half_spreads=result["max_impact_half_spreads"],
+            expected_feed=normalized_feed,
+            expected_provider=normalized_provider)
     except QuoteCostError:
         raise
     except (TypeError, ValueError, OverflowError) as exc:
@@ -297,6 +357,16 @@ def reprice_ibr_result(result: Any, *, resolver: Any,
     for trade in getattr(result, "trades", ()):
         entry_source = str(getattr(trade, "entry_fill_source", "") or "").lower()
         exit_source = str(getattr(trade, "exit_fill_source", "") or "").lower()
+        # Quote provenance belongs to the fill leg, not to the underlying bar
+        # used by a bar fallback or resting bracket. Normalize it once at the
+        # repricing boundary so resolver contexts and durable rows carry the
+        # same canonical identity.
+        entry_feed = _canonical_identity(getattr(trade, "entry_feed", None))
+        exit_feed = _canonical_identity(getattr(trade, "exit_feed", None))
+        entry_provider = _canonical_identity(
+            getattr(trade, "entry_provider", None))
+        exit_provider = _canonical_identity(
+            getattr(trade, "exit_provider", None))
         quantity = float(getattr(trade, "quantity", 1.0))
         multiplier = int(getattr(trade, "contract_multiplier", 1))
         direction = str(getattr(trade, "direction", "long"))
@@ -313,10 +383,22 @@ def reprice_ibr_result(result: Any, *, resolver: Any,
                                 if hasattr(exit_timestamp, "isoformat")
                                 else exit_timestamp),
         }
-        entry_model = resolver({**common, "cost_leg": "entry",
-                                "cost_timestamp": common["entry_timestamp"]})
-        exit_model = resolver({**common, "cost_leg": "exit",
-                               "cost_timestamp": common["exit_timestamp"]})
+        entry_context = {
+            **common, "cost_leg": "entry",
+            "feed": entry_feed, "provider": entry_provider,
+            "entry_feed": entry_feed, "exit_feed": exit_feed,
+            "entry_provider": entry_provider, "exit_provider": exit_provider,
+            "cost_timestamp": common["entry_timestamp"],
+        }
+        exit_context = {
+            **common, "cost_leg": "exit",
+            "feed": exit_feed, "provider": exit_provider,
+            "entry_feed": entry_feed, "exit_feed": exit_feed,
+            "entry_provider": entry_provider, "exit_provider": exit_provider,
+            "cost_timestamp": common["exit_timestamp"],
+        }
+        entry_model = resolver(entry_context)
+        exit_model = resolver(exit_context)
         if not isinstance(entry_model, CostModel) or not isinstance(exit_model, CostModel):
             raise QuoteCostError("measured cost resolver returned an invalid model")
         entry_price = entry_model.execution_price(
@@ -351,12 +433,51 @@ def reprice_ibr_result(result: Any, *, resolver: Any,
                  float(trade.stop_price) - entry_price),
             )
         risk_usd = quantity * realized_risk_per_unit
+        # Persist the exact per-leg model selection and the complete measured
+        # round-trip arithmetic.  The flat fields intentionally match the
+        # account/factory row contract; ``cost_economics`` is the one
+        # versioned claim that gates can recompute and cross-check.
+        entry_model_fields = {
+            "entry_cost_model_provenance": entry_model.provenance,
+            "entry_cost_model_spread_bps": entry_model.spread_bps,
+            "entry_cost_model_slippage_bps": entry_model.slippage_bps,
+            "entry_cost_model_fee_bps": entry_model.fee_bps,
+            "exit_cost_model_provenance": exit_model.provenance,
+            "exit_cost_model_spread_bps": exit_model.spread_bps,
+            "exit_cost_model_slippage_bps": exit_model.slippage_bps,
+            "exit_cost_model_fee_bps": exit_model.fee_bps,
+        }
+        round_trip_cost = (
+            abs(entry_price - float(trade.entry_reference)) * quantity * multiplier +
+            abs(exit_price - float(trade.exit_reference)) * quantity * multiplier +
+            fees)
+        cost_economics = {
+            "schema": "ibr-cost-economics.v1",
+            "vehicle": vehicle,
+            "direction": direction,
+            "quantity": quantity,
+            "contract_multiplier": multiplier,
+            "entry_reference": float(trade.entry_reference),
+            "exit_reference": float(trade.exit_reference),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "gross_pnl": gross,
+            "costs": fees,
+            "net_pnl": gross - fees,
+            "round_trip_cost": round_trip_cost,
+            "risk_per_unit": risk_per_unit,
+            "realized_risk_per_unit": realized_risk_per_unit,
+            "risk_usd": risk_usd,
+        }
         trades.append(replace(
             trade, entry_price=entry_price, exit_price=exit_price,
             gross_pnl=gross, costs=fees, net_pnl=gross - fees,
+            entry_feed=entry_feed, exit_feed=exit_feed,
+            entry_provider=entry_provider, exit_provider=exit_provider,
             risk_per_unit=risk_per_unit,
             realized_risk_per_unit=realized_risk_per_unit,
-            risk_usd=risk_usd))
+            risk_usd=risk_usd, **entry_model_fields,
+            cost_economics=cost_economics))
     try:
         return replace(result, trades=trades)
     except TypeError:
@@ -386,10 +507,7 @@ def cost_resolver_setup(config: Mapping[str, Any] | None, *,
     broker = (config or {}).get("broker") if isinstance(config, Mapping) else None
     expected_feed = (broker.get("data_feed") if isinstance(broker, Mapping)
                      else None)
-    expected_provider = (broker.get("provider") if isinstance(broker, Mapping)
-                         and "provider" in broker else None)
-    if expected_provider in (None, "") and isinstance(measured_raw, Mapping):
-        expected_provider = measured_raw.get("provider")
+    expected_provider = _authoritative_provider(config)
     normalized = validate_measured_quote_config(
         measured_raw, expected_feed=expected_feed,
         expected_provider=expected_provider)
@@ -419,7 +537,7 @@ def cost_resolver_setup(config: Mapping[str, Any] | None, *,
         max_spread_bps=static.max_spread_bps,
         max_slippage_bps=static.max_slippage_bps,
         expected_feed=normalized.get("feed"),
-        expected_provider=normalized.get("provider"),
+        expected_provider=expected_provider,
         coverage_policy=normalized["coverage_policy"])
     return CostResolverSetup(model=static, resolver=resolver, measured=normalized)
 
@@ -516,6 +634,12 @@ class _Accumulator:
                   for name in (*PERCENTILES, "mean")}
         return {
             "quote_count": self.spread.count,
+            # Keep the legacy quote_count field, but make the two coverage
+            # populations explicit. A spread quote is not necessarily an
+            # executable-depth quote: both displayed sizes must be present
+            # and positive before it enters the depth histogram.
+            "spread_quote_count": self.spread.count,
+            "depth_quote_count": self.depth.count,
             "session_count": len(self.sessions),
             # Keep the actual session IDs alongside the count.  A count alone
             # cannot distinguish broad chronological coverage from repeated
@@ -583,11 +707,12 @@ def measure_quote_costs(quotes: Iterable[Any], *,
 
     Accepts anything iterable — normalized ``QuoteSnapshot`` records or raw
     corpus mappings — and streams it, so a production corpus never has to be
-    held in memory.  A quote is used only when it is two-sided and positive;
-    anything else is counted as rejected rather than silently shaping the fit.
+    held in memory. A quote is used for spread measurement only when its
+    bid/ask are two-sided and positive; missing or malformed displayed sizes
+    leave that spread observation intact but do not shape executable depth.
     """
-    if int(min_quotes_per_cell) < 1:
-        raise QuoteCostError("min_quotes_per_cell must be positive")
+    min_quotes = _positive_integer(min_quotes_per_cell,
+                                   "min_quotes_per_cell")
     universe = _Accumulator()
     by_symbol: dict[str, _Accumulator] = defaultdict(_Accumulator)
     by_cell: dict[tuple[str, str], _Accumulator] = defaultdict(_Accumulator)
@@ -635,8 +760,13 @@ def measure_quote_costs(quotes: Iterable[Any], *,
         # life, so the smaller of the two is the honest capacity estimate.
         bid_size = _number(_value(row, "bid_size"))
         ask_size = _number(_value(row, "ask_size"))
-        sizes = [size for size in (bid_size, ask_size)
-                 if size is not None and size > 0]
+        # A one-sided size is not executable depth. The spread remains a
+        # legitimate observation, but positive-size pricing must not infer
+        # capacity from the one side that happened to be reported.
+        sizes = ([bid_size, ask_size]
+                 if (bid_size is not None and bid_size > 0 and
+                     ask_size is not None and ask_size > 0)
+                 else [])
         identity = _value(row, "identity")
         row_feed = _value(row, "feed", _value(identity, "feed"))
         row_provider = _value(row, "provider", _value(identity, "provider"))
@@ -729,18 +859,24 @@ def measure_quote_costs(quotes: Iterable[Any], *,
             bucket: cell.summary()
             for (cell_symbol, bucket), cell in sorted(by_cell.items())
             if cell_symbol == symbol and
-            cell.spread.count >= int(min_quotes_per_cell)}
+            cell.spread.count >= min_quotes}
         symbols[symbol] = {**accumulator.summary(), "buckets": buckets,
                            "sparse_buckets": sum(
                                1 for (cell_symbol, _bucket), cell
                                in by_cell.items()
                                if cell_symbol == symbol and
-                               cell.spread.count < int(min_quotes_per_cell))}
+                               cell.spread.count < min_quotes),
+                           "depth_sparse_buckets": sum(
+                               1 for (cell_symbol, _bucket), cell
+                               in by_cell.items()
+                               if cell_symbol == symbol and
+                               cell.depth.count < min_quotes)}
     schedule = {
         "schema": QUOTE_COST_SCHEMA,
         "measured": {
             "quote_rows_seen": seen,
             "quote_rows_used": universe.spread.count,
+            "depth_rows_used": universe.depth.count,
             "quote_rows_rejected": universe.rejected,
             "first_session": first_session, "last_session": last_session,
             "feeds": sorted(feeds), "providers": sorted(providers),
@@ -748,7 +884,7 @@ def measure_quote_costs(quotes: Iterable[Any], *,
             "provider": next(iter(providers)) if len(providers) == 1 else None,
             "missing_feed_rows": int(missing_feed_rows),
             "missing_provider_rows": int(missing_provider_rows),
-            "min_quotes_per_cell": int(min_quotes_per_cell),
+            "min_quotes_per_cell": min_quotes,
             "bucket_minutes": BUCKET_MINUTES,
             "quote_content_hash": quote_content_hash,
             "quote_content_hash_algorithm": "sha256-multiset-sum-xor.v1",
@@ -763,8 +899,64 @@ def measure_quote_costs(quotes: Iterable[Any], *,
     return schedule
 
 
+def _section_count(section: Mapping[str, Any], *, depth: bool) -> int | None:
+    """Read and cross-check a section's spread or depth observation count.
+
+    ``quote_count`` and ``touch_shares.count`` are retained for compatibility
+    with v1 schedules. New schedules also expose explicit count names so a
+    caller cannot mistake spread coverage for executable-depth coverage.
+    """
+    if not isinstance(section, Mapping):
+        return None
+    if depth:
+        touch = section.get("touch_shares")
+        legacy = (touch.get("count")
+                  if isinstance(touch, Mapping) else None)
+        explicit = section.get("depth_quote_count")
+        name = "depth quote count"
+    else:
+        legacy = section.get("quote_count")
+        explicit = section.get("spread_quote_count")
+        name = "spread quote count"
+    histogram = section.get("spread_bps")
+    histogram_count = (histogram.get("count")
+                        if not depth and isinstance(histogram, Mapping)
+                        else None)
+    values = [(name, value) for name, value in (
+        ("explicit", explicit), ("legacy", legacy),
+        ("histogram", histogram_count)) if value is not None]
+    if not values:
+        return None
+    parsed: list[int] = []
+    for source, value in values:
+        try:
+            count = int(value)
+        except (TypeError, ValueError, OverflowError):
+            raise QuoteCostError(f"cost schedule has invalid {name}")
+        if isinstance(value, bool) or count < 0 or count != value:
+            raise QuoteCostError(f"cost schedule has invalid {name}")
+        parsed.append(count)
+    if any(count != parsed[0] for count in parsed[1:]):
+        raise QuoteCostError(
+            f"cost schedule {name} metadata disagrees across section fields")
+    return parsed[0]
+
+
+def _required_quote_coverage(measured_meta: Mapping[str, Any]) -> int:
+    """Validate the immutable cell-coverage metadata on a public schedule."""
+    required = _positive_integer(measured_meta.get("min_quotes_per_cell"),
+                                 "cost schedule min_quotes_per_cell")
+    bucket_minutes = _number(measured_meta.get("bucket_minutes"))
+    if bucket_minutes != BUCKET_MINUTES:
+        raise QuoteCostError(
+            "cost schedule bucket_minutes does not match configured "
+            f"BUCKET_MINUTES ({BUCKET_MINUTES})")
+    return required
+
+
 def _cell(schedule: Mapping[str, Any], symbol: str | None,
-          bucket: str | None) -> tuple[Mapping[str, Any], str]:
+          bucket: str | None, *, required_quotes: int | None = None
+          ) -> tuple[Mapping[str, Any], str]:
     """Resolve the tightest measured cell available, and say which was used."""
     symbols = schedule.get("symbols") or {}
     normalized_symbol = (str(symbol).strip().upper()
@@ -776,16 +968,17 @@ def _cell(schedule: Mapping[str, Any], symbol: str | None,
         if entry is not None:
             if normalized_bucket is not None:
                 measured = (entry.get("buckets") or {}).get(normalized_bucket)
-                measured_meta = schedule.get("measured")
-                required_quotes = _number(
-                    measured_meta.get("min_quotes_per_cell")
-                    if isinstance(measured_meta, Mapping) else None)
-                observed_quotes = (_number(measured.get("quote_count"))
+                if required_quotes is None:
+                    measured_meta = schedule.get("measured")
+                    required_quotes = (_required_quote_coverage(measured_meta)
+                                       if isinstance(measured_meta, Mapping)
+                                       else None)
+                observed_quotes = (_section_count(measured, depth=False)
                                    if isinstance(measured, Mapping) else None)
                 if (isinstance(measured, Mapping) and measured and
-                        (required_quotes is None or
-                         (observed_quotes is not None and
-                          observed_quotes >= required_quotes))):
+                        required_quotes is not None and
+                        observed_quotes is not None and
+                        observed_quotes >= required_quotes):
                     return measured, (f"symbol_bucket:{normalized_symbol}:"
                                       f"{normalized_bucket}")
                 # A bucket omitted by ``measure_quote_costs`` did not meet
@@ -863,6 +1056,7 @@ def cost_model_from_schedule(
     measured_meta = schedule.get("measured")
     if not isinstance(measured_meta, Mapping):
         raise QuoteCostError("cost schedule metadata is missing")
+    required_quotes = _required_quote_coverage(measured_meta)
     schedule_feed = _normalized_identity(measured_meta.get("feed"))
     schedule_provider = _normalized_identity(measured_meta.get("provider"))
     normalized_feed = (_normalized_identity(expected_feed)
@@ -875,14 +1069,41 @@ def cost_model_from_schedule(
     if normalized_provider and schedule_provider != normalized_provider:
         raise QuoteCostError(
             f"schedule provider {schedule_provider!r} does not match {normalized_provider!r}")
-    section, origin = _cell(schedule, symbol, bucket)
+    section, origin = _cell(schedule, symbol, bucket,
+                            required_quotes=required_quotes)
     spread_bps = _percentile(section.get("spread_bps"), percentile)
     half_spread = spread_bps / 2.0
 
     impact_bps = 0.0
-    depth_shares = _number((section.get("touch_shares") or {}).get(depth_percentile))
     shares = _number(order_shares)
-    if shares is not None and shares > 0 and depth_shares and depth_shares > 0:
+    if shares is not None and shares > 0:
+        spread_count = _section_count(section, depth=False)
+        if spread_count is None or spread_count < required_quotes:
+            raise QuoteCostError(
+                f"chosen measured section {origin} has insufficient spread "
+                f"coverage for positive order_shares ({spread_count or 0} "
+                f"< {required_quotes})")
+        depth_count = _section_count(section, depth=True)
+        if depth_count is None:
+            raise QuoteCostError(
+                f"chosen measured section {origin} has no depth coverage "
+                "metadata for positive order_shares")
+        if depth_count > spread_count:
+            raise QuoteCostError(
+                f"chosen measured section {origin} has invalid depth "
+                f"coverage ({depth_count} > spread coverage {spread_count})")
+        if depth_count < required_quotes:
+            raise QuoteCostError(
+                f"chosen measured section {origin} has under-covered depth "
+                f"for positive order_shares ({depth_count} < {required_quotes})")
+        touch_shares = section.get("touch_shares")
+        depth_values = (touch_shares if isinstance(touch_shares, Mapping)
+                        else {})
+        depth_shares = _number(depth_values.get(depth_percentile))
+        if depth_shares is None or depth_shares <= 0:
+            raise QuoteCostError(
+                f"chosen measured section {origin} has no usable depth "
+                f"measurement at {depth_percentile}")
         multiple = max(0.0, shares / depth_shares - 1.0)
         impact_bps = half_spread * min(multiple, impact_cap)
     return CostModel(
@@ -926,10 +1147,39 @@ def measured_cost_resolver(schedule: Mapping[str, Any], *,
     if str(vehicle).strip().lower() != "equity":
         raise QuoteCostError(
             "measured quote-cost resolver currently supports equity only")
+    measured_meta = schedule.get("measured")
+    schedule_feed = (_normalized_identity(measured_meta.get("feed"))
+                     if isinstance(measured_meta, Mapping) else None)
+    schedule_provider = (_normalized_identity(measured_meta.get("provider"))
+                         if isinstance(measured_meta, Mapping) else None)
+    configured_feed = (_normalized_identity(expected_feed)
+                       if expected_feed not in (None, "") else schedule_feed)
+    configured_provider = (_normalized_identity(expected_provider)
+                           if expected_provider not in (None, "")
+                           else schedule_provider)
+
     def resolve(row: Mapping[str, Any] | None = None, *,
                 symbol: str | None = None, bucket: str | None = None,
                 order_shares: float | None = None) -> CostModel:
         item = row if isinstance(row, Mapping) else {}
+        # Opportunity contexts do not always duplicate source identity, but
+        # any explicit top-level or per-leg identity may never contradict the
+        # configured broker/schedule. Check both legs even when resolving one
+        # leg so a mixed-provenance row cannot be partially repriced.
+        for field, expected, label in (
+                ("feed", configured_feed, "feed"),
+                ("provider", configured_provider, "provider"),
+                ("entry_feed", configured_feed, "entry feed"),
+                ("exit_feed", configured_feed, "exit feed"),
+                ("entry_provider", configured_provider, "entry provider"),
+                ("exit_provider", configured_provider, "exit provider")):
+            supplied = item.get(field)
+            if (supplied not in (None, "") and expected not in (None, "") and
+                    _normalized_identity(supplied) != expected):
+                raise QuoteCostError(
+                    f"measured cost row {label} "
+                    f"{_normalized_identity(supplied)!r} does not match "
+                    f"{expected!r}")
         resolved_symbol = symbol or item.get("symbol")
         resolved_bucket = bucket
         if resolved_bucket in (None, ""):

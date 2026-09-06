@@ -47,6 +47,7 @@ from .factory_ledger import (
     ACTIVE_HYPOTHESIS_STATES, FACTORY_SCHEMA, FACTORY_STATUSES, FactoryError,
     CONFIRMATORY_SCOPE_VERSION, FactoryLedger, deferred_fdr,
     dependence_policy_digest, experiment_identity, experiment_provenance,
+    learning_epoch_fingerprint,
 )
 from .gates import (chronological_split, heldout_separation,
                     expectancy_rejection_report,
@@ -380,6 +381,12 @@ _FIT_SELECTION_DENY_PARTS = frozenset({
     "raw", "rows", "ohlcv", "market", "observation", "authorization",
 })
 
+_LEARNING_EPOCH_NOTICE = (
+    "Prior lessons from legacy or different learning epochs are audit-only "
+    "and non-citable because feed, economics, execution geometry, or rule "
+    "grammar assumptions changed. Their absence is not evidence of no market edge."
+)
+
 # Root diagnosis and the compact fit-diagnostics schema are deliberately
 # enumerated.  Rule-field names under ``tried``/``changed`` are the one
 # dynamic exception: they are still constrained to the audited grammar.
@@ -392,6 +399,7 @@ _FIT_SELECTION_ROOT_KEYS = frozenset({
     "shared_learning", "lessons", "already_failed_variant_ids",
     "tried_families", "last_diagnosis", "slot", "reason", "previous_family",
     "proved_families", "available_families", "already_seeded_this_cycle",
+    "learning_epoch_notice",
 })
 _FIT_DIAGNOSTIC_KEYS = frozenset({
     "schema", "scope", "variant_id", "eligible_prefix", "first_signal",
@@ -613,7 +621,7 @@ def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
             "tried_families", "proved_families", "available_families",
             "already_seeded_this_cycle", "last_diagnosis", "lessons",
             "shared_learning", "previous_family", "reason", "slot",
-            "family", "execution_geometry",
+            "family", "execution_geometry", "learning_epoch_notice",
         }))
     else:
         allowed = _FIT_SELECTION_AGGREGATE_KEYS
@@ -765,8 +773,9 @@ def _slot_reseeds(factory: FactoryLedger, vehicle: str, slot: int) -> int:
                                     flag="reseed")
 
 
-def _slot_families(factory: FactoryLedger, vehicle: str, slot: int) -> set[str]:
-    return factory.slot_families(vehicle, slot)
+def _slot_families(factory: FactoryLedger, vehicle: str, slot: int, *,
+                   learning_epoch: str | None = None) -> set[str]:
+    return factory.slot_families(vehicle, slot, learning_epoch=learning_epoch)
 
 
 def _proved_families(edge: EdgeLedger, vehicle: str) -> list[str]:
@@ -864,11 +873,10 @@ def _execution_geometry_context(*, vehicle: str, costs: CostModel,
         "grammar_stop_floor_admissible": (
             None if required_stop is None else
             float(MIN_STOP_DISTANCE_BPS) >= required_stop),
-        # The runtime amends an authored stop to this effective floor when
-        # stress controls bind.  Keep the authored grammar-floor result above
-        # explicit: it describes the submitted root, while this flag records
-        # that policy-adjusted geometry is admissible for discovery.
-        "policy_adjusted_stop_floor_admissible": True,
+        # A binding stress floor is an admission veto.  The runtime does not
+        # amend an authored stop or fixed-R target, so this diagnostic floor
+        # is not admissible as policy-adjusted geometry for discovery.
+        "policy_adjusted_stop_floor_admissible": False,
         "stop_distance_formula_available": valid_controls,
         "stop_distance_formula_unavailable_reason": (
             None if valid_controls else
@@ -880,13 +888,70 @@ def _execution_geometry_context(*, vehicle: str, costs: CostModel,
     })
     return geometry
 
+
+def _factory_learning_epoch(*, vehicle: str, costs: CostModel,
+                            measured_costs: Mapping[str, Any] | None,
+                            policy: ReplayPolicy,
+                            execution_geometry: Mapping[str, Any],
+                            risk_assumptions: Mapping[str, Any] | None,
+                            backtest_bar_fallback: bool) -> str:
+    """Fingerprint all assumptions proposal learning is allowed to reuse.
+
+    The persisted factory lesson is explanatory evidence, not a strategy
+    artifact.  Its reusable meaning nevertheless depends on the economics,
+    execution geometry, market feed/provider and audited rule grammar in force
+    when it was written.  Keep this descriptor configuration-only and include
+    measured schedule identity/resolver parameters without copying the full
+    schedule into every lesson row.
+    """
+    measured = measured_costs if isinstance(measured_costs, Mapping) else {}
+    measured_identity = {
+        key: measured.get(key) for key in (
+            "schema", "enabled", "schedule_hash", "feed", "provider",
+            "percentile", "depth_percentile", "max_impact_half_spreads",
+            "coverage_policy", "min_quotes_per_cell")
+        if key in measured
+    }
+    economics = {
+        "vehicle": str(vehicle),
+        "static_cost_model": costs.as_dict(),
+        "measured_quote": measured_identity,
+    }
+    feed = {
+        "equity_feed": str(policy.equity_feed),
+        "equity_provider": str(policy.equity_provider),
+        "strict_market_data": bool(policy.strict_market_data),
+        "require_exact_calendar": bool(policy.require_exact_calendar),
+        "bar_fallback": bool(backtest_bar_fallback),
+    }
+    grammar = {
+        "rule_schema": "rule-grammar.v4",
+        "accepted_rule_schemas": sorted(
+            str(item) for item in (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V4)),
+        "executable_rule_fields": sorted(str(item) for item in EXECUTABLE_RULE_FIELDS),
+        "proposal_schema": str(PROPOSAL_SCHEMA),
+        "tuning_schema": str(TUNING_SCHEMA),
+    }
+    geometry = {
+        "execution": dict(execution_geometry),
+        "risk_assumptions": dict(risk_assumptions or {}),
+        "stress_veto_semantics": {
+            "check": "check_stressed_cost_plan",
+            "binding_floor_is_veto": True,
+            "authored_stop_is_not_amended": True,
+        },
+    }
+    return learning_epoch_fingerprint(
+        economics=economics, geometry=geometry, feed=feed, grammar=grammar)
+
 def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
                        tried_families: set[str], proved_families: Sequence[str],
                        diagnostic: Mapping[str, Any] | None = None,
                        seeded_this_cycle: Sequence[Mapping[str, Any]] = (),
                        lessons: Sequence[Mapping[str, Any]] = (),
                        shared: Mapping[str, Any] | None = None,
-                       execution_geometry: Mapping[str, Any] | None = None) -> dict:
+                       execution_geometry: Mapping[str, Any] | None = None,
+                       learning_epoch: str | None = None) -> dict:
     """Build the small aggregate brief a discovery proposal is given."""
     context: dict[str, Any] = {
         "slot": int(slot),
@@ -903,6 +968,11 @@ def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
         context["execution_geometry"] = _sanitize_fit_selection(
             execution_geometry, label="execution_geometry",
             context="execution_geometry")
+    if learning_epoch is not None:
+        # This is a code-owned policy notice, not stale lesson content.  It
+        # keeps the model from treating a deliberately empty epoch-scoped
+        # brief as evidence that no prior market edge was found.
+        context["learning_epoch_notice"] = _LEARNING_EPOCH_NOTICE
     # Slots are seeded one after another inside a single cycle.  Without this
     # every slot of a fresh ledger receives an identical brief, so a model that
     # answers consistently returns the same hypothesis every time and all but
@@ -986,11 +1056,13 @@ def _trim_lessons(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
 
 
 def _failed_variants(factory: FactoryLedger, *, vehicle: str,
-                     family: str | None = None) -> frozenset[str]:
+                     family: str | None = None,
+                     learning_epoch: str | None = None) -> frozenset[str]:
     """Parameter sets a graded lesson already proved do not work."""
     try:
         return frozenset(factory.failed_variant_ids(vehicle=vehicle,
-                                                    family=family))
+                                                    family=family,
+                                                    learning_epoch=learning_epoch))
     except (sqlite3.Error, ValueError, KeyError):
         return frozenset()
 
@@ -1247,7 +1319,8 @@ def _failed_variant(spec: Mapping[str, Any], failed: set[str]) -> bool:
 
 def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
                   family: str | None = None,
-                  limit: int = LESSON_BRIEF_LIMIT) -> list[dict]:
+                  limit: int = LESSON_BRIEF_LIMIT,
+                  learning_epoch: str | None = None) -> list[dict]:
     """The graded reason history a proposal is allowed to learn from.
 
     Scoped to one family when tuning it, because the specific attempts on that
@@ -1256,7 +1329,8 @@ def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
     """
     try:
         rows = factory.lessons(vehicle=vehicle, family=family,
-                               graded_only=True, limit=int(limit))
+                               graded_only=True, learning_epoch=learning_epoch,
+                               limit=int(limit))
     except (sqlite3.Error, ValueError, KeyError):
         # The brief is an enrichment.  A ledger written before lessons existed
         # must degrade to "no history", never to a failed research cycle.
@@ -1265,7 +1339,8 @@ def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
 
 
 def _refinement_history(factory: FactoryLedger, *, vehicle: str,
-                        hypothesis_id: str, limit: int = 512) -> list[dict]:
+                        hypothesis_id: str, limit: int = 512,
+                        learning_epoch: str | None = None) -> list[dict]:
     """Return the full measured coordinate history used for interactions.
 
     The model prompt stays deliberately small, but selecting which good
@@ -1275,7 +1350,8 @@ def _refinement_history(factory: FactoryLedger, *, vehicle: str,
     try:
         rows = factory.lessons(
             vehicle=vehicle, hypothesis_id=hypothesis_id,
-            graded_only=True, limit=max(1, int(limit)))
+            graded_only=True, learning_epoch=learning_epoch,
+            limit=max(1, int(limit)))
     except (sqlite3.Error, ValueError, KeyError):
         return []
     history = []
@@ -1295,7 +1371,8 @@ def _refinement_history(factory: FactoryLedger, *, vehicle: str,
 
 
 def shared_learning(factory: FactoryLedger, *, vehicle: str,
-                    limit: int = SHARED_LEARNING_SAMPLE) -> dict:
+                    limit: int = SHARED_LEARNING_SAMPLE,
+                    learning_epoch: str | None = None) -> dict:
     """What every strategy has learned, aggregated across all of them.
 
     A per-family brief can only say what happened to *this* idea.  Some of what
@@ -1312,7 +1389,7 @@ def shared_learning(factory: FactoryLedger, *, vehicle: str,
     """
     try:
         rows = factory.lessons(vehicle=vehicle, graded_only=True,
-                               limit=int(limit))
+                               learning_epoch=learning_epoch, limit=int(limit))
     except (sqlite3.Error, ValueError, KeyError):
         return {"graded_attempts": 0, "parameters": [], "families": [],
                 "live_trials": {"run": 0, "failed": 0}}
@@ -1626,6 +1703,7 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                     config: Mapping[str, Any],
                     risk_config: Mapping[str, Any] | None = None,
                     adapter: RuleProposalAdapter | None,
+                    learning_epoch: str | None = None,
                     lessons: Sequence[Mapping[str, Any]] = (),
                     already_failed: frozenset[str] = frozenset(),
                     shared: Mapping[str, Any] | None = None,
@@ -1710,6 +1788,11 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
         diagnosis = {**dict(safe_diagnostic), "refinement_phase": phase,
                      "coordinate_candidates_remaining": len(remaining_coordinate),
                      "interaction_candidates_remaining": len(remaining_interactions)}
+        if learning_epoch is not None:
+            # Keep the quarantine policy visible to the model even when this
+            # lane receives only a lesson list rather than discovery context.
+            # The notice contains no stale lesson content and is non-authorizing.
+            diagnosis["learning_epoch_notice"] = _LEARNING_EPOCH_NOTICE
         if safe_shared and safe_shared.get("graded_attempts"):
             diagnosis["shared_learning"] = dict(safe_shared)
         proposal = (tune(vehicle=vehicle, slot=int(hypothesis["slot"]),
@@ -1866,6 +1949,7 @@ def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any],
                      not_before: str | None,
                      existing_variant_ids: set[str],
                      adapter: RuleProposalAdapter | None = None,
+                     learning_epoch: str | None = None,
                      lessons: Sequence[Mapping[str, Any]] = (),
                      failed_variant_ids: frozenset[str] = frozenset(),
                      tried_families: Sequence[str] = (),
@@ -1890,6 +1974,8 @@ def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any],
         list(lessons), label="lessons", context="lessons")
     enriched = dict(safe_diagnostic)
     enriched["lessons"] = list(safe_lessons)
+    if learning_epoch is not None:
+        enriched["learning_epoch_notice"] = _LEARNING_EPOCH_NOTICE
     enriched["already_failed_variant_ids"] = sorted(str(item) for item in failed_variant_ids)
     enriched["tried_families"] = sorted(str(item) for item in tried_families)
     try:
@@ -1984,7 +2070,8 @@ def _seed_reason(source: str, seed: Any, proposal: ProposalResult | None) -> str
 
 def _record_seed_lesson(factory: FactoryLedger, seed: Any, *, vehicle: str,
                         kind: str, source: str, proposal: ProposalResult | None,
-                        diagnostic: Mapping[str, Any] | None = None) -> None:
+                        diagnostic: Mapping[str, Any] | None = None,
+                        learning_epoch: str | None = None) -> None:
     """Record why a slot was given this hypothesis, before it is evaluated."""
     try:
         factory.record_lesson(
@@ -1996,7 +2083,8 @@ def _record_seed_lesson(factory: FactoryLedger, seed: Any, *, vehicle: str,
                      "rule_schema": seed.rule_spec["schema"]},
             diagnosis=_sanitize_fit_selection(
                 dict(diagnostic or {}), label="diagnosis", context="diagnostic"),
-            evidence=dict(proposal.evidence) if proposal is not None else {})
+            evidence=dict(proposal.evidence) if proposal is not None else {},
+            learning_epoch=learning_epoch)
     except (FactoryError, KeyError, sqlite3.Error):
         # A lesson is an annotation on work that already happened.  Failing to
         # write one must never cost the research cycle its actual result.
@@ -2010,6 +2098,7 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                   existing_specs: Sequence[Mapping[str, Any]] | None = None,
                   llm_observations: list[dict[str, Any]] | None = None,
                   execution_geometry: Mapping[str, Any] | None = None,
+                  learning_epoch: str | None = None,
                   ) -> tuple[list[dict], list[dict]]:
     """Give every configured slot an active hypothesis before scheduling.
 
@@ -2054,8 +2143,10 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
     cycle_seeds: list[dict] = [
         {"slot": int(item["slot"]), "family": str(item["family"])}
         for item in factory.active(vehicle)]
-    lessons = _lesson_brief(factory, vehicle=vehicle)
-    shared = shared_learning(factory, vehicle=vehicle)
+    lessons = _lesson_brief(factory, vehicle=vehicle,
+                            learning_epoch=learning_epoch)
+    shared = shared_learning(factory, vehicle=vehicle,
+                             learning_epoch=learning_epoch)
     for slot in range(int(strategies)):
         if slot in active_slots:
             continue
@@ -2088,7 +2179,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                         proved_families=_proved_families(edge, vehicle),
                         seeded_this_cycle=cycle_seeds, lessons=lessons,
                         shared=shared,
-                        execution_geometry=execution_geometry),
+                        execution_geometry=execution_geometry,
+                        learning_epoch=learning_epoch),
                     llm_enabled=True, config=llm_config, adapter=adapter,
                     llm_observations=llm_observations)
                 if (proposed is not None and
@@ -2102,7 +2194,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
             if _variant_seen(seed.rule_spec, existing_variant_ids):
                 continue
         else:
-            tried = factory.slot_families(vehicle, slot)
+            tried = factory.slot_families(
+                vehicle, slot, learning_epoch=learning_epoch)
             seed, genesis_proposal, source = _seed_slot(
                 previous, generation=factory.next_generation(vehicle, slot),
                 not_before=previous.get("not_before"),
@@ -2115,7 +2208,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                     proved_families=_proved_families(edge, vehicle),
                     seeded_this_cycle=cycle_seeds, lessons=lessons,
                     shared=shared,
-                    execution_geometry=execution_geometry),
+                    execution_geometry=execution_geometry,
+                    learning_epoch=learning_epoch),
                 llm_enabled=llm_enabled, config=llm_config, adapter=adapter,
                 llm_observations=llm_observations)
             if seed is None:
@@ -2125,7 +2219,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
         known_specs.append(seed.rule_spec)
         cycle_seeds.append({"slot": int(seed.slot), "family": str(seed.family)})
         _record_seed_lesson(factory, seed, vehicle=vehicle, kind="discovery",
-                            source=source, proposal=genesis_proposal)
+                            source=source, proposal=genesis_proposal,
+                            learning_epoch=learning_epoch)
         if previous is None:
             # A genesis slot has no ancestor to carry its provenance, so the
             # seeding decision is recorded on the hypothesis itself. Without
@@ -2179,6 +2274,8 @@ def _task_corpus(payload: Mapping[str, Any], *,
         "exclude": corpus["exclude"],
         "expected_equity_feed": getattr(
             payload.get("policy"), "equity_feed", "iex"),
+        "expected_provider": getattr(
+            payload.get("policy"), "equity_provider", "alpaca"),
     }
     if corpus.get("projection_digest") is not None:
         options["expected_digest"] = corpus["projection_digest"]
@@ -2971,7 +3068,8 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
           is_root: bool = False,
           qualification: Mapping | None = None,
           folds: int = 3,
-          equity_feed: str = "iex") -> dict:
+          equity_feed: str = "iex",
+          equity_provider: str = "alpaca") -> dict:
     raw_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
     raw_baseline = [dict(row) for row in baseline if isinstance(row, Mapping)]
     raw_null = [dict(row) for row in null_rows if isinstance(row, Mapping)]
@@ -2983,13 +3081,16 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                             [*raw_rows, *raw_baseline, *raw_null])
     row_projection = authorization_projection(raw_rows, vehicle=vehicle,
                                               strict=strict_projection,
-                                              equity_feed=equity_feed)
+                                              equity_feed=equity_feed,
+                                              equity_provider=equity_provider)
     baseline_projection = authorization_projection(raw_baseline, vehicle=vehicle,
                                                    strict=strict_projection,
-                                                   equity_feed=equity_feed)
+                                                   equity_feed=equity_feed,
+                                                   equity_provider=equity_provider)
     null_projection = authorization_projection(raw_null, vehicle=vehicle,
                                                strict=strict_projection,
-                                               equity_feed=equity_feed)
+                                               equity_feed=equity_feed,
+                                               equity_provider=equity_provider)
     rows = row_projection["eligible"]
     baseline = baseline_projection["eligible"]
     null_rows = null_projection["eligible"]
@@ -3030,24 +3131,29 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
     fit_floor = structural_floor(
         fit, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
         min_clusters=MIN_PROMOTION_CLUSTERS, required=mode != "shadow",
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     held_floor = structural_floor(
         heldout, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
-        min_clusters=MIN_PROMOTION_CLUSTERS, equity_feed=equity_feed)
+        min_clusters=MIN_PROMOTION_CLUSTERS, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     overall_floor = structural_floor(
         ordered, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
-        min_clusters=MIN_PROMOTION_CLUSTERS, equity_feed=equity_feed)
+        min_clusters=MIN_PROMOTION_CLUSTERS, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     fit_test = (matched_cluster_test(
-        fit, base_fit, vehicle=vehicle, equity_feed=equity_feed)
+        fit, base_fit, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
         if mode != "shadow" else
                 {"available": True, "actual_control": True, "matched": 0,
                  "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest",
                  "adequate": True,
                  "paired_adequacy": {"adequate": True, "mode": "prior_backtest"}})
     test = matched_cluster_test(
-        heldout, base_heldout, vehicle=vehicle, equity_feed=equity_feed)
+        heldout, base_heldout, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     placebo = placebo_null_distribution(
-        heldout, base_heldout, vehicle=vehicle, equity_feed=equity_feed)
+        heldout, base_heldout, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     independent_seed = stable_seed({
         "purpose": "independent_placebo_null_tail.v1",
         "primary_assignments_hash": placebo["assignments_hash"],
@@ -3062,7 +3168,7 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
     independent_placebo = placebo_null_distribution(
         heldout, base_heldout, vehicle=vehicle,
         draws=int(placebo["draws"]), seed=independent_seed,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     independent_falsification = falsification_gate(
         independent_placebo["observed"], independent_placebo["placebo"],
         alpha=alpha)
@@ -3091,7 +3197,8 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                    "passes": bool(heldout), "mode": "new_data"})
     fit_net = sum(float(row.get("net_pnl", 0.0)) for row in fit)
     absolute = performance_floor(
-        heldout, vehicle=vehicle, equity_feed=equity_feed)
+        heldout, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     held_net = absolute["net_pnl"]
     held_sessions = {str(row.get("session_date") or "") for row in heldout}
     null_heldout = [row for row in null_rows
@@ -3099,7 +3206,8 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
     null_test = (test if is_root else
                  matched_cluster_test(
                      heldout, null_heldout, vehicle=vehicle,
-                     equity_feed=equity_feed))
+                     equity_feed=equity_feed,
+                     equity_provider=equity_provider))
     null_control = {**null_test, "kind": "randomized_entry_null",
                     "available": bool(null_test["available"] and
                                       null_test.get("adequate")),
@@ -3119,9 +3227,10 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
             max(1, int(folds))),
         min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
         requested_min_sessions=max(1, int(min_sessions)),
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     rejection = expectancy_rejection_report(
-        heldout, vehicle=vehicle, equity_feed=equity_feed)
+        heldout, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     negative_folds = [item for item in walk_forward.get("results", ())
                       if item.get("adequate") and
                       float(item.get("net_pnl", 0.0)) <= 0.0]
@@ -3188,48 +3297,56 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                         if str(row.get("session_date") or "") in held_sessions]
     fit_null_projection = (authorization_projection(
         fit_null_raw, vehicle=vehicle, strict=strict_projection,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
         if fit_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
     heldout_null_projection = (authorization_projection(
         heldout_null_raw, vehicle=vehicle, strict=strict_projection,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
         if heldout_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
     arm_diagnostics = {
         "fit": arm_evidence_report(
             candidate=raw_fit, baseline=raw_base_fit, null=fit_null_raw,
             vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider,
             projections={"candidate": authorization_projection(
                              raw_fit, vehicle=vehicle, strict=strict_projection,
-                             equity_feed=equity_feed),
+                             equity_feed=equity_feed,
+                             equity_provider=equity_provider),
                          "baseline": authorization_projection(
                              raw_base_fit, vehicle=vehicle,
                              strict=strict_projection,
-                             equity_feed=equity_feed),
+                             equity_feed=equity_feed,
+                             equity_provider=equity_provider),
                          "null": fit_null_projection}),
         "heldout": arm_evidence_report(
             candidate=raw_heldout, baseline=raw_base_heldout,
             null=heldout_null_raw, vehicle=vehicle,
-            equity_feed=equity_feed,
+            equity_feed=equity_feed, equity_provider=equity_provider,
             projections={"candidate": authorization_projection(
                              raw_heldout, vehicle=vehicle,
                              strict=strict_projection,
-                             equity_feed=equity_feed),
+                             equity_feed=equity_feed,
+                             equity_provider=equity_provider),
                          "baseline": authorization_projection(
                              raw_base_heldout, vehicle=vehicle,
                              strict=strict_projection,
-                             equity_feed=equity_feed),
+                             equity_feed=equity_feed,
+                             equity_provider=equity_provider),
                          "null": heldout_null_projection}),
         "all": arm_evidence_report(
             candidate=ordered_raw, baseline=base_ordered_raw,
             null=raw_null, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider,
             projections={"candidate": authorization_projection(
                              ordered_raw, vehicle=vehicle,
                              strict=strict_projection,
-                             equity_feed=equity_feed),
+                             equity_feed=equity_feed,
+                             equity_provider=equity_provider),
                          "baseline": authorization_projection(
                              base_ordered_raw, vehicle=vehicle,
                              strict=strict_projection,
-                             equity_feed=equity_feed),
+                             equity_feed=equity_feed,
+                             equity_provider=equity_provider),
                          "null": null_projection}),
     }
     fit_execution_rows = [row for row in raw_fit if isinstance(row, Mapping)]
@@ -3267,9 +3384,11 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "heldout_expectancy": absolute["expectancy"],
         "heldout_performance": absolute,
         "fit_trades": sample_counts(
-            fit, vehicle=vehicle, equity_feed=equity_feed)["trades"],
+            fit, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider)["trades"],
         "heldout_trades": sample_counts(
-            heldout, vehicle=vehicle, equity_feed=equity_feed)["trades"],
+            heldout, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider)["trades"],
         "heldout_delta_lcb": lcb,
         "max_drawdown": max_drawdown_of(ordered), "test": test,
         "fit_test": fit_test, "control": {**test, "kind": (
@@ -3294,11 +3413,17 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                            {str(item.get("session_date") or "") for item in raw_heldout}],
         "authorization_projection": {
             "candidate": {key: row_projection.get(key) for key in
-                           ("schema", "vehicle", "strict", "counts", "reasons", "excluded")},
+                           ("schema", "vehicle", "equity_feed",
+                            "equity_provider", "strict", "counts", "reasons",
+                            "excluded")},
             "baseline": {key: baseline_projection.get(key) for key in
-                         ("schema", "vehicle", "strict", "counts", "reasons", "excluded")},
+                         ("schema", "vehicle", "equity_feed",
+                          "equity_provider", "strict", "counts", "reasons",
+                          "excluded")},
             "null": {key: null_projection.get(key) for key in
-                      ("schema", "vehicle", "strict", "counts", "reasons", "excluded")},
+                      ("schema", "vehicle", "equity_feed",
+                       "equity_provider", "strict", "counts", "reasons",
+                       "excluded")},
         },
         "arm_diagnostics": arm_diagnostics,
     }
@@ -3546,7 +3671,8 @@ def _run_diagnostic_factory(
     llm_observations: list[dict[str, Any]] = []
     raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
         data, require_provenance=False,
-        expected_equity_feed=policy.equity_feed)
+        expected_equity_feed=policy.equity_feed,
+        expected_provider=policy.equity_provider)
     actual_source_hash = content_hash(raw_rows)
     expected_source_hash = (source_report or {}).get("content_hash")
     if (expected_source_hash is not None and
@@ -3972,6 +4098,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     risk_assumptions = None
     if isinstance(configured_risk, Mapping) and configured_risk:
         risk_assumptions = {**policy.as_dict(), **dict(configured_risk)}
+    learning_epoch = _factory_learning_epoch(
+        vehicle=vehicle, costs=model, measured_costs=cost_setup.measured,
+        policy=policy, execution_geometry=execution_geometry,
+        risk_assumptions=risk_assumptions,
+        backtest_bar_fallback=backtest_bar_fallback)
     llm_config = dict(strategy_llm or {})
     llm_config.setdefault("near_duplicate_distance", NEAR_DUPLICATE_DISTANCE)
     llm_enabled = bool(llm_config.get("enabled", False))
@@ -4000,12 +4131,14 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     if worker_data_path is None:
         raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
             data, require_provenance=True,
-            expected_equity_feed=policy.equity_feed)
+            expected_equity_feed=policy.equity_feed,
+            expected_provider=policy.equity_provider)
     else:
         raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
             data, force_quote_index=isinstance(data, (str, Path)),
             require_provenance=True,
-            expected_equity_feed=policy.equity_feed)
+            expected_equity_feed=policy.equity_feed,
+            expected_provider=policy.equity_provider)
     dataset_hash = content_hash(raw_rows)
     if str(_source_report.get("content_hash")) != dataset_hash:
         if callable(getattr(quote_rows, "close", None)):
@@ -4020,7 +4153,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     if worker_data_path is not None:
         projection_digest = validate_worker_projection(
             worker_data_path, bars=bars, snapshots=snapshot_map,
-            expected_equity_feed=policy.equity_feed)
+            expected_equity_feed=policy.equity_feed,
+            expected_provider=policy.equity_provider)
         if (worker_source_report is not None and
                 str(worker_source_report.get("content_hash")) != projection_digest):
             raise FactoryError("worker_data changed after provenance validation")
@@ -4068,6 +4202,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "replay_policies": {"backtest": backtest_policy.as_dict(),
                              "shadow": shadow_policy.as_dict()},
         "backtest_bar_fallback": backtest_bar_fallback,
+        "learning_epoch": learning_epoch,
         "gate": gate_assumptions, "strategy_llm": llm_assumptions,
     }
     if risk_assumptions is not None:
@@ -4093,6 +4228,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     }
     experiment_provenance_body["backtest_bar_fallback"] = backtest_bar_fallback
     experiment_provenance_body["code_hash"] = identity_hashes["code_hash"]
+    experiment_provenance_body["learning_epoch"] = learning_epoch
     identity = experiment_identity(
         dataset_hash=dataset_hash, vehicle=vehicle,
         code_hash=identity_hashes["code_hash"],
@@ -4155,7 +4291,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         llm_config=llm_config, adapter=llm_adapter,
         existing_specs=existing_specs,
         llm_observations=llm_observations,
-        execution_geometry=execution_geometry)
+        execution_geometry=execution_geometry,
+        learning_epoch=learning_epoch)
     active = factory.active(vehicle)[:int(strategies)]
     if not active:
         return {"schema": FACTORY_SCHEMA, "status": "exhausted", "dataset_hash": dataset_hash,
@@ -4202,7 +4339,9 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                      quote_sessions)
     for hypothesis in active:
         mode = "shadow" if hypothesis.get("status") == "backtest_passed" else "backtest"
-        boundary = (factory.last_boundary(hypothesis["hypothesis_id"], vehicle)
+        boundary = (factory.last_boundary(
+                        hypothesis["hypothesis_id"], vehicle,
+                        learning_epoch=learning_epoch)
                     if mode == "shadow" else hypothesis.get("not_before"))
         selected_bars = [bar for bar in bars
                          if (boundary is None or _session(bar) > boundary)
@@ -4346,7 +4485,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         # Between the phases, and only in this process, the variants are
         # chosen.  Every provider call the factory makes lives here, so no
         # adapter is ever pickled into a worker.
-        shared = shared_learning(factory, vehicle=vehicle)
+        shared = shared_learning(factory, vehicle=vehicle,
+                                 learning_epoch=learning_epoch)
         scheduled = []
         for task in tasks:
             hypothesis = task["hypothesis"]
@@ -4367,9 +4507,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 task["diagnostic"] = diagnostic
                 family = str(hypothesis["family"])
                 family_lessons = _lesson_brief(
-                    factory, vehicle=vehicle, family=family)
+                    factory, vehicle=vehicle, family=family,
+                    learning_epoch=learning_epoch)
                 refinement_lessons = _refinement_history(
-                    factory, vehicle=vehicle, hypothesis_id=hypothesis_id)
+                    factory, vehicle=vehicle, hypothesis_id=hypothesis_id,
+                    learning_epoch=learning_epoch)
                 refinement: dict[str, Any] = {}
                 chosen, tuning = _tuned_variants(
                     hypothesis, diagnostic,
@@ -4377,16 +4519,19 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     llm_enabled=llm_enabled, config=llm_config,
                     risk_config=risk_assumptions,
                     adapter=llm_adapter,
+                    learning_epoch=learning_epoch,
                     lessons=family_lessons,
                     refinement_lessons=refinement_lessons,
                     already_failed=_failed_variants(factory, vehicle=vehicle,
-                                                    family=family),
+                                                    family=family,
+                                                    learning_epoch=learning_epoch),
                     closed_variant_ids=frozenset(factory.closed_variant_ids(
-                        vehicle=vehicle, hypothesis_id=hypothesis_id)),
+                        vehicle=vehicle, hypothesis_id=hypothesis_id,
+                        learning_epoch=learning_epoch)),
                     durable_novel_tuning_values=frozenset(
                         factory.novel_tuning_values(
                             hypothesis_id=hypothesis_id, vehicle=vehicle,
-                            family=family)),
+                            family=family, learning_epoch=learning_epoch)),
                     shared=shared,
                     existing_specs=existing_specs,
                     refinement_state=refinement,
@@ -4436,8 +4581,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                         diagnosis=task["diagnostic"],
                         evidence={"novel_tuning": bool(item.novel_tuning)},
                         parent_lesson_id=(
-                            factory.resolve_lesson_ref(item.builds_on)
-                            if item.builds_on else None))
+                            factory.resolve_lesson_ref(
+                                item.builds_on, learning_epoch=learning_epoch)
+                            if item.builds_on else None),
+                        learning_epoch=learning_epoch)
                 except (FactoryError, KeyError, sqlite3.Error):
                     # Losing an annotation must not lose the evaluation.
                     pass
@@ -4676,6 +4823,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     _progress("aggregating", 0, aggregation_total)
     aggregation_done = 0
     for worker in worker_results:
+        worker_policy = worker.get("policy", policy)
         for variant in worker["variants"]:
             gate = _gate(variant["account"]["rows"], vehicle=vehicle,
                          baseline=worker["control_rows"],
@@ -4685,8 +4833,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                              worker["hypothesis"]["rule_spec"])),
                          null_rows=(worker.get("null_rows") or {}).get(
                              variant["variant_id"], []),
-                         equity_feed=worker.get(
-                             "policy", policy).equity_feed)
+                         equity_feed=worker_policy.equity_feed,
+                         equity_provider=worker_policy.equity_provider)
             variant_rows.append((worker, variant, gate))
             aggregation_done += 1
             _progress("aggregating", aggregation_done, aggregation_total)
@@ -4897,7 +5045,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 sessions=sessions, candidate_id=selected_variant["variant_id"],
                 preselected=True,
                 max_drawdown=float(starting_cash) * .05,
-                equity_feed=selected_policy.equity_feed)
+                equity_feed=selected_policy.equity_feed,
+                equity_provider=selected_policy.equity_provider)
             qualification_key = selected_test_key
 
     partitions: dict[str, tuple[list, list]] = {}
@@ -5031,6 +5180,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             null_control=gate["null_control"],
             online_fdr=(cumulative if key == selected_test_key else {}),
             costs=model,
+            measured_costs=cost_setup.measured,
             provenance=provenance_hash(
                 dataset=raw_rows, config=run_config, code=Path(__file__),
                 provenance=run_provenance),
@@ -5041,7 +5191,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                          "heldout_net_pnl": gate["heldout_net_pnl"],
                          "heldout_expectancy": gate["heldout_expectancy"],
                          "max_drawdown": gate["max_drawdown"]},
-            equity_feed=worker_policy.equity_feed)
+            equity_feed=worker_policy.equity_feed,
+            equity_provider=worker_policy.equity_provider)
         gate["passes"] = bool(envelope["passes"])
         gate["verified_gate"] = envelope
         gate["gate_hash"] = envelope["content_hash"]
@@ -5077,7 +5228,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                gate: Mapping[str, Any]) -> None:
         try:
             factory.grade_lesson(hypothesis_id, variant_id, kind=kind,
-                                 outcome=_lesson_outcome(gate))
+                                 outcome=_lesson_outcome(gate),
+                                 learning_epoch=learning_epoch)
         except (FactoryError, KeyError, sqlite3.Error):
             pass
 
@@ -5096,7 +5248,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         refinement_snapshot = dict(worker.get("refinement") or {})
         local_ids = {str(item[0]["variant_id"]) for item in local}
         closed_ids = set(factory.closed_variant_ids(
-            vehicle=vehicle, hypothesis_id=str(hypothesis["hypothesis_id"])))
+            vehicle=vehicle, hypothesis_id=str(hypothesis["hypothesis_id"]),
+            learning_epoch=learning_epoch))
         coordinate_total = int(refinement_snapshot.get("coordinate_total") or 0)
         interaction_total = int(refinement_snapshot.get("interaction_total") or 0)
         remaining_before = refinement_snapshot.get("coordinate_remaining_before")
@@ -5107,9 +5260,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     local_ids & set(str(item) for item in refinement_snapshot.get(
                         "pool_variant_ids", ()))))
         eligible_confirmatory_attempts = sum(factory.variant_attempts(
-            str(hypothesis["hypothesis_id"]), variant_id) for variant_id in local_ids)
+            str(hypothesis["hypothesis_id"]), variant_id,
+            learning_epoch=learning_epoch) for variant_id in local_ids)
         account_attempts_total = sum(factory.account_attempts(
-            str(hypothesis["hypothesis_id"]), variant_id) for variant_id in local_ids)
+            str(hypothesis["hypothesis_id"]), variant_id,
+            learning_epoch=learning_epoch) for variant_id in local_ids)
         search_state = {
             "state": ("waiting_for_new_data" if not local else "searching"),
             "coordinate_total": coordinate_total,
@@ -5161,7 +5316,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                       "gate": gate, "reason": reason, "proposed_by": origin,
                       "signal_quality_screen": screen_record,
                       "classification": _gate_classification(gate)}
-            factory.add_account(cycle_id, hypothesis["hypothesis_id"], result)
+            factory.add_account(cycle_id, hypothesis["hypothesis_id"], result,
+                                learning_epoch=learning_epoch)
             # The reason was fixed before this gate existed; now it is graded
             # against it.  That pairing is what later prompts read back.
             _grade(str(hypothesis["hypothesis_id"]), variant["variant_id"],
@@ -5173,9 +5329,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             classification = _gate_classification(gate)
             try:
                 attempts = factory.variant_attempts(
-                    str(hypothesis["hypothesis_id"]), str(variant["variant_id"]))
+                    str(hypothesis["hypothesis_id"]), str(variant["variant_id"]),
+                    learning_epoch=learning_epoch)
                 total_attempts = factory.account_attempts(
-                    str(hypothesis["hypothesis_id"]), str(variant["variant_id"]))
+                    str(hypothesis["hypothesis_id"]), str(variant["variant_id"]),
+                    learning_epoch=learning_epoch)
                 if classification == "adequate_negative_rejection":
                     factory.close_variant(
                         str(hypothesis["hypothesis_id"]), str(variant["variant_id"]),
@@ -5185,7 +5343,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                             "classification": classification,
                             "gate_hash": gate.get("gate_hash"),
                             "eligible_confirmatory_attempts": attempts,
-                            "account_attempts_total": total_attempts})
+                            "account_attempts_total": total_attempts},
+                        learning_epoch=learning_epoch)
                 elif classification == "execution_blocked" and \
                         total_attempts >= int(max_confirmatory_attempts):
                     # Execution-blocked fit points are not statistical
@@ -5203,7 +5362,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                             "max_confirmatory_attempts": int(max_confirmatory_attempts),
                             "eligible_confirmatory_attempts": attempts,
                             "account_attempts_total": total_attempts,
-                            "fit_execution_blocked": True})
+                            "fit_execution_blocked": True},
+                        learning_epoch=learning_epoch)
                 elif (classification == "adequate_negative_inconclusive" or
                       classification == "adequate_inconclusive") and \
                         attempts >= int(max_confirmatory_attempts):
@@ -5216,13 +5376,15 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                             "max_confirmatory_attempts": int(max_confirmatory_attempts),
                             "gate_hash": gate.get("gate_hash"),
                             "eligible_confirmatory_attempts": attempts,
-                            "account_attempts_total": total_attempts})
+                            "account_attempts_total": total_attempts},
+                        learning_epoch=learning_epoch)
             except (FactoryError, KeyError, sqlite3.Error):
                 # Closure is an auditable lifecycle annotation.  A failure to
                 # append it must not discard the immutable account itself.
                 pass
             closure = next((item for item in factory.variant_closures(
-                hypothesis_id=str(hypothesis["hypothesis_id"]))
+                hypothesis_id=str(hypothesis["hypothesis_id"]),
+                learning_epoch=learning_epoch)
                             if str(item["variant_id"]) == str(variant["variant_id"])), None)
             if closure is not None:
                 gate["variant_closure"] = dict(closure)
@@ -5283,7 +5445,13 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                              "diagnostic": variant["diagnostic"],
                              "confidence": gate["confidence"],
                              "heldout_delta": gate["test"].get("mean_delta"),
-                             "max_drawdown": gate["max_drawdown"]})
+                             "max_drawdown": gate["max_drawdown"],
+                             # The trial lane must bind live feedback to the
+                             # exact factory assumptions that earned this
+                             # verified shadow proof.  Persist the token in
+                             # the immutable run metrics; candidate
+                             # provenance itself is stored only as a hash.
+                             "learning_epoch": learning_epoch})
                 for trade in variant["account"]["rows"]:
                     edge.append_trade(run["run_id"], trade)
                 edge.record_verified_gate(run["run_id"], gate)
@@ -5394,7 +5562,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     hypothesis["hypothesis_id"], cycle_id=cycle_id,
                     expected_variants=int(worker.get("expected_variants", 0)),
                     reason="coordinate phase recentered on best fit child",
-                    payload=recenter_payload, mode="recenter")
+                    payload=recenter_payload, mode="recenter",
+                    learning_epoch=learning_epoch)
                 replacements.append(asdict(child))
             elif recenter_payload and recenter_payload.get("bounded_space_exhausted"):
                 factory.event(
@@ -5455,9 +5624,14 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     not_before=worker["evaluation_end"],
                     existing_variant_ids=existing_variant_ids,
                     adapter=llm_adapter,
-                    lessons=_lesson_brief(factory, vehicle=vehicle),
-                    failed_variant_ids=_failed_variants(factory, vehicle=vehicle),
-                    tried_families=_slot_families(factory, vehicle, slot),
+                    learning_epoch=learning_epoch,
+                    lessons=_lesson_brief(factory, vehicle=vehicle,
+                                          learning_epoch=learning_epoch),
+                    failed_variant_ids=_failed_variants(
+                        factory, vehicle=vehicle,
+                        learning_epoch=learning_epoch),
+                    tried_families=_slot_families(
+                        factory, vehicle, slot, learning_epoch=learning_epoch),
                     existing_specs=existing_specs,
                     llm_observations=llm_observations)
                 # A model alias is not a reason to strand a research slot. An
@@ -5496,7 +5670,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                         changed={"from_family": hypothesis["family"],
                                  "to_family": replacement.family},
                         diagnosis=aggregate,
-                        evidence=dict(proposal.evidence) if proposal else {})
+                        evidence=dict(proposal.evidence) if proposal else {},
+                        learning_epoch=learning_epoch)
                 except (FactoryError, KeyError, sqlite3.Error):
                     pass
                 retirement_payload = {
@@ -5519,7 +5694,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     reason=("LLM replacement registered after every intended variant failed"
                             if proposal is not None else
                             "deterministic replacement registered after every intended variant failed"),
-                    payload=retirement_payload)
+                    payload=retirement_payload,
+                    learning_epoch=learning_epoch)
                 replacements.append(asdict(replacement))
             elif (llm_enabled and replacement_error != "generation_limit" and
                   not execution_blocked_exhausted):
@@ -5546,7 +5722,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                      execution_blocked_exhausted) and
                         rotations_used < int(max_rotations) and
                         len(rotations) < int(rotation_budget)):
-                    tried = _slot_families(factory, vehicle, slot)
+                    tried = _slot_families(
+                        factory, vehicle, slot, learning_epoch=learning_epoch)
                     seed, rotation_proposal, rotation_source = _seed_slot(
                         hypothesis,
                         generation=factory.next_generation(vehicle, slot),
@@ -5559,9 +5736,12 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                             previous=hypothesis, tried_families=tried,
                             proved_families=_proved_families(edge, vehicle),
                             diagnostic=aggregate,
-                            lessons=_lesson_brief(factory, vehicle=vehicle),
+                            lessons=_lesson_brief(
+                                factory, vehicle=vehicle,
+                                learning_epoch=learning_epoch),
                             shared=shared,
-                            execution_geometry=execution_geometry),
+                            execution_geometry=execution_geometry,
+                            learning_epoch=learning_epoch),
                         llm_enabled=llm_enabled, config=llm_config,
                         adapter=llm_adapter,
                         llm_observations=llm_observations)
@@ -5582,7 +5762,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     _record_seed_lesson(factory, seed, vehicle=vehicle,
                                         kind="rotation", source=rotation_source,
                                         proposal=rotation_proposal,
-                                        diagnostic=aggregate)
+                                        diagnostic=aggregate,
+                                        learning_epoch=learning_epoch)
                     rotation_payload = {
                         "diagnostic": aggregate, "tested_variants": len(local),
                         "rotation": True, "rotation_index": rotations_used,
@@ -5604,7 +5785,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                         hypothesis["hypothesis_id"], cycle_id=cycle_id,
                         expected_variants=int(worker.get("expected_variants", 0)),
                         reason="generation budget exhausted; slot rotated to a fresh family",
-                        payload=rotation_payload)
+                        payload=rotation_payload,
+                        learning_epoch=learning_epoch)
                     rotations.append(asdict(seed))
         elif all_intended_adequate:
             # Adequate evidence can still be inconclusive: FDR, walk-forward,
@@ -5706,6 +5888,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "dependence_policy": dependence_policy,
         "dependence_constraint": dependence_constraint,
         "dataset_hash": dataset_hash, "vehicle": vehicle,
+        "learning_epoch": learning_epoch,
         "bar_coverage": bar_coverage,
         "experiment_identity": identity,
         "experiment_provenance": experiment_provenance_body,
@@ -5716,7 +5899,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "worker_pids": sorted({row["worker_pid"] for row in summaries}),
         "strategies": len(worker_results), "variants": len(summaries),
         "accounts": len(summaries), "results": summaries,
-        "variant_closures": factory.variant_closures(vehicle=vehicle),
+        "variant_closures": factory.variant_closures(
+            vehicle=vehicle, learning_epoch=learning_epoch),
         "verdict": {
             "candidate_proved": bool(classification_counts.get("proved")),
             "classifications": classification_counts,

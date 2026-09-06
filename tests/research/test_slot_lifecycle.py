@@ -91,7 +91,7 @@ class SlotStateTests(unittest.TestCase):
         self.assertAlmostEqual(
             context["execution_geometry"]["effective_stop_floor_bps"],
             25.0 / 0.30)
-        self.assertTrue(
+        self.assertFalse(
             context["execution_geometry"]["policy_adjusted_stop_floor_admissible"])
         self.assertEqual(
             context["execution_geometry"]["expected_symmetric_bar_round_trip_bps"],

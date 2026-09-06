@@ -9,6 +9,8 @@ import sqlite3
 from typing import Mapping
 import uuid
 
+from .costs import CostError
+
 
 def run_engine_epoch(run: Mapping) -> int:
     """The replay generation a persisted run was measured under.
@@ -195,6 +197,80 @@ def _durable_trade_columns_match(item, payload: Mapping, run: Mapping) -> bool:
             _close(payload_return, durable_return))
 
 
+def _measured_cost_schedule_error(
+        candidate_config: Mapping, envelope: Mapping, *,
+        vehicle: str) -> str | None:
+    """Verify measured row models against the candidate's frozen schedule.
+
+    Row economics and an envelope content hash prove internal consistency,
+    not provenance authenticity: a caller can choose different model
+    parameters, recompute every price/P&L field, and re-sign the result.  The
+    immutable candidate config is the authority at the durable proof
+    boundary, so resolve both legs again from its embedded schedule and
+    compare every persisted model field exactly (within numeric tolerance).
+    """
+    measured_binding = envelope.get("cost_model_binding")
+    if not isinstance(measured_binding, Mapping):
+        return None
+    try:
+        from .gates import _measured_cost_authority
+        from .quote_costs import cost_resolver_setup
+
+        candidate_authority = _measured_cost_authority(candidate_config)
+        if (not isinstance(candidate_authority, Mapping) or
+                measured_binding.get("authority") != candidate_authority):
+            return "verified gate measured-cost schedule does not match candidate config"
+        setup = cost_resolver_setup(candidate_config, vehicle=vehicle)
+        if setup.measured is None or not callable(setup.resolver):
+            return "verified gate measured-cost candidate resolver is unavailable"
+
+        for arm in ("fit_source", "heldout_source", "fit_baseline_source",
+                    "heldout_baseline_source", "null_source"):
+            rows = envelope.get(arm)
+            if not isinstance(rows, list):
+                return "verified gate measured-cost source rows are invalid"
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    return "verified gate measured-cost source row is invalid"
+                provenances = [
+                    row.get(f"{leg}_cost_model_provenance")
+                    for leg in ("entry", "exit")]
+                measured = [
+                    isinstance(value, str) and
+                    value.strip().lower().startswith("measured:")
+                    for value in provenances]
+                if not any(measured):
+                    continue
+                if not all(measured):
+                    return "verified gate measured-cost row has partial leg provenance"
+                for leg in ("entry", "exit"):
+                    timestamp = next((
+                        row.get(name) for name in (
+                            f"{leg}_timestamp", f"{leg}_cost_timestamp",
+                            "timestamp")
+                        if row.get(name) not in (None, "")), None)
+                    context = {
+                        **dict(row),
+                        "cost_leg": leg,
+                        "cost_timestamp": timestamp,
+                        "feed": row.get(f"{leg}_feed"),
+                        "provider": row.get(f"{leg}_provider"),
+                    }
+                    expected = setup.resolver(context)
+                    if row.get(f"{leg}_cost_model_provenance") != expected.provenance:
+                        return "verified gate measured-cost provenance is not schedule-derived"
+                    for component in ("spread_bps", "slippage_bps", "fee_bps"):
+                        claimed = row.get(f"{leg}_cost_model_{component}")
+                        if (isinstance(claimed, bool) or
+                                not isinstance(claimed, (int, float)) or
+                                not _close(claimed, getattr(expected, component))):
+                            return ("verified gate measured-cost model parameter "
+                                    "is not schedule-derived")
+    except (CostError, TypeError, ValueError, OverflowError, KeyError):
+        return "verified gate measured-cost schedule resolution failed"
+    return None
+
+
 class EdgeLedgerProofMixin:
     """Mixin containing durable gate-proof and eligibility operations."""
 
@@ -247,6 +323,18 @@ class EdgeLedgerProofMixin:
             equity_feed = "delayed_sip"
         if equity_feed not in {"iex", "sip", "delayed_sip"}:
             return "verified gate equity feed is invalid"
+        has_equity_provider = "equity_provider" in envelope
+        raw_equity_provider = envelope.get("equity_provider")
+        if has_equity_provider and (
+                not isinstance(raw_equity_provider, str) or
+                not raw_equity_provider.strip()):
+            return "verified gate equity provider is invalid"
+        # Historical envelopes predate provider identity. Keep them readable
+        # under provider-agnostic compatibility verification, while every
+        # current envelope is bound to one canonical provider.
+        equity_provider = (
+            raw_equity_provider.strip().lower()
+            if has_equity_provider else None)
         # Source-backed proofs must identify the immutable run candidate.
         # During the historical transition producers used the candidate's
         # stable variant id before the UUID-backed ledger record existed, so
@@ -268,6 +356,26 @@ class EdgeLedgerProofMixin:
             if (not isinstance(envelope_candidate_id, str) or
                     envelope_candidate_id not in allowed_candidate_ids):
                 return "verified gate candidate identity does not match persisted run"
+            # Measured row models must be bound to the frozen schedule that
+            # earned this candidate.  A re-signed envelope may preserve all
+            # row arithmetic while swapping in a self-consistent fake model;
+            # comparing the immutable gate authority with candidate config
+            # prevents that substitution at the ledger boundary.
+            measured_binding = envelope.get("cost_model_binding")
+            if isinstance(measured_binding, Mapping):
+                try:
+                    candidate_config = json.loads(
+                        candidate.get("config_json") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return "verified gate measured-cost candidate config is invalid"
+                if (not isinstance(candidate_config, Mapping) or
+                        candidate.get("config_hash") != content_hash(candidate_config)):
+                    return "verified gate measured-cost candidate config hash is invalid"
+                schedule_error = _measured_cost_schedule_error(
+                    candidate_config, envelope,
+                    vehicle=str(run.get("vehicle") or ""))
+                if schedule_error:
+                    return schedule_error
             qualification = envelope.get("qualification")
             if isinstance(qualification, Mapping) and "post_selection" in qualification:
                 post = qualification.get("post_selection")
@@ -335,12 +443,14 @@ class EdgeLedgerProofMixin:
         expected = envelope.get("counts") or {}
         actual = {
             "fit": sample_counts(
-                fit_rows, vehicle=run["vehicle"], equity_feed=equity_feed),
+                fit_rows, vehicle=run["vehicle"], equity_feed=equity_feed,
+                equity_provider=equity_provider),
             "heldout": sample_counts(
                 heldout_rows, vehicle=run["vehicle"],
-                equity_feed=equity_feed),
+                equity_feed=equity_feed, equity_provider=equity_provider),
             "total": sample_counts(
-                rows, vehicle=run["vehicle"], equity_feed=equity_feed),
+                rows, vehicle=run["vehicle"], equity_feed=equity_feed,
+                equity_provider=equity_provider),
         }
         if expected != actual:
             return "verified gate counts do not match persisted trades"
@@ -350,14 +460,93 @@ class EdgeLedgerProofMixin:
         if (not isinstance(source_fit, list) or not isinstance(source_held, list) or
                 sample_counts(
                     source_fit, vehicle=run["vehicle"],
-                    equity_feed=equity_feed) != actual["fit"] or
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider) != actual["fit"] or
                 sample_counts(
                     source_held, vehicle=run["vehicle"],
-                    equity_feed=equity_feed) != actual["heldout"]):
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider) != actual["heldout"]):
             return "verified gate source evidence is missing or does not match persisted trades"
         if (not _trade_rows_match(source_fit, fit_rows) or
                 not _trade_rows_match(source_held, heldout_rows)):
             return "verified gate source rows do not match persisted trades"
+        # Repeat the measured-cost binding at the durable run boundary.  The
+        # standalone envelope verifier resolves each leg against its embedded
+        # schedule, while this check additionally proves that the schedule
+        # authority is the immutable candidate/run configuration.  Keeping
+        # both boundaries is intentional: a validly re-signed envelope must
+        # not be transplantable to a run with a different measured schedule.
+        measured_binding = envelope.get("cost_model_binding")
+        if isinstance(measured_binding, Mapping):
+            from .gates import (_cost_model_binding_report,
+                                _measured_cost_authority)
+            try:
+                candidate_config = json.loads(
+                    candidate.get("config_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return "verified gate measured-cost candidate config is invalid"
+            candidate_authority = _measured_cost_authority(candidate_config)
+            if (not isinstance(candidate_authority, Mapping) or
+                    measured_binding.get("authority") != candidate_authority):
+                return "verified gate measured-cost schedule does not match candidate config"
+            expected_binding = _cost_model_binding_report(
+                {"fit": source_fit, "heldout": source_held,
+                 "fit_baseline": envelope.get("fit_baseline_source") or (),
+                 "heldout_baseline": envelope.get("heldout_baseline_source") or (),
+                 "null": envelope.get("null_source") or ()},
+                vehicle=run["vehicle"], authority=candidate_authority)
+            if (expected_binding != measured_binding or
+                    measured_binding.get("valid") is not True):
+                return "verified gate measured-cost model binding is invalid"
+            # Resolve the persisted row context through the same configured
+            # resolver used by replay, then compare all per-leg model fields
+            # and exact provenance.  The schedule hash/context binding above
+            # protects identity; this second comparison protects arithmetic.
+            try:
+                from .quote_costs import cost_resolver_setup
+                setup = cost_resolver_setup(
+                    candidate_config, vehicle=run["vehicle"])
+                if setup.resolver is None:
+                    return "verified gate measured-cost resolver is unavailable"
+                for row in [*source_fit, *source_held,
+                            *(envelope.get("fit_baseline_source") or ()),
+                            *(envelope.get("heldout_baseline_source") or ()),
+                            *(envelope.get("null_source") or ())]:
+                    if not any(str(row.get(f"{leg}_cost_model_provenance") or "")
+                               .strip().lower().startswith("measured:")
+                               for leg in ("entry", "exit")):
+                        continue
+                    quantity = float(row.get("quantity", 1.0))
+                    common = {
+                        "vehicle": run["vehicle"],
+                        "symbol": str(row.get("symbol") or ""),
+                        "quantity": quantity, "shares": quantity,
+                        "entry_timestamp": row.get("entry_timestamp"),
+                        "exit_timestamp": row.get("exit_timestamp"),
+                        "entry_feed": row.get("entry_feed"),
+                        "exit_feed": row.get("exit_feed"),
+                        "entry_provider": row.get("entry_provider"),
+                        "exit_provider": row.get("exit_provider"),
+                    }
+                    for leg in ("entry", "exit"):
+                        context = {
+                            **common,
+                            "cost_leg": leg,
+                            "cost_timestamp": common[f"{leg}_timestamp"],
+                            "feed": common[f"{leg}_feed"],
+                            "provider": common[f"{leg}_provider"],
+                        }
+                        model = setup.resolver(context)
+                        for component in ("spread_bps", "slippage_bps", "fee_bps"):
+                            if not _close(
+                                    getattr(model, component),
+                                    row.get(f"{leg}_cost_model_{component}")):
+                                return "verified gate measured-cost model differs from resolver"
+                        if model.provenance != row.get(
+                                f"{leg}_cost_model_provenance"):
+                            return "verified gate measured-cost provenance differs from resolver"
+            except (CostError, TypeError, ValueError, OverflowError, KeyError):
+                return "verified gate measured-cost resolver validation failed"
         if run.get("lane") == "shadow":
             metrics = run.get("metrics")
             shadow_source = (metrics.get("shadow_source")
@@ -425,7 +614,8 @@ class EdgeLedgerProofMixin:
                 min_trades=normalized_minimums["trades"],
                 min_sessions=normalized_minimums["sessions"],
                 min_clusters=normalized_minimums["clusters"],
-                equity_feed=equity_feed)
+                equity_feed=equity_feed,
+                equity_provider=equity_provider)
             if (feasibility.get("status") != recomputed_feasibility.get("status") or
                     bool(feasibility.get("adequate")) != bool(recomputed_feasibility.get("adequate"))):
                 return "verified gate floor feasibility evidence is inconsistent"
@@ -593,7 +783,7 @@ class EdgeLedgerProofMixin:
         from .gates import performance_floor
         absolute = performance_floor(
             heldout_rows, vehicle=run["vehicle"],
-            equity_feed=equity_feed)
+            equity_feed=equity_feed, equity_provider=equity_provider)
         if "heldout_net_pnl" in performance and not _close(
                 _finite_number(performance.get("heldout_net_pnl")), absolute["net_pnl"]):
             return "verified gate held-out net P&L does not match persisted trades"
@@ -903,6 +1093,10 @@ class EdgeLedgerProofMixin:
                     isinstance(minimums.get(key), bool) or minimums.get(key) < 1
                     for key in ("trades", "sessions"))):
             return False
+        selection_equity_feed = str(gate.get("equity_feed") or "iex")
+        selection_equity_provider = (
+            gate.get("equity_provider")
+            if "equity_provider" in gate else None)
         try:
             from .edge_discovery_core import _discover_gate
             from .edge_lab import _strengthen_gate
@@ -914,10 +1108,14 @@ class EdgeLedgerProofMixin:
                 alpha=float(selection.get("alpha")), shadow=True,
                 null_rows=selection_null,
                 qualification=gate.get("qualification"),
-                test_iterations=int(selection.get("test_iterations", 20_000)))
+                test_iterations=int(selection.get("test_iterations", 20_000)),
+                equity_feed=selection_equity_feed,
+                equity_provider=selection_equity_provider)
             selection_gate = _strengthen_gate(
                 selection_gate, selection_baseline,
-                vehicle=str(run.get("vehicle") or ""))
+                vehicle=str(run.get("vehicle") or ""),
+                equity_feed=selection_equity_feed,
+                equity_provider=selection_equity_provider)
         except (TypeError, ValueError, OverflowError, KeyError):
             return False
         if selection_gate.get("candidate_p_raw") != selection.get("raw_p_value"):

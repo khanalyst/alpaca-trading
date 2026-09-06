@@ -30,6 +30,9 @@ the same strict per-symbol, per-half-hour resolver for candidate, control,
 randomized-null, qualification, and live-shadow entry/exit costs. Missing or
 under-covered cells fail closed. The checked-in block remains disabled because
 no corpus-specific schedule can truthfully serve every deployment by default.
+`broker.provider` is the authoritative provider identity (shipped as
+`alpaca`); a schedule cannot authorize its own provider, and any explicit
+opportunity or live-shadow row carrying a different provider/feed is refused.
 
 ## `research/quote_costs.py` — the fitted schedule
 
@@ -38,14 +41,17 @@ half-hour of the session:
 
 - quoted spread in basis points of the mid — count, mean, min, max, p25,
   median, p75, p90, p95;
-- displayed size at the touch, taken from the thinner of the two sides, since
-  an entry and its exit cross in opposite directions over a position's life;
+- displayed size at the touch, taken from the thinner of the two sides when
+  both `bid_size` and `ask_size` are positive, since an entry and its exit
+  cross in opposite directions over a position's life; spread and executable-
+  depth coverage are tracked separately;
 - session and quote coverage, rejected-row counts, feeds and providers.
 
 Percentiles come from bounded fixed-width histograms rather than retained
 observations, so an 18.9M-row corpus fits in memory. Quotes that are one-sided,
-crossed, or non-positive are counted as rejected rather than allowed to shape
-the fit.
+crossed, or non-positive in bid/ask are counted as rejected rather than allowed
+to shape the fit. Missing or malformed displayed sizes leave the spread
+observation intact but do not shape executable depth.
 
 `cost_model_from_schedule` builds an ordinary `CostModel` from the result:
 
@@ -57,6 +63,11 @@ the fit.
   `max_impact_half_spreads`;
 - `provenance` records the schedule hash, the cell used, and the percentile, so
   any number in a replay can be traced back to the measurement behind it.
+
+For a positive `order_shares`, the selected section must meet
+`min_quotes_per_cell` for both spread and executable depth and provide a usable
+selected depth percentile; otherwise measured pricing fails closed. Omitted or
+nonpositive order size remains spread-only and does not require depth coverage.
 
 **This is not a way to make costs smaller.** The schedule reports what the
 corpus contains; a wide measured spread produces a wide model, and
@@ -74,11 +85,12 @@ profit factor, and the reference / drag / net R decomposition the diagnostic
 report uses.
 
 The causal measured resolver requires an explicitly requested symbol/time bucket
-to meet the schedule's `min_quotes_per_cell` quote-count floor. A missing or
+to meet the schedule's `min_quotes_per_cell` quote-count floor. For positive
+`order_shares`, the selected section must meet that floor for both spread and
+executable depth and provide a usable selected depth percentile. A missing or
 under-covered cell fails the complete configured-versus-measured rerun instead
-of silently falling back to a symbol-wide or universe aggregate; this guard
-prevents missing-cell fallback/selection from producing a misleading partial
-comparison.
+of silently falling back to a symbol-wide or universe aggregate; omitted or
+nonpositive order size remains spread-only.
 
 ```
 python -m research.cost_rerun \

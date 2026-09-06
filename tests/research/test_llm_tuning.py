@@ -634,23 +634,29 @@ class CitedLearningTests(unittest.TestCase):
             factory, _edge = _ledgers(directory)
             hypothesis = initial_hypotheses(1)[0]
             factory.register(hypothesis)
+            learning_epoch = "cited-learning-v1"
             first = factory.record_lesson(
                 hypothesis.hypothesis_id, vehicle="equity",
                 family=hypothesis.family,
                 variant_id=rule_variant_id(hypothesis.rule_spec),
                 kind="tuning", source="deterministic",
-                reason="The root, unchanged.")
+                reason="The root, unchanged.",
+                learning_epoch=learning_epoch)
             factory.grade_lesson(hypothesis.hypothesis_id,
                                  rule_variant_id(hypothesis.rule_spec),
                                  kind="tuning",
                                  outcome={"passed": False,
-                                          "failed_checks": ["made money"]})
-            brief = _lesson_brief(factory, vehicle="equity")
+                                          "failed_checks": ["made money"]},
+                                 learning_epoch=learning_epoch)
+            brief = _lesson_brief(
+                factory, vehicle="equity", learning_epoch=learning_epoch)
             self.assertEqual(brief[0]["id"], first[:12])
 
             # A proposal citing that brief entry resolves back to the row.
-            self.assertEqual(factory.resolve_lesson_ref(brief[0]["id"]), first)
-            self.assertIsNone(factory.resolve_lesson_ref("ffffffffffff"))
+            self.assertEqual(factory.resolve_lesson_ref(
+                brief[0]["id"], learning_epoch=learning_epoch), first)
+            self.assertIsNone(factory.resolve_lesson_ref(
+                "ffffffffffff", learning_epoch=learning_epoch))
 
             child_spec = validate_rule_spec(
                 {**hypothesis.rule_spec, "threshold_bps": 33.0})
@@ -659,7 +665,7 @@ class CitedLearningTests(unittest.TestCase):
                 family=hypothesis.family,
                 variant_id=rule_variant_id(child_spec), kind="tuning",
                 source="llm", reason="The cited attempt made no money; widen.",
-                parent_lesson_id=first)
+                parent_lesson_id=first, learning_epoch=learning_epoch)
             chain = {row["lesson_id"]: row["parent_lesson_id"]
                      for row in factory.lessons(vehicle="equity")}
             self.assertEqual(chain[second], first)
@@ -670,17 +676,21 @@ class CitedLearningTests(unittest.TestCase):
             factory, _edge = _ledgers(directory)
             hypothesis = initial_hypotheses(1)[0]
             factory.register(hypothesis)
+            learning_epoch = "novel-learning-v1"
             variant = rule_variant_id(
                 validate_rule_spec({**hypothesis.rule_spec, "stop_atr": 1.2}))
             factory.record_lesson(
                 hypothesis.hypothesis_id, vehicle="equity",
                 family=hypothesis.family, variant_id=variant, kind="tuning",
                 source="llm", reason="Raised stop_atr after a prior attempt.",
-                evidence={"novel_tuning": True})
+                evidence={"novel_tuning": True},
+                learning_epoch=learning_epoch)
             factory.grade_lesson(
                 hypothesis.hypothesis_id, variant, kind="tuning",
-                outcome={"passed": False, "underpowered": False})
-            brief = _lesson_brief(factory, vehicle="equity")
+                outcome={"passed": False, "underpowered": False},
+                learning_epoch=learning_epoch)
+            brief = _lesson_brief(
+                factory, vehicle="equity", learning_epoch=learning_epoch)
         self.assertTrue(brief[0]["novel_tuning"])
 
     def test_failed_variant_ids_only_closes_explicit_powered_rejections(self):
@@ -689,6 +699,7 @@ class CitedLearningTests(unittest.TestCase):
             factory, _edge = _ledgers(directory)
             hypothesis = initial_hypotheses(1)[0]
             factory.register(hypothesis)
+            learning_epoch = "failed-learning-v1"
             outcomes = {
                 "failed": {"passed": False, "underpowered": False,
                            "classification": "adequate_negative_rejection"},
@@ -705,10 +716,13 @@ class CitedLearningTests(unittest.TestCase):
                 factory.record_lesson(
                     hypothesis.hypothesis_id, vehicle="equity",
                     family=hypothesis.family, variant_id=ids[name],
-                    kind="tuning", source="llm", reason=f"The {name} attempt.")
+                    kind="tuning", source="llm", reason=f"The {name} attempt.",
+                    learning_epoch=learning_epoch)
                 factory.grade_lesson(hypothesis.hypothesis_id, ids[name],
-                                     kind="tuning", outcome=outcome)
-            closed = factory.failed_variant_ids(vehicle="equity")
+                                     kind="tuning", outcome=outcome,
+                                     learning_epoch=learning_epoch)
+            closed = factory.failed_variant_ids(
+                vehicle="equity", learning_epoch=learning_epoch)
         self.assertEqual(closed, {ids["failed"]})
 
 
@@ -1099,6 +1113,7 @@ class LessonLedgerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             factory, _edge = _ledgers(directory)
             hypothesis = self._seeded(factory)
+            learning_epoch = "lesson-epoch-v1"
             for index in range(9):
                 spec = validate_rule_spec({
                     **hypothesis.rule_spec, "stop_atr": 1.1 + index * .1})
@@ -1109,11 +1124,15 @@ class LessonLedgerTests(unittest.TestCase):
                     kind="tuning", source="llm", reason="Novel stop tuning.",
                     changed={"stop_atr": {"from": 1.0,
                                             "to": spec["stop_atr"]}},
-                    evidence={"novel_tuning": True})
+                    evidence={"novel_tuning": True},
+                    learning_epoch=learning_epoch)
             restarted = FactoryLedger(factory.path)
+            self.assertEqual(restarted.novel_tuning_values(
+                hypothesis_id=hypothesis.hypothesis_id, vehicle="equity",
+                family=hypothesis.family), set())
             durable = restarted.novel_tuning_values(
                 hypothesis_id=hypothesis.hypothesis_id, vehicle="equity",
-                family=hypothesis.family)
+                family=hypothesis.family, learning_epoch=learning_epoch)
             self.assertEqual(len(durable), 9)
             novel = ({**hypothesis.rule_spec, "stop_atr": 1.2},
                      "Raised stop_atr after durable prior attempts.")
@@ -1276,6 +1295,7 @@ class FeedbackLoopTests(unittest.TestCase):
             factory, _edge = _ledgers(directory)
             hypothesis = initial_hypotheses(1)[0]
             factory.register(hypothesis)
+            learning_epoch = "brief-learning-v1"
             for index in range(40):
                 spec = validate_rule_spec(
                     {**hypothesis.rule_spec, "threshold_bps": 10.0 + index})
@@ -1284,12 +1304,15 @@ class FeedbackLoopTests(unittest.TestCase):
                     hypothesis.hypothesis_id, vehicle="equity",
                     family=hypothesis.family, variant_id=variant, kind="tuning",
                     source="llm", reason="A padded reason. " * 12,
-                    changed=spec_delta(hypothesis.rule_spec, spec))
+                    changed=spec_delta(hypothesis.rule_spec, spec),
+                    learning_epoch=learning_epoch)
                 factory.grade_lesson(hypothesis.hypothesis_id, variant,
                                      kind="tuning",
                                      outcome={"passed": False,
-                                              "failed_checks": ["a", "b"]})
-            brief = _lesson_brief(factory, vehicle="equity")
+                                              "failed_checks": ["a", "b"]},
+                                     learning_epoch=learning_epoch)
+            brief = _lesson_brief(
+                factory, vehicle="equity", learning_epoch=learning_epoch)
             self.assertTrue(brief)
             self.assertLessEqual(len(json.dumps(brief).encode("utf-8")),
                                  factory_module.LESSON_BRIEF_BYTES)
@@ -1418,6 +1441,8 @@ class SharedLearningTests(unittest.TestCase):
     stops twelve slots rediscovering the same thing twelve times.
     """
 
+    LEARNING_EPOCH = "shared-learning-v1"
+
     def _graded(self, factory, hypothesis, *, family, changes, passed,
                 kind="tuning", source="llm"):
         for index, change in enumerate(changes):
@@ -1427,7 +1452,8 @@ class SharedLearningTests(unittest.TestCase):
                 hypothesis.hypothesis_id, vehicle="equity", family=family,
                 variant_id=variant, kind=kind, source=source,
                 reason=f"Attempt {index} on {family}.",
-                changed=spec_delta(hypothesis.rule_spec, spec))
+                changed=spec_delta(hypothesis.rule_spec, spec),
+                learning_epoch=self.LEARNING_EPOCH)
             factory.grade_lesson(hypothesis.hypothesis_id, variant, kind=kind,
                                  outcome={"passed": passed,
                                           "underpowered": False,
@@ -1444,7 +1470,8 @@ class SharedLearningTests(unittest.TestCase):
                                               "fit_positive" if passed else
                                               "fit_negative"),
                                           "fit_passed": bool(passed),
-                                          "fit_delta": 1.0 if passed else -1.0})
+                                          "fit_delta": 1.0 if passed else -1.0},
+                                 learning_epoch=self.LEARNING_EPOCH)
 
     def test_it_aggregates_parameter_directions_across_families(self):
         from research.strategy_factory import shared_learning
@@ -1459,7 +1486,9 @@ class SharedLearningTests(unittest.TestCase):
             self._graded(factory, hypothesis, family="beta",
                          changes=[{"threshold_bps": 40.0 + index}
                                   for index in range(3)], passed=False)
-            digest = shared_learning(factory, vehicle="equity")
+            digest = shared_learning(
+                factory, vehicle="equity",
+                learning_epoch=self.LEARNING_EPOCH)
 
         self.assertEqual(digest["graded_attempts"], 7)
         by_parameter = {(item["parameter"], item["direction"]): item
@@ -1485,12 +1514,15 @@ class SharedLearningTests(unittest.TestCase):
                     hypothesis.hypothesis_id, vehicle="equity",
                     family="alpha", variant_id=variant, kind="tuning",
                     source="llm", reason="Thin sample.",
-                    changed=spec_delta(hypothesis.rule_spec, spec))
+                    changed=spec_delta(hypothesis.rule_spec, spec),
+                    learning_epoch=self.LEARNING_EPOCH)
                 factory.grade_lesson(hypothesis.hypothesis_id, variant,
                                      kind="tuning",
                                      outcome={"passed": False,
-                                              "underpowered": True})
-        digest = shared_learning(factory, vehicle="equity")
+                                              "underpowered": True},
+                                     learning_epoch=self.LEARNING_EPOCH)
+        digest = shared_learning(
+            factory, vehicle="equity", learning_epoch=self.LEARNING_EPOCH)
         self.assertEqual(digest["parameters"], [])
         self.assertEqual(digest["families"], [])
         self.assertEqual(digest["live_trials"], {"run": 0, "failed": 0})
@@ -1513,7 +1545,9 @@ class SharedLearningTests(unittest.TestCase):
                 hypothesis.hypothesis_id, variant, kind="tuning",
                 outcome={"passed": True, "underpowered": False,
                          "classification": "proved", "heldout_delta": 99.0})
-            digest = shared_learning(factory, vehicle="equity")
+            digest = shared_learning(
+                factory, vehicle="equity",
+                learning_epoch=self.LEARNING_EPOCH)
         self.assertEqual(digest["graded_attempts"], 0)
         self.assertEqual(digest["parameters"], [])
 
@@ -1527,7 +1561,9 @@ class SharedLearningTests(unittest.TestCase):
             factory.register(hypothesis)
             self._graded(factory, hypothesis, family="alpha",
                          changes=[{"threshold_bps": 42.0}], passed=True)
-            digest = shared_learning(factory, vehicle="equity")
+            digest = shared_learning(
+                factory, vehicle="equity",
+                learning_epoch=self.LEARNING_EPOCH)
         self.assertGreater(SHARED_LEARNING_MIN_ATTEMPTS, 1)
         self.assertEqual(digest["parameters"], [])
         self.assertEqual(digest["graded_attempts"], 1)
@@ -1542,7 +1578,9 @@ class SharedLearningTests(unittest.TestCase):
             self._graded(factory, hypothesis, family="alpha",
                          changes=[{"threshold_bps": 20.0}], passed=False,
                          kind="trial", source="live_paper")
-            digest = shared_learning(factory, vehicle="equity")
+            digest = shared_learning(
+                factory, vehicle="equity",
+                learning_epoch=self.LEARNING_EPOCH)
         self.assertEqual(digest["live_trials"], {"run": 1, "failed": 1})
 
     def test_an_empty_or_missing_ledger_degrades_to_no_digest(self):

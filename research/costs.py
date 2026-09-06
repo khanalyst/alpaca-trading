@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 import math
 from pathlib import Path
+import re
 import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -60,7 +61,34 @@ STRESSED_COST_BASIS = {
     "option_fees": "round_trip_two_sides_per_contract",
 }
 
+# IBR rows repriced by a dynamic quote-cost resolver carry this compact,
+# vehicle-neutral economics record. The per-leg model parameters live in the
+# flat fields shared with account/factory rows; keeping the exact result in
+# one versioned block gives gates a deterministic tamper check without
+# creating a second provenance representation that could drift.
+COST_ECONOMICS_SCHEMA = "ibr-cost-economics.v1"
+# A row's cost parameters are executable evidence, not a free-form label.
+# The resolver provenance has to identify the frozen schedule and the exact
+# lookup contract used to select each leg's model.  The full schedule hash is
+# carried by the envelope/config; rows retain its short prefix so they remain
+# compact and independently checkable.
+COST_MODEL_BINDING_SCHEMA = "verified-measured-cost-binding.v1"
+ROW_COST_MODEL_FIELDS = (
+    "entry_cost_model_provenance", "entry_cost_model_spread_bps",
+    "entry_cost_model_slippage_bps", "entry_cost_model_fee_bps",
+    "exit_cost_model_provenance", "exit_cost_model_spread_bps",
+    "exit_cost_model_slippage_bps", "exit_cost_model_fee_bps",
+)
+
 CONFIG_BLOCK = "costs"
+
+_MEASURED_PROVENANCE_RE = re.compile(
+    r"^measured:(?P<schedule>[0-9a-f]{12}):"
+    r"(?P<origin>universe|symbol:[^:]+|symbol_bucket:[^:]+:m\d{3}_\d{3})"
+    r":spread-(?P<spread>p25|median|p75|p90|p95)"
+    r":depth-(?P<depth>p25|median|p75|p90|p95)"
+    r":feed-(?P<feed>[^:]+):provider-(?P<provider>[^:]+)"
+    r":coverage-(?P<coverage>strict)$")
 
 
 class CostError(ValueError):
@@ -670,7 +698,9 @@ class CostModel:
     def round_trip_cost(self, entry_price: float, exit_price: float,
                         quantity: float = 1.0, multiplier: float = 1.0,
                         *, vehicle: str = "equity",
-                        executable_quotes: bool = False) -> float:
+                        executable_quotes: bool = False,
+                        entry_executable_quote: bool | None = None,
+                        exit_executable_quote: bool | None = None) -> float:
         """Return the configured expected cost for both execution legs.
 
         This is intentionally separate from :meth:`fees`: fees are only one
@@ -687,9 +717,22 @@ class CostModel:
             raise CostError("round-trip cost inputs must be finite")
         if qty < 0 or mult <= 0 or entry < 0 or exit < 0:
             raise CostError("round-trip cost inputs must be non-negative")
-        bps = self.per_side_bps(executable_quote=bool(executable_quotes)) / 10_000.0
-        notional = (abs(entry) + abs(exit)) * qty * mult
-        return notional * bps + self.fees(entry, exit, qty, mult, vehicle=vehicle)
+        for name, value in (("entry_executable_quote", entry_executable_quote),
+                            ("exit_executable_quote", exit_executable_quote)):
+            if value is not None and not isinstance(value, bool):
+                raise CostError(f"{name} must be true or false when supplied")
+        default_quote = bool(executable_quotes)
+        entry_quote = (default_quote if entry_executable_quote is None else
+                       entry_executable_quote)
+        exit_quote = (default_quote if exit_executable_quote is None else
+                      exit_executable_quote)
+        entry_rate = self.per_side_bps(
+            executable_quote=entry_quote) / 10_000.0
+        exit_rate = self.per_side_bps(
+            executable_quote=exit_quote) / 10_000.0
+        execution = ((abs(entry) * entry_rate + abs(exit) * exit_rate) *
+                     qty * mult)
+        return execution + self.fees(entry, exit, qty, mult, vehicle=vehicle)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CostModel":
@@ -796,6 +839,492 @@ class CostModel:
         )
 
 
+def _finite_row_number(row: Mapping[str, Any], name: str, *,
+                       default: float | None = None) -> float | None:
+    """Read one finite numeric row value without accepting booleans."""
+    value = row.get(name)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _canonical_binding_identity(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    normalized = str(value).strip().lower().replace("-", "_")
+    return "delayed_sip" if normalized == "delayed" else normalized
+
+
+def _binding_timestamp(value: Any) -> str | None:
+    """Canonicalize a persisted leg timestamp for the model contract."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, str):
+        try:
+            stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc).isoformat()
+
+
+def _binding_bucket(timestamp: str) -> str | None:
+    try:
+        stamp = datetime.fromisoformat(timestamp)
+        local = stamp.astimezone(ZoneInfo("America/New_York"))
+        minutes = ((local.hour * 60 + local.minute + local.second / 60.0)
+                   - 9 * 60 - 30)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if minutes < 0:
+        return "pre_open"
+    if minutes >= 390:
+        return "post_close"
+    start = int(minutes // 30) * 30
+    return f"m{start:03d}_{start + 30:03d}"
+
+
+def _measured_provenance_contract(provenance: Any, *, row: Mapping[str, Any],
+                                  leg: str) -> dict[str, Any]:
+    """Parse and validate one resolver provenance identity.
+
+    Prior code treated ``measured:*`` as an authenticity marker.  It is not:
+    an attacker could choose ``measured:fake`` and recompute the same prices.
+    The resolver's complete, deterministic identity is now required and is
+    checked against the row's leg context before any arithmetic is trusted.
+    """
+    if not isinstance(provenance, str):
+        raise CostError(f"{leg} measured cost model provenance is invalid")
+    match = _MEASURED_PROVENANCE_RE.fullmatch(provenance.strip())
+    if match is None:
+        raise CostError(
+            f"{leg} measured cost model provenance is not a frozen schedule identity")
+    parts = match.groupdict()
+    feed = _canonical_binding_identity(parts["feed"])
+    provider = _canonical_binding_identity(parts["provider"])
+    if not feed or not provider or parts["coverage"] != "strict":
+        raise CostError(f"{leg} measured cost model provenance is invalid")
+    row_feed = _canonical_binding_identity(row.get(f"{leg}_feed"))
+    row_provider = _canonical_binding_identity(row.get(f"{leg}_provider"))
+    if row_feed != feed or row_provider != provider:
+        raise CostError(f"{leg} measured cost model identity disagrees with row")
+    symbol = str(row.get("symbol") or "").strip()
+    origin = parts["origin"]
+    if origin.startswith("symbol_bucket:"):
+        prefix, origin_symbol, origin_bucket = origin.split(":", 2)
+        if not symbol or origin_symbol != symbol:
+            raise CostError(f"{leg} measured cost symbol does not match row")
+        raw_timestamp = next(
+            (row.get(name) for name in (
+                f"{leg}_timestamp", f"{leg}_cost_timestamp", "timestamp")
+             if row.get(name) not in (None, "")), None)
+        timestamp = _binding_timestamp(raw_timestamp)
+        if timestamp is None or _binding_bucket(timestamp) != origin_bucket:
+            raise CostError(
+                f"{leg} measured cost time bucket does not match row")
+    elif origin.startswith("symbol:"):
+        origin_symbol = origin.split(":", 1)[1]
+        if not symbol or origin_symbol != symbol:
+            raise CostError(f"{leg} measured cost symbol does not match row")
+        timestamp = _binding_timestamp(next(
+            (row.get(name) for name in (
+                f"{leg}_timestamp", f"{leg}_cost_timestamp", "timestamp")
+             if row.get(name) not in (None, "")), None))
+    else:
+        timestamp = _binding_timestamp(next(
+            (row.get(name) for name in (
+                f"{leg}_timestamp", f"{leg}_cost_timestamp", "timestamp")
+             if row.get(name) not in (None, "")), None))
+    quantity = _finite_row_number(row, "quantity", default=1.0)
+    if quantity is None or quantity <= 0:
+        raise CostError("measured cost model quantity is invalid")
+    model_values: dict[str, float] = {}
+    for component in ("spread_bps", "slippage_bps", "fee_bps"):
+        number = _finite_row_number(row, f"{leg}_cost_model_{component}")
+        if number is None or number < 0:
+            raise CostError(f"{leg} measured cost model {component} is invalid")
+        model_values[component] = number
+    return {
+        "schema": COST_MODEL_BINDING_SCHEMA,
+        "leg": leg,
+        "provenance": str(provenance).strip(),
+        "schedule_hash_prefix": parts["schedule"],
+        "origin": origin,
+        "feed": feed,
+        "provider": provider,
+        "symbol": symbol or None,
+        "timestamp": timestamp,
+        "quantity": quantity,
+        "spread_percentile": parts["spread"],
+        "depth_percentile": parts["depth"],
+        "coverage_policy": parts["coverage"],
+        **model_values,
+    }
+
+
+def row_cost_model_binding(row: Mapping[str, Any], *, vehicle: str) -> dict[str, Any] | None:
+    """Return the canonical measured-model contract for one replay row.
+
+    Static and historical rows intentionally return ``None``.  A measured row
+    must have both independently identified legs; a partial or free-form
+    provenance value fails closed.
+    """
+    if not isinstance(row, Mapping) or vehicle not in {"equity", "option"}:
+        raise CostError("row and vehicle are invalid for cost model binding")
+    provenances = {
+        leg: row.get(f"{leg}_cost_model_provenance") for leg in ("entry", "exit")
+    }
+    measured = [str(value or "").strip().lower().startswith("measured:")
+                for value in provenances.values()]
+    if not any(measured):
+        return None
+    if not all(measured):
+        raise CostError("measured cost model binding requires both legs")
+    legs = {
+        leg: _measured_provenance_contract(provenances[leg], row=row, leg=leg)
+        for leg in ("entry", "exit")
+    }
+    entry = legs["entry"]
+    exit_ = legs["exit"]
+    for field in ("schedule_hash_prefix", "feed", "provider"):
+        if entry[field] != exit_[field]:
+            raise CostError("measured cost model legs do not share one schedule")
+    return {
+        "schema": COST_MODEL_BINDING_SCHEMA,
+        "schedule_hash_prefix": entry["schedule_hash_prefix"],
+        "feed": entry["feed"],
+        "provider": entry["provider"],
+        "symbol": entry["symbol"],
+        "quantity": entry["quantity"],
+        "legs": legs,
+    }
+
+
+def _strict_claim_number(value: Any, name: str) -> None:
+    """Validate one numerical value persisted in the versioned claim.
+
+    Row fields intentionally retain their historical coercive compatibility
+    path, but ``cost_economics`` is a durable, self-describing claim.  Its
+    numerical members must therefore be actual JSON numeric values rather
+    than values that merely happen to be convertible by ``float``.  In
+    particular, Python's ``bool`` subtype of ``int`` is never a valid number
+    here.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CostError(f"row cost economics {name} must be an int or float")
+    try:
+        finite = math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        finite = False
+    if not finite:
+        raise CostError(f"row cost economics {name} must be finite")
+
+
+def _strict_claim_string(value: Any, name: str, expected: str) -> None:
+    """Validate one exact string identity member in the versioned claim."""
+    if not isinstance(value, str) or value != expected:
+        raise CostError(f"row cost economics {name} is invalid")
+
+
+def _row_cost_model_pair(row: Mapping[str, Any], *,
+                         vehicle: str) -> tuple[CostModel, CostModel] | None:
+    """Build the two immutable models recorded on a row.
+
+    ``None`` means the row has no row-specific economics at all. A
+    :class:`CostError` means it opted into the row contract but is incomplete
+    or malformed; callers must not silently fall back to a static model in
+    that case.
+    """
+    present = [name for name in ROW_COST_MODEL_FIELDS if row.get(name) is not None]
+    if not present:
+        return None
+    if len(present) != len(ROW_COST_MODEL_FIELDS):
+        missing = sorted(set(ROW_COST_MODEL_FIELDS) - set(present))
+        raise CostError(
+            "row cost model provenance is incomplete: " + ", ".join(missing))
+    # Account/factory rows have long carried the complete flat model fields
+    # for diagnostics, including static and option rows.  Without the exact
+    # IBR economics block, those non-measured fields retain their historical
+    # static report path. A measured dynamic row is identified by both leg
+    # provenance values, while a block is itself an explicit opt-in.
+    if (row.get("cost_economics") is None and not any(
+            str(row.get(f"{leg}_cost_model_provenance") or "")
+            .strip().lower().startswith("measured:")
+            for leg in ("entry", "exit"))):
+        return None
+
+    def model(leg: str) -> CostModel:
+        provenance = row.get(f"{leg}_cost_model_provenance")
+        if not isinstance(provenance, str) or not provenance.strip():
+            raise CostError(f"{leg} cost model provenance is invalid")
+        values: dict[str, float] = {}
+        for component in ("spread_bps", "slippage_bps", "fee_bps"):
+            value = _finite_row_number(
+                row, f"{leg}_cost_model_{component}")
+            if value is None or value < 0:
+                raise CostError(f"{leg} cost model {component} is invalid")
+            values[component] = value
+        return CostModel(**values, provenance=provenance.strip())
+
+    return model("entry"), model("exit")
+
+
+def _compute_row_cost_economics(
+        row: Mapping[str, Any], *, vehicle: str,
+        require_measured_claim: bool) -> dict[str, Any] | None:
+    """Recompute one row's cost and execution economics from its provenance.
+
+    Rows with no per-leg model fields return ``None`` so callers can retain
+    the historical static fallback. Once any row-specific field is present,
+    all eight fields are mandatory. Measured rows must also carry the
+    versioned economics claim when ``require_measured_claim`` is true. If
+    ``cost_economics`` is present, every persisted value is cross-checked
+    against the deterministic recomputation; malformed or forged blocks raise
+    :class:`CostError` and therefore fail closed at the gate boundary.
+    """
+    if not isinstance(row, Mapping):
+        raise CostError("row must be a mapping")
+    if vehicle not in {"equity", "option"}:
+        raise CostError("vehicle must be equity or option")
+    models = _row_cost_model_pair(row, vehicle=vehicle)
+    block = row.get("cost_economics")
+    if models is None:
+        if block is not None:
+            raise CostError(
+                "row cost_economics requires complete per-leg model provenance")
+        return None
+    if block is not None and not isinstance(block, Mapping):
+        raise CostError("row cost_economics must be a mapping")
+    measured = any(
+        str(row.get(f"{leg}_cost_model_provenance") or "")
+        .strip().lower().startswith("measured:")
+        for leg in ("entry", "exit"))
+    if block is None and measured and require_measured_claim:
+        raise CostError(
+            "measured row requires a versioned cost_economics claim")
+    binding = None
+    if measured:
+        try:
+            binding = row_cost_model_binding(row, vehicle=vehicle)
+        except (CostError, TypeError, ValueError, OverflowError):
+            # Source replay must remain able to report its historical
+            # arithmetic for diagnostic callers.  The strict recomputation
+            # path (used by gates) retries this contract and fails closed.
+            if require_measured_claim:
+                raise
+
+    entry_model, exit_model = models
+    direction = str(row.get("direction") or "long").strip().lower()
+    if direction not in {"long", "short"}:
+        raise CostError("row direction is invalid")
+    execution_direction = "long" if vehicle == "option" else direction
+    quantity = _finite_row_number(row, "quantity", default=1.0)
+    multiplier = _finite_row_number(
+        row, "contract_multiplier",
+        default=100.0 if vehicle == "option" else 1.0)
+    entry_reference = _finite_row_number(row, "entry_reference")
+    exit_reference = _finite_row_number(row, "exit_reference")
+    entry_price = _finite_row_number(row, "entry_price")
+    exit_price = _finite_row_number(row, "exit_price")
+    if (quantity is None or multiplier is None or entry_reference is None or
+            exit_reference is None or entry_price is None or exit_price is None or
+            quantity <= 0 or multiplier <= 0 or entry_reference <= 0 or
+            exit_reference <= 0 or entry_price <= 0 or exit_price <= 0):
+        raise CostError("row cost economics has invalid trade inputs")
+    entry_source = str(row.get("entry_fill_source") or "").strip().lower()
+    exit_source = str(row.get("exit_fill_source") or "").strip().lower()
+    entry_executable = entry_source == QUOTE or vehicle == "option"
+    exit_executable = exit_source == QUOTE or vehicle == "option"
+    expected_entry = entry_model.execution_price(
+        entry_reference, execution_direction, entry=True,
+        executable_quote=entry_executable)
+    expected_exit = exit_model.execution_price(
+        exit_reference, execution_direction, entry=False,
+        executable_quote=exit_executable)
+
+    def close(left: Any, right: Any) -> bool:
+        try:
+            return math.isclose(float(left), float(right),
+                                rel_tol=1e-9, abs_tol=1e-9)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    # The persisted prices must actually be the prices implied by each
+    # recorded model and fill source. This catches a forged model parameter,
+    # reference, or execution price before aggregate gates consume it.
+    if not close(entry_price, expected_entry) or not close(exit_price, expected_exit):
+        raise CostError("row cost economics execution price mismatch")
+    gross = ((exit_price - entry_price)
+             if execution_direction == "long" else
+             (entry_price - exit_price)) * quantity * multiplier
+    entry_fees = entry_model.fees(
+        entry_price, entry_price, quantity, multiplier, vehicle=vehicle) / 2.0
+    exit_fees = exit_model.fees(
+        exit_price, exit_price, quantity, multiplier, vehicle=vehicle) / 2.0
+    fees = entry_fees + exit_fees
+    # Cost is the modelled adverse execution drag plus the two fee legs. This
+    # is algebraically identical to CostModel.round_trip_cost for one static
+    # model and remains exact when entry/exit measured cells differ.
+    entry_drag = abs(entry_price - entry_reference) * quantity * multiplier
+    exit_drag = abs(exit_price - exit_reference) * quantity * multiplier
+    # Preserve the exact historical static calculation for pre-measurement
+    # rows that now happen to carry the common IBR model fields. Dynamic
+    # measured cells (identified by their immutable provenance) and all rows
+    # with an economics block use their own entry/exit legs independently.
+    static_provenance = not any(
+        str(row.get(f"{leg}_cost_model_provenance") or "")
+        .strip().lower().startswith("measured:")
+        for leg in ("entry", "exit"))
+    models_match = all(
+        math.isclose(float(getattr(entry_model, name)),
+                     float(getattr(exit_model, name)),
+                     rel_tol=0.0, abs_tol=1e-12)
+        for name in ("spread_bps", "slippage_bps", "fee_bps",
+                     "option_fee_per_contract_side"))
+    if block is None and static_provenance and models_match:
+        round_trip_cost = entry_model.round_trip_cost(
+            entry_price, exit_price, quantity, multiplier, vehicle=vehicle,
+            executable_quotes=(entry_source == QUOTE and
+                               exit_source == QUOTE))
+    else:
+        round_trip_cost = entry_drag + exit_drag + fees
+    net = gross - fees
+    stop = _finite_row_number(row, "stop_price")
+    if vehicle == "option":
+        risk_per_unit = entry_price * multiplier
+        realized_risk_per_unit = risk_per_unit
+    else:
+        if stop is None or stop <= 0:
+            raise CostError("row cost economics requires a positive stop_price")
+        risk_per_unit = _finite_row_number(row, "risk_per_unit",
+                                           default=abs(entry_price - stop))
+        realized_risk_per_unit = max(
+            0.0,
+            entry_price - stop if execution_direction == "long"
+            else stop - entry_price,
+        )
+        if risk_per_unit is None or risk_per_unit < 0:
+            raise CostError("row cost economics risk_per_unit is invalid")
+    risk_usd = quantity * realized_risk_per_unit
+    result = {
+        "schema": COST_ECONOMICS_SCHEMA,
+        "vehicle": vehicle,
+        "direction": direction,
+        "quantity": quantity,
+        "contract_multiplier": multiplier,
+        "entry_reference": entry_reference,
+        "exit_reference": exit_reference,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "gross_pnl": gross,
+        "costs": fees,
+        "net_pnl": net,
+        "round_trip_cost": round_trip_cost,
+        "risk_per_unit": risk_per_unit,
+        "realized_risk_per_unit": realized_risk_per_unit,
+        "risk_usd": risk_usd,
+        **({"cost_model_binding": binding} if binding is not None else {}),
+        # Used by the stress report without adding a second persisted
+        # provenance structure.
+        "entry_option_fee_per_contract_side":
+            entry_model.option_fee_per_contract_side,
+        "exit_option_fee_per_contract_side":
+            exit_model.option_fee_per_contract_side,
+    }
+    if block is not None:
+        required = {
+            "schema", "vehicle", "direction", "quantity",
+            "contract_multiplier", "entry_reference", "exit_reference",
+            "entry_price", "exit_price", "gross_pnl", "costs", "net_pnl",
+            "round_trip_cost", "risk_per_unit", "realized_risk_per_unit",
+            "risk_usd",
+        }
+        if binding is not None:
+            required.add("cost_model_binding")
+        if block.get("schema") != COST_ECONOMICS_SCHEMA:
+            raise CostError("row cost economics schema is invalid")
+        missing = sorted(required - set(block), key=str)
+        if missing:
+            raise CostError(
+                "row cost economics is incomplete: " + ", ".join(missing))
+        unexpected = sorted(set(block) - required, key=str)
+        if unexpected:
+            raise CostError(
+                "row cost economics has unknown field(s): " +
+                ", ".join(str(name) for name in unexpected))
+        # Validate the persisted claim before any comparison can coerce it.
+        # The row-level duplicates above intentionally remain compatibility
+        # inputs, but this versioned block is an immutable typed assertion.
+        _strict_claim_string(block.get("schema"), "schema",
+                             COST_ECONOMICS_SCHEMA)
+        _strict_claim_string(block.get("vehicle"), "vehicle", vehicle)
+        _strict_claim_string(block.get("direction"), "direction", direction)
+        for name in required - {"schema", "vehicle", "direction"}:
+            if name == "cost_model_binding":
+                if block.get(name) != result[name]:
+                    raise CostError(f"row cost economics {name} mismatch")
+                continue
+            _strict_claim_number(block.get(name), name)
+        for name in required - {"schema", "vehicle", "direction"}:
+            if name == "cost_model_binding":
+                continue
+            if not close(block.get(name), result[name]):
+                raise CostError(f"row cost economics {name} mismatch")
+        # The exact block is a durable claim about the row, not a replacement
+        # for the row itself. Cross-check the duplicated public values too.
+        for name in ("entry_reference", "exit_reference", "entry_price",
+                     "exit_price", "gross_pnl", "costs", "net_pnl",
+                     "risk_per_unit", "realized_risk_per_unit", "risk_usd"):
+            if not close(row.get(name), result[name]):
+                raise CostError(f"row {name} disagrees with cost economics")
+    return result
+
+
+def recompute_row_cost_economics(
+        row: Mapping[str, Any], *, vehicle: str) -> dict[str, Any] | None:
+    """Recompute and validate one persisted row's cost economics.
+
+    Dynamic/measured rows are fail-closed when their versioned claim is
+    absent. Static rows retain the historical fallback path.
+    """
+    return _compute_row_cost_economics(
+        row, vehicle=vehicle, require_measured_claim=True)
+
+
+def row_cost_economics_claim(
+        row: Mapping[str, Any], *, vehicle: str) -> dict[str, Any] | None:
+    """Build the versioned economics claim emitted on measured rows.
+
+    This source-side helper intentionally computes from the flat per-leg
+    model fields without requiring a pre-existing claim. Callers should use
+    the returned mapping as the row's ``cost_economics`` value; subsequent
+    gate verification uses :func:`recompute_row_cost_economics`, which
+    requires that claim for measured rows.
+    """
+    result = _compute_row_cost_economics(
+        row, vehicle=vehicle, require_measured_claim=False)
+    if result is None:
+        return None
+    return {
+        key: value for key, value in result.items()
+        if key not in {
+            "entry_option_fee_per_contract_side",
+            "exit_option_fee_per_contract_side",
+        }
+    }
+
+
 BAR = "bar"
 QUOTE = "quote"
 # Evidence labels are intentionally distinct: historical backfill identifies
@@ -813,6 +1342,17 @@ DIAGNOSTIC_EVIDENCE_MODES = frozenset({
 # gates can apply the ordinary adverse cost model and audit the claim.
 RESTING_BRACKET = "resting_bracket"
 RESTING_BRACKET_FILL_SCHEMA = "resting-bracket-fill.v1"
+
+
+def _canonical_equity_provider(value: Any, *, allow_none: bool = False) -> str | None:
+    """Normalize the provider identity used by authorizing equity checks."""
+    if allow_none and (value is None or
+                       (isinstance(value, str) and not value.strip())):
+        return None
+    provider = str(value or "").strip().lower()
+    if not provider:
+        raise CostError("equity_provider must be non-empty")
+    return provider
 # Readable compatibility alias for callers that describe the field as a
 # source schema rather than a fill schema.
 RESTING_BRACKET_SCHEMA = RESTING_BRACKET_FILL_SCHEMA
@@ -899,7 +1439,8 @@ def resting_bracket_fill_claim(*, exit_reason: Any, exit_reference: Any,
 
 
 def validate_resting_bracket_fill(row: Mapping[str, Any], *,
-                                  equity_feed: str = "iex") -> str | None:
+                                  equity_feed: str = "iex",
+                                  equity_provider: str | None = "alpaca") -> str | None:
     """Return a stable rejection reason for a resting-bracket row.
 
     This is the shared fail-closed predicate used by gates and replay/control
@@ -988,8 +1529,12 @@ def validate_resting_bracket_fill(row: Mapping[str, Any], *,
     if feed not in {"iex", "sip"}:
         return "resting_bracket_non_authorizing_feed"
     entry_feed = str(row.get("entry_feed") or "").strip().lower().replace("-", "_")
-    entry_provider = str(row.get("entry_provider") or "").strip()
-    if entry_feed != feed or not entry_provider:
+    entry_provider = _canonical_equity_provider(
+        row.get("entry_provider"), allow_none=True)
+    expected_provider = _canonical_equity_provider(
+        equity_provider, allow_none=True)
+    if (entry_feed != feed or not entry_provider or
+            (expected_provider is not None and entry_provider != expected_provider)):
         return "resting_bracket_entry_provenance"
     evidence_mode = str(row.get("evidence_mode") or "forward_observed").strip().lower()
     if evidence_mode in DIAGNOSTIC_EVIDENCE_MODES:
@@ -998,15 +1543,20 @@ def validate_resting_bracket_fill(row: Mapping[str, Any], *,
     # identity.  Missing metadata is not upgraded from the quote identity.
     for leg in ("signal_bar", "entry_bar", "exit_bar"):
         bar_feed = str(row.get(f"{leg}_feed") or "").strip().lower().replace("-", "_")
-        bar_provider = str(row.get(f"{leg}_provider") or "").strip()
-        if bar_feed != feed or not bar_provider:
+        bar_provider = _canonical_equity_provider(
+            row.get(f"{leg}_provider"), allow_none=True)
+        if (bar_feed != feed or not bar_provider or
+                (expected_provider is not None and bar_provider != expected_provider)):
             return "resting_bracket_bar_provenance"
     claim_feed = str(claim.get("bar_feed") or "").strip().lower().replace("-", "_")
-    claim_provider = str(claim.get("bar_provider") or "").strip()
-    if claim_feed != feed or not claim_provider:
+    claim_provider = _canonical_equity_provider(
+        claim.get("bar_provider"), allow_none=True)
+    if (claim_feed != feed or not claim_provider or
+            (expected_provider is not None and claim_provider != expected_provider)):
         return "resting_bracket_claim_provenance"
     if claim_feed != str(row.get("exit_bar_feed") or "").strip().lower().replace("-", "_") or \
-            claim_provider != str(row.get("exit_bar_provider") or "").strip():
+            claim_provider != _canonical_equity_provider(
+                row.get("exit_bar_provider"), allow_none=True):
         return "resting_bracket_claim_provenance"
     expected_bar_timestamp = row.get("exit_fill_bar_timestamp")
     claim_bar_timestamp = str(claim.get("bar_timestamp") or "").strip()
@@ -1212,7 +1762,8 @@ _cost_model_for_vehicle = cost_model_for_vehicle
 def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
                      costs: Any = None, config: Mapping | None = None,
                      min_cost_coverage: float = 1.0,
-                     equity_feed: str = "iex") -> dict[str, Any]:
+                     equity_feed: str = "iex",
+                     equity_provider: str | None = "alpaca") -> dict[str, Any]:
     """Recompute whether each executed row has a cost-covered risk unit.
 
     A risk unit is the monetary loss to the authored stop (``risk_usd`` when
@@ -1229,6 +1780,8 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
         equity_feed = "delayed_sip"
     if equity_feed not in {"iex", "sip", "delayed_sip"}:
         raise CostError("equity_feed must be iex, sip, or delayed_sip")
+    equity_provider = _canonical_equity_provider(
+        equity_provider, allow_none=True)
     if config is not None and costs is None:
         costs = CostModel.from_config(
             static_cost_config(config), vehicle=vehicle)
@@ -1258,23 +1811,40 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
                     return value
             return default
 
+        row_economics: dict[str, Any] | None = None
+        row_economics_error: str | None = None
+        try:
+            row_economics = recompute_row_cost_economics(
+                row, vehicle=vehicle)
+        except (CostError, TypeError, ValueError, OverflowError) as exc:
+            # Once any row-specific field is present, malformed or partial
+            # economics must not fall back to the configured static model.
+            row_economics_error = str(exc)
         qty = number("quantity", "contracts", default=1.0)
         mult = number("contract_multiplier", "multiplier", default=100.0 if vehicle == "option" else 1.0)
         entry = number("entry_price", "entry_reference", "plan_entry")
         exit = number("exit_price", "exit_reference", default=entry)
         stop_distance = number("stop_distance", "risk_per_unit")
         risk = number("risk_usd", "realized_risk_usd", "risk_unit_usd", "risk_unit")
-        if risk is None and stop_distance is not None and qty is not None and mult is not None:
-            risk = abs(stop_distance) * abs(qty) * abs(mult if vehicle == "option" and stop_distance else 1.0)
         cost = None
-        if entry is not None and exit is not None and qty is not None and mult is not None:
-            try:
-                cost = model.round_trip_cost(
-                    entry, exit, qty, mult, vehicle=vehicle,
-                    executable_quotes=(row.get("entry_fill_source") == QUOTE and
-                                       row.get("exit_fill_source") == QUOTE))
-            except CostError:
-                cost = None
+        if row_economics is not None:
+            qty = row_economics["quantity"]
+            mult = row_economics["contract_multiplier"]
+            risk = row_economics["risk_usd"]
+            cost = row_economics["round_trip_cost"]
+        elif row_economics_error is None:
+            if risk is None and stop_distance is not None and qty is not None and mult is not None:
+                risk = abs(stop_distance) * abs(qty) * abs(mult if vehicle == "option" and stop_distance else 1.0)
+            if entry is not None and exit is not None and qty is not None and mult is not None:
+                try:
+                    cost = model.round_trip_cost(
+                        entry, exit, qty, mult, vehicle=vehicle,
+                        entry_executable_quote=(
+                            row.get("entry_fill_source") == QUOTE),
+                        exit_executable_quote=(
+                            row.get("exit_fill_source") == QUOTE))
+                except CostError:
+                    cost = None
         # Equity proof is bound to the report's explicit feed identity.  New
         # authorizing research passes IEX; SIP remains available only for
         # faithful verification of pre-binding historical envelopes.
@@ -1284,13 +1854,17 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
             def _equity_leg(leg: str) -> bool:
                 source = str(row.get(f"{leg}_fill_source") or "").strip().lower()
                 feed = str(row.get(f"{leg}_feed") or "").strip().lower()
-                provider = str(row.get(f"{leg}_provider") or "").strip()
-                return source == QUOTE and feed == equity_feed and bool(provider)
+                provider = _canonical_equity_provider(
+                    row.get(f"{leg}_provider"), allow_none=True)
+                return (source == QUOTE and feed == equity_feed and
+                        bool(provider) and
+                        (equity_provider is None or provider == equity_provider))
             resting_exit = (str(row.get("exit_fill_source") or "").strip().lower()
                             == RESTING_BRACKET)
             if resting_exit:
                 resting_reason = validate_resting_bracket_fill(
-                    row, equity_feed=equity_feed)
+                    row, equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 equity_provenance = resting_reason is None
                 provenance_reason = resting_reason
             else:
@@ -1340,6 +1914,9 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
             failures.append(opportunity_id)
             if provenance_reason is not None:
                 failure_reasons[opportunity_id] = provenance_reason
+            elif row_economics_error is not None:
+                failure_reasons[opportunity_id] = (
+                    "invalid row cost economics: " + row_economics_error)
             elif risk is None:
                 failure_reasons[opportunity_id] = "missing or invalid risk unit"
             elif cost is None:
@@ -1366,6 +1943,7 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
     return {
         "schema": "risk-unit-report.v1",
         "equity_feed": equity_feed,
+        "equity_provider": equity_provider,
         "vehicle": vehicle,
         "minimum_cost_coverage": coverage,
         "cost_model": model.as_dict(),
@@ -1806,13 +2384,16 @@ __all__ = [
     "RESTING_BRACKET_FILL_SCHEMA", "RESTING_BRACKET_SCHEMA",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS",
     "COST_STRESS_SCENARIOS_BPS", "STRESSED_COST_SCHEMA", "STRESSED_COST_BASIS",
+    "COST_ECONOMICS_SCHEMA", "COST_MODEL_BINDING_SCHEMA",
+    "ROW_COST_MODEL_FIELDS", "row_cost_model_binding",
     "ReplayPolicy", "diagnostic_backfill_policy",
     "replay_policy_for_mode", "replay_policy_for_session",
     "replay_policy_for_bars", "derive_session_replay_policy",
     "cost_model_for_vehicle", "stressed_cost_usd", "stress_cost_usd",
     "stressed_cost_ratio_exceeds",
     "check_stressed_cost_plan",
-    "stressed_cost", "risk_unit_report",
+    "stressed_cost", "risk_unit_report", "recompute_row_cost_economics",
+    "row_cost_economics_claim",
     "QuoteFill", "SQLiteQuoteIndex", "SQLiteQuoteIndexDescriptor", "index_quotes",
     "quote_fill", "quote_fill_record", "resting_bracket_fill_claim",
     "validate_resting_bracket_fill",

@@ -140,9 +140,11 @@ def _split_sessions(sessions: Sequence[str], min_sessions: int) -> tuple[list[st
 
 
 def _window_counts(rows: Sequence[Mapping[str, Any]], vehicle: str, *,
-                   equity_feed: str = "iex") -> dict[str, Any]:
+                   equity_feed: str = "iex",
+                   equity_provider: str = "alpaca") -> dict[str, Any]:
     counts = sample_counts(
-        rows, vehicle=vehicle, equity_feed=equity_feed)
+        rows, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     capacity = _opportunity_capacity(rows, vehicle=vehicle)
     return {
         **{key: int(counts.get(key, 0)) for key in
@@ -167,8 +169,11 @@ def _window_capacity(rows: Sequence[Mapping[str, Any]], *, vehicle: str,
 
 def _window_ready(rows: Sequence[Mapping[str, Any]], *, vehicle: str,
                   min_trades: int, min_sessions: int,
-                  equity_feed: str = "iex") -> tuple[bool, dict[str, Any]]:
-    counts = _window_counts(rows, vehicle, equity_feed=equity_feed)
+                  equity_feed: str = "iex",
+                  equity_provider: str = "alpaca") -> tuple[bool, dict[str, Any]]:
+    counts = _window_counts(
+        rows, vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     return bool(counts["trades"] >= int(min_trades) and
                 counts["sessions"] >= int(min_sessions)), counts
 
@@ -607,7 +612,9 @@ class ShadowIngestor:
         if self.config.vehicle is not None and vehicle != self.config.vehicle:
             return {"candidate_id": candidate_id, "status": "vehicle_filtered",
                     "ingested": False}
-        equity_feed = ReplayPolicy.from_config(_config(candidate)).equity_feed
+        replay_policy = ReplayPolicy.from_config(_config(candidate))
+        equity_feed = replay_policy.equity_feed
+        equity_provider = replay_policy.equity_provider
         prior = _latest_gate(self.ledger, candidate_id)
         boundary = _latest_boundary(self.ledger, candidate_id)
         if prior is None or boundary is None:
@@ -843,7 +850,8 @@ class ShadowIngestor:
                     arm_rows, vehicle=vehicle,
                     min_trades=self.config.min_trades,
                     min_sessions=self.config.min_sessions,
-                    equity_feed=equity_feed)
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 capacity = _window_capacity(
                     arm_rows, vehicle=vehicle,
                     min_trades=self.config.min_trades,
@@ -955,10 +963,11 @@ class ShadowIngestor:
                 min_sessions=self.config.min_sessions,
                 alpha=float(self.config.alpha), shadow=True,
                 null_rows=selection_null_rows, qualification=qualification,
-                test_iterations=test_iterations, equity_feed=equity_feed)
+                test_iterations=test_iterations, equity_feed=equity_feed,
+                equity_provider=equity_provider)
             selection_gate = _strengthen_gate(
                 selection_gate, selection_baseline_rows, vehicle=vehicle,
-                equity_feed=equity_feed)
+                equity_feed=equity_feed, equity_provider=equity_provider)
             selection_p_value = float(selection_gate.get("candidate_p_raw", 1.0))
             source["selection"]["raw_p_value"] = selection_p_value
             preflight_ready, preflight_checks = _preflight_ready(selection_gate)
@@ -1022,10 +1031,11 @@ class ShadowIngestor:
                 min_sessions=self.config.min_sessions,
                 alpha=float(self.config.alpha), shadow=True,
                 null_rows=confirmatory_null_rows, qualification=qualification,
-                test_iterations=test_iterations, equity_feed=equity_feed)
+                test_iterations=test_iterations, equity_feed=equity_feed,
+                equity_provider=equity_provider)
             gate = _strengthen_gate(
                 gate, confirmatory_baseline_rows, vehicle=vehicle,
-                equity_feed=equity_feed)
+                equity_feed=equity_feed, equity_provider=equity_provider)
             p_value = float(gate.get("candidate_p_raw", 1.0))
             source["p_value_source"] = CONFIRMATORY_P_VALUE_SOURCE
             source["confirmatory"]["raw_p_value"] = p_value
@@ -1135,7 +1145,7 @@ class ShadowIngestor:
                 online_fdr=online,
                 fdr_batch=fdr_batch,
                 provenance=hashes, candidate_id=candidate_id,
-                equity_feed=equity_feed)
+                equity_feed=equity_feed, equity_provider=equity_provider)
             envelope = gate.get("verified_gate")
             if not isinstance(envelope, Mapping) or not envelope.get("passes") \
                     or not verify_gate_envelope(envelope):

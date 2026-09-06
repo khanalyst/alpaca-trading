@@ -22,10 +22,23 @@ from tests.research.test_factory_end_to_end import edge_corpus
 
 def _config() -> dict:
     config = json.loads(Path("config.yaml").read_text(encoding="utf-8"))
+    # edge_corpus is an explicitly synthetic, provider-labelled fixture.  Keep
+    # its runtime provenance aligned rather than silently treating it as
+    # production Alpaca data.
+    config["broker"] = {**config["broker"], "provider": "test"}
     # The synthetic fixture carries no broker calendar bounds; a production
     # corpus is calendar-authoritative and keeps the shipped requirement.
     config["session"] = {**config["session"], "require_exact_calendar": False}
     return config
+
+
+def _depth_qualified_edge_corpus(sessions: int) -> list[dict]:
+    """Give the synthetic executable quotes honest two-sided touch depth."""
+    return [
+        ({**row, "bid_size": 1_000.0, "ask_size": 1_000.0}
+         if str(row.get("kind") or "").lower() == "quote" else row)
+        for row in edge_corpus(sessions)
+    ]
 
 
 class CostRerunTests(unittest.TestCase):
@@ -40,7 +53,8 @@ class CostRerunTests(unittest.TestCase):
         cls.report = run_cost_rerun(
             # Keep the existing 50-quote cell floor, but provide enough
             # sessions for the late exit bucket to be genuinely measured.
-            edge_corpus(25), runtime_config=cls.config, specs=cls.cohort,
+            _depth_qualified_edge_corpus(25), runtime_config=cls.config,
+            specs=cls.cohort,
             min_quotes_per_cell=50)
         cls.traded = [item for item in cls.report["results"]
                       if item["configured"]["trades"] > 0]
@@ -103,7 +117,7 @@ class CostRerunTests(unittest.TestCase):
         corpus = [
             ({**row, "kind": "quote_snapshot"}
              if str(row.get("kind") or "").lower() == "quote" else row)
-            for row in edge_corpus(25)
+            for row in _depth_qualified_edge_corpus(25)
         ]
         report = run_cost_rerun(
             corpus, runtime_config=self.config, specs=self.cohort[:1],
@@ -120,7 +134,8 @@ class CostRerunTests(unittest.TestCase):
         with self.assertRaisesRegex(
                 QuoteCostError,
                 r"requested measured cost bucket .*unavailable.*under-covered"):
-            run_cost_rerun(edge_corpus(6), runtime_config=self.config,
+            run_cost_rerun(_depth_qualified_edge_corpus(6),
+                           runtime_config=self.config,
                            specs=self.cohort[:1], min_quotes_per_cell=50)
 
     def test_only_the_cost_model_differs_between_arms(self):
@@ -188,7 +203,8 @@ class CostRerunTests(unittest.TestCase):
         tight = [validate_rule_spec({**spec, "stop_atr": 1.0,
                                      "target_r": 10.0})
                  for spec in deterministic_cohort()][:2]
-        report = run_cost_rerun(edge_corpus(25), runtime_config=self.config,
+        report = run_cost_rerun(_depth_qualified_edge_corpus(25),
+                                runtime_config=self.config,
                                 specs=tight, min_quotes_per_cell=50)
         gated = [item for item in report["results"]
                  if item["measured"]["stressed_cost_rejections"] > 0]

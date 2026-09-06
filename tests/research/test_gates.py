@@ -12,8 +12,14 @@ from research.gates import (
     risk_unit_report, verified_gate_envelope, verify_gate_envelope,
     walk_forward_report, max_drawdown_of, paired_control_adequacy,
 )
-from research.costs import (RESTING_BRACKET, RESTING_BRACKET_FILL_SCHEMA,
+from research.costs import (CostModel, RESTING_BRACKET,
+                             RESTING_BRACKET_FILL_SCHEMA,
+                             row_cost_economics_claim,
+                             recompute_row_cost_economics,
                              resting_bracket_fill_claim)
+from research.quote_costs import (cost_model_from_schedule,
+                                  measure_quote_costs,
+                                  validate_measured_quote_config)
 
 
 def _rows(count, *, net, start=2, symbol="SPY", prefix="candidate"):
@@ -39,6 +45,72 @@ class EvidenceGateTests(unittest.TestCase):
         row.update(changes)
         return row
 
+    @staticmethod
+    def _measured_equity_row():
+        """Build one exact dynamic-cost row against a frozen schedule."""
+        schedule = measure_quote_costs([{
+            "kind": "quote", "symbol": "SPY",
+            "timestamp": "2026-01-02T14:35:00+00:00",
+            "bid": 100.0, "ask": 100.4,
+            "bid_size": 1.0, "ask_size": 1.0,
+            "feed": "iex", "provider": "alpaca",
+        }], feed="iex", provider="alpaca", min_quotes_per_cell=1)
+        entry_model = cost_model_from_schedule(
+            schedule, symbol="SPY", bucket="m000_030", order_shares=2.0,
+            fee_bps=0.0)
+        exit_model = cost_model_from_schedule(
+            schedule, symbol="SPY", bucket="m000_030", order_shares=2.0,
+            fee_bps=0.0)
+        row = EvidenceGateTests._equity_quote_row(
+            direction="long", entry_reference=100.0, exit_reference=101.0,
+            entry_timestamp="2026-01-02T14:35:00+00:00",
+            exit_timestamp="2026-01-02T14:36:00+00:00",
+            entry_price=entry_model.execution_price(
+                100.0, "long", entry=True, executable_quote=True),
+            exit_price=exit_model.execution_price(
+                101.0, "long", entry=False, executable_quote=True),
+            stop_price=99.0, stop_distance=1.0, risk_per_unit=1.0,
+            quantity=2.0, contract_multiplier=1.0)
+        row.update({
+            "entry_cost_model_provenance": entry_model.provenance,
+            "entry_cost_model_spread_bps": entry_model.spread_bps,
+            "entry_cost_model_slippage_bps": entry_model.slippage_bps,
+            "entry_cost_model_fee_bps": entry_model.fee_bps,
+            "exit_cost_model_provenance": exit_model.provenance,
+            "exit_cost_model_spread_bps": exit_model.spread_bps,
+            "exit_cost_model_slippage_bps": exit_model.slippage_bps,
+            "exit_cost_model_fee_bps": exit_model.fee_bps,
+        })
+        economics = row_cost_economics_claim(row, vehicle="equity")
+        assert economics is not None
+        row.update({
+            "gross_pnl": economics["gross_pnl"],
+            "costs": economics["costs"],
+            "net_pnl": economics["net_pnl"],
+            "risk_usd": economics["risk_usd"],
+            "realized_risk_per_unit": economics["realized_risk_per_unit"],
+            "cost_economics": economics,
+        })
+        return row
+
+    @staticmethod
+    def _measured_cost_config():
+        schedule = measure_quote_costs([{
+            "kind": "quote", "symbol": "SPY",
+            "timestamp": "2026-01-02T14:35:00+00:00",
+            "bid": 100.0, "ask": 100.4,
+            "bid_size": 1.0, "ask_size": 1.0,
+            "feed": "iex", "provider": "alpaca",
+        }], feed="iex", provider="alpaca", min_quotes_per_cell=1)
+        return validate_measured_quote_config({
+            "enabled": True, "schedule": schedule,
+            "percentile": "p75", "depth_percentile": "p25",
+            "min_quotes_per_cell": 1,
+            "max_impact_half_spreads": 4.0,
+            "coverage_policy": "strict", "feed": "iex",
+            "provider": "alpaca",
+        }, expected_feed="iex", expected_provider="alpaca")
+
     def test_equity_fill_quality_binds_to_configured_feed_on_both_legs(self):
         from research.gates import fill_source_summary
         self.assertTrue(fill_source_summary(
@@ -59,6 +131,19 @@ class EvidenceGateTests(unittest.TestCase):
                 self.assertFalse(fill_source_summary(
                     [self._equity_quote_row(**changes)],
                     vehicle="equity")["adequate"])
+
+    def test_foreign_provider_on_both_equity_quote_legs_fails_quality_and_risk(self):
+        from research.gates import fill_source_summary
+        row = self._equity_quote_row(
+            entry_price=100.0, exit_price=101.0, quantity=1.0,
+            contract_multiplier=1.0, risk_usd=10.0)
+        row["entry_provider"] = row["exit_provider"] = "foreign"
+        self.assertFalse(fill_source_summary(
+            [row], vehicle="equity")["adequate"])
+        self.assertFalse(risk_unit_report(
+            [row], vehicle="equity",
+            costs=CostModel(spread_bps=0.0, slippage_bps=0.0,
+                            fee_bps=0.0))["adequate"])
 
     def test_authorization_projection_is_symmetric_across_candidate_and_baseline(self):
         from research.gates import authorization_projection
@@ -129,6 +214,236 @@ class EvidenceGateTests(unittest.TestCase):
         # The old field remains an explicit compatibility alias, not the
         # authoritative description of how the stress is charged.
         self.assertEqual(required["round_trip_bps"], 25.0)
+
+    def test_static_risk_and_stress_price_quote_and_resting_legs_separately(self):
+        from research.gates import cost_stress_report
+
+        model = CostModel(spread_bps=4.0, slippage_bps=6.0, fee_bps=0.5)
+        row = self._equity_quote_row(
+            entry_price=100.0, exit_price=103.0, quantity=1.0,
+            risk_usd=1.0, stop_distance=1.0, net_pnl=1.0,
+            exit_fill_source=RESTING_BRACKET,
+            exit_fill_schema=RESTING_BRACKET_FILL_SCHEMA,
+            exit_reason="target", exit_reference=103.0,
+            stop_price=99.0, target_price=103.0, active_stop_price=99.0,
+            tie_broken=False, gap_fill=False, entry_gap_fill=False,
+            exit_gap_fill=False,
+            signal_bar_feed="iex", signal_bar_provider="alpaca",
+            entry_bar_feed="iex", entry_bar_provider="alpaca",
+            exit_bar_feed="iex", exit_bar_provider="alpaca",
+            exit_fill_bar_timestamp="2026-01-02T14:35:00+00:00")
+        row["exit_fill_claim"] = resting_bracket_fill_claim(
+            exit_reason="target", exit_reference=103.0,
+            stop_price=99.0, target_price=103.0,
+            bar_timestamp=row["exit_fill_bar_timestamp"],
+            bar_feed="iex", bar_provider="alpaca")
+        expected = model.round_trip_cost(
+            100.0, 103.0, entry_executable_quote=True,
+            exit_executable_quote=False)
+        risk = risk_unit_report([row], vehicle="equity", costs=model)
+        self.assertAlmostEqual(
+            risk["observations"][0]["round_trip_cost"], expected, places=12)
+        report = cost_stress_report(
+            [row], vehicle="equity", risk_report=risk)
+        required = next(item for item in report["scenarios"]
+                        if item["entry_notional_bps"] == 25.0)
+        self.assertAlmostEqual(
+            required["net_pnl"],
+            1.0 - max(0.0, 100.0 * 25.0 / 10_000.0 - expected),
+            places=12)
+
+    def test_measured_row_economics_override_static_risk_and_stress(self):
+        from research.gates import cost_stress_report
+
+        measured = self._measured_equity_row()
+        static = copy.deepcopy(measured)
+        for name in (
+                "entry_cost_model_provenance", "entry_cost_model_spread_bps",
+                "entry_cost_model_slippage_bps", "entry_cost_model_fee_bps",
+                "exit_cost_model_provenance", "exit_cost_model_spread_bps",
+                "exit_cost_model_slippage_bps", "exit_cost_model_fee_bps",
+                "cost_economics", "risk_usd", "risk_per_unit",
+                "realized_risk_per_unit"):
+            static.pop(name, None)
+        static["stop_distance"] = 1.0
+        measured_risk = risk_unit_report([measured], vehicle="equity",
+                                         costs=CostModel(
+                                             spread_bps=0, slippage_bps=0,
+                                             fee_bps=0))
+        static_risk = risk_unit_report([static], vehicle="equity",
+                                       costs=CostModel(
+                                           spread_bps=0, slippage_bps=0,
+                                           fee_bps=0))
+        self.assertGreater(measured_risk["total_risk_usd"],
+                           static_risk["total_risk_usd"])
+        self.assertGreater(measured_risk["total_round_trip_cost"],
+                           static_risk["total_round_trip_cost"])
+        measured_stress = cost_stress_report(
+            [measured], vehicle="equity", risk_report=measured_risk)
+        static_stress = cost_stress_report(
+            [static], vehicle="equity", risk_report=static_risk)
+        required_measured = next(item for item in measured_stress["scenarios"]
+                                 if item["entry_notional_bps"] == 25.0)
+        required_static = next(item for item in static_stress["scenarios"]
+                               if item["entry_notional_bps"] == 25.0)
+        self.assertNotEqual(required_measured["net_pnl"],
+                            required_static["net_pnl"])
+
+    def test_tampered_measured_economics_cannot_verify_an_envelope(self):
+        from research.gates import _content_hash
+
+        row = self._measured_equity_row()
+        envelope = verified_gate_envelope(
+            lane="backtest", vehicle="equity", fit=[], heldout=[row],
+            fit_floor=structural_floor(
+                [], vehicle="equity", min_trades=0, min_sessions=0,
+                min_clusters=0, required=False),
+            heldout_floor=structural_floor(
+                [row], vehicle="equity", min_trades=1, min_sessions=1,
+                min_clusters=1),
+            control={}, p_value=1.0, q_value=1.0, alpha=.05,
+            falsification={}, separation={}, checks={}, passes=False,
+            costs=CostModel(spread_bps=0.0, slippage_bps=0.0, fee_bps=0.0),
+            measured_costs=self._measured_cost_config())
+        self.assertTrue(verify_gate_envelope(envelope))
+        tampered = copy.deepcopy(envelope)
+        tampered["heldout_source"][0]["cost_economics"]["round_trip_cost"] += 1.0
+        tampered["content_hash"] = _content_hash({
+            key: value for key, value in tampered.items()
+            if key != "content_hash"})
+        self.assertFalse(verify_gate_envelope(tampered))
+
+        # Removing the versioned claim and replacing the duplicated P&L must
+        # still fail after an attacker recomputes the envelope hash.  The
+        # row-level measured provenance is enough to require the claim; a
+        # fresh digest is integrity, not authenticity of forged economics.
+        omitted = copy.deepcopy(envelope)
+        omitted["heldout_source"][0].pop("cost_economics")
+        omitted["heldout_source"][0]["net_pnl"] = 1_000_000.0
+        omitted["content_hash"] = _content_hash({
+            key: value for key, value in omitted.items()
+            if key != "content_hash"})
+        self.assertFalse(verify_gate_envelope(omitted))
+
+        # v3 envelopes emitted before provider binding remain verifiable when
+        # their provider field and derived summaries are absent.
+        legacy = copy.deepcopy(envelope)
+        legacy.pop("equity_provider")
+        for summary in legacy["authorization_projection"].values():
+            summary.pop("equity_provider", None)
+        for summary in legacy["fill_quality"].values():
+            summary.pop("equity_provider", None)
+        legacy["risk_unit_report"].pop("equity_provider", None)
+        legacy["content_hash"] = _content_hash({
+            key: value for key, value in legacy.items()
+            if key != "content_hash"})
+        self.assertTrue(verify_gate_envelope(legacy))
+
+        # Re-signing cannot make a claimed numerical value with a forged JSON
+        # type acceptable.  ``bool`` is an ``int`` subclass in Python and a
+        # numeric string is float-coercible, so both must be rejected before
+        # the ordinary value comparison runs.
+        for forged in (True, "1.0"):
+            with self.subTest(forged=forged):
+                typed_tamper = copy.deepcopy(envelope)
+                typed_tamper["heldout_source"][0]["cost_economics"][
+                    "quantity"] = forged
+                typed_tamper["content_hash"] = _content_hash({
+                    key: value for key, value in typed_tamper.items()
+                    if key != "content_hash"})
+                self.assertFalse(verify_gate_envelope(typed_tamper))
+
+        unknown_tamper = copy.deepcopy(envelope)
+        unknown_tamper["heldout_source"][0]["cost_economics"][
+            "unversioned_claim"] = 1.0
+        unknown_tamper["content_hash"] = _content_hash({
+            key: value for key, value in unknown_tamper.items()
+            if key != "content_hash"})
+        self.assertFalse(verify_gate_envelope(unknown_tamper))
+
+    def test_resigned_measured_model_parameter_tamper_cannot_verify(self):
+        """A real-looking schedule identity cannot bless altered leg costs."""
+        from research.gates import _content_hash
+        from research.edge_ledger_proof import _measured_cost_schedule_error
+
+        row = self._measured_equity_row()
+        measured_config = self._measured_cost_config()
+        envelope = verified_gate_envelope(
+            lane="backtest", vehicle="equity", fit=[], heldout=[row],
+            fit_floor=structural_floor(
+                [], vehicle="equity", min_trades=0, min_sessions=0,
+                min_clusters=0, required=False),
+            heldout_floor=structural_floor(
+                [row], vehicle="equity", min_trades=1, min_sessions=1,
+                min_clusters=1),
+            control={}, p_value=1.0, q_value=1.0, alpha=.05,
+            falsification={}, separation={}, checks={}, passes=False,
+            costs=CostModel(spread_bps=0.0, slippage_bps=0.0, fee_bps=0.0),
+            measured_costs=measured_config)
+        self.assertTrue(verify_gate_envelope(envelope))
+        candidate_config = {
+            "broker": {"data_feed": "iex", "provider": "alpaca"},
+            "costs": {"spread_bps": 0.0, "slippage_bps": 0.0,
+                      "fee_bps": 0.0, "measured_quote": measured_config},
+        }
+        self.assertIsNone(_measured_cost_schedule_error(
+            candidate_config, envelope, vehicle="equity"))
+
+        forged = copy.deepcopy(envelope)
+        forged["heldout_source"][0]["entry_cost_model_slippage_bps"] += 1.0
+        forged["content_hash"] = _content_hash({
+            key: value for key, value in forged.items()
+            if key != "content_hash"})
+        # Provenance still names the legitimate frozen schedule.  The
+        # immutable schedule resolution and row binding must reject the
+        # independently altered model parameter.
+        self.assertFalse(verify_gate_envelope(forged))
+
+        # A stronger forgery changes a model parameter and then recomputes all
+        # prices/economics before building a fresh, self-consistent envelope.
+        # Standalone verification can establish its arithmetic integrity, but
+        # only the durable candidate boundary owns the full schedule needed to
+        # reject the invented fee.
+        forged_row = copy.deepcopy(row)
+        forged_row["entry_cost_model_fee_bps"] = 1.0
+        forged_row["exit_cost_model_fee_bps"] = 1.0
+        forged_row.pop("cost_economics", None)
+        forged_claim = row_cost_economics_claim(forged_row, vehicle="equity")
+        self.assertIsNotNone(forged_claim)
+        forged_row["cost_economics"] = forged_claim
+        for name in ("gross_pnl", "costs", "net_pnl", "risk_per_unit",
+                     "realized_risk_per_unit", "risk_usd"):
+            forged_row[name] = forged_claim[name]
+        recomputed = recompute_row_cost_economics(
+            forged_row, vehicle="equity")
+        self.assertTrue(all(recomputed[name] == value
+                            for name, value in forged_claim.items()))
+        self_consistent = copy.deepcopy(envelope)
+        self_consistent["heldout_source"][0] = forged_row
+        self.assertIsNotNone(_measured_cost_schedule_error(
+            candidate_config, self_consistent, vehicle="equity"))
+
+    def test_resigned_provider_tamper_cannot_verify_an_envelope(self):
+        from research.gates import _content_hash
+        row = self._equity_quote_row()
+        envelope = verified_gate_envelope(
+            lane="backtest", vehicle="equity", fit=[], heldout=[row],
+            fit_floor=structural_floor(
+                [], vehicle="equity", min_trades=0, min_sessions=0,
+                min_clusters=0, required=False),
+            heldout_floor=structural_floor(
+                [row], vehicle="equity", min_trades=1, min_sessions=1,
+                min_clusters=1),
+            control={}, p_value=1.0, q_value=1.0, alpha=.05,
+            falsification={}, separation={}, checks={}, passes=False)
+        self.assertTrue(verify_gate_envelope(envelope))
+        tampered = copy.deepcopy(envelope)
+        tampered["heldout_source"][0]["entry_provider"] = "foreign"
+        tampered["heldout_source"][0]["exit_provider"] = "foreign"
+        tampered["content_hash"] = _content_hash({
+            key: value for key, value in tampered.items()
+            if key != "content_hash"})
+        self.assertFalse(verify_gate_envelope(tampered))
 
     def test_qualification_excludes_no_trade_and_bar_fallback_rows(self):
         from research.gates import qualification_report

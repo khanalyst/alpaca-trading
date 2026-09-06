@@ -313,7 +313,7 @@ class CrossSectionalIntegrationTests(unittest.TestCase):
                 "strategy": {"id": "rule", "version": "v1",
                              "variant_id": variant, "rule_spec": SPEC,
                              "execution_mode": "shares"},
-                "broker": {"data_feed": "iex"},
+                "broker": {"provider": "test", "data_feed": "iex"},
                 "risk": {"risk_per_trade_pct": 1.0},
                 "execution": {}, "session": {},
             },

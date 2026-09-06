@@ -1278,9 +1278,11 @@ def run_counterfactual(
                 any(character not in "0123456789abcdef"
                     for character in source_report_hash)):
             raise ValueError("source_report_hash must be a SHA-256 hex digest")
+    replay_policy = ReplayPolicy.from_config(runtime_config)
     raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
         data, require_provenance=False,
-        expected_equity_feed=ReplayPolicy.from_config(runtime_config).equity_feed)
+        expected_equity_feed=replay_policy.equity_feed,
+        expected_provider=replay_policy.equity_provider)
     quotes = (quote_rows if callable(getattr(quote_rows, "quote_fill", None))
               else list(quote_rows))
     snapshots = list(snapshot_map.values())

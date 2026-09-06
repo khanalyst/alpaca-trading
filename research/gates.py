@@ -24,7 +24,9 @@ from .costs import (
     DIAGNOSTIC_HISTORICAL_BACKFILL, QUOTE as QUOTE_FILL,
     RESTING_BRACKET, validate_resting_bracket_fill,
     STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
+    COST_MODEL_BINDING_SCHEMA, row_cost_model_binding, static_cost_config,
     risk_unit_report as _risk_unit_report,
+    recompute_row_cost_economics,
 )
 from .stats import (
     DEFAULT_BOOTSTRAP_DRAWS, DEFAULT_NULL_DRAWS,
@@ -41,12 +43,14 @@ from .stats import (
 def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
                      costs: Any = None, config: Mapping | None = None,
                      min_cost_coverage: float = 1.0,
-                     equity_feed: str = "iex") -> dict:
+                     equity_feed: str = "iex",
+                     equity_provider: str | None = "alpaca") -> dict:
     return _risk_unit_report(
-        _authorizing_rows(rows, vehicle=vehicle, equity_feed=equity_feed),
+        _authorizing_rows(rows, vehicle=vehicle, equity_feed=equity_feed,
+                          equity_provider=equity_provider),
         vehicle=vehicle,
         costs=costs, config=config, min_cost_coverage=min_cost_coverage,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
 
 
 GATE_ENVELOPE_SCHEMA = "verified-research-gate.v3"
@@ -426,9 +430,21 @@ def _finite_age(value: Any) -> bool:
             OPTION_MAX_QUOTE_AGE_SECONDS)
 
 
+def _canonical_equity_provider(value: Any, *, allow_none: bool = False) -> str | None:
+    """Normalize one expected provider identity at the gate boundary."""
+    if allow_none and (value is None or
+                       (isinstance(value, str) and not value.strip())):
+        return None
+    provider = str(value or "").strip().lower()
+    if not provider:
+        raise ValueError("equity_provider must be non-empty")
+    return provider
+
+
 def _authorization_exclusion_reason(row: Mapping[str, Any], *, vehicle: str,
                                     strict: bool,
-                                    equity_feed: str = "iex") -> str | None:
+                                    equity_feed: str = "iex",
+                                    equity_provider: str | None = "alpaca") -> str | None:
     """Return a stable reason when one replay row cannot authorize.
 
     ``strict=False`` is retained solely for old summary-only fixtures that
@@ -456,7 +472,8 @@ def _authorization_exclusion_reason(row: Mapping[str, Any], *, vehicle: str,
     entry_source = str(row.get("entry_fill_source") or "").strip().lower()
     exit_source = str(row.get("exit_fill_source") or "").strip().lower()
     if exit_source == RESTING_BRACKET:
-        return validate_resting_bracket_fill(row, equity_feed=equity_feed)
+        return validate_resting_bracket_fill(
+            row, equity_feed=equity_feed, equity_provider=equity_provider)
     if entry_source != QUOTE_FILL or exit_source != QUOTE_FILL:
         return "non_authorizing_fill_source"
     if not _finite_age(row.get("entry_quote_age_seconds")) or not _finite_age(
@@ -468,9 +485,18 @@ def _authorization_exclusion_reason(row: Mapping[str, Any], *, vehicle: str,
     if entry_feed != required_feed or exit_feed != required_feed:
         return "non_authorizing_feed"
     if vehicle == "equity":
-        if not str(row.get("entry_provider") or "").strip() or not str(
-                row.get("exit_provider") or "").strip():
+        expected_provider = _canonical_equity_provider(
+            equity_provider, allow_none=True)
+        providers = {
+            _canonical_equity_provider(row.get("entry_provider"),
+                                       allow_none=True),
+            _canonical_equity_provider(row.get("exit_provider"),
+                                       allow_none=True),
+        }
+        if None in providers:
             return "missing_quote_provider"
+        if expected_provider is not None and providers != {expected_provider}:
+            return "non_authorizing_provider"
     # Option rows produced by IBR also carry contract-feed aliases.  If
     # present, they must agree with the executable OPRA identity rather than
     # allowing an indicative contract to masquerade as a quote.
@@ -484,7 +510,8 @@ def _authorization_exclusion_reason(row: Mapping[str, Any], *, vehicle: str,
 
 def authorization_projection(rows: Iterable[Mapping], *, vehicle: str,
                               strict: bool = True,
-                              equity_feed: str = "iex") -> dict:
+                              equity_feed: str = "iex",
+                              equity_provider: str | None = "alpaca") -> dict:
     """Project raw replay rows into authorizing-quality executed evidence.
 
     The returned ``eligible`` list is the only list that should feed floors,
@@ -499,6 +526,8 @@ def authorization_projection(rows: Iterable[Mapping], *, vehicle: str,
         equity_feed = "delayed_sip"
     if equity_feed not in {"iex", "sip", "delayed_sip"}:
         raise ValueError("equity_feed must be iex, sip, or delayed_sip")
+    equity_provider = _canonical_equity_provider(
+        equity_provider, allow_none=True)
     raw = [dict(row) for row in rows if isinstance(row, Mapping)]
     eligible: list[dict] = []
     excluded: list[dict] = []
@@ -506,7 +535,8 @@ def authorization_projection(rows: Iterable[Mapping], *, vehicle: str,
     for index, row in enumerate(raw):
         reason = _authorization_exclusion_reason(row, vehicle=vehicle,
                                                  strict=bool(strict),
-                                                 equity_feed=equity_feed)
+                                                 equity_feed=equity_feed,
+                                                 equity_provider=equity_provider)
         if reason is None:
             eligible.append(row)
             continue
@@ -521,6 +551,7 @@ def authorization_projection(rows: Iterable[Mapping], *, vehicle: str,
         "schema": AUTHORIZATION_PROJECTION_SCHEMA,
         "vehicle": vehicle,
         "equity_feed": equity_feed,
+        "equity_provider": equity_provider,
         "strict": bool(strict),
         "raw": raw,
         "eligible": eligible,
@@ -532,16 +563,20 @@ def authorization_projection(rows: Iterable[Mapping], *, vehicle: str,
 
 
 def _projection_summary(projection: Mapping[str, Any], *,
-                        include_equity_feed: bool = True) -> dict:
+                        include_equity_feed: bool = True,
+                        include_equity_provider: bool = True) -> dict:
     keys = ["schema", "vehicle"]
     if include_equity_feed:
         keys.append("equity_feed")
+    if include_equity_provider:
+        keys.append("equity_provider")
     keys.extend(("strict", "counts", "reasons", "excluded"))
     return {key: projection.get(key) for key in keys}
 
 
 def _authorizing_rows(rows: Iterable[Mapping], *, vehicle: str,
-                      equity_feed: str = "iex") -> list[dict]:
+                      equity_feed: str = "iex",
+                      equity_provider: str | None = "alpaca") -> list[dict]:
     """Use strict projection when replay provenance is present.
 
     Small historical unit fixtures predate fill metadata and remain useful for
@@ -553,8 +588,173 @@ def _authorizing_rows(rows: Iterable[Mapping], *, vehicle: str,
     strict = any(_has_fill_metadata(row) for row in raw)
     return authorization_projection(
         raw, vehicle=vehicle, strict=True,
-        equity_feed=equity_feed)["eligible"] \
+        equity_feed=equity_feed, equity_provider=equity_provider)["eligible"] \
         if strict else raw
+
+
+def _measured_cost_authority(
+        value: Mapping[str, Any] | None,
+        *, base_costs: CostModel | None = None) -> dict[str, Any] | None:
+    """Project the frozen measured schedule identity used by a gate.
+
+    The complete schedule is normally supplied as the normalized
+    ``costs.measured_quote`` block.  The envelope stores its immutable
+    identity/configuration knobs, while the row contracts store the selected
+    symbol/time/size/leg models.  A short or free-form provenance string is
+    never accepted as schedule authority.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    block = value.get("costs") if isinstance(value.get("costs"), Mapping) else value
+    measured = block.get("measured_quote") if isinstance(block, Mapping) else None
+    if (measured is None and isinstance(block, Mapping) and
+            block.get("schema") == "measured-quote-cost.v1"):
+        measured = block
+    if not isinstance(measured, Mapping) or measured.get("enabled") is not True:
+        return None
+    # Verification rebuilds the envelope from the already-persisted authority
+    # projection.  It intentionally does not need to embed the full schedule
+    # a second time; the persisted config/run proof owns that larger object.
+    # Accept only the exact normalized identity shape in this internal path.
+    identity_fields = (
+        "schema", "enabled", "schedule_hash", "feed", "provider",
+        "percentile", "depth_percentile", "max_impact_half_spreads",
+        "coverage_policy", "min_quotes_per_cell", "schedule")
+    if ("schedule" not in measured and
+            all(key in measured for key in identity_fields)):
+        normalized = {key: measured.get(key) for key in identity_fields}
+        if "fee_bps" in measured:
+            normalized["fee_bps"] = measured.get("fee_bps")
+        if normalized.get("schema") != "measured-quote-cost.v1":
+            return None
+        schedule_hash = normalized.get("schedule_hash")
+        if (not isinstance(schedule_hash, str) or len(schedule_hash) != 64 or
+                any(char not in "0123456789abcdef" for char in schedule_hash)):
+            return None
+        if (not isinstance(normalized.get("feed"), str) or
+                not isinstance(normalized.get("provider"), str) or
+                not normalized["feed"] or not normalized["provider"]):
+            return None
+    else:
+        normalized = None
+    try:
+        if normalized is None:
+            from .quote_costs import validate_measured_quote_config
+            broker = value.get("broker") if isinstance(value.get("broker"), Mapping) else {}
+            expected_feed = broker.get("data_feed")
+            expected_provider = broker.get("provider")
+            normalized = validate_measured_quote_config(
+                measured, expected_feed=expected_feed,
+                expected_provider=expected_provider)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    fields = (
+        "schema", "enabled", "schedule_hash", "feed", "provider",
+        "percentile", "depth_percentile", "max_impact_half_spreads",
+        "coverage_policy", "min_quotes_per_cell", "schedule")
+    authority = {key: normalized.get(key) for key in fields}
+    fee_bps = (normalized.get("fee_bps")
+               if isinstance(normalized, Mapping) else None)
+    if fee_bps is None:
+        fee_bps = getattr(base_costs, "fee_bps", None)
+    if fee_bps is None:
+        try:
+            fee_bps = CostModel.from_config(
+                static_cost_config(value), vehicle="equity").fee_bps
+        except (CostError, TypeError, ValueError, OverflowError):
+            fee_bps = None
+    if fee_bps is not None:
+        authority["fee_bps"] = float(fee_bps)
+    schedule_hash = authority.get("schedule_hash")
+    if (not isinstance(schedule_hash, str) or
+            len(schedule_hash) != 64 or
+            any(char not in "0123456789abcdef" for char in schedule_hash)):
+        return None
+    if not isinstance(authority.get("feed"), str) or not authority["feed"]:
+        return None
+    if not isinstance(authority.get("provider"), str) or not authority["provider"]:
+        return None
+    return authority
+
+
+def _cost_model_binding_report(
+        arms: Mapping[str, Sequence[Mapping]], *, vehicle: str,
+        authority: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Bind every measured row to its immutable schedule/model contract."""
+    def schedule_model_matches(binding: Mapping[str, Any]) -> bool:
+        if not isinstance(authority, Mapping):
+            return False
+        schedule = authority.get("schedule")
+        fee_bps = authority.get("fee_bps")
+        if not isinstance(schedule, Mapping) or fee_bps is None:
+            return False
+        try:
+            from .quote_costs import cost_model_from_schedule
+            origin = str(binding.get("origin") or "")
+            symbol = binding.get("symbol")
+            bucket = None
+            if origin.startswith("symbol_bucket:"):
+                _prefix, _symbol, bucket = origin.split(":", 2)
+            model = cost_model_from_schedule(
+                schedule,
+                symbol=(str(symbol) if symbol not in (None, "") else None),
+                bucket=bucket,
+                percentile=str(authority.get("percentile")),
+                order_shares=float(binding["quantity"]),
+                depth_percentile=str(authority.get("depth_percentile")),
+                max_impact_half_spreads=float(
+                    authority.get("max_impact_half_spreads")),
+                fee_bps=float(fee_bps),
+                expected_feed=str(authority.get("feed")),
+                expected_provider=str(authority.get("provider")),
+                coverage_policy=str(authority.get("coverage_policy")),
+            )
+        except (CostError, TypeError, ValueError, OverflowError):
+            return False
+        leg = binding.get("leg")
+        if leg not in {"entry", "exit"}:
+            return False
+        expected_provenance = model.provenance
+        return (
+            binding.get("provenance") == expected_provenance and
+            all(_close_number(binding.get(name), getattr(model, name))
+                for name in ("spread_bps", "slippage_bps", "fee_bps")))
+
+    rows: list[dict[str, Any]] = []
+    invalid = False
+    for arm_name in ("fit", "heldout", "fit_baseline", "heldout_baseline", "null"):
+        for index, row in enumerate(arms.get(arm_name, ())):
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                binding = row_cost_model_binding(row, vehicle=vehicle)
+            except (CostError, TypeError, ValueError, OverflowError):
+                # Preserve a deterministic failure marker so the builder can
+                # still emit an auditable non-authorizing envelope.
+                binding = None
+                invalid = True
+            if binding is None:
+                # Static/legacy rows are deliberately omitted from this
+                # report; they continue through the historical cost path.
+                continue
+            if not schedule_model_matches(binding["legs"]["entry"]):
+                invalid = True
+            if not schedule_model_matches(binding["legs"]["exit"]):
+                invalid = True
+            rows.append({
+                "arm": arm_name,
+                "index": index,
+                "opportunity_id": row.get("opportunity_id"),
+                "binding": binding,
+            })
+    if not rows and not invalid:
+        return None
+    return {
+        "schema": COST_MODEL_BINDING_SCHEMA,
+        "authority": (dict(authority) if isinstance(authority, Mapping) else None),
+        "rows": rows,
+        "valid": bool(not invalid and isinstance(authority, Mapping)),
+    }
 
 
 def protocol_minimums(lane: str) -> dict[str, int]:
@@ -643,9 +843,11 @@ class AcceptanceFloor:
     min_clusters: int = 0
 
     def check(self, trades: Iterable[Mapping], *, vehicle: str,
-              equity_feed: str = "iex") -> dict:
+              equity_feed: str = "iex",
+              equity_provider: str | None = "alpaca") -> dict:
         rows = _authorizing_rows(
-            trades, vehicle=vehicle, equity_feed=equity_feed)
+            trades, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider)
         rows = [row for row in rows if row.get("vehicle", vehicle) == vehicle]
         # Discovery materializes zero-outcome opportunities to avoid
         # survivorship bias.  They remain part of the session/control sample,
@@ -717,7 +919,8 @@ def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
                      universe_size: int | None = None,
                      signal_opportunities: int | None = None,
                      target_total: int | None = None,
-                     equity_feed: str = "iex") -> dict:
+                     equity_feed: str = "iex",
+                     equity_provider: str | None = "alpaca") -> dict:
     """Report structural adequacy without treating profitability as sample size.
 
     Profitability is deliberately absent here.  ``AcceptanceFloor.min_net_pnl``
@@ -725,11 +928,13 @@ def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
     gate check rather than a sample-size statement.
     """
     materialized = _authorizing_rows(
-        rows, vehicle=vehicle, equity_feed=equity_feed)
+        rows, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     report = AcceptanceFloor(
         min_trades=min_trades, min_sessions=min_sessions,
         min_clusters=min_clusters,
-    ).check(materialized, vehicle=vehicle, equity_feed=equity_feed)
+    ).check(materialized, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider)
     report["minimums"] = {"trades": int(min_trades),
                           "sessions": int(min_sessions),
                           "clusters": int(min_clusters)}
@@ -740,7 +945,7 @@ def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
         min_sessions=min_sessions, min_clusters=min_clusters,
         available_sessions=available_sessions, universe_size=universe_size,
         signal_opportunities=signal_opportunities, target_total=target_total,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     return report
 
 
@@ -751,7 +956,8 @@ def floor_feasibility(rows: Iterable[Mapping], *, vehicle: str,
                       universe_size: int | None = None,
                       signal_opportunities: int | None = None,
                       target_total: int | None = None,
-                      equity_feed: str = "iex") -> dict:
+                      equity_feed: str = "iex",
+                      equity_provider: str | None = "alpaca") -> dict:
     """Classify whether a floor is impossible, underpowered or inconclusive.
 
     A failed structural floor is not automatically a negative result.  The
@@ -761,7 +967,8 @@ def floor_feasibility(rows: Iterable[Mapping], *, vehicle: str,
     descriptive and never lowers a configured floor.
     """
     materialized = _authorizing_rows(
-        rows, vehicle=vehicle, equity_feed=equity_feed)
+        rows, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     materialized = [row for row in materialized if row.get("vehicle", vehicle) == vehicle]
     sessions = {str(_session_key(row)) for row in materialized if _session_key(row)}
     clusters = {str(row.get("cluster") or _session_key(row))
@@ -818,7 +1025,8 @@ def floor_feasibility(rows: Iterable[Mapping], *, vehicle: str,
 def performance_floor(rows: Iterable[Mapping], *, vehicle: str,
                       min_net_pnl: float = 0.0,
                       min_expectancy: float = 0.0,
-                      equity_feed: str = "iex") -> dict:
+                      equity_feed: str = "iex",
+                      equity_provider: str | None = "alpaca") -> dict:
     """Require absolute, after-cost profitability rather than only a delta.
 
     A variant that loses money on unseen data has no edge to validate, however
@@ -827,7 +1035,8 @@ def performance_floor(rows: Iterable[Mapping], *, vehicle: str,
     report = AcceptanceFloor(min_trades=0, min_sessions=0,
                              min_net_pnl=float(min_net_pnl)).check(
                                  rows, vehicle=vehicle,
-                                 equity_feed=equity_feed)
+                                 equity_feed=equity_feed,
+                                 equity_provider=equity_provider)
     trades = int(report["trades"])
     net = float(report["net_pnl"])
     expectancy = net / trades if trades else None
@@ -850,7 +1059,8 @@ def expectancy_rejection_report(
         draws: int = DEFAULT_BOOTSTRAP_DRAWS,
         seed: int | None = None,
         block_length: int | None = None,
-        equity_feed: str = "iex") -> dict:
+        equity_feed: str = "iex",
+        equity_provider: str | None = "alpaca") -> dict:
     """Test whether a useful after-cost expectancy has been ruled out.
 
     Promotion asks whether the lower bound is positive.  Retirement is the
@@ -861,7 +1071,8 @@ def expectancy_rejection_report(
     remain auditable in P&L units against a zero minimum.
     """
     selected = [row for row in _authorizing_rows(
-                rows, vehicle=vehicle, equity_feed=equity_feed)
+                rows, vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider)
                 if row.get("vehicle", vehicle) == vehicle and
                 row.get("no_trade") is not True]
     r_values: list[float] = []
@@ -917,13 +1128,16 @@ def expectancy_rejection_report(
 
 
 def paired_delta(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
-                 vehicle: str, equity_feed: str = "iex") -> dict:
+                 vehicle: str, equity_feed: str = "iex",
+                 equity_provider: str | None = "alpaca") -> dict:
     """Compare matched vehicle-local rows without pooling unmatched outcomes."""
     left = [row for row in _authorizing_rows(
-            candidate, vehicle=vehicle, equity_feed=equity_feed)
+            candidate, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider)
             if row.get("vehicle", vehicle) == vehicle]
     right = [row for row in _authorizing_rows(
-             baseline, vehicle=vehicle, equity_feed=equity_feed)
+             baseline, vehicle=vehicle, equity_feed=equity_feed,
+             equity_provider=equity_provider)
              if row.get("vehicle", vehicle) == vehicle]
     def unique(rows: Iterable[Mapping]) -> dict:
         by_key: dict = {}
@@ -960,10 +1174,12 @@ def paired_delta(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
 
 
 def _unique_by_match_key(rows: Iterable[Mapping], vehicle: str, *,
-                         equity_feed: str = "iex") -> dict[str, Mapping]:
+                         equity_feed: str = "iex",
+                         equity_provider: str | None = "alpaca") -> dict[str, Mapping]:
     """Index vehicle-local rows by comparison key, dropping ambiguous keys."""
     rows = _authorizing_rows(
-        rows, vehicle=vehicle, equity_feed=equity_feed)
+        rows, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     values: dict[str, Mapping] = {}
     duplicates: set[str] = set()
     for row in rows:
@@ -980,10 +1196,13 @@ def _unique_by_match_key(rows: Iterable[Mapping], vehicle: str, *,
 
 
 def matched_pairs(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
-                  vehicle: str, equity_feed: str = "iex") -> dict:
+                  vehicle: str, equity_feed: str = "iex",
+                  equity_provider: str | None = "alpaca") -> dict:
     """Return the matched candidate-minus-baseline deltas and their clusters."""
-    left = _unique_by_match_key(candidate, vehicle, equity_feed=equity_feed)
-    right = _unique_by_match_key(baseline, vehicle, equity_feed=equity_feed)
+    left = _unique_by_match_key(candidate, vehicle, equity_feed=equity_feed,
+                                equity_provider=equity_provider)
+    right = _unique_by_match_key(baseline, vehicle, equity_feed=equity_feed,
+                                 equity_provider=equity_provider)
     matched: list[tuple[float | None, str, Mapping, Mapping]] = []
     for key in sorted(left):
         other = right.get(key)
@@ -1039,7 +1258,8 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
                          iterations: int = 20_000,
                          min_matched: int = ACTUAL_CONTROL_MIN_MATCHED,
                          min_coverage: float = ACTUAL_CONTROL_MIN_COVERAGE,
-                         equity_feed: str = "iex") -> dict:
+                         equity_feed: str = "iex",
+                         equity_provider: str | None = "alpaca") -> dict:
     """Test matched opportunity deltas with deterministic session clustering."""
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
         raise ValueError("iterations must be a positive integer")
@@ -1049,7 +1269,8 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
     candidate = [dict(row) for row in candidate]
     baseline = [dict(row) for row in baseline]
     pairs = matched_pairs(
-        candidate, baseline, vehicle=vehicle, equity_feed=equity_feed)
+        candidate, baseline, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     triples = [(stamp, delta, 0.0) for stamp, delta
                in zip(pairs["timestamps"], pairs["deltas"])]
     result = paired_cluster_sign_flip(triples, cluster_seconds=CLUSTER_SECONDS,
@@ -1077,7 +1298,7 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
     adequacy = paired_control_adequacy(
         candidate, baseline, vehicle=vehicle,
         min_matched=min_matched, min_coverage=min_coverage,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     result["paired_adequacy"] = adequacy
     result["coverage"] = adequacy["coverage"]
     result["adequate"] = bool(adequacy["adequate"])
@@ -1118,7 +1339,8 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
 def paired_control_adequacy(candidate: Iterable[Mapping], control: Iterable[Mapping], *,
                             vehicle: str, min_matched: int = NULL_CONTROL_MIN_MATCHED,
                             min_coverage: float = NULL_CONTROL_MIN_COVERAGE,
-                            equity_feed: str = "iex") -> dict:
+                            equity_feed: str = "iex",
+                            equity_provider: str | None = "alpaca") -> dict:
     """Check minimum paired count and coverage for a control arm.
 
     ``matched_cluster_test`` remains a descriptive statistic.  This separate
@@ -1128,18 +1350,21 @@ def paired_control_adequacy(candidate: Iterable[Mapping], control: Iterable[Mapp
     candidate = [dict(row) for row in candidate]
     control = [dict(row) for row in control]
     candidate_rows = [row for row in _authorizing_rows(
-        candidate, vehicle=vehicle, equity_feed=equity_feed)
+        candidate, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
                       if row.get("vehicle", vehicle) == vehicle and
                       row.get("no_trade") is not True]
     control_rows = [row for row in _authorizing_rows(
-        control, vehicle=vehicle, equity_feed=equity_feed)
+        control, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
                     if row.get("vehicle", vehicle) == vehicle and
                     row.get("no_trade") is not True]
     # Match exactly the same executed-row universe used by the denominator.
     # This matters for legacy/diagnostic rows without fill metadata, where the
     # projection intentionally retains no-trade observations for audit.
     pairs = matched_pairs(candidate_rows, control_rows, vehicle=vehicle,
-                          equity_feed=equity_feed)
+                          equity_feed=equity_feed,
+                          equity_provider=equity_provider)
     # Coverage answers the authorizing question: "what fraction of the
     # candidate trades being tested has a matched control?"  Extra trades in
     # a more-active baseline are outside that candidate estimand and cannot
@@ -1166,7 +1391,7 @@ def paired_control_adequacy(candidate: Iterable[Mapping], control: Iterable[Mapp
 def _legacy_v2_paired_control_adequacy(
         candidate: Iterable[Mapping], control: Iterable[Mapping], *,
         vehicle: str, min_matched: int, min_coverage: float,
-        equity_feed: str) -> dict:
+        equity_feed: str, equity_provider: str | None = None) -> dict:
     """Reproduce the v2 symmetric-coverage rule for audit verification only.
 
     v2's descriptive matcher retained ``no_trade`` rows in its matched
@@ -1177,13 +1402,16 @@ def _legacy_v2_paired_control_adequacy(
     candidate = [dict(row) for row in candidate]
     control = [dict(row) for row in control]
     pairs = matched_pairs(candidate, control, vehicle=vehicle,
-                          equity_feed=equity_feed)
+                          equity_feed=equity_feed,
+                          equity_provider=equity_provider)
     candidate_rows = [row for row in _authorizing_rows(
-        candidate, vehicle=vehicle, equity_feed=equity_feed)
+        candidate, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
                       if row.get("vehicle", vehicle) == vehicle and
                       row.get("no_trade") is not True]
     control_rows = [row for row in _authorizing_rows(
-        control, vehicle=vehicle, equity_feed=equity_feed)
+        control, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
                     if row.get("vehicle", vehicle) == vehicle and
                     row.get("no_trade") is not True]
     denominator = max(len(candidate_rows), len(control_rows))
@@ -1205,7 +1433,8 @@ def _legacy_v2_paired_control_adequacy(
 def matched_effective_breadth(candidate: Iterable[Mapping],
                               baseline: Iterable[Mapping], *,
                               vehicle: str,
-                              equity_feed: str = "iex") -> dict:
+                              equity_feed: str = "iex",
+                              equity_provider: str | None = "alpaca") -> dict:
     """Measure cross-symbol breadth without treating it as extra sample size.
 
     Statistical independence is still earned from chronological session
@@ -1214,8 +1443,10 @@ def matched_effective_breadth(candidate: Iterable[Mapping],
     it prevents claims about cross-sectional breadth from being inferred from
     a raw trade count.
     """
-    left = _unique_by_match_key(candidate, vehicle, equity_feed=equity_feed)
-    right = _unique_by_match_key(baseline, vehicle, equity_feed=equity_feed)
+    left = _unique_by_match_key(candidate, vehicle, equity_feed=equity_feed,
+                                equity_provider=equity_provider)
+    right = _unique_by_match_key(baseline, vehicle, equity_feed=equity_feed,
+                                 equity_provider=equity_provider)
     observations = []
     for key in sorted(left):
         other = right.get(key)
@@ -1237,7 +1468,8 @@ def matched_effective_breadth(candidate: Iterable[Mapping],
 
 def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
                        risk_report: Mapping,
-                       equity_feed: str = "iex") -> dict:
+                       equity_feed: str = "iex",
+                       equity_provider: str | None = "alpaca") -> dict:
     """Reprice realized replay P&L under preregistered entry-notional shocks.
 
     Source rows already contain P&L after the configured model.  Each stress
@@ -1257,7 +1489,8 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
         if isinstance(item, Mapping)
     }
     executed = [dict(row) for row in _authorizing_rows(
-                rows, vehicle=vehicle, equity_feed=equity_feed)
+        rows, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
                 if isinstance(row, Mapping) and
                 row.get("vehicle", vehicle) == vehicle and
                 row.get("no_trade") is not True]
@@ -1279,6 +1512,14 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
                         return value
                 return default
 
+            opportunity_id = str(row.get("opportunity_id", index))
+            row_economics: dict[str, Any] | None = None
+            row_economics_error: str | None = None
+            try:
+                row_economics = recompute_row_cost_economics(
+                    row, vehicle=vehicle)
+            except (CostError, TypeError, ValueError, OverflowError) as exc:
+                row_economics_error = str(exc)
             entry = number("entry_price", "entry_reference", "plan_entry")
             exit_price = number("exit_price", "exit_reference", default=entry)
             quantity = number("quantity", "contracts", default=1.0)
@@ -1286,27 +1527,44 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
                 "contract_multiplier", "multiplier",
                 default=100.0 if vehicle == "option" else 1.0)
             net = number("net_pnl")
-            opportunity_id = str(row.get("opportunity_id", index))
+            if row_economics is not None:
+                entry = row_economics["entry_price"]
+                exit_price = row_economics["exit_price"]
+                quantity = row_economics["quantity"]
+                multiplier = row_economics["contract_multiplier"]
+                net = row_economics["net_pnl"]
             if (entry is None or exit_price is None or quantity is None or
                     multiplier is None or net is None or entry <= 0 or
-                    quantity <= 0 or multiplier <= 0):
+                    quantity <= 0 or multiplier <= 0 or
+                    row_economics_error is not None):
                 missing.append(opportunity_id)
                 continue
             base = base_by_id.get(opportunity_id)
             try:
-                base_cost = float(base) if base is not None else model.round_trip_cost(
-                    entry, exit_price, quantity, multiplier, vehicle=vehicle,
-                    executable_quotes=(
-                        row.get("entry_fill_source") == QUOTE_FILL and
-                        row.get("exit_fill_source") == QUOTE_FILL))
+                if row_economics is not None:
+                    base_cost = float(row_economics["round_trip_cost"])
+                else:
+                    base_cost = (float(base) if base is not None else
+                                  model.round_trip_cost(
+                                      entry, exit_price, quantity, multiplier,
+                                      vehicle=vehicle,
+                                      entry_executable_quote=(
+                                          row.get("entry_fill_source") == QUOTE_FILL),
+                                      exit_executable_quote=(
+                                          row.get("exit_fill_source") == QUOTE_FILL)))
             except (CostError, TypeError, ValueError, OverflowError):
                 missing.append(opportunity_id)
                 continue
             notional = abs(entry) * abs(quantity) * abs(multiplier)
             stressed_cost = notional * float(scenario_bps) / 10_000.0
             if vehicle == "option":
-                stressed_cost += abs(quantity) * 2.0 * \
-                    model.option_fee_per_contract_side
+                if row_economics is not None:
+                    stressed_cost += abs(quantity) * (
+                        row_economics["entry_option_fee_per_contract_side"] +
+                        row_economics["exit_option_fee_per_contract_side"])
+                else:
+                    stressed_cost += abs(quantity) * 2.0 * \
+                        model.option_fee_per_contract_side
             stressed_values.append(net - max(0.0, stressed_cost - base_cost))
         net_pnl = sum(stressed_values)
         scenarios.append({
@@ -1342,7 +1600,8 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
 def placebo_null_distribution(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
                               vehicle: str, draws: int = DEFAULT_NULL_DRAWS,
                               seed: int | None = None,
-                              equity_feed: str = "iex") -> dict:
+                              equity_feed: str = "iex",
+                              equity_provider: str | None = "alpaca") -> dict:
     """Draw a seeded cluster sign-flip null distribution for matched deltas.
 
     ``placebo`` is the null *distribution* of the mean delta, not a single
@@ -1350,7 +1609,8 @@ def placebo_null_distribution(candidate: Iterable[Mapping], baseline: Iterable[M
     content itself, so the same evidence always reproduces the same draws.
     """
     pairs = matched_pairs(
-        candidate, baseline, vehicle=vehicle, equity_feed=equity_feed)
+        candidate, baseline, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     null = sign_flip_null_statistics(pairs["deltas"], pairs["clusters"],
                                      draws=draws, seed=seed)
     return {"method": "seeded_cluster_sign_flip_null",
@@ -1645,9 +1905,11 @@ def falsification_gate(observed: Sequence[float], placebo: Sequence[float], *,
 
 
 def sample_counts(rows: Iterable[Mapping], *, vehicle: str,
-                  equity_feed: str = "iex") -> dict:
+                  equity_feed: str = "iex",
+                  equity_provider: str | None = "alpaca") -> dict:
     selected = [row for row in _authorizing_rows(
-                rows, vehicle=vehicle, equity_feed=equity_feed)
+                rows, vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider)
                 if row.get("vehicle", vehicle) == vehicle]
     return {
         "rows": len(selected),
@@ -1666,7 +1928,8 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
                         min_matched: int | None = None,
                         min_coverage: float = ACTUAL_CONTROL_MIN_COVERAGE,
                         requested_min_sessions: int | None = None,
-                        equity_feed: str = "iex") -> dict:
+                        equity_feed: str = "iex",
+                        equity_provider: str | None = "alpaca") -> dict:
     """Return deterministic rolling-origin *forward stability* evidence.
 
     The rules are fixed; no refit is implied.  Each test fold is a contiguous
@@ -1679,9 +1942,11 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
     if int(folds) < 2:
         raise ValueError("walk-forward requires at least two folds")
     candidate = _authorizing_rows(
-        candidate, vehicle=vehicle, equity_feed=equity_feed)
+        candidate, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     baseline = _authorizing_rows(
-        baseline, vehicle=vehicle, equity_feed=equity_feed)
+        baseline, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     ordered = sorted(candidate, key=lambda row: (_session_key(row),
                                                  str(row.get("entry_timestamp", ""))))
     sessions = sorted({_session_key(row) for row in ordered if _session_key(row)})
@@ -1743,11 +2008,11 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
         base_rows = [row for row in baseline if _session_key(row) in test_sessions]
         pairs = matched_pairs(
             test_rows, base_rows, vehicle=vehicle,
-            equity_feed=equity_feed)
+            equity_feed=equity_feed, equity_provider=equity_provider)
         control_adequacy = paired_control_adequacy(
             test_rows, base_rows, vehicle=vehicle,
             min_matched=matched_min, min_coverage=min_coverage,
-            equity_feed=equity_feed)
+            equity_feed=equity_feed, equity_provider=equity_provider)
         delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
         net = sum(float(row.get("net_pnl", 0.0)) for row in test_rows)
         test_trades = sum(1 for row in test_rows if row.get("no_trade") is not True)
@@ -1811,7 +2076,8 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
                          draws: int = DEFAULT_BOOTSTRAP_DRAWS,
                          seed: int | None = None,
                          block_length: int | None = None,
-                         equity_feed: str = "iex") -> dict:
+                         equity_feed: str = "iex",
+                         equity_provider: str | None = "alpaca") -> dict:
     """Score a sealed final window for one preselected candidate.
 
     Qualification is post-selection evidence.  Callers that searched a
@@ -1838,10 +2104,10 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
                             [*raw_rows, *raw_baseline])
     candidate_projection = authorization_projection(
         raw_rows, vehicle=vehicle, strict=strict_projection,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     baseline_projection = authorization_projection(
         raw_baseline, vehicle=vehicle, strict=strict_projection,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     rows = candidate_projection["eligible"]
     baseline = baseline_projection["eligible"]
     drawdown_limit_source = "explicit_usd" if max_drawdown is not None else None
@@ -1908,7 +2174,8 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
             any(not item for item in declared_set)):
         raise ValueError("qualification sessions must be unique, non-empty strings")
     pairs = matched_pairs(
-        rows, baseline, vehicle=vehicle, equity_feed=equity_feed)
+        rows, baseline, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     control_adequacy = paired_control_adequacy(
         rows, baseline, vehicle=vehicle,
         # Qualification's declared trade floor remains the local descriptive
@@ -1917,9 +2184,10 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
         # while compact legacy diagnostic windows remain verifiable.
         min_matched=max(1, int(min_trades)),
         min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     absolute = performance_floor(
-        rows, vehicle=vehicle, equity_feed=equity_feed)
+        rows, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
     clusters = len({str(row.get("cluster") or _session_key(row))
                     for row in rows if row.get("vehicle", vehicle) == vehicle})
@@ -2081,7 +2349,8 @@ def seal_final_window(items: Sequence[Any], *, session_of, fraction: float = .2,
 
 
 def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
-                        equity_feed: str = "iex") -> dict:
+                        equity_feed: str = "iex",
+                        equity_provider: str | None = "alpaca") -> dict:
     """Report what actually priced the fills behind a result.
 
     ``entry_fill_source`` is recorded per row but was never aggregated, so a
@@ -2098,6 +2367,8 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
         equity_feed = "delayed_sip"
     if equity_feed not in {"iex", "sip", "delayed_sip"}:
         raise ValueError("equity_feed must be iex, sip, or delayed_sip")
+    equity_provider = _canonical_equity_provider(
+        equity_provider, allow_none=True)
     local = [row for row in rows if row.get("vehicle", vehicle) == vehicle]
     executed = [row for row in local if row.get("no_trade") is not True]
     no_trade = [row for row in local if row.get("no_trade") is True]
@@ -2135,9 +2406,11 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
         def _equity_quote_leg(row: Mapping, leg: str) -> bool:
             source = str(row.get(f"{leg}_fill_source") or "").strip().lower()
             feed = str(row.get(f"{leg}_feed") or "").strip().lower()
-            provider = str(row.get(f"{leg}_provider") or "").strip()
+            provider = _canonical_equity_provider(
+                row.get(f"{leg}_provider"), allow_none=True)
             age = row.get(f"{leg}_quote_age_seconds")
             return (source == QUOTE_FILL and feed == equity_feed and bool(provider) and
+                    (equity_provider is None or provider == equity_provider) and
                     isinstance(age, (int, float)) and not isinstance(age, bool) and
                     math.isfinite(float(age)) and
                     0 <= float(age) <= OPTION_MAX_QUOTE_AGE_SECONDS)
@@ -2151,7 +2424,8 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
             return (str(row.get("entry_fill_source") or "").strip().lower() ==
                     QUOTE_FILL and
                     validate_resting_bracket_fill(
-                        row, equity_feed=equity_feed) is None)
+                        row, equity_feed=equity_feed,
+                        equity_provider=equity_provider) is None)
 
         quality_adequate = bool(
             executed and all(
@@ -2180,6 +2454,7 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str,
             for row in executed))
     return {
         "vehicle": vehicle,
+        "equity_provider": equity_provider,
         "opportunities": len(local),
         "execution_opportunities": execution_opportunities,
         "no_signal": len(no_signal),
@@ -2303,7 +2578,8 @@ def arm_evidence_report(*, candidate: Iterable[Mapping],
                         baseline: Iterable[Mapping] = (),
                         null: Iterable[Mapping] = (), vehicle: str,
                         projections: Mapping[str, Mapping[str, Any]] | None = None,
-                        equity_feed: str = "iex") -> dict:
+                        equity_feed: str = "iex",
+                        equity_provider: str | None = "alpaca") -> dict:
     """Persist explainable evidence diagnostics for candidate/control arms.
 
     ``authorization_projection`` remains the authorizing boundary.  This
@@ -2327,7 +2603,7 @@ def arm_evidence_report(*, candidate: Iterable[Mapping],
             strict = any(_has_fill_metadata(row) for row in raw)
             projection = authorization_projection(
                 raw, vehicle=vehicle, strict=strict,
-                equity_feed=equity_feed)
+                equity_feed=equity_feed, equity_provider=equity_provider)
         eligible = [dict(row) for row in projection.get("eligible", ())
                     if isinstance(row, Mapping)]
         executed_raw = [row for row in raw if row.get("no_trade") is not True]
@@ -2518,10 +2794,12 @@ source_statistic_dependence_report = gate_dependence_report
 
 def _fill_quality_adequate(fit: Sequence[Mapping], heldout: Sequence[Mapping],
                            *, vehicle: str, lane: str,
-                           equity_feed: str = "iex") -> bool:
+                           equity_feed: str = "iex",
+                           equity_provider: str | None = "alpaca") -> bool:
     partitions = [heldout] if lane == "shadow" else [fit, heldout]
     summaries = [fill_source_summary(
-        rows, vehicle=vehicle, equity_feed=equity_feed)
+        rows, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
         for rows in partitions]
     # An empty fit partition is normal for shadow; an empty held-out partition
     # is not evidence.  Every partition with opportunities must be executable
@@ -2609,9 +2887,11 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                            provenance: Mapping | None = None,
                            candidate_id: str | None = None,
                            costs: Any = None,
+                           measured_costs: Mapping | None = None,
                            risk_unit: Mapping | None = None,
                            risk_unit_report: Mapping | None = None,
-                           equity_feed: str = "iex") -> dict:
+                           equity_feed: str = "iex",
+                           equity_provider: str | None = "alpaca") -> dict:
     """Build the immutable, content-addressed gate decision persisted per run.
 
     ``q_value`` is the cycle-global false-discovery q; ``family_q_value`` is
@@ -2623,6 +2903,8 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         equity_feed = "delayed_sip"
     if equity_feed not in {"iex", "sip", "delayed_sip"}:
         raise ValueError("equity_feed must be iex, sip, or delayed_sip")
+    equity_provider = _canonical_equity_provider(
+        equity_provider, allow_none=True)
     # ``fit``/``heldout`` are retained as compatibility inputs for callers
     # that already projected rows.  The raw variants are the audit source;
     # when omitted, the inputs themselves are treated as raw and projected
@@ -2635,6 +2917,16 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         heldout_baseline if heldout_baseline_raw is None else heldout_baseline_raw)]
     null_source_raw = [dict(row) for row in (
         null_source if null_raw is None else null_raw)]
+    measured_authority = _measured_cost_authority(
+        measured_costs if measured_costs is not None else
+        (costs if isinstance(costs, Mapping) else None),
+        base_costs=(costs if isinstance(costs, CostModel) else None))
+    cost_model_binding = _cost_model_binding_report(
+        {"fit": fit_source_raw, "heldout": heldout_source_raw,
+         "fit_baseline": fit_baseline_source_raw,
+         "heldout_baseline": heldout_baseline_source_raw,
+         "null": null_source_raw},
+        vehicle=vehicle, authority=measured_authority)
     # Legacy summary-only fixtures have no fill provenance at all.  Keep them
     # auditable and recomputable while production replay rows (which always
     # carry fill metadata) take the strict protocol path.
@@ -2645,19 +2937,22 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     projections = {
         "fit": authorization_projection(fit_source_raw, vehicle=vehicle,
                                          strict=strict_projection,
-                                         equity_feed=equity_feed),
+                                         equity_feed=equity_feed,
+                                         equity_provider=equity_provider),
         "heldout": authorization_projection(heldout_source_raw, vehicle=vehicle,
                                              strict=strict_projection,
-                                             equity_feed=equity_feed),
+                                             equity_feed=equity_feed,
+                                             equity_provider=equity_provider),
         "fit_baseline": authorization_projection(
             fit_baseline_source_raw, vehicle=vehicle, strict=strict_projection,
-            equity_feed=equity_feed),
+            equity_feed=equity_feed, equity_provider=equity_provider),
         "heldout_baseline": authorization_projection(
             heldout_baseline_source_raw, vehicle=vehicle, strict=strict_projection,
-            equity_feed=equity_feed),
+            equity_feed=equity_feed, equity_provider=equity_provider),
         "null": authorization_projection(null_source_raw, vehicle=vehicle,
                                           strict=strict_projection,
-                                          equity_feed=equity_feed),
+                                          equity_feed=equity_feed,
+                                          equity_provider=equity_provider),
     }
     fit = projections["fit"]["eligible"]
     heldout = projections["heldout"]["eligible"]
@@ -2680,7 +2975,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         heldout, heldout_baseline, vehicle=vehicle,
         min_matched=ACTUAL_CONTROL_MIN_MATCHED,
         min_coverage=ACTUAL_CONTROL_MIN_COVERAGE,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     control["paired_adequacy"] = control_adequacy
     control["coverage"] = control_adequacy["coverage"]
     control["adequate"] = bool(control_adequacy["adequate"])
@@ -2702,7 +2997,8 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         float(reported.get("heldout_net_pnl", sum(float(row.get("net_pnl", 0.0))
                                                     for row in heldout))) > 0)
     trades = sample_counts(
-        heldout, vehicle=vehicle, equity_feed=equity_feed)["trades"]
+        heldout, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)["trades"]
     net = float(reported.get("heldout_net_pnl", sum(float(row.get("net_pnl", 0.0))
                                                      for row in heldout)))
     derived["heldout_expectancy_positive"] = bool(trades and net / trades > 0)
@@ -2744,7 +3040,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         heldout, null_source, vehicle=vehicle,
         min_matched=null_min_matched,
         min_coverage=null_min_coverage,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     # Persisted adequacy is recomputed from source rows; a forged summary flag
     # cannot turn a thin null arm into an authorizing control.
     null_raw_available = bool(
@@ -2827,23 +3123,34 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     # precomputed report, but verification always rebuilds it from source rows
     # and the model captured in the report.
     supplied_risk = risk_unit_report if risk_unit_report is not None else risk_unit
-    if supplied_risk is None:
-        try:
-            supplied_risk = _risk_unit_report(
-                [*fit, *heldout], vehicle=vehicle, costs=costs,
-                equity_feed=equity_feed)
-        except (CostError, TypeError, ValueError, OverflowError):
-            supplied_risk = {"schema": "risk-unit-report.v1", "vehicle": vehicle,
-                             "adequate": False, "observations": []}
-    risk = dict(supplied_risk) if isinstance(supplied_risk, Mapping) else {}
+    # A caller-supplied report is a compatibility hint for the static
+    # fallback, not an authority over row-specific measured economics. Always
+    # rebuild from the source rows so a measured IBR row cannot be authorized
+    # with a stale static report. Legacy rows remain byte-for-byte equivalent
+    # because their canonical per-leg fields are absent.
+    risk_model_input = costs
+    risk_coverage = 1.0
+    if isinstance(supplied_risk, Mapping) and supplied_risk.get("cost_model"):
+        risk_model_input = supplied_risk.get("cost_model")
+    if isinstance(supplied_risk, Mapping) and (
+            "minimum_cost_coverage" in supplied_risk):
+        risk_coverage = supplied_risk.get("minimum_cost_coverage")
+    try:
+        risk = _risk_unit_report(
+            [*fit, *heldout], vehicle=vehicle, costs=risk_model_input,
+            min_cost_coverage=risk_coverage, equity_feed=equity_feed,
+            equity_provider=equity_provider)
+    except (CostError, TypeError, ValueError, OverflowError):
+        risk = {"schema": "risk-unit-report.v1", "vehicle": vehicle,
+                "adequate": False, "observations": []}
     derived["risk_unit_adequate"] = bool(risk.get("adequate"))
     derived["fill_quality_adequate"] = _fill_quality_adequate(
         fit, heldout, vehicle=vehicle, lane=str(lane),
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
     try:
         stress = cost_stress_report(
             [*fit, *heldout], vehicle=vehicle, risk_report=risk,
-            equity_feed=equity_feed)
+            equity_feed=equity_feed, equity_provider=equity_provider)
     except (CostError, TypeError, ValueError, OverflowError):
         stress = {"schema": "cost-stress-report.v1", "vehicle": vehicle,
                   "stress_basis_schema": STRESSED_COST_SCHEMA,
@@ -2855,7 +3162,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     try:
         breadth = matched_effective_breadth(
             heldout, heldout_baseline, vehicle=vehicle,
-            equity_feed=equity_feed)
+            equity_feed=equity_feed, equity_provider=equity_provider)
     except (TypeError, ValueError, OverflowError):
         breadth = {
             "method": "symmetric_correlation_eigenvalue_participation_ratio",
@@ -2873,22 +3180,24 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     # session keys, so its counts cannot imply evidence that was never replayed.
     fit_null_projection = (authorization_projection(
         fit_null_raw, vehicle=vehicle, strict=strict_projection,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
         if fit_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
     heldout_null_projection = (authorization_projection(
         heldout_null_raw, vehicle=vehicle, strict=strict_projection,
-        equity_feed=equity_feed)
+        equity_feed=equity_feed, equity_provider=equity_provider)
         if heldout_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
     arm_diagnostics = {
         "fit": arm_evidence_report(
             candidate=fit_source_raw, baseline=fit_baseline_source_raw,
             null=fit_null_raw, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider,
             projections={"candidate": projections["fit"],
                          "baseline": projections["fit_baseline"],
                          "null": fit_null_projection}),
         "heldout": arm_evidence_report(
             candidate=heldout_source_raw, baseline=heldout_baseline_source_raw,
             null=heldout_null_raw, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider,
             projections={"candidate": projections["heldout"],
                          "baseline": projections["heldout_baseline"],
                          "null": heldout_null_projection}),
@@ -2896,15 +3205,18 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
             candidate=[*fit_source_raw, *heldout_source_raw],
             baseline=[*fit_baseline_source_raw, *heldout_baseline_source_raw],
             null=null_source_raw, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider,
             projections={
                 "candidate": authorization_projection(
                     [*fit_source_raw, *heldout_source_raw],
                     vehicle=vehicle, strict=strict_projection,
-                    equity_feed=equity_feed),
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider),
                 "baseline": authorization_projection(
                     [*fit_baseline_source_raw, *heldout_baseline_source_raw],
                     vehicle=vehicle, strict=strict_projection,
-                    equity_feed=equity_feed),
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider),
                 "null": projections["null"],
             }),
     }
@@ -2935,19 +3247,25 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         # SIP remains diagnostic-only and therefore cannot pass this boundary.
         (vehicle != "equity" or equity_feed in {"iex", "sip"}) and
         all(derived.get(key, False) for key in GATE_REQUIRED_CHECKS) and
-        all(derived.values())
+        all(derived.values()) and
+        (cost_model_binding is None or
+         cost_model_binding.get("valid") is True)
     )
     body: dict[str, Any] = {
         "schema": GATE_ENVELOPE_SCHEMA,
         "lane": str(lane),
         "vehicle": str(vehicle),
         "equity_feed": equity_feed,
+        "equity_provider": equity_provider,
         "counts": {
-            "fit": sample_counts(fit, vehicle=vehicle, equity_feed=equity_feed),
+            "fit": sample_counts(fit, vehicle=vehicle, equity_feed=equity_feed,
+                                  equity_provider=equity_provider),
             "heldout": sample_counts(
-                heldout, vehicle=vehicle, equity_feed=equity_feed),
+                heldout, vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider),
             "total": sample_counts(
-                [*fit, *heldout], vehicle=vehicle, equity_feed=equity_feed),
+                [*fit, *heldout], vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider),
         },
         # Source rows make critical conclusions independently recomputable
         # after persistence; callers must not ship a summary-only pass.
@@ -2956,15 +3274,19 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "fit_baseline_source": fit_baseline_source_raw,
         "heldout_baseline_source": heldout_baseline_source_raw,
         "null_source": null_source_raw,
+        **({"cost_model_binding": cost_model_binding}
+           if cost_model_binding is not None else {}),
         "floors": {"fit": dict(fit_floor), "heldout": dict(heldout_floor)},
         # What priced these fills, so a persisted proof states its own
         # evidence quality instead of leaving it unauditable.
         "fill_quality": {
             "fit": fill_source_summary(
-                fit_source_raw, vehicle=vehicle, equity_feed=equity_feed),
+                fit_source_raw, vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider),
             "heldout": fill_source_summary(
                 heldout_source_raw, vehicle=vehicle,
-                equity_feed=equity_feed),
+                equity_feed=equity_feed,
+                equity_provider=equity_provider),
         },
         "authorization_projection": {
             name: _projection_summary(value) for name, value in projections.items()
@@ -3007,6 +3329,7 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         required_checks = (LEGACY_GATE_REQUIRED_CHECKS_V2
                            if legacy_v2 else GATE_REQUIRED_CHECKS)
         has_equity_feed = "equity_feed" in envelope
+        has_equity_provider = "equity_provider" in envelope
         # Envelopes created before feed binding used SIP.  Rebuild those exact
         # historical semantics; never reinterpret an omitted field as IEX.
         equity_feed = str(
@@ -3015,6 +3338,15 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         if equity_feed == "delayed":
             equity_feed = "delayed_sip"
         if equity_feed not in {"iex", "sip", "delayed_sip"}:
+            return False
+        # Pre-provider envelopes deliberately retain their historical
+        # provider-agnostic semantics. Newly emitted envelopes bind the
+        # canonical provider and every row-level gate must use that identity.
+        try:
+            equity_provider = _canonical_equity_provider(
+                envelope.get("equity_provider") if has_equity_provider else None,
+                allow_none=not has_equity_provider)
+        except (TypeError, ValueError):
             return False
         qualification = envelope.get("qualification")
         if not isinstance(qualification, Mapping):
@@ -3086,11 +3418,16 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                           "seed"), int) else None),
                 block_length=int(((qualification.get("delta_bootstrap") or {}).get(
                     "block_length", SERIAL_BLOCK_LENGTH))),
-                equity_feed=equity_feed)
+                equity_feed=equity_feed,
+                equity_provider=equity_provider)
             if not has_equity_feed:
                 for projection in (expected.get("authorization_projection") or {}).values():
                     if isinstance(projection, dict):
                         projection.pop("equity_feed", None)
+            if not has_equity_provider:
+                for projection in (expected.get("authorization_projection") or {}).values():
+                    if isinstance(projection, dict):
+                        projection.pop("equity_provider", None)
             for key in ("sessions", "net_pnl", "trades", "matched", "mean_delta",
                         "control_adequacy", "r_matched", "mean_r_delta",
                         "net_positive", "delta_positive", "clusters", "minimums",
@@ -3156,6 +3493,41 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     *null_source])):
             return False
         vehicle = str(envelope.get("vehicle") or "")
+        # A measured row is only auditable when its exact model contract is
+        # persisted alongside the source arms.  Re-signing a row and its
+        # algebraic economics claim must not manufacture schedule authority.
+        measured_binding = envelope.get("cost_model_binding")
+        measured_authority = (
+            measured_binding.get("authority")
+            if isinstance(measured_binding, Mapping) else None)
+        expected_binding = _cost_model_binding_report(
+            {"fit": sources_fit, "heldout": sources_held,
+             "fit_baseline": baseline_fit,
+             "heldout_baseline": baseline_held,
+             "null": null_source},
+            vehicle=vehicle, authority=measured_authority)
+        if expected_binding is None:
+            if measured_binding is not None:
+                return False
+        elif (measured_binding != expected_binding or
+              measured_binding.get("valid") is not True):
+            return False
+        if expected_binding is not None:
+            authority = expected_binding.get("authority")
+            if (not isinstance(authority, Mapping) or
+                    authority.get("enabled") is not True):
+                return False
+            schedule_hash = authority.get("schedule_hash")
+            if (not isinstance(schedule_hash, str) or len(schedule_hash) != 64 or
+                    any(char not in "0123456789abcdef" for char in schedule_hash)):
+                return False
+            for item in expected_binding.get("rows", ()):
+                binding = item.get("binding") if isinstance(item, Mapping) else None
+                if (not isinstance(binding, Mapping) or
+                        binding.get("schedule_hash_prefix") != schedule_hash[:12] or
+                        binding.get("feed") != authority.get("feed") or
+                        binding.get("provider") != authority.get("provider")):
+                    return False
         if (has_equity_feed and envelope.get("passes") and
                 vehicle == "equity" and equity_feed not in {"iex", "sip"}):
             return False
@@ -3168,23 +3540,27 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         source_projections = {
             "fit": authorization_projection(sources_fit, vehicle=vehicle,
                                              strict=projection_strict,
-                                             equity_feed=equity_feed),
+                                             equity_feed=equity_feed,
+                                             equity_provider=equity_provider),
             "heldout": authorization_projection(sources_held, vehicle=vehicle,
                                                  strict=projection_strict,
-                                                 equity_feed=equity_feed),
+                                                 equity_feed=equity_feed,
+                                                 equity_provider=equity_provider),
             "fit_baseline": authorization_projection(
                 baseline_fit, vehicle=vehicle, strict=projection_strict,
-                equity_feed=equity_feed),
+                equity_feed=equity_feed, equity_provider=equity_provider),
             "heldout_baseline": authorization_projection(
                 baseline_held, vehicle=vehicle, strict=projection_strict,
-                equity_feed=equity_feed),
+                equity_feed=equity_feed, equity_provider=equity_provider),
             "null": authorization_projection(null_source, vehicle=vehicle,
                                               strict=projection_strict,
-                                              equity_feed=equity_feed),
+                                              equity_feed=equity_feed,
+                                              equity_provider=equity_provider),
         }
         if projection_payload != {
                 name: _projection_summary(
-                    value, include_equity_feed=has_equity_feed)
+                    value, include_equity_feed=has_equity_feed,
+                    include_equity_provider=has_equity_provider)
                 for name, value in source_projections.items()}:
             return False
         sources_fit_eligible = source_projections["fit"]["eligible"]
@@ -3194,13 +3570,15 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         null_eligible = source_projections["null"]["eligible"]
         expected_counts = {
             "fit": sample_counts(
-                sources_fit_eligible, vehicle=vehicle, equity_feed=equity_feed),
+                sources_fit_eligible, vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider),
             "heldout": sample_counts(
                 sources_held_eligible, vehicle=vehicle,
-                equity_feed=equity_feed),
+                equity_feed=equity_feed, equity_provider=equity_provider),
             "total": sample_counts(
                 [*sources_fit_eligible, *sources_held_eligible],
-                vehicle=vehicle, equity_feed=equity_feed),
+                vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider),
         }
         if envelope.get("counts") != expected_counts:
             return False
@@ -3234,13 +3612,15 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     min_sessions=int(minimums.get("sessions")),
                     min_clusters=int(minimums.get("clusters")),
                     required=bool(report.get("required", True)),
-                    equity_feed=equity_feed)
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 recomputed_feasibility = floor_feasibility(
                     source_projections[name]["eligible"], vehicle=vehicle,
                     min_trades=int(minimums.get("trades")),
                     min_sessions=int(minimums.get("sessions")),
                     min_clusters=int(minimums.get("clusters")),
-                    equity_feed=equity_feed)
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider)
             except (TypeError, ValueError, OverflowError):
                 return False
             # A floor is source-derived even when it is underpowered or
@@ -3266,7 +3646,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 [*sources_fit_eligible, *sources_held_eligible], vehicle=vehicle,
                 costs=report_model,
                 min_cost_coverage=float(risk.get("minimum_cost_coverage", 1.0)),
-                equity_feed=equity_feed)
+                equity_feed=equity_feed,
+                equity_provider=equity_provider)
         except (CostError, TypeError, ValueError, OverflowError):
             return False
         risk_keys = ["vehicle", "rows", "adequate_rows", "total_risk_usd",
@@ -3276,15 +3657,25 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     "failed_opportunities", "observations", "adequate"]
         if has_equity_feed:
             risk_keys.append("equity_feed")
+        if has_equity_provider:
+            risk_keys.append("equity_provider")
         for key in risk_keys:
             if rebuilt_risk.get(key) != risk.get(key):
                 return False
         expected_fill_quality = {
             "fit": fill_source_summary(
-                sources_fit, vehicle=vehicle, equity_feed=equity_feed),
+                sources_fit, vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider),
             "heldout": fill_source_summary(
-                sources_held, vehicle=vehicle, equity_feed=equity_feed),
+                sources_held, vehicle=vehicle, equity_feed=equity_feed,
+                equity_provider=equity_provider),
         }
+        if not has_equity_provider:
+            expected_fill_quality = {
+                name: {key: value for key, value in summary.items()
+                       if key != "equity_provider"}
+                for name, summary in expected_fill_quality.items()
+            }
         if envelope.get("fill_quality") != expected_fill_quality:
             return False
         if "arm_diagnostics" in envelope:
@@ -3301,36 +3692,43 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     candidate=sources_fit, baseline=baseline_fit,
                     null=raw_null_fit, vehicle=vehicle,
                     equity_feed=equity_feed,
+                    equity_provider=equity_provider,
                     projections={"candidate": source_projections["fit"],
                                  "baseline": source_projections["fit_baseline"],
                                      "null": authorization_projection(
                                      raw_null_fit, vehicle=vehicle,
                                      strict=projection_strict,
-                                     equity_feed=equity_feed)}),
+                                     equity_feed=equity_feed,
+                                     equity_provider=equity_provider)}),
                 "heldout": arm_evidence_report(
                     candidate=sources_held, baseline=baseline_held,
                     null=raw_null_heldout, vehicle=vehicle,
                     equity_feed=equity_feed,
+                    equity_provider=equity_provider,
                     projections={"candidate": source_projections["heldout"],
                                  "baseline": source_projections["heldout_baseline"],
                                      "null": authorization_projection(
                                      raw_null_heldout, vehicle=vehicle,
                                      strict=projection_strict,
-                                     equity_feed=equity_feed)}),
+                                     equity_feed=equity_feed,
+                                     equity_provider=equity_provider)}),
                 "all": arm_evidence_report(
                     candidate=[*sources_fit, *sources_held],
                     baseline=[*baseline_fit, *baseline_held],
                     null=null_source, vehicle=vehicle,
                     equity_feed=equity_feed,
+                    equity_provider=equity_provider,
                     projections={
                         "candidate": authorization_projection(
                             [*sources_fit, *sources_held],
                             vehicle=vehicle, strict=projection_strict,
-                            equity_feed=equity_feed),
+                            equity_feed=equity_feed,
+                            equity_provider=equity_provider),
                         "baseline": authorization_projection(
                             [*baseline_fit, *baseline_held],
                             vehicle=vehicle, strict=projection_strict,
-                            equity_feed=equity_feed),
+                            equity_feed=equity_feed,
+                            equity_provider=equity_provider),
                         "null": source_projections["null"],
                     }),
             }
@@ -3338,19 +3736,21 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 return False
         expected_stress = cost_stress_report(
             [*sources_fit_eligible, *sources_held_eligible], vehicle=vehicle,
-            risk_report=risk, equity_feed=equity_feed)
+            risk_report=risk, equity_feed=equity_feed,
+            equity_provider=equity_provider)
         if envelope.get("cost_stress") != expected_stress:
             return False
         expected_breadth = matched_effective_breadth(
             sources_held_eligible, baseline_held_eligible, vehicle=vehicle,
-            equity_feed=equity_feed)
+            equity_feed=equity_feed, equity_provider=equity_provider)
         if envelope.get("effective_breadth") != expected_breadth:
             return False
         performance = envelope.get("performance")
         if isinstance(performance, Mapping):
             expected_performance = performance_floor(
                 sources_held_eligible, vehicle=vehicle,
-                equity_feed=equity_feed)
+                equity_feed=equity_feed,
+                equity_provider=equity_provider)
             for key in ("heldout_net_pnl", "heldout_expectancy"):
                 if key in performance:
                     source_key = key.removeprefix("heldout_")
@@ -3362,7 +3762,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     sources_held_eligible, baseline_held_eligible,
                     vehicle=vehicle, iterations=int(
                         (envelope.get("control") or {}).get("resamples") or 20_000),
-                    equity_feed=equity_feed)
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 if not _close_number(expected_effect.get("mean_r_delta"),
                                      performance.get("heldout_r_delta")):
                     return False
@@ -3373,7 +3774,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     sources_held_eligible, baseline_held_eligible,
                     vehicle=vehicle, iterations=int(
                         (envelope.get("control") or {}).get("resamples") or 20_000),
-                    equity_feed=equity_feed)
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 if not _close_number(expected_delta.get("mean_delta"),
                                      performance.get("heldout_delta")):
                     return False
@@ -3409,7 +3811,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                           else None),
                     block_length=int(retirement_bootstrap.get(
                         "block_length", SERIAL_BLOCK_LENGTH)),
-                    equity_feed=equity_feed)
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 walk = envelope.get("walk_forward") or {}
                 negative_folds = [item for item in walk.get("results", ())
                                   if item.get("adequate") and
@@ -3544,7 +3947,11 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 provenance=envelope.get("provenance") or {},
                 candidate_id=envelope.get("candidate_id"),
                 risk_unit_report=risk,
+                measured_costs=(
+                    {"costs": {"measured_quote": dict(measured_authority)}}
+                    if isinstance(measured_authority, Mapping) else None),
                 equity_feed=equity_feed,
+                equity_provider=equity_provider,
             )
             rebuilt_checks = dict(rebuilt.get("checks") or {})
             rebuilt_passes = rebuilt.get("passes")
@@ -3566,7 +3973,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                         "minimum_matched", NULL_CONTROL_MIN_MATCHED)),
                     min_coverage=float(legacy_null.get(
                         "minimum_coverage", NULL_CONTROL_MIN_COVERAGE)),
-                    equity_feed=equity_feed)
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 rebuilt_checks["null_control_available"] = bool(
                     legacy_null.get("available",
                                     legacy_null.get("actual_control", False)) and
@@ -3659,7 +4067,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 min_coverage=max(ACTUAL_CONTROL_MIN_COVERAGE, float(
                     control_adequacy.get(
                         "minimum_coverage", ACTUAL_CONTROL_MIN_COVERAGE))),
-                equity_feed=equity_feed)
+                equity_feed=equity_feed,
+                equity_provider=equity_provider)
             if not _compare_statistical_report(expected_control, control):
                 return False
         fit_control = envelope.get("fit_control") or {}
@@ -3684,7 +4093,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 min_coverage=max(ACTUAL_CONTROL_MIN_COVERAGE, float(
                     fit_adequacy.get(
                         "minimum_coverage", ACTUAL_CONTROL_MIN_COVERAGE))),
-                equity_feed=equity_feed)
+                equity_feed=equity_feed,
+                equity_provider=equity_provider)
             if not _compare_statistical_report(expected_fit_control,
                                                fit_control):
                 return False
@@ -3698,7 +4108,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 # no-trade denominator and compare it when present.
                 expected_null = matched_cluster_test(
                     sources_held_eligible, null_eligible, vehicle=vehicle,
-                    iterations=null_iterations, equity_feed=equity_feed)
+                    iterations=null_iterations, equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 persisted_adequacy = null_control.get("paired_adequacy")
                 if isinstance(persisted_adequacy, Mapping):
                     min_matched = int(persisted_adequacy.get(
@@ -3712,7 +4123,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                             sources_held, null_source, vehicle=vehicle,
                             min_matched=min_matched,
                             min_coverage=min_coverage,
-                            equity_feed=equity_feed))
+                            equity_feed=equity_feed,
+                            equity_provider=equity_provider))
             else:
                 expected_null = matched_cluster_test(
                     sources_held_eligible, null_eligible, vehicle=vehicle,
@@ -3722,7 +4134,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     min_coverage=max(NULL_CONTROL_MIN_COVERAGE, float(
                         null_control.get(
                             "minimum_coverage", NULL_CONTROL_MIN_COVERAGE))),
-                    equity_feed=equity_feed)
+                    equity_feed=equity_feed,
+                    equity_provider=equity_provider)
             # ``null_control.available`` is the authorizing availability
             # (paired adequacy applied), while the descriptive matched test's
             # ``available`` only means at least one pair.  Compare the latter
@@ -3756,7 +4169,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             placebo = placebo_null_distribution(
                 sources_held_eligible, baseline_held_eligible,
                 vehicle=vehicle, draws=draws,
-                equity_feed=equity_feed)
+                equity_feed=equity_feed,
+                equity_provider=equity_provider)
             independent_mode = bool(
                 falsification.get("independent_supplied") is True or
                 falsification.get("p_value_source") ==
@@ -3770,7 +4184,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 independent_placebo = placebo_null_distribution(
                     sources_held_eligible, baseline_held_eligible,
                     vehicle=vehicle, draws=independent_draws,
-                    seed=independent_seed, equity_feed=equity_feed)
+                    seed=independent_seed, equity_feed=equity_feed,
+                    equity_provider=equity_provider)
                 if (independent_placebo["assignments_hash"] ==
                         placebo["assignments_hash"]):
                     return False
@@ -3838,7 +4253,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 requested_min_sessions=int(walk.get(
                     "requested_min_sessions", walk.get(
                         "effective_min_sessions", 1))),
-                equity_feed=equity_feed)
+                equity_feed=equity_feed,
+                equity_provider=equity_provider)
             for key in ("available", "adequate", "majority_positive",
                         "tested_folds", "adequate_folds", "positive_folds"):
                 if expected_walk.get(key) != walk.get(key):

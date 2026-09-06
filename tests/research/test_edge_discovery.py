@@ -839,7 +839,8 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
         gate = edge_discovery_core._discover_gate(
             candidate, baseline, vehicle="equity", min_trades=1,
             min_sessions=1, alpha=.05, test_iterations=10,
-            null_rows=baseline, shadow=True)
+            null_rows=baseline, shadow=True,
+            equity_provider="fixture")
         adequacy = gate["heldout_paired_baseline"]["paired_adequacy"]
         self.assertEqual(adequacy["matched"], 5)
         self.assertLess(adequacy["coverage"], .8)
@@ -885,7 +886,7 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
             gate = edge_discovery_core._discover_gate(
                 candidate, baseline, vehicle="equity", min_trades=1,
                 min_sessions=1, alpha=1.0, test_iterations=100,
-                null_rows=null)
+                null_rows=null, equity_provider="fixture")
             all_arms = gate["arm_diagnostics"]["all"]["arms"]
             self.assertEqual(
                 all_arms["candidate"]["counts"]["eligible"], 288)

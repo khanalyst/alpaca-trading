@@ -135,7 +135,7 @@ class LiveShadowTests(unittest.TestCase):
                 "timestamp": stamp.isoformat(),
                 "as_of": (stamp + timedelta(minutes=1)).isoformat(),
                 "observed_at": (stamp + timedelta(minutes=2)).isoformat(),
-                "provider": "recorded", "feed": "iex", "open": "100",
+                "provider": "alpaca", "feed": "iex", "open": "100",
                 "high": "103", "low": "99", "close": str(100 + i),
                 "volume": "1000", "bid": "", "ask": "",
             })
@@ -146,7 +146,7 @@ class LiveShadowTests(unittest.TestCase):
                 "event_type": "quote", "symbol": "SPY",
                 "timestamp": stamp.isoformat(), "as_of": stamp.isoformat(),
                 "observed_at": (stamp + timedelta(minutes=1)).isoformat(),
-                "provider": "recorded", "feed": "iex", "open": "",
+                "provider": "alpaca", "feed": "iex", "open": "",
                 "high": "", "low": "", "close": "", "volume": "",
                 "bid": "99.9", "ask": "100.1",
             })
@@ -169,7 +169,7 @@ class LiveShadowTests(unittest.TestCase):
                 "timestamp": stamp.isoformat(),
                 "as_of": (stamp + timedelta(minutes=1)).isoformat(),
                 "observed_at": (stamp + timedelta(minutes=2)).isoformat(),
-                "provider": "recorded", "feed": "iex", "open": "100",
+                "provider": "alpaca", "feed": "iex", "open": "100",
                 "high": "103", "low": "99", "close": "100",
                 "volume": "1000", "bid": "", "ask": "",
             })
@@ -579,7 +579,7 @@ class LiveShadowTests(unittest.TestCase):
             "event_key": _event_key("bar_1m", "SPY", timestamp),
             "event_type": "bar_1m", "symbol": "SPY", "timestamp": timestamp,
             "as_of": as_of, "observed_at": "2026-01-02T21:01:00+00:00",
-            "provider": "recorded", "feed": "iex", "open": "100",
+            "provider": "alpaca", "feed": "iex", "open": "100",
             "high": "103", "low": "99", "close": "100", "volume": "1000",
         }
 
@@ -598,11 +598,12 @@ class LiveShadowTests(unittest.TestCase):
                   "risk_usd": risk_usd, "notional": notional})
 
     def _evaluate_with_context(self, runner, candidate, symbol="QQQ", *,
-                               equity_feed="iex"):
+                               equity_feed="iex", equity_provider="alpaca"):
         event = self._replay_row(
             timestamp="2026-01-02T16:00:00+00:00",
             as_of="2026-01-02T16:01:00+00:00")
         event["feed"] = equity_feed
+        event["provider"] = equity_provider
         event["observed_at"] = "2026-01-02T16:01:00+00:00"
         event["symbol"] = symbol
         event["event_key"] = _event_key("bar_1m", symbol, event["timestamp"])
@@ -614,7 +615,7 @@ class LiveShadowTests(unittest.TestCase):
         quote = {"symbol": symbol, "timestamp": event["observed_at"],
                  "as_of": event["observed_at"],
                  "observed_at": event["observed_at"],
-                 "provider": "recorded", "feed": equity_feed,
+                 "provider": equity_provider, "feed": equity_feed,
                  "bid": "99.9", "ask": "100.1"}
         signal_ts = datetime.fromisoformat(event["timestamp"]).timestamp()
         signal = {"symbol": symbol, "direction": "long",
@@ -641,6 +642,13 @@ class LiveShadowTests(unittest.TestCase):
         self.assertEqual(payload["equity_feed"], "iex")
         self.assertEqual(payload["observed_equity_feed"], "sip")
 
+        kind, reason, payload, plan = self._evaluate_with_context(
+            runner, candidate, equity_provider="foreign")
+        self.assertEqual((kind, reason, plan),
+                         ("no_data", "equity provider mismatch", None))
+        self.assertEqual(payload["equity_provider"], "alpaca")
+        self.assertEqual(payload["observed_equity_provider"], "foreign")
+
         sip_row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
         sip_row["feed"] = "sip"
         with patch("research.live_shadow.replay_ibr",
@@ -654,6 +662,20 @@ class LiveShadowTests(unittest.TestCase):
                          "sip")
         self.assertEqual(runner.store.gate_rows(candidate["candidate_id"]), [])
         self.assertEqual(runner.store.replay_accounts(candidate["candidate_id"]), [])
+
+        foreign_row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
+        foreign_row["provider"] = "foreign"
+        with patch("research.live_shadow.replay_ibr",
+                   return_value=SimpleNamespace(trades=[], refusals=[])) as replay:
+            runner._replay(candidate, "2026-01-02", [foreign_row], [], [])
+            replay.assert_not_called()
+        rejected = runner.store.replay_metadata(candidate["candidate_id"])[0]
+        self.assertEqual(rejected["status"], "incomplete")
+        self.assertEqual(rejected["details"]["equity_provider"], "alpaca")
+        self.assertEqual(
+            rejected["details"]["provider_mismatches"][0]["observed_provider"],
+            "foreign")
+        self.assertEqual(rejected["details"]["provider_mismatch_count"], 1)
 
         iex_row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
         with patch("research.live_shadow.replay_ibr",
@@ -870,7 +892,7 @@ class LiveShadowTests(unittest.TestCase):
         self.assertTrue(json.loads(rows[0][1])["complete"])
 
     def test_semantic_signature_can_match_and_reports_field_mismatch(self):
-        payload = {"equity_feed": "iex",
+        payload = {"equity_feed": "iex", "equity_provider": "ALPACA",
                    "signal": {"direction": "long", "setup_type": "rule_opening_range_breakout",
                                "signal_ts": 1767369600.0,
                                "decision_timestamp": "2026-01-02T16:00:00+00:00",
@@ -890,14 +912,41 @@ class LiveShadowTests(unittest.TestCase):
                                     "stop_price": 99, "target_price": 102,
                                     "stop_distance": 1}, vehicle="equity", strategy_id="rule",
                                    target_r=2, setup_type="rule_opening_range_breakout",
-                                   equity_feed="iex")
+                                   equity_feed="iex", equity_provider="alpaca")
         self.assertEqual(_signature_diffs([runtime], [replay]), [])
+        self.assertEqual(runtime["equity_provider"], "alpaca")
+        self.assertEqual(replay["equity_provider"], "alpaca")
         mismatch = {**replay, "target_price": 103}
         differences = _signature_diffs([runtime], [mismatch])
         self.assertEqual([item["field"] for item in differences], ["target_price"])
         feed_mismatch = {**replay, "equity_feed": "sip"}
         differences = _signature_diffs([runtime], [feed_mismatch])
         self.assertEqual([item["field"] for item in differences], ["equity_feed"])
+        provider_mismatch = {**replay, "equity_provider": "foreign"}
+        differences = _signature_diffs([runtime], [provider_mismatch])
+        self.assertEqual([item["field"] for item in differences], ["equity_provider"])
+
+        # Legacy projections omitted provider identity.  Keep that explicit
+        # compatibility path readable while all current replay call sites
+        # bind the policy provider above.
+        legacy_payload = {key: value for key, value in payload.items()
+                          if key != "equity_provider"}
+        legacy_runtime = _shadow_signature({
+            "kind": "open_incomplete", "symbol": "SPY",
+            "session_date": "2026-01-02",
+            "payload_json": json.dumps(legacy_payload),
+        })
+        legacy_replay = _replay_signature(
+            {"symbol": "SPY", "session_date": "2026-01-02",
+             "direction": "long", "signal_timestamp": "2026-01-02T16:00:00+00:00",
+             "decision_timestamp": "2026-01-02T16:00:00+00:00",
+             "entry_timestamp": "2026-01-02T16:01:00+00:00",
+             "stop_price": 99, "target_price": 102, "stop_distance": 1},
+            vehicle="equity", strategy_id="rule", target_r=2,
+            setup_type="rule_opening_range_breakout", equity_feed="iex")
+        self.assertIsNone(legacy_runtime["equity_provider"])
+        self.assertIsNone(legacy_replay["equity_provider"])
+        self.assertEqual(_signature_diffs([legacy_runtime], [legacy_replay]), [])
         self.assertNotIn("benchmark_symbol", runtime)
 
     def test_cross_sectional_context_is_bound_in_signatures(self):
@@ -980,7 +1029,7 @@ class LiveShadowTests(unittest.TestCase):
         signal_ts = datetime(2026, 1, 2, 16, 0, tzinfo=timezone.utc).timestamp()
 
         def payload():
-            return {"equity_feed": "iex",
+            return {"equity_feed": "iex", "equity_provider": "alpaca",
                     "signal": {"direction": "long", "setup_type": "ibr_breakout",
                                 "signal_ts": signal_ts},
                     "setup_plan": {"direction": "long", "setup_type": "ibr_breakout",
