@@ -16,7 +16,7 @@ from .contracts.risk_geometry import (
     quantize_equity_bracket,
 )
 from .contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V3,
-                             RULE_SCHEMA_V4)
+                             RULE_SCHEMA_V4, RULE_SCHEMA_V5)
 from research.costs import (CostError, STRESSED_COST_BASIS,
                             STRESSED_COST_SCHEMA, ReplayPolicy,
                             stressed_cost_ratio_exceeds, stressed_cost_usd)
@@ -667,12 +667,10 @@ class RiskEngine:
             "profile", strategy_cfg.get("execution_profile", "shares")))).lower()
         if (profile in {"options", "option", "defined_risk_options",
                         "options_defined_risk"} and
-                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}):
-            return None, "rule-strategy.v4 is not executable for options" if \
-                str(decision.get("rule_schema") or "") == RULE_SCHEMA_V4 else \
-                "rule-strategy.v3 is not executable for options"
+                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}):
+            return None, f"{decision['rule_schema']} is not executable for options"
         rule_signal_ts = None
-        if str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+        if str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
             rule_signal_ts = _num(decision.get("signal_ts"))
             if rule_signal_ts is None or rule_signal_ts < 0:
                 schema_name = str(decision.get("rule_schema") or "")
@@ -820,9 +818,11 @@ class RiskEngine:
                 # start from the same next bar used by research replay.
                 "signal_ts": rule_signal_ts,
             })
-        elif str(decision.get("rule_schema") or "") == RULE_SCHEMA_V4:
+        elif str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
             plan.update({
-                "rule_schema": RULE_SCHEMA_V4,
+                "rule_schema": str(decision["rule_schema"]),
+                **({"intraday_context": decision["intraday_context"]}
+                   if decision.get("intraday_context") is not None else {}),
                 "breakeven_r": decision.get("breakeven_r"),
                 "target_mode": decision.get("target_mode", "fixed_r"),
                 "target_reference": decision.get("target_reference"),

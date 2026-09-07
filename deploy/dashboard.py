@@ -7,6 +7,7 @@ import argparse
 from contextlib import closing
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import sqlite3
@@ -38,7 +39,10 @@ SAFE_STATE_FIELDS = (
     "equity_basis", "transfer_reconciliation_required",
 )
 SAFE_TRADE_FIELDS = (
-    "symbol", "direction", "qty", "entry_price", "opened_at", "setup_type",
+    "symbol", "direction", "position_side", "qty", "entry_price", "current_price",
+    "opened_at", "setup_type", "variant_id", "underlying_symbol", "vehicle",
+    "execution_profile", "stop_price", "target_price", "active_stop_price",
+    "hold_deadline_ts", "intraday_context",
     "strategy_id", "strategy_version", "stop_loss_pct", "take_profit_pct",
     "intended_risk_usd", "delivered_risk_usd", "risk_delivery_ratio",
     "risk_shortfall_usd", "configured_risk_budget_usd", "planned_risk_usd",
@@ -89,6 +93,49 @@ def _safe_state(path: Path) -> dict:
     else:
         result["active_trades"] = []
     return result
+
+
+def _portfolio_exposure(trades: Sequence[dict]) -> dict:
+    """Describe recorded position dollars without inventing independent bets.
+
+    These coarse symbol buckets are labels, not measured betas or risk gates.
+    Options cannot be converted to equity exposure without a delta snapshot.
+    """
+    equity_etfs = {"SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV",
+                   "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO", "VB", "SMH"}
+    groups = {}
+    unknown = 0
+    for trade in trades:
+        symbol = str(trade.get("underlying_symbol") or trade.get("symbol") or "").upper()
+        if str(trade.get("vehicle") or "").lower() == "option" or str(trade.get("execution_profile") or "").lower() in {"option", "options"}:
+            unknown += 1
+            continue
+        group = ("US equity ETFs" if symbol in equity_etfs else
+                 "Treasury ETFs" if symbol in {"TLT", "IEF", "SHY"} else
+                 "Precious metals ETFs" if symbol in {"GLD", "SLV", "IAU"} else
+                 "Other / unclassified")
+        try:
+            price = float(trade.get("current_price") or trade.get("entry_price"))
+            qty = abs(float(trade.get("qty")))
+        except (TypeError, ValueError, OverflowError):
+            unknown += 1
+            continue
+        if not math.isfinite(price * qty) or price <= 0 or qty <= 0:
+            unknown += 1
+            continue
+        direction = str(trade.get("position_side") or trade.get("direction") or "").lower()
+        if direction not in {"long", "short"}:
+            unknown += 1
+            continue
+        dollars = price * qty
+        item = groups.setdefault(group, {"group": group, "gross_usd": 0.0,
+                                        "net_usd": 0.0, "positions": 0})
+        item["gross_usd"] += dollars
+        item["net_usd"] += dollars if direction == "long" else -dollars
+        item["positions"] += 1
+    return {"groups": list(groups.values()), "unpriced_or_unmapped_positions": unknown,
+            "basis": "recorded_price_notional", "pending_orders_included": False,
+            "beta_adjusted": False, "independent_bets_estimated": False}
 
 
 def _ro_connect(path: Path) -> sqlite3.Connection:
@@ -148,6 +195,121 @@ def _performance(path: Path) -> dict:
         return {"available": False, "reason": type(exc).__name__}
 
 
+def _charts(path: Path, mode: str = "paper") -> dict:
+    """Return small chart-ready series from one runtime journal.
+
+    The dashboard never reconstructs equity or costs. Account equity comes from
+    the account equity samples, payoff values come from completed parent closes
+    with known net P&L, and uncertainty uses the existing session-cluster
+    moving-block bootstrap only when positive risk denominators are present.
+    """
+    source = str(mode or "paper").strip().lower()
+    empty = {
+        "available": False, "source": source,
+        "net_equity": {"available": False, "points": []},
+        "drawdown": {"available": False, "points": []},
+        "payoff": {"available": False, "values": [], "sample_count": 0},
+        "uncertainty": {"available": False, "sample_count": 0,
+                        "session_count": 0, "mean_net_r": None,
+                        "lower_net_r": None, "upper_net_r": None},
+    }
+    if not path.is_file():
+        empty["reason"] = "journal not created"
+        return empty
+    try:
+        from datetime import datetime, timezone
+        import report
+        with closing(_ro_connect(path)) as connection:
+            tables = _tables(connection)
+            if "equity" not in tables:
+                equity_rows = []
+            else:
+                equity_columns = {str(row[1]) for row in
+                                  connection.execute("PRAGMA table_info(equity)")}
+                equity_mode = ("runtime_mode" if "runtime_mode" in equity_columns
+                               else None)
+                selected_mode = f", {equity_mode}" if equity_mode else ""
+                equity_rows = connection.execute(
+                    f"SELECT ts,equity{selected_mode} FROM equity ORDER BY ts,rowid"
+                ).fetchall()
+            events = _trades(connection, limit=None) if "trades" in tables else []
+        points = []
+        for row in equity_rows:
+            if equity_mode and row["runtime_mode"] not in (None, "", source):
+                continue
+            try:
+                value = float(row["equity"])
+                timestamp = float(row["ts"])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not (value == value and abs(value) != float("inf") and
+                    timestamp == timestamp and abs(timestamp) != float("inf")):
+                continue
+            points.append({"ts": timestamp, "value": value})
+        drawdown = []
+        high_water = None
+        for point in points:
+            high_water = point["value"] if high_water is None else max(
+                high_water, point["value"])
+            drawdown.append({"ts": point["ts"],
+                             "value": point["value"] - high_water})
+        events = [event for event in events if str(event.get("runtime_mode") or source) == source]
+        parents = sorted(report.closed_parent_trades(events),
+                         key=lambda parent: float(parent.get("last_ts") or 0))
+        net_values = [float(parent["net"]) for parent in parents
+                      if parent.get("net") is not None]
+        r_values, clusters = [], []
+        from zoneinfo import ZoneInfo
+        for parent in parents:
+            if parent.get("r_multiple") is None or parent.get("last_ts") is None:
+                continue
+            try:
+                session = datetime.fromtimestamp(float(parent["last_ts"]), ZoneInfo("America/New_York")).date().isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+            r_values.append(float(parent["r_multiple"]))
+            clusters.append(session)
+        payoff = {
+            "available": bool(net_values), "values": net_values,
+            "sample_count": len(net_values),
+            "wins": sum(value > 0 for value in net_values),
+            "losses": sum(value < 0 for value in net_values),
+            "zeroes": sum(value == 0 for value in net_values),
+            "basis": "net_pnl" if net_values else None,
+        }
+        uncertainty = {**empty["uncertainty"],
+                       "sample_count": len(r_values),
+                       "session_count": len(set(clusters)),
+                       "mean_net_r": (sum(r_values) / len(r_values)
+                                      if r_values else None)}
+        if len(r_values) >= 2 and len(set(clusters)) >= 2:
+            try:
+                from research.stats import moving_block_cluster_bootstrap_lower_bound
+                cluster_count = len(set(clusters))
+                bound = moving_block_cluster_bootstrap_lower_bound(
+                    r_values, clusters, confidence=.95, draws=1000,
+                    block_length=min(5, cluster_count - 1), min_clusters=2)
+                uncertainty.update({
+                    "available": bool(bound.get("available")),
+                    "lower_net_r": bound.get("lower_bound"),
+                    "upper_net_r": bound.get("upper_bound"),
+                    "method": bound.get("method"),
+                    "confidence": bound.get("confidence"),
+                    "clusters": bound.get("clusters"),
+                })
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return {
+            "available": bool(points or net_values), "source": source,
+            "net_equity": {"available": bool(points), "points": points,
+                           "basis": "observed_account_equity", "cash_flows_adjusted": False},
+            "drawdown": {"available": bool(drawdown), "points": drawdown},
+            "payoff": payoff, "uncertainty": uncertainty,
+        }
+    except (OSError, sqlite3.Error, ValueError, KeyError):
+        return {**empty, "reason": "journal unreadable"}
+
+
 # Mirrors research.edge_ledger.PAPER_DEMOTION_* for compatibility. The dashboard
 # deliberately does not import the research package, so the advisory rolling
 # thresholds it displays are restated here and pinned to the ledger constants by
@@ -176,12 +338,16 @@ def _live_paper(connection: sqlite3.Connection) -> list[dict]:
             "candidate_id": str(row["candidate_id"]),
             "variant_id": row["variant_id"], "strategy_id": row["strategy_id"],
             "vehicle": row["vehicle"], "status": row["status"],
-            "outcomes": 0, "net_pnl": 0.0, "_r": [], "_sessions": set()})
+            "outcomes": 0, "net_pnl": 0.0, "_net_known": True,
+            "_r": [], "_sessions": set()})
         item["outcomes"] += 1
         try:
-            item["net_pnl"] += float(row["net_pnl"])
-        except (TypeError, ValueError):
-            pass
+            value = float(row["net_pnl"])
+            if not (value == value and abs(value) != float("inf")):
+                raise ValueError
+            item["net_pnl"] += value
+        except (TypeError, ValueError, OverflowError):
+            item["_net_known"] = False
         if row["session_date"]:
             item["_sessions"].add(str(row["session_date"]))
         try:
@@ -195,13 +361,15 @@ def _live_paper(connection: sqlite3.Connection) -> list[dict]:
     for item in grouped.values():
         r_values = item.pop("_r")
         sessions = item.pop("_sessions")
+        net_known = bool(item.pop("_net_known"))
         recent = r_values[-PAPER_ROLLING_WINDOW:]
         wins = [value for value in r_values if value > 0]
         report.append({
             **item,
             "sessions": len(sessions),
             "last_session": max(sessions) if sessions else None,
-            "net_pnl": round(item["net_pnl"], 2),
+            "net_pnl": round(item["net_pnl"], 2) if net_known else None,
+            "net_pnl_available": net_known,
             "total_r": round(sum(r_values), 4) if r_values else None,
             "mean_r": round(sum(r_values) / len(r_values), 4) if r_values else None,
             "win_rate": round(len(wins) / len(r_values), 4) if r_values else None,
@@ -335,7 +503,8 @@ def _edge_status(path: Path) -> dict:
                 "proved_edges": [], "live_paper": []}
 
 
-def _trades(connection: sqlite3.Connection, limit: int = 200) -> list[dict]:
+def _trades(connection: sqlite3.Connection, limit: int | None = 200,
+            offset: int = 0) -> list[dict]:
     """Every recorded fill, and which edge decided to place it.
 
     The journal already stamped ``strategy_id``/``variant_id`` on every row;
@@ -352,9 +521,23 @@ def _trades(connection: sqlite3.Connection, limit: int = 200) -> list[dict]:
     def field(name: str) -> str:
         return name if name in columns else f"NULL AS {name}"
 
+    order_id = "id" if "id" in columns else "rowid"
+    limit_clause = "" if limit is None else " LIMIT ? OFFSET ?"
+    params = () if limit is None else (max(1, int(limit)), max(0, int(offset)))
     rows = connection.execute(
-        f"""SELECT ts, symbol, side, action, qty, price, notional,
-                  {field('realized_pnl_usd')}, {field('risk_usd')},
+        f"""SELECT {field('ts')}, {field('symbol')}, {field('side')},
+                  {field('action')}, {field('qty')}, {field('price')},
+                  {field('notional')},
+                  {field('id')}, {field('order_id')}, {field('parent_trade_id')},
+                  {field('setup_id')}, {field('setup_key')}, {field('trade_id')},
+                  {field('requested_qty')}, {field('planned_qty')},
+                  {field('cumulative_filled_qty')}, {field('fill_fraction')},
+                  {field('filled_fraction')}, {field('position_closed')},
+                  {field('realized_pnl_usd')}, {field('gross_pnl')},
+                  {field('fees')}, {field('fee_usd')}, {field('funding_usd')},
+                  {field('slippage')}, {field('slippage_usd')},
+                  {field('net_pnl')}, {field('pnl_semantics')}, {field('pnl_provenance')},
+                  {field('cost_provenance')}, {field('risk_usd')},
                   {field('intended_risk_usd')}, {field('delivered_risk_usd')},
                   {field('risk_delivery_ratio')}, {field('risk_shortfall_usd')},
                   {field('configured_risk_budget_usd')},
@@ -365,17 +548,31 @@ def _trades(connection: sqlite3.Connection, limit: int = 200) -> list[dict]:
                   {field('strategy_id')}, {field('strategy_version')},
                   {field('variant_id')}, {field('runtime_mode')},
                   {field('exit_policy')}, {field('close_trigger')}
-           FROM trades ORDER BY ts DESC, id DESC LIMIT ?""",
-        (max(1, int(limit)),)).fetchall()
+           FROM trades ORDER BY ts DESC, {order_id} DESC{limit_clause}""",
+        params).fetchall()
     trades = []
     for row in rows:
         item = dict(row)
         risk = item.get("risk_usd")
         realized = item.get("realized_pnl_usd")
+        net = item.get("net_pnl")
+        if net is None:
+            # Keep this row visibly gross/unknown rather than presenting a
+            # legacy fill-only value as net R.
+            item["r_multiple"] = None
         try:
-            item["r_multiple"] = (round(float(realized) / float(risk), 4)
-                                  if risk and realized is not None else None)
+            item["net_r_multiple"] = (round(float(net) / float(risk), 4)
+                                      if risk and net is not None else None)
         except (TypeError, ValueError, ZeroDivisionError):
+            item["net_r_multiple"] = None
+        try:
+            item["gross_r_multiple"] = (round(float(realized) / float(risk), 4)
+                                        if risk and realized is not None else None)
+        except (TypeError, ValueError, ZeroDivisionError):
+            item["gross_r_multiple"] = None
+        if item.get("net_pnl") is not None:
+            item["r_multiple"] = item["net_r_multiple"]
+        else:
             item["r_multiple"] = None
         item["when"] = item.pop("ts", None)
         trades.append(item)
@@ -383,49 +580,117 @@ def _trades(connection: sqlite3.Connection, limit: int = 200) -> list[dict]:
 
 
 def _by_variant(trades: Sequence[dict]) -> list[dict]:
-    """Roll the journal's own fills up per deployed variant.
+    """Roll lifetime closed parent trades up per deployed variant.
 
     This is the runtime's view of an edge, independent of the research
     ledger's: it counts what the broker actually did.  When the two disagree,
     that disagreement is the finding.
     """
-    grouped: dict[tuple[str, str], dict] = {}
-    for trade in trades:
+    grouped: dict[tuple[str, str, str], list[dict]] = {}
+    close_actions = {"close", "partial_close", "exit", "sell_to_close"}
+    import report as reporting
+    all_rows = [dict(trade) for trade in trades]
+    for index, trade in enumerate(all_rows):
+        action = str(trade.get("action") or "").lower()
+        if action not in close_actions and action not in {"open", "buy_to_open", "sell_to_open"}:
+            continue
         key = (str(trade.get("strategy_id") or "unknown"),
-               str(trade.get("variant_id") or "unattributed"))
-        item = grouped.setdefault(key, {
-            "strategy_id": key[0], "variant_id": key[1], "trades": 0,
-            "symbols": set(), "realized_pnl_usd": 0.0, "_r": [],
-            "last_trade_ts": None})
+               str(trade.get("variant_id") or "unattributed"),
+               reporting._parent_key(trade, index))
+        grouped.setdefault(key, []).append(trade)
+    by_variant: dict[tuple[str, str], dict] = {}
+    for (strategy_id, variant_id, _parent), rows in grouped.items():
+        parents = reporting.closed_parent_trades(rows)
+        if not parents:
+            continue
+        parent = parents[0]
+        key = (strategy_id, variant_id)
+        item = by_variant.setdefault(key, {
+            "strategy_id": strategy_id, "variant_id": variant_id,
+            "trades": 0, "close_fills": 0, "symbols": set(),
+            "gross_pnl_usd": 0.0, "fees_usd": 0.0, "net_pnl_usd": 0.0,
+            "realized_pnl_usd": 0.0, "_gross_known": True, "_fees_known": True,
+            "_net_known": True, "_r": [], "_r_bases": set(), "_gross_r": [],
+            "_net_outcomes": [], "_gross_outcomes": [],
+            "last_trade_ts": None, "_cost_provenance": set()})
         item["trades"] += 1
-        if trade.get("symbol"):
-            item["symbols"].add(str(trade["symbol"]))
-        try:
-            item["realized_pnl_usd"] += float(trade.get("realized_pnl_usd") or 0.0)
-        except (TypeError, ValueError):
-            pass
-        if trade.get("r_multiple") is not None:
-            item["_r"].append(float(trade["r_multiple"]))
-        when = trade.get("when")
+        item["close_fills"] += int(parent.get("close_fills") or 0)
+        for row in rows:
+            if row.get("symbol"):
+                item["symbols"].add(str(row["symbol"]))
+        for field, flag in (("gross", "_gross_known"), ("fees", "_fees_known"),
+                            ("net", "_net_known")):
+            value = parent.get(field)
+            if value is None:
+                item[flag] = False
+            else:
+                destination = {"gross": "gross_pnl_usd", "fees": "fees_usd",
+                               "net": "net_pnl_usd"}[field]
+                item[destination] += value
+        if parent.get("net") is not None:
+            item["_net_outcomes"].append(float(parent["net"]))
+        if parent.get("gross") is not None:
+            item["_gross_outcomes"].append(float(parent["gross"]))
+        if parent.get("r_multiple") is not None:
+            item["_r"].append(float(parent["r_multiple"]))
+            item["_r_bases"].add("net_pnl")
+        elif parent.get("gross_r_multiple") is not None:
+            # Compatibility telemetry for legacy rows.  The explicit basis
+            # below keeps this gross R from being mistaken for net R.
+            item["_r"].append(float(parent["gross_r_multiple"]))
+            item["_r_bases"].add("gross_legacy_unknown_cost")
+        if parent.get("gross") is not None and parent.get("risk"):
+            item["_gross_r"].append(float(parent["gross_r_multiple"]))
+        item["_cost_provenance"].update(parent.get("cost_provenance") or ())
+        when = parent.get("last_ts")
         if when is not None and (item["last_trade_ts"] is None or
                                  when > item["last_trade_ts"]):
             item["last_trade_ts"] = when
-    report = []
-    for item in grouped.values():
+    output = []
+    for item in by_variant.values():
         values = item.pop("_r")
-        wins = [value for value in values if value > 0]
-        report.append({
+        r_bases = item.pop("_r_bases")
+        gross_values = item.pop("_gross_r")
+        net_known = bool(item.pop("_net_known"))
+        gross_known = bool(item.pop("_gross_known"))
+        fees_known = bool(item.pop("_fees_known"))
+        net = item["net_pnl_usd"] if net_known else None
+        gross = item["gross_pnl_usd"] if gross_known else None
+        fees = item["fees_usd"] if fees_known else None
+        if not r_bases:
+            r_basis = "unavailable"
+        elif len(r_bases) == 1:
+            r_basis = next(iter(r_bases))
+        else:
+            r_basis = "mixed_net_and_gross_unknown_cost"
+        net_outcomes = item.pop("_net_outcomes")
+        gross_outcomes = item.pop("_gross_outcomes")
+        wins = [value for value in net_outcomes if value > 0]
+        gross_wins = [value for value in gross_outcomes if value > 0]
+        output.append({
             **item,
             "symbols": ", ".join(sorted(item["symbols"])),
-            "realized_pnl_usd": round(item["realized_pnl_usd"], 2),
-            "total_r": round(sum(values), 4) if values else None,
-            "mean_r": round(sum(values) / len(values), 4) if values else None,
-            "win_rate": round(len(wins) / len(values), 4) if values else None,
+            "gross_pnl_usd": round(gross, 2) if gross is not None else None,
+            "fees_usd": round(fees, 2) if fees is not None else None,
+            "net_pnl_usd": round(net, 2) if net is not None else None,
+            "realized_pnl_usd": (round(net, 2) if net is not None else
+                                 round(gross, 2) if gross is not None else None),
+            "realized_pnl_basis": ("net_pnl" if net is not None else
+                                    "gross_legacy_unknown_cost"),
+            "r_basis": r_basis,
+            "cost_provenance": sorted(item.pop("_cost_provenance")),
+            "total_r": round(sum(values), 4) if len(values) == item["trades"] and len(r_bases) == 1 else None,
+            "mean_r": round(sum(values) / len(values), 4) if values and len(values) == item["trades"] and len(r_bases) == 1 else None,
+            "win_rate": (round(len(wins) / len(net_outcomes), 4)
+                         if net_known and net_outcomes else None),
+            "win_rate_basis": "net_pnl" if net_known else "unavailable",
+            "gross_win_rate": (round(len(gross_wins) / len(gross_outcomes), 4)
+                               if gross_known and gross_outcomes else None),
         })
-    return sorted(report, key=lambda item: item["trades"], reverse=True)
+    return sorted(output, key=lambda item: item["trades"], reverse=True)
 
 
-def _journal_view(path: Path) -> dict:
+def _journal_view(path: Path, *, page: int = 1, page_size: int = 200) -> dict:
     """Per-trade attribution and its per-variant roll-up, read-only."""
     if not path.is_file():
         return {"available": False, "trades": [], "by_variant": []}
@@ -433,11 +698,27 @@ def _journal_view(path: Path) -> dict:
         with closing(_ro_connect(path)) as connection:
             if "trades" not in _tables(connection):
                 return {"available": False, "trades": [], "by_variant": []}
-            trades = _trades(connection)
+            page = max(1, int(page))
+            page_size = max(1, min(1000, int(page_size)))
+            offset = (page - 1) * page_size
+            trades = _trades(connection, limit=page_size, offset=offset)
+            all_fills = _trades(connection, limit=None)
+            all_closes = all_fills
+            close_count = sum(
+                str(row.get("action") or "").lower() in
+                {"close", "partial_close", "exit", "sell_to_close"}
+                for row in all_closes)
     except (OSError, sqlite3.Error, ValueError):
         return {"available": False, "trades": [], "by_variant": []}
+    by_variant = _by_variant(all_fills)
     return {"available": True, "trades": trades,
-            "by_variant": _by_variant(trades)}
+            "recent_trades": trades, "by_variant": by_variant,
+            "lifetime": {"close_fills": close_count,
+                         "closed_trades": sum(item.get("trades", 0)
+                                               for item in by_variant)},
+            "page": page, "page_size": page_size,
+            "total_fills": len(all_fills),
+            "has_more": offset + len(trades) < len(all_fills)}
 
 
 def _learning(path: Path, limit: int = 60) -> dict:
@@ -543,6 +824,9 @@ def _trial_view(config: dict, edge_path: Path) -> dict:
                 "trades": item["verdict"].get("trades"),
                 "total_r": item["verdict"].get("total_r"),
                 "mean_r": item["verdict"].get("mean_r"),
+                "mean_r_lcb": (item["verdict"].get("session_cluster_confidence") or {}).get("lower_bound"),
+                "session_cluster_confidence": item["verdict"].get(
+                    "session_cluster_confidence"),
             } for item in review.get("reviews") or []],
             "promotable": promotable}
 
@@ -565,8 +849,9 @@ def _promotions(config: dict, edge_path: Path) -> dict:
     return {"selection_mode": mode, "pinned": [dict(item) for item in entries],
             "unresolved": unresolved,
             "frozen": bool(entries),
-            "note": ("pinned edges are never changed automatically; guard "
-                     "breaches raise an alert and leave them in place")}
+            "note": ("pins prevent automatic substitution; authoritative drift "
+                     "or trial failures can still pause or demote a pinned edge. "
+                     "Rolling-R warnings are advisory.")}
 
 
 def _config_audit(journal: Path) -> dict:
@@ -661,6 +946,62 @@ def _safe_heartbeat(path: Path) -> dict:
     return result
 
 
+def _direct_research_status(path: Path, *, now: float | None = None,
+                            max_age: float = 180.0) -> dict:
+    """Project the direct research lease using its versioned status contract."""
+    empty = {
+        "available": False, "schema": "research-direct-status.v1",
+        "status": "missing", "execution_mode": "direct",
+        "scheduler_managed": None, "status_scope": "cycle_process", "fresh": False, "running": False,
+        "job_id": None, "pid": None, "started_ts": None,
+        "updated_ts": None, "lease_ts": None, "progress": None,
+        "terminal": None, "dataset": None,
+    }
+    raw = _json_file(path)
+    if raw.get("schema") != "research-direct-status.v1":
+        return {**empty, "reason": "invalid_schema" if raw else "missing"}
+    current = time.time() if now is None else float(now)
+    updated = raw.get("updated_ts")
+    lease = raw.get("lease_ts", updated)
+    try:
+        age = current - float(lease)
+        fresh = -5.0 <= age <= float(max_age)
+    except (TypeError, ValueError, OverflowError):
+        fresh = False
+    progress = raw.get("progress")
+    bounded_progress = None
+    if isinstance(progress, dict):
+        bounded_progress = {
+            key: progress.get(key) for key in (
+                "schema", "phase", "unit", "vehicle", "done", "total",
+                "updated_ts") if key in progress
+        }
+    terminal = raw.get("terminal")
+    bounded_terminal = (dict(terminal) if isinstance(terminal, dict) else None)
+    dataset = raw.get("dataset")
+    bounded_dataset = (dict(dataset) if isinstance(dataset, dict) else None)
+    status = str(raw.get("status") or "unknown")
+    return {
+        "available": True,
+        "schema": "research-direct-status.v1",
+        "status": status,
+        "execution_mode": "direct",
+        "scheduler_managed": raw.get("scheduler_managed") if isinstance(raw.get("scheduler_managed"), bool) else None,
+        "status_scope": raw.get("status_scope", "cycle_process"),
+        "process_start_ts": raw.get("process_start_ts"),
+        "build_identity": raw.get("build_identity"),
+        "fresh": fresh,
+        "running": status == "running" and fresh,
+        "job_id": raw.get("job_id"), "pid": raw.get("pid"),
+        "started_ts": raw.get("started_ts"),
+        "updated_ts": updated, "lease_ts": lease,
+        "progress": bounded_progress, "terminal": bounded_terminal,
+        "dataset": bounded_dataset,
+        "provenance": raw.get("provenance") if isinstance(
+            raw.get("provenance"), dict) else None,
+    }
+
+
 def snapshot(root: Path) -> dict:
     config_path = root / "config.yaml"
     config = load_config(config_path)
@@ -670,6 +1011,7 @@ def snapshot(root: Path) -> dict:
     recorder_path = runtime / "research" / "recorded"
     trader_heartbeat = runtime / mode / "heartbeat.json"
     research_heartbeat = runtime / "health" / "research.json"
+    direct_research_status = runtime / "health" / "research-direct.json"
     edge_configured = Path(os.getenv("ALPACA_EDGE_DB", "runtime/research/edge_lab.sqlite3"))
     edge_path = edge_configured if edge_configured.is_absolute() else root / edge_configured
     cycle_seconds = float(config.get("cycle", {}).get("interval_seconds") or 60)
@@ -677,7 +1019,11 @@ def snapshot(root: Path) -> dict:
     edge = _cached(f"edge:{edge_path}", 30, lambda: _edge_status(edge_path))
     trial = _cached(f"trial:{edge_path}", 60,
                     lambda: _trial_view(config, edge_path))
+    direct = _cached(
+        f"research-direct:{direct_research_status}", 15,
+        lambda: _direct_research_status(direct_research_status))
     tradeable = _tradeable_vehicle(config)
+    trader_state = _safe_state(runtime / mode / "state.json")
     untradeable = sum(1 for row in edge.get("proved_edges") or ()
                       if str(row.get("vehicle")) != tradeable)
     return {
@@ -696,7 +1042,8 @@ def snapshot(root: Path) -> dict:
         "trader": {
             "health": health.trader(trader_heartbeat, trader_max_age),
             "heartbeat": _safe_heartbeat(trader_heartbeat),
-            "state": _safe_state(runtime / mode / "state.json"),
+            "state": trader_state,
+            "exposure": _portfolio_exposure(trader_state.get("active_trades", [])),
         },
         "recorder": health.recorder(
             recorder_path, 900,
@@ -715,9 +1062,16 @@ def snapshot(root: Path) -> dict:
                     "structured_failures": [],
                 }),
             "heartbeat": _safe_heartbeat(research_heartbeat),
+            # Direct invocations do not write the scheduler heartbeat. Keep
+            # their versioned lease visible beside it, with its own freshness
+            # and terminal state so an old file cannot look active.
+            "direct": direct,
+            "direct_status": direct,
         },
         "performance": _cached(
             f"performance:{journal}", 30, lambda: _performance(journal)),
+        "charts": _cached(
+            f"charts:{journal}:{mode}", 30, lambda: _charts(journal, mode)),
         # What the broker actually did, attributed to the edge that decided it.
         "journal": _cached(
             f"journal:{journal}", 30, lambda: _journal_view(journal)),
@@ -746,6 +1100,7 @@ def snapshot(root: Path) -> dict:
             # are reported rather than counted among the deployable edges.
             "untradeable_proved_edges": untradeable,
             "note": "the service is optional to run continuously; entries require a validated edge record",
+            "direct_job": direct,
         },
         "reports": _cached(
             f"reports:{root}", 30, lambda: _reports(root)),
@@ -787,34 +1142,63 @@ td,th{white-space:nowrap;font-variant-numeric:tabular-nums}
 <script>
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n};
 const card=(title,wide=false)=>{const n=el('section');n.className='card'+(wide?' wide':'');n.append(el('h2',title));cards.append(n);return n};
-const row=(parent,k,v,cls)=>{const n=el('div',undefined,'row');n.append(el('span',k,'muted'),el('span',String(v??'—'),cls));parent.append(n)};
-const good=x=>x?'ok':'bad'; const when=x=>x?new Date(x*1000).toISOString():'—';
-function table(parent,rows,cols){const t=el('table'),h=el('tr');cols.forEach(c=>h.append(el('th',c)));t.append(h);rows.forEach(r=>{const tr=el('tr');cols.forEach(c=>tr.append(el('td',String(r[c]??'—'))));t.append(tr)});parent.append(t)}
+function displayValue(value,key=''){if(value===null||value===undefined)return '—';if(typeof value==='number'){if(!Number.isFinite(value))return '—';if(/win[_ ]rate$/.test(key))return (value*100).toFixed(2)+'%';return value.toLocaleString('en-US',{maximumFractionDigits:/usd|p&l|fees/i.test(key)?2:4})}return String(value)}
+const row=(parent,k,v,cls)=>{const n=el('div',undefined,'row');n.append(el('span',k,'muted'),el('span',displayValue(v,k),cls));parent.append(n)};
+const good=x=>x?'ok':'bad'; const when=x=>{if(!x)return '—';const d=new Date(typeof x==='number'?x*1000:x);return Number.isNaN(d.getTime())?'—':d.toISOString()};
+const columnLabels={mean_r_pct:'Mean R × 100',capital_return_pct:'Capital return %',mean_r_lcb:'Mean R: 95% lower bound',win_rate:'Net win rate'};
+function table(parent,rows,cols){const t=el('table'),h=el('tr');cols.forEach(c=>h.append(el('th',columnLabels[c]||c.replaceAll('_',' '))));t.append(h);rows.forEach(r=>{const tr=el('tr');cols.forEach(c=>tr.append(el('td',c==='when'?when(r[c]):displayValue(r[c],c))));t.append(tr)});parent.append(t)}
+function chart(parent,title,series,color){
+ const wrap=el('div');wrap.append(el('h3',title));
+ const pts=((series||{}).points||[]).filter(x=>Number.isFinite(Number(x.value)));
+ if(!series||!series.available||!pts.length){wrap.append(el('p','Unavailable: no recorded samples.','muted'));parent.append(wrap);return}
+ const w=720,h=150,p=18,vals=pts.map(x=>Number(x.value)),lo=vals.reduce((a,b)=>Math.min(a,b),Infinity),hi=vals.reduce((a,b)=>Math.max(a,b),-Infinity),span=hi-lo||1;
+ const first=Number(pts[0].ts),last=Number(pts[pts.length-1].ts),timed=Number.isFinite(first)&&Number.isFinite(last)&&last>first;
+ const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 '+w+' '+h);svg.setAttribute('width','100%');svg.setAttribute('height','150');svg.setAttribute('role','img');svg.setAttribute('aria-label',title);
+ const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('fill','none');path.setAttribute('stroke',color);path.setAttribute('stroke-width','2');
+ path.setAttribute('d',pts.map((x,i)=>((i?'L':'M')+(p+(timed?(Number(x.ts)-first)/(last-first):i/Math.max(1,pts.length-1))*(w-2*p))+' '+(h-p-(Number(x.value)-lo)*(h-2*p)/span))).join(' '));svg.append(path);
+ row(wrap,'Value range',lo.toFixed(2)+' to '+hi.toFixed(2));wrap.append(svg);row(wrap,'Observed interval',when(pts[0].ts)+' to '+when(pts[pts.length-1].ts));parent.append(wrap)
+}
+function contextCharts(trades){
+ const c=card('Entry context from completed bars',true);let count=0;
+ for(const t of trades||[]){const x=t.intraday_context;if(!x||!Array.isArray(x.bars)||!x.bars.length)continue;count++;
+  chart(c,t.symbol+' · '+x.timeframe_minutes+'-minute closes',{available:true,points:x.bars.map(b=>({ts:Number(b.timestamp)+Number(x.timeframe_minutes)*60,value:b.close}))},'#8fb9ff');
+  row(c,'Entry / stop / target',[t.entry_price,t.active_stop_price??t.stop_price,t.target_price].map(v=>v??'—').join(' / '));
+  row(c,'Context direction / efficiency',x.direction+' / '+Number(x.efficiency).toFixed(3));
+  row(c,'Information cutoff',when(x.asof_ts));
+ }
+ c.append(el('p',count?'Frozen context used at entry; this chart does not update with current market prices.':'No active position has recorded entry context. New context-enabled strategies record it when a signal passes.','muted'))
+}
+function evidenceCharts(d){const ch=d.charts||{};const c=card('Actual account evidence — '+(ch.source||'unknown'),true);row(c,'source',ch.source||'unknown');const u=ch.uncertainty||{};row(c,'net-R samples',u.sample_count);row(c,'sessions',u.session_count);row(c,'net-R mean',u.mean_net_r);row(c,'net-R 95% lower bound',u.lower_net_r);row(c,'net-R 95% upper bound',u.upper_net_r);row(c,'equity basis','Observed account equity; cash transfers are not adjusted');chart(c,'Account equity',ch.net_equity,'#65d98a');chart(c,'Drawdown',ch.drawdown,'#ff7b86');const p=ch.payoff||{};row(c,'net payoff samples',p.sample_count);row(c,'net wins / losses',(p.wins??'—')+' / '+(p.losses??'—'));if(!p.available)c.append(el('p','Payoff unavailable until closed trades have known net P&L.','muted'));else{const vals=p.values||[],max=vals.reduce((a,b)=>Math.max(a,Math.abs(b)),1);const bar=el('div');vals.slice(-40).forEach(v=>{const b=el('span');b.style.display='inline-block';b.style.width='6px';b.style.height=Math.max(2,Math.round(Math.abs(v)/max*70))+'px';b.style.margin='1px';b.style.background=v>=0?'#65d98a':'#ff7b86';b.title=String(v);bar.append(b)});c.append(el('h3','Recent net payoff'));c.append(bar)}}
 async function showReport(path){const r=await fetch('/api/report?path='+encodeURIComponent(path));const j=await r.json();const p=card(path,true);p.append(el('pre',j.text||j.error||'unavailable'));p.scrollIntoView({behavior:'smooth'})}
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();cards.replaceChildren();
  let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'execution profile',d.strategy.execution_mode);row(c,'configured variant',d.strategy.variant_id);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'edge entry gate',d.research.entry_gate_required?'required':'disabled',d.research.entry_gate_required?'warn':'ok');
  c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'equity feed',d.recorder.configured_data_feed||d.recorder.data_feed||'—');row(c,'options feed',d.recorder.configured_options_feed||'disabled');row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'bar coverage',d.recorder.coverage_status,d.recorder.coverage_status==='covered'?'ok':'warn');row(c,'bar gap symbols',(d.recorder.bar_gap_symbols||[]).join(', ')||'none',(d.recorder.bar_gap_symbols||[]).length?'warn':'ok');row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'cycle outcome',d.research_service.heartbeat.cycle_status);const pf=d.research_service.health.research_preflight||d.research_service.heartbeat.research_preflight||{};row(c,'provider preflight',pf.status||'not_run',pf.status==='ready'||pf.status==='disabled'?'ok':pf.status==='degraded'?'warn':'bad');const rp=d.research_service.heartbeat.research_progress||{};const rpLine=rp.phase?rp.phase+' · '+rp.vehicle+' · '+rp.done+'/'+rp.total+' '+rp.unit:'—';row(c,'research progress',rpLine);const rr=d.research_service.health.research_readiness||{};row(c,'research readiness',rr.state||'unknown',rr.state==='ready'?'ok':'warn');row(c,'sessions remaining',rr.sessions_remaining??'—');row(c,'readiness ETA',when(rr.eta_ts));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
- c=card('Execution journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
+ c=card('Execution journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'gross P&L USD',d.performance.gross_pnl_usd);row(c,'fees USD',d.performance.fees_usd);row(c,'net P&L USD',d.performance.net_pnl_usd);row(c,'net win rate',d.performance.win_rate);row(c,'completed parent trades',d.performance.closed_trades);row(c,'cost basis',(d.performance.cost_provenance||[]).join(', ')||'unavailable');
+ const direct=d.research_service.direct||{};
+ c=card('Research process — direct research status');row(c,'status',direct.status,direct.running?'ok':'warn');row(c,'job',direct.job_id);row(c,'process',direct.pid);row(c,'scheduler ownership',direct.scheduler_managed===null?'unknown':direct.scheduler_managed?'managed':'direct');row(c,'build',direct.build_identity);row(c,'started',when(direct.started_ts));row(c,'process lease',when(direct.lease_ts));const dp=direct.progress||{};row(c,'phase',dp.phase);row(c,'completed work',dp.done===undefined?'—':dp.done+'/'+dp.total+' '+(dp.unit||''));row(c,'last progress',when(dp.updated_ts));row(c,'dataset',(direct.dataset||{}).source);row(c,'source identity',(direct.dataset||{}).source_identity);row(c,'outcome',(direct.terminal||{}).reason);if(!direct.running)c.append(el('p','No fresh running process lease. A saved result is not an active job.','muted'));
+ evidenceCharts(d);
  c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);row(c,'tradeable vehicle',d.research.tradeable_vehicle);row(c,'proved but untradeable',d.research.untradeable_proved_edges,d.research.untradeable_proved_edges?'warn':'ok');c.append(el('p',d.research.note||'No research status.','muted'));
  c=card('Proved edges — evidence at promotion',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
  c=card('Live paper results by edge',true);const lp=d.edge.live_paper||[];if(!lp.length){c.append(el('p','No paper outcomes recorded yet. Results appear once a deployed edge closes its first trade.','muted'))}else{table(c,lp,['status','vehicle','variant_id','outcomes','sessions','last_session','total_r','mean_r','win_rate','net_pnl','rolling_r','guard','rolling_action'])};
- c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','configured_risk_budget_usd','planned_risk_usd','delivered_risk_usd','planned_to_configured_risk_ratio','delivered_to_configured_risk_ratio','opened_at','setup_type']);
+ c=card('Recorded portfolio exposure',true);const exposure=d.trader.exposure||{};table(c,exposure.groups||[],['group','positions','gross_usd','net_usd']);row(c,'positions without a comparable exposure',exposure.unpriced_or_unmapped_positions);c.append(el('p','Recorded price notional, excluding pending orders. Shared ETF exposure is not an independent bet count; no beta hedge is estimated.','muted'));
+ c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','variant_id','direction','qty','entry_price','stop_price','target_price','active_stop_price','configured_risk_budget_usd','planned_risk_usd','delivered_risk_usd','planned_to_configured_risk_ratio','delivered_to_configured_risk_ratio','opened_at','setup_type']);
 
+ contextCharts(d.trader.state.active_trades);
  const tr=d.trial||{};
  c=card('Paper-account trials — which edge is earning a promotion',true);
  if(!tr.available){c.append(el('p','No trial data yet. Trials use the same Alpaca paper account once an edge is proved.','muted'))}
- else{const p=tr.policy||{};c.append(el('p','Trial window: '+p.min_sessions+' sessions and '+p.min_trades+' trades, then judged against total R > '+p.min_total_r+' and mean R > '+p.min_mean_r+'.','muted'));
-  table(c,tr.reviews||[],['state','action','family','vehicle','variant_id','sessions','trades','total_r','mean_r','pinned'])}
+ else{const p=tr.policy||{};c.append(el('p','Trial window: '+p.min_sessions+' sessions and '+p.min_trades+' trades, then judged against total R > '+p.min_total_r+' and a 95% session-cluster lower bound for mean R > '+p.min_mean_r+'.','muted'));
+  table(c,tr.reviews||[],['state','action','family','vehicle','variant_id','sessions','trades','total_r','mean_r','mean_r_lcb','pinned'])}
  c=card('Promotable — positive on the paper account',true);
  const pr=(tr.promotable)||[];
  if(!pr.length){c.append(el('p','Nothing has cleared its trial floor yet. Promotion is never automatic.','muted'))}
- else{table(c,pr,['variant_id','family','vehicle','sessions','trades','total_r','mean_r','win_rate','net_pnl','return_pct','already_pinned']);
+ else{table(c,pr,['variant_id','family','vehicle','sessions','trades','total_r','mean_r','win_rate','net_pnl','mean_r_pct','capital_return_pct','already_pinned']);
   pr.filter(x=>x.config_snippet).forEach(x=>{const b=el('details');b.append(el('summary','Config to promote '+x.variant_id));b.append(el('pre',x.config_snippet));c.append(b)})}
 
  const pm=d.promotions||{};
  c=card('Pinned promotions (operator-declared)',true);
  row(c,'selection mode',pm.selection_mode,pm.selection_mode==='pinned'?'ok':'muted');
- row(c,'automatic changes',pm.frozen?'disabled — notify only':'enabled (auto lane)',pm.frozen?'ok':'warn');
+ row(c,'automatic substitution',pm.frozen?'disabled for pinned edges':'enabled (auto lane)',pm.frozen?'ok':'warn');
  table(c,pm.pinned||[],['id','variant_id','vehicle','strategy_id','promoted_at','note']);
  if((pm.unresolved||[]).length){const w=el('h3','Pinned but NOT trading');w.className='bad';c.append(w);table(c,pm.unresolved,['id','variant_id','vehicle','reason'])}
  c.append(el('p',pm.note||'','muted'));
@@ -822,9 +1206,10 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  const jr=d.journal||{};
  c=card('Trades by edge — what the broker actually did',true);
  if(!(jr.by_variant||[]).length){c.append(el('p','No fills recorded yet.','muted'))}
- else{table(c,jr.by_variant,['strategy_id','variant_id','trades','symbols','total_r','mean_r','win_rate','realized_pnl_usd'])}
- c=card('Recent trades, attributed',true);
- table(c,(jr.trades||[]).slice(0,60),['when','symbol','side','action','qty','price','configured_risk_budget_usd','planned_risk_usd','delivered_risk_usd','planned_to_configured_risk_ratio','delivered_to_configured_risk_ratio','realized_pnl_usd','r_multiple','strategy_id','variant_id','setup_type','close_trigger']);
+ else{row(c,'lifetime closed parent trades',jr.lifetime&&jr.lifetime.closed_trades);row(c,'lifetime close fills',jr.lifetime&&jr.lifetime.close_fills);table(c,jr.by_variant,['strategy_id','variant_id','trades','close_fills','symbols','total_r','r_basis','mean_r','win_rate','win_rate_basis','gross_pnl_usd','fees_usd','net_pnl_usd','realized_pnl_basis','cost_provenance'])}
+ c=card('Recent fills, attributed (page '+(jr.page||1)+' of recent journal)',true);
+ table(c,jr.trades||[],['when','symbol','side','action','qty','price','configured_risk_budget_usd','planned_risk_usd','delivered_risk_usd','planned_to_configured_risk_ratio','delivered_to_configured_risk_ratio','gross_pnl','fees','net_pnl','realized_pnl_usd','realized_pnl_basis','net_r_multiple','gross_r_multiple','strategy_id','variant_id','setup_type','close_trigger']);
+ row(c,'fills on this page',(jr.trades||[]).length);row(c,'total fills',jr.total_fills);row(c,'next page',jr.has_more?'available':'none');
 
  const lr=d.learning||{};
  c=card('What research learned',true);

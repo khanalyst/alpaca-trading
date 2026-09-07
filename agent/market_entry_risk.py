@@ -22,7 +22,7 @@ from .contracts.risk_geometry import (
     quantize_equity_bracket as _shared_quantize_equity_bracket,
     quantize_equity_price as _shared_quantize_equity_price,
 )
-from .contracts.rule import RULE_SCHEMA_V3, RULE_SCHEMA_V4
+from .contracts.rule import RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5
 from .execution_lifecycle import _plain, _value
 from .instruments import validate_equity_symbol
 from research.costs import (ENTRY_SLIPPAGE_INVALID_REASON,
@@ -489,24 +489,20 @@ class MarketEntryRiskMixin:
                                    strategy.get("execution_mode", "shares"))).lower()
         decision["execution_profile"] = "options" if profile in {"options", "option"} else "shares"
         if (decision["execution_profile"] == "options" and
-                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}):
+                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}):
             self._event("risk_reject", {
                 "symbol": symbol,
-                "reason": ("rule-strategy.v4 is not executable for options"
-                           if str(decision.get("rule_schema") or "") == RULE_SCHEMA_V4
-                           else "rule-strategy.v3 is not executable for options"),
+                "reason": f"{decision['rule_schema']} is not executable for options",
             })
             return None
         if (decision["execution_profile"] == "shares" and
-                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4} and
+                str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5} and
                 (decision.get("breakeven_r") is not None or
                  decision.get("trailing_stop_r") is not None) and
                 not callable(getattr(self.provider, "replace_stop_order", None))):
             self._event("execution_reject", {
                 "symbol": symbol,
-                "reason": ("rule-strategy.v4 requires broker stop replacement capability"
-                           if str(decision.get("rule_schema") or "") == RULE_SCHEMA_V4
-                           else "rule-strategy.v3 requires broker stop replacement capability"),
+                "reason": f"{decision['rule_schema']} requires broker stop replacement capability",
             })
             return None
         if decision["execution_profile"] == "shares":

@@ -27,7 +27,7 @@ from research.live_shadow import _policy as shadow_policy
 import research.strategy_factory as factory_module
 from research.strategy_factory import run_factory
 
-from tests.research.test_factory_end_to_end import SESSIONS, edge_corpus
+from tests.research.test_factory_end_to_end import SESSIONS, TEST_RUNTIME_CONFIG, edge_corpus
 
 
 _CLI_PATH = Path(__file__).parents[2] / "research.py"
@@ -248,6 +248,7 @@ class MarketDataLaneBoundaryTests(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory(prefix="alpaca-lane-")
         root = Path(cls.directory.name)
         common = {
+            "runtime_config": TEST_RUNTIME_CONFIG,
             "strategies": 1,
             "variants_per_strategy": 2,
             "workers": 1,
@@ -342,9 +343,11 @@ class MarketDataLaneBoundaryTests(unittest.TestCase):
                     PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1):
                 strict = discover(
                     corpus, db_path=Path(directory) / "strict.sqlite3",
+                    config=TEST_RUNTIME_CONFIG,
                     lane="backtest", min_trades=1, min_sessions=1, alpha=1.0)
                 fallback = discover(
                     corpus, db_path=Path(directory) / "fallback.sqlite3",
+                    config=TEST_RUNTIME_CONFIG,
                     lane="backtest", min_trades=1, min_sessions=1, alpha=1.0,
                     backtest_bar_fallback=True)
         self.assertEqual(max(

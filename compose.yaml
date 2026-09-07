@@ -76,7 +76,7 @@ services:
   trader:
     <<: *app
     container_name: alpaca-trader
-    command: ["python", "main.py", "run"]
+    command: ["python", "deploy/trader_supervisor.py"]
     environment:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
@@ -118,8 +118,8 @@ services:
     container_name: alpaca-watchdog
     # A separate container with its own broker session, so it cannot die with
     # the trader it watches.  It can only cancel and flatten; the mode-scoped
-    # run lock on the shared runtime volume keeps it inert while the trader
-    # lives.
+    # run lock on the shared runtime volume prevents competing closers. The
+    # trader supervisor reaps an unresponsive child before recovery takes it.
     command:
       - python
       - deploy/watchdog.py

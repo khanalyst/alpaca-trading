@@ -13,6 +13,232 @@ if [[ "$agent_config" != /* ]]; then
   agent_config="$repo_root/$agent_config"
 fi
 
+# A direct invocation has no scheduler process to heartbeat its status. Keep a
+# separate durable lease so the dashboard can identify the active job and
+# distinguish it from an old scheduler record. The lease is refreshed on every
+# bounded progress event and is terminally replaced by ``finish``.
+direct_status_file="${ALPACA_RESEARCH_DIRECT_STATUS_FILE:-$repo_root/runtime/health/research-direct.json}"
+if [[ "$direct_status_file" != /* ]]; then
+  direct_status_file="$repo_root/$direct_status_file"
+fi
+direct_status_lock="${direct_status_file}.lock"
+direct_scheduler_managed="unknown"
+case "${ALPACA_RESEARCH_SCHEDULER_MANAGED:-}" in
+  1|true|TRUE|yes|YES) direct_scheduler_managed="true" ;;
+  0|false|FALSE|no|NO) direct_scheduler_managed="false" ;;
+esac
+direct_job_id="$($python_bin - <<'PY'
+import uuid
+print(uuid.uuid4().hex)
+PY
+)"
+direct_started_ts="$($python_bin - <<'PY'
+import time
+print(format(time.time(), ".6f"))
+PY
+)"
+direct_owner_pid="$$"
+direct_heartbeat_pid=""
+direct_heartbeat_seconds="${ALPACA_RESEARCH_DIRECT_HEARTBEAT_SECONDS:-15}"
+case "$direct_heartbeat_seconds" in
+  ''|*[!0-9]*) direct_heartbeat_seconds=15 ;;
+esac
+if [ "$direct_heartbeat_seconds" -lt 1 ]; then
+  direct_heartbeat_seconds=15
+fi
+direct_dataset=""
+direct_partition_root=""
+direct_source_identity=""
+direct_source_mode=""
+direct_last_phase="startup"
+direct_last_done=0
+direct_last_total=1
+direct_last_unit="steps"
+direct_last_vehicle="both"
+
+write_direct_status() {
+  local status="$1"
+  local phase="$2"
+  local done="$3"
+  local total="$4"
+  local unit="$5"
+  local vehicle="$6"
+  local terminal_status="${7:-}"
+  local terminal_reason="${8:-}"
+  local terminal_exit="${9:-}"
+  local terminal_outcomes="${10:-}"
+  "$python_bin" - "$repo_root" "$direct_status_file" "$direct_status_lock" "$direct_job_id" \
+    "$direct_owner_pid" "$direct_started_ts" "$direct_dataset" "$direct_partition_root" \
+    "$direct_source_identity" "$direct_source_mode" "$status" "$phase" \
+    "$done" "$total" "$unit" "$vehicle" "$direct_scheduler_managed" "$terminal_status" \
+    "$terminal_reason" "$terminal_exit" "$terminal_outcomes" <<'PY'
+import fcntl
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+repo_root, status_path, lock_path, job_id, owner_pid, started, dataset, partition_root, source_identity, \
+    source_mode, status, phase, done, total, unit, vehicle, scheduler_flag, terminal_status, \
+    terminal_reason, terminal_exit, raw_outcomes = sys.argv[1:]
+repo_root = Path(repo_root).resolve()
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+try:
+    from deploy.provenance import deployment_provenance
+    provenance = deployment_provenance()
+except Exception:
+    provenance = {"schema": "deployment-provenance.v1", "identity": None}
+now = time.time()
+try:
+    started_ts = float(started)
+except (TypeError, ValueError):
+    started_ts = now
+try:
+    owner_pid_int = int(owner_pid)
+except (TypeError, ValueError):
+    owner_pid_int = 0
+try:
+    done_int, total_int = int(done), int(total)
+except (TypeError, ValueError):
+    done_int, total_int = 0, 0
+scheduler_managed = (True if scheduler_flag == "true" else
+                     False if scheduler_flag == "false" else None)
+progress = {
+    "schema": "research-progress.v1", "phase": str(phase),
+    "unit": str(unit), "vehicle": str(vehicle), "done": done_int,
+    "total": total_int, "updated_ts": now,
+}
+payload = {
+    "schema": "research-direct-status.v1", "component": "research-cycle",
+    "status": str(status), "execution_mode": "direct",
+    # The cycle process cannot infer whether an external scheduler owns it.
+    # An explicit ALPACA_RESEARCH_SCHEDULER_MANAGED value is required before
+    # exposing either boolean; null keeps the dashboard from claiming the
+    # process is unmanaged when it was launched by an unknown wrapper.
+    "status_scope": "cycle_process", "scheduler_managed": scheduler_managed,
+    "job_id": str(job_id), "pid": owner_pid_int,
+    "lease_owner_pid": owner_pid_int,
+    "process_start_ts": started_ts, "started_ts": started_ts,
+    "updated_ts": now, "lease_ts": now, "provenance": provenance,
+    "build_identity": provenance.get("identity"),
+    "dataset": {
+        "source": dataset or None, "partition_root": partition_root or None,
+        "source_identity": source_identity or None,
+        "source_mode": source_mode or None,
+    },
+    "progress": progress,
+}
+if terminal_status:
+    try:
+        exit_code = int(terminal_exit)
+    except (TypeError, ValueError):
+        exit_code = 1
+    payload["terminal"] = {
+        "schema": "research-cycle.v1", "status": str(terminal_status),
+        "reason": str(terminal_reason)[:240], "exit_code": exit_code,
+        "outcomes": [item[:240] for item in str(raw_outcomes).split()[:32]],
+    }
+target = Path(status_path)
+lock = Path(lock_path)
+lock.parent.mkdir(parents=True, exist_ok=True)
+target.parent.mkdir(parents=True, exist_ok=True)
+with lock.open("a+", encoding="utf-8") as lock_handle:
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    try:
+        previous = json.loads(target.read_text(encoding="utf-8"))
+        newer_owner = (isinstance(previous, dict) and
+                       previous.get("job_id") != job_id and
+                       float(previous.get("started_ts") or 0) >= started_ts)
+    except (OSError, ValueError, TypeError):
+        newer_owner = False
+    if newer_owner:
+        raise SystemExit(0)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+PY
+}
+
+write_direct_lease() {
+  "$python_bin" - "$direct_status_file" "$direct_status_lock" "$direct_job_id" "$direct_owner_pid" <<'PY'
+import fcntl
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+status_path, lock_path, job_id, owner_pid = sys.argv[1:]
+target = Path(status_path)
+lock = Path(lock_path)
+lock.parent.mkdir(parents=True, exist_ok=True)
+with lock.open("a+", encoding="utf-8") as lock_handle:
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        raise SystemExit(0)
+    if (not isinstance(payload, dict) or
+            payload.get("schema") != "research-direct-status.v1" or
+            payload.get("status") != "running" or
+            str(payload.get("job_id")) != str(job_id) or
+            str(payload.get("pid")) != str(owner_pid)):
+        raise SystemExit(0)
+    now = time.time()
+    payload["updated_ts"] = now
+    payload["lease_ts"] = now
+    payload["lease_owner_pid"] = int(owner_pid)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+PY
+}
+
+start_direct_heartbeat() {
+  (
+    while kill -0 "$direct_owner_pid" 2>/dev/null; do
+      sleep "$direct_heartbeat_seconds" || break
+      kill -0 "$direct_owner_pid" 2>/dev/null || break
+      write_direct_lease || true
+    done
+  ) &
+  direct_heartbeat_pid="$!"
+}
+
+stop_direct_heartbeat() {
+  if [ -n "$direct_heartbeat_pid" ]; then
+    kill "$direct_heartbeat_pid" 2>/dev/null || true
+    wait "$direct_heartbeat_pid" 2>/dev/null || true
+    direct_heartbeat_pid=""
+  fi
+}
+
 # ``research.py`` emits detailed proof/result JSON itself. Keep those lines on
 # their original streams and add one terminal record for the scheduler.
 cycle_finalized=0
@@ -38,6 +264,11 @@ emit_progress() {
   local total="$3"
   local unit="$4"
   local vehicle="${5:-both}"
+  direct_last_phase="$phase"
+  direct_last_done="$done"
+  direct_last_total="$total"
+  direct_last_unit="$unit"
+  direct_last_vehicle="$vehicle"
   "$python_bin" - "$phase" "$unit" "$vehicle" "$done" "$total" <<'PY' >&2
 from datetime import datetime, timezone
 import json
@@ -50,6 +281,7 @@ print(json.dumps({
     "updated_ts": datetime.now(timezone.utc).isoformat(),
 }, separators=(",", ":"), sort_keys=True), flush=True)
 PY
+  write_direct_status "running" "$phase" "$done" "$total" "$unit" "$vehicle" || true
 }
 
 emit_cycle() {
@@ -124,20 +356,44 @@ finish() {
   local status="$1"
   local reason="$2"
   local exit_code="$3"
+  local terminal_phase="$direct_last_phase"
+  local terminal_done="$direct_last_done"
+  local terminal_total="$direct_last_total"
+  local terminal_unit="$direct_last_unit"
+  local terminal_vehicle="$direct_last_vehicle"
+  case "$status" in
+    completed|completed_no_edge|search_exhausted|llm_provider_failure)
+      terminal_phase="completed"
+      terminal_done=1
+      terminal_total=1
+      terminal_unit="cycles"
+      terminal_vehicle="both"
+      ;;
+  esac
   cycle_finalized=1
   emit_cycle "$status" "$reason" "$exit_code"
+  stop_direct_heartbeat
+  write_direct_status "$status" "$terminal_phase" "$terminal_done" "$terminal_total" \
+    "$terminal_unit" "$terminal_vehicle" \
+    "$status" "$reason" "$exit_code" "${cycle_outcomes[*]-}" || true
   exit "$exit_code"
 }
 
 on_exit() {
   local code=$?
+  stop_direct_heartbeat
   if [ "$cycle_finalized" -eq 0 ]; then
     emit_cycle "failed" "research cycle aborted before completion" "$code"
+    write_direct_status "failed" "$direct_last_phase" "$direct_last_done" \
+      "$direct_last_total" "$direct_last_unit" "$direct_last_vehicle" \
+      "failed" "research cycle aborted before completion" "$code" || true
   fi
   rm -rf "${tmp_dir:-}" 2>/dev/null || true
   exit "$code"
 }
 trap on_exit EXIT
+write_direct_status "running" "startup" 0 1 "steps" "both" || true
+start_direct_heartbeat
 
 # Load only provider keys from an optional, separate dotenv-style file. Never
 # source arbitrary shell and never consult the broker credential file.
@@ -380,6 +636,14 @@ elif [ -z "$dataset" ] || { [ "$dataset" != "-" ] && { [ -d "$dataset" ] || [ ! 
   finish "no_data" "recorded dataset unavailable" 2
 fi
 
+direct_dataset="$dataset"
+direct_partition_root="$partition_root"
+
+# A historical source marker is provenance, not a write barrier: recorder
+# partitions may still grow. Automatic cache identities stay disabled until
+# sealed immutable snapshots exist. Explicit caller-supplied immutable source
+# identity remains the pre-existing opt-in contract below.
+
 validated_input="$dataset"
 if [ "$dataset" = "-" ]; then
   validated_input="$tmp_dir/input.jsonl"
@@ -407,7 +671,10 @@ partitioned=0
 preprocess_cache_hit=0
 preprocess_cache_enabled=0
 cache_lookup_output=""
-cache_source_identity="${ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY:-}"
+cache_source_identity="${ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY:-$direct_source_identity}"
+if [ -z "$direct_source_identity" ]; then
+  direct_source_identity="$cache_source_identity"
+fi
 cache_root="${ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT:-$repo_root/research/cache/preprocessing}"
 if [[ "$cache_root" != /* ]]; then
   cache_root="$repo_root/$cache_root"
@@ -490,6 +757,9 @@ PY
 }
 
 if [ "$preprocess_cache_hit" -eq 1 ]; then
+  # Recheck the immutable source immediately before exposing cached artifacts;
+  # the lookup identity was computed before provider/config preflight and a
+  # recorder overwrite in that interval must never become a cache hit.
   validated_input="$(cache_artifact_path "$cache_lookup_output" validated)" || \
     finish "failed" "preprocessing cache has no validated artifact" 3
   bars_input="$(cache_artifact_path "$cache_lookup_output" bars)" || \
@@ -561,7 +831,9 @@ PY
   validated_input="$normalized_input"
 
   if [ "$preprocess_cache_enabled" -eq 1 ]; then
-    printf '%s\n' "$dataset_report" > "$cache_dataset_report"
+    # The source may have changed while the streaming pass was running. Do not
+    # publish a view under an identity for a different byte snapshot.
+      printf '%s\n' "$dataset_report" > "$cache_dataset_report"
     printf '%s\n' "$vehicle_filter_status" > "$cache_vehicle_report"
     set +e
     cache_publish_output="$($python_bin "$repo_root/deploy/research_cache.py" publish \
@@ -1115,6 +1387,17 @@ run_factory() {
   fi
   emit_progress "factory" 0 1 "tasks" "$vehicle"
   local factory_output_file="$tmp_dir/factory-$vehicle.stdout"
+  local factory_pipe="$tmp_dir/factory-$vehicle.pipe"
+  local factory_pid
+  local line
+  local progress_fields
+  local progress_phase
+  local progress_unit
+  local progress_vehicle
+  local progress_done
+  local progress_total
+  mkfifo "$factory_pipe"
+  : > "$factory_output_file"
   set +e
   ALPACA_RESEARCH_COST_RERUN_ENABLED="${ALPACA_RESEARCH_COST_RERUN_ENABLED:-1}" \
   ALPACA_RESEARCH_COST_RERUN_DIR="${ALPACA_RESEARCH_COST_RERUN_DIR:-$repo_root/runtime/research/diagnostics}" \
@@ -1131,12 +1414,63 @@ run_factory() {
     --alpha "${ALPACA_FACTORY_ALPHA:-0.05}" \
     --max-generations "${ALPACA_FACTORY_MAX_GENERATIONS:-5}" \
     --max-confirmatory-attempts "${ALPACA_FACTORY_MAX_CONFIRMATORY_ATTEMPTS:-3}" \
-    ${diagnostic_flag:+$diagnostic_flag} >"$factory_output_file"
+    ${diagnostic_flag:+$diagnostic_flag} >"$factory_pipe" &
+  factory_pid="$!"
+  # Stream the child's line-oriented JSON while retaining the complete output
+  # for the bounded terminal observability extraction below.  Progress events
+  # are parsed as they arrive so direct invocations expose the actual nested
+  # factory phase instead of waiting for the whole historical run to finish.
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$factory_output_file"
+    printf '%s\n' "$line"
+    case "$line" in
+      *'"schema":"research-progress.v1"'*|*'"schema": "research-progress.v1"'*)
+        progress_fields="$($python_bin - "$line" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except (IndexError, TypeError, ValueError):
+    raise SystemExit(1)
+if not isinstance(payload, dict) or payload.get("schema") != "research-progress.v1":
+    raise SystemExit(1)
+try:
+    done = int(payload.get("done"))
+    total = int(payload.get("total"))
+except (TypeError, ValueError):
+    raise SystemExit(1)
+phase = str(payload.get("phase") or "factory")
+unit = str(payload.get("unit") or "tasks")
+vehicle = str(payload.get("vehicle") or "both")
+print("\t".join((phase, unit, vehicle, str(done), str(total))))
+PY
+        )"
+        if [ $? -eq 0 ]; then
+          IFS=$'\t' read -r progress_phase progress_unit progress_vehicle \
+            progress_done progress_total <<< "$progress_fields"
+          if [ -n "$progress_phase" ] && [ -n "$progress_unit" ] \
+              && [ -n "$progress_vehicle" ] \
+              && [[ "$progress_done" =~ ^[0-9]+$ ]] \
+              && [[ "$progress_total" =~ ^[0-9]+$ ]]; then
+            direct_last_phase="$progress_phase"
+            direct_last_done="$progress_done"
+            direct_last_total="$progress_total"
+            direct_last_unit="$progress_unit"
+            direct_last_vehicle="$progress_vehicle"
+            write_direct_status "running" "$progress_phase" "$progress_done" \
+              "$progress_total" "$progress_unit" "$progress_vehicle" || true
+          fi
+        fi
+        ;;
+    esac
+  done < "$factory_pipe"
+  wait "$factory_pid"
   local status=$?
   set -e
-  # Keep the child's JSON byte-for-byte on stdout while extracting only the
+  rm -f "$factory_pipe"
+  # The child's JSON was forwarded line-by-line above; extract only the
   # bounded additive observability blocks for the terminal cycle record.
-  cat "$factory_output_file"
   local observability
   observability="$(capture_factory_observability "$factory_output_file")"
   cycle_research_funnel="$(printf '%s' "$observability" | "$python_bin" -c 'import json,sys; print(json.dumps((json.load(sys.stdin).get("funnel") or {}), separators=(",",":"), sort_keys=True))')"

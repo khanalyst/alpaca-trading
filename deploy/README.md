@@ -18,7 +18,7 @@ evidence must use the exact IEX or SIP feed; `delayed_sip` is diagnostic only.
 | Service | Responsibility | Durable state |
 | --- | --- | --- |
 | `recorder` | Alpaca bars, quotes, and session observations (paper by default) | `runtime-data` |
-| `trader` | Exactly one paper intraday loop in the shipped `shares` execution profile and broker reconciliation | `runtime-data`, `research-cache` |
+| `trader` | Owned-child supervisor for exactly one paper intraday loop and broker reconciliation | `runtime-data`, `research-cache` |
 | `research` | Scheduled twelve-slot offline factory/replay and shadow-WAL ingestion; no broker authority | `runtime-data`, research volumes |
 | `watchdog` | Independent stale-trader flatten; cancel and close only, never entries | `runtime-data` |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
@@ -43,8 +43,11 @@ keeps that lock through the final position snapshot and flatten action,
 authenticates and binds the broker account fingerprint before any mutation,
 and reports `acted` only after flattening is confirmed. An incomplete attempt
 is `degraded` with residual risk and fails health checks. It cannot help when
-the broker or the network is unreachable, or while a wedged trader still owns
-the lock.
+the broker or the network is unreachable. The trader service now launches
+`deploy/trader_supervisor.py`: after 300 seconds without advancing child
+heartbeats it terminates only its own child, confirms exit, then invokes the
+same locked, authenticated recovery. Recovery persists operator pause before
+broker I/O. It does not relaunch entries automatically.
 
 The recorder runs on a fixed 30-second cadence and writes its mixed
 bars/quotes/options corpus partitioned by New
@@ -575,3 +578,24 @@ Disable the lane before migrating to Compose.
 `ALPACA_EXTERNAL_BACKUP_PATH` is a verified different-device or off-host mount.
 A normal directory on the VM does not prove recovery from VM loss. See the
 backup verification steps in [`../OPERATIONS.md`](../OPERATIONS.md).
+
+## Direct research observability and immutable inputs
+
+`research-cycle.sh` writes `runtime/health/research-direct.json` for each cycle
+process, including direct invocations. `research-direct-status.v1` records the
+owner PID/start, job/build identity, dataset identity, phase/progress, independent
+lease, and terminal outcome. A fresh lease means the process is alive; only
+progress timestamps mean more work completed. Scheduler ownership is unknown
+unless explicitly supplied by `ALPACA_RESEARCH_SCHEDULER_MANAGED`. The dashboard
+shows this beside scheduler status. `ALPACA_RESEARCH_DIRECT_STATUS_FILE` can
+isolate test or diagnostic runs.
+
+Automatic cache identity derivation from historical partition markers is disabled:
+those partitions may still receive recorder writes. The pre-existing explicit
+`ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY` opt-in requires the caller to supply
+an actually frozen source. `historical_source_fingerprint` is diagnostic only;
+it does not certify immutability. A sealed snapshot protocol is unfinished.
+A valid calendar marker without its CSV is ignored on recorder rebuild;
+malformed markers still fail validation. Startup publishes its lease before
+preflight; unexpected exits preserve the last work phase, and older jobs cannot
+overwrite newer status owners.

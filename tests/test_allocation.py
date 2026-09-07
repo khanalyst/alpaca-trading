@@ -1,6 +1,7 @@
 """Portfolio allocation across concurrently proved edges."""
 
 from contextlib import ExitStack, closing
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -128,6 +129,51 @@ class AllocationTests(unittest.TestCase):
     def _resolved(self):
         with self._verified():
             return resolve_validated_variants(_RUNTIME_CONFIG, db_path=self.db)
+
+    def test_opportunity_prefilter_keeps_signaling_edge_for_allocation(self):
+        engine = _Stub(self.db)
+        quiet_record = {"candidate_id": "quiet", "variant_id": "quiet"}
+        live_record = {"candidate_id": "live", "variant_id": "live"}
+        quiet_cfg = {"strategy": {"id": "ibr", "marker": "quiet"}}
+        live_cfg = {"strategy": {"id": "ibr", "marker": "live"}}
+        rows = {"SPY": {"bars": []}}
+
+        def signal_for_config(_symbol, _bars, *, config, **_kwargs):
+            return {"session": "2026-09-07"} if config.get("marker") == "live" else None
+
+        with patch("agent.engine_cycle.generate_ibr_signal",
+                   side_effect=signal_for_config):
+            retained = engine._prefilter_edge_opportunities(
+                [(quiet_record, quiet_cfg), (live_record, live_cfg)],
+                rows=rows, symbols=["SPY"],
+                now=datetime(2026, 9, 7, 14, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(retained, [(live_record, live_cfg)])
+        self.assertEqual(engine.events[-1][0], "opportunity_prefilter_reject")
+        self.assertEqual(engine._allocate_edges(retained, free_slots=1), retained)
+
+    def test_opportunity_prefilter_honors_emission_and_exposure_state(self):
+        engine = _Stub(self.db)
+        used_record = {"candidate_id": "used", "variant_id": "used"}
+        other_record = {"candidate_id": "other", "variant_id": "other"}
+        cfg = {"strategy": {"id": "ibr", "marker": "signal"}}
+        rows = {"SPY": {"bars": []}}
+
+        with patch("agent.engine_cycle.generate_ibr_signal",
+                   return_value={"session": "2026-09-07"}):
+            self.assertEqual(
+                engine._prefilter_edge_opportunities(
+                    [(used_record, cfg), (other_record, cfg)], rows=rows, symbols=["SPY"],
+                    now=datetime(2026, 9, 7, 14, 0, tzinfo=timezone.utc),
+                    signal_sessions={"used|SPY": "2026-09-07",
+                                     "other|SPY": "2026-09-07"}),
+                [])
+            self.assertEqual(
+                engine._prefilter_edge_opportunities(
+                    [(used_record, cfg), (other_record, cfg)], rows=rows, symbols=["SPY"],
+                    now=datetime(2026, 9, 7, 14, 0, tzinfo=timezone.utc),
+                    blocked_symbols={"SPY"}),
+                [])
 
     def test_verified_frozen_dependence_cluster_keeps_one_strongest_edge(self):
         left = {"candidate_id": "a", "variant_id": "a", "family": "alpha",

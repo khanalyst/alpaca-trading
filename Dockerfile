@@ -30,4 +30,4 @@ RUN mkdir -p runtime research/cache research/results/edges \
 
 USER 10001:10001
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "main.py", "run"]
+CMD ["python", "deploy/trader_supervisor.py"]

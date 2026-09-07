@@ -20,6 +20,7 @@ from collections import Counter
 from contextlib import ExitStack
 import csv
 from datetime import date, datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -33,6 +34,7 @@ QUOTE_KINDS = {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}
 OPTION_KINDS = {"option", "option_snapshot", "option_quote"}
 _PARTITION_NAME = re.compile(r"market-(\d{4}-\d{2}-\d{2})\.csv\Z")
 _NEW_YORK = ZoneInfo("America/New_York")
+SOURCE_IDENTITY_SCHEMA = "research-source-identity.v1"
 
 
 def apply_partition_source(payload: dict, session_day: str,
@@ -372,6 +374,71 @@ def _partition_source_sidecars(source_paths: Sequence[Path],
             continue
         result[partition] = {"source_mode": source_mode}
     return result or None
+
+
+def historical_source_fingerprint(
+        *, partition_root: Path, session_window: int = 0,
+        recorded_root: Path | None = None) -> dict | None:
+    """Fingerprint historical recorder bytes without claiming immutability.
+
+    This is a diagnostic fingerprint only. Historical provenance does not
+    prevent later recorder appends, so this helper cannot certify immutability
+    or enable preprocessing cache reuse. It covers selected CSV bytes and
+    metadata and detects per-file mutations during hashing. A sealed snapshot
+    protocol is required before a caller can rely on cross-file consistency.
+    """
+    root = Path(partition_root)
+    paths = _partition_paths(root, int(session_window))
+    corpus_root = (Path(recorded_root) if recorded_root is not None else
+                   root.parent)
+    _assert_recorded_root_binding(paths, corpus_root)
+    source_markers = _partition_source_sidecars(paths, corpus_root)
+    selected_names = {path.name for path in paths}
+    if (not isinstance(source_markers, Mapping) or
+            set(source_markers) != selected_names or
+            any((not isinstance(value, Mapping) or
+                 value.get("source_mode") != "historical_backfill")
+                for value in source_markers.values())):
+        return None
+
+    sidecars: list[Path] = []
+    for path in paths:
+        for suffix in (".source.json", ".calendar.json"):
+            candidate = path.with_name(path.name + suffix)
+            if candidate.is_file():
+                sidecars.append(candidate)
+    aggregate = corpus_root / ".recorder-index.json"
+    if aggregate.is_file():
+        sidecars.append(aggregate)
+
+    files = [*paths, *sorted(set(sidecars))]
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for path in files:
+        before = _stat_identity(path)
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    total_bytes += len(chunk)
+        except OSError as exc:
+            raise ValueError(f"cannot hash immutable source {path}: {exc}") from exc
+        if _stat_identity(path) != before:
+            raise ValueError(f"source mutated while hashing: {path}")
+    return {
+        "schema": SOURCE_IDENTITY_SCHEMA,
+        "identity": "sha256:" + digest.hexdigest(),
+        "immutable": False,
+        "source_mode": "historical_backfill",
+        "partition_count": len(paths),
+        "bytes": total_bytes,
+        "files": [path.name for path in files],
+    }
 
 
 def _assert_recorded_root_binding(source_paths: Sequence[Path],

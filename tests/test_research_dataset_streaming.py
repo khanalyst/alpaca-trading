@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from deploy.research_dataset import build_views
+from deploy.research_dataset import build_views, historical_source_fingerprint
 
 
 HEADER = [
@@ -32,6 +32,58 @@ def _outputs(root: Path) -> dict[str, Path]:
 
 
 class ResearchDatasetStreamingTests(unittest.TestCase):
+    def test_historical_fingerprint_changes_on_bytes_but_is_not_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            sessions = corpus / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99,
+                "close": 100, "volume": 10,
+            }])
+            partition.with_name(partition.name + ".source.json").write_text(
+                json.dumps({
+                    "schema": "recorder-partition-source.v1",
+                    "partition": partition.name,
+                    "source_mode": "historical_backfill",
+                }), encoding="utf-8")
+            first = historical_source_fingerprint(
+                partition_root=sessions, recorded_root=corpus)
+            self.assertIsNotNone(first)
+            self.assertFalse(first["immutable"])
+            self.assertTrue(first["identity"].startswith("sha256:"))
+
+            # A same-size rewrite must invalidate the identity.  This is the
+            # property a size/mtime-only cache key cannot provide.
+            raw = partition.read_bytes()
+            replacement = raw.replace(b",100,10", b",101,10", 1)
+            self.assertEqual(len(replacement), len(raw))
+            partition.write_bytes(replacement)
+            second = historical_source_fingerprint(
+                partition_root=sessions, recorded_root=corpus)
+            self.assertNotEqual(first["identity"], second["identity"])
+
+    def test_immutable_identity_stays_disabled_for_unmarked_forward_partition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99,
+                "close": 100, "volume": 10,
+            }])
+            self.assertIsNone(historical_source_fingerprint(
+                partition_root=sessions, recorded_root=root))
+
     def test_trusted_recorder_unmarked_partition_gets_explicit_forward_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

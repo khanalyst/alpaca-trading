@@ -154,7 +154,7 @@ class LLMRuleStrategyTests(unittest.TestCase):
             for branch in option["properties"]["rule_spec"]["anyOf"]
         }
         self.assertEqual(equity_schemas, {"rule-strategy.v1", "rule-strategy.v2",
-                                          RULE_SCHEMA_V3, RULE_SCHEMA_V4})
+                                          RULE_SCHEMA_V3, RULE_SCHEMA_V4, "rule-strategy.v5"})
         self.assertEqual(option_schemas, {"rule-strategy.v1", "rule-strategy.v2"})
 
     def test_evidence_hashes_the_vehicle_specific_rule_grammar(self):

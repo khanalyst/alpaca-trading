@@ -15,7 +15,7 @@ Environment=ALPACA_AGENT_SECRETS_FILE=/etc/alpaca-agent-trading/agent.env
 Environment=ALPACA_DATA_FEED=iex
 Environment=ALPACA_STOCK_FEED=iex
 Environment=ALPACA_OPTIONS_FEED=indicative
-ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/main.py run
+ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/deploy/trader_supervisor.py
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5

@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
-    RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, SESSION_MINUTES,
+    RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, SESSION_MINUTES,
     V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS, V4_DEFAULT_EXTENSIONS,
     canonical_exit_reason, completed_bar_exit_transition, evaluate_rule_signal,
     evaluate_rule_signal_trace, frozen_target_reference,
@@ -1180,6 +1180,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     "residual_return", "market_context_digest",
                     "candidate_behavior_identity")
             })
+        if signal.get("intraday_context") is not None:
+            trade_row["intraday_context"] = signal["intraday_context"]
         if spec.get("breakeven_r") is not None:
             trade_row.update({
                 "breakeven_r": spec["breakeven_r"],
@@ -1188,7 +1190,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
             })
-        if spec.get("schema") == RULE_SCHEMA_V4:
+        if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
             trade_row.update({
                 "initial_stop_price": exit_state["initial_stop_price"],
                 "active_stop_price": exit_state["active_stop_price"],
@@ -1707,6 +1709,9 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             exit_price, exit_price, quantity, multiplier, vehicle=vehicle) / 2.0
         fees = entry_fees + exit_fees
         net = gross - fees
+        reference_pnl = ((raw["exit_reference"] - raw["entry_reference"])
+                         if execution_direction == "long" else
+                         (raw["entry_reference"] - raw["exit_reference"])) * quantity * multiplier
         row = {key: value for key, value in raw.items() if not key.startswith("_")}
         if (mark_has_historical_evidence or
                 str(row.get("evidence_mode") or "").strip().lower() ==
@@ -1714,6 +1719,10 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             row["evidence_mode"] = DIAGNOSTIC_HISTORICAL_BACKFILL
         row.update({"quantity": quantity, "entry_price": entry, "exit_price": exit_price,
                     "gross_pnl": gross, "costs": fees, "net_pnl": net,
+                    "reference_price_pnl": reference_pnl,
+                    "modeled_execution_drag": reference_pnl - gross,
+                    "pnl_basis": "modeled_fill_prices_minus_fees",
+                    "reference_pnl_basis": "executable_references_may_already_include_bid_ask_crossing",
                     "risk_usd": risk_usd,
                     "nominal_risk_usd": nominal_risk_usd,
                     "r_multiple": net / risk_usd if risk_usd > 0 else None,
@@ -1853,31 +1862,62 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0,
                              not row.get("reject_reason"))]
     reject_reasons = [str(row.get("reject_reason") or "").strip()
                       for row in refused_rows]
-    execution_blocked = (bool(refused_rows) and not trades and
-                         not unclassified_rows and all(reject_reasons) and
-                         all(row.get("signal_opportunity") is not False
-                             for row in refused_rows))
+    # Data absence is not a generated signal. Mixed data + risk refusals must
+    # still expose the actionable opportunities that could not be executed.
+    data_refusals = [row for row in refused_rows if row.get("signal_opportunity") is False]
+    signal_refusals = [row for row in refused_rows if row.get("signal_opportunity") is not False]
+    execution_blocked = bool(signal_refusals) and not all_trades and not unclassified_rows
     if execution_blocked:
         failure = "execution_blocked"
     elif len(trades) < max(3, len(sessions) // 3):
-        failure = "insufficient_signals"
+        failure = "insufficient_signals"  # retained legacy tuning category
     elif expectancy <= 0:
         failure = "negative_expectancy"
-    elif len(wins) / len(trades) < .35:
-        failure = "low_win_rate"
-    elif profit_factor < 1.1:
-        failure = "poor_payoff"
     elif drawdown > starting_cash * .05:
         failure = "excess_drawdown"
     else:
+        # Win rate and payoff are jointly meaningful. A low hit-rate system
+        # with sufficiently large wins is not rejected by an arbitrary 35%.
         failure = "none"
+    if not trades:
+        evidence_status = (
+            "diagnostic_evidence_only" if all_trades else
+            "data_and_execution_blocked" if data_refusals and signal_refusals else
+            "execution_blocked" if signal_refusals else
+            "missing_market_data" if data_refusals else
+            "no_entry_signal" if no_signal_rows and not unclassified_rows else
+            "insufficient_observations")
+    elif failure == "insufficient_signals":
+        evidence_status = "insufficient_trade_sample"
+    else:
+        evidence_status = "measured_negative_expectancy" if expectancy <= 0 else "positive_point_estimate"
+    average_win = mean(wins) if wins else None
+    average_loss = abs(mean(losses)) if losses else None
+    payoff = average_win / average_loss if average_win is not None and average_loss else None
+    # Conditional on non-flat outcomes; the net wins/losses already include
+    # costs. No fixed target-R approximation is substituted for actual exits.
+    break_even = (average_loss / (average_win + average_loss)
+                  if average_win is not None and average_loss is not None else None)
+    gross_known = bool(trades) and all(isinstance(row.get("gross_pnl"), (int, float))
+        and math.isfinite(float(row["gross_pnl"])) for row in trades)
+    gross_pnl = sum(float(row["gross_pnl"]) for row in trades) if gross_known else None
     discontinuity_rows = [row for row in all_trades if bool(
         row.get("hold_discontinuity_exit", row.get("hold_discontinuity")))]
     discontinuity_exits = len(discontinuity_rows)
     time_expiry_exits = sum(
         row.get("hold_exit_reason") == "time_expiry" for row in trades)
     return {
-        "primary_failure": failure, "trades": len(trades),
+        "primary_failure": failure, "evidence_status": evidence_status,
+        "edge_proven": False, "trades": len(trades),
+        "data_rejection_count": len(data_refusals),
+        "signal_execution_rejection_count": len(signal_refusals),
+        "average_net_win": average_win, "average_net_loss": average_loss,
+        "net_payoff_ratio": payoff, "break_even_nonflat_win_rate": break_even,
+        "nonflat_win_rate": len(wins) / (len(wins) + len(losses)) if wins or losses else None,
+        "gross_pnl": gross_pnl,
+        "fees_after_fill_prices": gross_pnl - sum(pnl) if gross_known else None,
+        "pnl_basis": "gross_at_modeled_fill_prices_minus_fees",
+        "measured_net_expectancy": expectancy if trades else None,
         "authorizing_trades": len(authorizing_trades),
         "executed_trades": len(all_trades),
         "sessions": len(sessions), "net_pnl": sum(pnl), "expectancy": expectancy,
@@ -1888,8 +1928,9 @@ def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0,
         "execution_rejection_count": len(refused_rows),
         "no_signal_count": len(no_signal_rows),
         "unclassified_no_trade_count": len(unclassified_rows),
-        "win_rate": len(wins) / len(trades) if trades else 0.0,
-        "profit_factor": profit_factor if math.isfinite(profit_factor) else 999.0,
+        "win_rate": len(wins) / len(trades) if trades else None,
+        "profit_factor": profit_factor if trades and losses else None,
+        "profit_factor_status": "measured" if losses else "no_losses" if wins else "unavailable",
         "max_drawdown": drawdown,
         "stop_rate": (sum(row.get("exit_reason") == "stop" for row in trades) / len(trades)
                       if trades else 0.0),
@@ -2036,7 +2077,7 @@ def _family_exit_hypothesis(root: Mapping[str, Any]) -> dict | None:
     remaining first-batch members retain fixed-R behavior, so an unavailable
     fair-value reference cannot suppress the entire batch.
     """
-    if root.get("schema") != RULE_SCHEMA_V4:
+    if root.get("schema") not in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         return None
     family = str(root.get("family") or "")
     if family == "mean_reversion":

@@ -12,7 +12,7 @@ import tempfile
 import types
 import unittest
 from inspect import getattr_static
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent.alpaca_domain import Account, Asset, CalendarDay, MarketClock, Order, Position, Quote
 from agent.alpaca_provider import AlpacaError, AlpacaProvider, AlpacaSession, PaperModeError
@@ -1655,6 +1655,95 @@ class RuntimeSafetyTests(unittest.TestCase):
         result = engine.run_once({})
         self.assertEqual(result["reason"], "latest_entry_time_passed")
         self.assertEqual(provider.orders_sent, [])
+
+    def test_daily_risk_runs_before_edge_and_entry_cutoff_returns(self):
+        class CycleProbe(EngineCycleMixin):
+            def __init__(self, *, edge=True, cutoff=True, daily_stop=False,
+                         monitor=None):
+                self.run_id = "cycle-probe"
+                self._edge_error = "no current validated edge"
+                self._ensure_order_ready = lambda: True
+                self._validated_clock_timestamp = lambda clock: clock.timestamp
+                self._required_number = lambda value, name: float(value)
+                self._inside_regular_session = lambda clock: True
+                self._universe = lambda: ["SPY"]
+                self._collect = lambda *args: {"SPY": {}}
+                self._event = lambda *args, **kwargs: None
+                self._monitor_positions = lambda *args, **kwargs: (
+                    monitor if monitor is not None else {})
+                self._refresh_edge = lambda: edge
+                self._latest_entry_allowed = lambda now: cutoff
+                self.market = type("Market", (), {
+                    "refresh_calendar": lambda _self: None,
+                    "clock": lambda _self: type("Clock", (), {
+                        "timestamp": datetime(2026, 9, 4, 19, 30,
+                                                tzinfo=timezone.utc),
+                        "is_open": True,
+                    })(),
+                    "should_force_flat": lambda _self, now: False,
+                    "can_enter": lambda _self, now: True,
+                })()
+                self.reconcile = lambda: {
+                    "positions": [{"symbol": "SPY", "market_value": 24000}],
+                }
+                self.provider = type("Provider", (), {
+                    "account": Mock(return_value={"equity": 97000}),
+                    "positions": Mock(return_value=[]),
+                })()
+                self._update_daily_risk = Mock(return_value=(
+                    -3000, daily_stop))
+                self.flatten_all = Mock(return_value=True)
+
+        for label, kwargs, expected_reason in (
+                ("after_entry_cutoff", {"cutoff": False},
+                 "latest_entry_time_passed"),
+                ("invalidated_edge", {"edge": False},
+                 "no current validated edge")):
+            with self.subTest(label=label):
+                probe = CycleProbe(**kwargs)
+                result = probe._run_once_impl()
+                self.assertEqual(result["reason"], expected_reason)
+                self.assertEqual(probe.provider.account.call_count, 1)
+                self.assertEqual(probe._update_daily_risk.call_count, 1)
+                self.assertEqual(probe.flatten_all.call_count, 0)
+
+        # A breached stop is acted on before either entry gate can return.
+        probe = CycleProbe(edge=False, cutoff=False, daily_stop=True)
+        result = probe._run_once_impl()
+        self.assertEqual(result["action"], "day_stopped")
+        self.assertEqual(probe.provider.account.call_count, 1)
+        self.assertEqual(probe._update_daily_risk.call_count, 1)
+        self.assertEqual(probe.flatten_all.call_count, 1)
+
+        # A close submitted by the position monitor must not bypass the same
+        # portfolio loss check while another position remains exposed.
+        probe = CycleProbe(monitor={"closed": [{"symbol": "SPY"}]})
+        result = probe._run_once_impl()
+        self.assertEqual(result["action"], "close")
+        self.assertEqual(probe.provider.account.call_count, 1)
+        self.assertEqual(probe._update_daily_risk.call_count, 1)
+
+        probe = CycleProbe(daily_stop=True, monitor={
+            "failed": [{"symbol": "SPY", "reason": "close_failed"}]})
+        result = probe._run_once_impl()
+        self.assertEqual(result["action"], "day_stopped")
+        probe.flatten_all.assert_called_once_with("daily_loss_limit")
+
+    def test_position_monitor_failure_still_checks_portfolio_risk(self):
+        # Failure to close one position must not prevent a portfolio stop.
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        engine._ensure_order_ready = lambda: True
+        engine._validated_clock_timestamp = lambda clock: provider.now
+        engine._monitor_positions = lambda *args, **kwargs: {
+            "failed": [{"symbol": "SPY", "reason": "close_failed"}],
+            "closed": [],
+        }
+        with patch.object(engine, "_update_daily_risk", return_value=(0, False)) as daily:
+            result = engine.run_once({})
+        self.assertEqual(result["reason"], "position_close_failed")
+        daily.assert_called_once()
 
     @staticmethod
     def _prove(ledger, variant_id, *, confidence=.99):

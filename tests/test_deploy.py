@@ -33,14 +33,17 @@ from agent.alpaca_provider import AlpacaProvider, AlpacaSession
 # keeps generated artifacts out of the working copy no matter which invocation
 # a later test adds; every call site builds its environment from ``os.environ``.
 _ARTIFACTS: tempfile.TemporaryDirectory | None = None
+_PRIOR_DIRECT_STATUS: str | None = None
 
 
 def setUpModule() -> None:                                     # noqa: N802
-    global _ARTIFACTS
+    global _ARTIFACTS, _PRIOR_DIRECT_STATUS
     _ARTIFACTS = tempfile.TemporaryDirectory(prefix="alpaca-test-artifacts.")
     root = Path(_ARTIFACTS.name)
     os.environ["ALPACA_RESEARCH_REPORT_DIR"] = str(root / "reports")
     os.environ["ALPACA_RESEARCH_PROOF_DIR"] = str(root / "proofs")
+    _PRIOR_DIRECT_STATUS = os.environ.get("ALPACA_RESEARCH_DIRECT_STATUS_FILE")
+    os.environ["ALPACA_RESEARCH_DIRECT_STATUS_FILE"] = str(root / "direct-status.json")
     # Keep legacy recorder fakes on one request; chunking itself has dedicated
     # tests with a deliberately small window.
     os.environ["ALPACA_RECORDER_FETCH_WINDOW_MINUTES"] = "1000000"
@@ -49,6 +52,10 @@ def setUpModule() -> None:                                     # noqa: N802
 
 
 def tearDownModule() -> None:                                  # noqa: N802
+    if _PRIOR_DIRECT_STATUS is None:
+        os.environ.pop("ALPACA_RESEARCH_DIRECT_STATUS_FILE", None)
+    else:
+        os.environ["ALPACA_RESEARCH_DIRECT_STATUS_FILE"] = _PRIOR_DIRECT_STATUS
     for name in ("ALPACA_RESEARCH_REPORT_DIR", "ALPACA_RESEARCH_PROOF_DIR",
                  "ALPACA_RECORDER_FETCH_WINDOW_MINUTES",
                  "ALPACA_RECORDER_BAR_GAP_MINUTES",
@@ -946,6 +953,31 @@ class DeployTests(unittest.TestCase):
                      if item.get("schema") == "research-cycle-views.v1"]
             self.assertEqual(views[0]["bars"], 1)
 
+    def test_research_cycle_publishes_direct_status_with_owner_pid_and_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "research-direct.json"
+            missing = root / "missing.jsonl"
+            config = Path(__file__).parents[1] / "config.yaml"
+            env = dict(os.environ, PYTHON=sys.executable,
+                       ALPACA_AGENT_CONFIG=str(config),
+                       ALPACA_RESEARCH_DATASET=str(missing),
+                       ALPACA_RESEARCH_DIRECT_STATUS_FILE=str(status),
+                       ALPACA_RESEARCH_LLM_SECRETS_FILE="/dev/null",
+                       ALPACA_RESEARCH_DIRECT_HEARTBEAT_SECONDS="1")
+            result = subprocess.run(
+                ["deploy/research-cycle.sh"], cwd=Path(__file__).parents[1],
+                env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 3)
+            payload = json.loads(status.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema"], "research-direct-status.v1")
+            self.assertEqual(payload["execution_mode"], "direct")
+            self.assertFalse(payload["scheduler_managed"])
+            self.assertEqual(payload["pid"], payload["lease_owner_pid"])
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["terminal"]["schema"], "research-cycle.v1")
+            self.assertEqual(payload["terminal"]["exit_code"], 3)
+
     def test_research_cycle_quarantines_legacy_observation_inversions(self):
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
@@ -1785,6 +1817,26 @@ class DeployTests(unittest.TestCase):
             expected = datetime(2026, 8, 8, 13, 29, 1,
                                 tzinfo=timezone.utc)
             self.assertEqual(fake.starts[-2:], [expected, expected])
+
+    def test_recorder_ignores_valid_orphan_calendar_marker_but_rejects_corrupt_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "market.csv"
+            sessions = output.parent / recorder.PARTITION_DIR
+            sessions.mkdir()
+            orphan = sessions / "market-2026-08-07.csv.calendar.json"
+            orphan.write_text(json.dumps({
+                "schema": recorder.PARTITION_CALENDAR_SCHEMA,
+                "partition": "market-2026-08-07.csv",
+                "open": "2026-08-07T13:30:00+00:00",
+                "close": "2026-08-07T20:00:00+00:00",
+                "source": "alpaca_calendar",
+            }), encoding="utf-8")
+            self.assertEqual(recorder._partition_calendars_from_markers(output), {})
+
+            orphan.write_text("not-json", encoding="utf-8")
+            with self.assertRaisesRegex(
+                    RuntimeError, "invalid recorder partition calendar marker"):
+                recorder._partition_calendars_from_markers(output)
 
     def test_recorder_chunks_a_stale_quote_catch_up_window(self):
         fake = _QuoteChunkFake()
@@ -3237,9 +3289,9 @@ class DeployTests(unittest.TestCase):
                 "d.trial", "Paper-account trials", "Promotable", "config_snippet",
                 # What was pinned, and whether it can actually trade.
                 "d.promotions", "Pinned promotions", "Pinned but NOT trading",
-                "notify only",
+                "automatic substitution",
                 # Which strategy and variant each real fill came from.
-                "d.journal", "Trades by edge", "Recent trades, attributed",
+                "d.journal", "Trades by edge", "Recent fills, attributed",
                 "variant_id",
                 # Why research tried what it tried.
                 "d.learning", "What research learned", "built_on",
@@ -3276,7 +3328,9 @@ class DeployTests(unittest.TestCase):
         by_variant = {row["variant_id"]: row for row in view["by_variant"]}
         self.assertEqual(by_variant["rule.a.1"]["trades"], 2)
         self.assertEqual(by_variant["rule.a.1"]["total_r"], 1.0)
-        self.assertEqual(by_variant["rule.a.1"]["win_rate"], 0.5)
+        self.assertIsNone(by_variant["rule.a.1"]["win_rate"])
+        self.assertEqual(by_variant["rule.a.1"]["gross_win_rate"], 0.5)
+        self.assertEqual(by_variant["rule.a.1"]["r_basis"], "gross_legacy_unknown_cost")
         self.assertEqual(by_variant["rule.b.2"]["realized_pnl_usd"], 50.0)
 
     def test_dashboard_journal_view_degrades_without_a_journal(self):

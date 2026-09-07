@@ -17,13 +17,15 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from . import register
+from .market_context import completed_context
 
 
 RULE_SCHEMA_V1 = "rule-strategy.v1"
 RULE_SCHEMA_V2 = "rule-strategy.v2"
 RULE_SCHEMA_V3 = "rule-strategy.v3"
 RULE_SCHEMA_V4 = "rule-strategy.v4"
-RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4)
+RULE_SCHEMA_V5 = "rule-strategy.v5"
+RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5)
 # ``RULE_SCHEMA`` remains the v1 name so existing callers, stored specs, and
 # content hashes are untouched.  v2 is a strict superset reached only by
 # writing its schema string explicitly.
@@ -151,6 +153,22 @@ _V4_BOUNDS = {
     "trailing_stop_r": (0.0, 10.0, float),
     "exit_before_minutes": (1, SESSION_MINUTES - 1, int),
 }
+# v5 changes entry meaning only when explicitly enabled. Old maps/hashes stay
+# unchanged; neutral v5 specs share the semantic identity of their v4 parent.
+V5_DEFAULT_EXTENSIONS: dict[str, Any] = {
+    "regime_mode": "none",
+    "regime_timeframe_minutes": 5,
+    "regime_lookback_bars": 6,
+    "regime_efficiency_threshold": 0.4,
+    "entry_trigger": "legacy",
+    "pullback_bars": 3,
+}
+_V5_BOUNDS = {
+    "regime_timeframe_minutes": (5, 15, int),
+    "regime_lookback_bars": (3, 24, int),
+    "regime_efficiency_threshold": (0.0, 1.0, float),
+    "pullback_bars": (2, 10, int),
+}
 _EXTRA_CONFIRMATIONS = tuple(name for name in CONFIRMATIONS if name != "none")
 MAX_CONFIRMATIONS = len(_EXTRA_CONFIRMATIONS)
 
@@ -266,6 +284,12 @@ def _causal_maturity_bars(spec: Mapping[str, Any]) -> int:
     if (spec.get("target_mode") == "rolling_mean" and
             spec.get("target_lookback") is not None):
         needed = max(needed, int(spec["target_lookback"]))
+    if spec.get("regime_mode", "none") != "none":
+        needed = max(needed, spec["regime_timeframe_minutes"] *
+                     (spec["regime_lookback_bars"] + 1) - 1)
+    if spec.get("entry_trigger") == "reclaim":
+        base = spec["slow_lookback"] if family == "trend_pullback" else spec["lookback"]
+        needed = max(needed, base + spec["pullback_bars"] + 1)
     return max(1, int(needed))
 
 
@@ -296,7 +320,12 @@ def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     if (family in SESSION_ACCUMULATING_FAMILIES | OPENING_ANCHORED_FAMILIES or
             spec.get("target_mode") == "session_vwap"):
         return None
-    return _causal_maturity_bars(spec)
+    needed = _causal_maturity_bars(spec)
+    if spec.get("regime_mode", "none") != "none":
+        # Retain enough minutes for N completed buckets at every alignment.
+        needed = max(needed, (spec["regime_lookback_bars"] + 1) *
+                     spec["regime_timeframe_minutes"] - 1)
+    return needed
 
 
 def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
@@ -317,6 +346,11 @@ def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
     if spec.get("family") == "cross_sectional_residual" and \
             "eligible_symbols" in spec:
         fields.add("eligible_symbols")
+    if spec.get("regime_mode", "none") != "none":
+        fields.update(("regime_mode", "regime_timeframe_minutes",
+                       "regime_lookback_bars", "regime_efficiency_threshold"))
+    if spec.get("entry_trigger", "legacy") != "legacy":
+        fields.update(("entry_trigger", "pullback_bars"))
     return fields
 
 
@@ -332,17 +366,17 @@ def rule_semantic_signature(value: Mapping[str, Any]) -> str:
     spec = validate_rule_spec(value)
     effective = {name: spec[name] for name in _semantic_fields(spec)
                  if name in spec}
-    if spec.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if spec.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         for name, default in V2_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
                 effective[name] = current
-    if spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         for name, default in V3_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
                 effective[name] = current
-    if spec.get("schema") == RULE_SCHEMA_V4:
+    if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         for name, default in V4_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
@@ -373,7 +407,7 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
     # local scale for floats, while retaining the audited span for discrete
     # integer coordinates such as lookback. Validation above remains the
     # source of truth for legal ranges.
-    bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS, **_V4_BOUNDS}
+    bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS, **_V4_BOUNDS, **_V5_BOUNDS}
     fields = _semantic_fields(a) | _semantic_fields(b)
     for name, default in V2_DEFAULT_EXTENSIONS.items():
         if a.get(name, default) != default or b.get(name, default) != default:
@@ -425,7 +459,7 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             "confirmation": {"type": "string", "enum": list(CONFIRMATIONS)},
         }
         required = list(DEFAULT_RULE_SPEC)
-        if name in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+        if name in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
             common_properties.update({
                 "confirmations": {"type": "array", "maxItems": MAX_CONFIRMATIONS,
                                   "uniqueItems": True,
@@ -438,12 +472,12 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
                 "max_atr_bps": {"type": "number", "minimum": 1.0, "maximum": 5000.0},
             })
             required += list(V2_DEFAULT_EXTENSIONS)
-        if name in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+        if name in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
             common_properties["breakeven_r"] = {
                 "type": ["number", "null"], "minimum": 0.0, "maximum": 10.0,
             }
             required += list(V3_DEFAULT_EXTENSIONS)
-        if name == RULE_SCHEMA_V4:
+        if name in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
             common_properties.update({
                 # Strict structured-output providers require every property
                 # to be listed in ``required``.  These v4 fields remain
@@ -468,6 +502,16 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             # deadline are the neutral defaults.  The provider-facing schema
             # represents omission as null because strict providers do not
             # permit an optional property; validation fills these defaults.
+        if name == RULE_SCHEMA_V5:
+            common_properties.update({
+                "regime_mode": {"type": "string", "enum": ["none", "trend", "range"]},
+                "regime_timeframe_minutes": {"type": "integer", "enum": [5, 15]},
+                "regime_lookback_bars": {"type": "integer", "minimum": 3, "maximum": 24},
+                "regime_efficiency_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+                "entry_trigger": {"type": "string", "enum": ["legacy", "reclaim"]},
+                "pullback_bars": {"type": "integer", "minimum": 2, "maximum": 10},
+            })
+            required += list(V5_DEFAULT_EXTENSIONS)
         def branch(family: dict[str, Any], *, eligible: bool) -> dict[str, Any]:
             properties = {**common_properties, "family": family}
             if eligible:
@@ -485,7 +529,7 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             branch_required = list(required)
             if eligible:
                 branch_required.append("eligible_symbols")
-            if name == RULE_SCHEMA_V4:
+            if name in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
                 branch_required.extend(V4_DEFAULT_EXTENSIONS)
             return {"type": "object", "additionalProperties": False,
                     "required": branch_required, "properties": properties}
@@ -562,14 +606,18 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         raise RuleSpecError(
             f"rule_spec.schema must be one of {', '.join(map(repr, RULE_SCHEMAS))}")
     permitted = set(DEFAULT_RULE_SPEC) | {"eligible_symbols"}
-    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         permitted |= set(V2_DEFAULT_EXTENSIONS)
-    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         permitted |= set(V3_DEFAULT_EXTENSIONS)
-    if schema == RULE_SCHEMA_V4:
+    if schema in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         permitted |= set(V4_DEFAULT_EXTENSIONS)
+    if schema == RULE_SCHEMA_V5:
+        permitted |= set(V5_DEFAULT_EXTENSIONS)
     unknown = sorted(set(value) - permitted)
     if unknown:
+        if any(name in V5_DEFAULT_EXTENSIONS for name in unknown):
+            raise RuleSpecError(f"context fields require schema {RULE_SCHEMA_V5!r}")
         # A v1 spec naming a v2 field is a version error, not a typo: say so.
         v3_extensions = [name for name in unknown if name in V3_DEFAULT_EXTENSIONS]
         if v3_extensions:
@@ -588,12 +636,14 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
                 f"schema {RULE_SCHEMA_V4!r}")
         raise RuleSpecError(f"rule_spec has unknown field(s): {', '.join(unknown)}")
     spec = dict(DEFAULT_RULE_SPEC)
-    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         spec.update(V2_DEFAULT_EXTENSIONS)
-    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         spec.update(V3_DEFAULT_EXTENSIONS)
-    if schema == RULE_SCHEMA_V4:
+    if schema in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         spec.update(V4_DEFAULT_EXTENSIONS)
+    if schema == RULE_SCHEMA_V5:
+        spec.update(V5_DEFAULT_EXTENSIONS)
     # Strict provider schemas encode legacy-optional properties as required
     # nullable values.  Treat null as omission for fields whose documented
     # defaults preserve the old caller contract.  ``breakeven_r`` and the two
@@ -710,6 +760,27 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
             raise RuleSpecError(
                 f"rule_spec.{name} must be between {lower:g} and {upper:g}, or null")
         spec[name] = number
+    if schema == RULE_SCHEMA_V5:
+        if spec["regime_mode"] not in {"none", "trend", "range"}:
+            raise RuleSpecError("rule_spec.regime_mode must be none, trend, or range")
+        if spec["entry_trigger"] not in {"legacy", "reclaim"}:
+            raise RuleSpecError("rule_spec.entry_trigger must be legacy or reclaim")
+        if spec["entry_trigger"] == "reclaim" and spec["family"] not in {
+                "trend_pullback", "mean_reversion", "vwap_reversion"}:
+            raise RuleSpecError("reclaim requires a pullback or reversion family")
+        for name, (lower, upper, cast) in _V5_BOUNDS.items():
+            raw = spec[name]
+            if isinstance(raw, bool) or (cast is int and not isinstance(raw, int)):
+                raise RuleSpecError(f"rule_spec.{name} has an invalid type")
+            try:
+                number = cast(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuleSpecError(f"rule_spec.{name} must be numeric") from exc
+            if not math.isfinite(number) or not lower <= number <= upper:
+                raise RuleSpecError(f"rule_spec.{name} is outside its bounds")
+            spec[name] = number
+        if spec["regime_timeframe_minutes"] not in {5, 15}:
+            raise RuleSpecError("regime_timeframe_minutes must be 5 or 15")
     return spec
 
 
@@ -1108,7 +1179,7 @@ def rule_vehicle_executable(spec: Mapping[str, Any], vehicle: str) -> bool:
     normalized = validate_rule_spec(spec)
     if normalized["family"] == "cross_sectional_residual":
         return str(vehicle or "").lower() in {"equity", "share", "shares"}
-    return not (normalized["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4} and
+    return not (normalized["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5} and
                 str(vehicle or "").lower() in {"option", "options"})
 
 
@@ -1385,7 +1456,7 @@ def _session_minutes(stamp: datetime) -> float:
 
 
 def _within_entry_window(spec: Mapping[str, Any], stamp: datetime) -> bool:
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         return True
     elapsed = _session_minutes(stamp)
     return (float(spec["entry_after_minutes"]) <= elapsed <
@@ -1407,7 +1478,7 @@ def entry_window_bounds(value: Mapping[str, Any]) -> tuple[float, float]:
     predicate instead of a copy that can drift away from it.
     """
     spec = validate_rule_spec(value)
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         return 0.0, float(SESSION_MINUTES)
     return (float(spec["entry_after_minutes"]),
             float(spec["entry_before_minutes"]))
@@ -1415,7 +1486,7 @@ def entry_window_bounds(value: Mapping[str, Any]) -> tuple[float, float]:
 
 def _within_volatility_band(spec: Mapping[str, Any], atr: float,
                             close: float) -> bool:
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         return True
     if close <= 0:
         return False
@@ -1549,6 +1620,54 @@ def _complete_opening_window(bars: Sequence[Any], current: Any,
     return [by_minute[point] for point in expected]
 
 
+def _reclaim_direction(bars: Sequence[Any], spec: Mapping[str, Any]) -> tuple[str | None, str]:
+    """A completed retracement followed by a close through the prior bar.
+
+    Value/trend is frozen before the retracement. The signal candle cannot
+    manufacture its own trend, extension, or value anchor.
+    """
+    count = int(spec["pullback_bars"])
+    session = _session_prefix(bars, bars[-1])
+    base_count = spec["slow_lookback"] if spec["family"] == "trend_pullback" else spec["lookback"]
+    if len(session) < base_count + count + 1:
+        return None, "reclaim_history_unavailable"
+    prior = session[:-count - 1]
+    pullback = session[-count - 1:-1]
+    prices = [_number(row, "close") for row in prior]
+    retracement = [_number(row, "close") for row in pullback]
+    close = _number(session[-1], "close")
+    reclaim_long = close > _number(pullback[-1], "high")
+    reclaim_short = close < _number(pullback[-1], "low")
+    threshold = spec["threshold_bps"] / 10_000
+    if spec["family"] == "trend_pullback":
+        fast = _sma(prices, spec["lookback"])
+        slow = _sma(prices, spec["slow_lookback"])
+        impulse = prices[-1] / prices[-base_count] - 1
+        down = all(b <= a for a, b in zip([prices[-1], *retracement], retracement))
+        up = all(b >= a for a, b in zip([prices[-1], *retracement], retracement))
+        if fast > slow and impulse > threshold and down and retracement[-1] < prices[-1] and reclaim_long:
+            return "long", "passed"
+        if fast < slow and impulse < -threshold and up and retracement[-1] > prices[-1] and reclaim_short:
+            return "short", "passed"
+    else:
+        anchor = (_vwap(prior) if spec["family"] == "vwap_reversion"
+                  else mean(prices[-spec["lookback"]:]))
+        if anchor is None or anchor <= 0:
+            return None, "reclaim_value_unavailable"
+        deviation = (pstdev(prices[-spec["lookback"]:]) * spec["zscore"]
+                     if spec["family"] == "mean_reversion"
+                     else anchor * max(threshold, 1e-9))
+        if deviation <= 0:
+            return None, "reclaim_value_variance_unavailable"
+        # The latest retracement close must remain extended; a reclaimed
+        # signal still has distance to the pre-pullback value anchor.
+        if retracement[-1] <= anchor - deviation and reclaim_long and close < anchor:
+            return "long", "passed"
+        if retracement[-1] >= anchor + deviation and reclaim_short and close > anchor:
+            return "short", "passed"
+    return None, "reclaim_not_confirmed"
+
+
 def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
                       close: float, opened: float) -> tuple[str | None, str]:
     """Evaluate only the family predicate shared by execution and diagnostics."""
@@ -1558,6 +1677,9 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
     direction: str | None = None
     family = spec["family"]
     reason = "family_predicate_not_met"
+
+    if spec.get("entry_trigger") == "reclaim":
+        return _reclaim_direction(bars, spec)
 
     if family.startswith("opening_range_"):
         zone = ZoneInfo("America/New_York")
@@ -1731,6 +1853,30 @@ def _evaluate_rule_signal_staged(
     if not stage("family_predicate", direction is not None, family_reason):
         return None, stages, family_metadata
     assert direction is not None
+    if spec.get("regime_mode", "none") != "none":
+        source = []
+        for row in bars:
+            timestamp = _timestamp(row)
+            if timestamp is None:
+                continue
+            source.append({"timestamp": timestamp.timestamp(),
+                           **{key: _number(row, key) for key in
+                              ("open", "high", "low", "close", "volume")}})
+        context, context_reason = completed_context(
+            source, minutes=spec["regime_timeframe_minutes"],
+            lookback=spec["regime_lookback_bars"])
+        if not stage("market_context", context is not None, context_reason):
+            return None, stages, family_metadata
+        assert context is not None
+        family_metadata["intraday_context"] = context
+        threshold = spec["regime_efficiency_threshold"]
+        regime_ok = ((context["efficiency"] >= threshold and
+                      context["direction"] == direction)
+                     if spec["regime_mode"] == "trend" else
+                     context["efficiency"] <= threshold)
+        if not stage("market_regime", regime_ok,
+                     "passed" if regime_ok else "regime_predicate_not_met"):
+            return None, stages, family_metadata
     if not stage("side", _allowed(direction, spec),
                  "passed" if _allowed(direction, spec) else "direction_not_allowed"):
         return None, stages, family_metadata
@@ -1794,11 +1940,11 @@ def _evaluate_rule_signal_staged(
         "rule_spec_hash": rule_spec_hash(spec),
         "confidence": 1.0,
     }
-    if spec["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}:
+    if spec["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         result.update({"rule_schema": RULE_SCHEMA_V3,
                        "breakeven_r": spec.get("breakeven_r")})
-    if spec["schema"] == RULE_SCHEMA_V4:
-        result.update({"rule_schema": RULE_SCHEMA_V4,
+    if spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+        result.update({"rule_schema": spec["schema"],
                        "target_mode": target_mode,
                        "target_reference": target_reference,
                        "target_lookback": spec.get("target_lookback"),
@@ -1806,6 +1952,8 @@ def _evaluate_rule_signal_staged(
                        "exit_before_minutes": spec.get("exit_before_minutes")})
     if spec["family"] == "cross_sectional_residual":
         result.update(family_metadata)
+    if "intraday_context" in family_metadata:
+        result["intraday_context"] = family_metadata["intraday_context"]
     stage("signal", True, "emitted")
     return result, stages, family_metadata
 
@@ -1926,7 +2074,7 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
         "stop_price": snapshot.get("stop_price"),
         "target_price": snapshot.get("target_price"),
     }
-    if spec["schema"] == RULE_SCHEMA_V4:
+    if spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
         evidence.update({
             "target_mode": snapshot.get("target_mode", spec.get("target_mode")),
             "target_reference": snapshot.get("target_reference"),
@@ -1938,6 +2086,8 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
                                                 spec.get("exit_before_minutes")),
             "exit_before_ts": snapshot.get("exit_before_ts"),
         })
+    if snapshot.get("intraday_context") is not None:
+        evidence["intraday_context"] = snapshot["intraday_context"]
     if spec["family"] == "cross_sectional_residual":
         evidence.update({
             "benchmark_symbol": snapshot.get(
@@ -1961,8 +2111,8 @@ __all__ = [
     "EXIT_REASON_UNKNOWN",
     "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
-           "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "RULE_SCHEMA_V4", "SESSION_MINUTES",
-           "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS", "V4_DEFAULT_EXTENSIONS",
+           "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "RULE_SCHEMA_V4", "RULE_SCHEMA_V5", "SESSION_MINUTES",
+           "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS", "V4_DEFAULT_EXTENSIONS", "V5_DEFAULT_EXTENSIONS",
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "OPENING_ANCHORED_FAMILIES",
            "entry_window_bounds", "session_minutes",

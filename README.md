@@ -212,7 +212,7 @@ provider submit an idempotently named day order.
 
 Equities use broker-side brackets. Long options are paper-only because Alpaca
 does not provide an option stop order: the runtime rests a broker-side
-take-profit, keeps the stop locally, and relies on the separate watchdog as a
+take-profit, keeps the stop locally, and uses the owned-child supervisor plus watchdog as a
 stale-process backstop. Protective orders must be broker-confirmed canceled
 before a local close is submitted. Startup, shutdown, force-flat, and crash
 recovery all reconcile against broker state; an unreadable state file is a
@@ -452,7 +452,7 @@ successful audit clears it.
   `ALPACA_AGENT_RUNTIME_ROOT` in a separate runtime scope from paper.
 - `strategy.execution_mode: options` is paper-only. Alpaca offers no bracket,
   OCO, or stop order on options, so an option position's protective stop is
-  software (the 60-second poller, bounded by the separate `watchdog` process)
+  software (the 60-second poller, supervised by an owned-child process with locked watchdog recovery)
   and `mode: live` rejects the options profile. If the broker or network is
   unreachable, nothing local protects an open option position.
 - `mode: live` rejects `llm.enabled: true`. The validated edge was proven with
@@ -484,14 +484,17 @@ normalizes account, asset, quote/bar, calendar, option-chain, order, and trade
 update data for the rest of the application. `agent/alpaca_session.py` owns
 the NYSE calendar and session policy. `agent/contracts/rule.py` is the safe
 strategy grammar shared by research and runtime; generated specifications can
-never contain executable code. It has four versions: `rule-strategy.v1` is
+never contain executable code. It has five versions: `rule-strategy.v1` is
 unchanged and keeps every existing variant id, `rule-strategy.v2` is a strict
 superset adding entry-side predicates only — a multi-filter confirmation list,
 a session-time entry window, and an ATR volatility band — and
 `rule-strategy.v3` adds nullable numeric `breakeven_r` for equity shares.
 `rule-strategy.v4` adds only the equity exit modes described above (frozen
 session VWAP/rolling-mean target, monotone trailing stop, and `exit-before`
-deadline). Options remain on executable v1/v2 schemas; a v3/v4 root stays on
+deadline). `rule-strategy.v5` adds optional completed 5/15-minute trend/range
+context and confirmed pullback/value reclaim entries. It retains v4 exits and
+records the causal context snapshot used at entry. Existing v1–v4 identities
+and behavior are unchanged. Options remain on executable v1/v2 schemas; a v3/v4/v5 root stays on
 its declared schema while tuning. V2 entry predicates do not reach sizing or
 execution; v3/v4 affect only shared bounded exit state and cannot author
 arbitrary orders.
@@ -548,7 +551,14 @@ pinned promotions and any pin that cannot currently trade; every recorded fill
 attributed to the strategy and variant that placed it, plus a per-variant
 roll-up of what the broker actually did; the graded reason history with what
 each proposal built on; and the configuration audit trail. It is read-only —
-`POST` returns 405 — and nothing on it can change a lifecycle.
+`POST` returns 405 — and nothing on it can change a lifecycle. Net P&L and net
+winners are based on completed parent trades across the full journal, with
+unknown costs left unknown. Charts show observed account equity, drawdown, net
+payoffs, uncertainty, and recorded entry context. Account equity is explicitly
+not adjusted for cash transfers. Direct research progress is separate from the
+scheduler heartbeat. See the [September 7 remediation record](docs/trading-edge-remediation-2026-09-07.md)
+for the fixed experiment cohort. The [handover and unfinished work](docs/trading-edge-handover-2026-09-08.md)
+records verification limits and the remaining evidence requirements.
 
 The CLI answers the same questions without a browser:
 

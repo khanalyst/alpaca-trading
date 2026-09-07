@@ -21,7 +21,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
 from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V1,
-                                  RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
+                                  RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5,
                                   rule_spec_hash, rule_variant_id,
                                   rule_spec_json_schema, validate_rule_spec)
 
@@ -72,7 +72,14 @@ research process.  Return one JSON object and nothing else, exactly:
 {"schema":"llm-rule-proposal.v1","rule_spec":{...}}
 The rule_spec must include every required key of the explicit grammar; schema
 is never inferred. The request includes a vehicle: equity may use
-rule-strategy.v1, rule-strategy.v2, rule-strategy.v3, or rule-strategy.v4
+rule-strategy.v1, rule-strategy.v2, rule-strategy.v3, rule-strategy.v4, or rule-strategy.v5
+rule-strategy.v5 adds optional completed 5/15-minute price-path regime context
+(regime_mode none/trend/range, timeframe 5/15, lookback 3..24,
+efficiency threshold 0..1) and entry_trigger legacy/reclaim with pullback_bars
+2..10 for trend_pullback, mean_reversion, and vwap_reversion. These are
+explicit testable hypotheses, not observed daily/news/market-wide context.
+Neutral v5 fields preserve v4 behavior. v5 remains equity-only.
+
 (with nullable equity-only exit controls such as "breakeven_r" in v3/v4),
 while options may use only executable v1/v2 and never those exit controls. The
 vehicle-specific provider schema and validator are authoritative.
@@ -98,7 +105,9 @@ all of which must hold), "entry_after_minutes" and "entry_before_minutes"
 trade). Use them to express a conditional edge, not just retuned numbers.
 rule-strategy.v3 extends v2 with equity-only exit control via nullable
 "breakeven_r" and rule-strategy.v4 adds the audited target/trailing/window
-controls. The request vehicle controls versions: equity may use v1-v4;
+controls. v5 additionally supports completed 5/15-minute trend/range price-path
+context and structural reclaim entries for pullback/reversion families. These
+features do not supply news, prior-day levels, or a beta hedge. The request vehicle controls versions: equity may use v1-v5;
 options remain on executable v1/v2 and never use those exit controls. The
 vehicle-specific provider schema and validator are authoritative.
 Propose something structurally different from the already-tried and
@@ -130,10 +139,10 @@ how each is computed from the bars — are fixed code that you are tuning, not
 designing.  You cannot introduce a new signal, indicator or data source, and a
 reply that tries to is rejected outright.  Changing which idea is being tested
 is a different job, done elsewhere.
-For an equity root using rule-strategy.v3 or rule-strategy.v4, a nullable
+For an equity root using rule-strategy.v3, v4, or v5, a nullable
 numeric exit control may be activated by changing null to one finite
 in-bounds number as a single coordinate change. Options remain on their
-executable schema and may never use rule-strategy.v3/v4 or those exit controls.
+executable schema and may never use rule-strategy.v3/v4/v5 or those exit controls.
 
 EXPERIMENT PHASE.  The request names a refinement_phase.  In "coordinate"
 phase every returned variant must change exactly ONE field, so its effect is
@@ -643,7 +652,7 @@ def _validate_vehicle_rule_spec(spec: Mapping[str, Any], vehicle: str) -> None:
     """Apply the vehicle executable-schema gate after grammar validation."""
 
     if (vehicle == "option" and
-            spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4}):
+            spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}):
         raise ValueError(
             f"{spec.get('schema')} is not executable for options")
 
@@ -668,7 +677,7 @@ def _tuning_reason_check(reason: str, root: Mapping[str, Any],
         after = normalized.get(key)
         nullable_numeric_activation = (
             key in {"breakeven_r", "trailing_stop_r", "exit_before_minutes"} and
-            root.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4} and
+            root.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5} and
             before is None and isinstance(after, (int, float)) and
             not isinstance(after, bool))
         if (not nullable_numeric_activation and

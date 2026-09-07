@@ -102,7 +102,7 @@ class TrialVerdictTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ledger, _factory, _hypothesis = _ledgers(directory)
             candidate = _candidate(ledger, "rule.win.1")
-            _outcomes(ledger, candidate, [1.0] * 6 + [-0.3] * 6)
+            _outcomes(ledger, candidate, [1.0, -0.3] * 6)
             result = review_trials(ledger.path, config=POLICY)
             review = result["reviews"][0]
             self.assertEqual(review["verdict"]["state"], "passed")
@@ -313,7 +313,7 @@ class PromotableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ledger, _factory, _hypothesis = _ledgers(directory)
             _outcomes(ledger, _candidate(ledger, "rule.win.1"),
-                      [1.0] * 6 + [-0.3] * 6)
+                      [1.0, -0.3] * 6)
             rows = promotable_report(ledger.path, config=POLICY)
             self.assertEqual(len(rows), 1)
             row = rows[0]
@@ -336,7 +336,7 @@ class PromotableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ledger, _factory, _hypothesis = _ledgers(directory)
             _outcomes(ledger, _candidate(ledger, "rule.win.1"),
-                      [1.0] * 6 + [-0.3] * 6)
+                      [1.0, -0.3] * 6)
             rows = promotable_report(ledger.path, config=POLICY,
                                      pinned=[("rule.win.1", "equity")])
             self.assertTrue(rows[0]["already_pinned"])

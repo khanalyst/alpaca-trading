@@ -22,7 +22,7 @@ from agent.contracts.risk_geometry import (
     quantize_equity_bracket,
 )
 from agent.contracts.rule import (
-    MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V4, canonical_exit_reason,
+    MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V4, RULE_SCHEMA_V5, canonical_exit_reason,
     completed_bar_exit_transition, exit_deadline,
     frozen_target_reference, initialize_exit_state,
     rule_vehicle_executable, thesis_exit_deadline, validate_rule_spec,
@@ -1500,7 +1500,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
             })
-        if spec.get("schema") == RULE_SCHEMA_V4:
+        if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
             row.update({
                 "initial_stop_price": exit_state["initial_stop_price"],
                 "active_stop_price": exit_state["active_stop_price"],

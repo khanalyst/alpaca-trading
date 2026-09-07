@@ -14,6 +14,7 @@ from . import state
 from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
 from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
+                             RULE_SCHEMA_V5,
                              RuleSpecError,
                              canonical_exit_reason,
                              completed_bar_exit_transition,
@@ -34,7 +35,7 @@ _PROTECTIVE_TERMINAL_STATUSES = _TERMINAL_ORDER_STATUSES | {
     "done", "closed", "done_for_day",
 }
 _OPTION_PROFILES = frozenset({"option", "options"})
-_RULE_EXIT_SCHEMAS = frozenset({RULE_SCHEMA_V3, RULE_SCHEMA_V4})
+_RULE_EXIT_SCHEMAS = frozenset({RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5})
 
 
 _EDGE_OUTBOX_WARN = 500
@@ -279,16 +280,17 @@ class ExecutionLifecycleMixin:
             except (CostError, TypeError, ValueError, OverflowError):
                 provenance = {"source": "cost_model_unavailable",
                               "vehicle": vehicle}
-        fees = max(0.0, fees or 0.0)
-        slippage = max(0.0, slippage or 0.0)
-        net = gross - fees
+        fees = max(0.0, fees) if fees is not None else None
+        slippage = max(0.0, slippage) if slippage is not None else None
+        net = gross - fees if fees is not None else None
         notional = (abs(entry_price) * quantity * multiplier
                     if entry_price is not None else None)
         pnl_pct = (net / notional * 100.0
-                   if notional is not None and notional > 0 else None)
+                   if net is not None and notional is not None and notional > 0 else None)
         return {
-            "gross_pnl": round(gross, 12), "fees": round(fees, 12),
-            "slippage": round(slippage, 12), "net_pnl": round(net, 12),
+            "gross_pnl": round(gross, 12), "fees": round(fees, 12) if fees is not None else None,
+            "slippage": round(slippage, 12) if slippage is not None else None,
+            "net_pnl": round(net, 12) if net is not None else None,
             "pnl_pct": round(pnl_pct, 12) if pnl_pct is not None else None,
             "pnl_semantics": "broker_fill_pnl_minus_fees",
             "pnl_provenance": "broker_fills",
@@ -821,6 +823,8 @@ class ExecutionLifecycleMixin:
                     "exit_before_minutes", plan.get("exit_before_minutes")),
                 "exit_entry_bar_epoch": entry_anchor_ts,
             })
+        if plan.get("intraday_context") is not None:
+            trade["intraday_context"] = deepcopy(plan["intraday_context"])
         # The broker-resident bracket legs are the position's real protection.
         # Keep the ids observed at submission; a later reconciliation refreshes
         # their status but must not lose the association.
@@ -1778,6 +1782,7 @@ class ExecutionLifecycleMixin:
                         active[symbol] = trade
                         runtime.setdefault("orders", {})[close_order_id] = {
                             "order_id": close_order_id, "symbol": symbol,
+                            "entry_order_id": trade.get("order_id"),
                             "status": str(getattr(order, "status", "submitted") or
                                           "submitted").lower(),
                             "client_order_id": getattr(order, "client_order_id", None),
@@ -1836,6 +1841,120 @@ class ExecutionLifecycleMixin:
                     pass
                 raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
         return {"closed": closed, "failed": failed, "force_flat": force_flat}
+
+    def _journal_close_fill(self, trade: Mapping, close_order: Any,
+                            close_qty: float, exit_price: float | None,
+                            current: Mapping, *, trade_id: str,
+                            close_requested: float | None = None) -> dict[str, Any]:
+        """Journal one durable quantity of a broker close fill.
+
+        Close order quantities are cumulative per broker order.  Callers pass
+        only the newly observed quantity, so retries and repeated snapshots
+        can safely use a stable trade id for each order (or an increment id
+        when a contradictory terminal snapshot grows the cumulative fill).
+        """
+        close_qty = max(0.0, self._number(close_qty) or 0.0)
+        if close_qty <= 0:
+            return {"gross_pnl": None, "net_pnl": None, "pnl_pct": None}
+        entry = self._number(trade.get("entry_price"))
+        multiplier = self._number(trade.get("contract_multiplier")) or 1.0
+        sign = -1.0 if str(trade.get("position_side", "long")) == "short" else 1.0
+        gross_pnl = ((exit_price - entry) * close_qty * multiplier * sign
+                     if entry is not None and exit_price is not None else None)
+        attribution_trade = dict(trade)
+        parent_qty = max(self._number(trade.get("cumulative_filled_qty")) or 0.0,
+                         self._number(trade.get("qty")) or 0.0)
+        # Explicit trade-level cost totals belong to the whole filled entry;
+        # prorate them across close increments instead of charging each retry
+        # the complete trade's fee. Configured per-fill costs already scale.
+        if parent_qty > 0:
+            for name in ("fees", "fee_usd", "slippage", "slippage_usd", "adverse_slippage_usd"):
+                value = self._number(trade.get(name))
+                if value is not None:
+                    attribution_trade[name] = value * min(1.0, close_qty / parent_qty)
+        attribution = self._close_pnl_attribution(
+            attribution_trade, gross_pnl, entry, exit_price, close_qty, multiplier)
+        close_order_id = str(_value(close_order, "order_id",
+                                    _value(close_order, "id", "")) or "")
+        close_status = str(_value(close_order, "status", "") or "").lower()
+        reason = (str(_value(close_order, "reason", "") or "") or
+                  str(trade.get("closing_reason", "broker_reconcile")))
+        close_reference = (self._number(trade.get("exit_reference")) or
+                           self._number(trade.get("current_price")))
+        if close_requested is None:
+            close_requested = self._number(_value(close_order, "qty", None))
+        close_requested = close_requested or close_qty
+        close_fraction = (close_qty / close_requested
+                          if close_requested > 0 else None)
+        close_notional = (abs(exit_price) * close_qty * multiplier
+                          if exit_price is not None else None)
+        state.log_trade(
+            str(trade.get("symbol", "")).upper(),
+            "sell" if str(trade.get("position_side", "long")) == "long" else "buy",
+            "close", close_qty, price=exit_price, notional=close_notional,
+            reason=reason, trade_id=trade_id,
+            realized_pnl_usd=attribution.get("gross_pnl"),
+            pnl_pct=attribution.get("pnl_pct"),
+            gross_pnl=attribution.get("gross_pnl"),
+            fees=attribution.get("fees"), slippage=attribution.get("slippage"),
+            net_pnl=attribution.get("net_pnl"),
+            pnl_semantics=attribution.get("pnl_semantics"),
+            pnl_provenance=attribution.get("pnl_provenance"),
+            cost_provenance=json.dumps(
+                attribution.get("cost_provenance"), sort_keys=True,
+                default=str) if attribution.get("cost_provenance") is not None else None,
+            close_trigger=reason,
+            close_evidence=("broker_order_fill" if close_order is not None
+                            else "local_trigger"),
+            setup_id=trade.get("setup_id"), setup_type=trade.get("setup_type"),
+            strategy_id=trade.get("strategy_id"),
+            strategy_version=trade.get("strategy_version"),
+            variant_id=trade.get("variant_id"),
+            execution_profile=trade.get("execution_profile"),
+            vehicle=trade.get("vehicle"), reference_price=close_reference,
+            entry_reference=trade.get("entry_reference"),
+            exit_reference=close_reference, market_price=trade.get("current_price"),
+            mid_price=trade.get("mid_price"), requested_qty=close_requested,
+            planned_qty=close_requested, cumulative_filled_qty=close_qty,
+            fill_fraction=close_fraction, filled_fraction=close_fraction,
+            risk_usd=trade.get("delivered_risk_usd", trade.get("risk_usd")),
+            intended_risk_usd=trade.get("intended_risk_usd"),
+            delivered_risk_usd=trade.get(
+                "delivered_risk_usd", trade.get("risk_usd")),
+            risk_delivery_ratio=trade.get("risk_delivery_ratio"),
+            risk_shortfall_usd=trade.get("risk_shortfall_usd"),
+            configured_risk_budget_usd=trade.get(
+                "configured_risk_budget_usd", trade.get("risk_budget_usd")),
+            risk_budget_usd=trade.get(
+                "configured_risk_budget_usd", trade.get("risk_budget_usd")),
+            planned_risk_usd=trade.get(
+                "planned_risk_usd", trade.get("intended_risk_usd")),
+            nominal_risk_usd=trade.get(
+                "planned_risk_usd", trade.get("intended_risk_usd")),
+            planned_to_configured_risk_ratio=trade.get(
+                "planned_to_configured_risk_ratio"),
+            delivered_to_configured_risk_ratio=trade.get(
+                "delivered_to_configured_risk_ratio"),
+            entry_fill_source=trade.get("entry_fill_source"),
+            exit_fill_source=trade.get("exit_fill_source"),
+            entry_feed=trade.get("entry_feed"), exit_feed=trade.get("exit_feed"),
+            entry_provider=trade.get("entry_provider"),
+            exit_provider=trade.get("exit_provider"),
+            entry_quote_age_seconds=trade.get("entry_quote_age_seconds"),
+            exit_quote_age_seconds=trade.get("exit_quote_age_seconds"),
+            signal_bar_feed=trade.get("signal_bar_feed"),
+            signal_bar_provider=trade.get("signal_bar_provider"),
+            signal_bar_age_seconds=trade.get("signal_bar_age_seconds"),
+            entry_bar_feed=trade.get("entry_bar_feed"),
+            entry_bar_provider=trade.get("entry_bar_provider"),
+            entry_bar_age_seconds=trade.get("entry_bar_age_seconds"),
+            exit_bar_feed=trade.get("exit_bar_feed"),
+            exit_bar_provider=trade.get("exit_bar_provider"),
+            exit_bar_age_seconds=trade.get("exit_bar_age_seconds"),
+            runtime_mode=self.mode,
+            account_fingerprint=current.get("account_fingerprint"),
+            run_id=self.run_id)
+        return attribution
 
     def reconcile(self):
         if hasattr(self.provider, "reconcile"):
@@ -1908,6 +2027,7 @@ class ExecutionLifecycleMixin:
                     "closing_order_id": leg_id, "updated_ts": time.time()})
                 order_state.setdefault(leg_id, {
                     "order_id": leg_id, "symbol": symbol,
+                    "entry_order_id": trade.get("order_id"),
                     "status": leg["status"], "qty": str(getattr(broker_leg, "qty", "")),
                     "side": str(getattr(broker_leg, "side", "")),
                     "action": "close", "reason": leg_reason,
@@ -2138,10 +2258,138 @@ class ExecutionLifecycleMixin:
                     continue
                 if fresh.get("position_confirmed") is False:
                     active[symbol] = dict(fresh)
+
+        def close_entries(trade: Mapping) -> list[dict]:
+            """Return this trade's persisted close attempts in attempt order."""
+            symbol = str(trade.get("symbol", "")).upper()
+            rows = []
+            seen = set()
+            for key, saved in order_state.items():
+                if not isinstance(saved, Mapping):
+                    continue
+                order_id = str(saved.get("order_id") or key)
+                if order_id in seen or str(saved.get("symbol", "")).upper() != symbol:
+                    continue
+                action = str(saved.get("action", "")).lower()
+                if action != "close" and order_id != str(trade.get("closing_order_id") or ""):
+                    continue
+                # Close rows are retained in the durable order map after a
+                # trade is removed.  Bind new rows to their entry order so a
+                # later trade in the same symbol cannot inherit old exits.
+                parent_entry = str(saved.get("entry_order_id") or
+                                   saved.get("parent_order_id") or "")
+                entry_order_id = str(trade.get("order_id") or "")
+                primary_id = str(trade.get("closing_order_id") or "")
+                if parent_entry and entry_order_id and parent_entry != entry_order_id:
+                    continue
+                if not parent_entry and order_id != primary_id:
+                    continue
+                seen.add(order_id)
+                rows.append(saved)
+            primary_id = str(trade.get("closing_order_id") or "")
+            if primary_id and primary_id not in seen:
+                broker_order = by_id.get(primary_id)
+                if broker_order is not None:
+                    fallback = {
+                        "order_id": primary_id,
+                        "symbol": symbol,
+                        "entry_order_id": trade.get("order_id"),
+                        "status": str(getattr(broker_order, "status", "") or "").lower(),
+                        "qty": str(getattr(broker_order, "qty", "") or ""),
+                        "filled_qty": self._number(
+                            getattr(broker_order, "filled_qty", None)) or 0.0,
+                        "filled_avg_price": self._number(
+                            getattr(broker_order, "filled_avg_price", None)),
+                        "action": "close",
+                        "reason": trade.get("closing_reason"),
+                        "attempt": trade.get("closing_attempt", 0),
+                    }
+                    # Persist broker-only fallback evidence before journaling
+                    # a partial fill, so a missing local order row cannot make
+                    # the next reconciliation book the same fill again.
+                    order_state[primary_id] = fallback
+                    rows.append(fallback)
+            rows.sort(key=lambda row: (
+                self._number(row.get("attempt", row.get("closing_attempt")))
+                if self._number(row.get("attempt", row.get("closing_attempt"))) is not None
+                else 0.0,
+                self._number(row.get("updated_ts")) or 0.0,
+                str(row.get("order_id") or "")))
+            return rows
+
+        # A terminal partial close is real fill evidence even while the
+        # residual position remains visible.  Journal each order's cumulative
+        # terminal quantity once, retaining its progress in the order row so a
+        # retry can only add newly observed quantity.
         for symbol, trade in previous.items():
-            if symbol in active or not isinstance(trade, Mapping):
+            if not isinstance(trade, Mapping):
                 continue
-            if trade.get("position_confirmed") is False:
+            entries = close_entries(trade)
+            if not entries:
+                continue
+            initial_qty = max(
+                self._number(trade.get("cumulative_filled_qty")) or 0.0,
+                self._number(trade.get("qty")) or 0.0,
+            )
+            if initial_qty <= 0:
+                continue
+            allocated = 0.0
+            for saved in entries:
+                status = str(saved.get("status", "")).lower()
+                if status not in _TERMINAL_ORDER_STATUSES:
+                    continue
+                # A broker protective leg can settle before the position
+                # endpoint catches up.  Keep the historical fail-closed
+                # behavior and defer its journal close until the position
+                # disappears; explicit monitor close attempts carry an
+                # attempt marker and can record terminal partial progress
+                # against a visible residual.
+                if symbol in active and not any(
+                        key in saved for key in ("attempt", "closing_attempt")):
+                    continue
+                raw_filled = self._number(saved.get("filled_qty")) or 0.0
+                if raw_filled <= 0 and status == "filled":
+                    raw_filled = self._number(saved.get("qty")) or initial_qty
+                requested = self._number(saved.get("qty")) or initial_qty
+                raw_filled = min(initial_qty, max(0.0, raw_filled), requested)
+                if raw_filled <= 0:
+                    continue
+                # Cumulative order evidence is allocated in attempt order;
+                # stale/redundant retries cannot overbook the entry quantity.
+                available = max(0.0, initial_qty - allocated)
+                logged = min(raw_filled, max(0.0,
+                                             self._number(saved.get("close_logged_qty")) or 0.0))
+                new_qty = min(max(0.0, raw_filled - logged), available)
+                if new_qty > 0:
+                    average = self._number(saved.get("filled_avg_price"))
+                    logged_avg = self._number(saved.get("close_logged_avg_price"))
+                    if (logged > 0 and new_qty > 0 and average is not None and
+                            logged_avg is not None and raw_filled > logged):
+                        implied = ((average * raw_filled) - (logged_avg * logged)) / new_qty
+                        if implied == implied and abs(implied) != float("inf"):
+                            average = implied
+                    entry_order_id = str(trade.get("order_id") or "")
+                    close_order_id = str(saved.get("order_id") or "")
+                    base_id = f"close:{entry_order_id}:{close_order_id}"
+                    trade_id = (base_id if logged <= 0 else
+                                f"{base_id}:increment:{raw_filled:.12g}")
+                    self._journal_close_fill(
+                        trade, saved, new_qty, average, current,
+                        trade_id=trade_id, close_requested=requested)
+                    saved["close_logged_qty"] = raw_filled
+                    if average is not None:
+                        saved["close_logged_avg_price"] = self._number(
+                            saved.get("filled_avg_price"))
+                allocated += min(raw_filled, max(0.0, initial_qty - allocated))
+
+        for symbol, trade in previous.items():
+            if (symbol in active and
+                    not (isinstance(trade, Mapping) and
+                         trade.get("position_confirmed") is False and
+                         close_entries(trade))) or not isinstance(trade, Mapping):
+                continue
+            entries = close_entries(trade)
+            if trade.get("position_confirmed") is False and not entries:
                 # The order endpoint has durable fill evidence, but this
                 # trade has never been confirmed by a position snapshot.
                 # Do not infer a close from an empty position list yet.
@@ -2163,6 +2411,87 @@ class ExecutionLifecycleMixin:
                 fresh = current.get("active_trades", {}).get(symbol)
                 active[symbol] = dict(fresh if isinstance(fresh, Mapping) else trade)
                 continue
+
+            if entries:
+                initial_qty = max(
+                    self._number(trade.get("cumulative_filled_qty")) or 0.0,
+                    self._number(trade.get("qty")) or 0.0,
+                )
+                filled_total = 0.0
+                weighted_exit = 0.0
+                weighted_qty = 0.0
+                gross_total = 0.0
+                gross_known = True
+                entry_price = self._number(trade.get("entry_price"))
+                multiplier = self._number(trade.get("contract_multiplier")) or 1.0
+                sign = (-1.0 if str(trade.get("position_side", "long")) == "short"
+                        else 1.0)
+                for saved in entries:
+                    raw = self._number(saved.get("filled_qty")) or 0.0
+                    status = str(saved.get("status", "")).lower()
+                    if raw <= 0 and status == "filled":
+                        raw = self._number(saved.get("qty")) or initial_qty
+                    requested = self._number(saved.get("qty")) or initial_qty
+                    raw = min(initial_qty, max(0.0, raw), requested)
+                    if raw <= 0:
+                        continue
+                    take = min(raw, max(0.0, initial_qty - filled_total))
+                    if take <= 0:
+                        continue
+                    average = self._number(saved.get("filled_avg_price"))
+                    if average is not None:
+                        weighted_exit += average * take
+                        weighted_qty += take
+                        if entry_price is not None:
+                            gross_total += ((average - entry_price) * take *
+                                            multiplier * sign)
+                    else:
+                        gross_known = False
+                    filled_total += take
+                if filled_total <= 0:
+                    # A canceled/rejected close with no fill is not an exit.
+                    # Keep durable exposure active so the monitor can retry it.
+                    active[symbol] = dict(trade)
+                    continue
+                if initial_qty > filled_total + 1e-9:
+                    # The broker has only proven a partial close.  Preserve
+                    # the residual as unconfirmed exposure until a position
+                    # snapshot or another terminal close attempt accounts for
+                    # it; never infer a full exit from an empty snapshot.
+                    residual = dict(trade)
+                    residual["qty"] = str(round(initial_qty - filled_total, 12))
+                    residual["status"] = "closing"
+                    residual["position_confirmed"] = False
+                    residual["updated_ts"] = time.time()
+                    active[symbol] = residual
+                    continue
+                if weighted_qty > 0:
+                    aggregate_exit = weighted_exit / weighted_qty
+                else:
+                    aggregate_exit = self._number(trade.get("closing_price"))
+                if gross_known and entry_price is not None:
+                    aggregate_attribution = self._close_pnl_attribution(
+                        trade, gross_total, entry_price, aggregate_exit,
+                        filled_total, multiplier)
+                    outcome_trade = dict(trade)
+                    outcome_trade["qty"] = str(filled_total)
+                    self._record_edge_outcome(
+                        outcome_trade, gross_total,
+                        aggregate_attribution.get("pnl_pct"), aggregate_exit)
+                entry_order = order_state.get(str(trade.get("order_id") or ""))
+                if isinstance(entry_order, dict):
+                    attempts = [self._number(trade.get("closing_attempt"))]
+                    attempts.extend(
+                        self._number(row.get("attempt", row.get("closing_attempt")))
+                        for row in entries)
+                    attempts = [value for value in attempts if value is not None]
+                    entry_order["position_closed"] = True
+                    if attempts:
+                        entry_order["closing_attempt"] = int(max(attempts))
+                active.pop(symbol, None)
+                current.setdefault("protection", {}).pop(symbol, None)
+                continue
+
             qty = self._number(trade.get("qty")) or 0.0
             entry = self._number(trade.get("entry_price"))
             exit_price = self._number(trade.get("closing_price"))

@@ -15,8 +15,10 @@ stale the heartbeat looks, and the flatten it eventually performs runs under
 the same lock and the same deterministic client-order-id scheme the trader
 uses.  Before any close, the watchdog authenticates the broker account and
 binds the returned account id to the mode-scoped runtime fingerprint.  A
-hung-but-alive trader still owns the lock and is deliberately left alone; no
-action beats an unsynchronized second closer.
+hung-but-alive trader still owns the lock. The deployed trader supervisor
+terminates and waits for its own unresponsive child before asking this module
+to recover under the same exclusive lock. This process never steals a lock or
+signals a PID read from an untrusted or stale heartbeat.
 
 Nothing local helps when the broker or the network is unreachable.  That
 residual is real and is documented rather than papered over.
@@ -148,14 +150,21 @@ def _bind_verified_identity(cfg: Mapping[str, Any], provider) -> str:
 
 
 def run_once(cfg: Mapping[str, Any], provider, *, max_age: float,
-             now: float | None = None) -> dict:
+             now: float | None = None,
+             terminated_child: bool = False) -> dict:
+    """Recover stale exposure, or an already reaped supervisor-owned child.
+
+    ``terminated_child`` is used only by the process supervisor after wait()
+    confirms exit. It bypasses heartbeat freshness, never lock ownership or
+    account identity. It also durably pauses restart even if already flat.
+    """
     mode = str(cfg.get("mode", "paper")).lower()
     agent_state.configure_runtime(mode)
     handle = agent_state.acquire_run_lock()
     try:
         if handle is None:
             # A running trader legitimately owns the mode-scoped lock.  The
-            # watchdog remains inert, including when that trader is hung.
+            # supervisor must reap its child before this lock can transfer.
             heartbeat = _read_json(agent_state.HEARTBEAT_FILE)
             return {
                 "act": False, "reason": INERT_TRADER,
@@ -166,9 +175,13 @@ def run_once(cfg: Mapping[str, Any], provider, *, max_age: float,
         # Keep the lock from this point through every snapshot and the action.
         # Re-read the heartbeat immediately before flattening so a trader that
         # refreshed while the watchdog was obtaining its snapshot wins safely.
+        if terminated_child:
+            agent_state.commit({"operator_pause": True},
+                               transition=(agent_state.RUNNING, agent_state.PAUSED))
+            _bind_verified_identity(cfg, provider)
         heartbeat = _read_json(agent_state.HEARTBEAT_FILE)
         positions = provider.positions()
-        verdict = decide(heartbeat, positions, trader_alive=False,
+        verdict = decide({} if terminated_child else heartbeat, positions, trader_alive=False,
                          max_age=max_age, now=now)
         verdict["heartbeat_status"] = str(heartbeat.get("status") or "missing")
         if not verdict["act"]:
@@ -177,7 +190,7 @@ def run_once(cfg: Mapping[str, Any], provider, *, max_age: float,
 
         heartbeat = _read_json(agent_state.HEARTBEAT_FILE)
         positions = provider.positions()
-        verdict = decide(heartbeat, positions, trader_alive=False,
+        verdict = decide({} if terminated_child else heartbeat, positions, trader_alive=False,
                          max_age=max_age, now=now)
         verdict["heartbeat_status"] = str(heartbeat.get("status") or "missing")
         if not verdict["act"]:
@@ -189,6 +202,8 @@ def run_once(cfg: Mapping[str, Any], provider, *, max_age: float,
         # from this authenticated account response; an existing mismatch is
         # rejected by bind_account_identity and no order is submitted.
         verdict["account_fingerprint"] = _bind_verified_identity(cfg, provider)
+        if terminated_child:
+            verdict["reason"] = "supervisor_terminated_unresponsive_trader"
         engine = _engine(cfg, provider)
         # Engine.flatten_all normally acquires a temporary lock.  Transfer the
         # watchdog's already-held descriptor so it cannot release/reacquire
@@ -198,7 +213,8 @@ def run_once(cfg: Mapping[str, Any], provider, *, max_age: float,
         handle = None
         try:
             verdict["flattened"] = bool(
-                engine.flatten_all("watchdog_stale_heartbeat"))
+                engine.flatten_all("supervisor_terminated_unresponsive_trader"
+                                   if terminated_child else "watchdog_stale_heartbeat"))
             verdict["residual_risk"] = not verdict["flattened"]
             verdict["status"] = "acted" if verdict["flattened"] else "degraded"
         finally:

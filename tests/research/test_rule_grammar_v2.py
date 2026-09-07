@@ -123,7 +123,7 @@ class V1IdentityTests(unittest.TestCase):
 
     def test_unknown_schema_is_refused(self):
         with self.assertRaises(RuleSpecError):
-            validate_rule_spec({"schema": "rule-strategy.v5",
+            validate_rule_spec({"schema": "rule-strategy.v999",
                                 "family": "mean_reversion"})
 
     def test_v2_content_hash_is_frozen_when_v3_is_added(self):

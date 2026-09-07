@@ -22,9 +22,10 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
-                                  RULE_SCHEMA_V1, RULE_SCHEMA_V2,
-                                  RULE_SCHEMA_V4, V2_DEFAULT_EXTENSIONS,
-                                  V4_DEFAULT_EXTENSIONS, EXECUTABLE_RULE_FIELDS,
+                                  RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
+                                  RULE_SCHEMA_V4, RULE_SCHEMA_V5, V2_DEFAULT_EXTENSIONS,
+                                  V3_DEFAULT_EXTENSIONS, V4_DEFAULT_EXTENSIONS,
+                                  V5_DEFAULT_EXTENSIONS, EXECUTABLE_RULE_FIELDS,
                                   hold_deadline,
                                   rule_semantic_distance,
                                   rule_semantic_signature, rule_variant_id,
@@ -392,6 +393,10 @@ _LEARNING_EPOCH_NOTICE = (
 # dynamic exception: they are still constrained to the audited grammar.
 _FIT_SELECTION_ROOT_KEYS = frozenset({
     "primary_failure", "failure_mode", "trades", "sessions", "net_pnl",
+    "evidence_status", "data_rejection_count", "signal_execution_rejection_count",
+    "no_signal_count", "unclassified_no_trade_count", "average_net_win", "average_net_loss",
+    "net_payoff_ratio", "break_even_nonflat_win_rate", "nonflat_win_rate",
+    "gross_pnl", "fees_after_fill_prices", "pnl_basis", "measured_net_expectancy",
     "expectancy", "win_rate", "profit_factor", "max_drawdown", "stop_rate",
     "target_rate", "fit_diagnostics", "refinement_phase",
     "execution_blocked", "execution_rejection_count",
@@ -523,7 +528,8 @@ _FIT_SELECTION_TRIAL_KEYS = frozenset({"run", "failed"})
 _FIT_SELECTION_DELTA_KEYS = frozenset({"from", "to"})
 _FIT_SELECTION_RULE_KEYS = frozenset(
     str(name) for name in (*EXECUTABLE_RULE_FIELDS,
-                           *V2_DEFAULT_EXTENSIONS.keys()))
+                           *V2_DEFAULT_EXTENSIONS.keys(), *V3_DEFAULT_EXTENSIONS.keys(),
+                           *V4_DEFAULT_EXTENSIONS.keys(), *V5_DEFAULT_EXTENSIONS.keys()))
 
 
 def _selection_key(raw_key: Any) -> str:
@@ -927,7 +933,7 @@ def _factory_learning_epoch(*, vehicle: str, costs: CostModel,
     grammar = {
         "rule_schema": "rule-grammar.v4",
         "accepted_rule_schemas": sorted(
-            str(item) for item in (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V4)),
+            str(item) for item in (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5)),
         "executable_rule_fields": sorted(str(item) for item in EXECUTABLE_RULE_FIELDS),
         "proposal_schema": str(PROPOSAL_SCHEMA),
         "tuning_schema": str(TUNING_SCHEMA),
@@ -1229,7 +1235,7 @@ def structure_signature(spec: Mapping[str, Any],
             (prior_confirmations is not None and
              conditional["confirmations"] != prior_confirmations)):
         active_axes.append("confirmations")
-    extension_active = normalized.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V4} and (
+    extension_active = normalized.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V4, RULE_SCHEMA_V5} and (
             conditional["entry_window"] != (defaults["entry_after_minutes"],
                                                defaults["entry_before_minutes"]) or
             conditional["atr_band"] != (defaults["min_atr_bps"],
@@ -1243,6 +1249,13 @@ def structure_signature(spec: Mapping[str, Any],
     if ((prior is None and extension_active) or
             (prior is not None and extension_values != prior_extension_values)):
         active_axes.append("conditional_window_or_atr")
+    for name, neutral in (("regime_mode", "none"), ("entry_trigger", "legacy")):
+        if normalized.get(name, neutral) != (prior.get(name, neutral) if prior else neutral):
+            active_axes.append(name)
+    if (prior is not None and normalized.get("regime_mode", "none") != "none"
+            and prior.get("regime_mode", "none") != "none"
+            and normalized["regime_timeframe_minutes"] != prior["regime_timeframe_minutes"]):
+        active_axes.append("regime_timeframe_minutes")
     semantic_fields = set(EXECUTABLE_RULE_FIELDS)
     # ``rule_semantic_signature`` uses family-relevant fields; expose that
     # count for an auditable near-structure decision.
@@ -1287,6 +1300,11 @@ def _structurally_distinct(spec: Mapping[str, Any],
                    if prior.get(name) != current.get(name)]
         changed.extend(name for name, default in V4_DEFAULT_EXTENSIONS.items()
                        if prior.get(name, default) != current.get(name, default))
+        effective = set(compared["executable_fields"]) | set(
+            structure_signature(prior)["executable_fields"])
+        changed.extend(name for name, default in V5_DEFAULT_EXTENSIONS.items()
+                       if name in effective and
+                       prior.get(name, default) != current.get(name, default))
         # Same-family one-axis numeric motion is tuning, not discovery.  Two
         # executable changes form a distinct interaction topology.
         if len(changed) < 2:
@@ -3634,6 +3652,7 @@ def _run_diagnostic_factory(
         runtime_config: Mapping[str, Any] | None,
         proposal_adapter: RuleProposalAdapter | None,
         source_report: Mapping[str, Any] | None = None,
+        cohort: str | None = None, progress_callback: Any | None = None,
         ) -> dict[str, Any]:
     """Evaluate an explicitly diagnostic corpus without touching ledgers.
 
@@ -3643,6 +3662,16 @@ def _run_diagnostic_factory(
     only; it deliberately does not construct ``FactoryLedger``/``EdgeLedger``
     instances, run gates/FDR, reserve boundaries, or emit proofs.
     """
+    manifest = None
+    if cohort is not None:
+        from .mechanism_cohort import mechanism_cohort
+        if vehicle != "equity":
+            raise FactoryError("intraday mechanism cohort is equity-only")
+        manifest = mechanism_cohort(cohort)
+        strategies, variants_per_strategy = 3, 4
+    def progress(phase, done, total):
+        if progress_callback is not None:
+            progress_callback(phase, done, total)
     if vehicle not in {"equity", "option"}:
         raise FactoryError("vehicle must be equity or option")
     if not 1 <= int(strategies) <= MAX_STRATEGIES:
@@ -3660,7 +3689,7 @@ def _run_diagnostic_factory(
         vehicle=vehicle, costs=model, policy=policy)
     llm_config = dict(strategy_llm or {})
     llm_config.setdefault("near_duplicate_distance", NEAR_DUPLICATE_DISTANCE)
-    llm_enabled = bool(llm_config.get("enabled", False))
+    llm_enabled = bool(llm_config.get("enabled", False)) and manifest is None
     if (llm_enabled and not str(llm_config.get("model") or "").strip()
             and proposal_adapter is None):
         raise FactoryError(
@@ -3685,6 +3714,15 @@ def _run_diagnostic_factory(
         else list(quote_rows)
     snapshots = list(snapshot_map.values())
     templates = initial_hypotheses(int(strategies), vehicle=vehicle)
+    if manifest is not None:
+        templates = [StrategyHypothesis(
+            _hypothesis_id(vehicle, slot, 0, item["arms"][0]["rule_spec"]),
+            slot, 0, vehicle, item["arms"][0]["rule_spec"]["family"],
+            item["thesis"], "Reject unless new untouched after-cost evidence supports this exact arm.",
+            item["arms"][0]["rule_spec"])
+            for slot, item in enumerate(manifest["families"])]
+    root_cache = {}
+    progress("diagnosing", 0, len(templates))
     selected_hypotheses: list[tuple[StrategyHypothesis, str,
                                     ProposalResult | None, dict[str, Any]]] = []
     existing_variant_ids: set[str] = set()
@@ -3712,6 +3750,8 @@ def _run_diagnostic_factory(
             "authorizing": False,
             "diagnostic_only": True,
         }
+        root_cache[rule_variant_id(template.rule_spec)] = (root_account, root_fit)
+        progress("diagnosing", len(root_cache), len(templates))
         hypothesis = template
         source = "deterministic_template"
         discovery: ProposalResult | None = None
@@ -3742,17 +3782,22 @@ def _run_diagnostic_factory(
     tuning_proposals: list[dict[str, Any]] = []
     risk_config = ((runtime_config or {}).get("risk")
                    if isinstance(runtime_config, Mapping) else None)
+    completed_accounts = 0
+    progress("evaluating", 0, len(templates) * int(variants_per_strategy))
     for hypothesis, source, discovery, discovery_context in selected_hypotheses:
-        root_account = simulate_account(
-            bars, snapshots, hypothesis.rule_spec, vehicle=vehicle,
-            account_id=f"diagnostic-root:{hypothesis.hypothesis_id}",
-            starting_cash=float(starting_cash), costs=model, quotes=quotes,
-            cost_resolver=cost_resolver,
-            policy=policy)
-        root_fit = measure_fit_diagnostics(
-            bars, hypothesis.rule_spec, account_rows=root_account["rows"],
-            costs=model, vehicle=vehicle, risk_config=risk_config,
-            policy=policy)
+        cached = root_cache.get(rule_variant_id(hypothesis.rule_spec))
+        if cached is not None:
+            cached_account, root_fit = cached
+            root_account = {**cached_account, "account_id": f"diagnostic-root:{hypothesis.hypothesis_id}"}
+        else:
+            root_account = simulate_account(
+                bars, snapshots, hypothesis.rule_spec, vehicle=vehicle,
+                account_id=f"diagnostic-root:{hypothesis.hypothesis_id}",
+                starting_cash=float(starting_cash), costs=model, quotes=quotes,
+                cost_resolver=cost_resolver, policy=policy)
+            root_fit = measure_fit_diagnostics(
+                bars, hypothesis.rule_spec, account_rows=root_account["rows"],
+                costs=model, vehicle=vehicle, risk_config=risk_config, policy=policy)
         diagnosis = {
             **diagnose(root_account["rows"], starting_cash=float(starting_cash),
                        diagnostic_only=True),
@@ -3761,13 +3806,19 @@ def _run_diagnostic_factory(
             "diagnostic_only": True,
         }
         root_variant_id = rule_variant_id(hypothesis.rule_spec)
-        chosen, tuning = _tuned_variants(
-            asdict(hypothesis), diagnosis,
-            count=int(variants_per_strategy), vehicle=vehicle,
-            llm_enabled=llm_enabled, config=llm_config,
-            risk_config=risk_config, adapter=llm_adapter,
-            existing_specs=existing_specs,
-            llm_observations=llm_observations)
+        if manifest is not None:
+            chosen = [TunedVariant(arm["rule_spec"], arm["reason"],
+                                   "frozen_mechanism_cohort", None)
+                      for arm in manifest["families"][hypothesis.slot]["arms"]]
+            tuning = None
+        else:
+            chosen, tuning = _tuned_variants(
+                asdict(hypothesis), diagnosis,
+                count=int(variants_per_strategy), vehicle=vehicle,
+                llm_enabled=llm_enabled, config=llm_config,
+                risk_config=risk_config, adapter=llm_adapter,
+                existing_specs=existing_specs,
+                llm_observations=llm_observations)
         if not chosen:
             chosen = [TunedVariant(
                 hypothesis.rule_spec,
@@ -3809,6 +3860,8 @@ def _run_diagnostic_factory(
                     bars, selected.rule_spec, account_rows=account["rows"],
                     costs=model, vehicle=vehicle, risk_config=risk_config,
                     policy=policy)
+            completed_accounts += 1
+            progress("evaluating", completed_accounts, len(templates) * int(variants_per_strategy))
             variants.append({
                 "variant_id": variant_id,
                 "rule_spec": selected.rule_spec,
@@ -3911,6 +3964,7 @@ def _run_diagnostic_factory(
         "research_funnel": research_funnel({"reports": reports}, vehicle=vehicle),
         "research_verdict": research_verdict({"reports": reports}, vehicle=vehicle),
         "cost_diagnostic": cost_diagnostic,
+        **({"mechanism_cohort": manifest} if manifest is not None else {}),
     }
 
 
@@ -3931,10 +3985,13 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 worker_data: str | Path | None = None,
                 progress_callback: Any | None = None,
                 backtest_bar_fallback: bool = False,
-                diagnostic_only: bool = False) -> dict:
+                diagnostic_only: bool = False,
+                cohort: str | None = None) -> dict:
     """Run one cycle and always release its parent-owned quote index."""
     if not isinstance(diagnostic_only, bool):
         raise FactoryError("diagnostic_only must be true or false")
+    if cohort is not None and not diagnostic_only:
+        raise FactoryError("mechanism cohort requires diagnostic_only; no proof or automatic selection is permitted")
     try:
         source_report = validate_source(data, diagnostic_only=diagnostic_only)
     except SourceValidationError as exc:
@@ -3945,7 +4002,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             variants_per_strategy=variants_per_strategy,
             starting_cash=starting_cash, strategy_llm=strategy_llm,
             costs=costs, runtime_config=runtime_config,
-            proposal_adapter=proposal_adapter, source_report=source_report)
+            proposal_adapter=proposal_adapter, source_report=source_report,
+            cohort=cohort, progress_callback=progress_callback)
         result["source_mode_counts"] = source_report.get("source_mode_counts", {})
         result["future_observed_rows"] = source_report.get("future_observed_rows", 0)
         return result

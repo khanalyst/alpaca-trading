@@ -309,7 +309,15 @@ def _cadence_telemetry(output: Path, *, interval: float,
 
 
 def _partition_calendars_from_markers(output: Path) -> dict[str, dict[str, str]]:
-    """Load exact calendar markers for existing partitions, fail closed on corruption."""
+    """Load exact calendar markers, ignoring only valid orphan markers.
+
+    Calendar markers are committed before their partition so a crash can leave
+    a valid marker without a CSV.  That marker is safe to ignore until the
+    resumable writer commits the partition.  Marker syntax and calendar
+    semantics are still validated before the existence check: a malformed
+    orphan must remain a hard failure rather than becoming an invisible way to
+    bypass recorder integrity checks.
+    """
     directory = _corpus_root(output) / PARTITION_DIR
     if not directory.is_dir():
         return {}
@@ -327,7 +335,7 @@ def _partition_calendars_from_markers(output: Path) -> dict[str, dict[str, str]]
                 payload.get("schema") != PARTITION_CALENDAR_SCHEMA or
                 not isinstance(partition, str) or
                 path.name != partition + ".calendar.json" or
-                partition not in existing or opened is None or closed is None or
+                opened is None or closed is None or
                 opened >= closed or payload.get("source") != "alpaca_calendar"):
             raise RuntimeError(f"invalid recorder partition calendar marker {path}")
         day_name = partition.removeprefix("market-").removesuffix(".csv")
@@ -338,6 +346,12 @@ def _partition_calendars_from_markers(output: Path) -> dict[str, dict[str, str]]
         if (opened.astimezone(NEW_YORK).date() != parsed_day or
                 closed.astimezone(NEW_YORK).date() != parsed_day):
             raise RuntimeError(f"recorder partition calendar marker has wrong day: {path}")
+        # The marker is intentionally written before the CSV.  A valid marker
+        # with no matching partition therefore represents an interrupted,
+        # resumable write rather than corruption.  Do not expose it to the
+        # aggregate calendar until the partition is durable.
+        if partition not in existing:
+            continue
         result[day_name] = {"open": opened.isoformat(),
                             "close": closed.isoformat(),
                             "source": "alpaca_calendar"}

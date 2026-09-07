@@ -951,6 +951,7 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         costs=CostModel.from_config(static_cost_config(runtime_config)),
         runtime_config=runtime_config,
         diagnostic_only=diagnostic_only,
+        cohort=getattr(args, "cohort", None),
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"),
         # A worker projection is itself a strict, authorizing view.  Do not
         # let it turn the explicit diagnostic escape hatch back into a hard
@@ -1139,6 +1140,8 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
             "--diagnostic-only", action="store_true",
             help=("run despite SIP/delayed source provenance; the result is "
                   "non-authorizing and no edge proofs are emitted"))
+        parser.add_argument("--cohort", choices=("intraday-mechanisms.v1",), default=None,
+                            help="frozen 3-mechanism/12-arm comparison; requires --diagnostic-only")
         parser.add_argument("--agent-config", default=None,
                             help="validated agent config (default: config.yaml)")
         parser.add_argument("--vehicle", choices=("equity", "option"), default="equity")

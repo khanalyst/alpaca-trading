@@ -60,16 +60,15 @@ class DiagnosticLLMEpochTests(unittest.TestCase):
         self.assertEqual(len(other_variants), 1)
         other_id = other_variants[0]["variant_id"]
 
-        # One context replay, one selected-root replay, and one independent
-        # non-root replay: the selected root itself is not replayed a third
-        # time by the variant loop.
-        self.assertEqual(len(calls["simulate"]), 3)
-        self.assertEqual(len(calls["fit"]), 3)
+        # The exact root context/account/fit are reused; only the non-root
+        # arm needs an additional replay and diagnostic pass.
+        self.assertEqual(len(calls["simulate"]), 2)
+        self.assertEqual(len(calls["fit"]), 2)
         self.assertEqual(
-            [item["variant_id"] for item in calls["simulate"]].count(root_id), 2)
+            [item["variant_id"] for item in calls["simulate"]].count(root_id), 1)
         self.assertEqual(
             [item["variant_id"] for item in calls["simulate"]].count(other_id), 1)
-        self.assertEqual(calls["fit"].count(root_id), 2)
+        self.assertEqual(calls["fit"].count(root_id), 1)
         self.assertEqual(calls["fit"].count(other_id), 1)
         expected_variant_account = f"diagnostic:{report['hypothesis_id']}:{root_id}"
         self.assertNotIn(

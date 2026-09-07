@@ -244,17 +244,19 @@ so cancellation, the poller backstop, and the filled-leg close path are shared
 code. A lone resting take-profit is not a half-dead bracket and never triggers
 the lost-protection close.
 
-The stop stays software. `deploy/watchdog.py` bounds it: a separate process
-with its own broker session that flattens when the trader heartbeat is stale
-and the broker reports exposure. It takes the mode-scoped run lock first, so a
-living trader — even a hung one — keeps it inert rather than racing it into a
-double close, and it has no entry path at all. While holding that lock it takes
-the final broker snapshots, authenticates and binds the account fingerprint,
-and transfers the same lock into the flatten engine. `acted` means flattening
-was confirmed; an attempted but incomplete flatten is `degraded` with residual
-risk and is unhealthy. What no local process can cover is the broker or the
-network being unreachable; in that window an option position has no stop of
-any kind. That is the residual, and it is why live mode is equities-only.
+The option stop stays software. `deploy/trader_supervisor.py` owns one trader
+child and measures advancing heartbeats from that exact PID with a monotonic
+300-second deadline. If the child hangs, the supervisor terminates its own
+process group, escalates after a 15-second grace, and confirms child exit before
+handing recovery to `deploy/watchdog.py`. It never signals a PID read from a
+heartbeat file. Recovery acquires the mode-scoped run lock, persists operator
+pause before broker I/O, authenticates the account, and transfers the same lock
+into the flatten engine. A restart retains that pause.
+
+The independent watchdog still handles a dead trader/supervisor and cannot
+steal a living owner's lock. `acted` means flattening was confirmed; incomplete
+recovery is degraded with residual risk. Neither process guarantees recovery
+while the broker or network is unreachable. Live mode remains equities-only.
 
 ### Provider boundary
 
@@ -417,7 +419,11 @@ session-time entry window, and an ATR volatility band. `rule-strategy.v3`
 retains those predicates and adds nullable numeric `breakeven_r` for equity
 shares; v3 is therefore the first breakeven version. `rule-strategy.v4` adds
 the equity-only frozen session VWAP/rolling-mean target, monotone trailing stop,
-and `exit-before` deadline. Options remain on executable v1/v2 schemas. Each
+and `exit-before` deadline. `rule-strategy.v5` adds optional causal 5/15-minute
+trend/range context and confirmed pullback/value reclaim entries, while retaining
+v4 exits. Context and its exact source digest travel with the signal, plan, and
+trade. Neutral v5 settings preserve v4 behavior; existing v1–v4 identities remain
+unchanged. Options remain on executable v1/v2 schemas. Each
 entry extension is a pure function of the same completed-bar prefix, so
 `evaluate_rule_signal` remains the single evaluator shared by research and
 runtime. V2 entry predicates remain outside sizing/execution; v3/v4 affect only
@@ -781,7 +787,9 @@ can change a lifecycle state.
 `research.trial` is the lane between "proved" and "given money". A proved,
 unpinned edge trades the paper account; after a configured window of sessions
 and trades its live record is judged against an explicit floor. Clearing it
-makes the edge *promotable* — reported, never promoted. Missing it parks the
+requires a 95% session-cluster lower bound above the configured mean-R floor
+and makes the edge *promotable* — reported, never promoted. A positive point
+estimate with insufficient confidence stays inconclusive. Missing the point-estimate floor parks the
 edge and writes the reason into `factory_lessons` as a `trial` lesson sourced
 from `live_paper`, graded on the spot, which the next tuning request reads.
 That feedback path is the lane's purpose: without it the paper book drove the
@@ -849,7 +857,7 @@ gets a dashboard.
 - Alpaca accepts market and limit day orders on options only: no bracket, no
   OCO/OTO, and no stop or stop-limit at all. The option profile therefore gets
   a broker-resident take-profit and no broker-resident stop. Its stop is the
-  local poller, bounded from outside by `deploy/watchdog.py`, and `mode: live`
+  local poller, bounded by the owned-child supervisor and recovery watchdog, and `mode: live`
   rejects `strategy.execution_mode: options` for exactly that reason.
 - `mode: live` rejects `llm.enabled: true`; the deployed strategy must be the
   deterministic rule the gates passed.

@@ -468,7 +468,7 @@ eligibility set fail closed and remain visible in per-symbol diagnostics.
 Research replays one session at a time and the runtime fetches from the session
 open, so the two see the same window either way.
 
-The grammar has four versions. `rule-strategy.v1` is the original field set and
+The grammar has five versions. `rule-strategy.v1` is the original field set and
 is unchanged, so every candidate already in a ledger keeps its exact
 `variant_id`. `rule-strategy.v2` is a strict superset reached only by naming it
 explicitly, and adds four *entry-side* predicates: `confirmations` (a list of
@@ -479,7 +479,13 @@ regime the rule may trade). `rule-strategy.v3` keeps those entry predicates and
 adds nullable numeric `breakeven_r` for equity shares; `null` preserves the
 fixed-stop behavior. `rule-strategy.v4` adds bounded equity-only exits: a
 frozen session VWAP or rolling-mean target, a monotone trailing stop, and an
-`exit-before` deadline. Options remain on executable v1/v2 schemas. Together
+`exit-before` deadline. `rule-strategy.v5` adds optional trend/range context
+from whole, contiguous 5- or 15-minute bars and structural pullback/value reclaim
+entries. Incomplete higher-timeframe buckets and missing minutes are excluded;
+context must be available before a context-enabled signal can pass. The exact
+source digest and feature version accompany the signal and replay trade.
+Neutral v5 behavior matches v4; old v1–v4 content identities remain unchanged.
+Options remain on executable v1/v2 schemas. Together
 the extensions let a hypothesis express a *conditional* edge or bounded
 equity exit behavior without changing the signal evaluator. V2 entry
 predicates stay outside sizing/execution; v3/v4 affect only the shared bounded
@@ -808,13 +814,15 @@ module fallback is 30 sessions/100 trades, while the shipped validated runtime
 configuration supplies 20 sessions/20 trades — that proof epoch is judged
 against an explicit floor (total R and mean R both positive by default):
 
-- **Clears it** → the edge keeps trading and becomes *promotable*. Nothing is
+- **Clears it, with a 95% session-cluster lower bound above the mean-R floor** →
+  the edge keeps trading and becomes *promotable*. Nothing is
   promoted; `edge promotable` hands the operator the config block.
 - **Misses it** → the edge is parked, and the reason is written into the lesson
   ledger as a `trial` lesson from `live_paper`, graded immediately. The next
   tuning request reads it, so the parameters proposed next are answering the
   book rather than only the replay. This is the point of the lane.
-- **Window still open, or outcomes carry no usable R** → nothing happens.
+- **Window still open, outcomes carry no usable R, or a positive estimate has
+  insufficient confidence** → nothing happens.
   Underpowered is not failure here either.
 
 A pinned edge is still judged. The sequential drift stop and trial review run
@@ -1002,3 +1010,29 @@ so “what it has done since” means since the proof currently authorizing it, 
 the candidate's lifetime. Both matter: the first is the evidence an edge was
 promoted with, the second is what it has done since. Neither can change a
 lifecycle state; they are read-only views of append-only data.
+
+## Fixed mechanism comparison (diagnostic only)
+
+```bash
+python research.py factory run --data market.jsonl \
+  --diagnostic-only --cohort intraday-mechanisms.v1
+```
+
+This freezes 12 arms in three families: opening-range breakout with trend
+context, confirmed trend pullbacks with context/trailing exits, and VWAP
+reclaims with range context/shorter holds. Roots and treatments share the same
+dataset and existing costed simulation. The cohort disables proposal generation
+and mutation, persists every arm including losses and zero-trade arms, and
+cannot write proofs or authorize entries. The manifest and its hash live in
+`research/mechanism_cohort.py`. It is a hypothesis comparison, not a new winner
+selection gate. A later confirmation needs an independently frozen protocol and
+unseen observations.
+
+Diagnostics distinguish missing data, execution refusals, and no signal. They
+report net expectancy, average net win/loss, payoff ratio and implied break-even
+win rate instead of treating an arbitrary win-rate threshold as edge. Zero
+trades mean no measured expectancy; undefined profit factors stay undefined.
+Gross P&L is already calculated at modeled fills. Reference-price P&L and
+modeled execution drag are separate, and reference quotes may already include
+bid/ask crossing. Trial `mean_r_pct` is mean R × 100, not capital return;
+`capital_return_pct` requires a recorded capital denominator.

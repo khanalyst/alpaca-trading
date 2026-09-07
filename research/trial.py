@@ -25,6 +25,9 @@ never promotes anything in its place — the replacement still has to earn
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import closing
+import json
+import math
 import sqlite3
 from typing import Any, Mapping, Sequence
 
@@ -70,26 +73,145 @@ def _verdict(performance: Mapping[str, Any], policy: Mapping[str, Any]) -> dict:
     trades = int(performance.get("outcomes") or 0)
     total_r = performance.get("total_r")
     mean_r = performance.get("mean_r")
+    confidence = performance.get("session_cluster_confidence")
     if sessions < int(policy["min_sessions"]) or trades < int(policy["min_trades"]):
         return {"state": "running", "sessions": sessions, "trades": trades,
                 "sessions_required": int(policy["min_sessions"]),
                 "trades_required": int(policy["min_trades"]),
-                "total_r": total_r, "mean_r": mean_r}
+                "total_r": total_r, "mean_r": mean_r,
+                "session_cluster_confidence": confidence}
     # A concluded window with no measurable R is not a pass.  It means the
     # outcomes carried no risk reference, which is a data problem, not an edge.
     if total_r is None or mean_r is None:
         return {"state": "inconclusive", "sessions": sessions, "trades": trades,
                 "reason": "outcomes carry no usable R multiple",
-                "total_r": total_r, "mean_r": mean_r}
+                "total_r": total_r, "mean_r": mean_r,
+                "session_cluster_confidence": confidence}
     clears = (float(total_r) > float(policy["min_total_r"]) and
               float(mean_r) > float(policy["min_mean_r"]))
-    return {"state": "passed" if clears else "failed",
+    if not clears:
+        return {"state": "failed",
+                "sessions": sessions, "trades": trades,
+                "total_r": float(total_r), "mean_r": float(mean_r),
+                "min_total_r": float(policy["min_total_r"]),
+                "min_mean_r": float(policy["min_mean_r"]),
+                "net_pnl": performance.get("net_pnl"),
+                "win_rate": performance.get("win_rate"),
+                "session_cluster_confidence": confidence}
+    # A positive point estimate is only promotable when the independent
+    # session-cluster interval also clears the mean-R floor.  Missing or
+    # underpowered uncertainty evidence is not a failure of the edge, so it
+    # stays inconclusive and cannot park a live candidate.
+    usable = confidence if isinstance(confidence, Mapping) else {}
+    try:
+        confidence_level = float(usable.get("confidence"))
+        lower_bound = float(usable.get("lower_bound"))
+        usable_observations = int(usable.get("observations") or 0)
+        usable_clusters = int(usable.get("session_clusters") or
+                              usable.get("clusters") or 0)
+    except (TypeError, ValueError, OverflowError):
+        confidence_level = lower_bound = float("nan")
+        usable_observations = usable_clusters = 0
+    confidence_ready = bool(
+        usable.get("available") is True and
+        confidence_level >= 0.95 and
+        math.isfinite(lower_bound) and
+        usable_observations >= int(policy["min_trades"]) and
+        usable_clusters >= int(policy["min_sessions"]))
+    if not confidence_ready or lower_bound <= float(policy["min_mean_r"]):
+        return {"state": "inconclusive", "sessions": sessions, "trades": trades,
+                "reason": ("positive point estimate lacks a session-cluster "
+                           "lower bound above the configured mean-R floor"),
+                "total_r": float(total_r), "mean_r": float(mean_r),
+                "min_total_r": float(policy["min_total_r"]),
+                "min_mean_r": float(policy["min_mean_r"]),
+                "net_pnl": performance.get("net_pnl"),
+                "win_rate": performance.get("win_rate"),
+                "session_cluster_confidence": confidence}
+    return {"state": "passed",
             "sessions": sessions, "trades": trades,
             "total_r": float(total_r), "mean_r": float(mean_r),
             "min_total_r": float(policy["min_total_r"]),
             "min_mean_r": float(policy["min_mean_r"]),
             "net_pnl": performance.get("net_pnl"),
-            "win_rate": performance.get("win_rate")}
+            "win_rate": performance.get("win_rate"),
+            "session_cluster_confidence": confidence}
+
+
+def _session_cluster_confidence(ledger: EdgeLedger, candidate_id: str) -> dict:
+    """Estimate uncertainty from independent live-paper session clusters.
+
+    The trial floor remains the lifecycle decision.  This is evidence attached
+    to that decision, using the same deterministic moving-block helper as the
+    research gates so repeated reviews produce the same interval.
+    """
+    empty = {
+        "schema": "session-cluster-confidence.v1", "available": False,
+        "confidence": 0.95, "lower_bound": None, "upper_bound": None,
+        "mean": None, "clusters": 0, "observations": 0,
+        "method": "moving_block_cluster_bootstrap",
+        "reason": "no_usable_r_observations",
+    }
+    try:
+        epoch, has_shadow = ledger._trial_epoch_state(candidate_id)
+        with closing(sqlite3.connect(ledger.path)) as db:
+            db.row_factory = sqlite3.Row
+            if has_shadow and epoch is None:
+                rows = []
+            elif epoch is None:
+                rows = db.execute(
+                    "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
+                    "WHERE candidate_id=? AND proof_run_id IS NULL "
+                    "ORDER BY session_date,created_at,outcome_id", (candidate_id,)).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
+                    "WHERE candidate_id=? AND proof_run_id=? "
+                    "ORDER BY session_date,created_at,outcome_id", (candidate_id, epoch)).fetchall()
+        values: list[float] = []
+        clusters: list[str] = []
+        for row in rows:
+            session = str(row["session_date"] or "").strip()
+            if not session:
+                continue
+            try:
+                payload = json.loads(row["outcome_json"])
+                if not isinstance(payload, Mapping):
+                    continue
+                value = payload.get("r_multiple")
+                if value is None:
+                    net = row["net_pnl"]
+                    risk = payload.get("risk_usd")
+                    net_value = float(net)
+                    risk_value = float(risk)
+                    value = (net_value / risk_value
+                             if math.isfinite(net_value) and
+                             math.isfinite(risk_value) and risk_value > 0
+                             else None)
+                value = float(value)
+            except (TypeError, ValueError, OverflowError, json.JSONDecodeError,
+                    AttributeError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+                clusters.append(session)
+        if not values:
+            return empty
+        from .stats import moving_block_cluster_bootstrap_lower_bound
+        cluster_count = len(set(clusters))
+        bound = moving_block_cluster_bootstrap_lower_bound(
+            values, clusters, confidence=.95, draws=1000,
+            block_length=max(1, min(5, cluster_count - 1)), min_clusters=2)
+        return {
+            "schema": "session-cluster-confidence.v1",
+            **{key: bound.get(key) for key in (
+                "available", "confidence", "lower_bound", "upper_bound",
+                "mean", "clusters", "observations", "method", "reason")},
+            "session_clusters": cluster_count,
+            "proof_run_id": epoch,
+        }
+    except (OSError, sqlite3.Error, TypeError, ValueError, KeyError):
+        return {**empty, "reason": "confidence_unavailable"}
 
 
 def _reason(record: Mapping[str, Any], verdict: Mapping[str, Any]) -> str:
@@ -176,6 +298,11 @@ def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
         candidate_vehicle = str(candidate.get("vehicle") or "")
         is_pinned = (variant_id, candidate_vehicle) in frozen
         performance = ledger.paper_performance(candidate_id)
+        performance = {
+            **performance,
+            "session_cluster_confidence": _session_cluster_confidence(
+                ledger, candidate_id),
+        }
         verdict = _verdict(performance, policy)
         learning_epoch = _learning_epoch_of(ledger, candidate_id)
         review = {
@@ -200,7 +327,9 @@ def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
                                "mean_r": verdict["mean_r"],
                                "net_pnl": verdict.get("net_pnl"),
                                "sessions": verdict["sessions"],
-                               "trades": verdict["trades"]})
+                               "trades": verdict["trades"],
+                               "session_cluster_confidence": verdict.get(
+                                   "session_cluster_confidence")})
         elif verdict["state"] == "failed" and apply:
             review["action"] = "parked"
             reason = _reason(candidate, verdict)
@@ -308,7 +437,15 @@ def promotable_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             "total_r": verdict["total_r"], "mean_r": verdict["mean_r"],
             "win_rate": performance.get("win_rate"),
             "net_pnl": performance.get("net_pnl"),
-            "return_pct": _return_pct(performance),
+            "mean_r_pct": _mean_r_pct(performance),
+            "capital_return_pct": _capital_return_pct(performance),
+            # Compatibility alias for existing consumers.  It is explicitly
+            # tied to the mean-R basis; new consumers should use
+            # ``mean_r_pct`` or the denominator-gated capital field above.
+            "return_pct": _mean_r_pct(performance),
+            "return_pct_basis": "mean_r_pct",
+            "session_cluster_confidence": verdict.get(
+                "session_cluster_confidence"),
             "config_snippet": (None if already else promotion_snippet(
                 item["variant_id"], item["vehicle"],
                 note=(f"live paper: {verdict['trades']} trades over "
@@ -318,21 +455,33 @@ def promotable_report(db_path: str | Path = DEFAULT_DB_PATH, *,
     return sorted(rows, key=lambda row: row["total_r"], reverse=True)
 
 
-def _return_pct(performance: Mapping[str, Any]) -> float | None:
-    """Realized P&L as a percentage of the risk actually deployed.
-
-    Expressed against risk rather than account equity: the account is shared by
-    every edge, so an equity-relative number would say more about the other
-    edges than about this one.
-    """
-    total_r = performance.get("total_r")
-    trades = performance.get("outcomes")
-    if total_r is None or not trades:
+def _mean_r_pct(performance: Mapping[str, Any]) -> float | None:
+    """Display mean R as a percentage, with a label that states its basis."""
+    mean_r = performance.get("mean_r")
+    if mean_r is None:
         return None
     try:
-        return round(100.0 * float(total_r) / float(trades), 4)
-    except (TypeError, ValueError, ZeroDivisionError):
+        value = float(mean_r)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return round(100.0 * value, 4) if math.isfinite(value) else None
+
+
+def _capital_return_pct(performance: Mapping[str, Any]) -> float | None:
+    """Return capital P&L only when an explicit capital denominator exists."""
+    pnl = performance.get("net_pnl")
+    denominator = next((performance.get(key) for key in (
+        "capital_return_denominator", "starting_equity", "initial_equity",
+        "equity_denominator") if performance.get(key) is not None), None)
+    try:
+        pnl_value = float(pnl)
+        denominator_value = float(denominator)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (not math.isfinite(pnl_value) or not math.isfinite(denominator_value)
+            or denominator_value <= 0):
+        return None
+    return round(100.0 * pnl_value / denominator_value, 4)
 
 
 __all__ = ["DEFAULT_MIN_SESSIONS", "DEFAULT_MIN_TRADES", "TRIAL_SCHEMA",

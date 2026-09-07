@@ -203,6 +203,30 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self.assertEqual(attribution["pnl_semantics"],
                          "broker_fill_pnl_minus_fees")
 
+    def test_close_increments_prorate_reported_trade_fees(self):
+        self._bind_engine(runtime_name="runtime-close-fee-parts")
+        trade = {"symbol": "SPY", "entry_price": 100, "qty": 6,
+                 "cumulative_filled_qty": 10, "position_side": "long",
+                 "fees": 1.0, "slippage": 2.0, "risk_usd": 10}
+        with mock.patch.object(state, "log_trade") as journal:
+            for quantity, order in ((4, "first"), (6, "retry")):
+                self.engine._journal_close_fill(trade,
+                    {"order_id": order, "qty": quantity, "status": "filled"},
+                    quantity, 101, {}, trade_id=f"close:entry:{order}")
+        self.assertAlmostEqual(sum(call.kwargs["fees"] for call in journal.call_args_list), 1)
+        self.assertAlmostEqual(sum(call.kwargs["net_pnl"] for call in journal.call_args_list), 9)
+
+    def test_unknown_costs_cannot_become_zero_fee_net_profit(self):
+        self._bind_engine(runtime_name="runtime-cost-unavailable")
+        from research.costs import CostError
+        with mock.patch("agent.execution_lifecycle.CostModel.from_config",
+                        side_effect=CostError("unavailable")):
+            attribution = self.engine._close_pnl_attribution(
+                {"execution_profile": "shares"}, 10, 100, 101, 10, 1)
+        self.assertEqual(attribution["gross_pnl"], 10)
+        self.assertIsNone(attribution["net_pnl"])
+        self.assertIsNone(attribution["fees"])
+
     def test_partial_fill_progression_is_monotonic_and_incremental(self):
         self._bind_engine(runtime_name="runtime-partial")
         _, entry = self._submit_stock_entry()
@@ -577,6 +601,165 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self.assertNotEqual(first_id, second_id)
         self.engine._monitor_positions(now, list(self.provider.positions_live))
         self.assertEqual(len(self.provider.close_requests), 2)
+
+    def test_terminal_partial_close_uses_cumulative_terminal_fill(self):
+        self._bind_engine(runtime_name="runtime-close-cumulative")
+        _, entry = self._submit_stock_entry(
+            quantity=Decimal("10"), client_order_id="entry-close-cumulative")
+        self.provider.set_order(entry.id, status="filled", filled_qty=10,
+                                filled_avg_price=100)
+        full_position = Position(
+            "SPY", Decimal("10"), "long", avg_entry_price=Decimal("100"),
+            current_price=Decimal("98"))
+        self.provider.positions_live = [full_position]
+        self.engine.reconcile()
+        self.engine._monitor_positions(
+            datetime(2026, 8, 7, 14, tzinfo=timezone.utc),
+            list(self.provider.positions_live))
+        close_id = next(
+            item.id for item in self.provider.orders_by_id.values()
+            if item.client_order_id == self.provider.close_requests[0].client_order_id)
+
+        # The open order first exposes a non-terminal four-share fill while
+        # Alpaca confirms the six-share residual position.
+        self.provider.set_order(close_id, status="partially_filled",
+                                filled_qty=4, filled_avg_price=101)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("6"), "long", avg_entry_price=Decimal("100"),
+            current_price=Decimal("101"))]
+        self.engine.reconcile()
+        self.assertEqual(state.load_state()["active_trades"]["SPY"]["qty"], "6")
+        self.assertEqual([row[1] for row in self._journal_trades()], ["open"])
+
+        # The terminal snapshot is cumulative and its terminal average is the
+        # authoritative price for all ten shares.
+        self.provider.set_order(close_id, status="filled", filled_qty=10,
+                                filled_avg_price=102)
+        self.provider.positions_live = []
+        self.engine.reconcile()
+        rows = self._journal_trades()
+        self.assertEqual(rows[-1][1:5], ("close", 10.0, 102.0, 20.0))
+        self.assertEqual(state.load_state()["active_trades"], {})
+
+        # Replaying the same terminal order is a durable no-op.
+        self.engine.reconcile()
+        self.assertEqual(self._journal_trades(), rows)
+
+    def test_terminal_partial_close_retries_reconcile_each_attempt_once(self):
+        self._bind_engine(runtime_name="runtime-close-attempts")
+        _, entry = self._submit_stock_entry(
+            quantity=Decimal("10"), client_order_id="entry-close-attempts")
+        self.provider.set_order(entry.id, status="filled", filled_qty=10,
+                                filled_avg_price=100)
+        full_position = Position(
+            "SPY", Decimal("10"), "long", avg_entry_price=Decimal("100"),
+            current_price=Decimal("98"))
+        self.provider.positions_live = [full_position]
+        self.engine.reconcile()
+        now = datetime(2026, 8, 7, 14, tzinfo=timezone.utc)
+        self.engine._monitor_positions(now, list(self.provider.positions_live))
+        first = self.provider.close_requests[-1]
+        first_order = next(item for item in self.provider.orders_by_id.values()
+                           if item.client_order_id == first.client_order_id)
+        self.provider.set_order(first_order.id, status="canceled",
+                                filled_qty=4, filled_avg_price=101)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("6"), "long", avg_entry_price=Decimal("100"),
+            current_price=Decimal("98"))]
+        self.engine.reconcile()
+        self.assertEqual(self._journal_trades()[-1][1:4], ("close", 4.0, 101.0))
+
+        # A retry owns only the six-share residual and contributes its own
+        # terminal fill row; the first attempt must never be duplicated.
+        self.engine._monitor_positions(now, list(self.provider.positions_live))
+        second = self.provider.close_requests[-1]
+        second_order = next(item for item in self.provider.orders_by_id.values()
+                            if item.client_order_id == second.client_order_id)
+        self.provider.set_order(second_order.id, status="filled",
+                                filled_qty=6, filled_avg_price=102)
+        self.provider.positions_live = []
+        self.engine.reconcile()
+        rows = self._journal_trades()
+        self.assertEqual([row[1] for row in rows], ["open", "close", "close"])
+        self.assertEqual([(row[2], row[3], row[4]) for row in rows[1:]],
+                         [(4.0, 101.0, 4.0), (6.0, 102.0, 12.0)])
+        self.engine.reconcile()
+        self.assertEqual(self._journal_trades(), rows)
+
+    def test_terminal_partial_close_without_position_can_finish_from_cumulative_fill(self):
+        self._bind_engine(runtime_name="runtime-close-cumulative-no-position")
+        _, entry = self._submit_stock_entry(
+            quantity=Decimal("10"), client_order_id="entry-close-cumulative-no-position")
+        self.provider.set_order(entry.id, status="filled", filled_qty=10,
+                                filled_avg_price=100)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("10"), "long", avg_entry_price=Decimal("100"),
+            current_price=Decimal("98"),
+        )]
+        self.engine.reconcile()
+        self.engine._monitor_positions(
+            datetime(2026, 8, 7, 14, tzinfo=timezone.utc),
+            list(self.provider.positions_live))
+        close_id = next(
+            item.id for item in self.provider.orders_by_id.values()
+            if item.client_order_id == self.provider.close_requests[0].client_order_id)
+
+        # A terminal partial close can be observed after the position endpoint
+        # has already gone empty. Keep the six-share residual unconfirmed.
+        self.provider.set_order(close_id, status="canceled",
+                                filled_qty=4, filled_avg_price=101)
+        self.provider.positions_live = []
+        self.engine.reconcile()
+        residual = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(residual["qty"], "6.0")
+        self.assertFalse(residual["position_confirmed"])
+        self.assertEqual(self._journal_trades()[-1][1:4], ("close", 4.0, 101.0))
+
+        # A later cumulative terminal snapshot proves the residual even though
+        # no position row ever reappears.
+        self.provider.set_order(close_id, status="filled",
+                                filled_qty=10, filled_avg_price=102)
+        self.engine.reconcile()
+        rows = self._journal_trades()
+        self.assertEqual([row[1] for row in rows], ["open", "close", "close"])
+        self.assertEqual(sum(row[2] for row in rows[1:]), 10.0)
+        self.assertAlmostEqual(sum(row[4] for row in rows[1:]), 20.0)
+        self.assertEqual(state.load_state()["active_trades"], {})
+
+        self.engine.reconcile()
+        self.assertEqual(self._journal_trades(), rows)
+
+    def test_same_symbol_new_entry_ignores_historical_close_orders(self):
+        self._bind_engine(runtime_name="runtime-close-lifecycle-binding")
+        now = datetime(2026, 8, 7, 14, tzinfo=timezone.utc)
+
+        def complete_trade(entry_id, exit_price):
+            _, entry = self._submit_stock_entry(
+                quantity=Decimal("10"), client_order_id=entry_id)
+            self.provider.set_order(entry.id, status="filled", filled_qty=10,
+                                    filled_avg_price=100)
+            position = Position(
+                "SPY", Decimal("10"), "long", avg_entry_price=Decimal("100"),
+                current_price=Decimal("98"))
+            self.provider.positions_live = [position]
+            self.engine.reconcile()
+            self.engine._monitor_positions(now, [position])
+            close = self.provider.close_requests[-1]
+            close_order = max(
+                (item for item in self.provider.orders_by_id.values()
+                 if item.client_order_id == close.client_order_id),
+                key=lambda item: int(str(item.id).rsplit("-", 1)[-1]))
+            self.provider.set_order(close_order.id, status="filled", filled_qty=10,
+                                    filled_avg_price=exit_price)
+            self.provider.positions_live = []
+            self.engine.reconcile()
+
+        complete_trade("entry-close-first", 101)
+        self.assertEqual(self._journal_trades()[-1][2:4], (10.0, 101.0))
+        complete_trade("entry-close-second", 103)
+        rows = self._journal_trades()
+        self.assertEqual([row[1] for row in rows], ["open", "close", "open", "close"])
+        self.assertEqual(rows[-1][2:5], (10.0, 103.0, 30.0))
 
     def test_reappearing_closed_position_is_unprotected_residual_not_reactivated(self):
         self._bind_engine(runtime_name="runtime-reappearing")

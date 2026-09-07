@@ -218,6 +218,170 @@ class EngineCycleMixin:
             "dependence_policy_hash": result.get("dependence_policy_hash")})
         return admitted
 
+    def _edge_runtime_opportunity(
+            self, edge_cfg: Mapping[str, Any], rows: Mapping[str, Any],
+            symbols: list[str], now: datetime, *, edge_identity: str | None = None,
+            signal_sessions: Mapping[str, str] | None = None,
+            blocked_symbols: set[str] | None = None) -> bool | None:
+        """Probe whether an edge can emit a signal from this cycle's rows.
+
+        Allocation ranks proof records before the normal per-symbol signal
+        loop. A proved edge with no current opportunity must not consume a
+        slot ahead of an edge that does have one. This probe uses the already
+        collected rows and disposable signal state; it does not persist
+        session markers or reserve risk. ``None`` means that the probe could
+        not establish a result, so allocation keeps the edge and the normal
+        signal path remains authoritative.
+        """
+        if not isinstance(edge_cfg, Mapping) or not isinstance(rows, Mapping):
+            return None
+        signal_sessions = (signal_sessions
+                           if isinstance(signal_sessions, Mapping) else {})
+        blocked_symbols = {str(symbol).upper() for symbol in (blocked_symbols or set())}
+        strategy_cfg = (edge_cfg.get("strategy", {})
+                        if isinstance(edge_cfg.get("strategy"), Mapping) else {})
+        strategy_id = str(strategy_cfg.get("id") or "").lower()
+        if strategy_id == "rule":
+            try:
+                from .contracts.rule import (
+                    CROSS_SECTIONAL_BENCHMARK,
+                    rule_vehicle_executable,
+                    validate_rule_spec,
+                )
+                rule_spec = validate_rule_spec(
+                    strategy_cfg.get("rule_spec") or {})
+                execution_cfg = (edge_cfg.get("execution", {})
+                                 if isinstance(edge_cfg.get("execution"), Mapping)
+                                 else {})
+                configured_bar_age = float(
+                    execution_cfg.get("max_market_data_age_seconds", 30) or 30)
+                execution_mode = str(
+                    strategy_cfg.get("execution_mode") or "").lower()
+                if (rule_spec["family"] == "cross_sectional_residual" and
+                        not rule_vehicle_executable(rule_spec, execution_mode)):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return None
+            for symbol in symbols:
+                if str(symbol).upper() in blocked_symbols:
+                    continue
+                row = rows.get(symbol)
+                if not isinstance(row, Mapping):
+                    continue
+                prepared = _rule_runtime_bars(
+                    row.get("bars", []), rule_spec, now,
+                    max_age_seconds=configured_bar_age)
+                if prepared is None:
+                    continue
+                rule_bars, current_session, latest_bar_ts = prepared
+                if signal_sessions.get(f"rule|{symbol}") == current_session:
+                    continue
+                market_context = None
+                if rule_spec["family"] == "cross_sectional_residual":
+                    benchmark_row = rows.get(CROSS_SECTIONAL_BENCHMARK)
+                    benchmark_bars = (benchmark_row.get("bars", [])
+                                      if isinstance(benchmark_row, Mapping) else [])
+                    benchmark_prepared = (
+                        prepared if symbol == CROSS_SECTIONAL_BENCHMARK else
+                        _rule_runtime_bars(
+                            benchmark_bars, rule_spec, now,
+                            max_age_seconds=configured_bar_age))
+                    if benchmark_prepared is None:
+                        continue
+                    market_context = MappingProxyType({
+                        CROSS_SECTIONAL_BENCHMARK:
+                            tuple(benchmark_prepared[0]),
+                    })
+                try:
+                    if market_context is None:
+                        signal = generate_rule_signal(
+                            symbol, rule_bars, config=edge_cfg, now=now)
+                    else:
+                        signal = generate_rule_signal(
+                            symbol, rule_bars, config=edge_cfg, now=now,
+                            bars_by_symbol=market_context)
+                except Exception:  # noqa: BLE001
+                    return None
+                if signal is None:
+                    continue
+                try:
+                    signal_ts = float(signal.get("signal_ts"))
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    continue
+                if (abs(signal_ts - latest_bar_ts) <= 1e-6 and
+                        str(signal.get("session") or "") == current_session):
+                    return True
+            return False
+        if strategy_id in {"", "ibr", "opening_range_breakout"}:
+            for symbol in symbols:
+                if str(symbol).upper() in blocked_symbols:
+                    continue
+                row = rows.get(symbol)
+                if not isinstance(row, Mapping):
+                    continue
+                try:
+                    prior_session = signal_sessions.get(
+                        f"{edge_identity or strategy_id}|{symbol}")
+                    signal = generate_ibr_signal(
+                        symbol, row.get("bars", []), config=strategy_cfg,
+                        now=now, session_state={
+                            "signals": ({(symbol, prior_session)}
+                                         if prior_session else set())})
+                except Exception:  # noqa: BLE001
+                    return None
+                if signal is not None:
+                    emitted_session = str(signal.get("session") or "")
+                    signal_key = f"{edge_identity or strategy_id}|{symbol}"
+                    if (emitted_session and
+                            signal_sessions.get(signal_key) == emitted_session):
+                        continue
+                    return True
+            return False
+        # Future strategy families should be admitted for the normal path to
+        # decide, since this probe cannot safely infer their opportunity.
+        return None
+
+    def _prefilter_edge_opportunities(
+            self, edge_configs: list, *, rows: Mapping[str, Any],
+            symbols: list[str], now: datetime,
+            signal_sessions: Mapping[str, str] | None = None,
+            blocked_symbols: set[str] | None = None) -> list:
+        """Drop proved edges with no current signal before proof allocation."""
+        if (len(edge_configs) < 2 or self.mode == "live" or
+                getattr(self, "_edge_selection_mode", "specific") != "all_proved" or
+                not isinstance(rows, Mapping)):
+            return edge_configs
+        retained = []
+        for item in edge_configs:
+            try:
+                record, edge_cfg = item
+                strategy_cfg = (edge_cfg.get("strategy", {})
+                                if isinstance(edge_cfg, Mapping) and
+                                isinstance(edge_cfg.get("strategy"), Mapping)
+                                else {})
+                record_candidate = (record.get("candidate_id")
+                                    if isinstance(record, Mapping) else None)
+                edge_identity = str(
+                    record_candidate or strategy_cfg.get("variant_id") or
+                    f"{strategy_cfg.get('id', 'ibr')}:{strategy_cfg.get('version', 'v1')}" )
+                opportunity = self._edge_runtime_opportunity(
+                    edge_cfg, rows, symbols, now,
+                    edge_identity=edge_identity,
+                    signal_sessions=signal_sessions,
+                    blocked_symbols=blocked_symbols)
+            except Exception:  # noqa: BLE001
+                opportunity = None
+            if opportunity is False:
+                self._event("opportunity_prefilter_reject", {
+                    "candidate_id": (record or {}).get("candidate_id")
+                    if isinstance(record, Mapping) else None,
+                    "variant_id": (record or {}).get("variant_id")
+                    if isinstance(record, Mapping) else None,
+                    "reason": "no_current_signal"})
+                continue
+            retained.append(item)
+        return retained
+
     def _run_once_impl(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:
         if not self._ensure_order_ready():
             reason = self._preflight_error or "startup_reconciliation_required"
@@ -291,34 +455,12 @@ class EngineCycleMixin:
                 self._event("protection_market_data_unavailable", {
                     "error": str(exc)})
         monitored = self._monitor_positions(now, positions, market_rows=rows)
-        if monitored.get("failed"):
-            return {"action": "hold", "reason": "position_close_failed", **monitored}
-        if monitored.get("closed"):
-            try:
-                self.reconcile()
-            except Exception as exc:  # noqa: BLE001
-                return {"action": "hold", "reason": "close_reconciliation_failed", "error": str(exc)}
-            # A submitted close must be reconciled before any new exposure is
-            # considered, even if the broker has not filled it yet.
-            return {"action": "close", **monitored}
-        if not self._refresh_edge():
-            return {"action": "hold", "reason": self._edge_error or
-                    "validated edge champion is required"}
-        if _value(clock, "is_open", None) is not True or not self.market.can_enter(now):
-            return {"action": "hold", "reason": "outside_regular_session"}
-        if not self._latest_entry_allowed(now):
-            return {"action": "hold", "reason": "latest_entry_time_passed"}
-        session = self.market.session(now)
-        session_close = session.close if session is not None else None
-        force_flat_at = None
-        if session_close is not None:
-            minutes = int(self.cfg.get("strategy", {}).get(
-                "force_flat_minutes_before_close",
-                self.cfg.get("session", {}).get("force_flat_minutes_before_close", 10),
-            ))
-            force_flat_at = session_close - timedelta(minutes=max(0, minutes))
-        if rows is None:
-            rows = self._collect(symbols, now, snapshot)
+
+        # Account loss protection is a portfolio-wide guard, so it must run
+        # on every regular-session cycle after position monitoring and before
+        # any edge or entry eligibility return.  Otherwise an invalidated edge
+        # or an elapsed entry cutoff can leave an existing position alive
+        # without refreshing the daily stop.
         try:
             account = self.provider.account()
         except Exception as exc:  # noqa: BLE001
@@ -332,11 +474,67 @@ class EngineCycleMixin:
             self._event("daily_loss_limit", {"daily_pnl": daily_pnl,
                                               "flatten_complete": complete})
             try:
+                state.write_heartbeat("paused", run_id=self.run_id,
+                                      reason="daily_loss_limit", orders=0)
+            except Exception:
+                pass
+            try:
                 residual = _plain(self.provider.positions())
             except Exception as exc:  # noqa: BLE001
                 return self._fail_closed("post_risk_positions_unavailable", exc)
             return {"action": "day_stopped", "daily_pnl": daily_pnl,
                     "closed": complete, "residual": residual}
+
+        if monitored.get("failed"):
+            return {"action": "hold", "reason": "position_close_failed", **monitored}
+
+        if monitored.get("closed"):
+            try:
+                self.reconcile()
+            except Exception as exc:  # noqa: BLE001
+                return {"action": "hold", "reason": "close_reconciliation_failed", "error": str(exc)}
+            # A submitted close must be reconciled before any new exposure is
+            # considered, even if the broker has not filled it yet.
+            try:
+                state.write_heartbeat("running", run_id=self.run_id,
+                                      reason="position_close_submitted", orders=0)
+            except Exception:
+                pass
+            return {"action": "close", **monitored}
+
+        if not self._refresh_edge():
+            try:
+                state.write_heartbeat("paused", run_id=self.run_id,
+                                      reason="validated_edge_required")
+            except Exception:
+                pass
+            return {"action": "hold", "reason": self._edge_error or
+                    "validated edge champion is required"}
+        if _value(clock, "is_open", None) is not True or not self.market.can_enter(now):
+            try:
+                state.write_heartbeat("running", run_id=self.run_id,
+                                      reason="outside_regular_session", orders=0)
+            except Exception:
+                pass
+            return {"action": "hold", "reason": "outside_regular_session"}
+        if not self._latest_entry_allowed(now):
+            try:
+                state.write_heartbeat("running", run_id=self.run_id,
+                                      reason="latest_entry_time_passed", orders=0)
+            except Exception:
+                pass
+            return {"action": "hold", "reason": "latest_entry_time_passed"}
+        session = self.market.session(now)
+        session_close = session.close if session is not None else None
+        force_flat_at = None
+        if session_close is not None:
+            minutes = int(self.cfg.get("strategy", {}).get(
+                "force_flat_minutes_before_close",
+                self.cfg.get("session", {}).get("force_flat_minutes_before_close", 10),
+            ))
+            force_flat_at = session_close - timedelta(minutes=max(0, minutes))
+        if rows is None:
+            rows = self._collect(symbols, now, snapshot)
         try:
             positions = self.provider.positions()
         except Exception as exc:  # noqa: BLE001
@@ -429,10 +627,15 @@ class EngineCycleMixin:
             if underlying not in held_underlyings)
         edge_configs = self._edge_configs or ([(None, self._edge_base_cfg)]
                                                if not self._edge_required else [])
+        free_slots = int(risk_cfg.get("max_concurrent_positions", 1) or 1) - (
+            len(positions) + pending_position_count)
+        edge_configs = self._prefilter_edge_opportunities(
+            edge_configs, rows=rows, symbols=symbols, now=now,
+            signal_sessions=signal_sessions,
+            blocked_symbols=held_underlyings | pending_underlyings)
         edge_configs = self._allocate_edges(
             edge_configs,
-            free_slots=int(risk_cfg.get("max_concurrent_positions", 1) or 1) -
-            (len(positions) + pending_position_count))
+            free_slots=free_slots)
         for edge_record, edge_cfg in edge_configs:
             if not self._latest_entry_allowed(now, edge_cfg):
                 continue
