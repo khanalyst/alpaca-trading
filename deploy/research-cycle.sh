@@ -581,6 +581,89 @@ case "$session_window" in
     ;;
 esac
 
+# A sealed snapshot is an explicit, bounded input. It is never created for a
+# normal recorder run: copying a large corpus requires both an opt-in flag and
+# an explicit destination. A caller-supplied dataset keeps precedence so the
+# existing frozen-source path contract remains unchanged.
+snapshot_root="${ALPACA_RESEARCH_SNAPSHOT_ROOT:-}"
+snapshot_create="${ALPACA_RESEARCH_SNAPSHOT_CREATE:-${ALPACA_RESEARCH_CREATE_SNAPSHOT:-0}}"
+snapshot_max_bytes="${ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES:-}"
+snapshot_min_free_bytes="${ALPACA_RESEARCH_SNAPSHOT_MIN_FREE_BYTES:-0}"
+snapshot_identity=""
+snapshot_verified=0
+case "$snapshot_create" in
+  0|1) ;;
+  *) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_CREATE must be 0 or 1" 3 ;;
+esac
+case "$snapshot_max_bytes" in
+  '') ;;
+  *[!0-9]*) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES must be a positive integer" 3 ;;
+  0) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES must be positive" 3 ;;
+esac
+case "$snapshot_min_free_bytes" in
+  ''|*[!0-9]*) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MIN_FREE_BYTES must be nonnegative" 3 ;;
+esac
+if [ -n "$snapshot_root" ] && [[ "$snapshot_root" != /* ]]; then
+  snapshot_root="$repo_root/$snapshot_root"
+fi
+if [ -z "$dataset" ] && [ "$snapshot_create" -eq 1 ]; then
+  if [ -z "$snapshot_root" ]; then
+    finish "failed" "snapshot creation requires ALPACA_RESEARCH_SNAPSHOT_ROOT" 3
+  fi
+  if [ "$session_window" = "0" ]; then
+    finish "failed" "snapshot creation requires a positive ALPACA_RESEARCH_SESSION_WINDOW" 3
+  fi
+  snapshot_create_args=()
+  if [ -n "$snapshot_max_bytes" ]; then
+    snapshot_create_args+=(--max-bytes "$snapshot_max_bytes")
+  fi
+  if [ "$snapshot_min_free_bytes" != "0" ]; then
+    snapshot_create_args+=(--min-free-bytes "$snapshot_min_free_bytes")
+  fi
+  set +e
+  snapshot_create_output="$($python_bin "$repo_root/deploy/research_snapshot.py" create \
+    --recorded-root "$recorded_root" --snapshot-root "$snapshot_root" \
+    --session-window "$session_window" "${snapshot_create_args[@]}" 2>&1)"
+  snapshot_create_status=$?
+  set -e
+  printf '%s\n' "$snapshot_create_output" >&2
+  if [ "$snapshot_create_status" -ne 0 ]; then
+    finish "failed" "sealed research snapshot creation failed" 3
+  fi
+fi
+if [ -z "$dataset" ] && [ -n "$snapshot_root" ]; then
+  set +e
+  snapshot_verify_output="$($python_bin "$repo_root/deploy/research_snapshot.py" verify \
+    --snapshot-root "$snapshot_root")"
+  snapshot_verify_status=$?
+  set -e
+  printf '%s\n' "$snapshot_verify_output" >&2
+  if [ "$snapshot_verify_status" -ne 0 ]; then
+    finish "failed" "sealed research snapshot verification failed" 3
+  fi
+  snapshot_identity="$($python_bin - "$snapshot_verify_output" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("verified") is not True or payload.get("immutable") is not True:
+    raise SystemExit(1)
+identity = payload.get("identity")
+if not isinstance(identity, str) or not identity.startswith("sha256:"):
+    raise SystemExit(1)
+print(identity)
+PY
+)" || finish "failed" "sealed research snapshot identity is invalid" 3
+  snapshot_verified=1
+  # Use the sealed root as the parser's one corpus root. This keeps CSV rows
+  # and every matching source/calendar/index sidecar bound to the snapshot.
+  recorded_root="$snapshot_root"
+  dataset="$snapshot_root"
+  dataset_from_recorder=1
+  direct_source_identity="$snapshot_identity"
+  direct_source_mode="sealed_snapshot"
+fi
+
 tmp_root="${TMPDIR:-/tmp}"
 mkdir -p "$tmp_root"
 tmp_dir="$(mktemp -d "$tmp_root/alpaca-research.XXXXXX")"
@@ -640,9 +723,9 @@ direct_dataset="$dataset"
 direct_partition_root="$partition_root"
 
 # A historical source marker is provenance, not a write barrier: recorder
-# partitions may still grow. Automatic cache identities stay disabled until
-# sealed immutable snapshots exist. Explicit caller-supplied immutable source
-# identity remains the pre-existing opt-in contract below.
+# partitions may still grow. Only the verified sealed snapshot path above can
+# derive an automatic cache identity. Explicit caller-supplied immutable source
+# identity remains the pre-existing opt-in contract for other frozen inputs.
 
 validated_input="$dataset"
 if [ "$dataset" = "-" ]; then
@@ -674,6 +757,14 @@ cache_lookup_output=""
 cache_source_identity="${ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY:-$direct_source_identity}"
 if [ -z "$direct_source_identity" ]; then
   direct_source_identity="$cache_source_identity"
+fi
+if [ "$snapshot_verified" -eq 1 ]; then
+  if [ -n "${ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY:-}" ] && \
+      [ "$ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY" != "$snapshot_identity" ]; then
+    finish "failed" "explicit immutable source identity does not match verified snapshot" 3
+  fi
+  cache_source_identity="$snapshot_identity"
+  direct_source_identity="$snapshot_identity"
 fi
 cache_root="${ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT:-$repo_root/research/cache/preprocessing}"
 if [[ "$cache_root" != /* ]]; then

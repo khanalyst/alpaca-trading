@@ -17,8 +17,10 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Sequence
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import parse_qs, urlencode, urlparse
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -51,7 +53,6 @@ SAFE_TRADE_FIELDS = (
 )
 _CACHE: dict[str, tuple[float, object]] = {}
 _CACHE_LOCK = threading.Lock()
-
 
 def _content_hash(value: object) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -308,6 +309,9 @@ def _charts(path: Path, mode: str = "paper") -> dict:
         }
     except (OSError, sqlite3.Error, ValueError, KeyError):
         return {**empty, "reason": "journal unreadable"}
+
+
+from deploy.dashboard_workbench import workbench
 
 
 # Mirrors research.edge_ledger.PAPER_DEMOTION_* for compatibility. The dashboard
@@ -1139,6 +1143,18 @@ td,th{white-space:nowrap;font-variant-numeric:tabular-nums}
 </style></head><body>
 <h1>Alpaca agent</h1><div class="muted">Read-only operational view. Auto-refreshes every 30 seconds.</div>
 <div id="error" class="bad"></div><main class="grid" id="cards"></main>
+<section class="card" style="margin-top:18px"><h2>Trader workbench</h2>
+<p class="muted">Filter recorded evidence. Market candles show complete observations available by the chosen cutoff. Research and account results have separate sources.</p>
+<form id="workbench-form" style="display:flex;flex-wrap:wrap;gap:10px">
+<label>Source <select name="source"><option>paper</option><option>live</option><option>sim</option><option>research</option></select></label>
+<label>Symbol <input name="symbol" value="SPY" size="6"></label>
+<label>Feed <select name="feed"><option>iex</option><option>sip</option></select></label>
+<label>From <input type="date" name="start_date"></label><label>To <input type="date" name="end_date"></label>
+<label>Variant <input name="variant_id" size="18"></label><label>Candidate <input name="candidate_id" size="18"></label>
+<label>Proof epoch <input name="proof_epoch" size="14"></label>
+<label>Information cutoff <input name="as_of" placeholder="ISO time with timezone" size="24"></label>
+<button type="submit">Load evidence</button></form>
+<div id="workbench-result"></div></section>
 <script>
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n};
 const card=(title,wide=false)=>{const n=el('section');n.className='card'+(wide?' wide':'');n.append(el('h2',title));cards.append(n);return n};
@@ -1225,6 +1241,26 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
 
  c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}
+function candleChart(parent,name,points){
+ const box=el('div');box.append(el('h3',name+' candles'));parent.append(box);
+ if(!points.length){box.append(el('p','Unavailable: no complete recorded bars.','muted'));return}
+ const data=points.slice(-600),w=960,h=200,p=18,lo=Math.min(...data.map(r=>r.low)),hi=Math.max(...data.map(r=>r.high)),span=hi-lo||1;
+ const start=data[0].ts,end=data[data.length-1].ts,range=end-start||1,x=t=>p+(t-start)/range*(w-2*p),y=v=>h-p-(v-lo)/span*(h-2*p);
+ const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 '+w+' '+h);svg.setAttribute('width','100%');svg.setAttribute('height',h);svg.setAttribute('role','img');svg.setAttribute('aria-label',name+' OHLC candles');
+ for(const r of data){const line=document.createElementNS(svg.namespaceURI,'path');const px=x(r.ts),bw=Math.max(1,Math.min(8,(w-2*p)/data.length*.6));line.setAttribute('d',`M${px} ${y(r.high)}V${y(r.low)} M${px-bw/2} ${y(r.open)}H${px}V${y(r.close)}H${px+bw/2}`);line.setAttribute('stroke',r.close>=r.open?'#65d98a':'#ff7b86');line.setAttribute('fill','none');const title=document.createElementNS(svg.namespaceURI,'title');title.textContent=when(r.ts)+' · O '+r.open+' H '+r.high+' L '+r.low+' C '+r.close;line.append(title);svg.append(line)}
+ box.append(svg);row(box,'Observed interval',when(start)+' to '+when(end));row(box,'Price range',lo.toFixed(2)+' to '+hi.toFixed(2));if(points.length>data.length)box.append(el('p','Showing the latest 600 complete candles.','muted'))
+}
+document.getElementById('workbench-form').addEventListener('submit',async event=>{
+ event.preventDefault();const out=document.getElementById('workbench-result');out.replaceChildren(el('p','Loading recorded evidence…'));
+ try{const query=new URLSearchParams(new FormData(event.target));const response=await fetch('/api/workbench?'+query);const d=await response.json();if(!response.ok)throw Error(d.error||'Evidence unavailable');out.replaceChildren();
+ const c=d.candles||{},e=d.evidence||{};row(out,'Evidence source',d.filters.source);row(out,'Chart source',c.source||c.reason);if(c.incomplete_source)out.append(el('p','Some source files exceeded the read bound. This is an incomplete chart window.','warn'));
+ for(const [name,points] of Object.entries(c.series||{}))candleChart(out,name,points);
+ if(c.prior_session){row(out,'Prior complete session',c.prior_session.session_date);row(out,'Prior high / low / close',[c.prior_session.high,c.prior_session.low,c.prior_session.close].join(' / '))}
+ if(e.parents){out.append(el('h3','Completed parent trades'));table(out,e.parents.map(r=>({...r,when:r.ts})),['symbol','variant_id','when','gross','fees','net','r_multiple','hold_minutes','exit_reason']);out.append(el('p','Holding time uses recorded fill timestamps where available, otherwise the journal interval.','muted'));out.append(el('h3','Recorded signal and risk events'));table(out,Object.entries(e.signal_funnel||{}).map(([event,count])=>({event,count})),['event','count']);out.append(el('h3','Exit distribution'));table(out,Object.entries(e.exit_distribution||{}).map(([reason,count])=>({reason,count})),['reason','count']);if(e.path_metrics)out.append(el('p',e.path_metrics.reason,'muted'))}
+ for(const r of e.records||[]){const detail=el('details'),summary=el('summary',r.variant_id||r.candidate_id||r.kind||'Recorded evidence');detail.append(summary,el('pre',JSON.stringify(r.evidence||r,null,2)));out.append(detail)}
+ if(e.reason)out.append(el('p',e.reason,'muted'));if(e.truncated)out.append(el('p','Journal read is limited to the latest 10,000 rows; lifetime totals remain in the account view.','warn'));
+ }catch(error){out.replaceChildren(el('p',error.message,'bad'))}
+});
 refresh();setInterval(refresh,30000);
 </script></body></html>"""
 
@@ -1267,6 +1303,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE,
                        {"ok": ok, "component": "dashboard",
                         "provenance": deployment_provenance()})
+            return
+        if parsed.path == "/api/workbench":
+            try:
+                self._json(HTTPStatus.OK, workbench(self.root, parse_qs(parsed.query)))
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except Exception as exc:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": type(exc).__name__})
             return
         if parsed.path == "/api/status":
             try:

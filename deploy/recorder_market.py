@@ -382,7 +382,11 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
         feed if feed is not None else
         getattr(provider, "data_feed", None) or _feed())
     symbols = [validate_equity_symbol(symbol) for symbol in symbols]
-    bars = _call_market_data(provider.bars, symbols, start=start, end=now,
+    # A quote watermark can fall partway through a minute. Round only the bar
+    # request back to its start so an updated previous-minute bar is observed
+    # by the overlap; quote acquisition keeps its original bounded window.
+    bars = _call_market_data(provider.bars, symbols,
+                              start=start.replace(second=0, microsecond=0), end=now,
                               feed=feed)
     quotes = _call_quotes(provider.quotes, symbols, start=start, end=now,
                           feed=feed)

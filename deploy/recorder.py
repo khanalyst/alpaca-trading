@@ -607,6 +607,8 @@ def _fsync_directory(path: Path) -> None:
 def corpus_write_lock(output: Path):
     """Serialize every CSV/SQLite/JSON corpus mutation across processes."""
     root = _corpus_root(output)
+    if (root / ".research-snapshot.json").exists():
+        raise RuntimeError("sealed research snapshots cannot be used as a recorder output")
     root.mkdir(parents=True, exist_ok=True)
     handle = (root / CORPUS_LOCK_NAME).open("a+")
     try:
@@ -1892,6 +1894,13 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
         policy=bar_gap_policy, maximum=bar_gap_maximum)
     _update_bar_coverage(index, coverage, observed_at)
     _update_observation_watermarks(index, rows)
+    # Keep changed bar responses before CSV event-key deduplication discards
+    # corrections. The CSV remains the first-observation replay contract.
+    from deploy.market_observations import append_observations
+    revision_receipt = append_observations(
+        _corpus_root(output) / "bar-observations.sqlite3", rows,
+        maximum_lag_seconds=forward_observation_max_lag.total_seconds())
+    index["bar_observation_store"] = revision_receipt
     unique_rows: list[dict] = []
     unique_keys: set[str] = set()
     recent_entries: list[tuple[str, str]] = []

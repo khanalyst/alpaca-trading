@@ -211,6 +211,10 @@ def initialize_journal(
                     "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
                 },
                 "orders": {
+                    "candidate_id": "TEXT", "proof_run_id": "TEXT",
+                    "decision_ts": "REAL", "request_sent_ts": "REAL",
+                    "response_received_ts": "REAL", "submit_roundtrip_ms": "REAL",
+                    "broker_submitted_ts": "REAL", "broker_filled_ts": "REAL",
                     "reason": "TEXT", "run_id": "TEXT", "cycle_id": "TEXT",
                     "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
                     "setup_id": "TEXT", "execution_profile": "TEXT",
@@ -245,6 +249,8 @@ def initialize_journal(
                     "nominal_risk_usd": "REAL",
                 },
                 "trades": {
+                    "candidate_id": "TEXT", "proof_run_id": "TEXT",
+                    "entry_filled_at_ts": "REAL", "exit_filled_at_ts": "REAL",
                     "run_id": "TEXT", "cycle_id": "TEXT",
                     "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
                     "risk_usd": "REAL",

@@ -22,6 +22,7 @@ from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
                              thesis_exit_deadline,
                              initialize_exit_state)
 from .instruments import validate_instrument
+from .order_timing import broker_timing
 from research.costs import CostError, CostModel, static_cost_config
 
 _FILLED_ORDER_STATUSES = {"filled", "partially_filled"}
@@ -421,6 +422,8 @@ class ExecutionLifecycleMixin:
         planned_risk = self._planned_risk(risk_plan, fallback=intended_risk)
         provenance_fields = {
             key: risk_plan.get(key) for key in (
+                "decision_ts", "request_sent_ts", "response_received_ts", "submit_roundtrip_ms",
+                "candidate_id", "proof_run_id",
                 "entry_fill_source", "exit_fill_source", "entry_feed",
                 "exit_feed", "entry_provider", "exit_provider",
                 "entry_quote_age_seconds", "exit_quote_age_seconds",
@@ -862,6 +865,8 @@ class ExecutionLifecycleMixin:
                 price=incremental_price, notional=incremental_notional,
                 risk_usd=incremental_risk, order_id=order_state.get("order_id"),
                 setup_id=plan.get("setup_id"), setup_type=plan.get("setup_type"),
+                candidate_id=plan.get("candidate_id"), proof_run_id=plan.get("proof_run_id"),
+                entry_filled_at_ts=trade.get("entry_filled_at_ts"),
                 strategy_id=trade.get("strategy_id"),
                 strategy_version=trade.get("strategy_version"),
                 variant_id=trade.get("variant_id"), fill_status="filled",
@@ -1907,6 +1912,9 @@ class ExecutionLifecycleMixin:
             close_evidence=("broker_order_fill" if close_order is not None
                             else "local_trigger"),
             setup_id=trade.get("setup_id"), setup_type=trade.get("setup_type"),
+            candidate_id=trade.get("candidate_id"), proof_run_id=trade.get("proof_run_id"),
+            entry_filled_at_ts=trade.get("entry_filled_at_ts"),
+            exit_filled_at_ts=broker_timing(close_order).get("broker_filled_ts"),
             strategy_id=trade.get("strategy_id"),
             strategy_version=trade.get("strategy_version"),
             variant_id=trade.get("variant_id"),

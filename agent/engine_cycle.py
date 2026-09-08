@@ -9,6 +9,7 @@ cycle.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import time
 from types import MappingProxyType
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -792,6 +793,7 @@ class EngineCycleMixin:
                 if signal is None:
                     continue
                 signal = dict(signal)
+                decision_ts = time.time()
                 if strategy_id != "rule":
                     emitted_session = str(signal.get("session") or "")
                     if len(emitted_session) != 10:
@@ -923,7 +925,13 @@ class EngineCycleMixin:
                                                     "client_order_id": request.client_order_id})
                     continue
                 try:
+                    risk_plan = dict(risk_plan)
+                    risk_plan["decision_ts"] = decision_ts
+                    risk_plan["request_sent_ts"] = time.time()
+                    submit_clock = time.monotonic()
                     order = self.provider.submit_order(request)
+                    risk_plan["response_received_ts"] = time.time()
+                    risk_plan["submit_roundtrip_ms"] = (time.monotonic() - submit_clock) * 1000
                     placed.append(order); placed_keys.add(key)
                     pending_keys.add((symbol, str(risk_plan.get("direction") or "")))
                     pending_underlyings.add(symbol)

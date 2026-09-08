@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+from datetime import datetime
 import json
 import math
 import sqlite3
@@ -17,8 +18,10 @@ import sys
 from pathlib import Path
 from statistics import median
 from typing import Any, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from .costs import CostModel, cost_model_for_vehicle, static_cost_config
+from agent.order_timing import TIMING_FIELDS
 
 SCHEMA = 2
 MIN_FILLS = 20
@@ -101,7 +104,7 @@ def _latest_orders(db: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         "execution_profile", "vehicle", "variant_id", "reference_price",
         "entry_reference", "exit_reference", "market_price", "mid_price",
         "requested_qty", "planned_qty", "cumulative_filled_qty",
-        "fill_fraction", "filled_fraction",
+        "fill_fraction", "filled_fraction", *TIMING_FIELDS,
     ) if name in columns]
     try:
         order_sort = "ts, _rowid" if "ts" in columns else "_rowid"
@@ -117,6 +120,10 @@ def _latest_orders(db: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         key = row.get("order_id")
         if key is None:
             continue
+        previous = latest.get(str(key), {})
+        for field in TIMING_FIELDS:
+            if row.get(field) is None:
+                row[field] = previous.get(field)
         latest[str(key)] = row
     return latest
 
@@ -161,6 +168,8 @@ def _load_rows(db: sqlite3.Connection, actions: set[str]) -> list[dict[str, Any]
             ):
                 row[f"order_{name}"] = order.get(name)
         row["order_status"] = str((order or {}).get("status") or "").lower()
+        for field in TIMING_FIELDS:
+            row[field] = (order or {}).get(field)
         row["_legacy_schema"] = legacy_schema
         # Explicit order/trade fields take precedence over old aliases.
         row["requested_qty"] = (row.get("requested_qty")
@@ -234,6 +243,7 @@ def _measure(row: Mapping[str, Any]) -> dict[str, Any] | None:
     adverse_bps = adverse / reference * 10_000.0
     return {
         "symbol": str(row.get("symbol") or ""), "ts": _finite(row.get("ts")),
+        **{field: _finite(row.get(field)) for field in TIMING_FIELDS},
         "side": side, "qty": qty, "reference_price": reference,
         "fill_price": fill, "adverse_bps": adverse_bps, "drift_bps": drift,
         "execution_slippage_bps": (adverse_bps - drift if drift is not None else None),
@@ -352,6 +362,42 @@ def _order_metrics(measured: Sequence[Mapping[str, Any]], raw_count: int,
     }
 
 
+def timing_report(measured: Sequence[Mapping[str, Any]]) -> dict:
+    samples = {"decision_to_request_ms": [], "submit_roundtrip_ms": [],
+               "broker_submit_to_fill_ms": []}
+    invalid = 0
+    strata = {}
+    for row in measured:
+        for name, start, end in (
+                ("decision_to_request_ms", "decision_ts", "request_sent_ts"),
+                ("broker_submit_to_fill_ms", "broker_submitted_ts", "broker_filled_ts")):
+            a, b = row.get(start), row.get(end)
+            if a is not None and b is not None:
+                if b >= a:
+                    samples[name].append((b - a) * 1000)
+                else:
+                    invalid += 1
+        roundtrip = row.get("submit_roundtrip_ms")
+        if roundtrip is not None and roundtrip >= 0:
+            samples["submit_roundtrip_ms"].append(roundtrip)
+        ts = row.get("broker_submitted_ts") or row.get("ts")
+        day = datetime.fromtimestamp(ts, ZoneInfo("America/New_York")).date().isoformat() if ts else "unknown"
+        notional = abs(row["qty"] * row["reference_price"])
+        size = "under_1000" if notional < 1000 else "1000_to_10000" if notional < 10000 else "10000_plus"
+        key = "|".join((str(row["runtime_mode"]), str(row["vehicle"]), day, row["symbol"], size))
+        strata.setdefault(key, []).append(row["adverse_bps"])
+    def summary(values):
+        ordered = sorted(values)
+        return {"samples": len(values), "median_ms": median(values) if values else None,
+                "p95_ms": ordered[max(0, math.ceil(.95 * len(values)) - 1)] if values else None}
+    return {"schema": "execution-timing.v1", "metrics": {k: summary(v) for k, v in samples.items()},
+            "invalid_clock_intervals": invalid,
+            "by_session_symbol_size": {k: {"orders": len(v), "mean_adverse_bps": sum(v) / len(v)}
+                                       for k, v in strata.items()},
+            "authorization_scope": "fill-price calibration; latency impact and market impact remain unmeasured",
+            "paper_fill_caveat": "paper fills do not measure live queue position, market impact or latency slippage"}
+
+
 def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | Mapping | None = None, *,
               runtime_mode: str | None = None, vehicle: str | None = None,
               execution_profile: str | None = None) -> dict[str, Any]:
@@ -383,6 +429,7 @@ def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | Mapping | No
     report.update({"vehicle": selected_vehicle,
                    "vehicle_filter": selected_vehicle,
                    "available_vehicles": available_vehicles})
+    report["execution_timing"] = timing_report(measured)
     if not measured:
         report.update({"authorization_verdict": "insufficient_data",
                        # Calibration is advisory for offline research, but

@@ -1,5 +1,9 @@
 # Trading edge audit and implementation handover
 
+The user subsequently requested completion. See the
+[continuation record](trading-edge-completion-2026-09-08.md) for work after this
+historical handover; the priority list below records the original handoff state.
+
 Prepared September 8, 2026, for the user-authorized commit and push to local
 and GitHub `main`. Implementation baseline: `958da0c`. Repository:
 `khanalyst/alpaca-trading`. This is a code handover, not a deployment or an

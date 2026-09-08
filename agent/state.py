@@ -341,6 +341,9 @@ def log_order(order=None, request=None, *, action: str = "submit",
               reason: str | None = None, **detail) -> None:
     """Persist an order lifecycle row in the mode-scoped durable journal."""
     source = order or request
+    from .order_timing import broker_timing
+    for key, value in broker_timing(order).items():
+        detail.setdefault(key, value)
     source_qty = float(getattr(source, "qty", 0) or 0)
     # ``qty`` remains the broker/request compatibility field.  Calibration
     # reads these explicit aliases so an incremental trade row can never be

@@ -206,6 +206,10 @@ services:
       # Cache reuse is opt-in per immutable corpus snapshot. The identity must
       # cover the selected partition bytes and provenance/calendar sidecars.
       ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY: ${ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY:-}
+      ALPACA_RESEARCH_SNAPSHOT_ROOT: ${ALPACA_RESEARCH_SNAPSHOT_ROOT:-}
+      ALPACA_RESEARCH_SNAPSHOT_CREATE: ${ALPACA_RESEARCH_SNAPSHOT_CREATE:-0}
+      ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES: ${ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES:-}
+      ALPACA_RESEARCH_SNAPSHOT_MIN_FREE_BYTES: ${ALPACA_RESEARCH_SNAPSHOT_MIN_FREE_BYTES:-0}
       ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT: ${ALPACA_RESEARCH_PREPROCESSING_CACHE_ROOT:-/app/research/cache/preprocessing}
       # Historical catch-up may run the model-assisted diagnostic factory, but
       # never the authorizing edge ledger or shadow-ingestion path.
