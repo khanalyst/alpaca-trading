@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -16,7 +17,7 @@ class WorkbenchTests(unittest.TestCase):
             root = Path(tmp)
             path = root / "runtime/paper/journal.db"
             path.parent.mkdir(parents=True)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("CREATE TABLE trades(ts REAL, action TEXT, symbol TEXT, setup_id TEXT, qty REAL, runtime_mode TEXT, variant_id TEXT, entry_feed TEXT, net_pnl REAL, fees REAL, gross_pnl REAL)")
                 rows = [(1, "open", "SPY", "a", 10, "paper", "v1", "iex", None, None, None),
                         (2, "close", "SPY", "a", 4, "paper", "v1", "iex", 3.6, .4, 4),
@@ -24,7 +25,7 @@ class WorkbenchTests(unittest.TestCase):
                         (4, "close", "SPY", "b", 10, "live", "v1", "iex", 900, 1, 901)]
                 db.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
             self.assertEqual(workbench(root, {"variant_id": "v1"})["evidence"]["parents"], [])
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("INSERT INTO trades VALUES (5,'close','SPY','a',6,'paper','v1','iex',11.4,.6,12)")
             result = workbench(root, {"variant_id": "v1"})["evidence"]["parents"]
             self.assertEqual(len(result), 1)
@@ -57,6 +58,22 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(len(result["series"]["5m"]), 1)
             self.assertEqual(result["series"]["15m"], [])
             self.assertEqual(result["series"]["1d"], [])
+
+    def test_order_timing_preserves_initial_fields_and_respects_receipt_cutoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            p = root / 'runtime/paper/journal.db'
+            p.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(p)) as db, db:
+                db.execute('CREATE TABLE orders(ts REAL, order_id TEXT, symbol TEXT, runtime_mode TEXT, decision_ts REAL, broker_filled_ts REAL)')
+                db.execute("INSERT INTO orders VALUES (1,'o','SPY','paper',0.5,NULL)")
+                db.execute("INSERT INTO orders VALUES (3,'o','SPY','paper',NULL,2)")
+            before = workbench(root, {'as_of': '1970-01-01T00:00:02+00:00'})['evidence']['order_timing']
+            self.assertEqual(len(before), 1)
+            self.assertIsNone(before[0]['broker_filled_ts'])
+            after = workbench(root)['evidence']['order_timing']
+            self.assertEqual(after[0]['decision_ts'], .5)
+            self.assertEqual(after[0]['broker_filled_ts'], 2)
 
     def test_invalid_source_and_reversed_dates_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

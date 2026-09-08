@@ -92,6 +92,19 @@ This lets snapshots acquire the corpus lock during a long outage recovery.
 The Python command defaults to unlimited windows for compatibility; use zero
 explicitly only when an uninterrupted catch-up is intended.
 
+Compose now prioritizes fresh observations with
+`ALPACA_RECORDER_CAPTURE_POLICY=forward_only`. After an outage it requests the
+recent three-minute window, retains historical files, and records the latest
+deferred interval in the recorder index. It does not advance the data watermark
+until an observation is written or relabel historical rows. Missing history
+must be recovered explicitly with backfill; it cannot delay forward collection.
+Use `catch_up` to opt back into the durable historical catch-up path. The Python
+command retains that compatibility default. Closed calendar windows are idle.
+
+The trader supervisor remains alive with a paused heartbeat while operator
+pause is set, without launching a trader child or calling the broker. The
+existing authenticated resume command is still required to clear the pause.
+
 Catch-up requests are split into `ALPACA_RECORDER_FETCH_WINDOW_MINUTES`
 windows (1 minute by default), so a long outage cannot materialize the whole
 quote backlog in one process. The small default bounds peak memory, at the cost

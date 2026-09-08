@@ -236,6 +236,7 @@ class HandoverFaultTests(unittest.TestCase):
         try:
             with patch("main.load_cfg", return_value={"mode": "paper"}), \
                  patch.object(supervisor.state, "configure_runtime"), \
+                 patch.object(supervisor, "wait_until_resumed", return_value=True), \
                  patch.object(supervisor.subprocess, "Popen", return_value=child), \
                  patch.object(supervisor, "monitor", return_value="unresponsive"), \
                  patch.object(supervisor, "write_status",

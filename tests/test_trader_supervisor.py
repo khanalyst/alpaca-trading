@@ -11,6 +11,28 @@ from deploy import trader_supervisor as supervisor
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_pause_waits_for_persisted_resume_without_broker_recovery(self):
+        with patch.object(supervisor.state, "load_state", side_effect=[
+                {"operator_pause": True}, {"operator_pause": True}, {"operator_pause": False}]), \
+             patch.object(supervisor.state, "write_heartbeat") as heartbeat, \
+             patch.object(supervisor, "write_status"), \
+             patch.object(supervisor, "recover") as recovery:
+            sleep = Mock()
+            self.assertTrue(supervisor.wait_until_resumed(
+                Path("unused"), interval=5, stop_requested=lambda: False, sleep=sleep))
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(heartbeat.call_count, 2)
+            recovery.assert_not_called()
+
+    def test_shutdown_while_paused_never_launches_a_child(self):
+        with patch("main.load_cfg", return_value={"mode": "paper"}), \
+             patch.object(supervisor.state, "configure_runtime"), \
+             patch.object(supervisor, "wait_until_resumed", return_value=False), \
+             patch.object(supervisor, "write_status"), \
+             patch.object(supervisor.subprocess, "Popen") as launch:
+            self.assertEqual(supervisor.supervise("test.json"), 0)
+            launch.assert_not_called()
+
     def test_hung_child_is_reaped_and_releases_its_lock(self):
         # A real child owns a real lock: killing the owner, then waiting, must
         # make the same inode lockable without ever deleting the lock file.
@@ -86,6 +108,7 @@ class SupervisorTests(unittest.TestCase):
                 return {"flattened": True}
             with patch("main.load_cfg", return_value={"mode": "paper"}), \
                  patch.object(supervisor.state, "configure_runtime"), \
+                 patch.object(supervisor, "wait_until_resumed", return_value=True), \
                  patch.object(supervisor.subprocess, "Popen", return_value=child), \
                  patch.object(supervisor, "write_status"), \
                  patch.object(supervisor, "monitor", return_value="unresponsive"), \
@@ -123,6 +146,7 @@ class SupervisorTests(unittest.TestCase):
         child = Mock(pid=27, returncode=-9)
         with patch("main.load_cfg", return_value={"mode": "paper"}), \
              patch.object(supervisor.state, "configure_runtime"), \
+             patch.object(supervisor, "wait_until_resumed", return_value=True), \
              patch.object(supervisor.subprocess, "Popen", return_value=child), \
              patch.object(supervisor, "write_status", side_effect=OSError("disk full")), \
              patch.object(supervisor, "terminate_child", side_effect=lambda *a, **k: order.append("reaped") or True), \

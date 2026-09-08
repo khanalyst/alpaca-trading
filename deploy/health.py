@@ -465,6 +465,9 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
         "index_write_ts": index_write,
         "index_migration_pending": index_oversized,
         "data_feed": index.get("data_feed"),
+        "capture_policy": attempt.get("capture_policy") or index.get("capture_policy"),
+        "deferred_catchup": (index.get("deferred_catchup")
+                             if isinstance(index.get("deferred_catchup"), dict) else None),
         "configured_data_feed": (attempt.get("data_feed") or
                                   configured_data_feed),
         "configured_options_feed": (attempt.get("options_feed") or

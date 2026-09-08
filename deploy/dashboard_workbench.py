@@ -11,6 +11,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from deploy.market_observations import epoch, read_bars
+from agent.order_timing import TIMING_FIELDS
 from deploy.research_dataset import (_apply_calendar, _partition_calendar_sidecars,
                                      _partition_source_sidecars)
 from report import _parent_key, closed_parent_trades
@@ -130,12 +131,30 @@ def runtime_evidence(root, selected):
         parents.append(item)
     events = [identity(r) for r in sql_rows(path, "events")
               if r.get("runtime_mode") == selected["source"]]
+    orders = {}
+    for row in sql_rows(path, "orders"):
+        if row.get("runtime_mode") != selected["source"]:
+            continue
+        if selected["as_of"] and (stamp(row.get("ts")) is None or
+                                   stamp(row["ts"]) > stamp(selected["as_of"])):
+            continue
+        key = row.get("order_id") or row.get("client_order_id")
+        if not key:
+            continue
+        previous = orders.setdefault(key, {})
+        # Reconciliation appends may omit original request/decision timing.
+        # Keep recorded values across those null fields, as calibration does.
+        previous.update({k: v for k, v in identity(row).items() if v is not None})
     parents = [r for r in parents if matches(r, selected)]
     events = [r for r in events if matches(r, selected)]
     fields = ("parent_trade_id", "symbol", "variant_id", "candidate_id", "proof_epoch",
               "feed", "ts", "gross", "fees", "net", "r_multiple", "hold_minutes",
               "hold_basis", "exit_reason", "close_fills")
+    timing_fields = ("ts", "symbol", "variant_id", "candidate_id", "proof_epoch",
+                     "action", "status", "entry_quote_age_seconds", *TIMING_FIELDS)
     return {"parents": [{k: r.get(k) for k in fields} for r in parents],
+            "order_timing": [{k: row.get(k) for k in timing_fields}
+                             for row in orders.values() if matches(row, selected)][-100:],
             "events": [{k: r.get(k) for k in ("ts", "kind", "symbol", "variant_id", "reason")}
                        for r in events[-200:]],
             "signal_funnel": dict(Counter(r.get("kind", "unknown") for r in events)),

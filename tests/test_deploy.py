@@ -1816,7 +1816,9 @@ class DeployTests(unittest.TestCase):
                                                   feed="iex"), 0)
             expected = datetime(2026, 8, 8, 13, 29, 1,
                                 tzinfo=timezone.utc)
-            self.assertEqual(fake.starts[-2:], [expected, expected])
+            # Bars overlap the complete minute to observe corrections; quote
+            # requests preserve the precise durable watermark boundary.
+            self.assertEqual(fake.starts[-2:], [expected.replace(second=0), expected])
 
     def test_recorder_ignores_valid_orphan_calendar_marker_but_rejects_corrupt_one(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1872,6 +1874,47 @@ class DeployTests(unittest.TestCase):
                                          "ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE": "2"}):
                 recorder.record_once(fake, ["SPY"], path)
             self.assertGreater(recorder._prepare_index(path)["watermark"], watermark)
+
+    def test_forward_capture_does_not_wait_behind_historical_quote_backlog(self):
+        fake = _QuoteChunkFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            stamp = datetime.now(timezone.utc) - timedelta(days=4)
+            row = {field: "" for field in recorder.FIELDS}
+            row.update({"event_key": recorder._event_key("quote", "SPY", stamp.isoformat()),
+                        "observed_at": stamp.isoformat(), "provider": "alpaca", "feed": "sip",
+                        "event_type": "quote", "symbol": "SPY", "timestamp": stamp.isoformat(),
+                        "as_of": stamp.isoformat(), "bid": "100", "ask": "101"})
+            recorder._append_partitions(path, [row])
+            recorder._save_index(path, recorder._scan_corpus(path))
+            old_path = recorder._partition_path(path, recorder._session_date(stamp))
+            old_bytes = old_path.read_bytes()
+            before = datetime.now(timezone.utc)
+            with patch.dict(os.environ, {"ALPACA_RECORDER_CAPTURE_POLICY": "forward_only",
+                                         "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "1",
+                                         "ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE": "2"}):
+                recorder.record_once(fake, ["SPY"], path)
+            requests = [x for x in fake.windows if x[0] == "quotes"]
+            self.assertEqual(len(requests), 2)
+            self.assertGreaterEqual(requests[0][1], before - timedelta(minutes=3))
+            index = recorder._prepare_index(path)
+            self.assertFalse(index["deferred_catchup"]["recorded"])
+            self.assertEqual(index["deferred_catchup"]["from"], stamp.isoformat())
+            self.assertGreater(recorder._timestamp(index["watermark"]), before - timedelta(minutes=2))
+            self.assertEqual(old_path.read_bytes(), old_bytes)
+
+    def test_forward_capture_is_idle_when_exact_calendar_has_no_open_window(self):
+        fake = _QuoteChunkFake()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"ALPACA_RECORDER_CAPTURE_POLICY": "forward_only"}), \
+             patch.object(recorder, "_record_session_calendar"), \
+             patch.object(recorder, "_next_exact_session_window", return_value=None):
+            path = Path(directory) / "market.csv"
+            count = recorder.record_once(fake, ["SPY"], path,
+                config={"session": {"require_exact_calendar": True}}, calendar=object())
+            self.assertEqual(count, 0)
+            self.assertEqual(fake.windows, [])
+            self.assertIsNone(recorder._prepare_index(path)["watermark"])
 
     def test_recorder_classifies_only_late_first_observations_as_historical(self):
         observed = datetime(2026, 8, 13, 14, 0, tzinfo=timezone.utc)

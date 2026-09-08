@@ -4,6 +4,9 @@ Continuation of [the audit handover](trading-edge-handover-2026-09-08.md).
 This record distinguishes implementation, observed operation and evidence that
 still requires future market sessions. No positive edge is claimed.
 
+The completed [frozen comparison and paired-feed study](trading-edge-comparison-2026-09-08.md)
+contains every arm's result and the measured market-data differences.
+
 ## Implemented in this continuation
 
 - Sealed snapshots copy a bounded session window under the recorder/backfill
@@ -50,6 +53,18 @@ still requires future market sessions. No positive edge is claimed.
 - Recorder catch-up commits at most two fetch windows per Compose cycle,
   releasing the shared corpus lock between batches. This prevents a multi-hour
   catch-up from starving a snapshot reader.
+- Forward collection has explicit priority in Compose. Historical rows remain
+  intact; the latest deferred catch-up interval is recorded as unfilled, with
+  no invented data watermark or source relabelling. Exact closed market windows
+  are idle. Historical recovery is an explicit separate operation.
+- Deployment exposed a paused-child restart loop. The supervisor now waits with
+  a healthy paused heartbeat and no trader child until persisted operator pause
+  is cleared through the existing authenticated resume command.
+  Its heartbeat does not claim an order count or verified exposure. The
+  independent watchdog still reconciles residual positions when the paused
+  supervisor has no child; heartbeat freshness cannot suppress that recovery.
+- The workbench also displays recorded local/broker timing and quote age,
+  preserving initial request fields across later reconciliation records.
 
 ## Verification in progress
 
@@ -69,6 +84,31 @@ still requires future market sessions. No positive edge is claimed.
   and open orders, with operator pause true. The old stalled diagnostic process
   was stopped with its container and artifacts preserved. Recording and shadow
   services were restarted; historical catch-up is distinct from forward evidence.
+- Both complete CI runs (`34191767877`, `34192788169`) passed the edge,
+  factory, research and container jobs. Runtime had one obsolete assertion that
+  bar requests preserve fractional quote watermarks. The implementation now
+  deliberately overlaps the full bar minute to observe revisions; the fixture
+  now asserts that boundary separately from the unchanged quote watermark.
+- The frozen real-input experiment completed all twelve arms, with zero executed
+  trades because execution viability failed. Independent conditional-return
+  diagnostics were below the assumed 17 bps hurdle for every authored horizon.
+  No winner, promotion or positive P&L is inferred from this result.
+
+## What still needs evidence or a separate implementation
+
+| Original item | Remaining work after this continuation |
+| --- | --- |
+| Forward evidence | Observe new regular market sessions after deployment, verify cadence/coverage and revision receipts, and accrue the unchanged minimum independent sessions. Backfill cannot replace those observations. |
+| Measured execution | New actual paper fills need an authorized resume and eligible strategy. Current timing instrumentation cannot reconstruct missing historical timestamps or measure live queue/impact effects. No new calibrated schedule was produced. |
+| Market context | Prior-session/gap/volume/breadth/beta diagnostics exist. Authenticated point-in-time catalyst/news and corporate-action context are not implemented. Historical SIP access does not establish real-time SIP entitlement. |
+| Portfolio/policy | Synchronized historical beta is measured diagnostically. A production factor/sector/duration allocator, a separate hedged residual execution contract, and the later-signal emission-policy comparison remain unimplemented. Zero viable entries in this experiment do not identify their economic benefit. |
+| Full chart analysis | Candles, completed parents, source/identity/date filters, event/exit counts and order timing are implemented. Runtime MFE/MAE, executable markouts and matched-control paths require captured paths and remain unavailable. Research conditional-return controls are retained in the cohort artifact. |
+| Independent review | Existing independent fault regressions pass. The follow-up review worker again hit its provider usage limit and returned no verdict; parent review is not represented as an independent sign-off. |
+
+These limits do not justify loosening costs, proof floors or risk gates. The next
+economic decision is to measure costs and data fidelity against the gross signal
+effect, then confirm the registered hypotheses on unseen observations. The
+current strategy comparison shows no deployable positive edge.
 
 ## Reproduction
 

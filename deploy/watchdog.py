@@ -52,6 +52,7 @@ INERT_TRADER = "trader_holds_run_lock"
 INERT_FRESH = "heartbeat_fresh"
 INERT_FLAT = "no_open_positions"
 ACT_STALE = "stale_heartbeat_with_open_positions"
+ACT_PAUSED = "paused_without_trader_with_open_positions"
 
 
 class WatchdogError(RuntimeError):
@@ -83,18 +84,23 @@ def decide(heartbeat: Mapping[str, Any] | None, positions: Any, *,
     """Decide whether flattening is both necessary and unambiguously safe.
 
     The order of the tests is the safety argument: a live trader wins over
-    every other signal, a fresh heartbeat wins over exposure, and exposure the
-    broker does not report is not exposure this process may act on.  A missing
-    or unreadable heartbeat is stale, never fresh.
+    every other signal. A parked supervisor's heartbeat proves only process
+    liveness: it cannot protect residual exposure without a trader child.
+    Other fresh heartbeats still win over exposure. A missing or unreadable
+    heartbeat is stale, never fresh.
     """
     if trader_alive:
         return {"act": False, "reason": INERT_TRADER}
-    fresh = _fresh((heartbeat or {}).get("updated_ts"), max_age, now)
-    if fresh:
+    heartbeat = heartbeat or {}
+    parked = (heartbeat.get("status") == "paused" and
+              heartbeat.get("reason") == "operator_pause" and
+              heartbeat.get("trader_child_running") is False)
+    fresh = _fresh(heartbeat.get("updated_ts"), max_age, now)
+    if fresh and not parked:
         return {"act": False, "reason": INERT_FRESH}
     if not positions:
         return {"act": False, "reason": INERT_FLAT}
-    return {"act": True, "reason": ACT_STALE,
+    return {"act": True, "reason": ACT_PAUSED if parked else ACT_STALE,
             "symbols": sorted({str(getattr(item, "symbol", "")).upper()
                                for item in positions})}
 
@@ -214,7 +220,10 @@ def run_once(cfg: Mapping[str, Any], provider, *, max_age: float,
         try:
             verdict["flattened"] = bool(
                 engine.flatten_all("supervisor_terminated_unresponsive_trader"
-                                   if terminated_child else "watchdog_stale_heartbeat"))
+                                   if terminated_child else
+                                   "watchdog_paused_without_trader"
+                                   if verdict["reason"] == ACT_PAUSED else
+                                   "watchdog_stale_heartbeat"))
             verdict["residual_risk"] = not verdict["flattened"]
             verdict["status"] = "acted" if verdict["flattened"] else "degraded"
         finally:

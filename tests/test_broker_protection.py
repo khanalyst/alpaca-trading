@@ -1057,6 +1057,23 @@ class WatchdogTests(ProtectionHarness):
         self.assertEqual(verdict["reason"], watchdog.INERT_FRESH)
         self.assertEqual(self.provider.close_requests, [])
 
+    def test_paused_supervisor_heartbeat_cannot_hide_residual_exposure(self):
+        self._bind_engine(profile="options", runtime_name="runtime-dog-parked")
+        self._open_option_position()
+        self._closing_provider()
+        state.commit({"operator_pause": True}, transition=(state.RUNNING, state.PAUSED))
+        heartbeat = {"updated_ts": time.time(), "status": "paused",
+                     "reason": "operator_pause", "trader_child_running": False}
+        state.HEARTBEAT_FILE.write_text(json.dumps(heartbeat))
+        # The mode lock remains authoritative even with the parked marker.
+        self.assertFalse(watchdog.decide(heartbeat, self.provider.positions_live,
+                         trader_alive=True, max_age=300)["act"])
+        verdict = self._run_watchdog("runtime-dog-parked")
+        self.assertTrue(verdict["flattened"])
+        self.assertEqual(verdict["reason"], watchdog.ACT_PAUSED)
+        self.assertEqual(self.provider.positions_live, [])
+        self.assertTrue(state.load_state()["operator_pause"])
+
     def test_watchdog_never_races_a_trader_that_holds_the_run_lock(self):
         self._bind_engine(profile="options", runtime_name="runtime-dog-lock")
         self._open_option_position()

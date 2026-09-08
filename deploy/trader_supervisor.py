@@ -87,6 +87,24 @@ def recover(config_path: str) -> dict:
                     terminated_child=True)
 
 
+def wait_until_resumed(status_path: Path, *, interval: float,
+                       stop_requested: Callable[[], bool],
+                       sleep: Callable[[float], None] = time.sleep) -> bool:
+    """Park without a trader child or broker I/O while operator pause persists."""
+    while not stop_requested():
+        paused = state.load_state().get("operator_pause", False)
+        if not isinstance(paused, bool):
+            raise ValueError("operator pause state must be boolean")
+        if not paused:
+            return True
+        state.write_heartbeat("paused", reason="operator_pause",
+                              trader_child_running=False)
+        write_status(status_path, "paused", reason="operator_pause",
+                     operator_pause=True, trader_child_running=False)
+        sleep(interval)
+    return False
+
+
 def supervise(config_path: str, *, max_age: float = 300.0,
               interval: float = 5.0, grace: float = 15.0,
               status_path: Path = Path("runtime/health/trader-supervisor.json")) -> int:
@@ -105,6 +123,12 @@ def supervise(config_path: str, *, max_age: float = 300.0,
     recovery_attempted = False
     started = time.time()
     try:
+        if not wait_until_resumed(status_path, interval=interval,
+                                  stop_requested=lambda: stopping):
+            write_status(status_path, "stopped", reason="shutdown_while_paused",
+                         operator_pause=True, trader_child_running=False)
+            return 0
+        started = time.time()
         child = subprocess.Popen(
             [sys.executable, str(ROOT / "main.py"), "--config", config_path, "run"],
             cwd=ROOT, start_new_session=True, close_fds=True)

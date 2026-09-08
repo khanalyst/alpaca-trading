@@ -559,6 +559,9 @@ not adjusted for cash transfers. Direct research progress is separate from the
 scheduler heartbeat. See the [September 7 remediation record](docs/trading-edge-remediation-2026-09-07.md)
 for the fixed experiment cohort. The [handover and unfinished work](docs/trading-edge-handover-2026-09-08.md)
 records verification limits and the remaining evidence requirements.
+The [September 8 completion record](docs/trading-edge-completion-2026-09-08.md)
+tracks the subsequent fixes and deployment. The [frozen strategy and feed comparison](docs/trading-edge-comparison-2026-09-08.md)
+retains all twelve arms and their execution refusals; it establishes no deployable positive edge.
 
 The CLI answers the same questions without a browser:
 

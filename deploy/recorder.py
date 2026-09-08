@@ -167,6 +167,7 @@ def _save_status(output: Path, payload: dict) -> dict:
     value = {
         "schema": STATUS_SCHEMA,
         "updated_ts": time.time(),
+        "capture_policy": os.getenv("ALPACA_RECORDER_CAPTURE_POLICY", "catch_up"),
         "provenance": deployment_provenance(),
         **payload,
     }
@@ -2061,6 +2062,21 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
     # materialize millions of quotes in one provider response.
     start = (watermark - timedelta(minutes=1)
              if watermark is not None else now - timedelta(minutes=3))
+    capture_policy = os.getenv("ALPACA_RECORDER_CAPTURE_POLICY", "catch_up")
+    if capture_policy not in {"catch_up", "forward_only"}:
+        raise RuntimeError("ALPACA_RECORDER_CAPTURE_POLICY must be catch_up or forward_only")
+    index["capture_policy"] = capture_policy
+    if capture_policy == "forward_only" and start < now - timedelta(minutes=3):
+        # Preserve old rows and expose the unfilled interval. Do not advance
+        # the market watermark or relabel old partitions as forward evidence.
+        # Historical recovery is a separate explicit backfill; it must not
+        # hold fresh collection behind hours of historical quote requests.
+        start = now - timedelta(minutes=3)
+        index["deferred_catchup"] = {
+            "from": watermark.isoformat(),
+            "through": start.isoformat(), "observed_at": now.isoformat(),
+            "reason": "forward_capture_priority", "recorded": False,
+        }
     _record_session_calendar(index, calendar, start, now, output)
     pins = {contract: value for contract, value in index["option_pins"].items()
             if str(value) > now.isoformat()}
@@ -2117,6 +2133,10 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
         # this keeps strict fetch failures atomic while retaining closed-day
         # markers for a successful no-data holiday response.
         _save_index(output, index)
+        if capture_policy == "forward_only" and require_exact_calendar and completed_windows == 0:
+            # The exact calendar contains no open market interval in the
+            # requested recent window. This is a healthy idle recorder.
+            return 0
         raise RuntimeError("Alpaca returned no point-in-time bars or quotes")
     return total_unique
 
