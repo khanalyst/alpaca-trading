@@ -1853,11 +1853,12 @@ class DeployTests(unittest.TestCase):
             })
             recorder._append_partitions(path, [row])
             recorder._save_index(path, recorder._scan_corpus(path))
-            with patch.dict(os.environ, {"ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "30"}):
+            with patch.dict(os.environ, {"ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "30",
+                                         "ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE": "2"}):
                 count = recorder.record_once(fake, ["SPY"], path)
             self.assertGreater(count, 1)
             windows = [item for item in fake.windows if item[0] == "quotes"]
-            self.assertGreater(len(windows), 1)
+            self.assertEqual(len(windows), 2)
             self.assertTrue(all(end - start <= timedelta(minutes=30)
                                 for _kind, start, end in windows))
             index = recorder._prepare_index(path)
@@ -1866,6 +1867,11 @@ class DeployTests(unittest.TestCase):
                 recorder._partition_path(path, stale_day).name], {
                     "source_mode": "historical_backfill",
                 })
+            watermark = index["watermark"]
+            with patch.dict(os.environ, {"ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "30",
+                                         "ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE": "2"}):
+                recorder.record_once(fake, ["SPY"], path)
+            self.assertGreater(recorder._prepare_index(path)["watermark"], watermark)
 
     def test_recorder_classifies_only_late_first_observations_as_historical(self):
         observed = datetime(2026, 8, 13, 14, 0, tzinfo=timezone.utc)

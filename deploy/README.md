@@ -85,6 +85,13 @@ a fresh research/shadow proof epoch. Readiness requires both quote and completed
 bar watermarks to be no older than 30 seconds for every required symbol; an
 alive recorder or scheduler is not evidence of readiness or research quality.
 
+Compose limits each catch-up cycle to two request windows with
+`ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE`. Each window commits its watermark before
+the lock is released; the next cycle resumes with normal overlap and deduplication.
+This lets snapshots acquire the corpus lock during a long outage recovery.
+The Python command defaults to unlimited windows for compatibility; use zero
+explicitly only when an uninterrupted catch-up is intended.
+
 Catch-up requests are split into `ALPACA_RECORDER_FETCH_WINDOW_MINUTES`
 windows (1 minute by default), so a long outage cannot materialize the whole
 quote backlog in one process. The small default bounds peak memory, at the cost

@@ -722,6 +722,24 @@ fi
 direct_dataset="$dataset"
 direct_partition_root="$partition_root"
 
+# A provider-sized quote corpus can expand into several much larger temporary
+# views. An explicit deployment budget rejects that job before preprocessing.
+# This is a capacity check only; it supplies no source/cache identity.
+maximum_source_bytes="${ALPACA_RESEARCH_MAX_SOURCE_BYTES:-0}"
+case "$maximum_source_bytes" in
+  ''|*[!0-9]*) finish "failed" "ALPACA_RESEARCH_MAX_SOURCE_BYTES must be nonnegative" 3 ;;
+esac
+if [ "$maximum_source_bytes" != "0" ] && [ "$dataset" != "-" ]; then
+  resource_args=(--source "$dataset")
+  if [ -n "$partition_root" ]; then
+    resource_args=(--partition-root "$partition_root" --session-window "$session_window")
+  fi
+  if ! "$python_bin" "$repo_root/deploy/research_budget.py" "${resource_args[@]}" \
+      --max-bytes "$maximum_source_bytes" --temporary-root "$tmp_dir"; then
+    finish "failed" "research input exceeds capacity budget; use a bounded sealed dataset or provision capacity before retrying" 3
+  fi
+fi
+
 # A historical source marker is provenance, not a write barrier: recorder
 # partitions may still grow. Only the verified sealed snapshot path above can
 # derive an automatic cache identity. Explicit caller-supplied immutable source

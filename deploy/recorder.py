@@ -1786,6 +1786,17 @@ def _fetch_window_minutes() -> int:
     return value
 
 
+def _max_windows_per_cycle() -> int:
+    raw = os.getenv("ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE", "0")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE must be nonnegative") from exc
+    if value < 0:
+        raise RuntimeError("ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE must be nonnegative")
+    return value
+
+
 def _forward_observation_max_lag() -> timedelta:
     """Maximum delay that may still count as forward-observed evidence.
 
@@ -2058,6 +2069,8 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
     cursor = start
     total_rows = 0
     total_unique = 0
+    completed_windows = 0
+    maximum_windows = _max_windows_per_cycle()
     while True:
         if require_exact_calendar:
             request_window = _next_exact_session_window(
@@ -2089,8 +2102,13 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             bar_gap_maximum=bar_gap_maximum,
             forward_observation_max_lag=forward_observation_max_lag)
         total_unique += unique
+        completed_windows += 1
         horizon = None if watermark is None else watermark - DEDUP_HORIZON
-        if window_end >= now:
+        # _ingest_chunk durably commits each window. Release the corpus lock
+        # between bounded catch-up batches so sealed readers are not starved
+        # by an entire multi-session outage. The next cycle resumes from that
+        # durable watermark with the usual overlap and late-source labelling.
+        if window_end >= now or (maximum_windows and completed_windows >= maximum_windows):
             break
         cursor = window_end
 

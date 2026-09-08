@@ -39,6 +39,36 @@ still requires future market sessions. No positive edge is claimed.
 - CI now partitions the complete discovered suite into four disjoint jobs.
   The previous serial run reached the 90-minute limit; its container build was
   skipped, so that run is not a pass.
+- Paired-feed diagnostics request IEX and SIP separately on identical completed
+  broker-calendar sessions. They retain raw responses, receipt times, missing
+  minutes and paired price/volume differences. An unavailable feed remains an
+  unavailable comparison; no fallback is permitted.
+- Compose limits research input to 1 GiB by default and checks estimated
+  temporary expansion plus a 2 GiB reserve before preprocessing. The expansion
+  multiplier is a capacity estimate, not a hard disk quota. Larger jobs need
+  explicit capacity and `ALPACA_RESEARCH_MAX_SOURCE_BYTES` configuration.
+- Recorder catch-up commits at most two fetch windows per Compose cycle,
+  releasing the shared corpus lock between batches. This prevents a multi-hour
+  catch-up from starving a snapshot reader.
+
+## Verification in progress
+
+- Commit `dd71ae339fd2b0fff613a92656b5ba1c05351afd` was pushed to main and
+  built successfully on the deployment host. GitHub's container build also
+  passed in [run 34191767877](https://github.com/khanalyst/alpaca-trading/actions/runs/34191767877).
+  Its four test shards were still running at this checkpoint.
+- New mechanism, snapshot, workbench, context, timing and fault contracts:
+  26 tests passed. The overlapping execution/accounting review package passed
+  221 tests. These are software results, not evidence of trading profitability.
+- Browser verification on synthetic data showed 30 complete one-minute bars,
+  six five-minute bars, two fifteen-minute bars, no fabricated incomplete daily
+  candle, and prior complete-session levels. Candidate/variant/proof filters
+  retained one completed parent with gross $16, fees $1, net $15 from two close
+  fills; POST returned 405.
+- At `2026-09-08T05:49:29Z`, an authenticated read found zero paper positions
+  and open orders, with operator pause true. The old stalled diagnostic process
+  was stopped with its container and artifacts preserved. Recording and shadow
+  services were restarted; historical catch-up is distinct from forward evidence.
 
 ## Reproduction
 
