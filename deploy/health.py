@@ -53,6 +53,231 @@ def _read_json(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _status_text(value: object, *, limit: int = 160) -> str | None:
+    """Return one bounded scalar string for externally visible status data."""
+    if value in (None, "") or isinstance(value, (dict, list, tuple)):
+        return None
+    text = str(value).strip()
+    return text[:limit] if text else None
+
+
+def _status_nonnegative_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0 or not number.is_integer():
+        return None
+    return min(int(number), 1_000_000_000)
+
+
+def _status_nonnegative_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return min(number, 1_000_000_000_000.0)
+
+
+def _status_string_list(value: object, *, limit: int) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    for item in value[:limit]:
+        text = _status_text(item)
+        if text is not None and text not in result:
+            result.append(text)
+    return result
+
+
+def paper_selection_summary(value: object) -> dict | None:
+    """Whitelist the one requested/resolved paper identity from a heartbeat."""
+    if not isinstance(value, dict):
+        return None
+    state = _status_text(value.get("state"), limit=40)
+    armed = value.get("armed")
+    if state not in {"waiting_for_proof", "ready", "blocked"} or not isinstance(
+            armed, bool):
+        return None
+
+    resolved = None
+    raw_resolved = value.get("resolved")
+    if isinstance(raw_resolved, dict):
+        raw_proof = raw_resolved.get("proof")
+        proof = None
+        if isinstance(raw_proof, dict):
+            proof = {
+                key: _status_text(raw_proof.get(key))
+                for key in ("run_id", "gate_hash", "config_hash", "lane")
+            }
+            if any(item is None for item in proof.values()):
+                proof = None
+        identity = {
+            key: _status_text(raw_resolved.get(key))
+            for key in ("candidate_id", "variant_id", "family")
+        }
+        if proof is not None and all(identity.values()):
+            resolved = {**identity, "proof": proof}
+    # A ready label without one verified identity is less honest than no
+    # projection at all. Waiting/blocked states may legitimately be unresolved.
+    if state == "ready" and resolved is None:
+        return None
+    return {
+        "configured_strategy": _status_text(value.get("configured_strategy")),
+        "selection_mode": _status_text(value.get("selection_mode")),
+        "requested_variant": _status_text(value.get("requested_variant")),
+        "resolved": resolved,
+        "blocker_code": _status_text(value.get("blocker_code"), limit=80),
+        "armed": armed,
+        "state": state,
+    }
+
+
+def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
+    """Validate and bound non-authorizing fixed-cohort shadow telemetry."""
+    if not isinstance(value, dict):
+        return None
+
+    candidate_ids = _status_string_list(
+        value.get("candidate_identities"), limit=25)
+    raw_arms = value.get("arms")
+    arms = ([item for item in raw_arms[:25] if isinstance(item, dict)]
+            if isinstance(raw_arms, list) else [])
+    family_roles: dict[str, set[str]] = {}
+    arm_candidate_ids: set[str] = set()
+    for arm in arms:
+        family = _status_text(arm.get("family"))
+        role = _status_text(arm.get("role"), limit=20)
+        candidate_id = _status_text(arm.get("candidate_id"))
+        if family and role in {"baseline", "variant"}:
+            family_roles.setdefault(family, set()).add(role)
+        if candidate_id:
+            arm_candidate_ids.add(candidate_id)
+
+    decision_raw = value.get("decision_counts")
+    decision_raw = decision_raw if isinstance(decision_raw, dict) else {}
+    by_kind_raw = decision_raw.get("by_kind")
+    by_kind: dict[str, int] = {}
+    if isinstance(by_kind_raw, dict):
+        for key, count in list(by_kind_raw.items())[:16]:
+            name = _status_text(key, limit=60)
+            number = _status_nonnegative_int(count)
+            if name is not None and number is not None:
+                by_kind[name] = number
+    rejection_raw = value.get("rejection_counts")
+    rejection_raw = rejection_raw if isinstance(rejection_raw, dict) else {}
+
+    source_lag = _status_nonnegative_float(value.get("source_lag_seconds"))
+    poll_duration = _status_nonnegative_float(
+        value.get("poll_duration_seconds"))
+    flags = {
+        key: value.get(key) if isinstance(value.get(key), bool) else None
+        for key in (
+            "enabled", "diagnostic", "authorizing", "gate_eligible",
+            "promotion_eligible", "online_fdr", "actual_fill_claims",
+            "realized_pnl_authorizing",
+        )
+    }
+    diagnostic_only = (
+        flags["enabled"] is True and
+        flags["diagnostic"] is True and
+        flags["authorizing"] is False and
+        flags["gate_eligible"] is False and
+        flags["promotion_eligible"] is False and
+        flags["actual_fill_claims"] is False and
+        flags["realized_pnl_authorizing"] is False
+    )
+    families_missing_raw = value.get("families_missing")
+    families_missing = _status_string_list(families_missing_raw, limit=12)
+    families_without_decisions = _status_string_list(
+        value.get("families_without_decisions"), limit=12)
+    families_total = _status_nonnegative_int(value.get("families_total"))
+    families_covered = _status_nonnegative_int(
+        value.get("families_covered"))
+    baseline_count = _status_nonnegative_int(value.get("baseline_count"))
+    variant_count = _status_nonnegative_int(value.get("variant_count"))
+    actual_fills = _status_nonnegative_int(value.get("actual_fills"))
+    cohort_identity = _status_text(value.get("cohort_identity"))
+    activation_identity = _status_text(value.get("activation_identity"))
+    activation_status = _status_text(value.get("activation_status"), limit=40)
+    cohort_active = bool(
+        cohort_identity and activation_identity and activation_status == "active")
+    coverage_complete = bool(
+        families_total == 12 and families_covered == 12 and
+        isinstance(families_missing_raw, list) and not families_missing and
+        baseline_count == 12 and variant_count == 12 and
+        len(candidate_ids) == 24 and len(set(candidate_ids)) == 24 and
+        isinstance(raw_arms, list) and len(raw_arms) == 24 and len(arms) == 24 and
+        len(arm_candidate_ids) == 24 and
+        set(candidate_ids) == arm_candidate_ids and
+        len(family_roles) == 12 and
+        all(roles == {"baseline", "variant"}
+            for roles in family_roles.values()))
+    metadata_valid = bool(
+        value.get("schema") == "diagnostic-shadow-coverage.v1" and
+        diagnostic_only and flags["online_fdr"] is False and
+        actual_fills == 0 and poll_duration is not None)
+
+    return {
+        "schema": _status_text(value.get("schema")),
+        **flags,
+        "diagnostic_only": diagnostic_only,
+        "proof_authority": False if diagnostic_only else None,
+        "metadata_valid": metadata_valid,
+        "cohort_active": cohort_active,
+        "coverage_complete": coverage_complete,
+        "families_total": families_total,
+        "families_covered": families_covered,
+        "families_missing": families_missing,
+        "families_observed": _status_nonnegative_int(
+            value.get("families_observed")),
+        "families_without_decisions": families_without_decisions,
+        "baseline_count": baseline_count,
+        "variant_count": variant_count,
+        "candidate_count": len(candidate_ids),
+        "arms_total": len(arms),
+        "cohort_identity": cohort_identity,
+        "activation_identity": activation_identity,
+        "activation_status": activation_status,
+        "warmup_session": _status_text(value.get("warmup_session"), limit=40),
+        "observation_status": _status_text(
+            value.get("observation_status"), limit=80),
+        "decision_counts": {
+            "total": _status_nonnegative_int(decision_raw.get("total")),
+            "this_poll": _status_nonnegative_int(
+                decision_raw.get("this_poll")),
+            "warmup": _status_nonnegative_int(decision_raw.get("warmup")),
+            "by_kind": by_kind,
+        },
+        "rejection_counts": {
+            key: _status_nonnegative_int(rejection_raw.get(key))
+            for key in (
+                "reject", "unpriced", "preactivation",
+                "preactivation_this_poll",
+            )
+        },
+        "quoteable_virtual_opens": _status_nonnegative_int(
+            value.get("quoteable_virtual_opens")),
+        "unpriced_virtual_opens": _status_nonnegative_int(
+            value.get("unpriced_virtual_opens")),
+        "replay_modeled_fills": _status_nonnegative_int(
+            value.get("replay_modeled_fills")),
+        "warmup_replay_modeled_fills": _status_nonnegative_int(
+            value.get("warmup_replay_modeled_fills")),
+        "actual_fills": actual_fills,
+        "poll_duration_seconds": poll_duration,
+        "source_lag_seconds": source_lag,
+        "source_data_fresh": (
+            source_lag <= float(max_age) if source_lag is not None else None),
+    }
+
+
 def _fresh(timestamp: object, max_age: float, now: float | None = None) -> bool:
     try:
         age = (time.time() if now is None else float(now)) - float(timestamp)
@@ -263,6 +488,8 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "residual_risk": residual_risk,
         "alert": residual_risk,
         "alert_kind": alert_kind,
+        "paper_selection": paper_selection_summary(
+            heartbeat.get("paper_selection")),
     }, heartbeat)
 
 
@@ -448,6 +675,7 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
         "ok": (service_liveness_ok and not blocking_attempt_failure and
                not coverage_failures),
         "component": "recorder",
+        "corpus_root": str(path),
         "status": ("recording_market_closed"
                    if closed_no_data_failure else
                    str(attempt.get("failure_kind") or "failed")
@@ -637,11 +865,44 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
     stress_calibration = heartbeat.get("stress_calibration")
     if not isinstance(stress_calibration, dict):
         stress_calibration = stale_tail.get("stress_calibration")
+    diagnostic = _shadow_diagnostic_summary(
+        heartbeat.get("diagnostic_shadow"), max_age=max_age)
+    liveness_ok = fresh and status == "running"
+    if not fresh:
+        coverage_status = "stale_heartbeat"
+    elif status != "running":
+        coverage_status = "service_not_running"
+    elif diagnostic is None:
+        coverage_status = "diagnostic_metadata_missing"
+    elif not diagnostic["metadata_valid"]:
+        coverage_status = "diagnostic_metadata_invalid"
+    elif not diagnostic["cohort_active"]:
+        coverage_status = "active_cohort_missing"
+    elif not diagnostic["coverage_complete"]:
+        coverage_status = "family_coverage_incomplete"
+    elif diagnostic["source_lag_seconds"] is None:
+        coverage_status = "fresh_data_unavailable"
+    elif not diagnostic["source_data_fresh"]:
+        coverage_status = "source_data_stale"
+    else:
+        coverage_status = "ready"
+    coverage_ready = coverage_status == "ready"
+    current = time.time() if now is None else float(now)
+    try:
+        heartbeat_age = current - float(heartbeat.get("updated_ts"))
+        heartbeat_age = (round(max(0.0, heartbeat_age), 6)
+                         if math.isfinite(heartbeat_age) else None)
+    except (TypeError, ValueError):
+        heartbeat_age = None
     return _with_provenance({
-        "ok": fresh and status == "running",
+        "ok": liveness_ok,
         "component": "shadow",
         "status": status,
         "fresh": fresh,
+        "heartbeat_age_seconds": heartbeat_age,
+        "coverage_ready": coverage_ready,
+        "coverage_status": coverage_status,
+        "diagnostic_shadow": diagnostic,
         "last_error": last_error,
         "candidates": heartbeat.get("candidates"),
         "events": heartbeat.get("events"),

@@ -115,16 +115,16 @@ RECENT_KEY_INDEX_SCHEMA = "recorder-recent-keys.v1"
 CORPUS_LOCK_NAME = ".recorder.lock"
 STATUS_NAME = ".recorder-status.json"
 STATUS_SCHEMA = "recorder-status.v1"
+CYCLE_TELEMETRY_SCHEMA = "recorder-cycle-telemetry.v1"
 PARTITION_DIR = "sessions"
 PARTITION_SOURCE_SCHEMA = "recorder-partition-source.v1"
 PARTITION_CALENDAR_SCHEMA = "recorder-partition-calendar.v1"
-# The recorder only ever asks the provider for ``watermark - 1 minute`` onwards,
-# so a row it can legally receive is at most one minute older than the
-# watermark. The dedup window is fifteen minutes: an order of magnitude of
-# headroom over that overlap, and small enough that the index stays tiny. A row
-# older than the window cannot be checked against durable keys, so it is a hard
-# failure rather than a silent append -- replaying an old key is impossible, not
-# merely unlikely.
+# Catch-up asks the provider for ``watermark - 1 minute`` onwards; forward-only
+# repeatedly asks for the newest configured window. The dedup window is fifteen
+# minutes: ample headroom for the production one-minute overlap and small enough
+# that the index stays tiny. A row older than the window cannot be checked
+# against durable keys, so it is a hard failure rather than a silent append --
+# replaying an old key is impossible, not merely unlikely.
 DEDUP_HORIZON = timedelta(minutes=15)
 MAX_INLINE_INDEX_BYTES = 16 * 1024 * 1024
 RECENT_KEY_BATCH_SIZE = 10_000
@@ -133,10 +133,52 @@ DEFAULT_FORWARD_OBSERVATION_MAX_LAG_MINUTES = 15
 DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
 MAX_AUTHORIZING_INTERVAL_SECONDS = 30.0
+MAX_DEFERRED_CATCHUP_INTERVALS = 64
 # Calendar metadata is an audit boundary, not a deduplication cache.  Keep the
 # name for callers that imported the old constant, but do not prune calendar
 # entries by age.
 SESSION_CALENDAR_RETENTION_DAYS = 90
+
+
+def _initialize_cycle_telemetry(target: dict) -> dict:
+    """Reset one bounded, non-attributing recorder cycle measurement."""
+    target.clear()
+    target.update({
+        "schema": CYCLE_TELEMETRY_SCHEMA,
+        "corpus_migration_seconds": 0.0,
+        "index_preparation_seconds": 0.0,
+        "calendar_preparation_seconds": 0.0,
+        "fetch_projection_seconds": 0.0,
+        "validation_ingest_seconds": 0.0,
+        "revision_validation_save_seconds": 0.0,
+        "durable_save_seconds": 0.0,
+        "windows_completed": 0,
+        "projected_rows": 0,
+        "session_rows": 0,
+        "unique_rows": 0,
+    })
+    return target
+
+
+@contextmanager
+def _timed_cycle_phase(telemetry: dict | None, name: str):
+    """Accumulate elapsed wall time for a precisely named recorder phase."""
+    if telemetry is None:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        previous = float(telemetry.get(name, 0.0) or 0.0)
+        telemetry[name] = round(
+            previous + max(0.0, time.perf_counter() - started), 6)
+
+
+def _increment_cycle_telemetry(telemetry: dict | None, name: str,
+                               value: int = 1) -> None:
+    if telemetry is not None:
+        telemetry[name] = max(0, int(telemetry.get(name, 0) or 0) + int(value))
 
 
 def _next_cadence_deadline(previous: float | None, now: float,
@@ -1504,6 +1546,82 @@ def _next_exact_session_window(cursor: datetime, end: datetime,
     return None
 
 
+def _latest_exact_session_window(start: datetime, end: datetime,
+                                 calendar: CalendarCache
+                                 ) -> tuple[datetime, datetime] | None:
+    """Return the newest open-session intersection inside one forward window."""
+    first = start.astimezone(NEW_YORK).date()
+    day = end.astimezone(NEW_YORK).date()
+    while day >= first:
+        if not calendar.known(day):
+            raise RuntimeError(
+                f"exact broker calendar metadata unavailable: {day.isoformat()}")
+        session = calendar.session(day)
+        if session is not None:
+            opened = max(start, session.open.astimezone(timezone.utc))
+            closed = min(end, session.close.astimezone(timezone.utc))
+            if closed > opened:
+                return opened, closed
+        day -= timedelta(days=1)
+    return None
+
+
+def _deferred_open_session_intervals(
+        start: datetime, end: datetime,
+        calendar: CalendarCache) -> tuple[list[dict[str, str]], bool]:
+    """Return newest bounded open-session segments omitted before a fetch."""
+    if end <= start:
+        return [], False
+    first = start.astimezone(NEW_YORK).date()
+    day = end.astimezone(NEW_YORK).date()
+    newest_first: list[dict[str, str]] = []
+    truncated = False
+    while day >= first:
+        if not calendar.known(day):
+            raise RuntimeError(
+                f"exact broker calendar metadata unavailable: {day.isoformat()}")
+        session = calendar.session(day)
+        if session is not None:
+            opened = max(start, session.open.astimezone(timezone.utc))
+            closed = min(end, session.close.astimezone(timezone.utc))
+            if closed > opened:
+                if len(newest_first) >= MAX_DEFERRED_CATCHUP_INTERVALS:
+                    truncated = True
+                    break
+                newest_first.append({
+                    "from": opened.isoformat(),
+                    "through": closed.isoformat(),
+                })
+        day -= timedelta(days=1)
+    newest_first.reverse()
+    return newest_first, truncated
+
+
+def _deferred_catchup_payload(
+        watermark: datetime, window_start: datetime, observed_at: datetime,
+        calendar: CalendarCache) -> dict | None:
+    """Describe only authoritative open-session history not recorded live."""
+    intervals, truncated = _deferred_open_session_intervals(
+        watermark, window_start, calendar)
+    if not intervals:
+        return None
+    latest = intervals[-1]
+    return {
+        # Keep the legacy scalar fields non-inverted and scoped to one actual
+        # open interval. Consumers needing the full gap use ``intervals``.
+        "from": latest["from"],
+        "through": latest["through"],
+        "summary_scope": "latest_open_session_interval",
+        "intervals": intervals,
+        "intervals_truncated_before": truncated,
+        "interval_limit": MAX_DEFERRED_CATCHUP_INTERVALS,
+        "observed_at": observed_at.isoformat(),
+        "reason": "forward_capture_priority",
+        "source": "alpaca_calendar",
+        "recorded": False,
+    }
+
+
 def _regular_session_gap(previous: datetime, current: datetime,
                          calendar: CalendarCache | None = None,
                          maximum: timedelta = timedelta(
@@ -1787,6 +1905,14 @@ def _fetch_window_minutes() -> int:
     return value
 
 
+def _capture_policy() -> str:
+    value = os.getenv("ALPACA_RECORDER_CAPTURE_POLICY", "catch_up")
+    if value not in {"catch_up", "forward_only"}:
+        raise RuntimeError(
+            "ALPACA_RECORDER_CAPTURE_POLICY must be catch_up or forward_only")
+    return value
+
+
 def _max_windows_per_cycle() -> int:
     raw = os.getenv("ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE", "0")
     try:
@@ -1899,58 +2025,62 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
                   calendar: CalendarCache | None, *, feed: str,
                   bar_gap_policy: str,
                   bar_gap_maximum: timedelta,
-                  forward_observation_max_lag: timedelta):
+                  forward_observation_max_lag: timedelta,
+                  telemetry: dict | None = None):
     """Validate and durably append one bounded provider response."""
-    coverage = _verify_bar_continuity(
-        rows, latest_bars, window_end, symbols, calendar, feed=feed,
-        policy=bar_gap_policy, maximum=bar_gap_maximum)
-    _update_bar_coverage(index, coverage, observed_at)
-    _update_observation_watermarks(index, rows)
+    with _timed_cycle_phase(telemetry, "validation_ingest_seconds"):
+        coverage = _verify_bar_continuity(
+            rows, latest_bars, window_end, symbols, calendar, feed=feed,
+            policy=bar_gap_policy, maximum=bar_gap_maximum)
+        _update_bar_coverage(index, coverage, observed_at)
+        _update_observation_watermarks(index, rows)
     # Keep changed bar responses before CSV event-key deduplication discards
     # corrections. The CSV remains the first-observation replay contract.
-    from deploy.market_observations import append_observations
-    revision_receipt = append_observations(
-        _corpus_root(output) / "bar-observations.sqlite3", rows,
-        maximum_lag_seconds=forward_observation_max_lag.total_seconds())
+    with _timed_cycle_phase(telemetry, "revision_validation_save_seconds"):
+        from deploy.market_observations import append_observations
+        revision_receipt = append_observations(
+            _corpus_root(output) / "bar-observations.sqlite3", rows,
+            maximum_lag_seconds=forward_observation_max_lag.total_seconds())
     index["bar_observation_store"] = revision_receipt
     unique_rows: list[dict] = []
     unique_keys: set[str] = set()
     recent_entries: list[tuple[str, str]] = []
-    for row in rows:
-        parsed = _timestamp(row.get("timestamp"))
-        if parsed is None:
-            raise RuntimeError("recorder row has an invalid timestamp")
-        if horizon is not None and parsed < horizon:
-            # Outside the durable dedup window uniqueness cannot be proven, so
-            # the row is refused rather than risking a silent replay.
-            raise RuntimeError(
-                "recorder received rows older than the dedup window")
-        key = str(row.get("event_key") or "").strip()
-        if not key:
-            raise RuntimeError("recorder row has no event_key")
-        if row.get("event_type") == "option_snapshot":
-            # Refresh the hold even when the snapshot itself is a duplicate;
-            # the option contract remains pinned while the recorder observes it.
-            pins[str(row.get("contract") or row.get("symbol"))] = (
-                observed_at + option_hold).isoformat()
-        if key in unique_keys or recent_store.contains(key):
-            continue
-        unique_keys.add(key)
-        unique_rows.append(row)
-        recent_entries.append((key, parsed.isoformat()))
-        if watermark is None or parsed > watermark:
-            watermark = parsed
-        if row.get("event_type") in {"bar", "bar_1m"}:
-            symbol = str(row.get("symbol") or "")
-            if index["latest_bars"].get(symbol, "") < parsed.isoformat():
-                index["latest_bars"][symbol] = parsed.isoformat()
-            previous = latest_bars.get(symbol)
-            if previous is None or parsed > previous:
-                latest_bars[symbol] = parsed
+    with _timed_cycle_phase(telemetry, "validation_ingest_seconds"):
+        for row in rows:
+            parsed = _timestamp(row.get("timestamp"))
+            if parsed is None:
+                raise RuntimeError("recorder row has an invalid timestamp")
+            if horizon is not None and parsed < horizon:
+                # Outside the durable dedup window uniqueness cannot be proven, so
+                # the row is refused rather than risking a silent replay.
+                raise RuntimeError(
+                    "recorder received rows older than the dedup window")
+            key = str(row.get("event_key") or "").strip()
+            if not key:
+                raise RuntimeError("recorder row has no event_key")
+            if row.get("event_type") == "option_snapshot":
+                # Refresh the hold even when the snapshot itself is a duplicate;
+                # the option contract remains pinned while the recorder observes it.
+                pins[str(row.get("contract") or row.get("symbol"))] = (
+                    observed_at + option_hold).isoformat()
+            if key in unique_keys or recent_store.contains(key):
+                continue
+            unique_keys.add(key)
+            unique_rows.append(row)
+            recent_entries.append((key, parsed.isoformat()))
+            if watermark is None or parsed > watermark:
+                watermark = parsed
+            if row.get("event_type") in {"bar", "bar_1m"}:
+                symbol = str(row.get("symbol") or "")
+                if index["latest_bars"].get(symbol, "") < parsed.isoformat():
+                    index["latest_bars"][symbol] = parsed.isoformat()
+                previous = latest_bars.get(symbol)
+                if previous is None or parsed > previous:
+                    latest_bars[symbol] = parsed
 
-    index["option_pins"] = pins
-    index["watermark"] = watermark.isoformat() if watermark else None
-    index = _prune_index(index)
+        index["option_pins"] = pins
+        index["watermark"] = watermark.isoformat() if watermark else None
+        index = _prune_index(index)
     if rows:
         if unique_rows:
             # Provenance is durable before the authoritative append.  A crash
@@ -1958,22 +2088,25 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
             # historical; it can never leave late-observed rows looking like
             # forward evidence.  Partition-level metadata intentionally never
             # downgrades from historical_backfill.
-            historical_days = _historical_partition_days(
-                unique_rows, forward_observation_max_lag)
+            with _timed_cycle_phase(telemetry, "validation_ingest_seconds"):
+                historical_days = _historical_partition_days(
+                    unique_rows, forward_observation_max_lag)
             sources = index.setdefault("partition_sources", {})
-            for day in sorted(historical_days):
-                _save_partition_source(output, day, "historical_backfill")
-                sources[_partition_path(output, day).name] = {
-                    "source_mode": "historical_backfill",
-                }
-            _append_partitions(output, unique_rows)
-            # The corpus append happens first.  If the process dies before the
-            # SQLite and JSON commits, partition sizes no longer match the
-            # sidecars and recovery rebuilds them from the authoritative CSV.
-            recent_store.add_many(recent_entries)
+            with _timed_cycle_phase(telemetry, "durable_save_seconds"):
+                for day in sorted(historical_days):
+                    _save_partition_source(output, day, "historical_backfill")
+                    sources[_partition_path(output, day).name] = {
+                        "source_mode": "historical_backfill",
+                    }
+                _append_partitions(output, unique_rows)
+                # The corpus append happens first.  If the process dies before the
+                # SQLite and JSON commits, partition sizes no longer match the
+                # sidecars and recovery rebuilds them from the authoritative CSV.
+                recent_store.add_many(recent_entries)
         # Persist even a duplicate-only response: the sidecar write is the
         # recorder's durable liveness signal, while the corpus remains unchanged.
-        _save_index(output, index, recent_store=recent_store)
+        with _timed_cycle_phase(telemetry, "durable_save_seconds"):
+            _save_index(output, index, recent_store=recent_store)
     return index, watermark, latest_bars, pins, len(unique_rows)
 
 
@@ -1981,12 +2114,17 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
                 *, feed: str | None = None, config: dict | None = None,
                 include_options: bool | None = None, option_limit: int = 5,
                 option_hold: timedelta = timedelta(minutes=180),
-                calendar: CalendarCache | None = None) -> int:
+                calendar: CalendarCache | None = None,
+                now: datetime | None = None,
+                telemetry: dict | None = None) -> int:
+    cycle_telemetry = _initialize_cycle_telemetry(
+        telemetry if telemetry is not None else {})
     with corpus_write_lock(output):
         return _record_once_locked(
             provider, symbols, output, feed=feed, config=config,
             include_options=include_options, option_limit=option_limit,
-            option_hold=option_hold, calendar=calendar)
+            option_hold=option_hold, calendar=calendar, now=now,
+            telemetry=cycle_telemetry)
 
 
 def _record_once_locked(provider: AlpacaProvider, symbols: list[str], output: Path,
@@ -1995,25 +2133,43 @@ def _record_once_locked(provider: AlpacaProvider, symbols: list[str], output: Pa
                         include_options: bool | None = None,
                         option_limit: int = 5,
                         option_hold: timedelta = timedelta(minutes=180),
-                        calendar: CalendarCache | None = None) -> int:
+                        calendar: CalendarCache | None = None,
+                        now: datetime | None = None,
+                        telemetry: dict | None = None) -> int:
     symbols = [validate_equity_symbol(symbol) for symbol in symbols]
     if not symbols:
         raise ValueError("at least one US equity symbol is required")
-    now = datetime.now(timezone.utc)
+    capture_policy = _capture_policy()
+    if now is not None:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("recorder time must be timezone-aware")
+        now = now.astimezone(timezone.utc)
+    cycle_now = now
+    if cycle_now is None and capture_policy == "catch_up":
+        # Preserve the historical catch-up boundary: elapsed index work does
+        # not silently widen one catch-up cycle.
+        cycle_now = datetime.now(timezone.utc)
     if include_options is None:
         classes = (config or {}).get("universe", {}).get("asset_classes", [])
         include_options = any(str(value).lower() in {"us_option", "option"}
                               for value in classes)
     _corpus_root(output).mkdir(parents=True, exist_ok=True)
-    migrate_corpus(output)
-    index = _prepare_index(output)
+    with _timed_cycle_phase(telemetry, "corpus_migration_seconds"):
+        migrate_corpus(output)
+    with _timed_cycle_phase(telemetry, "index_preparation_seconds"):
+        index = _prepare_index(output)
     recent_store = RecentKeyIndex(_recent_key_index_path(output))
     try:
+        # Forward capture must target the newest window after a slow rebuild;
+        # an explicit deterministic boundary remains stable for both policies.
+        request_now = cycle_now or datetime.now(timezone.utc)
         return _record_once_with_index(
-            provider, symbols, output, index, recent_store, now=now, feed=feed,
+            provider, symbols, output, index, recent_store, now=request_now,
+            feed=feed,
             config=config, include_options=include_options,
             option_limit=option_limit, option_hold=option_hold,
-            calendar=calendar)
+            calendar=calendar, capture_policy=capture_policy,
+            telemetry=telemetry)
     finally:
         recent_store.close()
 
@@ -2024,7 +2180,9 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                             feed: str | None, config: dict | None,
                             include_options: bool, option_limit: int,
                             option_hold: timedelta,
-                            calendar: CalendarCache | None) -> int:
+                            calendar: CalendarCache | None,
+                            capture_policy: str,
+                            telemetry: dict | None = None) -> int:
     """Run one recorder cycle with an already validated disk-backed index."""
     session_cfg = (config or {}).get("session") if isinstance(config, dict) else {}
     require_exact_calendar = bool(
@@ -2056,32 +2214,42 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                    if parsed is not None}
     if watermark is not None and watermark > now + timedelta(seconds=5):
         raise RuntimeError("recorder dataset watermark is in the future")
-    # Resume from durable data rather than a fixed three-minute lookback. The
-    # one-minute overlap makes retries safe while the event key removes dupes.
-    # A stale watermark is split into bounded requests so a long outage cannot
-    # materialize millions of quotes in one provider response.
-    start = (watermark - timedelta(minutes=1)
-             if watermark is not None else now - timedelta(minutes=3))
-    capture_policy = os.getenv("ALPACA_RECORDER_CAPTURE_POLICY", "catch_up")
-    if capture_policy not in {"catch_up", "forward_only"}:
-        raise RuntimeError("ALPACA_RECORDER_CAPTURE_POLICY must be catch_up or forward_only")
     index["capture_policy"] = capture_policy
-    if capture_policy == "forward_only" and start < now - timedelta(minutes=3):
-        # Preserve old rows and expose the unfilled interval. Do not advance
-        # the market watermark or relabel old partitions as forward evidence.
-        # Historical recovery is a separate explicit backfill; it must not
-        # hold fresh collection behind hours of historical quote requests.
-        start = now - timedelta(minutes=3)
-        index["deferred_catchup"] = {
-            "from": watermark.isoformat(),
-            "through": start.isoformat(), "observed_at": now.isoformat(),
-            "reason": "forward_capture_priority", "recorded": False,
-        }
-    _record_session_calendar(index, calendar, start, now, output)
+    window = timedelta(minutes=_fetch_window_minutes())
+    if capture_policy == "forward_only":
+        # Always observe exactly the newest configured window. Repeated cycles
+        # overlap naturally; recorder_market additionally rounds only the bar
+        # request back to the minute boundary to capture revisions.
+        start = now - window
+    else:
+        # Catch-up resumes from durable data. The one-minute overlap makes
+        # retries safe while event-key deduplication removes duplicates.
+        start = (watermark - timedelta(minutes=1)
+                 if watermark is not None else now - timedelta(minutes=3))
+    with _timed_cycle_phase(telemetry, "calendar_preparation_seconds"):
+        _record_session_calendar(index, calendar, start, now, output)
+    forward_open_window = None
+    if capture_policy == "forward_only" and calendar is not None:
+        try:
+            forward_open_window = _latest_exact_session_window(
+                start, now, calendar)
+        except RuntimeError:
+            if require_exact_calendar:
+                raise
+        if (forward_open_window is not None and watermark is not None and
+                watermark < forward_open_window[0]):
+            try:
+                deferred = _deferred_catchup_payload(
+                    watermark, forward_open_window[0], now, calendar)
+            except RuntimeError:
+                if require_exact_calendar:
+                    raise
+                deferred = None
+            if deferred is not None:
+                index["deferred_catchup"] = deferred
     pins = {contract: value for contract, value in index["option_pins"].items()
             if str(value) > now.isoformat()}
     horizon = None if watermark is None else watermark - DEDUP_HORIZON
-    window = timedelta(minutes=_fetch_window_minutes())
     cursor = start
     total_rows = 0
     total_unique = 0
@@ -2089,42 +2257,53 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
     maximum_windows = _max_windows_per_cycle()
     while True:
         if require_exact_calendar:
-            request_window = _next_exact_session_window(
-                cursor, now, window, calendar)
+            request_window = (
+                forward_open_window
+                if capture_policy == "forward_only" else
+                _next_exact_session_window(cursor, now, window, calendar))
             if request_window is None:
                 break
             cursor, window_end = request_window
         else:
             window_end = min(cursor + window, now)
-        fetched_rows = list(_rows(
-            provider, symbols, window_end, feed=resolved_feed, config=config,
-            # Option-chain snapshots are observations made now, not historical
-            # market data. Sampling them in every stale catch-up window can
-            # admit an illiquid contract's old quote timestamp and incorrectly
-            # trip the equity dedup horizon. Sample once, in the live window,
-            # and let recorder_market discard candidates older than that
-            # request's lower bound.
-            include_options=bool(include_options and window_end >= now),
-            option_limit=option_limit,
-            start=cursor, option_pins=frozenset(pins), observed_at=now))
+        with _timed_cycle_phase(telemetry, "fetch_projection_seconds"):
+            fetched_rows = list(_rows(
+                provider, symbols, window_end, feed=resolved_feed, config=config,
+                # Option-chain snapshots are observations made now, not historical
+                # market data. Sampling them in every stale catch-up window can
+                # admit an illiquid contract's old quote timestamp and incorrectly
+                # trip the equity dedup horizon. Sample once, in the live window,
+                # and let recorder_market discard candidates older than that
+                # request's lower bound.
+                include_options=bool(include_options and window_end >= now),
+                option_limit=option_limit,
+                start=cursor, option_pins=frozenset(pins), observed_at=now))
         total_rows += len(fetched_rows)
-        rows = _recorded_session_rows(
-            index, fetched_rows,
-            require_exact_calendar=require_exact_calendar)
+        _increment_cycle_telemetry(
+            telemetry, "projected_rows", len(fetched_rows))
+        with _timed_cycle_phase(telemetry, "validation_ingest_seconds"):
+            rows = _recorded_session_rows(
+                index, fetched_rows,
+                require_exact_calendar=require_exact_calendar)
+        _increment_cycle_telemetry(telemetry, "session_rows", len(rows))
         index, watermark, latest_bars, pins, unique = _ingest_chunk(
             output, index, recent_store, watermark, latest_bars, pins, rows, symbols,
             window_end, now, option_hold, horizon, calendar,
             feed=resolved_feed, bar_gap_policy=bar_gap_policy,
             bar_gap_maximum=bar_gap_maximum,
-            forward_observation_max_lag=forward_observation_max_lag)
+            forward_observation_max_lag=forward_observation_max_lag,
+            telemetry=telemetry)
         total_unique += unique
         completed_windows += 1
+        _increment_cycle_telemetry(telemetry, "unique_rows", unique)
+        _increment_cycle_telemetry(telemetry, "windows_completed")
         horizon = None if watermark is None else watermark - DEDUP_HORIZON
         # _ingest_chunk durably commits each window. Release the corpus lock
         # between bounded catch-up batches so sealed readers are not starved
         # by an entire multi-session outage. The next cycle resumes from that
         # durable watermark with the usual overlap and late-source labelling.
-        if window_end >= now or (maximum_windows and completed_windows >= maximum_windows):
+        if (capture_policy == "forward_only" or window_end >= now or
+                (maximum_windows and completed_windows >= maximum_windows)):
             break
         cursor = window_end
 
@@ -2132,7 +2311,8 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
         # Persist calendar coverage only after all bounded requests completed;
         # this keeps strict fetch failures atomic while retaining closed-day
         # markers for a successful no-data holiday response.
-        _save_index(output, index)
+        with _timed_cycle_phase(telemetry, "durable_save_seconds"):
+            _save_index(output, index)
         if capture_policy == "forward_only" and require_exact_calendar and completed_windows == 0:
             # The exact calendar contains no open market interval in the
             # requested recent window. This is a healthy idle recorder.
@@ -2275,11 +2455,13 @@ def main(argv=None) -> int:
     next_tick: float | None = time.monotonic()
     while True:
         cycle_started_ts = time.time()
+        cycle_telemetry = _initialize_cycle_telemetry({})
         try:
             count = record_once(provider, symbols, output, config=cfg,
                                 include_options=include_options,
                                 option_limit=option_limit,
-                                option_hold=option_hold, calendar=calendar)
+                                option_hold=option_hold, calendar=calendar,
+                                telemetry=cycle_telemetry)
         except Exception as exc:
             failure_count += 1
             delay = min(
@@ -2301,6 +2483,7 @@ def main(argv=None) -> int:
                 "error": str(exc),
                 "failure_count": failure_count,
                 "retry_seconds": delay,
+                "cycle_telemetry": cycle_telemetry,
                 "cadence": _cadence_telemetry(
                     output, interval=args.interval,
                     cycle_started_ts=cycle_started_ts,
@@ -2327,6 +2510,7 @@ def main(argv=None) -> int:
             "retryable": None,
             "error_type": None,
             "error": None,
+            "cycle_telemetry": cycle_telemetry,
             "cadence": _cadence_telemetry(
                 output, interval=args.interval,
                 cycle_started_ts=cycle_started_ts,

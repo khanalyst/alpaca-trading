@@ -160,6 +160,90 @@ class ReportContentTests(unittest.TestCase):
         self.assertAlmostEqual(verdict["effect_estimate"], .12)
         self.assertEqual(verdict["confidence_interval"]["lower"], .02)
 
+    def test_current_cohort_diagnostics_report_the_complete_refusal_funnel(self):
+        # Mirrors the twelve 240-session variant summaries emitted by the
+        # 2026-09-08 cohort without loading its multi-megabyte raw result.
+        distributions = (
+            (18, 1, 18, 203), (17, 0, 22, 201),
+            (30, 1, 45, 164), (17, 0, 22, 201),
+            (1, 0, 23, 216), (26, 1, 26, 187),
+            (80, 1, 26, 133), (80, 1, 26, 133),
+            (4, 1, 22, 213), (5, 0, 25, 210),
+            (23, 0, 25, 192), (23, 0, 25, 192),
+        )
+        variants = []
+        for index, (no_signal, non_adjacent, no_window, stressed) in enumerate(
+                distributions):
+            reasons = {
+                "entry_bar_not_adjacent": non_adjacent,
+                "no_contiguous_feature_window": no_window,
+                "stressed_cost_risk_limit": stressed,
+            }
+            reasons = {reason: count for reason, count in reasons.items() if count}
+            refused = sum(reasons.values())
+            variants.append({
+                "variant_id": f"rule.synthetic.{index}",
+                "diagnostic": {"fit_diagnostics": {"execution_rejections": {
+                    "rows": 240, "executed_rows": 0, "no_trade_rows": 240,
+                    "no_signal_rows": no_signal,
+                    "explicit_rejections": refused,
+                    "unclassified_no_trade_rows": 0,
+                    "reject_reason_counts": reasons,
+                }}},
+            })
+        result = {
+            "vehicle": "equity",
+            "reports": [
+                {"vehicle": "equity", "variants": variants[offset:offset + 4]}
+                for offset in range(0, len(variants), 4)
+            ],
+        }
+
+        funnel = research_funnel(result)
+
+        self.assertEqual(funnel["counts"], {
+            "opportunities": 2556, "admitted": 0, "executed": 0,
+            "authorizing_eligible": 0, "gated": 2556, "selected": 0})
+        self.assertEqual(funnel["no_signal"], 324)
+        self.assertEqual(funnel["refused"], 2556)
+        self.assertEqual(funnel["refusal_reasons"], {
+            "entry_bar_not_adjacent": 6,
+            "no_contiguous_feature_window": 305,
+            "stressed_cost_risk_limit": 2245,
+        })
+        self.assertEqual(funnel["dominant_refusal_reason"],
+                         "stressed_cost_risk_limit")
+
+    def test_malformed_current_diagnostic_does_not_fall_back_to_legacy_counts(self):
+        diagnostic = {
+            "rows": 10, "trades": 0, "no_signal_count": 2,
+            "execution_rejection_count": 8,
+            "fit_diagnostics": {"execution_rejections": {
+                "rows": 10, "executed_rows": 0, "no_trade_rows": 10,
+                "no_signal_rows": 2, "explicit_rejections": 8,
+                "unclassified_no_trade_rows": 0,
+                "reject_reason_counts": {"stressed_cost_risk_limit": 7},
+            }},
+        }
+        funnel = research_funnel({"reports": [{"diagnostic": diagnostic}]})
+
+        self.assertEqual(funnel["counts"]["opportunities"], 0)
+        self.assertEqual(funnel["counts"]["gated"], 0)
+        self.assertEqual(funnel["refusal_reasons"], {})
+
+    def test_legacy_top_level_diagnostic_remains_supported(self):
+        diagnostic = {
+            "rows": 4, "trades": 1, "no_signal_count": 1,
+            "execution_rejection_count": 2,
+            "unclassified_no_trade_count": 0,
+        }
+        funnel = research_funnel({"reports": [{"diagnostic": diagnostic}]})
+
+        self.assertEqual(funnel["counts"]["opportunities"], 3)
+        self.assertEqual(funnel["counts"]["executed"], 1)
+        self.assertEqual(funnel["counts"]["gated"], 2)
+        self.assertEqual(funnel["no_signal"], 1)
+
     def test_it_answers_every_question_the_ledgers_can_answer(self):
         with tempfile.TemporaryDirectory() as directory:
             report = build_report(_run(directory))

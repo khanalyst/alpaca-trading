@@ -15,6 +15,151 @@ from .instruments import validate_asset_class, validate_instrument
 
 
 class StartupEdgePolicyMixin:
+    def _paper_selection_status(self) -> dict[str, Any]:
+        """Describe paper selection without implying execution or broker state.
+
+        ``armed`` is the operator/runtime authorization posture.  A process may
+        therefore be armed while it waits for the first passing proof; durable
+        pause, kill, daily-risk, shutdown, and resolution faults all fail it
+        closed.  ``resolved`` is populated only from the single record whose
+        durable shadow proof already passed the edge resolver.
+        """
+        base_cfg = (self._edge_base_cfg
+                    if isinstance(getattr(self, "_edge_base_cfg", None), Mapping)
+                    else self.cfg if isinstance(self.cfg, Mapping) else {})
+        strategy = (base_cfg.get("strategy", {})
+                    if isinstance(base_cfg.get("strategy"), Mapping) else {})
+        configured_strategy = str(strategy.get("id") or "").strip() or None
+        selection_mode = str(
+            getattr(self, "_edge_selection_mode", None) or
+            strategy.get("selection_mode") or "specific")
+        requested_variant = str(
+            getattr(self, "_edge_requested_variant", None) or
+            strategy.get("variant_id") or "").strip() or None
+
+        edge_error = str(getattr(self, "_edge_error", None) or "").strip()
+        records = [record for record in
+                   (getattr(self, "_edge_records", None) or ())
+                   if isinstance(record, Mapping)]
+        record = (getattr(self, "_edge_record", None)
+                  if not edge_error and len(records) == 1 else None)
+        resolved = None
+        if (isinstance(record, Mapping) and
+                record.get("candidate_id") == records[0].get("candidate_id")):
+            proof = record.get("latest_proof")
+            gate = (proof.get("verified_gate")
+                    if isinstance(proof, Mapping) and
+                    isinstance(proof.get("verified_gate"), Mapping) else {})
+            candidate_id = str(record.get("candidate_id") or "").strip()
+            variant_id = str(record.get("variant_id") or "").strip()
+            record_strategy = str(record.get("strategy_id") or "").strip()
+            record_hash = str(record.get("config_hash") or "").strip()
+            proof_hash = (str(proof.get("config_hash") or "").strip()
+                          if isinstance(proof, Mapping) else "")
+            run_id = (str(proof.get("run_id") or "").strip()
+                      if isinstance(proof, Mapping) else "")
+            gate_hash = (str(proof.get("gate_hash") or "").strip()
+                         if isinstance(proof, Mapping) else "")
+            lane = (str(proof.get("lane") or "").strip().lower()
+                    if isinstance(proof, Mapping) else "")
+            verified = bool(
+                candidate_id and variant_id and run_id and gate_hash and
+                record_hash and proof_hash == record_hash and lane == "shadow" and
+                gate.get("passes") is True and
+                (configured_strategy is None or
+                 record_strategy == configured_strategy))
+            if verified:
+                config = (record.get("config")
+                          if isinstance(record.get("config"), Mapping) else {})
+                record_strategy_cfg = (
+                    config.get("strategy", {})
+                    if isinstance(config.get("strategy"), Mapping) else {})
+                rule_spec = (
+                    record_strategy_cfg.get("rule_spec", {})
+                    if isinstance(record_strategy_cfg.get("rule_spec"), Mapping)
+                    else {})
+                axes = (record.get("axes")
+                        if isinstance(record.get("axes"), Mapping) else {})
+                family = str(
+                    rule_spec.get("family") or axes.get("family") or
+                    record_strategy or "").strip() or None
+                resolved = {
+                    "candidate_id": candidate_id,
+                    "variant_id": variant_id,
+                    "family": family,
+                    "proof": {
+                        "run_id": run_id,
+                        "gate_hash": gate_hash,
+                        "config_hash": proof_hash,
+                        "lane": lane,
+                    },
+                }
+
+        runtime_error = False
+        try:
+            runtime = state.load_state()
+        except Exception:  # noqa: BLE001 - observability must fail closed
+            runtime = {}
+            runtime_error = True
+        risk_day = runtime.get("risk_day", {}) if isinstance(runtime, Mapping) else {}
+        if not isinstance(runtime, Mapping) or not isinstance(risk_day, Mapping):
+            runtime_error = True
+        risk_limit = risk_day.get("limit_hit") if isinstance(risk_day, Mapping) else None
+        if risk_limit is not None and not isinstance(risk_limit, bool):
+            runtime_error = True
+
+        runtime_state = runtime.get("state") if isinstance(runtime, Mapping) else None
+        kill_reason = runtime.get("kill_reason") if isinstance(runtime, Mapping) else None
+        operator_pause = (runtime.get("operator_pause")
+                          if isinstance(runtime, Mapping) else None)
+        shutdown_reason = str(
+            getattr(self, "shutdown_reason", None) or "").strip()
+        edge_required = bool(getattr(self, "_edge_required", False))
+        selection_ambiguous = len(records) > 1
+        waiting_for_proof = bool(
+            edge_required and resolved is None and not selection_ambiguous and
+            (not edge_error or
+             edge_error.startswith("no latest-passing validated edge")))
+        edge_fault = bool(
+            edge_required and resolved is None and not waiting_for_proof)
+
+        if runtime_error:
+            blocker = "runtime_state_unavailable"
+        elif (runtime_state == state.KILLED or
+              kill_reason not in (None, False, "")):
+            blocker = "runtime_killed"
+        elif shutdown_reason:
+            blocker = "shutdown_requested"
+        elif runtime_state == state.DAY_STOPPED or risk_limit is True:
+            blocker = "daily_risk_limit"
+        elif operator_pause is not False:
+            blocker = "operator_paused"
+        elif selection_ambiguous:
+            blocker = "selection_not_singular"
+        elif edge_fault:
+            blocker = "edge_resolution_failed"
+        elif waiting_for_proof:
+            blocker = "validated_edge_required"
+        else:
+            blocker = None
+
+        armed = blocker in {None, "validated_edge_required"}
+        if armed and blocker == "validated_edge_required":
+            selection_state = "waiting_for_proof"
+        elif armed:
+            selection_state = "ready"
+        else:
+            selection_state = "blocked"
+        return {
+            "configured_strategy": configured_strategy,
+            "selection_mode": selection_mode,
+            "requested_variant": requested_variant,
+            "resolved": resolved,
+            "blocker_code": blocker,
+            "armed": armed,
+            "state": selection_state,
+        }
+
     @staticmethod
     def _feed_name(value: Any, *, default: str) -> str:
         """Return a provider/config feed's canonical comparison name.
@@ -379,11 +524,17 @@ class StartupEdgePolicyMixin:
                     try:
                         state.update_state(lambda runtime: {
                             **runtime, "state": state.PAUSED})
+                        detail = {
+                            "run_id": self.run_id,
+                            "reason": "validated_edge_required",
+                            "edge_vehicle": lookup.get("strategy", {}).get(
+                                "execution_mode", "shares"),
+                        }
+                        if self.mode == "paper":
+                            detail["paper_selection"] = \
+                                self._paper_selection_status()
                         state.write_heartbeat(
-                            "paused", run_id=self.run_id,
-                            reason="validated_edge_required",
-                            edge_vehicle=lookup.get("strategy", {}).get(
-                                "execution_mode", "shares"))
+                            "paused", **detail)
                     except Exception:  # noqa: BLE001
                         pass
                 return not self._edge_required

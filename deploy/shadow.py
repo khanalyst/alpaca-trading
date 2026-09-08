@@ -15,8 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from research.live_shadow import (DEFAULT_MAX_WORKERS, DEFAULT_RETENTION_DAYS, ShadowConfig,
-                                  ShadowRunner)  # noqa: E402
+from research.live_shadow import (DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS,
+                                  DEFAULT_MAX_WORKERS, DEFAULT_RETENTION_DAYS,
+                                  ShadowConfig, ShadowRunner)  # noqa: E402
+from agent.config import load_config as load_runtime_config  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
@@ -27,6 +29,11 @@ def parser() -> argparse.ArgumentParser:
                    default=Path("runtime/research/edge_lab.sqlite3"))
     p.add_argument("--shadow-db", type=Path,
                    default=Path("runtime/research/shadow.sqlite3"))
+    p.add_argument("--config", type=Path, default=ROOT / "config.yaml",
+                   help="mounted runtime config used unchanged for diagnostic policy")
+    p.add_argument("--diagnostic", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="run the fixed 24-arm non-authorizing family cohort")
     p.add_argument("--health-file", type=Path,
                    help="durable polling heartbeat (defaults beside shadow DB)")
     p.add_argument("--interval", type=float, default=60.0)
@@ -34,6 +41,9 @@ def parser() -> argparse.ArgumentParser:
                    help="run one bounded ingest/evaluation cycle and exit")
     p.add_argument("--max-candidates", type=int, default=32)
     p.add_argument("--max-events", type=int, default=20_000)
+    p.add_argument("--diagnostic-session-max-events", type=int,
+                   default=DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS,
+                   help="bounded full-session context available to diagnostics")
     p.add_argument("--max-decisions", type=int, default=100_000)
     p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                    help="bounded parallel candidate evaluators (default: %(default)s)")
@@ -67,12 +77,19 @@ def _write_health(path: Path, status: str, **detail) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    runtime_config = (load_runtime_config(args.config)
+                      if args.diagnostic else None)
     config = ShadowConfig(
         corpus_path=args.corpus, edge_db=args.edge_db, shadow_db=args.shadow_db,
         max_candidates=args.max_candidates, max_events=args.max_events,
-        max_decisions=args.max_decisions, max_workers=args.max_workers,
+        max_decisions=args.max_decisions,
+        diagnostic_session_max_events=args.diagnostic_session_max_events,
+        max_workers=args.max_workers,
         retention_days=args.retention_days,
-        poll_seconds=args.interval)
+        poll_seconds=args.interval,
+        diagnostic=args.diagnostic,
+        runtime_config=runtime_config,
+        runtime_config_path=args.config)
     runner = ShadowRunner(config)
     health_file = args.health_file or args.shadow_db.with_name("shadow-health.json")
     while True:
@@ -86,7 +103,9 @@ def main(argv: list[str] | None = None) -> int:
                 "quarantine_through_session", "pruned_replay_diffs",
                 "retention_days", "retention_floor_ts",
                 "retention_gap_watermark", "signal_dispositions",
-                "stress_calibration", "stale_tail")
+                "stress_calibration", "stale_tail", "diagnostic_shadow",
+                "authorizing_candidates", "diagnostic_candidates",
+                "poll_duration_seconds", "source_lag_seconds")
                 if key in result}
             _write_health(health_file, "degraded" if candidate_errors else "running",
                           last_error=("candidate evaluation failures" if candidate_errors

@@ -30,8 +30,11 @@ from .gates import (fdr_batch_evidence, sample_counts, verify_gate_envelope,
                     validate_protocol_floor)
 from .live_shadow import (
     REPLAY_QUARANTINE_OVERFLOW_KEY, ShadowError, ShadowStore,
-    _opportunity_capacity,
+    _candidate_epoch_identity, _digest as _shadow_digest,
+    _manifest_replay_identity, _opportunity_capacity, _replay_code_hash,
+    _safe_config,
 )
+from .diagnostic_shadow import is_diagnostic_candidate
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from .factory_ledger import CONFIRMATORY_SCOPE_VERSION, FactoryLedger
 from .stats import benjamini_yekutieli
@@ -245,6 +248,18 @@ def _latest_gate(ledger: EdgeLedger, candidate_id: str) -> tuple[dict, dict] | N
 def _meta_by_session(store: ShadowStore, candidate_id: str,
                      sessions: Sequence[str], vehicle: str) -> tuple[dict[str, dict], str | None]:
     """Validate complete replay/account metadata for one candidate."""
+    manifest_candidate_id = str(candidate_id)
+    if manifest_candidate_id.startswith("shadow:null:"):
+        manifest_candidate_id = manifest_candidate_id.removeprefix(
+            "shadow:null:")
+    persisted_candidates = {
+        str(item.get("candidate_id") or ""): item
+        for item in store.candidates()
+    }
+    persisted_candidate = persisted_candidates.get(manifest_candidate_id)
+    if persisted_candidate is None:
+        return {}, "candidate epoch identity is unavailable"
+    candidate_config = _safe_config(persisted_candidate)
     wanted = set(str(item) for item in sessions)
     rows = [row for row in store.replay_metadata(candidate_id)
             if str(row.get("session_date") or "") in wanted]
@@ -252,18 +267,65 @@ def _meta_by_session(store: ShadowStore, candidate_id: str,
     for row in rows:
         grouped.setdefault(str(row.get("session_date") or ""), []).append(row)
     result: dict[str, dict] = {}
+    manifest_cache: dict[str, Mapping[str, Any]] = {}
     for day in sorted(wanted):
         values = grouped.get(day, [])
         if len(values) != 1:
             return {}, f"session {day} has incomplete replay metadata"
         row = values[0]
         details = row.get("details")
+        if not isinstance(details, Mapping):
+            return {}, f"session {day} has invalid replay metadata"
+        replay_code_hash = details.get("replay_code_hash")
+        manifest_digest = details.get("manifest_digest")
+        replay_epoch_identity = details.get("replay_epoch_identity")
+        candidate_epoch_identity = details.get("candidate_epoch_identity")
+        if (replay_code_hash != _replay_code_hash() or
+                not isinstance(manifest_digest, str) or not manifest_digest or
+                not isinstance(replay_epoch_identity, str) or
+                not replay_epoch_identity or
+                not isinstance(candidate_epoch_identity, str) or
+                not candidate_epoch_identity):
+            return {}, f"session {day} replay code/manifest epoch is stale"
+        try:
+            manifest = manifest_cache.get(manifest_digest)
+            if manifest is None:
+                manifest = store.manifest(manifest_digest)
+                if not isinstance(manifest, Mapping):
+                    return {}, f"session {day} replay manifest is unavailable"
+                manifest_cache[manifest_digest] = manifest
+            expected_identity = _manifest_replay_identity(manifest)
+        except ShadowError as exc:
+            return {}, f"session {day} replay manifest is invalid: {exc}"
+        if any(details.get(key) != value for key, value in
+               expected_identity.items()):
+            return {}, f"session {day} replay manifest identity mismatch"
+        manifest_candidates = {
+            str(item.get("candidate_id") or ""): item
+            for item in (manifest.get("candidate_set") or ())
+            if isinstance(item, Mapping) and item.get("candidate_id")
+        }
+        manifest_candidate = manifest_candidates.get(manifest_candidate_id)
+        if manifest_candidate is None:
+            return {}, f"session {day} candidate is absent from replay manifest"
+        config_digest = _shadow_digest(candidate_config)
+        if manifest_candidate.get("config_digest") != config_digest:
+            return {}, f"session {day} candidate epoch config mismatch"
+        try:
+            expected_candidate_epoch = _candidate_epoch_identity(
+                candidate_id=manifest_candidate_id,
+                config=candidate_config,
+                replay_identity=expected_identity)
+        except ShadowError as exc:
+            return {}, f"session {day} candidate epoch identity is invalid: {exc}"
+        if candidate_epoch_identity != expected_candidate_epoch:
+            return {}, f"session {day} candidate epoch identity mismatch"
         if (row.get("status") != "match" or row.get("replay_status") != "match" or
                 not all(isinstance(row.get(key), str) and row.get(key)
                         for key in ("source_digest", "shadow_digest",
                                     "replay_digest")) or
                 row.get("account_id") is None or
-                row.get("vehicle") != vehicle or not isinstance(details, Mapping) or
+                row.get("vehicle") != vehicle or
                 details.get("complete") is not True or
                 details.get("signature_match") is not True):
             return {}, f"session {day} is not a complete parity match"
@@ -382,6 +444,10 @@ class ShadowIngestor:
             return [str(self.config.candidate_id)]
         candidate_ids: list[str] = []
         for row in self.ledger.status():
+            if is_diagnostic_candidate({
+                    "candidate_id": str(row.get("candidate_id") or ""),
+                    "config": _config(row)}):
+                continue
             status = row.get("status")
             if status not in {"backtest_passed", "shadow", "demoted",
                               "validated", "champion"}:
@@ -604,6 +670,13 @@ class ShadowIngestor:
         candidate = self.ledger.candidate(candidate_id)
         if not isinstance(candidate, Mapping):
             return {"candidate_id": candidate_id, "status": "unknown_candidate",
+                    "ingested": False}
+        if is_diagnostic_candidate({
+                "candidate_id": str(candidate_id),
+                "config": _config(candidate)}):
+            return {"candidate_id": candidate_id,
+                    "status": "diagnostic_non_authorizing",
+                    "reason": "diagnostic shadow candidates cannot be ingested",
                     "ingested": False}
         vehicle = str(candidate.get("vehicle") or "")
         if vehicle not in VEHICLES:

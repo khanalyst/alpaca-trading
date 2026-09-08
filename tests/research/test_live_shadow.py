@@ -21,10 +21,12 @@ from research.edge_ledger import EdgeLedger
 from research.factory_core import simulate_account as factory_simulate_account
 from research.live_shadow import (InputConflict, ShadowConfig, ShadowRunner,
                                    ShadowError, ShadowStore, _compact_shadow_rows,
+                                   _digest, _manifest_replay_identity,
                                    _replay_signature,
                                    _shadow_signature, _signature_diffs,
                                    _replay_code_hash,
                                    _opportunity_capacity,
+                                   _safe_config,
                                    _signal_dispositions,
                                    run_shadow_once, MAX_QUARANTINE_EVENTS,
                                    QUARANTINE_OVERFLOW_KEY)
@@ -120,6 +122,35 @@ class LiveShadowTests(unittest.TestCase):
             db.execute("UPDATE candidate_state SET status=? WHERE candidate_id=?",
                        (status, row["candidate_id"]))
         return row
+
+    def _strict_replay_identity(self, runner, *candidates):
+        """Create the same current-code candidate epoch used by a live poll."""
+        arms = sorted((dict(candidate) for candidate in candidates),
+                      key=lambda item: str(item.get("candidate_id") or ""))
+        for arm in arms:
+            runner.store.upsert_candidate(arm)
+        candidate_set = [{
+            "candidate_id": str(arm.get("candidate_id") or ""),
+            "variant_id": str(arm.get("variant_id") or ""),
+            "strategy_id": str(arm.get("strategy_id") or ""),
+            "vehicle": str(arm.get("vehicle") or ""),
+            "status": str(arm.get("status") or ""),
+            "config_digest": _digest(_safe_config(arm)),
+            "diagnostic_only": False,
+            "family": None,
+            "role": None,
+            "cohort_identity": None,
+        } for arm in arms]
+        manifest_digest = runner.store.save_manifest({
+            "schema": "shadow-manifest.v1",
+            "replay_code_hash": _replay_code_hash(),
+            "candidate_set": candidate_set,
+            "candidate_set_digest": _digest(candidate_set),
+            "event_watermark": {"count": 0},
+        })
+        manifest = runner.store.manifest(manifest_digest)
+        self.assertIsNotNone(manifest)
+        return _manifest_replay_identity(manifest, manifest_digest)
 
     def _write_rows(self, *, include_quote=False):
         start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
@@ -634,6 +665,7 @@ class LiveShadowTests(unittest.TestCase):
     def test_iex_shadow_rejects_sip_decisions_and_replay_evidence(self):
         candidate = self._candidate()
         runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        replay_identity = self._strict_replay_identity(runner, candidate)
 
         kind, reason, payload, plan = self._evaluate_with_context(
             runner, candidate, equity_feed="sip")
@@ -653,7 +685,8 @@ class LiveShadowTests(unittest.TestCase):
         sip_row["feed"] = "sip"
         with patch("research.live_shadow.replay_ibr",
                    return_value=SimpleNamespace(trades=[], refusals=[])) as replay:
-            runner._replay(candidate, "2026-01-02", [sip_row], [], [])
+            runner._replay(candidate, "2026-01-02", [sip_row], [], [],
+                           replay_identity=replay_identity)
             replay.assert_not_called()
         rejected = runner.store.replay_metadata(candidate["candidate_id"])[0]
         self.assertEqual(rejected["status"], "incomplete")
@@ -667,7 +700,8 @@ class LiveShadowTests(unittest.TestCase):
         foreign_row["provider"] = "foreign"
         with patch("research.live_shadow.replay_ibr",
                    return_value=SimpleNamespace(trades=[], refusals=[])) as replay:
-            runner._replay(candidate, "2026-01-02", [foreign_row], [], [])
+            runner._replay(candidate, "2026-01-02", [foreign_row], [], [],
+                           replay_identity=replay_identity)
             replay.assert_not_called()
         rejected = runner.store.replay_metadata(candidate["candidate_id"])[0]
         self.assertEqual(rejected["status"], "incomplete")
@@ -680,7 +714,8 @@ class LiveShadowTests(unittest.TestCase):
         iex_row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
         with patch("research.live_shadow.replay_ibr",
                    return_value=SimpleNamespace(trades=[], refusals=[])):
-            runner._replay(candidate, "2026-01-02", [iex_row], [], [])
+            runner._replay(candidate, "2026-01-02", [iex_row], [], [],
+                           replay_identity=replay_identity)
         accepted = runner.store.replay_metadata(candidate["candidate_id"])[0]
         self.assertEqual(accepted["status"], "match")
         self.assertEqual(accepted["details"]["equity_feed"], "iex")
@@ -755,8 +790,10 @@ class LiveShadowTests(unittest.TestCase):
     def test_completed_replay_uses_as_of_and_real_ibr_config(self):
         candidate = self._candidate()
         runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        replay_identity = self._strict_replay_identity(runner, candidate)
         row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
-        runner._replay(candidate, "2026-01-02", [row], [], [])
+        runner._replay(candidate, "2026-01-02", [row], [], [],
+                       replay_identity=replay_identity)
         with closing(sqlite3.connect(self.shadow)) as db:
             stored = db.execute(
                 "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
@@ -770,6 +807,7 @@ class LiveShadowTests(unittest.TestCase):
     def test_option_replay_receives_every_normalized_snapshot(self):
         candidate = {**self._candidate(), "vehicle": "option"}
         runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        replay_identity = self._strict_replay_identity(runner, candidate)
         row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
         base = {
             "event_type": "option_snapshot", "underlying": "SPY",
@@ -790,7 +828,8 @@ class LiveShadowTests(unittest.TestCase):
             })
         with patch("research.live_shadow.replay_ibr",
                    return_value=SimpleNamespace(trades=[], refusals=[])) as replay:
-            runner._replay(candidate, "2026-01-02", [row], [], [], options)
+            runner._replay(candidate, "2026-01-02", [row], [], [], options,
+                           replay_identity=replay_identity)
         snapshots = replay.call_args.kwargs["option_snapshots"]
         self.assertEqual(len(snapshots), 2)
         self.assertEqual(
@@ -800,6 +839,7 @@ class LiveShadowTests(unittest.TestCase):
     def test_recorder_calendar_marks_an_early_close_complete(self):
         candidate = self._candidate()
         runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        replay_identity = self._strict_replay_identity(runner, candidate)
         (self.corpus.parent / INDEX_NAME).write_text(json.dumps({
             "session_calendar": {"2026-01-02": {
                 "open": "2026-01-02T14:30:00+00:00",
@@ -818,7 +858,8 @@ class LiveShadowTests(unittest.TestCase):
         with patch("research.live_shadow.replay_ibr",
                    return_value=SimpleNamespace(trades=[], refusals=[])) as replay:
             self.assertTrue(runner._replay(
-                candidate, "2026-01-02", [row, extended], [], []))
+                candidate, "2026-01-02", [row, extended], [], [],
+                replay_identity=replay_identity))
         replay_bars = replay.call_args.args[0]
         replay_config = replay.call_args.kwargs["config"]
         self.assertEqual(len(replay_bars), 1)
@@ -879,10 +920,13 @@ class LiveShadowTests(unittest.TestCase):
     def test_completed_replay_replaces_earlier_incomplete_window(self):
         candidate = self._candidate()
         runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        replay_identity = self._strict_replay_identity(runner, candidate)
         partial = self._replay_row(as_of="2026-01-02T20:00:00+00:00")
         complete = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
-        runner._replay(candidate, "2026-01-02", [partial], [], [])
-        runner._replay(candidate, "2026-01-02", [complete], [], [])
+        runner._replay(candidate, "2026-01-02", [partial], [], [],
+                       replay_identity=replay_identity)
+        runner._replay(candidate, "2026-01-02", [complete], [], [],
+                       replay_identity=replay_identity)
         with closing(sqlite3.connect(self.shadow)) as db:
             rows = db.execute(
                 "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
@@ -1066,11 +1110,14 @@ class LiveShadowTests(unittest.TestCase):
         result_trades = [SimpleNamespace(
             **{**trade, "session_date": date.fromisoformat(trade["session_date"])})
             for trade in trades]
+        replay_identity = self._strict_replay_identity(runner, candidate)
         self.assertTrue(store.has_open(candidate["candidate_id"], "SPY"))
         self.assertTrue(store.has_open(candidate["candidate_id"], "QQQ"))
         with patch("research.live_shadow.replay_ibr",
                    return_value=SimpleNamespace(trades=result_trades, refusals=[])) as replay:
-            self.assertTrue(runner._replay(candidate, "2026-01-02", rows, [], decisions))
+            self.assertTrue(runner._replay(
+                candidate, "2026-01-02", rows, [], decisions,
+                replay_identity=replay_identity))
             self.assertEqual(replay.call_count, 1)
             self.assertEqual({bar.symbol for bar in replay.call_args.args[0]}, {"SPY", "QQQ"})
 
@@ -1100,7 +1147,8 @@ class LiveShadowTests(unittest.TestCase):
                "target_price": 103}) for trade in trades]
         with patch("research.live_shadow.replay_ibr",
                    return_value=SimpleNamespace(trades=mismatch_trades, refusals=[])):
-            runner._replay(candidate, "2026-01-02", rows, [], decisions)
+            runner._replay(candidate, "2026-01-02", rows, [], decisions,
+                           replay_identity=replay_identity)
         self.assertEqual(store.gate_rows(candidate["candidate_id"]), [])
 
     def test_single_run_session_batches_close_before_next_session(self):
@@ -1136,10 +1184,12 @@ class LiveShadowTests(unittest.TestCase):
                     "risk": {"risk_per_trade_pct": 1},
                     "execution": {}, "session": {}})
         runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        replay_identity = self._strict_replay_identity(runner, candidate)
         row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
         with patch("research.live_shadow.simulate_account",
                    wraps=factory_simulate_account) as factory:
-            runner._replay(candidate, "2026-01-02", [row], [], [])
+            runner._replay(candidate, "2026-01-02", [row], [], [],
+                           replay_identity=replay_identity)
         self.assertTrue(factory.called)
         with closing(sqlite3.connect(self.shadow)) as db:
             stored = db.execute(

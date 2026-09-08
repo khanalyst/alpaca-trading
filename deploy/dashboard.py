@@ -80,6 +80,21 @@ def _json_file(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _recorder_corpus_path(root: Path) -> Path:
+    """Resolve the current recorder epoch inside the mounted runtime tree."""
+    raw = str(os.getenv("ALPACA_RECORDER_CORPUS_ROOT") or
+              "runtime/research/recorded").strip()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = candidate.resolve()
+    runtime_root = (root / "runtime").resolve()
+    if not candidate.is_relative_to(runtime_root):
+        raise ValueError(
+            "ALPACA_RECORDER_CORPUS_ROOT must remain inside runtime")
+    return candidate
+
+
 def _safe_state(path: Path) -> dict:
     raw = _json_file(path)
     result = {key: raw.get(key) for key in SAFE_STATE_FIELDS if key in raw}
@@ -947,6 +962,9 @@ def _safe_heartbeat(path: Path) -> dict:
             result["research_cycle"].get("preflight"))
     if preflight is not None:
         result["research_preflight"] = preflight
+    paper_selection = health.paper_selection_summary(raw.get("paper_selection"))
+    if paper_selection is not None:
+        result["paper_selection"] = paper_selection
     return result
 
 
@@ -1012,8 +1030,9 @@ def snapshot(root: Path) -> dict:
     mode = str(config.get("mode") or "paper").lower()
     runtime = root / "runtime"
     journal = runtime / mode / "journal.db"
-    recorder_path = runtime / "research" / "recorded"
+    recorder_path = _recorder_corpus_path(root)
     trader_heartbeat = runtime / mode / "heartbeat.json"
+    shadow_heartbeat = root / "shadow" / "health.json"
     research_heartbeat = runtime / "health" / "research.json"
     direct_research_status = runtime / "health" / "research-direct.json"
     edge_configured = Path(os.getenv("ALPACA_EDGE_DB", "runtime/research/edge_lab.sqlite3"))
@@ -1037,7 +1056,10 @@ def snapshot(root: Path) -> dict:
         "mode": mode,
         "strategy": {
             key: config.get("strategy", {}).get(key)
-            for key in ("id", "version", "execution_mode", "variant_id")
+            for key in (
+                "id", "version", "execution_mode", "variant_id",
+                "selection_mode",
+            )
         },
         "cycle": {
             key: config.get("cycle", {}).get(key)
@@ -1057,6 +1079,9 @@ def snapshot(root: Path) -> dict:
                                   or "iex"),
             configured_options_feed=((config.get("broker") or {}).get(
                 "options_feed") or "indicative")),
+        # Broker-free diagnostic liveness is separate from complete/fresh
+        # cohort coverage. This is a bounded projection, never raw shadow data.
+        "shadow": health.shadow(shadow_heartbeat, 180),
         "research_service": {
             "health": (
                 health.research(research_heartbeat, 180)
@@ -1187,8 +1212,9 @@ function contextCharts(trades){
 function evidenceCharts(d){const ch=d.charts||{};const c=card('Actual account evidence — '+(ch.source||'unknown'),true);row(c,'source',ch.source||'unknown');const u=ch.uncertainty||{};row(c,'net-R samples',u.sample_count);row(c,'sessions',u.session_count);row(c,'net-R mean',u.mean_net_r);row(c,'net-R 95% lower bound',u.lower_net_r);row(c,'net-R 95% upper bound',u.upper_net_r);row(c,'equity basis','Observed account equity; cash transfers are not adjusted');chart(c,'Account equity',ch.net_equity,'#65d98a');chart(c,'Drawdown',ch.drawdown,'#ff7b86');const p=ch.payoff||{};row(c,'net payoff samples',p.sample_count);row(c,'net wins / losses',(p.wins??'—')+' / '+(p.losses??'—'));if(!p.available)c.append(el('p','Payoff unavailable until closed trades have known net P&L.','muted'));else{const vals=p.values||[],max=vals.reduce((a,b)=>Math.max(a,Math.abs(b)),1);const bar=el('div');vals.slice(-40).forEach(v=>{const b=el('span');b.style.display='inline-block';b.style.width='6px';b.style.height=Math.max(2,Math.round(Math.abs(v)/max*70))+'px';b.style.margin='1px';b.style.background=v>=0?'#65d98a':'#ff7b86';b.title=String(v);bar.append(b)});c.append(el('h3','Recent net payoff'));c.append(bar)}}
 async function showReport(path){const r=await fetch('/api/report?path='+encodeURIComponent(path));const j=await r.json();const p=card(path,true);p.append(el('pre',j.text||j.error||'unavailable'));p.scrollIntoView({behavior:'smooth'})}
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();cards.replaceChildren();
- let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'execution profile',d.strategy.execution_mode);row(c,'configured variant',d.strategy.variant_id);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'edge entry gate',d.research.entry_gate_required?'required':'disabled',d.research.entry_gate_required?'warn':'ok');
- c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'equity feed',d.recorder.configured_data_feed||d.recorder.data_feed||'—');row(c,'options feed',d.recorder.configured_options_feed||'disabled');row(c,'capture policy',d.recorder.capture_policy||'unknown');if(d.recorder.deferred_catchup){const gap=d.recorder.deferred_catchup;row(c,'latest deferred history',(gap.from||'?')+' → '+(gap.through||'?')+' (unfilled)','warn');}row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'bar coverage',d.recorder.coverage_status,d.recorder.coverage_status==='covered'?'ok':'warn');row(c,'bar gap symbols',(d.recorder.bar_gap_symbols||[]).join(', ')||'none',(d.recorder.bar_gap_symbols||[]).length?'warn':'ok');row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'cycle outcome',d.research_service.heartbeat.cycle_status);const pf=d.research_service.health.research_preflight||d.research_service.heartbeat.research_preflight||{};row(c,'provider preflight',pf.status||'not_run',pf.status==='ready'||pf.status==='disabled'?'ok':pf.status==='degraded'?'warn':'bad');const rp=d.research_service.heartbeat.research_progress||{};const rpLine=rp.phase?rp.phase+' · '+rp.vehicle+' · '+rp.done+'/'+rp.total+' '+rp.unit:'—';row(c,'research progress',rpLine);const rr=d.research_service.health.research_readiness||{};row(c,'research readiness',rr.state||'unknown',rr.state==='ready'?'ok':'warn');row(c,'sessions remaining',rr.sessions_remaining??'—');row(c,'readiness ETA',when(rr.eta_ts));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
+ let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'execution profile',d.strategy.execution_mode);row(c,'configured variant',d.strategy.variant_id);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'edge entry gate',d.research.entry_gate_required?'required':'disabled',d.research.entry_gate_required?'warn':'ok');const ps=d.trader.health.paper_selection||d.trader.heartbeat.paper_selection||{};const resolved=ps.resolved||{},proof=resolved.proof||{};row(c,'selection mode',ps.selection_mode||d.strategy.selection_mode);row(c,'requested paper pair',(ps.configured_strategy||d.strategy.id)+' / '+(ps.requested_variant||d.strategy.variant_id));row(c,'selection state',ps.state||'unavailable',ps.state==='ready'?'ok':ps.state==='waiting_for_proof'?'warn':'bad');row(c,'armed',ps.armed===true?'yes':ps.armed===false?'no':'unavailable',ps.armed===true?'ok':'warn');row(c,'selection blocker',ps.blocker_code||'none');row(c,'resolved identity',resolved.candidate_id?[resolved.candidate_id,resolved.variant_id,resolved.family].join(' / '):'not resolved');row(c,'verified proof',proof.run_id?[proof.run_id,proof.gate_hash,proof.lane].join(' / '):'not resolved');
+ c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'current corpus root',d.recorder.corpus_root);row(c,'equity feed',d.recorder.configured_data_feed||d.recorder.data_feed||'—');row(c,'options feed',d.recorder.configured_options_feed||'disabled');row(c,'capture policy',d.recorder.capture_policy||'unknown');if(d.recorder.deferred_catchup){const gap=d.recorder.deferred_catchup;row(c,'latest deferred history',(gap.from||'?')+' → '+(gap.through||'?')+' (unfilled)','warn');}row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'bar coverage',d.recorder.coverage_status,d.recorder.coverage_status==='covered'?'ok':'warn');row(c,'bar gap symbols',(d.recorder.bar_gap_symbols||[]).join(', ')||'none',(d.recorder.bar_gap_symbols||[]).length?'warn':'ok');row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'cycle outcome',d.research_service.heartbeat.cycle_status);const pf=d.research_service.health.research_preflight||d.research_service.heartbeat.research_preflight||{};row(c,'provider preflight',pf.status||'not_run',pf.status==='ready'||pf.status==='disabled'?'ok':pf.status==='degraded'?'warn':'bad');const rp=d.research_service.heartbeat.research_progress||{};const rpLine=rp.phase?rp.phase+' · '+rp.vehicle+' · '+rp.done+'/'+rp.total+' '+rp.unit:'—';row(c,'research progress',rpLine);const rr=d.research_service.health.research_readiness||{};row(c,'research readiness',rr.state||'unknown',rr.state==='ready'?'ok':'warn');row(c,'sessions remaining',rr.sessions_remaining??'—');row(c,'readiness ETA',when(rr.eta_ts));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));c.append(el('p','This card follows only the configured current recorder corpus. Historical research reports retain their original source identities.','muted'));
+ const sh=d.shadow||{},ds=sh.diagnostic_shadow||{};c=card('Diagnostic shadow');row(c,'service alive',sh.ok===true?'yes':'no',good(sh.ok));row(c,'heartbeat age seconds',sh.heartbeat_age_seconds);row(c,'coverage ready',sh.coverage_ready===true?'yes':'no',sh.coverage_ready?'ok':'warn');row(c,'coverage status',sh.coverage_status);row(c,'active cohort',ds.cohort_active===true?'yes':'no',ds.cohort_active?'ok':'warn');row(c,'activation',ds.activation_status);row(c,'family coverage',(ds.families_covered??'—')+' / '+(ds.families_total??'—'));row(c,'baseline / variant / arms',(ds.baseline_count??'—')+' / '+(ds.variant_count??'—')+' / '+(ds.arms_total??'—'));row(c,'families observed',ds.families_observed);row(c,'source lag seconds',ds.source_lag_seconds);row(c,'poll duration seconds',ds.poll_duration_seconds);row(c,'observation',ds.observation_status);row(c,'proof authority',ds.proof_authority===false?'none — diagnostic only':'unavailable',ds.proof_authority===false?'ok':'warn');c.append(el('p','This lane is diagnostic only: it cannot authorize proof, promotion, or broker orders. Zero actual fills is not a profit claim.','muted'));
  c=card('Execution journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'gross P&L USD',d.performance.gross_pnl_usd);row(c,'fees USD',d.performance.fees_usd);row(c,'net P&L USD',d.performance.net_pnl_usd);row(c,'net win rate',d.performance.win_rate);row(c,'completed parent trades',d.performance.closed_trades);row(c,'cost basis',(d.performance.cost_provenance||[]).join(', ')||'unavailable');
  const direct=d.research_service.direct||{};
  c=card('Research process — direct research status');row(c,'status',direct.status,direct.running?'ok':'warn');row(c,'job',direct.job_id);row(c,'process',direct.pid);row(c,'scheduler ownership',direct.scheduler_managed===null?'unknown':direct.scheduler_managed?'managed':'direct');row(c,'build',direct.build_identity);row(c,'started',when(direct.started_ts));row(c,'process lease',when(direct.lease_ts));const dp=direct.progress||{};row(c,'phase',dp.phase);row(c,'completed work',dp.done===undefined?'—':dp.done+'/'+dp.total+' '+(dp.unit||''));row(c,'last progress',when(dp.updated_ts));row(c,'dataset',(direct.dataset||{}).source);row(c,'source identity',(direct.dataset||{}).source_identity);row(c,'outcome',(direct.terminal||{}).reason);if(!direct.running)c.append(el('p','No fresh running process lease. A saved result is not an active job.','muted'));

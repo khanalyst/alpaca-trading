@@ -31,7 +31,7 @@ services:
       - python
       - deploy/recorder.py
       - --out
-      - runtime/research/recorded
+      - ${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}
       - --interval
       - ${ALPACA_RECORDER_INTERVAL_SECONDS:-30}
     environment:
@@ -41,6 +41,9 @@ services:
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
       ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
       ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      # Override to a new sibling under /app/runtime/research; the previous
+      # corpus is neither renamed nor merged into the forward epoch.
+      ALPACA_RECORDER_CORPUS_ROOT: ${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}
       ALPACA_RECORDER_OPTION_LIMIT: ${ALPACA_RECORDER_OPTION_LIMIT:-10}
       ALPACA_RECORDER_OPTION_HOLD_MINUTES: ${ALPACA_RECORDER_OPTION_HOLD_MINUTES:-180}
       ALPACA_RECORDER_FETCH_WINDOW_MINUTES: ${ALPACA_RECORDER_FETCH_WINDOW_MINUTES:-1}
@@ -65,12 +68,12 @@ services:
         target: /app/config.yaml
         mode: 0444
     healthcheck:
-      test: ["CMD", "python", "deploy/health.py", "recorder", "--config", "config.yaml", "--max-age", "300"]
+      test: ["CMD", "python", "deploy/health.py", "recorder", "--path", "${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}", "--config", "config.yaml", "--max-age", "300"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 2m
-    cpus: "0.75"
+    cpus: "${ALPACA_RECORDER_CPUS:-0.75}"
     mem_limit: 768m
     pids_limit: 128
     stop_grace_period: 45s
@@ -189,6 +192,9 @@ services:
       # Scheduled research follows the deployed shares/equity lane by default.
       # Set ALPACA_RESEARCH_VEHICLES=all (or option) to opt into other lanes.
       ALPACA_RESEARCH_VEHICLES: ${ALPACA_RESEARCH_VEHICLES:-equity}
+      # An explicit dataset still wins in research-cycle.sh. Otherwise consume
+      # the same current-forward corpus root as recorder and shadow.
+      ALPACA_RECORDED_DATASET_ROOT: ${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}
       ALPACA_RESEARCH_DATASET: ${ALPACA_RESEARCH_DATASET:-}
       # A fresh Compose deployment has no paper execution journal yet.  The
       # explicit bootstrap state permits broker-free shadow evidence collection
@@ -295,8 +301,13 @@ services:
     command:
       - python
       - deploy/shadow.py
+      - --config
+      - /app/config.yaml
+      - --diagnostic
       - --corpus
-      - /app/runtime/research/recorded/market.csv
+      # Default resolved argument:
+      # - /app/runtime/research/recorded/market.csv
+      - ${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}/market.csv
       - --edge-db
       - /app/runtime/research/edge_lab.sqlite3
       - --shadow-db
@@ -305,9 +316,17 @@ services:
       - /app/shadow/health.json
       - --interval
       - ${ALPACA_SHADOW_INTERVAL_SECONDS:-60}
+      - --max-workers
+      - ${ALPACA_SHADOW_MAX_WORKERS:-4}
       - --retention-days
       - ${ALPACA_SHADOW_RETENTION_DAYS:-180}
     environment:
+      ALPACA_PAPER: "true"
+      ALPACA_LIVE_ENABLE: "false"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_RECORDER_CORPUS_ROOT: ${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}
       ALPACA_SHADOW_RETENTION_DAYS: ${ALPACA_SHADOW_RETENTION_DAYS:-180}
       # Optional, shadow-only calibrated stress overlay. A mounted artifact
       # remains inert unless the explicit enabled switch is true.
@@ -316,6 +335,10 @@ services:
       ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
       ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
       ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
+    configs:
+      - source: agent_config
+        target: /app/config.yaml
+        mode: 0444
     volumes:
       - runtime-data:/app/runtime:ro
       - shadow-data:/app/shadow
@@ -325,7 +348,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 3m
-    cpus: "0.50"
+    cpus: "${ALPACA_SHADOW_CPUS:-0.50}"
     # A bounded raw CSV batch can expand substantially while Python validates
     # and compacts rows. Keep this independently configurable and large enough
     # to avoid an OOM restart before the durable source offset is advanced.
@@ -340,6 +363,7 @@ services:
     environment:
       ALPACA_PAPER: "true"
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_RECORDER_CORPUS_ROOT: ${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}
       ALPACA_EDGE_DB: ${ALPACA_EDGE_DB:-runtime/research/edge_lab.sqlite3}
       ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
       ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
@@ -354,6 +378,7 @@ services:
       - runtime-data:/app/runtime:ro
       - research-cache:/app/research/cache:ro
       - research-results:/app/research/results:ro
+      - shadow-data:/app/shadow:ro
     healthcheck:
       test: ["CMD", "python", "deploy/health.py", "dashboard"]
       interval: 30s

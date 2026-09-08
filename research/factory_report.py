@@ -234,6 +234,97 @@ def _finalize_research_funnel(funnel: dict[str, Any]) -> dict[str, Any]:
     return funnel
 
 
+def _nonnegative_count(value: Any) -> int | None:
+    """Return an integral count without turning malformed evidence into data."""
+    if isinstance(value, bool):
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if count < 0:
+        return None
+    if isinstance(value, float) and value != count:
+        return None
+    return count
+
+
+def _current_diagnostic_funnel(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the current compact execution-rejection diagnostic.
+
+    The arithmetic checks make the projection fail closed: a partially
+    written or internally inconsistent summary cannot be reported as an
+    opportunity, execution, or refusal.
+    """
+    keys = ("rows", "executed_rows", "no_trade_rows", "no_signal_rows",
+            "explicit_rejections", "unclassified_no_trade_rows")
+    counts = {key: _nonnegative_count(summary.get(key)) for key in keys}
+    if any(value is None for value in counts.values()):
+        return {}
+    rows = counts["rows"]
+    executed = counts["executed_rows"]
+    no_trade = counts["no_trade_rows"]
+    no_signal = counts["no_signal_rows"]
+    refused = counts["explicit_rejections"]
+    unclassified = counts["unclassified_no_trade_rows"]
+    if rows != executed + no_trade or no_trade != no_signal + refused + unclassified:
+        return {}
+    raw_reasons = summary.get("reject_reason_counts")
+    if not isinstance(raw_reasons, Mapping):
+        return {}
+    reasons: dict[str, int] = {}
+    for raw_reason, raw_count in raw_reasons.items():
+        reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+        count = _nonnegative_count(raw_count)
+        if not reason or count is None:
+            return {}
+        reasons[reason] = count
+    if sum(reasons.values()) != refused:
+        return {}
+    return {
+        "opportunities": rows - no_signal,
+        "admitted": executed,
+        "executed": executed,
+        "no_signal": no_signal,
+        "refused": refused,
+        "unclassified_refusals": unclassified,
+        "gated": refused,
+        "refusal_reasons": reasons,
+    }
+
+
+def _legacy_diagnostic_funnel(diagnostic: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain the former top-level diagnostic projection for old results."""
+    try:
+        rows = int(diagnostic.get("rows") or 0)
+        no_signal = int(diagnostic.get("no_signal_count") or 0)
+        refused = int(diagnostic.get("execution_rejection_count") or 0)
+        unclassified = int(diagnostic.get("unclassified_no_trade_count") or 0)
+        executed = int(diagnostic.get("trades") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    if min(rows, no_signal, refused, unclassified, executed) < 0:
+        return {}
+    return {
+        "opportunities": max(0, rows - no_signal),
+        "admitted": executed,
+        "executed": executed,
+        "no_signal": no_signal,
+        "refused": refused,
+        "unclassified_refusals": unclassified,
+        "gated": refused,
+    }
+
+
+def _diagnostic_funnel(diagnostic: Mapping[str, Any]) -> dict[str, Any]:
+    fit = diagnostic.get("fit_diagnostics")
+    if isinstance(fit, Mapping) and "execution_rejections" in fit:
+        summary = fit.get("execution_rejections")
+        return (_current_diagnostic_funnel(summary)
+                if isinstance(summary, Mapping) else {})
+    return _legacy_diagnostic_funnel(diagnostic)
+
+
 def research_funnel(payload: Mapping[str, Any] | None, *,
                     vehicle: str | None = None) -> dict[str, Any]:
     """Build a bounded top-level funnel from factory/cycle result payloads."""
@@ -272,20 +363,7 @@ def research_funnel(payload: Mapping[str, Any] | None, *,
                     diagnostic = report.get("diagnostic")
                 if not isinstance(diagnostic, Mapping):
                     continue
-                try:
-                    rows = int(diagnostic.get("rows") or 0)
-                    no_signal = int(diagnostic.get("no_signal_count") or 0)
-                    refused = int(diagnostic.get("execution_rejection_count") or 0)
-                    unclassified = int(diagnostic.get("unclassified_no_trade_count") or 0)
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                _funnel_add(funnel, {
-                    "opportunities": max(0, rows - no_signal),
-                    "admitted": diagnostic.get("trades", 0),
-                    "executed": diagnostic.get("trades", 0),
-                    "no_signal": no_signal, "refused": refused,
-                    "unclassified_refusals": unclassified, "gated": refused,
-                })
+                _funnel_add(funnel, _diagnostic_funnel(diagnostic))
     return _finalize_research_funnel(funnel)
 
 

@@ -31,6 +31,7 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from agent.config import load_config as load_runtime_config
 from agent.contracts.ibr import generate_ibr_signal
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, cross_sectional_symbol_eligibility,
@@ -41,6 +42,11 @@ from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
 from deploy.recorder import INDEX_NAME as RECORDER_INDEX_NAME, corpus_partitions
 from research.costs import ReplayPolicy, replay_policy_for_session
+from research.diagnostic_shadow import (
+    DIAGNOSTIC_ACTIVATION_SCHEMA, DIAGNOSTIC_CANDIDATE_PREFIX,
+    DIAGNOSTIC_COHORT_SCHEMA, build_diagnostic_cohort,
+    is_diagnostic_candidate,
+)
 from research.quote_costs import cost_resolver_setup, reprice_ibr_result
 from research.stressed_cost_calibration import (
     load_stress_calibration_artifact, verify_stress_calibration_artifact,
@@ -65,6 +71,8 @@ DEFAULT_EQUITY = 100_000.0
 DEFAULT_MAX_CANDIDATES = 32
 DEFAULT_MAX_EVENTS = 20_000
 DEFAULT_MAX_DECISIONS = 100_000
+DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS = 200_000
+MAX_DIAGNOSTIC_SESSION_MAX_EVENTS = 1_000_000
 # Candidate evaluation is CPU-heavy but deliberately bounded.  SQLite/WAL
 # mutation remains parent-owned; workers only inspect the frozen snapshot.
 DEFAULT_MAX_WORKERS = 4
@@ -89,6 +97,13 @@ MAX_ACTIVE_REPLAY_QUARANTINE = 1024
 REPLAY_QUARANTINE_OVERFLOW_KEY = "__replay_quarantine_overflow__"
 SHADOW_MANIFEST_META_PREFIX = "shadow-manifest.v1:"
 SHADOW_MANIFEST_LATEST_KEY = "shadow-manifest.v1:latest"
+DIAGNOSTIC_COHORT_META_PREFIX = "diagnostic-shadow-cohort.v1:"
+DIAGNOSTIC_ACTIVATION_META_PREFIX = "diagnostic-shadow-activation.v1:"
+DIAGNOSTIC_PROGRESS_SCHEMA = "diagnostic-shadow-progress.v1"
+DIAGNOSTIC_REPLAY_EPOCH_SCHEMA = "shadow-replay-epoch.v1"
+CANDIDATE_REPLAY_EPOCH_SCHEMA = "shadow-candidate-replay-epoch.v1"
+MAX_DIAGNOSTIC_ROLLUP_SESSIONS = 64
+DIAGNOSTIC_REASON_ROLLUP_PREFIX = "reason:"
 _REPLAY_CODE_BUNDLE_ROOTS = ("agent", "research")
 _REPLAY_CODE_BUNDLE_EXTRAS = ("deploy/recorder.py", "requirements.lock.txt")
 
@@ -132,8 +147,59 @@ def _replay_code_hash() -> str:
     return digest.hexdigest()
 
 
+def _replay_epoch_identity(*, replay_code_hash: str,
+                           manifest_digest: str,
+                           candidate_set_digest: str) -> str:
+    """Bind replay metadata to one strict current-code poll manifest."""
+    return _digest({
+        "schema": DIAGNOSTIC_REPLAY_EPOCH_SCHEMA,
+        "replay_code_hash": str(replay_code_hash),
+        "manifest_digest": str(manifest_digest),
+        "candidate_set_digest": str(candidate_set_digest),
+    })
+
+
+def _manifest_replay_identity(manifest: Mapping[str, Any],
+                              manifest_digest: str | None = None
+                              ) -> dict[str, str]:
+    digest = str(manifest_digest or manifest.get("manifest_digest") or "")
+    code_hash = str(manifest.get("replay_code_hash") or "")
+    candidate_set_digest = str(manifest.get("candidate_set_digest") or "")
+    if not digest or not code_hash or not candidate_set_digest:
+        raise ShadowError("replay manifest identity is incomplete")
+    return {
+        "replay_code_hash": code_hash,
+        "manifest_digest": digest,
+        "candidate_set_digest": candidate_set_digest,
+        "replay_epoch_identity": _replay_epoch_identity(
+            replay_code_hash=code_hash, manifest_digest=digest,
+            candidate_set_digest=candidate_set_digest),
+    }
+
+
+def _candidate_epoch_identity(*, candidate_id: str,
+                              config: Mapping[str, Any],
+                              replay_identity: Mapping[str, Any]) -> str:
+    """Bind one replay row to its exact candidate and strict code epoch."""
+    required = {
+        key: replay_identity.get(key) for key in (
+            "replay_code_hash", "manifest_digest", "candidate_set_digest",
+            "replay_epoch_identity")
+    }
+    if any(not isinstance(value, str) or not value
+           for value in required.values()):
+        raise ShadowError("candidate replay epoch identity is incomplete")
+    return _digest({
+        "schema": CANDIDATE_REPLAY_EPOCH_SCHEMA,
+        "candidate_id": str(candidate_id),
+        "config_digest": _digest(dict(config)),
+        **required,
+    })
+
+
 def _validated_shadow_manifest(
-        value: Any, *, requested_digest: str | None = None) -> dict[str, Any]:
+        value: Any, *, requested_digest: str | None = None,
+        require_current_code: bool = True) -> dict[str, Any]:
     """Validate one persisted manifest before exposing it to callers.
 
     Manifest rows are immutable evidence, so a syntactically valid JSON value
@@ -145,8 +211,11 @@ def _validated_shadow_manifest(
     if not isinstance(value, Mapping) or value.get("schema") != "shadow-manifest.v1":
         raise ShadowError("shadow manifest metadata is invalid")
     replay_code_hash = value.get("replay_code_hash")
-    if (not isinstance(replay_code_hash, str) or
-            replay_code_hash != _replay_code_hash()):
+    if (not isinstance(replay_code_hash, str) or len(replay_code_hash) != 64 or
+            any(character not in "0123456789abcdef"
+                for character in replay_code_hash.lower())):
+        raise ShadowError("shadow manifest replay code identity is invalid")
+    if require_current_code and replay_code_hash != _replay_code_hash():
         raise ShadowError("shadow manifest replay code identity is invalid")
     stored_digest = value.get("manifest_digest")
     body = dict(value)
@@ -156,6 +225,83 @@ def _validated_shadow_manifest(
         raise ShadowError("shadow manifest metadata digest mismatch")
     if requested_digest is not None and stored_digest != requested_digest:
         raise ShadowError("shadow manifest metadata key mismatch")
+    return dict(value)
+
+
+def _validated_diagnostic_cohort(value: Any, *,
+                                 expected_identity: str) -> dict[str, Any]:
+    """Validate one immutable diagnostic cohort definition."""
+    if not isinstance(value, Mapping) or value.get("schema") != DIAGNOSTIC_COHORT_SCHEMA:
+        raise ShadowError("diagnostic shadow cohort metadata is invalid")
+    if value.get("cohort_identity") != expected_identity:
+        raise ShadowError("diagnostic shadow cohort identity mismatch")
+    digest = str(value.get("cohort_digest") or "")
+    if expected_identity != f"{DIAGNOSTIC_CANDIDATE_PREFIX}cohort:{digest}":
+        raise ShadowError("diagnostic shadow cohort digest mismatch")
+    arms = value.get("arms")
+    if not isinstance(arms, list) or len(arms) != 24:
+        raise ShadowError("diagnostic shadow cohort arm structure is invalid")
+    family_roles: dict[str, set[str]] = {}
+    for arm in arms:
+        if not isinstance(arm, Mapping):
+            raise ShadowError("diagnostic shadow cohort arm structure is invalid")
+        family_roles.setdefault(str(arm.get("family") or ""), set()).add(
+            str(arm.get("role") or ""))
+    if (len(family_roles) != 12 or
+            any(roles != {"baseline", "variant"}
+                for roles in family_roles.values())):
+        raise ShadowError("diagnostic shadow cohort family coverage is invalid")
+    identities = value.get("candidate_identities")
+    expected_candidates = [str(arm.get("candidate_id") or "")
+                           for arm in arms if isinstance(arm, Mapping)]
+    if (not isinstance(identities, list) or identities != expected_candidates or
+            len(set(expected_candidates)) != 24 or
+            any(not candidate.startswith(DIAGNOSTIC_CANDIDATE_PREFIX)
+                for candidate in expected_candidates)):
+        raise ShadowError("diagnostic shadow cohort candidate identities are invalid")
+    stored = value.get("record_digest")
+    body = dict(value)
+    body.pop("record_digest", None)
+    if not isinstance(stored, str) or stored != _digest(body):
+        raise ShadowError("diagnostic shadow cohort metadata digest mismatch")
+    return dict(value)
+
+
+def _validated_diagnostic_activation(value: Any, *,
+                                     cohort_identity: str) -> dict[str, Any]:
+    """Validate one immutable forward activation record."""
+    if (not isinstance(value, Mapping) or
+            value.get("schema") != DIAGNOSTIC_ACTIVATION_SCHEMA or
+            value.get("cohort_identity") != cohort_identity):
+        raise ShadowError("diagnostic shadow activation metadata is invalid")
+    watermark = value.get("activation_event_watermark")
+    if not isinstance(watermark, Mapping):
+        raise ShadowError("diagnostic shadow activation watermark is invalid")
+    inserted_after = _finite(watermark.get("last_inserted_at"))
+    if inserted_after is None or inserted_after < 0:
+        raise ShadowError("diagnostic shadow activation watermark is invalid")
+    activated_at = _timestamp(value.get("activated_at"))
+    if activated_at is None:
+        raise ShadowError("diagnostic shadow activation timestamp is invalid")
+    activation_session = activated_at.astimezone(NEW_YORK).date().isoformat()
+    if (value.get("activation_session") != activation_session or
+            value.get("warmup_session") != activation_session):
+        raise ShadowError("diagnostic shadow activation session is invalid")
+    source_offsets = value.get("source_offsets")
+    if (not isinstance(source_offsets, Mapping) or any(
+            not isinstance(key, str) or isinstance(offset, bool) or
+            not isinstance(offset, int) or offset < 0
+            for key, offset in source_offsets.items())):
+        raise ShadowError("diagnostic shadow activation source offsets are invalid")
+    stored = value.get("activation_digest")
+    body = dict(value)
+    body.pop("activation_digest", None)
+    body.pop("activation_identity", None)
+    computed = _digest(body)
+    expected = f"{DIAGNOSTIC_CANDIDATE_PREFIX}activation:{computed}"
+    if (not isinstance(stored, str) or stored != computed or
+            value.get("activation_identity") != expected):
+        raise ShadowError("diagnostic shadow activation digest mismatch")
     return dict(value)
 
 
@@ -874,10 +1020,17 @@ class ShadowConfig:
     max_candidates: int = DEFAULT_MAX_CANDIDATES
     max_events: int = DEFAULT_MAX_EVENTS
     max_decisions: int = DEFAULT_MAX_DECISIONS
+    diagnostic_session_max_events: int = DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS
     max_workers: int = DEFAULT_MAX_WORKERS
     retention_days: int = DEFAULT_RETENTION_DAYS
     equity: float = DEFAULT_EQUITY
     poll_seconds: float = 60.0
+    # The fixed family cohort is opt-in at the library boundary.  Deployment
+    # CLIs enable it explicitly and must supply the mounted runtime config so
+    # signal, setup, risk, execution, and cost policy are identical to runtime.
+    diagnostic: bool = False
+    runtime_config: Mapping[str, Any] | None = None
+    runtime_config_path: str | Path | None = None
     # Shadow-only empirical stress overlay.  These fields are intentionally
     # separate from candidate/runtime config: enabling them cannot mutate the
     # trader's production policy or its persisted configuration.
@@ -886,15 +1039,34 @@ class ShadowConfig:
     stress_calibration_artifact: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        for name in ("max_candidates", "max_events", "max_decisions", "max_workers",
+        for name in ("max_candidates", "max_events", "max_decisions",
+                     "diagnostic_session_max_events", "max_workers",
                      "retention_days"):
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value or int(value) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         if int(self.max_workers) > MAX_MAX_WORKERS:
             raise ValueError(f"max_workers must be <= {MAX_MAX_WORKERS}")
+        if (int(self.diagnostic_session_max_events) >
+                MAX_DIAGNOSTIC_SESSION_MAX_EVENTS):
+            raise ValueError(
+                "diagnostic_session_max_events must be <= "
+                f"{MAX_DIAGNOSTIC_SESSION_MAX_EVENTS}")
         if _finite(self.equity) is None or float(self.equity) <= 0:
             raise ValueError("equity must be positive and finite")
+        if not isinstance(self.diagnostic, bool):
+            raise ValueError("diagnostic must be true or false")
+        if self.diagnostic and not isinstance(self.runtime_config, Mapping):
+            raise ValueError(
+                "diagnostic shadow requires the mounted --config mapping")
+        if isinstance(self.runtime_config, Mapping):
+            # Detach mutable caller state; the cohort identity and every arm
+            # are derived from this frozen projection for the process lifetime.
+            object.__setattr__(self, "runtime_config",
+                               json.loads(_json(dict(self.runtime_config))))
+        if self.runtime_config_path not in (None, ""):
+            object.__setattr__(self, "runtime_config_path",
+                               str(self.runtime_config_path))
         path = self.stress_calibration_path
         if path in (None, ""):
             path = (os.getenv("ALPACA_SHADOW_STRESS_CALIBRATION_PATH") or
@@ -1032,6 +1204,17 @@ class ShadowStore:
                     replay_status TEXT NOT NULL, trade_json TEXT NOT NULL,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS diagnostic_progress (
+                    cohort_identity TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    last_inserted_at REAL NOT NULL,
+                    last_event_key TEXT NOT NULL,
+                    processed_events INTEGER NOT NULL,
+                    rollups_json TEXT NOT NULL,
+                    pending_sessions_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(cohort_identity,candidate_id)
+                );
                 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
                   BEGIN SELECT RAISE(ABORT, 'shadow events are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
@@ -1053,9 +1236,24 @@ class ShadowStore:
                 CREATE TRIGGER IF NOT EXISTS shadow_trades_no_delete BEFORE DELETE ON shadow_trades
                   BEGIN SELECT RAISE(ABORT, 'shadow trades are immutable'); END;
                 CREATE INDEX IF NOT EXISTS events_timestamp_idx ON events(timestamp);
+                CREATE INDEX IF NOT EXISTS events_inserted_at_idx
+                  ON events(inserted_at,event_key);
             """)
+            event_columns = {
+                str(row["name"]) for row in db.execute(
+                    "PRAGMA table_info(events)").fetchall()
+            }
+            for name, declaration in (
+                    ("source_path", "TEXT"),
+                    ("source_offset_start", "INTEGER"),
+                    ("source_offset_end", "INTEGER")):
+                if name not in event_columns:
+                    db.execute(f"ALTER TABLE events ADD COLUMN {name} {declaration}")
 
-    def ingest_event(self, row: Mapping[str, Any], *, max_events: int) -> tuple[str, bool]:
+    def ingest_event(self, row: Mapping[str, Any], *, max_events: int,
+                     source_path: str | None = None,
+                     source_offset_start: int | None = None,
+                     source_offset_end: int | None = None) -> tuple[str, bool]:
         event_key = str(row.get("event_key") or "").strip()
         if not event_key:
             raise ShadowError("recorder row has no event_key")
@@ -1080,11 +1278,16 @@ class ShadowStore:
         event_type = str(payload.get("event_type") or "").lower()
         with self._connection() as db:
             db.execute("""INSERT INTO events
-                (event_key,digest,event_json,event_type,symbol,timestamp,as_of,inserted_at)
-                VALUES(?,?,?,?,?,?,?,?)""",
+                (event_key,digest,event_json,event_type,symbol,timestamp,as_of,inserted_at,
+                 source_path,source_offset_start,source_offset_end)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (event_key, digest, _json(payload), event_type, symbol,
                  timestamp.isoformat(), as_of.isoformat() if as_of else None,
-                 time.time()))
+                 time.time(), (str(source_path) if source_path else None),
+                 (int(source_offset_start)
+                  if source_offset_start is not None else None),
+                 (int(source_offset_end)
+                  if source_offset_end is not None else None)))
             cursor = db.execute("SELECT last_timestamp,last_event_key FROM cursor WHERE scope='corpus'").fetchone()
             if cursor is None or (timestamp.isoformat(), event_key) >= (cursor[0], cursor[1]):
                 db.execute("""INSERT INTO cursor(scope,last_event_key,last_timestamp,last_digest,updated_at)
@@ -1161,6 +1364,448 @@ class ShadowStore:
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ShadowError("shadow manifest metadata is invalid") from exc
         return _validated_shadow_manifest(value, requested_digest=requested_digest)
+
+    def latest_manifest_for_rollover(self) -> dict[str, Any] | None:
+        """Read the latest self-valid manifest without requiring current code.
+
+        This reader is operational only: it lets a new code epoch inspect and
+        decline reuse of the prior epoch, then append a current-code manifest.
+        Digest-addressed ``manifest()`` remains strict for proof consumers.
+        """
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (SHADOW_MANIFEST_LATEST_KEY,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("shadow manifest metadata is invalid") from exc
+        return _validated_shadow_manifest(value, require_current_code=False)
+
+    def save_diagnostic_cohort(self, cohort: Mapping[str, Any]) -> dict[str, Any]:
+        """Preregister one immutable content-addressed diagnostic cohort."""
+        if self.readonly:
+            raise ShadowError("cannot register diagnostic cohort on a read-only WAL")
+        body = dict(cohort)
+        body.pop("record_digest", None)
+        identity = str(body.get("cohort_identity") or "")
+        encoded_value = {**body, "record_digest": _digest(body)}
+        key = f"{DIAGNOSTIC_COHORT_META_PREFIX}{identity}"
+        with self._connection() as db:
+            existing = db.execute(
+                "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            if existing is None:
+                db.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                           (key, _json(encoded_value)))
+                value = encoded_value
+            else:
+                try:
+                    value = json.loads(existing["value"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ShadowError(
+                        "diagnostic shadow cohort metadata is invalid") from exc
+        validated = _validated_diagnostic_cohort(
+            value, expected_identity=identity)
+        if _json(validated) != _json(encoded_value):
+            raise ShadowError("diagnostic shadow cohort identity conflicts")
+        return validated
+
+    def diagnostic_cohort(self, cohort_identity: str) -> dict[str, Any] | None:
+        key = f"{DIAGNOSTIC_COHORT_META_PREFIX}{str(cohort_identity)}"
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("diagnostic shadow cohort metadata is invalid") from exc
+        return _validated_diagnostic_cohort(
+            value, expected_identity=str(cohort_identity))
+
+    def save_diagnostic_activation(
+            self, *, cohort: Mapping[str, Any],
+            activation_event_watermark: Mapping[str, Any],
+            source_offsets: Mapping[str, int], forward_event_floor: float) -> dict[str, Any]:
+        """Append the sole forward activation for one frozen cohort epoch."""
+        if self.readonly:
+            raise ShadowError("cannot activate diagnostic cohort on a read-only WAL")
+        cohort_identity = str(cohort.get("cohort_identity") or "")
+        activated = datetime.now(UTC)
+        activation_session = activated.astimezone(NEW_YORK).date().isoformat()
+        body = {
+            "schema": DIAGNOSTIC_ACTIVATION_SCHEMA,
+            "cohort_identity": cohort_identity,
+            "code_identity": str(cohort.get("code_identity") or ""),
+            "runtime_config_identity": str(
+                cohort.get("runtime_config_identity") or ""),
+            "policy_config_identity": str(
+                cohort.get("policy_config_identity") or ""),
+            "activation_event_watermark": dict(activation_event_watermark),
+            "source_offsets": {str(key): int(value)
+                               for key, value in source_offsets.items()},
+            "forward_event_floor": float(forward_event_floor),
+            "activation_session": activation_session,
+            "warmup_session": activation_session,
+            "activated_at": activated.isoformat(),
+        }
+        digest = _digest(body)
+        value = {
+            **body,
+            "activation_digest": digest,
+            "activation_identity": (
+                f"{DIAGNOSTIC_CANDIDATE_PREFIX}activation:{digest}"),
+        }
+        key = f"{DIAGNOSTIC_ACTIVATION_META_PREFIX}{cohort_identity}"
+        with self._connection() as db:
+            existing = db.execute(
+                "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            if existing is None:
+                db.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                           (key, _json(value)))
+                stored = value
+            else:
+                try:
+                    stored = json.loads(existing["value"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ShadowError(
+                        "diagnostic shadow activation metadata is invalid") from exc
+        validated = _validated_diagnostic_activation(
+            stored, cohort_identity=cohort_identity)
+        if existing is not None and _json(validated) != _json(value):
+            # A cohort has exactly one activation. Restarting reuses it; a
+            # different code/config epoch receives a different cohort key.
+            return validated
+        return validated
+
+    def diagnostic_activation(self, cohort_identity: str) -> dict[str, Any] | None:
+        key = f"{DIAGNOSTIC_ACTIVATION_META_PREFIX}{str(cohort_identity)}"
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("diagnostic shadow activation metadata is invalid") from exc
+        return _validated_diagnostic_activation(
+            value, cohort_identity=str(cohort_identity))
+
+    def diagnostic_progress(
+            self, cohort_identity: str, candidate_ids: Sequence[str],
+            activation: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        """Return bounded per-arm cursors and compact diagnostic rollups."""
+        watermark = activation.get("activation_event_watermark")
+        if not isinstance(watermark, Mapping):
+            raise ShadowError("diagnostic shadow activation watermark is invalid")
+        initial_at = _finite(watermark.get("last_inserted_at"))
+        if initial_at is None:
+            raise ShadowError("diagnostic shadow activation watermark is invalid")
+        initial_key = str(watermark.get("last_event_key") or "")
+        wanted = {str(value) for value in candidate_ids}
+        with self._connection() as db:
+            rows = db.execute("""SELECT * FROM diagnostic_progress
+                WHERE cohort_identity=? ORDER BY candidate_id""",
+                (str(cohort_identity),)).fetchall()
+        result: dict[str, dict[str, Any]] = {
+            candidate_id: {
+                "cohort_identity": str(cohort_identity),
+                "candidate_id": candidate_id,
+                "last_inserted_at": float(initial_at),
+                "last_event_key": initial_key,
+                "processed_events": 0,
+                "rollups": {"cumulative": {}, "sessions": {},
+                            "completed_sessions": []},
+                "pending_sessions": [],
+            }
+            for candidate_id in wanted
+        }
+        for row in rows:
+            candidate_id = str(row["candidate_id"])
+            if candidate_id not in wanted:
+                continue
+            try:
+                rollups = json.loads(row["rollups_json"])
+                pending = json.loads(row["pending_sessions_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ShadowError("diagnostic shadow progress is invalid") from exc
+            if (not isinstance(rollups, Mapping) or
+                    not isinstance(pending, list) or
+                    any(not isinstance(value, str) for value in pending)):
+                raise ShadowError("diagnostic shadow progress is invalid")
+            result[candidate_id] = {
+                "cohort_identity": str(cohort_identity),
+                "candidate_id": candidate_id,
+                "last_inserted_at": float(row["last_inserted_at"]),
+                "last_event_key": str(row["last_event_key"]),
+                "processed_events": int(row["processed_events"]),
+                "rollups": dict(rollups),
+                "pending_sessions": sorted(set(pending)),
+            }
+        return result
+
+    def record_diagnostic_batch(
+            self, *, cohort_identity: str, candidate_id: str,
+            cursor_inserted_at: float, cursor_event_key: str,
+            processed_events: int, rollups: Mapping[str, Mapping[str, int]],
+            pending_sessions: Sequence[str], decisions: Sequence[Mapping[str, Any]],
+            warmup_session: str | None, max_decisions: int) -> int:
+        """Atomically persist sparse decisions and advance one arm cursor."""
+        if self.readonly:
+            raise ShadowError("cannot update diagnostic progress on a read-only WAL")
+        persistent_kinds = {"open_incomplete", "reject", "unpriced"}
+        normalized_rollups = {
+            str(day): {str(kind): int(count)
+                       for kind, count in counts.items()}
+            for day, counts in rollups.items()
+        }
+        normalized_decisions = sorted(
+            (_json(dict(decision)) for decision in decisions))
+        batch_identity = _digest({
+            "schema": "diagnostic-shadow-batch.v1",
+            "cohort_identity": str(cohort_identity),
+            "candidate_id": str(candidate_id),
+            "cursor": [float(cursor_inserted_at), str(cursor_event_key)],
+            "processed_events": int(processed_events),
+            "rollups": normalized_rollups,
+            "pending_sessions": sorted({str(day) for day in pending_sessions}),
+            "decisions": normalized_decisions,
+            "warmup_session": str(warmup_session or ""),
+        })
+        inserted = 0
+        with self._connection() as db:
+            prior = db.execute("""SELECT * FROM diagnostic_progress
+                WHERE cohort_identity=? AND candidate_id=?""",
+                (str(cohort_identity), str(candidate_id))).fetchone()
+            previous_rollups: dict[str, Any] = {
+                "cumulative": {}, "sessions": {}, "completed_sessions": []}
+            previous_pending: set[str] = set()
+            previous_processed = 0
+            previous_cursor = (0.0, "")
+            if prior is not None:
+                try:
+                    decoded_rollups = json.loads(prior["rollups_json"])
+                    decoded_pending = json.loads(prior["pending_sessions_json"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ShadowError("diagnostic shadow progress is invalid") from exc
+                if (not isinstance(decoded_rollups, Mapping) or
+                        not isinstance(decoded_pending, list)):
+                    raise ShadowError("diagnostic shadow progress is invalid")
+                previous_rollups = dict(decoded_rollups)
+                previous_pending = {str(value) for value in decoded_pending}
+                previous_processed = int(prior["processed_events"])
+                previous_cursor = (float(prior["last_inserted_at"]),
+                                   str(prior["last_event_key"]))
+            next_cursor = (float(cursor_inserted_at), str(cursor_event_key))
+            if next_cursor < previous_cursor:
+                raise ShadowError("diagnostic shadow cursor cannot move backwards")
+            if prior is not None and next_cursor == previous_cursor:
+                if previous_rollups.get("last_batch_identity") == batch_identity:
+                    return 0
+                raise ShadowError(
+                    "diagnostic shadow equal-cursor batch conflicts with persisted progress")
+
+            cumulative = dict(previous_rollups.get("cumulative") or {})
+            sessions = {
+                str(day): dict(counts)
+                for day, counts in dict(
+                    previous_rollups.get("sessions") or {}).items()
+                if isinstance(counts, Mapping)
+            }
+            for day, counts in normalized_rollups.items():
+                target = sessions.setdefault(str(day), {})
+                for kind, raw_count in counts.items():
+                    count = int(raw_count)
+                    target[str(kind)] = int(target.get(str(kind), 0)) + count
+                    if not str(kind).startswith(
+                            DIAGNOSTIC_REASON_ROLLUP_PREFIX):
+                        cumulative[str(kind)] = int(
+                            cumulative.get(str(kind), 0)) + count
+            sessions = {
+                day: sessions[day]
+                for day in sorted(sessions)[-MAX_DIAGNOSTIC_ROLLUP_SESSIONS:]
+            }
+            completed_sessions = {
+                str(day) for day in
+                (previous_rollups.get("completed_sessions") or ()) if str(day)
+            }
+            previous_pending.update(
+                str(day) for day in pending_sessions
+                if str(day) and str(day) not in completed_sessions)
+
+            cohort_candidate_ids: list[str] = []
+            for candidate_row in db.execute(
+                    "SELECT candidate_id,config_json FROM candidates"):
+                try:
+                    candidate_config = json.loads(candidate_row["config_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    candidate_config = None
+                marker = (candidate_config.get("diagnostic_shadow")
+                          if isinstance(candidate_config, Mapping) else None)
+                if (isinstance(marker, Mapping) and
+                        marker.get("diagnostic_only") is True and
+                        str(marker.get("cohort_identity") or "") ==
+                        str(cohort_identity)):
+                    cohort_candidate_ids.append(str(
+                        candidate_row["candidate_id"]))
+            if str(candidate_id) not in cohort_candidate_ids:
+                cohort_candidate_ids.append(str(candidate_id))
+            placeholders = ",".join("?" for _ in cohort_candidate_ids)
+            diagnostic_count = int(db.execute(
+                f"SELECT count(*) FROM decisions WHERE candidate_id IN "
+                f"({placeholders})", tuple(cohort_candidate_ids)).fetchone()[0])
+            for decision in decisions:
+                kind = str(decision.get("kind") or "no_data")
+                if kind not in persistent_kinds:
+                    continue
+                source_event_key = str(decision.get("event_key") or "")
+                session_date = str(decision.get("session_date") or "")
+                reason = str(decision.get("reason") or "unspecified")
+                plan = decision.get("plan")
+                payload = decision.get("payload")
+                payload = dict(payload) if isinstance(payload, Mapping) else {}
+                event_key = source_event_key
+                if (kind in {"reject", "unpriced"} and
+                        not isinstance(plan, Mapping)):
+                    # Rejection and missing-quote traces can repeat for every
+                    # bar. Preserve one immutable representative per
+                    # arm/session/kind/reason; exact occurrence counts live in
+                    # the bounded session rollup. Actionable plans are never
+                    # collapsed by this path.
+                    trace_identity = _digest({
+                        "schema": "diagnostic-shadow-trace.v1",
+                        "candidate_id": str(candidate_id),
+                        "kind": kind,
+                        "reason": reason,
+                    })
+                    event_key = (
+                        f"{DIAGNOSTIC_CANDIDATE_PREFIX}trace:{trace_identity}")
+                    marker = payload.get("diagnostic_shadow")
+                    marker = (dict(marker) if isinstance(marker, Mapping)
+                              else {})
+                    marker["trace_representative"] = True
+                    marker["representative_event_key"] = source_event_key
+                    marker["trace_identity"] = trace_identity
+                    marker["trace_group"] = {
+                        "scope": "cohort",
+                        "kind": kind,
+                        "reason": reason,
+                    }
+                    marker["representative_session_date"] = session_date
+                    payload["diagnostic_shadow"] = marker
+                decision_id = _digest({"candidate_id": candidate_id,
+                                       "event_key": event_key})
+                exists = db.execute(
+                    "SELECT 1 FROM decisions WHERE candidate_id=? AND event_key=?",
+                    (str(candidate_id), event_key)).fetchone()
+                if exists is not None:
+                    continue
+                if diagnostic_count + inserted >= int(max_decisions):
+                    raise ShadowError(
+                        f"diagnostic shadow decision bound {max_decisions} exceeded")
+                db.execute("""INSERT INTO decisions
+                    (decision_id,candidate_id,event_key,session_date,symbol,kind,
+                     reason,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (decision_id, str(candidate_id), event_key, session_date,
+                     str(decision.get("symbol") or ""), kind,
+                     decision.get("reason"), _json(payload), time.time()))
+                inserted += 1
+                if (kind == "open_incomplete" and isinstance(plan, Mapping) and
+                        (not warmup_session or session_date > warmup_session)):
+                    quantity = _finite(plan.get("contracts", plan.get("shares")))
+                    entry = _finite(plan.get("entry_price"))
+                    db.execute("""INSERT OR IGNORE INTO virtual_books
+                        (book_id,candidate_id,decision_id,symbol,status,quantity,
+                         entry_price,plan_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (_digest({"candidate_id": candidate_id,
+                                  "decision_id": decision_id}),
+                         str(candidate_id), decision_id,
+                         str(decision.get("symbol") or ""), "open_incomplete",
+                         quantity, entry, _json(plan), time.time()))
+            encoded_rollups = {
+                "cumulative": dict(sorted(cumulative.items())),
+                "sessions": sessions,
+                "completed_sessions": sorted(completed_sessions)[
+                    -MAX_DIAGNOSTIC_ROLLUP_SESSIONS:],
+                "last_batch_identity": batch_identity,
+            }
+            db.execute("""INSERT INTO diagnostic_progress
+                (cohort_identity,candidate_id,last_inserted_at,last_event_key,
+                 processed_events,rollups_json,pending_sessions_json,updated_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(cohort_identity,candidate_id) DO UPDATE SET
+                  last_inserted_at=excluded.last_inserted_at,
+                  last_event_key=excluded.last_event_key,
+                  processed_events=excluded.processed_events,
+                  rollups_json=excluded.rollups_json,
+                  pending_sessions_json=excluded.pending_sessions_json,
+                  updated_at=excluded.updated_at""",
+                (str(cohort_identity), str(candidate_id), next_cursor[0],
+                 next_cursor[1], previous_processed + int(processed_events),
+                 _json(encoded_rollups), _json(sorted(previous_pending)),
+                 time.time()))
+        return inserted
+
+    def complete_diagnostic_replay(self, *, cohort_identity: str,
+                                   candidate_id: str,
+                                   session_date: str) -> None:
+        """Remove one replay obligation after its durable outcome is written."""
+        with self._connection() as db:
+            row = db.execute("""SELECT pending_sessions_json,rollups_json
+                FROM diagnostic_progress WHERE cohort_identity=? AND candidate_id=?""",
+                (str(cohort_identity), str(candidate_id))).fetchone()
+            if row is None:
+                return
+            try:
+                pending = json.loads(row["pending_sessions_json"])
+                rollups = json.loads(row["rollups_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ShadowError("diagnostic shadow progress is invalid") from exc
+            if not isinstance(pending, list) or not isinstance(rollups, Mapping):
+                raise ShadowError("diagnostic shadow progress is invalid")
+            remaining = sorted({str(value) for value in pending
+                                if str(value) != str(session_date)})
+            encoded_rollups = dict(rollups)
+            completed = {str(value) for value in
+                         (encoded_rollups.get("completed_sessions") or ())}
+            completed.add(str(session_date))
+            encoded_rollups["completed_sessions"] = sorted(completed)[
+                -MAX_DIAGNOSTIC_ROLLUP_SESSIONS:]
+            db.execute("""UPDATE diagnostic_progress
+                SET pending_sessions_json=?,rollups_json=?,updated_at=?
+                WHERE cohort_identity=? AND candidate_id=?""",
+                (_json(remaining), _json(encoded_rollups), time.time(),
+                 str(cohort_identity), str(candidate_id)))
+
+    def event_watermark(self) -> dict[str, Any]:
+        """Return a scalar immutable-event boundary without loading the WAL."""
+        with self._connection() as db:
+            count = int(db.execute("SELECT count(*) FROM events").fetchone()[0])
+            decision_events = int(db.execute("""SELECT count(*) FROM events
+                WHERE event_type IN ('bar','bar_1m')""").fetchone()[0])
+            row = db.execute("""SELECT event_key,timestamp,digest,event_json,inserted_at
+                FROM events ORDER BY inserted_at DESC,event_key DESC LIMIT 1""").fetchone()
+        available = None
+        if row is not None:
+            try:
+                payload = json.loads(row["event_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, Mapping):
+                available = _availability_time(payload)
+        return {
+            "count": count,
+            "decision_event_count": decision_events,
+            "last_event_key": (str(row["event_key"]) if row is not None else None),
+            "last_timestamp": (str(row["timestamp"]) if row is not None else None),
+            "last_available_at": (available.isoformat()
+                                  if available is not None else None),
+            "last_digest": (str(row["digest"]) if row is not None else None),
+            "last_inserted_at": (float(row["inserted_at"])
+                                 if row is not None else 0.0),
+        }
 
     def forward_event_floor(self) -> float | None:
         with self._connection() as db:
@@ -1466,8 +2111,16 @@ class ShadowStore:
                     config = decoded
         if not isinstance(config, Mapping):
             config = {}
-        proof = {key: candidate.get(key) for key in (
-            "dataset_hash", "config_hash", "code_hash", "provenance_hash", "status")}
+        if is_diagnostic_candidate({**dict(candidate), "config": config}):
+            proof = {
+                "diagnostic_only": True,
+                "authorizing": False,
+                "gate_eligible": False,
+                "promotion_eligible": False,
+            }
+        else:
+            proof = {key: candidate.get(key) for key in (
+                "dataset_hash", "config_hash", "code_hash", "provenance_hash", "status")}
         with self._connection() as db:
             db.execute("""INSERT OR IGNORE INTO candidates
                 (candidate_id,variant_id,strategy_id,vehicle,status,config_json,proof_json,observed_at)
@@ -1480,14 +2133,31 @@ class ShadowStore:
                  symbol: str, kind: str, reason: str | None, payload: Mapping,
                  max_decisions: int) -> bool:
         decision_id = _digest({"candidate_id": candidate_id, "event_key": event_key})
+        diagnostic = self.candidate_is_diagnostic(str(candidate_id))
         with self._connection() as db:
             existing = db.execute("SELECT 1 FROM decisions WHERE candidate_id=? AND event_key=?",
                                   (candidate_id, event_key)).fetchone()
             if existing is not None:
                 return False
-            count = int(db.execute("SELECT count(*) FROM decisions").fetchone()[0])
+            if diagnostic:
+                count = int(db.execute("""SELECT count(*)
+                    FROM decisions d LEFT JOIN candidates c
+                      ON c.candidate_id=d.candidate_id
+                    WHERE d.candidate_id LIKE ?
+                       OR c.proof_json LIKE '%\"diagnostic_only\":true%'
+                       OR c.config_json LIKE '%\"diagnostic_only\":true%'""",
+                    (f"{DIAGNOSTIC_CANDIDATE_PREFIX}%",)).fetchone()[0])
+            else:
+                count = int(db.execute("""SELECT count(*)
+                    FROM decisions d LEFT JOIN candidates c
+                      ON c.candidate_id=d.candidate_id
+                    WHERE d.candidate_id NOT LIKE ?
+                      AND COALESCE(c.proof_json,'') NOT LIKE '%\"diagnostic_only\":true%'
+                      AND COALESCE(c.config_json,'') NOT LIKE '%\"diagnostic_only\":true%'""",
+                    (f"{DIAGNOSTIC_CANDIDATE_PREFIX}%",)).fetchone()[0])
             if count >= int(max_decisions):
-                raise ShadowError(f"shadow decision bound {max_decisions} exceeded")
+                lane = "diagnostic shadow" if diagnostic else "shadow"
+                raise ShadowError(f"{lane} decision bound {max_decisions} exceeded")
             db.execute("""INSERT INTO decisions
                 (decision_id,candidate_id,event_key,session_date,symbol,kind,reason,payload_json,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?)""", (decision_id, candidate_id, event_key,
@@ -1536,11 +2206,55 @@ class ShadowStore:
         with self._connection() as db:
             return [dict(row) for row in db.execute("SELECT * FROM candidates ORDER BY candidate_id")]
 
+    @staticmethod
+    def _candidate_row_is_diagnostic(candidate_id: str,
+                                     config_json: Any = None,
+                                     proof_json: Any = None) -> bool:
+        if is_diagnostic_candidate(str(candidate_id)):
+            return True
+        decoded: dict[str, Any] = {}
+        for key, encoded in (("config", config_json), ("proof", proof_json)):
+            try:
+                value = (json.loads(encoded) if isinstance(encoded, str)
+                         else encoded)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = None
+            decoded[key] = dict(value) if isinstance(value, Mapping) else {}
+        if is_diagnostic_candidate({
+                "candidate_id": str(candidate_id),
+                "config": decoded["config"]}):
+            return True
+        return decoded["proof"].get("diagnostic_only") is True
+
+    def candidate_is_diagnostic(self, candidate_id: str) -> bool:
+        if is_diagnostic_candidate(str(candidate_id)):
+            return True
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT config_json,proof_json FROM candidates WHERE candidate_id=?",
+                (str(candidate_id),)).fetchone()
+        return bool(row is not None and self._candidate_row_is_diagnostic(
+            str(candidate_id), row["config_json"], row["proof_json"]))
+
     def events(self, *, inserted_after: float = 0.0) -> list[dict]:
         with self._connection() as db:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM events WHERE inserted_at>=? ORDER BY timestamp,event_key",
                 (float(inserted_after),))]
+
+    def events_after_cursor(self, *, inserted_at: float, event_key: str,
+                            max_events: int) -> list[dict]:
+        """Read a bounded insertion-ordered diagnostic increment."""
+        with self._connection() as db:
+            rows = db.execute("""SELECT * FROM events
+                WHERE inserted_at>? OR (inserted_at=? AND event_key>?)
+                ORDER BY inserted_at,event_key LIMIT ?""",
+                (float(inserted_at), float(inserted_at), str(event_key),
+                 int(max_events) + 1)).fetchall()
+        if len(rows) > int(max_events):
+            raise ShadowError(
+                f"diagnostic shadow event batch bound {max_events} exceeded")
+        return [dict(row) for row in rows]
 
     def events_for_sessions(self, sessions: Sequence[str], *,
                             max_events: int) -> list[dict]:
@@ -1583,15 +2297,21 @@ class ShadowStore:
     def gate_sessions(self) -> list[tuple[str, str]]:
         """Return candidate/session pairs whose replay evidence currently gates."""
         with self._connection() as db:
-            rows = db.execute("""SELECT DISTINCT t.candidate_id,t.session_date
+            rows = db.execute("""SELECT DISTINCT t.candidate_id,t.session_date,
+                       c.config_json,c.proof_json
                 FROM shadow_trades t JOIN replay_diffs d
                   ON d.candidate_id=t.candidate_id
                  AND d.session_date=t.session_date
                  AND d.replay_digest=t.replay_digest
+                LEFT JOIN candidates c ON c.candidate_id=t.candidate_id
                 WHERE d.status='match' AND t.replay_status='match'
                 ORDER BY t.session_date,t.candidate_id""").fetchall()
-        return [(str(row["candidate_id"]), str(row["session_date"]))
-                for row in rows]
+        return [
+            (str(row["candidate_id"]), str(row["session_date"]))
+            for row in rows
+            if not self._candidate_row_is_diagnostic(
+                str(row["candidate_id"]), row["config_json"], row["proof_json"])
+        ]
 
     def replay_diff(self, *, candidate_id: str, session_date: str, source_digest: str,
                     shadow_digest: str, replay_digest: str | None, status: str,
@@ -1706,6 +2426,8 @@ class ShadowStore:
 
     def gate_rows(self, candidate_id: str, session_date: str | None = None) -> list[dict]:
         """Return rows eligible for existing gates after replay parity only."""
+        if self.candidate_is_diagnostic(str(candidate_id)):
+            return []
         params: list[Any] = [candidate_id]
         clause = ""
         if session_date is not None:
@@ -1739,17 +2461,21 @@ class ShadowStore:
         """
         floor = time.time() - max(1, self.retention_days) * 86400
         # Retention is the only intentional deletion.  The append-only rows
-        # themselves cannot be updated or deleted by ordinary writes.
+        # themselves cannot be updated or deleted by ordinary writes.  Fixed
+        # diagnostic cohorts are preregistered forward evidence, so even their
+        # derived replay diffs remain outside retention.
         with self._connection() as db:
             before = int(db.execute(
-                "SELECT count(*) FROM replay_diffs WHERE created_at < ?",
-                (floor,)).fetchone()[0])
+                """SELECT count(*) FROM replay_diffs
+                   WHERE created_at < ? AND candidate_id NOT LIKE ?""",
+                (floor, f"{DIAGNOSTIC_CANDIDATE_PREFIX}%")).fetchone()[0])
             previous = db.execute(
                 "SELECT value FROM meta WHERE key='replay_diff_prune_watermark'").fetchone()
             if before:
                 latest_session = db.execute(
-                    "SELECT MAX(session_date) FROM replay_diffs WHERE created_at < ?",
-                    (floor,)).fetchone()[0]
+                    """SELECT MAX(session_date) FROM replay_diffs
+                       WHERE created_at < ? AND candidate_id NOT LIKE ?""",
+                    (floor, f"{DIAGNOSTIC_CANDIDATE_PREFIX}%")).fetchone()[0]
                 watermark = {
                     "floor_ts": float(floor),
                     "pruned_replay_diffs": before,
@@ -1771,7 +2497,10 @@ class ShadowStore:
                     raise ShadowError("shadow retention watermark is invalid") from exc
                 if watermark is not None and not isinstance(watermark, Mapping):
                     raise ShadowError("shadow retention watermark is invalid")
-            db.execute("DELETE FROM replay_diffs WHERE created_at < ?", (floor,))
+            db.execute(
+                """DELETE FROM replay_diffs
+                   WHERE created_at < ? AND candidate_id NOT LIKE ?""",
+                (floor, f"{DIAGNOSTIC_CANDIDATE_PREFIX}%"))
         return {"retention_days": int(self.retention_days),
                 "retention_floor_ts": float(floor),
                 "pruned_replay_diffs": before,
@@ -1805,6 +2534,20 @@ def _read_candidates(path: Path, *, max_candidates: int) -> list[dict]:
         # each handle so repeated polls cannot leak file descriptors.
         with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:
             db.row_factory = sqlite3.Row
+            # Diagnostic arms are owned exclusively by the isolated shadow
+            # WAL.  Reject any attempted registration in EdgeLedger even when
+            # its lifecycle status would otherwise keep it out of this poll.
+            for marker_row in db.execute(
+                    "SELECT candidate_id,config_json FROM candidates").fetchall():
+                try:
+                    marker_config = json.loads(marker_row["config_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    marker_config = {}
+                if is_diagnostic_candidate({
+                        "candidate_id": marker_row["candidate_id"],
+                        "config": marker_config}):
+                    raise ShadowError(
+                        "diagnostic shadow candidates cannot be ingested from EdgeLedger")
             rows = db.execute("""SELECT c.*, s.status FROM candidates c JOIN candidate_state s
                 ON c.candidate_id=s.candidate_id
                 WHERE (s.status IN ('backtest_passed','shadow','demoted','validated','champion')
@@ -1824,6 +2567,9 @@ def _read_candidates(path: Path, *, max_candidates: int) -> list[dict]:
                     item["axes"] = json.loads(item.pop("axes_json"))
                 except (TypeError, ValueError, json.JSONDecodeError):
                     item["axes"] = {}
+                if is_diagnostic_candidate(item):
+                    raise ShadowError(
+                        "diagnostic shadow candidates cannot be ingested from EdgeLedger")
                 result.append(item)
             return result
     except sqlite3.OperationalError as exc:
@@ -1918,6 +2664,627 @@ class ShadowRunner:
         # (and test seams) while ensuring no worker mutates or observes a
         # sibling candidate's virtual book.
         self._worker_state = threading.local()
+
+    def _prepare_diagnostic_cohort(self) -> tuple[
+            dict[str, Any] | None, list[dict[str, Any]], dict[str, Any] | None]:
+        """Preregister the current code/config cohort before corpus observation."""
+        if not self.config.diagnostic:
+            return None, [], None
+        cohort = build_diagnostic_cohort(
+            self.config.runtime_config or {}, code_identity=_replay_code_hash())
+        cohort = self.store.save_diagnostic_cohort(cohort)
+        arms = [dict(arm) for arm in cohort.get("arms", ())
+                if isinstance(arm, Mapping)]
+        for arm in arms:
+            self.store.upsert_candidate(arm)
+        activation = self.store.diagnostic_activation(
+            str(cohort["cohort_identity"]))
+        return cohort, arms, activation
+
+    def _activate_diagnostic_cohort(
+            self, cohort: Mapping[str, Any], *, source_offsets: Mapping[str, int],
+            forward_event_floor: float) -> dict[str, Any]:
+        watermark = self.store.event_watermark()
+        return self.store.save_diagnostic_activation(
+            cohort=cohort, activation_event_watermark=watermark,
+            source_offsets=source_offsets,
+            forward_event_floor=float(forward_event_floor))
+
+    @staticmethod
+    def _diagnostic_event_provenance(
+            event: Mapping[str, Any],
+            activation: Mapping[str, Any]) -> tuple[bool, str | None]:
+        """Validate insertion, recorder-offset, and observation-time causality."""
+        watermark = activation.get("activation_event_watermark")
+        floor = (_finite(watermark.get("last_inserted_at"))
+                 if isinstance(watermark, Mapping) else None)
+        floor_key = (str(watermark.get("last_event_key") or "")
+                     if isinstance(watermark, Mapping) else "")
+        inserted = _finite(event.get("inserted_at"))
+        event_key = str(event.get("event_key") or "")
+        if (floor is None or inserted is None or
+                (inserted, event_key) <= (floor, floor_key)):
+            return False, "preactivation_insertion"
+        try:
+            payload = (json.loads(event.get("event_json"))
+                       if isinstance(event.get("event_json"), str)
+                       else event.get("event_json"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if not isinstance(payload, Mapping):
+            return False, "invalid_event_payload"
+        observed_at = _timestamp(payload.get("observed_at"))
+        activated_at = _timestamp(activation.get("activated_at"))
+        if (observed_at is None or activated_at is None or
+                observed_at < activated_at):
+            return False, "preactivation_observed_at"
+        source_path = str(event.get("source_path") or "")
+        source_start = event.get("source_offset_start")
+        source_end = event.get("source_offset_end")
+        offsets = activation.get("source_offsets")
+        if (not source_path or isinstance(source_start, bool) or
+                isinstance(source_end, bool) or
+                not isinstance(source_start, int) or
+                not isinstance(source_end, int) or source_start < 0 or
+                source_end <= source_start or not isinstance(offsets, Mapping)):
+            return False, "missing_forward_source_provenance"
+        activation_offset = offsets.get(source_path, 0)
+        if (isinstance(activation_offset, bool) or
+                not isinstance(activation_offset, int) or
+                source_start < activation_offset or
+                source_end <= activation_offset):
+            return False, "preactivation_source_offset"
+        return True, None
+
+    @classmethod
+    def _diagnostic_event_eligible(cls, event: Mapping[str, Any],
+                                   activation: Mapping[str, Any]) -> bool:
+        return cls._diagnostic_event_provenance(event, activation)[0]
+
+    @staticmethod
+    def _diagnostic_decision_payload(
+            arm: Mapping[str, Any], activation: Mapping[str, Any],
+            payload: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(payload)
+        session = str(payload.get("session_date") or "")
+        warmup_session = str(activation.get("warmup_session") or "")
+        result["diagnostic_shadow"] = {
+            "schema": "diagnostic-shadow-decision.v1",
+            "diagnostic_only": True,
+            "authorizing": False,
+            "gate_eligible": False,
+            "promotion_eligible": False,
+            "family": arm.get("family"),
+            "role": arm.get("role"),
+            "candidate_id": arm.get("candidate_id"),
+            "variant_id": arm.get("variant_id"),
+            "spec_identity": arm.get("spec_identity"),
+            "config_identity": arm.get("config_identity"),
+            "code_identity": arm.get("code_identity"),
+            "cohort_identity": arm.get("cohort_identity"),
+            "activation_identity": activation.get("activation_identity"),
+            "activation_event_watermark": activation.get(
+                "activation_event_watermark"),
+            "activated_at": activation.get("activated_at"),
+            "warmup_session": activation.get("warmup_session"),
+            "activation_phase": ("warmup" if warmup_session and
+                                 session == warmup_session else
+                                 "forward_diagnostic"),
+        }
+        return result
+
+    @staticmethod
+    def _stored_event_payload(event: Mapping[str, Any]) -> dict[str, Any] | None:
+        try:
+            payload = (json.loads(event.get("event_json"))
+                       if isinstance(event.get("event_json"), str)
+                       else event.get("event_json"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    @classmethod
+    def _stored_event_session(cls, event: Mapping[str, Any]) -> str | None:
+        payload = cls._stored_event_payload(event)
+        if payload is None:
+            return None
+        stamp = _timestamp(payload.get("as_of") or payload.get("timestamp"))
+        return (stamp.astimezone(NEW_YORK).date().isoformat()
+                if stamp is not None else None)
+
+    @staticmethod
+    def _stored_event_cursor(event: Mapping[str, Any]) -> tuple[float, str]:
+        inserted = _finite(event.get("inserted_at"))
+        if inserted is None:
+            raise ShadowError("diagnostic event insertion cursor is invalid")
+        return float(inserted), str(event.get("event_key") or "")
+
+    def _diagnostic_snapshot(
+            self, cohort: Mapping[str, Any] | None,
+            arms: Sequence[Mapping[str, Any]],
+            activation: Mapping[str, Any] | None
+            ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+        if cohort is None or activation is None or not arms:
+            return [], {}, {"count": 0, "events_digest": _digest([])}
+        candidate_ids = [str(arm.get("candidate_id") or "") for arm in arms]
+        progress = self.store.diagnostic_progress(
+            str(cohort.get("cohort_identity") or ""), candidate_ids, activation)
+        cursors = [
+            (float(item["last_inserted_at"]), str(item["last_event_key"]))
+            for item in progress.values()
+        ]
+        minimum = min(cursors) if cursors else (0.0, "")
+        rows = self.store.events_after_cursor(
+            inserted_at=minimum[0], event_key=minimum[1],
+            max_events=self.config.max_events)
+        watermark = {
+            "count": len(rows),
+            "events_digest": _digest([{
+                "event_key": row.get("event_key"),
+                "digest": row.get("digest"),
+                "inserted_at": row.get("inserted_at"),
+                "source_path": row.get("source_path"),
+                "source_offset_start": row.get("source_offset_start"),
+                "source_offset_end": row.get("source_offset_end"),
+            } for row in rows]),
+            "minimum_cursor": {"inserted_at": minimum[0],
+                               "event_key": minimum[1]},
+            "last_cursor": ({
+                "inserted_at": self._stored_event_cursor(rows[-1])[0],
+                "event_key": self._stored_event_cursor(rows[-1])[1],
+            } if rows else None),
+        }
+        return rows, progress, watermark
+
+    def _diagnostic_session_complete(
+            self, arm: Mapping[str, Any], session: str,
+            bars: Sequence[Mapping[str, Any]]) -> bool:
+        cfg = self._shadow_candidate_config(_safe_config(arm))
+        session_cfg = cfg.get("session") if isinstance(
+            cfg.get("session"), Mapping) else {}
+        close, _source = _session_close(
+            self.config.corpus_path, session,
+            require_exact_calendar=bool(session_cfg.get(
+                "require_exact_calendar", False)))
+        return bool(close is not None and any(
+            (_event_end(row) or datetime.min.replace(tzinfo=UTC)) >= close
+            for row in bars))
+
+    def _run_diagnostic_poll(
+            self, cohort: Mapping[str, Any] | None,
+            arms: Sequence[Mapping[str, Any]],
+            activation: Mapping[str, Any] | None, *,
+            snapshot_rows: Sequence[Mapping[str, Any]],
+            progress: Mapping[str, Mapping[str, Any]],
+            replay_identity: Mapping[str, Any]) -> dict[str, Any]:
+        """Evaluate sparse forward diagnostics independently of gate progress."""
+        if cohort is None or activation is None or not arms:
+            return {"this_poll_decisions": 0, "provenance_rejections": 0,
+                    "candidate_errors": {}}
+        cohort_identity = str(cohort.get("cohort_identity") or "")
+        candidate_ids = [str(arm.get("candidate_id") or "") for arm in arms]
+        sessions = {
+            session for row in snapshot_rows
+            if (session := self._stored_event_session(row)) is not None
+        }
+        for item in progress.values():
+            sessions.update(str(day) for day in
+                            (item.get("pending_sessions") or ()) if str(day))
+
+        context_rows: list[dict[str, Any]] = []
+        if sessions:
+            context_rows = self.store.events_for_sessions(
+                sorted(sessions),
+                max_events=self.config.diagnostic_session_max_events)
+        eligible_context = [
+            row for row in context_rows
+            if self._diagnostic_event_eligible(row, activation)
+        ]
+        context_bars, context_quotes, context_options = self._group_event_rows(
+            eligible_context)
+
+        def payload_session(row: Mapping[str, Any]) -> str | None:
+            payload = self._stored_event_payload(row)
+            if payload is None:
+                return None
+            stamp = _timestamp(payload.get("as_of") or payload.get("timestamp"))
+            return (stamp.astimezone(NEW_YORK).date().isoformat()
+                    if stamp is not None else None)
+
+        session_inputs: dict[str, tuple[tuple[dict, ...], tuple[dict, ...],
+                                             tuple[dict, ...]]] = {}
+        for session in sorted(sessions):
+            session_inputs[session] = (
+                tuple(row for values in context_bars.values() for row in values
+                      if (_timestamp(row.get("as_of") or row.get("timestamp")) or
+                          datetime.min.replace(tzinfo=UTC)).astimezone(
+                              NEW_YORK).date().isoformat() == session),
+                tuple(row for values in context_quotes.values() for row in values
+                      if (_timestamp(row.get("as_of") or row.get("timestamp")) or
+                          datetime.min.replace(tzinfo=UTC)).astimezone(
+                              NEW_YORK).date().isoformat() == session),
+                tuple(row for values in context_options.values() for row in values
+                      if (_timestamp(row.get("as_of") or row.get("timestamp")) or
+                          datetime.min.replace(tzinfo=UTC)).astimezone(
+                              NEW_YORK).date().isoformat() == session),
+            )
+
+        work: dict[str, dict[str, Any]] = {}
+        provenance_rejections = 0
+        for arm in arms:
+            candidate_id = str(arm.get("candidate_id") or "")
+            arm_progress = progress[candidate_id]
+            cursor = (float(arm_progress.get("last_inserted_at") or 0.0),
+                      str(arm_progress.get("last_event_key") or ""))
+            arm_rows = [row for row in snapshot_rows
+                        if self._stored_event_cursor(row) > cursor]
+            rollups: dict[str, dict[str, int]] = {}
+            session_events: dict[str, list[dict[str, Any]]] = {}
+            rejected = 0
+            for row in arm_rows:
+                session = payload_session(row) or "unknown"
+                ok, reason = self._diagnostic_event_provenance(row, activation)
+                if not ok:
+                    key = f"provenance_reject:{reason or 'unknown'}"
+                    counts = rollups.setdefault(session, {})
+                    counts[key] = int(counts.get(key, 0)) + 1
+                    rejected += 1
+                    continue
+                if str(row.get("event_type") or "") not in {"bar", "bar_1m"}:
+                    counts = rollups.setdefault(session, {})
+                    counts["context_event"] = int(counts.get(
+                        "context_event", 0)) + 1
+                    continue
+                payload = self._stored_event_payload(row)
+                if payload is None or session == "unknown":
+                    counts = rollups.setdefault(session, {})
+                    reject_key = ("provenance_reject:invalid_event_payload"
+                                  if payload is None else
+                                  "provenance_reject:invalid_session")
+                    counts[reject_key] = int(counts.get(reject_key, 0)) + 1
+                    rejected += 1
+                    continue
+                session_events.setdefault(session, []).append(payload)
+            for values in session_events.values():
+                values.sort(key=lambda row: (
+                    str(row.get("timestamp") or ""),
+                    str(row.get("event_key") or "")))
+            close_sessions = [
+                session for session in session_events
+                if session != "unknown" and session in session_inputs and
+                self._diagnostic_session_complete(
+                    arm, session, session_inputs[session][0])
+            ]
+            work[candidate_id] = {
+                "arm": arm, "rows": arm_rows, "rollups": rollups,
+                "session_events": session_events,
+                "close_sessions": close_sessions, "rejected": rejected,
+            }
+            provenance_rejections += rejected
+
+        worker_results: dict[str, dict[str, Any]] = {}
+        candidate_errors: dict[str, str] = {}
+        active = [item for item in work.values() if item["session_events"]]
+        if active:
+            with ThreadPoolExecutor(max_workers=self.config.max_workers,
+                                    thread_name_prefix="diagnostic-shadow") as pool:
+                futures = {}
+                for item in active:
+                    arm = item["arm"]
+                    candidate_id = str(arm.get("candidate_id") or "")
+                    initial = self._portfolio_state(candidate_id)
+                    selected_inputs = {
+                        session: session_inputs[session]
+                        for session in item["session_events"]
+                    }
+                    futures[pool.submit(
+                        self._evaluate_arm_snapshot, arm,
+                        item["session_events"], selected_inputs,
+                        context_bars, context_quotes, context_options,
+                        initial)] = candidate_id
+                for future in as_completed(futures):
+                    candidate_id = futures[future]
+                    try:
+                        worker_results[candidate_id] = future.result()
+                    except Exception as exc:  # pragma: no cover - defensive
+                        worker_results[candidate_id] = {
+                            "candidate_id": candidate_id, "decisions": [],
+                            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                        }
+
+        this_poll_decisions = 0
+        for candidate_id, item in work.items():
+            rows = item["rows"]
+            if not rows:
+                continue
+            result = worker_results.get(candidate_id, {
+                "candidate_id": candidate_id, "decisions": [], "error": None})
+            if result.get("error"):
+                candidate_errors[candidate_id] = str(result["error"])
+                continue
+            arm = item["arm"]
+            tagged: list[dict[str, Any]] = []
+            for decision in result.get("decisions") or ():
+                normalized = dict(decision)
+                payload = normalized.get("payload")
+                payload = dict(payload) if isinstance(payload, Mapping) else {}
+                payload.setdefault("session_date", normalized.get("session_date"))
+                normalized["payload"] = self._diagnostic_decision_payload(
+                    arm, activation, payload)
+                tagged.append(normalized)
+                session_rollup = item["rollups"].setdefault(
+                    str(normalized.get("session_date") or "unknown"), {})
+                kind = str(normalized.get("kind") or "no_data")
+                session_rollup[kind] = int(session_rollup.get(kind, 0)) + 1
+                if kind in {"reject", "unpriced"}:
+                    reason = str(normalized.get("reason") or "unspecified")
+                    reason_key = (
+                        f"{DIAGNOSTIC_REASON_ROLLUP_PREFIX}{kind}:{reason}")
+                    session_rollup[reason_key] = int(
+                        session_rollup.get(reason_key, 0)) + 1
+            cursor = self._stored_event_cursor(rows[-1])
+            this_poll_decisions += self.store.record_diagnostic_batch(
+                cohort_identity=cohort_identity, candidate_id=candidate_id,
+                cursor_inserted_at=cursor[0], cursor_event_key=cursor[1],
+                processed_events=len(rows), rollups=item["rollups"],
+                pending_sessions=item["close_sessions"], decisions=tagged,
+                warmup_session=str(activation.get("warmup_session") or ""),
+                max_decisions=self.config.max_decisions)
+
+        refreshed = self.store.diagnostic_progress(
+            cohort_identity, candidate_ids, activation)
+        arm_by_id = {str(arm.get("candidate_id") or ""): arm for arm in arms}
+        for candidate_id in sorted(candidate_ids):
+            arm = arm_by_id[candidate_id]
+            for session in refreshed[candidate_id].get("pending_sessions") or ():
+                inputs = session_inputs.get(str(session))
+                if inputs is None or not self._diagnostic_session_complete(
+                        arm, str(session), inputs[0]):
+                    continue
+                try:
+                    complete = self._replay(
+                        arm, str(session), inputs[0], inputs[1],
+                        self.store.decisions(candidate_id), inputs[2],
+                        replay_identity=replay_identity,
+                        diagnostic_activation=activation)
+                    if complete:
+                        self.store.complete_diagnostic_replay(
+                            cohort_identity=cohort_identity,
+                            candidate_id=candidate_id,
+                            session_date=str(session))
+                except Exception as exc:
+                    candidate_errors[candidate_id] = (
+                        f"{type(exc).__name__}: {str(exc)[:240]}")
+        return {
+            "this_poll_decisions": int(this_poll_decisions),
+            "provenance_rejections": int(provenance_rejections),
+            "candidate_errors": dict(sorted(candidate_errors.items())),
+        }
+
+    def _diagnostic_coverage(
+            self, cohort: Mapping[str, Any] | None,
+            activation: Mapping[str, Any] | None, *,
+            this_poll_decisions: int = 0,
+            preactivation_rejections: int = 0,
+            poll_duration_seconds: float = 0.0) -> dict[str, Any]:
+        """Return bounded, explicitly non-authorizing cohort telemetry."""
+        if cohort is None:
+            return {
+                "enabled": False, "diagnostic": False, "authorizing": False,
+                "families_total": 12, "families_covered": 0,
+                "families_missing": [], "baseline_count": 0,
+                "variant_count": 0, "candidate_identities": [],
+                "decision_counts": {"total": 0, "this_poll": 0, "by_kind": {}},
+                "rejection_counts": {"reject": 0, "preactivation": 0},
+                "quoteable_virtual_opens": 0, "unpriced_virtual_opens": 0,
+                "replay_modeled_fills": 0, "actual_fills": 0,
+                "poll_duration_seconds": round(max(0.0, poll_duration_seconds), 6),
+                "source_lag_seconds": None,
+            }
+        candidate_ids = {str(value) for value in
+                         cohort.get("candidate_identities", ())}
+        arms = [arm for arm in cohort.get("arms", ()) if isinstance(arm, Mapping)]
+        covered = sorted({str(arm.get("family") or "") for arm in arms
+                          if str(arm.get("family") or "")})
+        expected = [str(value) for value in cohort.get("families", ())]
+        decisions = [row for row in self.store.decisions()
+                     if str(row.get("candidate_id") or "") in candidate_ids]
+        progress = (self.store.diagnostic_progress(
+            str(cohort.get("cohort_identity") or ""), sorted(candidate_ids),
+            activation) if isinstance(activation, Mapping) else {})
+        evaluated_by_kind: dict[str, int] = {}
+        reason_counts: dict[str, dict[str, int]] = {
+            "reject": {}, "unpriced": {}}
+        processed_events = 0
+        pending_sessions: set[str] = set()
+        completed_sessions: set[str] = set()
+        cursors: dict[str, dict[str, Any]] = {}
+        for candidate_id, item in progress.items():
+            processed_events += int(item.get("processed_events") or 0)
+            pending_sessions.update(str(value) for value in
+                                    (item.get("pending_sessions") or ()))
+            rollups = item.get("rollups")
+            if isinstance(rollups, Mapping):
+                cumulative = rollups.get("cumulative")
+                if isinstance(cumulative, Mapping):
+                    for kind, count in cumulative.items():
+                        evaluated_by_kind[str(kind)] = int(
+                            evaluated_by_kind.get(str(kind), 0)) + int(count)
+                sessions = rollups.get("sessions")
+                if isinstance(sessions, Mapping):
+                    for counts in sessions.values():
+                        if not isinstance(counts, Mapping):
+                            continue
+                        for key, count in counts.items():
+                            raw_key = str(key)
+                            if not raw_key.startswith(
+                                    DIAGNOSTIC_REASON_ROLLUP_PREFIX):
+                                continue
+                            kind, separator, reason = raw_key.removeprefix(
+                                DIAGNOSTIC_REASON_ROLLUP_PREFIX).partition(":")
+                            if separator and kind in reason_counts:
+                                target = reason_counts[kind]
+                                target[reason] = int(
+                                    target.get(reason, 0)) + int(count)
+                completed_sessions.update(str(value) for value in
+                                          (rollups.get("completed_sessions") or ()))
+            cursors[candidate_id] = {
+                "last_inserted_at": item.get("last_inserted_at"),
+                "last_event_key": item.get("last_event_key"),
+                "processed_events": item.get("processed_events"),
+            }
+        family_by_candidate = {
+            str(arm.get("candidate_id") or ""): str(arm.get("family") or "")
+            for arm in arms}
+        observed_candidate_ids = {
+            str(row.get("candidate_id") or "") for row in decisions}
+        observed_candidate_ids.update(
+            candidate_id for candidate_id, item in progress.items()
+            if int(item.get("processed_events") or 0) > 0)
+        observed_families = sorted({
+            family_by_candidate.get(candidate_id, "")
+            for candidate_id in observed_candidate_ids
+            if family_by_candidate.get(candidate_id, "")})
+        by_kind: dict[str, int] = {}
+        warmup_decisions = 0
+        warmup_session = (str(activation.get("warmup_session"))
+                          if isinstance(activation, Mapping) and
+                          activation.get("warmup_session") else None)
+        for row in decisions:
+            kind = str(row.get("kind") or "unknown")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            if warmup_session and str(row.get("session_date") or "") == warmup_session:
+                warmup_decisions += 1
+        accounts = [row for row in self.store.replay_accounts()
+                    if str(row.get("candidate_id") or "") in candidate_ids]
+        modeled_fills = sum(int(row.get("trade_count") or 0) for row in accounts)
+        warmup_modeled_fills = sum(
+            int(row.get("trade_count") or 0) for row in accounts
+            if warmup_session and str(row.get("session_date") or "") == warmup_session)
+        watermark = self.store.event_watermark()
+        latest = (_timestamp(watermark.get("last_available_at")) or
+                  _timestamp(watermark.get("last_timestamp")))
+        source_lag = (max(0.0, time.time() - latest.timestamp())
+                      if latest is not None else None)
+        quoteable = sum(
+            1 for row in decisions
+            if str(row.get("kind") or "") == "open_incomplete" and
+            (not warmup_session or
+             str(row.get("session_date") or "") > warmup_session))
+        warmup_quoteable = sum(
+            1 for row in decisions
+            if str(row.get("kind") or "") == "open_incomplete" and
+            warmup_session and
+            str(row.get("session_date") or "") == warmup_session)
+        unpriced = int(evaluated_by_kind.get("unpriced", 0))
+        evaluated_decisions = sum(
+            int(count) for kind, count in evaluated_by_kind.items()
+            if kind != "context_event" and
+            not str(kind).startswith("provenance_reject:"))
+        if activation is None:
+            observation_status = "awaiting_forward_activation"
+        elif not decisions and evaluated_decisions <= 0:
+            observation_status = "no_post_activation_events"
+        elif quoteable:
+            observation_status = "quoteable_virtual_observations"
+        elif unpriced:
+            observation_status = "signals_unpriced_no_virtual_fill_claim"
+        elif warmup_quoteable:
+            observation_status = "warmup_signals_not_evaluated"
+        else:
+            observation_status = "observed_no_quoteable_virtual_opens"
+        activation_identity = (activation.get("activation_identity")
+                               if isinstance(activation, Mapping) else None)
+        activation_watermark = (activation.get("activation_event_watermark")
+                                if isinstance(activation, Mapping) else None)
+        preregistered_decision_events = (
+            int(activation_watermark.get("decision_event_count") or 0)
+            if isinstance(activation_watermark, Mapping) else 0)
+        return {
+            "schema": "diagnostic-shadow-coverage.v1",
+            "enabled": True,
+            "diagnostic": True,
+            "authorizing": False,
+            "gate_eligible": False,
+            "promotion_eligible": False,
+            "online_fdr": False,
+            "families_total": int(cohort.get("families_total") or len(expected)),
+            "families_covered": len(covered),
+            "families_missing": sorted(set(expected) - set(covered)),
+            "families_observed": len(observed_families),
+            "families_without_decisions": sorted(
+                set(expected) - set(observed_families)),
+            "baseline_count": sum(1 for arm in arms if arm.get("role") == "baseline"),
+            "variant_count": sum(1 for arm in arms if arm.get("role") == "variant"),
+            "cohort_identity": cohort.get("cohort_identity"),
+            "code_identity": cohort.get("code_identity"),
+            "runtime_config_identity": cohort.get("runtime_config_identity"),
+            "policy_config_identity": cohort.get("policy_config_identity"),
+            "activation_identity": activation_identity,
+            "activation_event_watermark": (
+                dict(activation_watermark) if isinstance(
+                    activation_watermark, Mapping) else None),
+            "activation_status": ("active" if activation_identity else "preregistered"),
+            "warmup_session": warmup_session,
+            "candidate_identities": sorted(candidate_ids),
+            "arms": [{
+                "candidate_id": arm.get("candidate_id"),
+                "family": arm.get("family"),
+                "role": arm.get("role"),
+                "variant_id": arm.get("variant_id"),
+                "spec_identity": arm.get("spec_identity"),
+                "config_identity": arm.get("config_identity"),
+                "code_identity": arm.get("code_identity"),
+                "cohort_identity": arm.get("cohort_identity"),
+            } for arm in sorted(arms, key=lambda item: str(
+                item.get("candidate_id") or ""))],
+            "decision_counts": {
+                "total": len(decisions),
+                "this_poll": int(this_poll_decisions),
+                "by_kind": dict(sorted(by_kind.items())),
+                "warmup": warmup_decisions,
+                "evaluated_by_kind": dict(sorted(evaluated_by_kind.items())),
+                "compacted_no_trade": int(evaluated_by_kind.get(
+                    "no_trade", 0)),
+                "compacted_no_data": int(evaluated_by_kind.get(
+                    "no_data", 0)),
+                "evaluated_total": int(evaluated_decisions),
+                "trace_representatives": int(
+                    by_kind.get("reject", 0) + by_kind.get("unpriced", 0)),
+            },
+            "rejection_counts": {
+                "reject": int(evaluated_by_kind.get("reject", 0)),
+                "unpriced": unpriced,
+                "by_reason": dict(sorted(reason_counts["reject"].items())),
+                "unpriced_by_reason": dict(sorted(
+                    reason_counts["unpriced"].items())),
+                "preactivation": preregistered_decision_events * len(candidate_ids),
+                "preactivation_this_poll": int(preactivation_rejections),
+                "forward_provenance": sum(
+                    int(count) for kind, count in evaluated_by_kind.items()
+                    if str(kind).startswith("provenance_reject:")),
+            },
+            "processed_events": int(processed_events),
+            "processed_event_cursors": cursors,
+            "pending_replay_sessions": sorted(pending_sessions),
+            "completed_replay_sessions": sorted(completed_sessions),
+            "quoteable_virtual_opens": quoteable,
+            "warmup_quoteable_signals": warmup_quoteable,
+            "unpriced_virtual_opens": unpriced,
+            "replay_modeled_fills": modeled_fills,
+            "warmup_replay_modeled_fills": warmup_modeled_fills,
+            "actual_fills": 0,
+            "actual_fill_claims": False,
+            "realized_pnl_authorizing": False,
+            "observation_status": observation_status,
+            "poll_duration_seconds": round(max(0.0, poll_duration_seconds), 6),
+            "source_lag_seconds": (round(source_lag, 6)
+                                   if source_lag is not None else None),
+            "config_source": self.config.runtime_config_path,
+            "incremental_max_events": int(self.config.max_events),
+            "session_context_max_events": int(
+                self.config.diagnostic_session_max_events),
+        }
 
     def _shadow_policy(self, config: Mapping[str, Any]) -> ReplayPolicy:
         """Resolve a candidate policy with the optional shadow-only overlay."""
@@ -2349,8 +3716,25 @@ class ShadowRunner:
     def _replay(self, candidate: Mapping[str, Any], session: str,
                 session_bars: Sequence[Mapping], session_quotes: Sequence[Mapping],
                 decisions: Sequence[Mapping],
-                session_options: Sequence[Mapping] | None = None) -> bool:
+                session_options: Sequence[Mapping] | None = None, *,
+                replay_identity: Mapping[str, Any] | None = None,
+                diagnostic_activation: Mapping[str, Any] | None = None) -> bool:
         candidate_id = str(candidate["candidate_id"])
+        diagnostic = is_diagnostic_candidate(candidate)
+        replay_identity = dict(replay_identity or {})
+        identity_details = {
+            "replay_code_hash": replay_identity.get("replay_code_hash"),
+            "manifest_digest": replay_identity.get("manifest_digest"),
+            "candidate_set_digest": replay_identity.get("candidate_set_digest"),
+            "replay_epoch_identity": replay_identity.get(
+                "replay_epoch_identity"),
+            "candidate_epoch_identity": (
+                candidate.get("cohort_identity") or
+                _candidate_epoch_identity(
+                    candidate_id=candidate_id,
+                    config=_safe_config(candidate),
+                    replay_identity=replay_identity)),
+        }
         # Option replay is also point-in-time input.  Include it in the source
         # digest so a corrected/stale option snapshot cannot be mistaken for
         # the same replay window merely because the underlying bars/quotes
@@ -2444,10 +3828,39 @@ class ShadowRunner:
                                        vehicle=candidate_vehicle,
                                        timestamp=(calendar_close or
                                                   datetime.now(UTC))),
-                                   "replay_signatures": replay_signatures}
+                                   "replay_signatures": replay_signatures,
+                                   **identity_details}
         complete = bool(calendar_close is not None and
                         any((_event_end(row) or datetime.min.replace(tzinfo=UTC)) >=
                             calendar_close for row in in_session_bars))
+        if diagnostic and not complete:
+            # Diagnostic replay is a close-only modeled outcome. Intraday
+            # explanation is retained in sparse decisions/rollups instead of
+            # repeatedly replaying an incomplete full session.
+            return False
+        warmup_session = (
+            str(diagnostic_activation.get("warmup_session") or "")
+            if isinstance(diagnostic_activation, Mapping) else "")
+        if diagnostic and warmup_session and str(session) <= warmup_session:
+            details.update({
+                "complete": True,
+                "evaluated": False,
+                "signature_match": False,
+                "status_reason": "activation session is explanatory only",
+                "diagnostic_only": True,
+                "authorizing": False,
+                "gate_eligible": False,
+                "promotion_eligible": False,
+                "cohort_identity": candidate.get("cohort_identity"),
+                "activation_identity": diagnostic_activation.get(
+                    "activation_identity"),
+            })
+            self.store.replay_diff(
+                candidate_id=candidate_id, session_date=session,
+                source_digest=source_digest, shadow_digest=shadow_digest,
+                replay_digest=None, status="warmup_not_evaluated",
+                details=details)
+            return True
         try:
             if provider_mismatches:
                 raise ShadowError(
@@ -2505,26 +3918,31 @@ class ShadowRunner:
                 # candidate replay.  It is a diagnostic research source, not a
                 # runtime shadow decision, and therefore receives its own
                 # synthetic WAL candidate id below.
-                try:
-                    null_account = null_control_account(
-                        normalized_bars, normalized_options, _null_spec(replay_cfg),
-                        vehicle=candidate_vehicle,
-                        reference_rows=_null_reference_rows(
-                            result, normalized_bars,
-                            str(candidate.get("vehicle") or "equity"),
-                            policy=replay_cfg.policy),
-                        account_id=f"shadow:null:{candidate_id}:{session}",
-                        starting_cash=float(self.config.equity), costs=cost_setup.model,
-                        cost_resolver=cost_setup.resolver,
-                        quotes=normalized_quotes, fixed_quantity=replay_cfg.quantity,
-                        policy=_policy(cfg))
-                    null_rows = list(null_account.get("rows") or [])
-                    details["null_control"] = True
-                    details["null_trade_count"] = len([
-                        row for row in null_rows if row.get("no_trade") is not True])
-                except Exception as exc:
+                if diagnostic:
                     details["null_control"] = False
-                    details["null_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+                    details["null_reason"] = "diagnostic_non_authorizing"
+                else:
+                    try:
+                        null_account = null_control_account(
+                            normalized_bars, normalized_options, _null_spec(replay_cfg),
+                            vehicle=candidate_vehicle,
+                            reference_rows=_null_reference_rows(
+                                result, normalized_bars,
+                                str(candidate.get("vehicle") or "equity"),
+                                policy=replay_cfg.policy),
+                            account_id=f"shadow:null:{candidate_id}:{session}",
+                            starting_cash=float(self.config.equity), costs=cost_setup.model,
+                            cost_resolver=cost_setup.resolver,
+                            quotes=normalized_quotes, fixed_quantity=replay_cfg.quantity,
+                            policy=_policy(cfg))
+                        null_rows = list(null_account.get("rows") or [])
+                        details["null_control"] = True
+                        details["null_trade_count"] = len([
+                            row for row in null_rows if row.get("no_trade") is not True])
+                    except Exception as exc:
+                        details["null_control"] = False
+                        details["null_error"] = (
+                            f"{type(exc).__name__}: {str(exc)[:240]}")
                 replay_ok = True
             else:
                 strategy = cfg.get("strategy") if isinstance(cfg.get("strategy"), Mapping) else {}
@@ -2576,25 +3994,31 @@ class ShadowRunner:
                                replay_signatures=replay_signatures, account=account)
                 details["opportunity_capacity"] = _opportunity_capacity(
                     rows, vehicle=candidate_vehicle)
-                try:
-                    null_account = null_control_account(
-                        normalized_bars, normalized_options, spec,
-                        vehicle=candidate_vehicle,
-                        reference_rows=rows,
-                        account_id=f"shadow:null:{candidate_id}:{session}",
-                        starting_cash=float(self.config.equity),
-                        risk_pct=float((cfg.get("risk") or {}).get("risk_per_trade_pct", .5)),
-                        costs=cost_setup.model,
-                        cost_resolver=cost_setup.resolver,
-                        quotes=normalized_quotes,
-                        policy=policy)
-                    null_rows = list(null_account.get("rows") or [])
-                    details["null_control"] = True
-                    details["null_trade_count"] = len([
-                        row for row in null_rows if row.get("no_trade") is not True])
-                except Exception as exc:
+                if diagnostic:
                     details["null_control"] = False
-                    details["null_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+                    details["null_reason"] = "diagnostic_non_authorizing"
+                else:
+                    try:
+                        null_account = null_control_account(
+                            normalized_bars, normalized_options, spec,
+                            vehicle=candidate_vehicle,
+                            reference_rows=rows,
+                            account_id=f"shadow:null:{candidate_id}:{session}",
+                            starting_cash=float(self.config.equity),
+                            risk_pct=float((cfg.get("risk") or {}).get(
+                                "risk_per_trade_pct", .5)),
+                            costs=cost_setup.model,
+                            cost_resolver=cost_setup.resolver,
+                            quotes=normalized_quotes,
+                            policy=policy)
+                        null_rows = list(null_account.get("rows") or [])
+                        details["null_control"] = True
+                        details["null_trade_count"] = len([
+                            row for row in null_rows if row.get("no_trade") is not True])
+                    except Exception as exc:
+                        details["null_control"] = False
+                        details["null_error"] = (
+                            f"{type(exc).__name__}: {str(exc)[:240]}")
                 replay_ok = True
         except Exception as exc:
             details.update(complete=complete, error=f"{type(exc).__name__}: {str(exc)[:240]}")
@@ -2604,6 +4028,15 @@ class ShadowRunner:
                        signature_mismatches=differences)
         status = ("incomplete" if not details.get("complete") or not replay_ok or replay_digest is None
                   else ("match" if not differences else "mismatch"))
+        persisted_status = f"diagnostic_{status}" if diagnostic else status
+        if diagnostic:
+            details.update({
+                "diagnostic_only": True,
+                "authorizing": False,
+                "gate_eligible": False,
+                "promotion_eligible": False,
+                "cohort_identity": candidate.get("cohort_identity"),
+            })
         if complete and replay_ok:
             details["account_summary"] = {
                 "starting_cash": starting_cash,
@@ -2611,11 +4044,12 @@ class ShadowRunner:
                 "realized_pnl": realized_pnl,
                 "trade_count": len([row for row in evidence_rows
                                      if row.get("no_trade") is not True]),
-                "replay_status": status,
+                "replay_status": persisted_status,
             }
         self.store.replay_diff(candidate_id=candidate_id, session_date=session,
                                source_digest=source_digest, shadow_digest=shadow_digest,
-                               replay_digest=replay_digest, status=status, details=details)
+                               replay_digest=replay_digest, status=persisted_status,
+                               details=details)
         # Keep a durable repair trail for any session that was incomplete or
         # semantically mismatched.  Ingestion treats a quarantined session as
         # blocked even when later sessions are healthy; only a subsequent
@@ -2625,7 +4059,9 @@ class ShadowRunner:
         # that expected open tail is diagnostic but is not itself a repair
         # incident.  Quarantine only an attempted closed-session replay (or a
         # replay exception), while ingestion still refuses incomplete metadata.
-        if status == "mismatch" or (
+        if diagnostic:
+            pass
+        elif status == "mismatch" or (
                 status == "incomplete" and (complete or not replay_ok)):
             self.store.quarantine_replay_session(
                 candidate_id=candidate_id, session_date=session,
@@ -2649,31 +4085,33 @@ class ShadowRunner:
                 vehicle=str(candidate.get("vehicle") or "equity"),
                 starting_cash=starting_cash, ending_cash=ending_cash,
                 realized_pnl=realized_pnl, trades=evidence_rows,
-                replay_status=status)
+                replay_status=persisted_status)
             # Randomized-entry nulls are generated from this exact normalized
             # session, so their source digest is identical.  They have no
             # runtime semantic signature to compare; ``match`` here means the
             # deterministic null replay completed, not that a broker decision
             # matched it.
-            null_digest = _digest(null_rows)
-            null_candidate_id = f"shadow:null:{candidate_id}"
-            self.store.replay_diff(
-                candidate_id=null_candidate_id, session_date=session,
-                source_digest=source_digest, shadow_digest=_digest([]),
-                replay_digest=null_digest, status="match",
-                details={"complete": True, "signature_match": True,
-                         "equity_feed": expected_equity_feed,
-                         "equity_provider": expected_equity_provider,
-                         "null_control": True, "replay_signatures": [],
-                         "null_rows_digest": null_digest})
-            self.store.record_replay_evidence(
-                candidate_id=null_candidate_id, session_date=session,
-                replay_digest=null_digest,
-                vehicle=str(candidate.get("vehicle") or "equity"),
-                starting_cash=_finite(null_account.get("starting_cash")) or starting_cash,
-                ending_cash=_finite(null_account.get("ending_equity")) or starting_cash,
-                realized_pnl=_finite(null_account.get("realized_pnl")) or 0.0,
-                trades=null_rows, replay_status="match")
+            if not diagnostic:
+                null_digest = _digest(null_rows)
+                null_candidate_id = f"shadow:null:{candidate_id}"
+                self.store.replay_diff(
+                    candidate_id=null_candidate_id, session_date=session,
+                    source_digest=source_digest, shadow_digest=_digest([]),
+                    replay_digest=null_digest, status="match",
+                    details={"complete": True, "signature_match": True,
+                             "equity_feed": expected_equity_feed,
+                             "equity_provider": expected_equity_provider,
+                             "null_control": True, "replay_signatures": [],
+                             "null_rows_digest": null_digest,
+                             **identity_details})
+                self.store.record_replay_evidence(
+                    candidate_id=null_candidate_id, session_date=session,
+                    replay_digest=null_digest,
+                    vehicle=str(candidate.get("vehicle") or "equity"),
+                    starting_cash=_finite(null_account.get("starting_cash")) or starting_cash,
+                    ending_cash=_finite(null_account.get("ending_equity")) or starting_cash,
+                    realized_pnl=_finite(null_account.get("realized_pnl")) or 0.0,
+                    trades=null_rows, replay_status="match")
         # A closing timestamp alone is not enough: malformed input or a
         # replay exception must remain diagnostic and keep the virtual open
         # blocked rather than silently declaring it settled.
@@ -2768,6 +4206,16 @@ class ShadowRunner:
                 "error": None}
 
     def run_once(self) -> dict[str, Any]:
+        poll_started = time.monotonic()
+        # Validate the mutable operational pointer before writing anything.
+        # Older code identities are readable for rollover; malformed or
+        # self-digest-mismatched manifests are never silently replaced.
+        prior_manifest = self.store.latest_manifest_for_rollover()
+        # Cohort registration is intentionally the first durable action.  The
+        # activation watermark is written only after this poll's existing
+        # corpus bytes have been ingested, so none can become a decision event.
+        diagnostic_cohort, diagnostic_arms, diagnostic_activation = (
+            self._prepare_diagnostic_cohort())
         # Factory hypotheses can be registered by the research cycle between
         # shadow polls; refresh the read-only root catalog for every pass.
         self._factory_roots = _read_factory_rule_roots(self.config.edge_db)
@@ -2803,7 +4251,7 @@ class ShadowRunner:
         pending: list[dict] = []
         next_offsets = dict(offsets)
         source_consumed: dict[str, int] = {}
-        source_for_event: dict[str, str] = {}
+        source_for_event: dict[str, tuple[str, int, int]] = {}
         pending_bytes = sum(max(0, source.stat().st_size - offsets.get(
             str(source.resolve()), 0)) for source in sources)
         skipped_recovery_bytes = 0
@@ -2823,13 +4271,15 @@ class ShadowRunner:
         else:
             for source in sources:
                 key = str(source.resolve())
-                rows, consumed = _read_corpus_append(source, offsets.get(key, 0))
+                source_start = int(offsets.get(key, 0))
+                rows, consumed = _read_corpus_append(source, source_start)
                 pending.extend(rows)
                 source_consumed[key] = consumed
                 for row in rows:
                     event_key = str(row.get("event_key") or "")
                     if event_key:
-                        source_for_event[event_key] = key
+                        source_for_event[event_key] = (
+                            key, source_start, int(consumed))
         selected = _compact_shadow_rows(pending)
         if len(selected) > self.config.max_events:
             raise ShadowError(
@@ -2848,9 +4298,17 @@ class ShadowRunner:
         quarantine_overflow = QUARANTINE_OVERFLOW_KEY in quarantine
         for raw in selected:
             event_key = str(raw.get("event_key") or "")
-            source_key = source_for_event.get(event_key)
+            source_provenance = source_for_event.get(event_key)
+            source_key = source_provenance[0] if source_provenance else None
             try:
-                _, added = self.store.ingest_event(raw, max_events=self.config.max_events)
+                _, added = self.store.ingest_event(
+                    raw, max_events=self.config.max_events,
+                    source_path=(source_provenance[0]
+                                 if source_provenance else None),
+                    source_offset_start=(source_provenance[1]
+                                         if source_provenance else None),
+                    source_offset_end=(source_provenance[2]
+                                       if source_provenance else None))
             except InputConflict:
                 conflicts += 1
                 raise
@@ -2907,6 +4365,14 @@ class ShadowRunner:
             for detail in quarantine.values())
         quarantine_overflow = QUARANTINE_OVERFLOW_KEY in quarantine
 
+        if diagnostic_cohort is not None and diagnostic_activation is None:
+            diagnostic_activation = self._activate_diagnostic_cohort(
+                diagnostic_cohort, source_offsets=next_offsets,
+                forward_event_floor=float(forward_floor or 0.0))
+        diagnostic_rows, diagnostic_progress, diagnostic_event_watermark = (
+            self._diagnostic_snapshot(
+                diagnostic_cohort, diagnostic_arms, diagnostic_activation))
+
         # A poll without an eligible candidate still has to finish ingestion,
         # quarantine, and source-offset persistence above.  It must not then
         # materialize the complete immutable event WAL merely to report that
@@ -2941,9 +4407,12 @@ class ShadowRunner:
                 forward_floor = current_floor
             prune = self.store.prune()
             stored_events = self.store.event_count()
-            decision_count = self.store.decision_count()
             quarantine_through = self.store.quarantine_through_session()
-            signal_dispositions = _signal_dispositions(self.store.decisions())
+            signal_dispositions = _signal_dispositions([
+                row for row in self.store.decisions()
+                if not self.store.candidate_is_diagnostic(
+                    str(row.get("candidate_id") or ""))
+            ])
             calibration_status = self._calibration_status()
             stale_tail = {
                 "status": "blocked" if (
@@ -2962,7 +4431,18 @@ class ShadowRunner:
                 "signal_dispositions": signal_dispositions,
                 "stress_calibration": calibration_status,
             }
-            candidate_watermark: list[dict[str, Any]] = []
+            candidate_watermark = [{
+                "candidate_id": str(arm.get("candidate_id") or ""),
+                "variant_id": str(arm.get("variant_id") or ""),
+                "strategy_id": str(arm.get("strategy_id") or ""),
+                "vehicle": str(arm.get("vehicle") or ""),
+                "status": str(arm.get("status") or ""),
+                "config_digest": _digest(_safe_config(arm)),
+                "diagnostic_only": True,
+                "family": arm.get("family"),
+                "role": arm.get("role"),
+                "cohort_identity": arm.get("cohort_identity"),
+            } for arm in diagnostic_arms]
             manifest = {
                 "schema": "shadow-manifest.v1",
                 "replay_code_hash": _replay_code_hash(),
@@ -2981,9 +4461,32 @@ class ShadowRunner:
                 },
                 "session_watermark": [],
                 "max_workers": int(self.config.max_workers),
+                "diagnostic_shadow": ({
+                    "diagnostic_only": True,
+                    "authorizing": False,
+                    "cohort_identity": diagnostic_cohort.get(
+                        "cohort_identity"),
+                    "activation_identity": diagnostic_activation.get(
+                        "activation_identity") if diagnostic_activation else None,
+                    "event_watermark": diagnostic_event_watermark,
+                    "candidate_identities": diagnostic_cohort.get(
+                        "candidate_identities"),
+                } if diagnostic_cohort is not None else {
+                    "diagnostic_only": False, "authorizing": False,
+                    "enabled": False,
+                }),
             }
             manifest_digest = self.store.save_manifest(manifest)
-            return {
+            replay_identity = _manifest_replay_identity(
+                manifest, manifest_digest)
+            diagnostic_result = self._run_diagnostic_poll(
+                diagnostic_cohort, diagnostic_arms, diagnostic_activation,
+                snapshot_rows=diagnostic_rows,
+                progress=diagnostic_progress,
+                replay_identity=replay_identity)
+            diagnostic_errors = diagnostic_result.get("candidate_errors") or {}
+            decision_count = self.store.decision_count()
+            result = {
                 "candidates": 0,
                 "no_candidates": True,
                 "ingested_events": ingested,
@@ -2995,7 +4498,7 @@ class ShadowRunner:
                 "conflicts": conflicts,
                 "invalid_events": invalid_events,
                 "manifest_digest": manifest_digest,
-                "candidate_errors": {},
+                "candidate_errors": dict(diagnostic_errors),
                 "skipped_recovery_bytes": skipped_recovery_bytes,
                 "quarantine_through_session": quarantine_through,
                 "forward_event_floor": float(forward_floor),
@@ -3004,8 +4507,22 @@ class ShadowRunner:
                 "opportunity_capacity": [],
                 "signal_dispositions": signal_dispositions,
                 "stress_calibration": calibration_status,
+                "authorizing_candidates": 0,
+                "diagnostic_candidates": len(diagnostic_arms),
                 **prune,
             }
+            result["diagnostic_shadow"] = self._diagnostic_coverage(
+                diagnostic_cohort, diagnostic_activation,
+                this_poll_decisions=int(diagnostic_result.get(
+                    "this_poll_decisions") or 0),
+                preactivation_rejections=int(diagnostic_result.get(
+                    "provenance_rejections") or 0),
+                poll_duration_seconds=time.monotonic() - poll_started)
+            result["poll_duration_seconds"] = result[
+                "diagnostic_shadow"]["poll_duration_seconds"]
+            result["source_lag_seconds"] = result[
+                "diagnostic_shadow"]["source_lag_seconds"]
+            return result
         events, bars, quotes, options = self._load_events()
         # Persist only exact recorder/Alpaca calendar sessions.  This catalog
         # is the continuity authority used by ingestion; event timestamps or
@@ -3161,6 +4678,8 @@ class ShadowRunner:
             "last_timestamp": (str(frozen_events[-1].get("timestamp") or "")
                                 if frozen_events else None),
         }
+        manifest_arms = [*arms, *(dict(arm) for arm in diagnostic_arms)]
+        manifest_arms.sort(key=lambda item: str(item.get("candidate_id") or ""))
         candidate_watermark = [{
             "candidate_id": str(arm.get("candidate_id") or ""),
             "variant_id": str(arm.get("variant_id") or ""),
@@ -3168,7 +4687,12 @@ class ShadowRunner:
             "vehicle": str(arm.get("vehicle") or ""),
             "status": str(arm.get("status") or ""),
             "config_digest": _digest(_safe_config(arm)),
-        } for arm in arms]
+            "diagnostic_only": is_diagnostic_candidate(arm),
+            "family": arm.get("family") if is_diagnostic_candidate(arm) else None,
+            "role": arm.get("role") if is_diagnostic_candidate(arm) else None,
+            "cohort_identity": (arm.get("cohort_identity")
+                                if is_diagnostic_candidate(arm) else None),
+        } for arm in manifest_arms]
         manifest = {
             "schema": "shadow-manifest.v1",
             "replay_code_hash": _replay_code_hash(),
@@ -3184,16 +4708,42 @@ class ShadowRunner:
                                          replay_only_sessions),
             "replay_validation_sessions": sorted(replay_only_sessions),
             "max_workers": int(self.config.max_workers),
+            "diagnostic_shadow": ({
+                "diagnostic_only": True,
+                "authorizing": False,
+                "cohort_identity": diagnostic_cohort.get("cohort_identity"),
+                "code_identity": diagnostic_cohort.get("code_identity"),
+                "runtime_config_identity": diagnostic_cohort.get(
+                    "runtime_config_identity"),
+                "policy_config_identity": diagnostic_cohort.get(
+                    "policy_config_identity"),
+                "activation_identity": (diagnostic_activation.get(
+                    "activation_identity") if diagnostic_activation else None),
+                "activation_event_watermark": (
+                    diagnostic_activation.get("activation_event_watermark")
+                    if diagnostic_activation else None),
+                "event_watermark": diagnostic_event_watermark,
+                "candidate_identities": diagnostic_cohort.get(
+                    "candidate_identities"),
+                "arms": [{key: arm.get(key) for key in (
+                    "candidate_id", "family", "role", "variant_id",
+                    "spec_identity", "config_identity", "code_identity",
+                    "cohort_identity")}
+                         for arm in diagnostic_cohort.get("arms", ())
+                         if isinstance(arm, Mapping)],
+            } if diagnostic_cohort is not None else {
+                "diagnostic_only": False, "authorizing": False,
+                "enabled": False,
+            }),
         }
         # A successful replay advances the immutable event floor below.  On a
         # retry with no newly loaded rows, reuse that final content-addressed
         # snapshot rather than creating a digest that merely says ``count=0``;
         # this keeps retries auditable and idempotent while still allowing a
         # changed candidate/source snapshot to receive a new manifest.
-        prior_manifest = self.store.manifest()
         reuse_manifest = bool(
             not events and not frozen_session_events and
-            not replay_only_sessions and
+            not replay_only_sessions and not diagnostic_rows and
             isinstance(prior_manifest, Mapping) and
             prior_manifest.get("candidate_set_digest") == manifest["candidate_set_digest"] and
             prior_manifest.get("source_watermark", {}).get("offsets") ==
@@ -3206,26 +4756,38 @@ class ShadowRunner:
             manifest_digest = str(manifest["manifest_digest"])
         else:
             manifest_digest = self.store.save_manifest(manifest)
+        replay_identity = _manifest_replay_identity(manifest, manifest_digest)
+        diagnostic_result = self._run_diagnostic_poll(
+            diagnostic_cohort, diagnostic_arms, diagnostic_activation,
+            snapshot_rows=diagnostic_rows, progress=diagnostic_progress,
+            replay_identity=replay_identity)
 
         # Dispatch one immutable session at a time.  The parent commits
         # decisions and performs replay before the next session is submitted,
         # preserving virtual-book blocking when a replay remains incomplete.
         # Workers still run candidate arms concurrently within each barrier.
         arm_by_id = {str(arm["candidate_id"]): arm for arm in arms}
-        candidate_errors: dict[str, str] = {}
+        diagnostic_errors = dict(diagnostic_result.get("candidate_errors") or {})
+        candidate_errors: dict[str, str] = dict(diagnostic_errors)
+        authorizing_errors: dict[str, str] = {}
         failed_arms: set[str] = set()
         replay_blocked = False
         replay_decisions: dict[str, list[dict[str, Any]]] = {}
         for session in sorted(set(frozen_session_events) | replay_only_sessions):
             is_replay_only = session in replay_only_sessions
-            session_events_one = {session: frozen_session_events[session]}
             session_inputs_one = {session: frozen_session_inputs[session]}
             session_candidates = ({candidate_id for candidate_id, value in gate_pairs
                                    if value == session}
                                   if is_replay_only else arm_ids)
-            active_arms = [arm for arm in arms
-                           if str(arm["candidate_id"]) in session_candidates and
-                           str(arm["candidate_id"]) not in failed_arms]
+            eligible_events_by_arm: dict[str, tuple[dict, ...]] = {}
+            active_arms: list[dict[str, Any]] = []
+            for arm in arms:
+                candidate_id = str(arm["candidate_id"])
+                if candidate_id not in session_candidates or candidate_id in failed_arms:
+                    continue
+                eligible_events_by_arm[candidate_id] = tuple(
+                    frozen_session_events[session])
+                active_arms.append(arm)
             session_success = bool(active_arms)
             initial_states = {
                 str(arm["candidate_id"]): self._portfolio_state(
@@ -3236,7 +4798,9 @@ class ShadowRunner:
                                         thread_name_prefix="shadow-eval") as pool:
                     futures = {
                         pool.submit(self._evaluate_arm_snapshot, arm,
-                                    session_events_one, session_inputs_one,
+                                    {session: eligible_events_by_arm[
+                                        str(arm["candidate_id"])]},
+                                    session_inputs_one,
                                     frozen_bars, frozen_quotes, frozen_options,
                                     initial_states[str(arm["candidate_id"])]): arm
                         for arm in active_arms}
@@ -3259,6 +4823,7 @@ class ShadowRunner:
                 candidate_id = str(result.get("candidate_id") or "")
                 if result.get("error"):
                     candidate_errors[candidate_id] = str(result["error"])
+                    authorizing_errors[candidate_id] = str(result["error"])
                     failed_arms.add(candidate_id)
                     session_success = False
                     continue
@@ -3267,6 +4832,7 @@ class ShadowRunner:
                     str(item.get("session_date") or ""),
                     str(item.get("symbol") or "")))
                 for decision in decisions:
+                    payload = decision.get("payload") or {}
                     inserted = self.store.decision(
                         candidate_id=candidate_id,
                         event_key=str(decision.get("event_key") or ""),
@@ -3274,7 +4840,7 @@ class ShadowRunner:
                         symbol=str(decision.get("symbol") or ""),
                         kind=str(decision.get("kind") or "no_data"),
                         reason=decision.get("reason"),
-                        payload=decision.get("payload") or {},
+                        payload=payload,
                         max_decisions=self.config.max_decisions)
                     if inserted and decision.get("plan") is not None:
                         self.store.virtual_open(
@@ -3310,12 +4876,14 @@ class ShadowRunner:
                         rows.extend(current_rows)
                     complete = self._replay(
                         arm_by_id[candidate_id], session, session_bars,
-                        session_quotes, rows, session_options)
+                        session_quotes, rows, session_options,
+                        replay_identity=replay_identity)
                     if complete is not True:
                         session_success = False
                 except Exception as exc:
-                    candidate_errors[candidate_id] = (
-                        f"{type(exc).__name__}: {str(exc)[:240]}")
+                    message = f"{type(exc).__name__}: {str(exc)[:240]}"
+                    candidate_errors[candidate_id] = message
+                    authorizing_errors[candidate_id] = message
                     failed_arms.add(candidate_id)
                     session_success = False
             if not session_success:
@@ -3339,7 +4907,7 @@ class ShadowRunner:
         # place for a deterministic retry; immutable evidence is never pruned.
         floor_eligible = bool(
             frozen_session_events and not replay_blocked and
-            not candidate_errors and not failed_arms and
+            not authorizing_errors and not failed_arms and
             not invalid_sessions and not unknown_quarantine and
             not pending_repairs)
         if floor_eligible:
@@ -3381,7 +4949,19 @@ class ShadowRunner:
                 if isinstance(detail, Mapping)
                 and str(detail.get("source") or "") == "recorder_alpaca_calendar")[-64:],
         }
-        signal_dispositions = _signal_dispositions(self.store.decisions())
+        diagnostic_candidate_ids = {
+            str(row.get("candidate_id") or "")
+            for row in self.store.candidates()
+            if self.store._candidate_row_is_diagnostic(
+                str(row.get("candidate_id") or ""), row.get("config_json"),
+                row.get("proof_json"))
+        }
+        authorizing_decisions = [
+            row for row in self.store.decisions()
+            if (str(row.get("candidate_id") or "") not in diagnostic_candidate_ids
+                and not is_diagnostic_candidate(
+                    str(row.get("candidate_id") or "")))]
+        signal_dispositions = _signal_dispositions(authorizing_decisions)
         calibration_status = self._calibration_status()
         stale_tail["signal_dispositions"] = signal_dispositions
         stale_tail["stress_calibration"] = calibration_status
@@ -3391,6 +4971,9 @@ class ShadowRunner:
         # tail for the operational result.
         capacity: list[dict[str, Any]] = []
         for metadata in self.store.replay_metadata():
+            if (str(metadata.get("candidate_id") or "") in diagnostic_candidate_ids or
+                    is_diagnostic_candidate(str(metadata.get("candidate_id") or ""))):
+                continue
             details = metadata.get("details")
             summary = details.get("opportunity_capacity") if isinstance(details, Mapping) else None
             if not isinstance(summary, Mapping):
@@ -3403,7 +4986,17 @@ class ShadowRunner:
             })
         capacity = sorted(capacity, key=lambda item: (
             item["candidate_id"], item["session_date"]))[-64:]
-        return {"candidates": len(candidates), "ingested_events": ingested,
+        diagnostic_coverage = self._diagnostic_coverage(
+            diagnostic_cohort, diagnostic_activation,
+            this_poll_decisions=int(diagnostic_result.get(
+                "this_poll_decisions") or 0),
+            preactivation_rejections=int(diagnostic_result.get(
+                "provenance_rejections") or 0),
+            poll_duration_seconds=time.monotonic() - poll_started)
+        return {"candidates": len(candidates),
+                "authorizing_candidates": len(candidates),
+                "diagnostic_candidates": len(diagnostic_arms),
+                "ingested_events": ingested,
                 "events": len(events), "decisions": self.store.decision_count(),
                 "conflicts": conflicts, "invalid_events": invalid_events,
                 "manifest_digest": manifest_digest,
@@ -3416,6 +5009,11 @@ class ShadowRunner:
                 "opportunity_capacity": capacity,
                 "signal_dispositions": signal_dispositions,
                 "stress_calibration": calibration_status,
+                "diagnostic_shadow": diagnostic_coverage,
+                "poll_duration_seconds": diagnostic_coverage[
+                    "poll_duration_seconds"],
+                "source_lag_seconds": diagnostic_coverage[
+                    "source_lag_seconds"],
                 **prune}
 
 
@@ -3429,17 +5027,31 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--corpus", type=Path, default=Path("runtime/research/recorded/data.csv"))
     parser.add_argument("--edge-db", type=Path, default=Path("runtime/research/edge_lab.sqlite3"))
     parser.add_argument("--shadow-db", type=Path, default=Path("runtime/research/shadow.sqlite3"))
+    parser.add_argument("--config", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "config.yaml")
+    parser.add_argument("--diagnostic", action=argparse.BooleanOptionalAction,
+                        default=True)
     parser.add_argument("--once", action="store_true", help="ingest and evaluate one cycle")
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
+    parser.add_argument(
+        "--diagnostic-session-max-events", type=int,
+        default=DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    runtime_config = (load_runtime_config(args.config)
+                      if args.diagnostic else None)
     cfg = ShadowConfig(corpus_path=args.corpus, edge_db=args.edge_db,
                        shadow_db=args.shadow_db, poll_seconds=args.interval,
-                       max_workers=args.max_workers)
+                       max_workers=args.max_workers,
+                       diagnostic_session_max_events=(
+                           args.diagnostic_session_max_events),
+                       diagnostic=args.diagnostic,
+                       runtime_config=runtime_config,
+                       runtime_config_path=args.config)
     while True:
         try:
             print(json.dumps(run_shadow_once(cfg), sort_keys=True), flush=True)
@@ -3453,7 +5065,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
-    "DEFAULT_EQUITY", "DEFAULT_MAX_WORKERS", "DEFAULT_RETENTION_DAYS", "InputConflict",
+    "DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS", "DEFAULT_EQUITY",
+    "DEFAULT_MAX_WORKERS", "DEFAULT_RETENTION_DAYS", "InputConflict",
     "_opportunity_capacity", "_signal_dispositions", "REPLAY_QUARANTINE_META_KEY",
     "SESSION_CATALOG_META_KEY", "REPLAY_QUARANTINE_OVERFLOW_KEY",
     "ShadowConfig", "ShadowError",

@@ -12,11 +12,14 @@ from unittest.mock import patch
 from research import edge_discovery_core, gates
 from research.edge_ledger import EdgeLedger
 from research.edge_ledger_store import content_hash
-from research.live_shadow import ShadowStore
+from research.live_shadow import (
+    ShadowStore, _candidate_epoch_identity, _digest,
+    _manifest_replay_identity, _safe_config,
+)
 from research.factory_ledger import FactoryLedger
 from research.live_shadow_ingest import (
     MAX_CONFIRMATORY_ITERATIONS, ShadowIngestConfig, _confirmatory_iterations,
-    ingest_shadow,
+    _meta_by_session, ingest_shadow,
 )
 
 from tests.research.test_edge_discovery import _persist_gate
@@ -96,6 +99,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         # half has enough exact clusters for the deterministic tests; short
         # value patterns repeat across the complete tail.
         sessions = [f"2024-04-{day:02d}" for day in range(1, 17)]
+        replay_identity = self._replay_identity(cid)
         for index, session in enumerate(sessions):
             value = values[index % len(values)]
             row = {"vehicle": "equity", "symbol": "SPY",
@@ -122,7 +126,8 @@ class LiveShadowIngestTests(unittest.TestCase):
                 source_digest=digest, shadow_digest=f"shadow:{cid}:{session}",
                 replay_digest=replay, status=status,
                 details={"complete": status == "match",
-                         "signature_match": status == "match"})
+                         "signature_match": status == "match",
+                         **replay_identity})
             self.store.record_replay_evidence(
                 candidate_id=cid, session_date=session,
                 replay_digest=replay, vehicle="equity",
@@ -144,17 +149,48 @@ class LiveShadowIngestTests(unittest.TestCase):
                "entry_quote_age_seconds": 0.0,
                "exit_quote_age_seconds": 0.0}
         replay = f"replay:{cid}:{session}"
+        replay_identity = self._replay_identity(cid)
         self.store.replay_diff(
             candidate_id=cid, session_date=session,
             source_digest=f"source:{cid}:{session}",
             shadow_digest=f"shadow:{cid}:{session}", replay_digest=replay,
             status=status, details={"complete": status == "match",
-                                    "signature_match": status == "match"})
+                                    "signature_match": status == "match",
+                                    **replay_identity})
         self.store.record_replay_evidence(
             candidate_id=cid, session_date=session, replay_digest=replay,
             vehicle="equity", starting_cash=100_000,
             ending_cash=100_000 + float(value), realized_pnl=float(value),
             trades=[row], replay_status=status)
+
+    def _replay_identity(self, cid):
+        candidate_rows = {
+            str(row.get("candidate_id") or ""): row
+            for row in self.ledger.status()
+        }
+        for row in candidate_rows.values():
+            self.store.upsert_candidate(row)
+        candidate_id = str(cid)
+        if candidate_id.startswith("shadow:null:"):
+            candidate_id = candidate_id.removeprefix("shadow:null:")
+        candidate_row = candidate_rows[candidate_id]
+        candidate_set = [
+            {"candidate_id": value,
+             "config_digest": _digest(_safe_config(candidate_rows[value]))}
+            for value in sorted(candidate_rows)
+        ]
+        digest = self.store.save_manifest({
+            "candidate_set": candidate_set,
+            "candidate_set_digest": _digest(candidate_set),
+            "event_watermark": {"count": 0},
+        })
+        manifest = self.store.manifest(digest)
+        self.assertIsNotNone(manifest)
+        identity = _manifest_replay_identity(manifest)
+        identity["candidate_epoch_identity"] = _candidate_epoch_identity(
+            candidate_id=candidate_id,
+            config=_safe_config(candidate_row), replay_identity=identity)
+        return identity
 
     def test_matched_tail_appends_shadow_proof_and_transitions(self):
         cid = self.candidate["candidate_id"]
@@ -184,8 +220,61 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertAlmostEqual(state["decisions"][0]["p_value"],
                                online["p_value"])
         evidence = self.ledger.evidence(cid)
-        self.assertTrue(any(item["kind"] == "shadow_ingestion" for item in evidence))
+        self.assertTrue(any(item["kind"] == "shadow_ingestion"
+                            for item in evidence))
         self.assertEqual(len(self.ledger.trades(cid, lane="shadow")), 8)
+
+    def test_old_code_and_unstamped_no_trade_metadata_are_audit_only(self):
+        cid = self.candidate["candidate_id"]
+        session = "2024-04-01"
+        identity = self._replay_identity(cid)
+        identity["replay_code_hash"] = "0" * 64
+        self.store.replay_diff(
+            candidate_id=cid, session_date=session,
+            source_digest="source", shadow_digest="shadow",
+            replay_digest="replay", status="match",
+            details={"complete": True, "signature_match": True, **identity})
+        self.store.record_replay_evidence(
+            candidate_id=cid, session_date=session, replay_digest="replay",
+            vehicle="equity", starting_cash=100_000, ending_cash=100_000,
+            realized_pnl=0, trades=[], replay_status="match")
+        rows, reason = _meta_by_session(
+            self.store, cid, [session], "equity")
+        self.assertEqual(rows, {})
+        self.assertIn("code/manifest epoch is stale", reason)
+
+    def test_forged_candidate_epoch_no_trade_metadata_are_audit_only(self):
+        cid = self.candidate["candidate_id"]
+        session = "2024-04-01"
+        identity = self._replay_identity(cid)
+        identity["candidate_epoch_identity"] = "forged-but-nonempty"
+        self.store.replay_diff(
+            candidate_id=cid, session_date=session,
+            source_digest="source", shadow_digest="shadow",
+            replay_digest="replay", status="match",
+            details={"complete": True, "signature_match": True, **identity})
+        self.store.record_replay_evidence(
+            candidate_id=cid, session_date=session, replay_digest="replay",
+            vehicle="equity", starting_cash=100_000, ending_cash=100_000,
+            realized_pnl=0, trades=[], replay_status="match")
+        rows, reason = _meta_by_session(
+            self.store, cid, [session], "equity")
+        self.assertEqual(rows, {})
+        self.assertIn("candidate epoch identity mismatch", reason)
+
+    def test_explicit_marker_only_diagnostic_candidate_is_not_ingested(self):
+        candidate = self.ledger.register_candidate(
+            "rule.alias.diagnostic", strategy_id="rule", vehicle="equity",
+            hypothesis="non-authorizing alias",
+            config={"strategy": {"id": "rule"},
+                    "diagnostic_shadow": {"diagnostic_only": True}})
+        result = ingest_shadow(ShadowIngestConfig(
+            self.edge_path, self.shadow_path,
+            candidate_id=candidate["candidate_id"],
+            min_trades=1, min_sessions=1))
+        self.assertEqual(result["ingested"], 0)
+        self.assertEqual(result["candidates"][0]["status"],
+                         "diagnostic_non_authorizing")
 
     def test_generic_evidence_api_cannot_append_shadow_authorization_marker(self):
         cid = self.candidate["candidate_id"]

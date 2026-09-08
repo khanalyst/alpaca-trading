@@ -176,7 +176,11 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                 log.warning(self._preflight_error)
             else:
                 try:
-                    state.write_heartbeat("starting", run_id=self.run_id)
+                    detail = {"run_id": self.run_id}
+                    if self.mode == "paper":
+                        detail["paper_selection"] = \
+                            self._paper_selection_status()
+                    state.write_heartbeat("starting", **detail)
                     self._heartbeat_owner = True
                     self.preflight()
                     self.reconcile()
@@ -203,6 +207,8 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
             "variant_ids": [record.get("variant_id") for record in self._edge_records],
             "edge_vehicle": (self._edge_record or {}).get("vehicle"),
         }
+        if self.mode == "paper":
+            result["paper_selection"] = self._paper_selection_status()
         if authenticated:
             preflight = self.preflight()
             result.update(authenticated=True, account=preflight["account"],
