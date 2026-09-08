@@ -128,6 +128,7 @@ PARTITION_CALENDAR_SCHEMA = "recorder-partition-calendar.v1"
 DEDUP_HORIZON = timedelta(minutes=15)
 MAX_INLINE_INDEX_BYTES = 16 * 1024 * 1024
 RECENT_KEY_BATCH_SIZE = 10_000
+RECENT_KEY_CACHE_KIB = 64 * 1024
 DEFAULT_FETCH_WINDOW_MINUTES = 1
 DEFAULT_FORWARD_OBSERVATION_MAX_LAG_MINUTES = 15
 DEFAULT_BAR_GAP_MINUTES = 5
@@ -152,6 +153,9 @@ def _initialize_cycle_telemetry(target: dict) -> dict:
         "validation_ingest_seconds": 0.0,
         "revision_validation_save_seconds": 0.0,
         "durable_save_seconds": 0.0,
+        "csv_partition_flush_fsync_seconds": 0.0,
+        "recent_key_transaction_seconds": 0.0,
+        "index_json_save_seconds": 0.0,
         "windows_completed": 0,
         "projected_rows": 0,
         "session_rows": 0,
@@ -714,6 +718,7 @@ class RecentKeyIndex:
             self.db.execute("PRAGMA journal_mode=DELETE")
             self.db.execute("PRAGMA synchronous=FULL")
             self.db.execute("PRAGMA temp_store=FILE")
+            self.db.execute(f"PRAGMA cache_size=-{RECENT_KEY_CACHE_KIB}")
         if create:
             with self.db:
                 self.db.execute(
@@ -786,6 +791,61 @@ class RecentKeyIndex:
                 "INSERT INTO metadata(key,value) VALUES (?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 sorted(values.items()))
+        return {
+            "schema": RECENT_KEY_INDEX_SCHEMA,
+            "name": RECENT_KEY_INDEX_NAME,
+            "count": count,
+            "corpus_signature": signature,
+        }
+
+    def commit_cycle(self, entries, *, floor: datetime | None,
+                     signature: str) -> dict:
+        """Atomically publish one cycle's exact recent-key state.
+
+        CSV partitions are already durable when this begins.  Keeping inserts,
+        expiry, the exact count, and corpus binding in one FULL-synchronous
+        rollback-journal transaction avoids repeated durable journal cycles
+        while ensuring a fault in any phase leaves the prior SQLite state
+        intact.  The aggregate JSON index is published only after this commit.
+        """
+        values = [(str(key), _recent_key_timestamp(stamp))
+                  for key, stamp in entries]
+        metadata_values = {
+            "schema": RECENT_KEY_INDEX_SCHEMA,
+            "corpus_signature": signature,
+        }
+        try:
+            with self.db:
+                # Begin before the read-only count too: even an empty or
+                # duplicate-only capture binds one internally consistent state.
+                self.db.execute("BEGIN IMMEDIATE")
+                if values:
+                    try:
+                        self.db.executemany(
+                            "INSERT INTO recent_keys(event_key,event_ts) "
+                            "VALUES (?,?)", values)
+                    except sqlite3.IntegrityError as exc:
+                        raise RuntimeError(
+                            "recorder recent-key index repeats an event_key") from exc
+                if floor is not None:
+                    self.db.execute(
+                        "DELETE FROM recent_keys WHERE event_ts < ?",
+                        (_recent_key_timestamp(floor),))
+                row = self.db.execute(
+                    "SELECT COUNT(*) FROM recent_keys").fetchone()
+                count = int(row[0]) if row is not None else 0
+                metadata_values["count"] = str(count)
+                self.db.executemany(
+                    "INSERT INTO metadata(key,value) VALUES (?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    sorted(metadata_values.items()))
+        except Exception:
+            # Connection context management performs the rollback.  Keep this
+            # explicit guard so a future refactor cannot accidentally publish
+            # metadata after any failed insert or prune operation.
+            if self.db.in_transaction:
+                self.db.rollback()
+            raise
         return {
             "schema": RECENT_KEY_INDEX_SCHEMA,
             "name": RECENT_KEY_INDEX_NAME,
@@ -1205,7 +1265,8 @@ def _load_preserved_index_metadata(output: Path) -> dict | None:
 
 
 def _save_index(output: Path, index: dict,
-                recent_store: RecentKeyIndex | None = None) -> None:
+                recent_store: RecentKeyIndex | None = None, *,
+                recent_entries=(), telemetry: dict | None = None) -> None:
     root = _corpus_root(output)
     root.mkdir(parents=True, exist_ok=True)
     index = _prune_index(dict(index))
@@ -1238,20 +1299,24 @@ def _save_index(output: Path, index: dict,
                         partitions=partitions, fingerprints=fingerprints)
             if recent_store is not None:
                 watermark = _timestamp(index.get("watermark"))
-                recent_store.prune(
-                    watermark - DEDUP_HORIZON if watermark is not None else None)
-                metadata = recent_store.bind(signature=signature)
+                floor = (watermark - DEDUP_HORIZON
+                         if watermark is not None else None)
+                with _timed_cycle_phase(
+                        telemetry, "recent_key_transaction_seconds"):
+                    metadata = recent_store.commit_cycle(
+                        recent_entries, floor=floor, signature=signature)
         finally:
             if owned_store is not None:
                 owned_store.close()
     index["recent_key_index"] = metadata
     temporary = root / (INDEX_NAME + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(index, handle, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, root / INDEX_NAME)
-    _fsync_directory(root)
+    with _timed_cycle_phase(telemetry, "index_json_save_seconds"):
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(index, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, root / INDEX_NAME)
+        _fsync_directory(root)
 
 
 def _prepare_index(output: Path) -> dict:
@@ -1391,6 +1456,21 @@ class CalendarCache:
     def known(self, day: date) -> bool:
         self.session(day)
         return self.available is True
+
+    def isolated(self) -> "CalendarCache":
+        """Return a disposable view for historical enumeration.
+
+        Deferred-gap discovery may walk far beyond the current cache span and
+        encounter unavailable historical calendar data.  Copying the current
+        exact view lets that best-effort walk reuse known sessions without
+        replacing or poisoning the cache that authorizes the live window.
+        """
+        view = CalendarCache(self.provider, span_days=self.span_days)
+        view.days = dict(self.days)
+        view.covered = self.covered
+        view.available = self.available
+        view._failed_on = self._failed_on
+        return view
 
 
 def _record_session_calendar(index: dict, calendar: CalendarCache | None,
@@ -1568,18 +1648,24 @@ def _latest_exact_session_window(start: datetime, end: datetime,
 
 def _deferred_open_session_intervals(
         start: datetime, end: datetime,
-        calendar: CalendarCache) -> tuple[list[dict[str, str]], bool]:
+        calendar: CalendarCache
+        ) -> tuple[list[dict[str, str]], bool, date | None]:
     """Return newest bounded open-session segments omitted before a fetch."""
     if end <= start:
-        return [], False
+        return [], False, None
     first = start.astimezone(NEW_YORK).date()
     day = end.astimezone(NEW_YORK).date()
     newest_first: list[dict[str, str]] = []
     truncated = False
+    history_unavailable_on_or_before = None
     while day >= first:
         if not calendar.known(day):
-            raise RuntimeError(
-                f"exact broker calendar metadata unavailable: {day.isoformat()}")
+            # Deferred metadata is descriptive, not authorization for the
+            # newest fetch. Preserve exact intervals already resolved and mark
+            # the older boundary unknown instead of treating it as a closure.
+            truncated = True
+            history_unavailable_on_or_before = day
+            break
         session = calendar.session(day)
         if session is not None:
             opened = max(start, session.open.astimezone(timezone.utc))
@@ -1594,32 +1680,41 @@ def _deferred_open_session_intervals(
                 })
         day -= timedelta(days=1)
     newest_first.reverse()
-    return newest_first, truncated
+    return newest_first, truncated, history_unavailable_on_or_before
 
 
 def _deferred_catchup_payload(
         watermark: datetime, window_start: datetime, observed_at: datetime,
         calendar: CalendarCache) -> dict | None:
     """Describe only authoritative open-session history not recorded live."""
-    intervals, truncated = _deferred_open_session_intervals(
-        watermark, window_start, calendar)
-    if not intervals:
+    intervals, truncated, history_unavailable = (
+        _deferred_open_session_intervals(
+            watermark, window_start, calendar.isolated()))
+    if not intervals and history_unavailable is None:
         return None
-    latest = intervals[-1]
-    return {
-        # Keep the legacy scalar fields non-inverted and scoped to one actual
-        # open interval. Consumers needing the full gap use ``intervals``.
-        "from": latest["from"],
-        "through": latest["through"],
-        "summary_scope": "latest_open_session_interval",
+    payload = {
         "intervals": intervals,
         "intervals_truncated_before": truncated,
         "interval_limit": MAX_DEFERRED_CATCHUP_INTERVALS,
+        "history_unavailable": history_unavailable is not None,
         "observed_at": observed_at.isoformat(),
         "reason": "forward_capture_priority",
         "source": "alpaca_calendar",
         "recorded": False,
     }
+    if history_unavailable is not None:
+        payload["history_unavailable_on_or_before"] = (
+            history_unavailable.isoformat())
+    if intervals:
+        latest = intervals[-1]
+        # Keep legacy scalar fields non-inverted and scoped to one actual open
+        # interval. Unknown history never fabricates scalar boundaries.
+        payload.update({
+            "from": latest["from"],
+            "through": latest["through"],
+            "summary_scope": "latest_open_session_interval",
+        })
+    return payload
 
 
 def _regular_session_gap(previous: datetime, current: datetime,
@@ -1812,7 +1907,8 @@ def _migrate_header(output: Path) -> None:
     os.replace(temporary, output)
 
 
-def _append_partitions(output: Path, rows: list[dict]) -> None:
+def _append_partitions(output: Path, rows: list[dict], *,
+                       telemetry: dict | None = None) -> None:
     """Append rows to their session partitions, creating headers as needed."""
     by_day: dict[date, list[dict]] = {}
     for row in rows:
@@ -1830,10 +1926,14 @@ def _append_partitions(output: Path, rows: list[dict]) -> None:
                 writer.writeheader()
             writer.writerows({field: row.get(field, "") for field in FIELDS}
                              for row in by_day[day])
-            handle.flush()
-            os.fsync(handle.fileno())
+            with _timed_cycle_phase(
+                    telemetry, "csv_partition_flush_fsync_seconds"):
+                handle.flush()
+                os.fsync(handle.fileno())
         if fresh:
-            _fsync_directory(path.parent)
+            with _timed_cycle_phase(
+                    telemetry, "csv_partition_flush_fsync_seconds"):
+                _fsync_directory(path.parent)
 
 
 def migrate_corpus(output: Path) -> int:
@@ -2098,15 +2198,17 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
                     sources[_partition_path(output, day).name] = {
                         "source_mode": "historical_backfill",
                     }
-                _append_partitions(output, unique_rows)
+                _append_partitions(
+                    output, unique_rows, telemetry=telemetry)
                 # The corpus append happens first.  If the process dies before the
                 # SQLite and JSON commits, partition sizes no longer match the
                 # sidecars and recovery rebuilds them from the authoritative CSV.
-                recent_store.add_many(recent_entries)
         # Persist even a duplicate-only response: the sidecar write is the
         # recorder's durable liveness signal, while the corpus remains unchanged.
         with _timed_cycle_phase(telemetry, "durable_save_seconds"):
-            _save_index(output, index, recent_store=recent_store)
+            _save_index(
+                output, index, recent_store=recent_store,
+                recent_entries=recent_entries, telemetry=telemetry)
     return index, watermark, latest_bars, pins, len(unique_rows)
 
 
@@ -2312,7 +2414,7 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
         # this keeps strict fetch failures atomic while retaining closed-day
         # markers for a successful no-data holiday response.
         with _timed_cycle_phase(telemetry, "durable_save_seconds"):
-            _save_index(output, index)
+            _save_index(output, index, telemetry=telemetry)
         if capture_policy == "forward_only" and require_exact_calendar and completed_windows == 0:
             # The exact calendar contains no open market interval in the
             # requested recent window. This is a healthy idle recorder.

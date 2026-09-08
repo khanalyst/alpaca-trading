@@ -505,8 +505,11 @@ class EngineCycleMixin:
 
         if not self._refresh_edge():
             try:
-                state.write_heartbeat("paused", run_id=self.run_id,
-                                      reason="validated_edge_required")
+                detail = {"run_id": self.run_id,
+                          "reason": "validated_edge_required"}
+                if self.mode == "paper":
+                    detail["paper_selection"] = self._paper_selection_status()
+                state.write_heartbeat("paused", **detail)
             except Exception:
                 pass
             return {"action": "hold", "reason": self._edge_error or

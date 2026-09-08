@@ -213,6 +213,32 @@ class _ForwardCalendarFake:
                 {"date": "2026-09-08", "open": "09:30", "close": "16:00"}]
 
 
+class _CurrentCalendarHistoricalFailureFake:
+    """Serve current exact sessions but reject sufficiently old history."""
+
+    def __init__(self):
+        self.calls = []
+        self.historical_failures = 0
+
+    def calendar(self, start=None, end=None):
+        self.calls.append((start, end))
+        if end < datetime(2026, 8, 20).date():
+            self.historical_failures += 1
+            raise OSError("historical calendar unavailable")
+        rows = []
+        cursor = start
+        while cursor <= end:
+            if (cursor.weekday() < 5 and
+                    cursor != datetime(2026, 9, 7).date()):
+                rows.append({
+                    "date": cursor.isoformat(),
+                    "open": "09:30",
+                    "close": "16:00",
+                })
+            cursor += timedelta(days=1)
+        return rows
+
+
 def _corpus_rows(*, sessions: int, per_session: int, minute: int = 0,
                  feed: str = "iex") -> list[dict]:
     """Synthesize a durable corpus ending the session before the fakes' rows."""
@@ -2146,7 +2172,10 @@ class DeployTests(unittest.TestCase):
                 "corpus_migration_seconds", "index_preparation_seconds",
                 "calendar_preparation_seconds", "fetch_projection_seconds",
                 "validation_ingest_seconds",
-                "revision_validation_save_seconds", "durable_save_seconds"):
+                "revision_validation_save_seconds", "durable_save_seconds",
+                "csv_partition_flush_fsync_seconds",
+                "recent_key_transaction_seconds",
+                "index_json_save_seconds"):
             self.assertGreaterEqual(telemetry[field], 0.0)
         self.assertEqual(saved["cycle_telemetry"], telemetry)
         self.assertNotIn("cpu_seconds", telemetry)
@@ -2216,6 +2245,130 @@ class DeployTests(unittest.TestCase):
                 2026, 9, 8, 13, 30, tzinfo=timezone.utc).isoformat(),
             "through": window_start.isoformat(),
         })
+
+    def test_recorder_deferred_history_failure_has_no_invented_bounds(self):
+        class UnavailableCalendar:
+            def calendar(self, start=None, end=None):
+                raise OSError("calendar unavailable")
+
+        start = datetime(2026, 7, 1, 15, 0, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 2, 15, 0, tzinfo=timezone.utc)
+        payload = recorder._deferred_catchup_payload(
+            start, end, end,
+            recorder.CalendarCache(UnavailableCalendar()))
+
+        self.assertEqual(payload["intervals"], [])
+        self.assertTrue(payload["intervals_truncated_before"])
+        self.assertTrue(payload["history_unavailable"])
+        self.assertIn("history_unavailable_on_or_before", payload)
+        self.assertNotIn("from", payload)
+        self.assertNotIn("through", payload)
+
+    def test_forward_capture_isolates_unavailable_historical_calendar(self):
+        provider = _CurrentCalendarHistoricalFailureFake()
+        calendar = recorder.CalendarCache(provider)
+        fake = _QuoteChunkFake()
+        fixed_now = datetime(2026, 9, 8, 15, 0, tzinfo=timezone.utc)
+        stale = datetime(2026, 7, 1, 19, 59, tzinfo=timezone.utc)
+        row = {field: "" for field in recorder.FIELDS}
+        row.update({
+            "event_key": recorder._event_key(
+                "quote", "SPY", stale.isoformat()),
+            "observed_at": stale.isoformat(), "provider": "alpaca",
+            "feed": "sip", "event_type": "quote", "symbol": "SPY",
+            "timestamp": stale.isoformat(), "as_of": stale.isoformat(),
+            "bid": "100", "ask": "101",
+        })
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {
+                 "ALPACA_RECORDER_CAPTURE_POLICY": "forward_only",
+                 "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "1"}):
+            path = Path(directory) / "market.csv"
+            recorder._append_partitions(path, [row])
+            recorder._save_index(path, recorder._scan_corpus(path))
+
+            self.assertEqual(recorder.record_once(
+                fake, ["SPY"], path, now=fixed_now,
+                config={"session": {"require_exact_calendar": True}},
+                calendar=calendar), 1)
+            first_index = recorder._prepare_index(path)
+            deferred = first_index["deferred_catchup"]
+            self.assertTrue(deferred["intervals"])
+            self.assertTrue(deferred["intervals_truncated_before"])
+            self.assertTrue(deferred["history_unavailable"])
+            self.assertIn("history_unavailable_on_or_before", deferred)
+            self.assertTrue(calendar.available)
+            self.assertTrue(calendar.known(
+                fixed_now.astimezone(recorder.NEW_YORK).date()))
+            self.assertEqual(provider.historical_failures, 1)
+
+            next_now = fixed_now + timedelta(minutes=1)
+            self.assertEqual(recorder.record_once(
+                fake, ["SPY"], path, now=next_now,
+                config={"session": {"require_exact_calendar": True}},
+                calendar=calendar), 1)
+            self.assertTrue(calendar.available)
+            self.assertEqual(provider.historical_failures, 1)
+            self.assertEqual(
+                [item for item in fake.windows if item[0] == "quotes"],
+                [("quotes", fixed_now - timedelta(minutes=1), fixed_now),
+                 ("quotes", fixed_now, next_now)])
+            self.assertEqual(recorder._timestamp(
+                recorder._prepare_index(path)["watermark"]),
+                next_now - timedelta(seconds=1))
+
+    def test_forward_capture_closed_restart_keeps_current_calendar_usable(self):
+        stale = datetime(2026, 7, 1, 19, 59, tzinfo=timezone.utc)
+        closed_then_open = {
+            "weekend": (
+                datetime(2026, 9, 6, 15, 0, tzinfo=timezone.utc),
+                datetime(2026, 9, 8, 15, 0, tzinfo=timezone.utc)),
+            "overnight": (
+                datetime(2026, 9, 8, 21, 5, tzinfo=timezone.utc),
+                datetime(2026, 9, 9, 15, 0, tzinfo=timezone.utc)),
+        }
+        for label, (restart_now, open_now) in closed_then_open.items():
+            with self.subTest(label=label), \
+                 tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {
+                     "ALPACA_RECORDER_CAPTURE_POLICY": "forward_only",
+                     "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "1"}):
+                provider = _CurrentCalendarHistoricalFailureFake()
+                calendar = recorder.CalendarCache(provider)
+                fake = _QuoteChunkFake()
+                path = Path(directory) / "market.csv"
+                row = {field: "" for field in recorder.FIELDS}
+                row.update({
+                    "event_key": recorder._event_key(
+                        "quote", "SPY", stale.isoformat()),
+                    "observed_at": stale.isoformat(), "provider": "alpaca",
+                    "feed": "sip", "event_type": "quote", "symbol": "SPY",
+                    "timestamp": stale.isoformat(), "as_of": stale.isoformat(),
+                    "bid": "100", "ask": "101",
+                })
+                recorder._append_partitions(path, [row])
+                recorder._save_index(path, recorder._scan_corpus(path))
+
+                self.assertEqual(recorder.record_once(
+                    fake, ["SPY"], path, now=restart_now,
+                    config={"session": {"require_exact_calendar": True}},
+                    calendar=calendar), 0)
+                self.assertEqual(fake.windows, [])
+                self.assertNotIn(
+                    "deferred_catchup", recorder._prepare_index(path))
+                self.assertTrue(calendar.available)
+
+                self.assertEqual(recorder.record_once(
+                    fake, ["SPY"], path, now=open_now,
+                    config={"session": {"require_exact_calendar": True}},
+                    calendar=calendar), 1)
+                self.assertTrue(calendar.available)
+                self.assertGreaterEqual(provider.historical_failures, 1)
+                self.assertTrue(recorder._prepare_index(path)[
+                    "deferred_catchup"]["history_unavailable"])
+                self.assertEqual(
+                    [item for item in fake.windows if item[0] == "quotes"],
+                    [("quotes", open_now - timedelta(minutes=1), open_now)])
 
     def test_forward_capture_uses_newest_exact_session_in_a_wide_window(self):
         fake = _QuoteChunkFake()
@@ -2752,6 +2905,52 @@ class DeployTests(unittest.TestCase):
             self.assertLess((root / recorder.INDEX_NAME).stat().st_size,
                             max(16_384, before_size * 2))
 
+    def test_recorder_retry_after_sqlite_commit_before_json_deduplicates(self):
+        fake = _QuoteChunkFake()
+        first_now = datetime(2026, 9, 8, 14, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {
+                 "ALPACA_RECORDER_CAPTURE_POLICY": "forward_only",
+                 "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "1"}):
+            root = Path(directory)
+            path = root / "market.csv"
+            self.assertEqual(
+                recorder.record_once(fake, ["SPY"], path, now=first_now), 1)
+            real_replace = recorder.os.replace
+            failed = False
+
+            def fail_before_index_publish(source, target):
+                nonlocal failed
+                if (not failed and
+                        Path(target).name == recorder.INDEX_NAME):
+                    failed = True
+                    raise OSError("simulated crash before JSON publication")
+                return real_replace(source, target)
+
+            retry_now = first_now + timedelta(minutes=1)
+            with patch.object(
+                    recorder.os, "replace",
+                    side_effect=fail_before_index_publish):
+                with self.assertRaisesRegex(OSError, "before JSON"):
+                    recorder.record_once(
+                        fake, ["SPY"], path, now=retry_now)
+
+            interrupted_rows = list(recorder.iter_corpus_rows(path))
+            self.assertEqual(len(interrupted_rows), 2)
+            self.assertIsNone(recorder._load_index(path))
+            with recorder.RecentKeyIndex(
+                    root / recorder.RECENT_KEY_INDEX_NAME,
+                    read_only=True) as recent:
+                self.assertEqual(recent.count(), 2)
+
+            self.assertEqual(
+                recorder.record_once(fake, ["SPY"], path, now=retry_now), 0)
+            recovered_rows = list(recorder.iter_corpus_rows(path))
+            keys = [row["event_key"] for row in recovered_rows]
+            self.assertEqual(len(keys), 2)
+            self.assertEqual(len(keys), len(set(keys)))
+            self.assertIsNotNone(recorder._load_index(path))
+
     def test_recorder_repairs_missing_historical_partition_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "market.csv"
@@ -2861,6 +3060,91 @@ class DeployTests(unittest.TestCase):
                     2026, 8, 8, 13, 0, tzinfo=timezone.utc))
                 self.assertFalse(recent.contains("first"))
                 self.assertTrue(recent.contains("second"))
+
+    def test_recorder_recent_key_cache_keeps_full_delete_durability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / recorder.RECENT_KEY_INDEX_NAME
+            with recorder.RecentKeyIndex(database, create=True) as recent:
+                self.assertEqual(
+                    recent.db.execute("PRAGMA cache_size").fetchone()[0],
+                    -recorder.RECENT_KEY_CACHE_KIB)
+                self.assertEqual(
+                    recent.db.execute("PRAGMA journal_mode").fetchone()[0],
+                    "delete")
+                self.assertEqual(
+                    recent.db.execute("PRAGMA synchronous").fetchone()[0], 2)
+
+    def test_recorder_recent_key_cycle_commit_uses_one_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / recorder.RECENT_KEY_INDEX_NAME
+            with recorder.RecentKeyIndex(database, create=True) as recent:
+                recent.add_many([
+                    ("old", "2026-08-08T13:00:00+00:00"),
+                ])
+                recent.bind(signature="before")
+                statements = []
+                recent.db.set_trace_callback(statements.append)
+
+                metadata = recent.commit_cycle(
+                    [("new", "2026-08-08T13:02:00+00:00")],
+                    floor=datetime(2026, 8, 8, 13, 1,
+                                   tzinfo=timezone.utc),
+                    signature="after")
+
+                transaction_statements = [
+                    statement.strip().upper() for statement in statements
+                    if statement.strip().upper().startswith(("BEGIN", "COMMIT"))
+                ]
+                self.assertEqual(transaction_statements,
+                                 ["BEGIN IMMEDIATE", "COMMIT"])
+                self.assertFalse(recent.contains("old"))
+                self.assertTrue(recent.contains("new"))
+                self.assertEqual(metadata["count"], 1)
+                self.assertEqual(
+                    recent.metadata()["corpus_signature"], "after")
+
+    def test_recorder_recent_key_cycle_faults_rollback_all_phases(self):
+        old_stamp = "2026-08-08T13:00:00+00:00"
+        new_stamp = "2026-08-08T13:02:00+00:00"
+        floor = datetime(2026, 8, 8, 13, 1, tzinfo=timezone.utc)
+
+        def snapshot(recent):
+            return (
+                list(recent.db.execute(
+                    "SELECT event_key,event_ts FROM recent_keys "
+                    "ORDER BY event_key")),
+                recent.metadata(),
+            )
+
+        for phase in ("insert", "prune", "bind"):
+            with self.subTest(phase=phase), \
+                 tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / recorder.RECENT_KEY_INDEX_NAME
+                with recorder.RecentKeyIndex(database, create=True) as recent:
+                    recent.add_many([("old", old_stamp)])
+                    recent.bind(signature="before")
+                    before = snapshot(recent)
+                    entries = [("new", new_stamp)]
+                    if phase == "insert":
+                        entries = [("old", new_stamp)]
+                    elif phase == "prune":
+                        recent.db.execute(
+                            "CREATE TRIGGER fail_recent_prune "
+                            "BEFORE DELETE ON recent_keys BEGIN "
+                            "SELECT RAISE(ABORT, 'prune fault'); END")
+                        recent.db.commit()
+                    else:
+                        recent.db.execute(
+                            "CREATE TRIGGER fail_recent_bind "
+                            "BEFORE UPDATE ON metadata BEGIN "
+                            "SELECT RAISE(ABORT, 'bind fault'); END")
+                        recent.db.commit()
+
+                    with self.assertRaises((RuntimeError,
+                                            sqlite3.DatabaseError)):
+                        recent.commit_cycle(
+                            entries, floor=floor, signature="after")
+                    self.assertEqual(snapshot(recent), before)
 
     def test_recorder_service_retries_errors_without_exiting(self):
         with tempfile.TemporaryDirectory() as directory:
