@@ -17,7 +17,8 @@ if str(ROOT) not in sys.path:
 
 from research.live_shadow import (DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS,
                                   DEFAULT_MAX_WORKERS, DEFAULT_RETENTION_DAYS,
-                                  ShadowConfig, ShadowRunner)  # noqa: E402
+                                  ShadowConfig, ShadowRunner,
+                                  _next_shadow_cadence_deadline)  # noqa: E402
 from agent.config import load_config as load_runtime_config  # noqa: E402
 
 
@@ -92,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:
         runtime_config_path=args.config)
     runner = ShadowRunner(config)
     health_file = args.health_file or args.shadow_db.with_name("shadow-health.json")
+    interval = config.poll_seconds
+    # Anchor before work so poll duration is included in the configured cadence.
+    next_tick: float | None = time.monotonic()
     while True:
         try:
             result = runner.run_once()
@@ -117,10 +121,17 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"error": error}), flush=True)
             if args.once:
                 return 1
+            # Preserve completion-relative retry pacing after a failure, then
+            # start a fresh fixed-cadence sequence with the next attempt.
+            time.sleep(interval)
+            next_tick = time.monotonic()
+            continue
         if args.once:
             return 0
-        import time
-        time.sleep(max(1.0, float(args.interval)))
+        now = time.monotonic()
+        next_tick = _next_shadow_cadence_deadline(
+            next_tick, now, interval)
+        time.sleep(max(0.0, next_tick - time.monotonic()))
 
 
 if __name__ == "__main__":  # pragma: no cover
