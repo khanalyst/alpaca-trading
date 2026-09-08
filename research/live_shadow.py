@@ -108,6 +108,38 @@ _REPLAY_CODE_BUNDLE_ROOTS = ("agent", "research")
 _REPLAY_CODE_BUNDLE_EXTRAS = ("deploy/recorder.py", "requirements.lock.txt")
 
 
+def _poll_interval(value: object) -> float:
+    """Return the finite CLI/library cadence with its historical one-second floor."""
+    try:
+        interval = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 1.0
+    if not math.isfinite(interval):
+        return 1.0
+    return max(1.0, interval)
+
+
+def _next_shadow_cadence_deadline(previous: float | None, now: float,
+                                  interval: float) -> float:
+    """Advance to the next future start-anchored poll slot.
+
+    A slow poll skips every elapsed slot instead of issuing an immediate burst.
+    """
+    interval = _poll_interval(interval)
+    now = float(now)
+    if not math.isfinite(now):
+        raise ValueError("shadow monotonic clock must be finite")
+    if previous is None:
+        return now + interval
+    deadline = float(previous)
+    if not math.isfinite(deadline):
+        return now + interval
+    if deadline > now:
+        return deadline
+    missed = int((now - deadline) // interval) + 1
+    return deadline + missed * interval
+
+
 class ShadowError(RuntimeError):
     """Base error for a shadow run."""
 
@@ -1054,6 +1086,8 @@ class ShadowConfig:
                 f"{MAX_DIAGNOSTIC_SESSION_MAX_EVENTS}")
         if _finite(self.equity) is None or float(self.equity) <= 0:
             raise ValueError("equity must be positive and finite")
+        object.__setattr__(self, "poll_seconds",
+                           _poll_interval(self.poll_seconds))
         if not isinstance(self.diagnostic, bool):
             raise ValueError("diagnostic must be true or false")
         if self.diagnostic and not isinstance(self.runtime_config, Mapping):
@@ -5052,6 +5086,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                        diagnostic=args.diagnostic,
                        runtime_config=runtime_config,
                        runtime_config_path=args.config)
+    interval = cfg.poll_seconds
+    # Anchor before work begins so request duration is part of the configured
+    # period instead of being added to it.
+    next_tick: float | None = time.monotonic()
     while True:
         try:
             print(json.dumps(run_shadow_once(cfg), sort_keys=True), flush=True)
@@ -5059,9 +5097,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), flush=True)
             if args.once:
                 return 1
+            # Failure retry pacing remains completion-relative: wait at least
+            # one configured interval, then start a fresh cadence anchor.
+            time.sleep(interval)
+            next_tick = time.monotonic()
+            continue
         if args.once:
             return 0
-        time.sleep(max(1.0, float(args.interval)))
+        now = time.monotonic()
+        next_tick = _next_shadow_cadence_deadline(
+            next_tick, now, interval)
+        time.sleep(max(0.0, next_tick - time.monotonic()))
 
 
 __all__ = [

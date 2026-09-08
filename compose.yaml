@@ -196,6 +196,8 @@ services:
       # the same current-forward corpus root as recorder and shadow.
       ALPACA_RECORDED_DATASET_ROOT: ${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}
       ALPACA_RESEARCH_DATASET: ${ALPACA_RESEARCH_DATASET:-}
+      # Calibration is default-closed and requires an explicit operator opt-in.
+      ALPACA_RESEARCH_CALIBRATION_ENABLED: ${ALPACA_RESEARCH_CALIBRATION_ENABLED:-0}
       # A fresh Compose deployment has no paper execution journal yet.  The
       # explicit bootstrap state permits broker-free shadow evidence collection
       # only; its persisted calibration authorization_exit_code remains 2.
