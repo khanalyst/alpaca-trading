@@ -417,15 +417,29 @@ and randomized-null quote entries; malformed inputs use the stable reason
 `entry_slippage_invalid`, while over-cap quotes use
 `entry_slippage_exceeds_limit` as a no-trade/refusal.
 
-Compose ships `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=1` so a fresh
-installation with no paper journal can collect broker-free shadow evidence.
-This is a narrow empty-journal bootstrap only: the persisted
-`calibration_state=bootstrap_unknown` and `authorization_exit_code=2` remain
-non-authorizing and cannot claim measured calibration or promote a candidate.
-Set the variable to `0` in the deployment environment when measured
-calibration must exist before shadow ingestion. Thin, existing, mixed-vehicle,
-stale, or optimistic history remains blocked until normal measured
-calibration is authorized.
+Compose forwards `ALPACA_RESEARCH_CALIBRATION_ENABLED` with a default of `0`
+and `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN` with a default of `1`.
+The bootstrap is consulted only when calibration is explicitly enabled. For a
+fresh empty paper journal, a persisted `calibration_state=bootstrap_unknown`
+report exits `2` but may open the research-cycle shadow-ingestion gate. That
+state is still unknown, not measured execution calibration, and must never be
+reported as calibrated.
+
+The current downstream contract does not re-check calibration state after
+ingestion. A candidate that independently passes every qualification,
+selection, confirmation, trade-floor, statistical, provenance, and replay gate
+can therefore transition to `validated` and be selected by the shipped
+paper-only `selection_mode: specific` / `variant_id: auto` resolver even while
+calibration remains `bootstrap_unknown`. This is narrow PAPER eligibility under
+`broker.allow_live: false`; it is not live-money authorization. The fixed
+24-arm diagnostic cohort is non-authorizing and never enters this ingestion
+path. Once the journal is nonempty, insufficient, stale, mixed-vehicle, or
+optimistic calibration blocks new ingestion, but that calibration check does
+not revoke a candidate already validated by an earlier run.
+
+Set `ALPACA_RESEARCH_CALIBRATION_BOOTSTRAP_UNKNOWN=0` when measured calibration
+must exist before shadow ingestion. A live deployment remains a separate
+reviewed configuration and authorization scope described below.
 
 The scheduled calibration-only pass measures per-symbol/session stress on the
 9/15/25/50-bps ladder. It is disabled by default and can be activated only by
