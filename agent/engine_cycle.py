@@ -153,6 +153,11 @@ def build_setup_plan(*args, **kwargs):
 
 
 class EngineCycleMixin:
+    def _cycle_heartbeat_detail(self, **detail) -> dict[str, Any]:
+        if self.mode == "paper":
+            detail["paper_selection"] = self._paper_selection_status()
+        return detail
+
     def run_once(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:
         """Run one safely gated cycle, taking a temporary process lock."""
         temporary = False
@@ -387,7 +392,8 @@ class EngineCycleMixin:
         if not self._ensure_order_ready():
             reason = self._preflight_error or "startup_reconciliation_required"
             try:
-                state.write_heartbeat("degraded", run_id=self.run_id, reason=reason)
+                state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
+                    run_id=self.run_id, reason=reason))
             except Exception:
                 pass
             return {"action": "hold", "reason": reason}
@@ -395,7 +401,9 @@ class EngineCycleMixin:
             calendar = self.market.refresh_calendar()
             clock = self.market.clock()
         except Exception as exc:  # noqa: BLE001
-            try: state.write_heartbeat("degraded", reason="calendar_or_clock_unavailable")
+            try:
+                state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
+                    reason="calendar_or_clock_unavailable"))
             except Exception: pass
             return self._fail_closed("calendar_or_clock_unavailable", exc)
         try:
@@ -429,8 +437,9 @@ class EngineCycleMixin:
                 return {"action": "hold", "reason": self._edge_error or
                         "validated edge champion is required"}
             try:
-                state.write_heartbeat("running", run_id=self.run_id,
-                                      reason="outside_regular_session", orders=0)
+                state.write_heartbeat("running", **self._cycle_heartbeat_detail(
+                    run_id=self.run_id, reason="outside_regular_session",
+                    orders=0))
             except Exception:
                 pass
             return {"action": "force_flat", "reason": "outside_regular_session",
@@ -475,8 +484,8 @@ class EngineCycleMixin:
             self._event("daily_loss_limit", {"daily_pnl": daily_pnl,
                                               "flatten_complete": complete})
             try:
-                state.write_heartbeat("paused", run_id=self.run_id,
-                                      reason="daily_loss_limit", orders=0)
+                state.write_heartbeat("paused", **self._cycle_heartbeat_detail(
+                    run_id=self.run_id, reason="daily_loss_limit", orders=0))
             except Exception:
                 pass
             try:
@@ -497,8 +506,9 @@ class EngineCycleMixin:
             # A submitted close must be reconciled before any new exposure is
             # considered, even if the broker has not filled it yet.
             try:
-                state.write_heartbeat("running", run_id=self.run_id,
-                                      reason="position_close_submitted", orders=0)
+                state.write_heartbeat("running", **self._cycle_heartbeat_detail(
+                    run_id=self.run_id, reason="position_close_submitted",
+                    orders=0))
             except Exception:
                 pass
             return {"action": "close", **monitored}
@@ -506,7 +516,9 @@ class EngineCycleMixin:
         if not self._refresh_edge():
             try:
                 detail = {"run_id": self.run_id,
-                          "reason": "validated_edge_required"}
+                          "reason": (self._edge_error
+                                     if self._paper_trial_runtime is not None
+                                     else "validated_edge_required")}
                 if self.mode == "paper":
                     detail["paper_selection"] = self._paper_selection_status()
                 state.write_heartbeat("paused", **detail)
@@ -516,15 +528,17 @@ class EngineCycleMixin:
                     "validated edge champion is required"}
         if _value(clock, "is_open", None) is not True or not self.market.can_enter(now):
             try:
-                state.write_heartbeat("running", run_id=self.run_id,
-                                      reason="outside_regular_session", orders=0)
+                state.write_heartbeat("running", **self._cycle_heartbeat_detail(
+                    run_id=self.run_id, reason="outside_regular_session",
+                    orders=0))
             except Exception:
                 pass
             return {"action": "hold", "reason": "outside_regular_session"}
         if not self._latest_entry_allowed(now):
             try:
-                state.write_heartbeat("running", run_id=self.run_id,
-                                      reason="latest_entry_time_passed", orders=0)
+                state.write_heartbeat("running", **self._cycle_heartbeat_detail(
+                    run_id=self.run_id, reason="latest_entry_time_passed",
+                    orders=0))
             except Exception:
                 pass
             return {"action": "hold", "reason": "latest_entry_time_passed"}
@@ -859,6 +873,9 @@ class EngineCycleMixin:
                             "candidate_behavior_identity",
                         )
                     })
+                trial_runtime = getattr(self, "_paper_trial_runtime", None)
+                if trial_runtime is not None:
+                    plan = trial_runtime.annotate(plan)
                 signals.append(plan)
                 if not self._llm_allows(plan, row, portfolio_data):
                     continue
@@ -892,6 +909,9 @@ class EngineCycleMixin:
                         proof_run_id = latest_proof.get("run_id")
                         if proof_run_id is not None:
                             risk_plan["proof_run_id"] = str(proof_run_id)
+                trial_runtime = getattr(self, "_paper_trial_runtime", None)
+                if trial_runtime is not None:
+                    risk_plan = trial_runtime.annotate(risk_plan)
                 try:
                     candidate_risk = self._required_number(
                         risk_plan.get("risk_usd"), "planned risk_usd")
@@ -950,14 +970,17 @@ class EngineCycleMixin:
                             state.commit({"operator_pause": True},
                                          transition=(state.RUNNING, state.PAUSED))
                             state.write_heartbeat(
-                                "degraded", run_id=self.run_id,
-                                reason="post_submit_durability_failure")
+                                "degraded", **self._cycle_heartbeat_detail(
+                                    run_id=self.run_id,
+                                    reason="post_submit_durability_failure"))
                         except Exception:  # noqa: BLE001
                             pass
                         raise AlpacaError(
                             f"{self._preflight_error}: {exc}") from exc
                 except AlpacaError:
                     raise
-        try: state.write_heartbeat("running", run_id=self.run_id, orders=len(placed))
+        try:
+            state.write_heartbeat("running", **self._cycle_heartbeat_detail(
+                run_id=self.run_id, orders=len(placed)))
         except Exception: pass
         return {"action": "decide", "orders": placed, "signals": signals}

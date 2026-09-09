@@ -40,8 +40,8 @@ TRIAL_SCHEMA = "paper-trial.v1"
 # Defaults chosen to need a real sample before acting.  A trial that concludes
 # from four trades is measuring noise, and parking an edge on noise costs more
 # search than it saves.
-DEFAULT_MIN_SESSIONS = 30
-DEFAULT_MIN_TRADES = 100
+DEFAULT_MIN_SESSIONS = 20
+DEFAULT_MIN_TRADES = 20
 DEFAULT_MIN_MEAN_R = 0.0
 DEFAULT_MIN_TOTAL_R = 0.0
 
@@ -54,7 +54,8 @@ def trial_policy(config: Mapping[str, Any] | None) -> dict[str, Any]:
 
     def number(key: str, default: float) -> float:
         value = raw.get(key, default)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not math.isfinite(value)):
             return float(default)
         return float(value)
 
@@ -69,73 +70,107 @@ def trial_policy(config: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def _verdict(performance: Mapping[str, Any], policy: Mapping[str, Any]) -> dict:
     """Judge one edge's live paper record against the trial floor."""
-    sessions = int(performance.get("sessions") or 0)
-    trades = int(performance.get("outcomes") or 0)
+    def count(value: Any) -> int:
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not math.isfinite(value) or value < 0 or int(value) != value):
+            raise ValueError("sample count must be a finite nonnegative integer")
+        return int(value)
+
     total_r = performance.get("total_r")
     mean_r = performance.get("mean_r")
     confidence = performance.get("session_cluster_confidence")
-    if sessions < int(policy["min_sessions"]) or trades < int(policy["min_trades"]):
+    try:
+        sessions = count(performance.get("sessions", 0))
+        trades = count(performance.get("outcomes", 0))
+        required_sessions = count(policy["min_sessions"])
+        required_trades = count(policy["min_trades"])
+        if not required_sessions or not required_trades:
+            raise ValueError("sample floors must be positive")
+    except (ValueError, TypeError, OverflowError, KeyError):
+        return {"state": "inconclusive", "sessions": None, "trades": None,
+                "reason": "sample counts or required floors are invalid"}
+    if sessions < required_sessions or trades < required_trades:
         return {"state": "running", "sessions": sessions, "trades": trades,
-                "sessions_required": int(policy["min_sessions"]),
-                "trades_required": int(policy["min_trades"]),
+                "sessions_required": required_sessions,
+                "trades_required": required_trades,
                 "total_r": total_r, "mean_r": mean_r,
                 "session_cluster_confidence": confidence}
-    # A concluded window with no measurable R is not a pass.  It means the
-    # outcomes carried no risk reference, which is a data problem, not an edge.
-    if total_r is None or mean_r is None:
+    # A concluded window with no measurable R is neither a pass nor a failure.
+    # It means the outcomes carried no usable risk reference, which is a data
+    # problem rather than evidence against the edge.
+    try:
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               for value in (total_r, mean_r, policy["min_total_r"], policy["min_mean_r"])):
+            raise TypeError
+        total_value = float(total_r)
+        mean_value = float(mean_r)
+        min_total_r = float(policy["min_total_r"])
+        min_mean_r = float(policy["min_mean_r"])
+        if not all(math.isfinite(value) for value in (
+                total_value, mean_value, min_total_r, min_mean_r)):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError, KeyError):
         return {"state": "inconclusive", "sessions": sessions, "trades": trades,
                 "reason": "outcomes carry no usable R multiple",
                 "total_r": total_r, "mean_r": mean_r,
                 "session_cluster_confidence": confidence}
-    clears = (float(total_r) > float(policy["min_total_r"]) and
-              float(mean_r) > float(policy["min_mean_r"]))
-    if not clears:
-        return {"state": "failed",
-                "sessions": sessions, "trades": trades,
-                "total_r": float(total_r), "mean_r": float(mean_r),
-                "min_total_r": float(policy["min_total_r"]),
-                "min_mean_r": float(policy["min_mean_r"]),
-                "net_pnl": performance.get("net_pnl"),
-                "win_rate": performance.get("win_rate"),
-                "session_cluster_confidence": confidence}
-    # A positive point estimate is only promotable when the independent
-    # session-cluster interval also clears the mean-R floor.  Missing or
-    # underpowered uncertainty evidence is not a failure of the edge, so it
-    # stays inconclusive and cannot park a live candidate.
+
+    # Both terminal verdicts require the same trustworthy uncertainty
+    # evidence.  This keeps stopping symmetric: a positive estimate passes
+    # only when its lower bound clears the mean-R floor, while a negative
+    # estimate fails only when its upper bound is below that floor and the
+    # aggregate total-R economics are also nonpositive.
     usable = confidence if isinstance(confidence, Mapping) else {}
     try:
-        confidence_level = float(usable.get("confidence"))
-        lower_bound = float(usable.get("lower_bound"))
-        usable_observations = int(usable.get("observations") or 0)
-        usable_clusters = int(usable.get("session_clusters") or
-                              usable.get("clusters") or 0)
+        confidence_raw = usable.get("confidence")
+        lower_raw = usable.get("lower_bound")
+        upper_raw = usable.get("upper_bound")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in (
+                confidence_raw, lower_raw, upper_raw)):
+            raise TypeError
+        confidence_level = float(confidence_raw)
+        lower_bound = float(lower_raw)
+        upper_bound = float(upper_raw)
+        usable_observations = count(usable.get("observations", 0))
+        cluster_value = usable.get("session_clusters")
+        if cluster_value is None:
+            cluster_value = usable.get("clusters")
+        usable_clusters = count(cluster_value)
     except (TypeError, ValueError, OverflowError):
-        confidence_level = lower_bound = float("nan")
+        confidence_level = lower_bound = upper_bound = float("nan")
         usable_observations = usable_clusters = 0
     confidence_ready = bool(
         usable.get("available") is True and
-        confidence_level >= 0.95 and
-        math.isfinite(lower_bound) and
-        usable_observations >= int(policy["min_trades"]) and
-        usable_clusters >= int(policy["min_sessions"]))
-    if not confidence_ready or lower_bound <= float(policy["min_mean_r"]):
-        return {"state": "inconclusive", "sessions": sessions, "trades": trades,
-                "reason": ("positive point estimate lacks a session-cluster "
-                           "lower bound above the configured mean-R floor"),
-                "total_r": float(total_r), "mean_r": float(mean_r),
-                "min_total_r": float(policy["min_total_r"]),
-                "min_mean_r": float(policy["min_mean_r"]),
-                "net_pnl": performance.get("net_pnl"),
-                "win_rate": performance.get("win_rate"),
-                "session_cluster_confidence": confidence}
-    return {"state": "passed",
-            "sessions": sessions, "trades": trades,
-            "total_r": float(total_r), "mean_r": float(mean_r),
-            "min_total_r": float(policy["min_total_r"]),
-            "min_mean_r": float(policy["min_mean_r"]),
-            "net_pnl": performance.get("net_pnl"),
-            "win_rate": performance.get("win_rate"),
-            "session_cluster_confidence": confidence}
+        math.isfinite(confidence_level) and
+        0.95 <= confidence_level <= 1.0 and
+        math.isfinite(lower_bound) and math.isfinite(upper_bound) and
+        lower_bound <= upper_bound and
+        usable_observations >= required_trades and
+        usable_clusters >= required_sessions)
+    common = {"sessions": sessions, "trades": trades,
+              "total_r": total_value, "mean_r": mean_value,
+              "min_total_r": min_total_r, "min_mean_r": min_mean_r,
+              "net_pnl": performance.get("net_pnl"),
+              "win_rate": performance.get("win_rate"),
+              "session_cluster_confidence": confidence}
+    if not confidence_ready:
+        return {"state": "inconclusive",
+                "reason": ("point estimate lacks a usable sample-sized 95% "
+                           "session-cluster interval"),
+                **common}
+    positive_economics = (total_value > min_total_r and
+                          mean_value > min_mean_r)
+    if positive_economics and lower_bound > min_mean_r:
+        return {"state": "passed", **common}
+    negative_economics = (total_value <= min_total_r and
+                          mean_value <= min_mean_r)
+    if negative_economics and upper_bound < min_mean_r:
+        return {"state": "failed", **common}
+    return {"state": "inconclusive",
+            "reason": ("session-cluster interval does not establish mean R "
+                       "above or below the configured floor with matching "
+                       "total-R economics"),
+            **common}
 
 
 def _session_cluster_confidence(ledger: EdgeLedger, candidate_id: str) -> dict:

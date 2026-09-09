@@ -34,6 +34,10 @@ from .runtime_control import RuntimeControlMixin
 from .startup_edge_policy import StartupEdgePolicyMixin
 from .market_entry_risk import MarketEntryRiskMixin
 from .engine_cycle import EngineCycleMixin
+from .paper_trial import (
+    PaperTrialError, PaperTrialRuntime, REPLACEMENT_LOCAL_BOOK_ERROR,
+    paper_trial_enabled, replacement_local_book_is_flat,
+)
 
 log = logging.getLogger("engine")
 
@@ -42,7 +46,21 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
              MarketEntryRiskMixin, EngineCycleMixin):
     def __init__(self, cfg: dict, light: bool = False, *, provider=None,
                  market_data: MarketData | None = None, brain=None):
+        if paper_trial_enabled(cfg):
+            # Engine is a public construction boundary used directly by tests
+            # and integrations.  An enabled experimental lane must receive the
+            # same complete validation as the file-loading path.
+            from .config import ConfigError, validate_config
+            try:
+                cfg = validate_config(cfg)
+            except ConfigError as exc:
+                raise AlpacaError(str(exc)) from exc
         self.cfg = cfg
+        try:
+            self._paper_trial_runtime = (
+                PaperTrialRuntime(cfg) if paper_trial_enabled(cfg) else None)
+        except PaperTrialError as exc:
+            raise AlpacaError(str(exc)) from exc
         broker = cfg.get("broker", {}) if isinstance(cfg, Mapping) else {}
         self.mode = str(cfg.get("mode", "paper")).lower()
         if self.mode not in {"paper", "live"}:
@@ -59,10 +77,14 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         except ValueError as exc:
             raise AlpacaError(str(exc)) from exc
         strategy_cfg = cfg.get("strategy", {}) if isinstance(cfg.get("strategy"), Mapping) else {}
-        self._edge_selection_mode = str(
-            strategy_cfg.get("selection_mode") or "specific")
+        self._edge_selection_mode = (
+            "paper_trial" if self._paper_trial_runtime is not None else
+            str(strategy_cfg.get("selection_mode") or "specific"))
         llm_cfg = cfg.get("llm", {})
         llm_enabled = bool(llm_cfg.get("enabled", False)) if isinstance(llm_cfg, Mapping) else False
+        if self._paper_trial_runtime is not None and (llm_enabled or brain is not None):
+            raise AlpacaError(
+                "paper trial forbids runtime LLM decisions and injected brains")
         if self.mode == "live":
             requested = str(strategy_cfg.get("variant_id") or "").strip()
             if self._edge_selection_mode == "specific":
@@ -93,6 +115,7 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
             cfg.get("strategy", {}).get("variant_id") or "")
         self._edge_db_path = research_cfg.get("db_path") if isinstance(research_cfg, Mapping) else None
         self._edge_required = bool(
+            self._paper_trial_runtime is None and
             isinstance(research_cfg, Mapping) and research_cfg.get("enabled", False) and
             research_cfg.get("require_validated_variant", True))
         self._edge_record: dict | None = None
@@ -102,7 +125,10 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         self._edge_pinned_config_hash: str | None = None
         self._edge_pinned_runtime_cfg: dict | None = None
         self._edge_error: str | None = None
-        if isinstance(research_cfg, Mapping) and research_cfg.get("enabled", False):
+        if self._paper_trial_runtime is not None:
+            self.cfg = self._paper_trial_runtime.config
+            self._edge_configs = [(None, self.cfg)]
+        elif isinstance(research_cfg, Mapping) and research_cfg.get("enabled", False):
             try:
                 from .edge import (apply_variant, resolve_validated_variant,
                                    resolve_validated_variants,
@@ -140,12 +166,12 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                 self._edge_error = f"edge resolution failed: {exc}"
         else:
             self._edge_configs = [(None, cfg)]
-        self.provider = provider or AlpacaProvider(cfg)
+        self.provider = provider or AlpacaProvider(self.cfg)
         provider_paper = getattr(self.provider, "paper", None)
         if (not isinstance(provider_paper, bool) or
                 provider_paper is not expected_paper):
             raise AlpacaError(f"provider is not {self.mode} scoped")
-        session_cfg = cfg.get("session", {})
+        session_cfg = self.cfg.get("session", {})
         self.market = market_data or MarketData(self.provider, SessionPolicy(**session_cfg))
         self.brain = brain or (DecisionBrain(llm_cfg) if llm_enabled and not light else None)
         self.risk = RiskEngine(self._edge_base_cfg)
@@ -167,11 +193,41 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
             state.configure_runtime(self.mode)
             state.ensure_ready()
             self._runtime_state = state.load_state()
+            if self._paper_trial_runtime is not None:
+                self._runtime_state = state.update_state(
+                    lambda current: self._paper_trial_runtime.update_runtime(
+                        current))
+                if self._paper_trial_runtime.pending_replacement:
+                    # No replacement policy may touch residual exposure.  A
+                    # run using the requested incumbent stays inert until a
+                    # fresh broker reconciliation proves the old book flat.
+                    self._edge_configs = []
+                    self._edge_error = (
+                        "paper trial replacement is pending a flat old incumbent")
+            elif self._runtime_state.get("paper_trial"):
+                raise PaperTrialError(
+                    "persisted paper trial cannot be disabled or bypassed; "
+                    "review it and replace it through the explicit trial lane")
             self._state_ready = True
+        except PaperTrialError as exc:
+            raise AlpacaError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
+            if self._paper_trial_runtime is not None:
+                raise AlpacaError(
+                    f"paper trial runtime state is unavailable: {exc}") from exc
             log.warning("state startup unavailable: %s", exc)
         if not light:
-            if not self._acquire_lock():
+            if (self._paper_trial_runtime is not None and
+                    self._paper_trial_runtime.pending_replacement and
+                    not replacement_local_book_is_flat(self._runtime_state)):
+                # Reconciliation can settle a pending close and computes its
+                # attribution from ``self.cfg``.  Refuse before any broker
+                # snapshot while this process carries the replacement config;
+                # the frozen incumbent must finish its own local exposure.
+                self._preflight_error = REPLACEMENT_LOCAL_BOOK_ERROR
+                self._edge_error = REPLACEMENT_LOCAL_BOOK_ERROR
+                log.warning(self._preflight_error)
+            elif not self._acquire_lock():
                 self._preflight_error = "runtime lock held during startup reconciliation"
                 log.warning(self._preflight_error)
             else:
@@ -184,6 +240,15 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                     self._heartbeat_owner = True
                     self.preflight()
                     self.reconcile()
+                    if self._paper_trial_runtime is not None:
+                        refreshed = self._refresh_edge()
+                        if (not refreshed and
+                                self._paper_trial_runtime.pending_replacement):
+                            self._reconciled = False
+                            raise AlpacaError(
+                                "paper trial replacement cannot manage old "
+                                "exposure; restart with the frozen incumbent "
+                                "until broker and local books are flat")
                     self._enforce_intraday_cleanup(
                         self._preflight.get("clock") if self._preflight else None,
                         reason="startup_reconciliation", force=True)

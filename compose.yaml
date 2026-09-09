@@ -105,6 +105,9 @@ services:
     volumes:
       - runtime-data:/app/runtime
       - research-cache:/app/research/cache
+      # The shadow service is the sole writer of full-session acceptance.
+      # The paper incumbent reads this evidence; it cannot rewrite it.
+      - shadow-data:/app/shadow:ro
     healthcheck:
       test: ["CMD", "python", "deploy/health.py", "trader", "--config", "config.yaml", "--max-age", "240"]
       interval: 30s
@@ -196,6 +199,9 @@ services:
       # the same current-forward corpus root as recorder and shadow.
       ALPACA_RECORDED_DATASET_ROOT: ${ALPACA_RECORDER_CORPUS_ROOT:-/app/runtime/research/recorded}
       ALPACA_RESEARCH_DATASET: ${ALPACA_RESEARCH_DATASET:-}
+      # Refuse expensive preprocessing until enough complete, accepted
+      # forward sessions exist. Missing evidence is not a failed strategy.
+      ALPACA_RESEARCH_ACCEPTANCE_ROOT: ${ALPACA_RESEARCH_ACCEPTANCE_ROOT:-/app/shadow/session-acceptance}
       # Calibration is default-closed and requires an explicit operator opt-in.
       ALPACA_RESEARCH_CALIBRATION_ENABLED: ${ALPACA_RESEARCH_CALIBRATION_ENABLED:-0}
       # A fresh Compose deployment has no paper execution journal yet.  The
@@ -317,7 +323,9 @@ services:
       - --health-file
       - /app/shadow/health.json
       - --interval
-      - ${ALPACA_SHADOW_INTERVAL_SECONDS:-60}
+      - ${ALPACA_SHADOW_INTERVAL_SECONDS:-30}
+      - --acceptance-root
+      - /app/shadow/session-acceptance
       - --max-workers
       - ${ALPACA_SHADOW_MAX_WORKERS:-4}
       - --retention-days

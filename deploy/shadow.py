@@ -20,6 +20,11 @@ from research.live_shadow import (DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS,
                                   ShadowConfig, ShadowRunner,
                                   _next_shadow_cadence_deadline)  # noqa: E402
 from agent.config import load_config as load_runtime_config  # noqa: E402
+from deploy.session_acceptance import (  # noqa: E402
+    DEFAULT_MAX_AGE_SECONDS,
+    DEFAULT_SAMPLE_GAP_TOLERANCE_SECONDS,
+    record_poll,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -37,6 +42,13 @@ def parser() -> argparse.ArgumentParser:
                    help="run the fixed 24-arm non-authorizing family cohort")
     p.add_argument("--health-file", type=Path,
                    help="durable polling heartbeat (defaults beside shadow DB)")
+    p.add_argument("--acceptance-root", type=Path,
+                   help="session evidence directory (defaults beside shadow DB)")
+    p.add_argument("--acceptance-recorder-root", type=Path,
+                   help="recorder root containing the exact calendar index")
+    p.add_argument("--acceptance-gap-tolerance", type=float,
+                   default=DEFAULT_SAMPLE_GAP_TOLERANCE_SECONDS,
+                   help="seconds added to the configured interval for gap checks")
     p.add_argument("--interval", type=float, default=60.0)
     p.add_argument("--once", action="store_true",
                    help="run one bounded ingest/evaluation cycle and exit")
@@ -74,6 +86,35 @@ def _write_health(path: Path, status: str, **detail) -> dict:
         except FileNotFoundError:
             pass
     return payload
+
+
+def _recorder_root(corpus: Path) -> Path:
+    if corpus.name == "sessions":
+        return corpus.parent
+    if corpus.parent.name == "sessions":
+        return corpus.parent.parent
+    return corpus if corpus.is_dir() else corpus.parent
+
+
+def _record_acceptance(args: argparse.Namespace, health_file: Path,
+                       interval: float) -> dict:
+    recorder_root = args.acceptance_recorder_root or _recorder_root(args.corpus)
+    output_dir = args.acceptance_root or args.shadow_db.with_name(
+        "session-acceptance")
+    try:
+        return record_poll(
+            recorder_root, health_file, output_dir,
+            interval_seconds=interval,
+            gap_tolerance_seconds=args.acceptance_gap_tolerance,
+            freshness_seconds=DEFAULT_MAX_AGE_SECONDS)
+    except Exception as exc:
+        # Acceptance is deliberately fail-closed but does not replace the
+        # broker-free shadow service's own liveness contract.
+        return {
+            "schema": "session-acceptance.v1", "status": "unavailable",
+            "accepted": False, "authorizing": False,
+            "reason": f"{type(exc).__name__}: {exc}"[:500],
+        }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -114,10 +155,14 @@ def main(argv: list[str] | None = None) -> int:
             _write_health(health_file, "degraded" if candidate_errors else "running",
                           last_error=("candidate evaluation failures" if candidate_errors
                                       else None), **safe_result)
+            acceptance = _record_acceptance(args, health_file, interval)
+            print(json.dumps(acceptance, sort_keys=True), file=sys.stderr, flush=True)
             print(json.dumps(result, sort_keys=True), flush=True)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             _write_health(health_file, "degraded", last_error=error[:500])
+            acceptance = _record_acceptance(args, health_file, interval)
+            print(json.dumps(acceptance, sort_keys=True), file=sys.stderr, flush=True)
             print(json.dumps({"error": error}), flush=True)
             if args.once:
                 return 1

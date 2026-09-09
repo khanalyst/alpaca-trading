@@ -111,7 +111,8 @@ NEW_YORK = ZoneInfo("America/New_York")
 INDEX_NAME = ".recorder-index.json"
 INDEX_SCHEMA = "recorder-index.v1"
 RECENT_KEY_INDEX_NAME = ".recorder-recent-keys.sqlite3"
-RECENT_KEY_INDEX_SCHEMA = "recorder-recent-keys.v1"
+RECENT_KEY_INDEX_SCHEMA = "recorder-recent-keys.v2"
+LEGACY_RECENT_KEY_INDEX_SCHEMA = "recorder-recent-keys.v1"
 CORPUS_LOCK_NAME = ".recorder.lock"
 STATUS_NAME = ".recorder-status.json"
 STATUS_SCHEMA = "recorder-status.v1"
@@ -723,14 +724,38 @@ class RecentKeyIndex:
             with self.db:
                 self.db.execute(
                     "CREATE TABLE IF NOT EXISTS recent_keys ("
-                    "event_key TEXT PRIMARY KEY, event_ts TEXT NOT NULL) "
-                    "WITHOUT ROWID")
+                    "event_key TEXT PRIMARY KEY NOT NULL, event_ts TEXT NOT NULL)")
                 self.db.execute(
                     "CREATE INDEX IF NOT EXISTS recent_keys_event_ts "
                     "ON recent_keys(event_ts)")
                 self.db.execute(
                     "CREATE TABLE IF NOT EXISTS metadata ("
                     "key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID")
+        # Keep event keys/timestamps unchanged. An ordinary rowid table keeps
+        # the time index and expiry deletes on short integer references instead
+        # of repeating random 64-character hashes in that index. Measured
+        # transactions retain DELETE/FULL durability and the same 64 MiB cache.
+        columns = [(row[1], str(row[2]).upper(), row[3], row[5])
+                   for row in self.db.execute("PRAGMA table_info(recent_keys)")]
+        indexes = list(self.db.execute("PRAGMA index_list(recent_keys)"))
+        time_columns = [row[2] for row in self.db.execute(
+            "PRAGMA index_info(recent_keys_event_ts)")]
+        if (columns != [("event_key", "TEXT", 1, 1), ("event_ts", "TEXT", 1, 0)] or
+                not any(row[1] == "recent_keys_event_ts" and row[2] == 0 and
+                        row[3] == "c" and not row[4]
+                        for row in indexes) or time_columns != ["event_ts"] or
+                not any(row[2] == 1 and row[3] == "pk" and not row[4]
+                        for row in indexes)):
+            self.db.close()
+            raise RuntimeError("recorder recent-key table or index layout is invalid")
+        try:
+            self.db.execute("SELECT rowid FROM recent_keys LIMIT 0")
+            self.schema = RECENT_KEY_INDEX_SCHEMA
+        except sqlite3.OperationalError as exc:
+            if "no such column: rowid" not in str(exc).lower():
+                self.db.close()
+                raise
+            self.schema = LEGACY_RECENT_KEY_INDEX_SCHEMA
 
     def close(self) -> None:
         self.db.close()
@@ -782,7 +807,7 @@ class RecentKeyIndex:
     def bind(self, *, signature: str) -> dict:
         count = self.count()
         values = {
-            "schema": RECENT_KEY_INDEX_SCHEMA,
+            "schema": self.schema,
             "corpus_signature": signature,
             "count": str(count),
         }
@@ -792,7 +817,7 @@ class RecentKeyIndex:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 sorted(values.items()))
         return {
-            "schema": RECENT_KEY_INDEX_SCHEMA,
+            "schema": self.schema,
             "name": RECENT_KEY_INDEX_NAME,
             "count": count,
             "corpus_signature": signature,
@@ -811,7 +836,7 @@ class RecentKeyIndex:
         values = [(str(key), _recent_key_timestamp(stamp))
                   for key, stamp in entries]
         metadata_values = {
-            "schema": RECENT_KEY_INDEX_SCHEMA,
+            "schema": self.schema,
             "corpus_signature": signature,
         }
         try:
@@ -847,7 +872,7 @@ class RecentKeyIndex:
                 self.db.rollback()
             raise
         return {
-            "schema": RECENT_KEY_INDEX_SCHEMA,
+            "schema": self.schema,
             "name": RECENT_KEY_INDEX_NAME,
             "count": count,
             "corpus_signature": signature,
@@ -920,7 +945,8 @@ def _recent_key_index_matches(output: Path, metadata: object, *,
     if not isinstance(metadata, dict):
         return False
     signature = _recent_key_signature(watermark, partitions, fingerprints)
-    if (metadata.get("schema") != RECENT_KEY_INDEX_SCHEMA or
+    if (metadata.get("schema") not in {
+            RECENT_KEY_INDEX_SCHEMA, LEGACY_RECENT_KEY_INDEX_SCHEMA} or
             metadata.get("name") != RECENT_KEY_INDEX_NAME or
             metadata.get("corpus_signature") != signature or
             not isinstance(metadata.get("count"), int) or
@@ -931,10 +957,11 @@ def _recent_key_index_matches(output: Path, metadata: object, *,
                 _recent_key_index_path(output), read_only=True) as store:
             durable = store.metadata()
             durable_count = store.count()
+            layout_schema = store.schema
     except (OSError, RuntimeError, sqlite3.DatabaseError):
         return False
     return (
-        durable.get("schema") == RECENT_KEY_INDEX_SCHEMA and
+        durable.get("schema") == metadata.get("schema") == layout_schema and
         durable.get("corpus_signature") == signature and
         durable.get("count") == str(metadata.get("count")) and
         durable_count == metadata.get("count")
@@ -1322,6 +1349,35 @@ def _save_index(output: Path, index: dict,
 def _prepare_index(output: Path) -> dict:
     """Load or rebuild both caches while preserving irreplaceable metadata."""
     index = _load_index(output)
+    if index is not None:
+        recent_metadata = index.get("recent_key_index") or {}
+        if recent_metadata.get("schema") == LEGACY_RECENT_KEY_INDEX_SCHEMA:
+            # The normal loader has already verified corpus fingerprints,
+            # watermark, durable count, and signature. Stream only this bounded
+            # overlap cache, never the multi-gigabyte market history. A crash
+            # before JSON publication remains a cache mismatch and follows the
+            # existing authoritative-corpus recovery path.
+            def recent_entries():
+                with RecentKeyIndex(
+                        _recent_key_index_path(output), read_only=True) as old:
+                    cursor = old.db.execute(
+                        "SELECT event_key,event_ts FROM recent_keys "
+                        "ORDER BY event_ts,event_key")
+                    while batch := cursor.fetchmany(RECENT_KEY_BATCH_SIZE):
+                        yield from batch
+
+            try:
+                index["recent_key_index"] = _build_recent_key_index(
+                    output, recent_entries(), watermark=index.get("watermark"),
+                    partitions=index["partitions"],
+                    fingerprints=index["partition_fingerprints"])
+                _save_index(output, index)
+                index = _load_index(output)
+            except (RuntimeError, sqlite3.DatabaseError):
+                # A cache can have matching bookkeeping but corrupt row values.
+                # Invalid timestamps/duplicate keys must trigger authoritative
+                # CSV recovery rather than trapping every subsequent cycle.
+                index = None
     if index is not None:
         # ``observation_watermarks`` is an additive v1 field.  If every other
         # cache component validates, initialize the new map conservatively and

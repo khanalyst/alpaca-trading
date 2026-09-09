@@ -360,6 +360,17 @@ class DiagnosticLiveShadowTests(unittest.TestCase):
                 "SELECT count(*) FROM shadow_accounts").fetchone()[0], 0)
             self.assertEqual(db.execute(
                 "SELECT count(*) FROM shadow_trades").fetchone()[0], 0)
+            self.assertEqual(db.execute(
+                "SELECT count(*) FROM diagnostic_accounts").fetchone()[0], 24)
+            self.assertEqual(db.execute(
+                "SELECT count(*) FROM diagnostic_positions").fetchone()[0], 0)
+            self.assertEqual(db.execute(
+                "SELECT count(*) FROM diagnostic_fills").fetchone()[0], 0)
+        forward_accounts = result["diagnostic_shadow"]["forward_accounts"]
+        self.assertEqual(forward_accounts["account_count"], 24)
+        self.assertEqual(forward_accounts["cash"], 2_400_000.0)
+        self.assertEqual(forward_accounts["modeled_fills"], 0)
+        self.assertEqual(forward_accounts["realized_pnl"], 0.0)
         metadata = [row for row in runner.store.replay_metadata()
                     if row["candidate_id"] in candidate_ids]
         self.assertEqual(len(metadata), 24)
@@ -390,6 +401,45 @@ class DiagnosticLiveShadowTests(unittest.TestCase):
         self.assertEqual(repeated["rejection_counts"][
             "preactivation_this_poll"], 0)
         self.assertEqual(repeated["decision_counts"]["total"], 0)
+
+    def test_partition_source_marker_rejects_postactivation_backfill(self):
+        runner = ShadowRunner(self._config())
+        first = runner.run_once()
+        activation = runner.store.diagnostic_activation(
+            first["diagnostic_shadow"]["cohort_identity"])
+        warmup = datetime.fromisoformat(
+            str(activation["warmup_session"])).date()
+        day = warmup + timedelta(days=1)
+        while day.weekday() >= 5:
+            day += timedelta(days=1)
+        stamp = datetime.combine(
+            day, datetime.min.time(),
+            tzinfo=ZoneInfo("America/New_York")).replace(
+                hour=9, minute=30).astimezone(timezone.utc)
+        source = self.root / "partitions" / f"market-{day.isoformat()}.csv"
+        source.parent.mkdir(parents=True)
+        marker = source.with_name(source.name + ".source.json")
+        marker.write_text(json.dumps({
+            "schema": "recorder-partition-source.v1",
+            "partition": source.name,
+            "source_mode": "historical_backfill",
+        }), encoding="utf-8")
+        runner.store.ingest_event({
+            "event_key": "postactivation-backfill",
+            "event_type": "bar_1m", "symbol": "SPY",
+            "timestamp": stamp.isoformat(),
+            "as_of": (stamp + timedelta(minutes=1)).isoformat(),
+            "observed_at": (stamp + timedelta(minutes=1)).isoformat(),
+            "provider": "alpaca", "feed": "iex", "open": 100,
+            "high": 101, "low": 99, "close": 100, "volume": 1000,
+        }, max_events=200, source_path=str(source), source_offset_start=0,
+            source_offset_end=1)
+        with patch.object(
+                ShadowRunner, "_evaluate",
+                side_effect=AssertionError("backfill evaluated")):
+            coverage = runner.run_once()["diagnostic_shadow"]
+        self.assertEqual(coverage["rejection_counts"]["forward_provenance"], 24)
+        self.assertEqual(coverage["forward_accounts"]["modeled_fills"], 0)
 
     def test_old_sep4_wal_with_ibr_never_retroactively_enters_diagnostics(self):
         ledger = EdgeLedger(self.edge)
@@ -621,6 +671,89 @@ class DiagnosticLiveShadowTests(unittest.TestCase):
                     ShadowError,
                     "shadow replay validation event bound 2 exceeded"):
             context_runner.run_once()
+
+    def test_account_events_are_globally_causal_across_sessions_and_restarts(self):
+        runner = ShadowRunner(self._config())
+        activated = runner.run_once()["diagnostic_shadow"]
+        cohort_identity = activated["cohort_identity"]
+        activation = runner.store.diagnostic_activation(cohort_identity)
+        first_day = datetime.fromisoformat(
+            activation["warmup_session"]).date() + timedelta(days=1)
+        while first_day.weekday() >= 5:
+            first_day += timedelta(days=1)
+        second_day = first_day + timedelta(days=1)
+        while second_day.weekday() >= 5:
+            second_day += timedelta(days=1)
+        market = ZoneInfo("America/New_York")
+        first_stamp = datetime.combine(
+            first_day, datetime.min.time(), tzinfo=market).replace(
+                hour=9, minute=30).astimezone(timezone.utc)
+        second_stamp = datetime.combine(
+            second_day, datetime.min.time(), tzinfo=market).replace(
+                hour=9, minute=30).astimezone(timezone.utc)
+        newer_stamp = second_stamp + timedelta(seconds=10)
+        delayed_stamp = first_stamp + timedelta(seconds=10)
+        delayed_available = second_stamp + timedelta(hours=1)
+        newer_key = _event_key("quote", "SPY", newer_stamp.isoformat())
+        delayed_key = _event_key("quote", "SPY", delayed_stamp.isoformat())
+        with self.corpus.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.FIELDS)
+            for key, stamp, observed, bid, ask in (
+                    (newer_key, newer_stamp, newer_stamp, "100", "100.1"),
+                    (delayed_key, delayed_stamp, delayed_available,
+                     "101", "101.1")):
+                writer.writerow({
+                    "event_key": key, "event_type": "quote",
+                    "symbol": "SPY", "timestamp": stamp.isoformat(),
+                    "as_of": stamp.isoformat(),
+                    "observed_at": observed.isoformat(),
+                    "provider": "alpaca", "feed": "iex", "open": "",
+                    "high": "", "low": "", "close": "", "volume": "",
+                    "bid": bid, "ask": ask,
+                })
+        runner.run_once()
+        summary = runner.store.diagnostic_account_summary(
+            cohort_identity=cohort_identity,
+            candidate_ids=activated["candidate_identities"])
+        self.assertTrue(all(
+            item["last_event_at"] == delayed_available.isoformat()
+            for item in summary["by_candidate"]))
+
+        backward_stamp = first_stamp + timedelta(minutes=1)
+        backward_available = second_stamp - timedelta(minutes=1)
+        backward_key = _event_key(
+            "bar_1m", "SPY", backward_stamp.isoformat())
+        with self.corpus.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=self.FIELDS).writerow({
+                "event_key": backward_key, "event_type": "bar_1m",
+                "symbol": "SPY", "timestamp": backward_stamp.isoformat(),
+                "as_of": (backward_stamp + timedelta(minutes=1)).isoformat(),
+                "observed_at": backward_available.isoformat(),
+                "provider": "alpaca", "feed": "iex", "open": "100",
+                "high": "101", "low": "99", "close": "100",
+                "volume": "1000", "bid": "", "ask": "",
+            })
+        cash_before = summary["cash"]
+        fills_before = summary["modeled_fills"]
+        with patch.object(
+                ShadowRunner, "_evaluate",
+                side_effect=AssertionError("backward event evaluated")):
+            runner.run_once()
+        after = runner.store.diagnostic_account_summary(
+            cohort_identity=cohort_identity,
+            candidate_ids=activated["candidate_identities"])
+        self.assertEqual(after["cash"], cash_before)
+        self.assertEqual(after["modeled_fills"], fills_before)
+        self.assertTrue(all(
+            item["last_event_at"] == delayed_available.isoformat()
+            for item in after["by_candidate"]))
+        candidate_id = activated["candidate_identities"][0]
+        snapshot = runner.store.diagnostic_account_snapshot(
+            cohort_identity=cohort_identity, candidate_id=candidate_id)
+        self.assertEqual(snapshot["account"]["last_event_key"], delayed_key)
+        progress = runner.store.diagnostic_progress(
+            cohort_identity, [candidate_id], activation)[candidate_id]
+        self.assertEqual(progress["last_event_key"], backward_key)
 
     def test_marker_alias_is_excluded_from_all_gate_surfaces(self):
         store = ShadowStore(self.shadow)

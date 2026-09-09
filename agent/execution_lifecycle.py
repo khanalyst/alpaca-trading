@@ -23,6 +23,8 @@ from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RULE_SCHEMA_V4,
                              initialize_exit_state)
 from .instruments import validate_instrument
 from .order_timing import broker_timing
+from .paper_trial import (REPLACEMENT_LOCAL_BOOK_ERROR,
+                          replacement_local_book_is_flat)
 from research.costs import CostError, CostModel, static_cost_config
 
 _FILLED_ORDER_STATUSES = {"filled", "partially_filled"}
@@ -424,6 +426,9 @@ class ExecutionLifecycleMixin:
             key: risk_plan.get(key) for key in (
                 "decision_ts", "request_sent_ts", "response_received_ts", "submit_roundtrip_ms",
                 "candidate_id", "proof_run_id",
+                "paper_trial_id", "paper_trial_candidate_id",
+                "paper_trial_variant_id", "paper_trial_incumbent_identity",
+                "paper_trial_authorizing",
                 "entry_fill_source", "exit_fill_source", "entry_feed",
                 "exit_feed", "entry_provider", "exit_provider",
                 "entry_quote_age_seconds", "exit_quote_age_seconds",
@@ -762,6 +767,12 @@ class ExecutionLifecycleMixin:
             "notional": cumulative_notional, "variant_id": plan.get("variant_id"),
             "candidate_id": plan.get("candidate_id"),
             "proof_run_id": plan.get("proof_run_id"),
+            "paper_trial_id": plan.get("paper_trial_id"),
+            "paper_trial_candidate_id": plan.get("paper_trial_candidate_id"),
+            "paper_trial_variant_id": plan.get("paper_trial_variant_id"),
+            "paper_trial_incumbent_identity": plan.get(
+                "paper_trial_incumbent_identity"),
+            "paper_trial_authorizing": plan.get("paper_trial_authorizing"),
             "strategy_id": plan.get("strategy_id", self.cfg.get("strategy", {}).get("id")),
             "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
             "contract_multiplier": multiplier,
@@ -1965,6 +1976,16 @@ class ExecutionLifecycleMixin:
         return attribution
 
     def reconcile(self):
+        trial_runtime = getattr(self, "_paper_trial_runtime", None)
+        if (trial_runtime is not None and
+                trial_runtime.pending_replacement and
+                not replacement_local_book_is_flat(state.load_state())):
+            # A replacement Engine already carries its requested config.
+            # Settling old local exposure here would therefore attribute the
+            # incumbent's close with replacement costs or policy metadata.
+            self._preflight_error = REPLACEMENT_LOCAL_BOOK_ERROR
+            self._edge_error = REPLACEMENT_LOCAL_BOOK_ERROR
+            raise AlpacaError(REPLACEMENT_LOCAL_BOOK_ERROR)
         if hasattr(self.provider, "reconcile"):
             result = self.provider.reconcile()
         else:
@@ -2486,6 +2507,15 @@ class ExecutionLifecycleMixin:
                     self._record_edge_outcome(
                         outcome_trade, gross_total,
                         aggregate_attribution.get("pnl_pct"), aggregate_exit)
+                elif trade.get("paper_trial_id"):
+                    # A fully closed experimental parent remains an outcome
+                    # even when one broker fragment omitted its fill price.
+                    # Persist it as unmeasurable so review stays inconclusive;
+                    # silently dropping it would bias the trial record.
+                    outcome_trade = dict(trade)
+                    outcome_trade["qty"] = str(filled_total)
+                    self._record_edge_outcome(
+                        outcome_trade, None, None, aggregate_exit)
                 entry_order = order_state.get(str(trade.get("order_id") or ""))
                 if isinstance(entry_order, dict):
                     attempts = [self._number(trade.get("closing_attempt"))]
@@ -2690,10 +2720,13 @@ class ExecutionLifecycleMixin:
             "protection": protection,
             "last_reconciliation_ts": reconciled_at,
             "edge_outbox": self._queued_edge_outbox(latest),
+            "paper_trial": self._queued_paper_trial_state(latest),
         })
         self._runtime_state = current
         self._pending_edge_outcome_rows = []
+        self._pending_paper_trial_outcome_rows = []
         self._reconciled = True
+        self._last_reconcile_snapshot = result
         self._drain_edge_outbox()
         self._event("rest_reconcile", {"positions": len(result.get("positions", [])) if isinstance(result, Mapping) else 0})
         # After the atomic replacement above, so a broker submission can never
@@ -2706,8 +2739,12 @@ class ExecutionLifecycleMixin:
                              *, attribution: Mapping | None = None) -> None:
         if self.mode != "paper":
             return
+        trial_id = trade.get("paper_trial_id")
         variant_id = trade.get("variant_id")
         if not variant_id:
+            if trial_id:
+                raise AlpacaError(
+                    "paper trial close is missing its frozen variant identity")
             return
         entry_price = self._number(trade.get("entry_price"))
         quantity = self._number(trade.get("qty")) or 0.0
@@ -2720,7 +2757,7 @@ class ExecutionLifecycleMixin:
                 trade, realized, entry_price, self._number(exit_price),
                 quantity, multiplier)
         realized_value = self._number(attribution.get("net_pnl"))
-        if realized_value is None:
+        if realized_value is None and not trial_id:
             return
         gross_value = self._number(attribution.get("gross_pnl"))
         fees_value = self._number(attribution.get("fees")) or 0.0
@@ -2749,8 +2786,17 @@ class ExecutionLifecycleMixin:
             "variant_id": variant_id, "vehicle": vehicle,
             "candidate_id": trade.get("candidate_id"),
             "proof_run_id": trade.get("proof_run_id"),
+            "paper_trial_id": trial_id,
+            "paper_trial_candidate_id": trade.get(
+                "paper_trial_candidate_id"),
+            "paper_trial_variant_id": trade.get("paper_trial_variant_id"),
+            "paper_trial_incumbent_identity": trade.get(
+                "paper_trial_incumbent_identity"),
             "opportunity_id": trade.get("setup_id") or
                               f"{trade.get('symbol')}:{opened:.6f}",
+            "order_id": trade.get("order_id"),
+            "symbol": trade.get("symbol"),
+            "opened_at": opened,
             "session_date": datetime.fromtimestamp(opened, timezone.utc).date().isoformat(),
             "gross_pnl": gross_value, "fees": fees_value,
             "slippage": slippage_value, "net_pnl": realized_value,
@@ -2763,7 +2809,8 @@ class ExecutionLifecycleMixin:
             "planned_risk_usd": risk_usd,
             "delivered_risk_usd": delivered_risk,
             "r_multiple": (realized_value / risk_usd
-                           if risk_usd and risk_usd > 0 else None),
+                           if realized_value is not None and
+                           risk_usd and risk_usd > 0 else None),
             "entry_price": self._number(trade.get("entry_price")),
             "exit_price": self._number(exit_price),
             "reason": trade.get("closing_reason", "broker_reconcile"),
@@ -2792,6 +2839,15 @@ class ExecutionLifecycleMixin:
             "exit_bar_age_seconds": trade.get("exit_bar_age_seconds"),
             "paper": True,
         }
+        if outcome.get("paper_trial_id"):
+            trial_runtime = getattr(self, "_paper_trial_runtime", None)
+            if trial_runtime is None:
+                raise AlpacaError(
+                    "paper trial outcome has no active non-authorizing runtime")
+            # Experimental outcomes are committed with the parent close below
+            # and never enter the authorizing EdgeLedger/FDR outbox.
+            self._pending_paper_trial_outcomes.append(outcome)
+            return
         # Queue only.  The outcome becomes durable in the same atomic state
         # replacement that removes the closed trade, and is ingested by
         # ``_drain_edge_outbox`` from that durable record.
@@ -2820,6 +2876,26 @@ class ExecutionLifecycleMixin:
         if len(rows) > _EDGE_OUTBOX_WARN:
             self._event("edge_outbox_saturated", {"queued": len(rows)})
         return rows
+
+    @property
+    def _pending_paper_trial_outcomes(self) -> list:
+        pending = getattr(self, "_pending_paper_trial_outcome_rows", None)
+        if pending is None:
+            pending = []
+            self._pending_paper_trial_outcome_rows = pending
+        return pending
+
+    def _queued_paper_trial_state(self, latest: Mapping) -> dict:
+        current = latest.get("paper_trial")
+        if not self._pending_paper_trial_outcomes:
+            return dict(current) if isinstance(current, Mapping) else {}
+        trial_runtime = getattr(self, "_paper_trial_runtime", None)
+        if trial_runtime is None:
+            raise AlpacaError(
+                "paper trial outcome cannot be committed without its runtime")
+        return trial_runtime.merge_pending(
+            current if isinstance(current, Mapping) else {},
+            self._pending_paper_trial_outcomes)
 
     def _drain_edge_outbox(self) -> int:
         """Ingest durably queued outcomes, retaining whatever is unproven.

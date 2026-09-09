@@ -276,10 +276,12 @@ class ParallelRuntimeStatusTests(unittest.TestCase):
             encoding="utf-8")
         explicit = research_cycle.index(
             'dataset="${ALPACA_RESEARCH_DATASET:-}"')
-        fallback = research_cycle.index(
-            'recorded_root="${ALPACA_RECORDED_DATASET_ROOT:-')
+        # Readiness now resolves the recorder root before expensive work, but
+        # only when no explicit dataset was supplied. Source selection still
+        # starts with the caller's dataset, then enters the recorder fallback.
+        fallback = research_cycle.index('if [ -z "$dataset" ]', explicit)
         self.assertLess(explicit, fallback)
-        self.assertIn('if [ -z "$dataset" ]', research_cycle)
+        self.assertIn('[ -z "$preflight_dataset" ]', research_cycle)
         # Historical workbench evidence remains on its original durable path;
         # only the live recorder-health view follows the current corpus epoch.
         workbench = (ROOT / "deploy/dashboard_workbench.py").read_text(

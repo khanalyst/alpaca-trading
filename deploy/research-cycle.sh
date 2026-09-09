@@ -71,7 +71,8 @@ write_direct_status() {
     "$direct_owner_pid" "$direct_started_ts" "$direct_dataset" "$direct_partition_root" \
     "$direct_source_identity" "$direct_source_mode" "$status" "$phase" \
     "$done" "$total" "$unit" "$vehicle" "$direct_scheduler_managed" "$terminal_status" \
-    "$terminal_reason" "$terminal_exit" "$terminal_outcomes" <<'PY'
+    "$terminal_reason" "$terminal_exit" "$terminal_outcomes" \
+    "$cycle_readiness_record" <<'PY'
 import fcntl
 import json
 import os
@@ -82,7 +83,7 @@ from pathlib import Path
 
 repo_root, status_path, lock_path, job_id, owner_pid, started, dataset, partition_root, source_identity, \
     source_mode, status, phase, done, total, unit, vehicle, scheduler_flag, terminal_status, \
-    terminal_reason, terminal_exit, raw_outcomes = sys.argv[1:]
+    terminal_reason, terminal_exit, raw_outcomes, raw_readiness = sys.argv[1:]
 repo_root = Path(repo_root).resolve()
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
@@ -111,6 +112,12 @@ progress = {
     "unit": str(unit), "vehicle": str(vehicle), "done": done_int,
     "total": total_int, "updated_ts": now,
 }
+try:
+    readiness = json.loads(raw_readiness)
+except (TypeError, ValueError):
+    readiness = None
+if not isinstance(readiness, dict):
+    readiness = None
 payload = {
     "schema": "research-direct-status.v1", "component": "research-cycle",
     "status": str(status), "execution_mode": "direct",
@@ -131,6 +138,8 @@ payload = {
     },
     "progress": progress,
 }
+if readiness is not None:
+    payload["research_readiness"] = readiness
 if terminal_status:
     try:
         exit_code = int(terminal_exit)
@@ -141,6 +150,8 @@ if terminal_status:
         "reason": str(terminal_reason)[:240], "exit_code": exit_code,
         "outcomes": [item[:240] for item in str(raw_outcomes).split()[:32]],
     }
+    if readiness is not None:
+        payload["terminal"]["readiness"] = readiness
 target = Path(status_path)
 lock = Path(lock_path)
 lock.parent.mkdir(parents=True, exist_ok=True)
@@ -257,6 +268,7 @@ cycle_cost_diagnostic='{}'
 # Every terminal cycle carries a bounded preflight record. ``not_run`` is
 # explicit for failures that happen before the provider probe.
 llm_preflight_record='{"schema":"research-llm-preflight.v1","status":"not_run","reason":"provider preflight was not reached","evidence":{}}'
+cycle_readiness_record='{"schema":"research-readiness.v1","state":"not_run","reason":"partition census was not reached","authorizing":false}'
 
 emit_progress() {
   local phase="$1"
@@ -293,13 +305,14 @@ emit_cycle() {
     "$cycle_success" "$cycle_no_edge" "$cycle_unevaluable" \
     "$cycle_search_exhausted" "$cycle_llm_provider_failure" \
     "$llm_preflight_record" "$cycle_research_funnel" \
-    "$cycle_research_verdict" "$cycle_cost_diagnostic" <<'PY'
+    "$cycle_research_verdict" "$cycle_cost_diagnostic" \
+    "$cycle_readiness_record" <<'PY'
 import json
 import sys
 
 status, reason, exit_code, raw_outcomes, success, no_edge, unevaluable, \
     search_exhausted, llm_provider_failure, raw_preflight, raw_funnel, \
-    raw_verdict, raw_cost = sys.argv[1:]
+    raw_verdict, raw_cost, raw_readiness = sys.argv[1:]
 try:
     preflight = json.loads(raw_preflight)
 except (TypeError, ValueError):
@@ -325,6 +338,12 @@ def object_or_none(raw):
 funnel = object_or_none(raw_funnel)
 verdict = object_or_none(raw_verdict)
 cost = object_or_none(raw_cost)
+try:
+    readiness = json.loads(raw_readiness)
+except (TypeError, ValueError):
+    readiness = None
+if not isinstance(readiness, dict):
+    readiness = None
 payload = {
     "schema": "research-cycle.v1", "status": status, "reason": reason,
     "exit_code": int(exit_code),
@@ -340,6 +359,8 @@ payload = {
     "llm_provider_failure": bool(int(llm_provider_failure)),
     "preflight": preflight,
 }
+if readiness is not None:
+    payload["readiness"] = readiness
 if funnel is not None:
     payload["research_funnel"] = funnel
 if verdict is not None:
@@ -362,7 +383,7 @@ finish() {
   local terminal_unit="$direct_last_unit"
   local terminal_vehicle="$direct_last_vehicle"
   case "$status" in
-    completed|completed_no_edge|search_exhausted|llm_provider_failure)
+    completed|completed_no_edge|search_exhausted|llm_provider_failure|waiting_for_forward_sessions)
       terminal_phase="completed"
       terminal_done=1
       terminal_total=1
@@ -461,6 +482,109 @@ set -e
 [ "$feed_guard_status" -eq 0 ] || \
   finish "failed" "feed entitlement/configuration validation failed: ${feed_guard:-unknown error}" 3
 read -r configured_feed configured_option_feed <<< "$feed_guard"
+
+preflight_dataset="${ALPACA_RESEARCH_DATASET-}"
+dataset_from_recorder=0
+partition_root=""
+recorded_root="${ALPACA_RECORDED_DATASET_ROOT:-$repo_root/runtime/research/recorded}"
+if [[ "$recorded_root" != /* ]]; then
+  recorded_root="$repo_root/$recorded_root"
+fi
+acceptance_root="${ALPACA_RESEARCH_ACCEPTANCE_ROOT:-}"
+if [ -n "$acceptance_root" ] && [[ "$acceptance_root" != /* ]]; then
+  acceptance_root="$repo_root/$acceptance_root"
+fi
+
+session_window="${ALPACA_RESEARCH_SESSION_WINDOW:-0}"
+case "$session_window" in
+  ''|*[!0-9]*)
+    finish "failed" "ALPACA_RESEARCH_SESSION_WINDOW must be a nonnegative integer" 3
+    ;;
+esac
+
+# A sealed snapshot is an explicit, bounded input. It is never created for a
+# normal recorder run: copying a large corpus requires both an opt-in flag and
+# an explicit destination. A caller-supplied dataset keeps precedence so the
+# existing frozen-source path contract remains unchanged.
+snapshot_root="${ALPACA_RESEARCH_SNAPSHOT_ROOT:-}"
+snapshot_create="${ALPACA_RESEARCH_SNAPSHOT_CREATE:-${ALPACA_RESEARCH_CREATE_SNAPSHOT:-0}}"
+snapshot_max_bytes="${ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES:-}"
+snapshot_min_free_bytes="${ALPACA_RESEARCH_SNAPSHOT_MIN_FREE_BYTES:-0}"
+snapshot_identity=""
+snapshot_verified=0
+case "$snapshot_create" in
+  0|1) ;;
+  *) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_CREATE must be 0 or 1" 3 ;;
+esac
+case "$snapshot_max_bytes" in
+  '') ;;
+  *[!0-9]*) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES must be a positive integer" 3 ;;
+  0) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES must be positive" 3 ;;
+esac
+case "$snapshot_min_free_bytes" in
+  ''|*[!0-9]*) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MIN_FREE_BYTES must be nonnegative" 3 ;;
+esac
+if [ -n "$snapshot_root" ] && [[ "$snapshot_root" != /* ]]; then
+  snapshot_root="$repo_root/$snapshot_root"
+fi
+
+census_ran=0
+run_partition_census() {
+  local census_partition_root="$1"
+  local census_recorded_root="$2"
+  local census_output census_status census_gate
+  local census_args=(
+    --partition-root "$census_partition_root"
+    --recorded-root "$census_recorded_root"
+    --session-window "$session_window"
+    --trusted-recorder
+    --summary-only
+  )
+  if [ -n "$acceptance_root" ]; then
+    census_args+=(--acceptance-root "$acceptance_root")
+  fi
+  set +e
+  census_output="$($python_bin "$repo_root/deploy/research_census.py" \
+    "${census_args[@]}")"
+  census_status=$?
+  set -e
+  printf '%s\n' "$census_output" >&2
+  if [ "$census_status" -ne 0 ]; then
+    finish "failed" "research partition census failed" 3
+  fi
+  cycle_readiness_record="$($python_bin - "$census_output" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+readiness = payload.get("readiness")
+if not isinstance(readiness, dict):
+    raise SystemExit(1)
+print(json.dumps(readiness, sort_keys=True, separators=(",", ":")))
+PY
+)" || finish "failed" "research partition census readiness is invalid" 3
+  census_gate="$($python_bin - "$census_output" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+print("1" if payload.get("structurally_underpowered") is True else "0")
+print(str(payload.get("reason") or "forward-session evidence is insufficient"))
+PY
+)" || finish "failed" "research partition census result is invalid" 3
+  census_ran=1
+  if [ -n "$acceptance_root" ] && [ "${census_gate%%$'\n'*}" = "1" ]; then
+    finish "waiting_for_forward_sessions" "${census_gate#*$'\n'}" 0
+  fi
+}
+
+# The normal recorder path is censused before provider calls, snapshot copying,
+# capacity checks, or preprocessing. An explicit external dataset retains its
+# legacy flow because it has no trusted recorder acceptance contract.
+if [ -n "$acceptance_root" ] && [ -z "$preflight_dataset" ] && \
+   { [ -z "$snapshot_root" ] || [ "$snapshot_create" -eq 1 ]; }; then
+  run_partition_census "$recorded_root/sessions" "$recorded_root"
+fi
 
 # Enabling model-assisted research is an explicit operational contract.  Do
 # not let an empty/default /dev/null secret silently open an authentication
@@ -567,45 +691,6 @@ if [ "$option_research_selected" -eq 1 ] && [ "$configured_option_feed" != "opra
 fi
 
 dataset="${ALPACA_RESEARCH_DATASET:-}"
-dataset_from_recorder=0
-partition_root=""
-recorded_root="${ALPACA_RECORDED_DATASET_ROOT:-$repo_root/runtime/research/recorded}"
-if [[ "$recorded_root" != /* ]]; then
-  recorded_root="$repo_root/$recorded_root"
-fi
-
-session_window="${ALPACA_RESEARCH_SESSION_WINDOW:-0}"
-case "$session_window" in
-  ''|*[!0-9]*)
-    finish "failed" "ALPACA_RESEARCH_SESSION_WINDOW must be a nonnegative integer" 3
-    ;;
-esac
-
-# A sealed snapshot is an explicit, bounded input. It is never created for a
-# normal recorder run: copying a large corpus requires both an opt-in flag and
-# an explicit destination. A caller-supplied dataset keeps precedence so the
-# existing frozen-source path contract remains unchanged.
-snapshot_root="${ALPACA_RESEARCH_SNAPSHOT_ROOT:-}"
-snapshot_create="${ALPACA_RESEARCH_SNAPSHOT_CREATE:-${ALPACA_RESEARCH_CREATE_SNAPSHOT:-0}}"
-snapshot_max_bytes="${ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES:-}"
-snapshot_min_free_bytes="${ALPACA_RESEARCH_SNAPSHOT_MIN_FREE_BYTES:-0}"
-snapshot_identity=""
-snapshot_verified=0
-case "$snapshot_create" in
-  0|1) ;;
-  *) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_CREATE must be 0 or 1" 3 ;;
-esac
-case "$snapshot_max_bytes" in
-  '') ;;
-  *[!0-9]*) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES must be a positive integer" 3 ;;
-  0) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MAX_BYTES must be positive" 3 ;;
-esac
-case "$snapshot_min_free_bytes" in
-  ''|*[!0-9]*) finish "failed" "ALPACA_RESEARCH_SNAPSHOT_MIN_FREE_BYTES must be nonnegative" 3 ;;
-esac
-if [ -n "$snapshot_root" ] && [[ "$snapshot_root" != /* ]]; then
-  snapshot_root="$repo_root/$snapshot_root"
-fi
 if [ -z "$dataset" ] && [ "$snapshot_create" -eq 1 ]; then
   if [ -z "$snapshot_root" ]; then
     finish "failed" "snapshot creation requires ALPACA_RESEARCH_SNAPSHOT_ROOT" 3
@@ -698,6 +783,11 @@ else
       fi
     done
   fi
+fi
+
+if [ "$census_ran" -eq 0 ] && [ -n "$acceptance_root" ] && \
+   [ "$dataset_from_recorder" -eq 1 ] && [ -n "$partition_root" ]; then
+  run_partition_census "$partition_root" "$recorded_root"
 fi
 
 if [ -n "$partition_root" ]; then

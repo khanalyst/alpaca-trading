@@ -3934,7 +3934,7 @@ class DeployTests(unittest.TestCase):
         self.assertIn("configured_risk_budget_usd", dashboard.HTML)
         self.assertIn("planned_to_configured_risk_ratio", dashboard.HTML)
         self.assertIn("delivered_to_configured_risk_ratio", dashboard.HTML)
-        self.assertIn("Paper-account trials", dashboard.HTML)
+        self.assertIn("Qualified-edge paper reviews — separate from the experiment", dashboard.HTML)
         self.assertNotIn("d.research_feed_version", dashboard.HTML)
         self.assertNotIn("d.research.optional", dashboard.HTML)
         self.assertNotIn("d.trader.heartbeat.research_available", dashboard.HTML)
@@ -3943,7 +3943,7 @@ class DeployTests(unittest.TestCase):
         """Every question the operator asked has a surface that answers it."""
         for marker in (
                 # Which edge is earning a promotion, and what to paste.
-                "d.trial", "Paper-account trials", "Promotable", "config_snippet",
+                "d.trial", "Qualified-edge paper reviews — separate from the experiment", "Promotable", "config_snippet",
                 # What was pinned, and whether it can actually trade.
                 "d.promotions", "Pinned promotions", "Pinned but NOT trading",
                 "automatic substitution",

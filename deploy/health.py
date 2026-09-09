@@ -85,6 +85,18 @@ def _status_nonnegative_float(value: object) -> float | None:
     return min(number, 1_000_000_000_000.0)
 
 
+def _status_signed_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return max(-1_000_000_000_000.0, min(number, 1_000_000_000_000.0))
+
+
 def _status_string_list(value: object, *, limit: int) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
@@ -96,20 +108,82 @@ def _status_string_list(value: object, *, limit: int) -> list[str]:
     return result
 
 
+def _paper_trial_summary(value: object) -> dict | None:
+    """Expose a paper experiment without projecting it as verified proof."""
+    if (not isinstance(value, dict) or
+            value.get("schema") != "paper-incumbent-trial.v1" or
+            value.get("enabled") is not True or
+            value.get("authorizing") is not False or
+            value.get("proof_authority") is not False):
+        return None
+    state = value.get("state")
+    if state not in {"running", "passed", "failed", "review_required", "blocked"}:
+        return None
+    eligible = value.get("entry_eligible")
+    if not isinstance(eligible, bool) or (eligible and state not in {"running", "passed"}):
+        return None
+    activated = value.get("activation_confirmed") is True
+    if eligible and not activated:
+        return None
+    result = {
+        "schema": value["schema"], "enabled": True,
+        "state": state, "entry_eligible": eligible,
+        "activation_confirmed": activated,
+        "authorizing": False, "proof_authority": False,
+        "blockers": _status_string_list(value.get("blockers"), limit=8),
+    }
+    for key in ("trial_id", "candidate_id", "variant_id", "incumbent_identity",
+                "verdict", "started_on"):
+        result[key] = _status_text(value.get(key))
+    for key in ("valid_sessions", "required_sessions", "closed_outcomes",
+                "required_trades", "max_review_sessions"):
+        result[key] = _status_nonnegative_int(value.get(key))
+    if eligible and not all(result.get(key) for key in (
+            "trial_id", "candidate_id", "variant_id", "incumbent_identity")):
+        return None
+    detail = value.get("verdict_detail")
+    if isinstance(detail, dict):
+        result["verdict_detail"] = {
+            "state": _status_text(detail.get("state"), limit=40),
+            "reason": _status_text(detail.get("reason"), limit=240),
+            **{key: _status_signed_float(detail.get(key)) for key in (
+                "total_r", "mean_r", "min_total_r", "min_mean_r", "net_pnl", "win_rate")},
+        }
+        confidence = detail.get("session_cluster_confidence")
+        if isinstance(confidence, dict):
+            result["verdict_detail"]["session_cluster_confidence"] = {
+                "available": confidence.get("available") is True,
+                **{key: _status_signed_float(confidence.get(key)) for key in (
+                    "confidence", "lower_bound", "upper_bound")},
+                **{key: _status_nonnegative_int(confidence.get(key)) for key in (
+                    "observations", "session_clusters", "clusters")},
+            }
+    return result
+
+
 def paper_selection_summary(value: object) -> dict | None:
     """Whitelist the one requested/resolved paper identity from a heartbeat."""
     if not isinstance(value, dict):
         return None
     state = _status_text(value.get("state"), limit=40)
     armed = value.get("armed")
-    if state not in {"waiting_for_proof", "ready", "blocked"} or not isinstance(
+    if state not in {"waiting_for_proof", "ready", "blocked", "paper_trial"} or not isinstance(
             armed, bool):
+        return None
+    trial = _paper_trial_summary(value.get("paper_trial"))
+    if "paper_trial" in value and trial is None:
+        return None
+    if state == "paper_trial" and (trial is None or not trial["entry_eligible"] or not armed):
+        return None
+    if trial is not None and state == "ready":
         return None
 
     resolved = None
     raw_resolved = value.get("resolved")
     if isinstance(raw_resolved, dict):
         raw_proof = raw_resolved.get("proof")
+        if trial is not None and raw_proof is not None:
+            return None
         proof = None
         if isinstance(raw_proof, dict):
             proof = {
@@ -124,11 +198,15 @@ def paper_selection_summary(value: object) -> dict | None:
         }
         if proof is not None and all(identity.values()):
             resolved = {**identity, "proof": proof}
+        elif (trial is not None and raw_proof is None and all(identity.values()) and
+              identity["candidate_id"] == trial["candidate_id"] and
+              identity["variant_id"] == trial["variant_id"]):
+            resolved = {**identity, "proof": None, "proof_authority": False}
     # A ready label without one verified identity is less honest than no
     # projection at all. Waiting/blocked states may legitimately be unresolved.
-    if state == "ready" and resolved is None:
+    if state in {"ready", "paper_trial"} and resolved is None:
         return None
-    return {
+    result = {
         "configured_strategy": _status_text(value.get("configured_strategy")),
         "selection_mode": _status_text(value.get("selection_mode")),
         "requested_variant": _status_text(value.get("requested_variant")),
@@ -137,6 +215,50 @@ def paper_selection_summary(value: object) -> dict | None:
         "armed": armed,
         "state": state,
     }
+    if trial is not None:
+        result["paper_trial"] = trial
+    return result
+
+
+def _shadow_accounts_summary(value: object, arms: list[dict]) -> dict | None:
+    if (not isinstance(value, dict) or
+            value.get("schema") != "diagnostic-forward-accounts-summary.v1" or
+            _status_nonnegative_int(value.get("actual_fills")) != 0):
+        return None
+    identity_by_candidate = {
+        _status_text(arm.get("candidate_id")): {
+            key: _status_text(arm.get(key)) for key in ("family", "role", "variant_id")}
+        for arm in arms}
+    result = {
+        "schema": value["schema"], "actual_fills": 0,
+        "authorizing": False, "proof_authority": False,
+    }
+    for key in ("account_count", "priced_account_count", "unpriced_account_count",
+                "open_positions", "closed_positions", "orders", "modeled_fills",
+                "entry_fills", "exit_fills", "late_data_gap_positions"):
+        result[key] = _status_nonnegative_int(value.get(key))
+    for key in ("cash", "equity", "realized_pnl", "unrealized_pnl"):
+        result[key] = _status_signed_float(value.get(key))
+    projected = []
+    seen = set()
+    candidates = value.get("by_candidate")
+    for raw in candidates[:24] if isinstance(candidates, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        candidate = _status_text(raw.get("candidate_id"))
+        if not candidate or candidate in seen or candidate not in identity_by_candidate:
+            continue
+        seen.add(candidate)
+        item = {"candidate_id": candidate, **identity_by_candidate[candidate],
+                "mark_status": _status_text(raw.get("mark_status"), limit=40),
+                "last_event_at": _status_text(raw.get("last_event_at"), limit=80)}
+        item.update({key: _status_signed_float(raw.get(key)) for key in (
+            "cash", "equity", "realized_pnl", "unrealized_pnl")})
+        item.update({key: _status_nonnegative_int(raw.get(key)) for key in (
+            "open_positions", "closed_positions", "fills", "late_data_gaps")})
+        projected.append(item)
+    result["by_candidate"] = projected
+    return result
 
 
 def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
@@ -224,7 +346,7 @@ def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
         diagnostic_only and flags["online_fdr"] is False and
         actual_fills == 0 and poll_duration is not None)
 
-    return {
+    result = {
         "schema": _status_text(value.get("schema")),
         **flags,
         "diagnostic_only": diagnostic_only,
@@ -254,6 +376,8 @@ def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
                 decision_raw.get("this_poll")),
             "warmup": _status_nonnegative_int(decision_raw.get("warmup")),
             "by_kind": by_kind,
+            **{key: _status_nonnegative_int(decision_raw.get(key)) for key in (
+                "evaluated_total", "compacted_no_trade", "compacted_no_data")},
         },
         "rejection_counts": {
             key: _status_nonnegative_int(rejection_raw.get(key))
@@ -276,6 +400,18 @@ def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
         "source_data_fresh": (
             source_lag <= float(max_age) if source_lag is not None else None),
     }
+    forward_accounts = (_shadow_accounts_summary(value.get("forward_accounts"), arms)
+                        if diagnostic_only else None)
+    if forward_accounts is not None:
+        result["forward_accounts"] = forward_accounts
+    for key in ("by_reason", "unpriced_by_reason"):
+        raw = rejection_raw.get(key)
+        if isinstance(raw, dict):
+            result["rejection_counts"][key] = {
+                name: count for reason, number in list(raw.items())[:24]
+                if (name := _status_text(reason, limit=120)) is not None
+                and (count := _status_nonnegative_int(number)) is not None}
+    return result
 
 
 def _fresh(timestamp: object, max_age: float, now: float | None = None) -> bool:
@@ -743,7 +879,8 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         hung = status == "running" and deadline is not None and current > float(deadline)
     except (TypeError, ValueError):
         hung = status == "running"
-    scheduler_operational = status in {"waiting", "running"}
+    scheduler_operational = status in {
+        "waiting", "running", "waiting_for_forward_sessions"}
     previous_cycle_degraded = last_exit not in {None, 0}
     waiting_after_no_data = (
         status == "waiting"
@@ -758,13 +895,15 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
     scheduler_liveness_ok = fresh and not hung and status in {
         "waiting", "running", "completed", "completed_no_edge", "failed",
         "no_data", "unevaluable", "search_exhausted",
-        "llm_provider_failure"}
+        "llm_provider_failure", "waiting_for_forward_sessions"}
     terminal_status = str(cycle.get("status") if isinstance(cycle, dict)
                           else heartbeat.get("cycle_status") or status).lower()
     explicit_evidence = (cycle.get("evidence_available")
                          if isinstance(cycle, dict) else
                          heartbeat.get("evidence_available"))
-    if isinstance(explicit_evidence, bool):
+    if terminal_status == "waiting_for_forward_sessions":
+        evidence_available = False
+    elif isinstance(explicit_evidence, bool):
         evidence_available = explicit_evidence
     elif terminal_status in {"failed", "no_data", "unevaluable",
                              "search_exhausted", "llm_provider_failure"}:
@@ -843,6 +982,8 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         result["reason"] = "research scheduler waiting for first cycle"
     elif previous_cycle_degraded:
         result["reason"] = "previous research cycle failed"
+    elif terminal_status == "waiting_for_forward_sessions":
+        result["reason"] = readiness.get("reason") or "waiting for accepted forward sessions"
     elif not evidence_available:
         result["reason"] = "latest research cycle produced no usable evidence"
     elif not readiness_ok:

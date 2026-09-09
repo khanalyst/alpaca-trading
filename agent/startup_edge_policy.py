@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+import json
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
@@ -12,6 +13,8 @@ from .alpaca_provider import AlpacaError
 from .alpaca_session import as_new_york
 from .execution_lifecycle import _value
 from .instruments import validate_asset_class, validate_instrument
+from .paper_trial import (REPLACEMENT_LOCAL_BOOK_ERROR,
+                          replacement_local_book_is_flat)
 
 
 class StartupEdgePolicyMixin:
@@ -21,8 +24,9 @@ class StartupEdgePolicyMixin:
         ``armed`` is the operator/runtime authorization posture.  A process may
         therefore be armed while it waits for the first passing proof; durable
         pause, kill, daily-risk, shutdown, and resolution faults all fail it
-        closed.  ``resolved`` is populated only from the single record whose
-        durable shadow proof already passed the edge resolver.
+        closed.  Ordinarily ``resolved`` names only a durable proved edge; the
+        explicit paper-trial lane instead publishes its frozen identity with
+        ``proof: null`` and non-authorizing flags.
         """
         base_cfg = (self._edge_base_cfg
                     if isinstance(getattr(self, "_edge_base_cfg", None), Mapping)
@@ -36,6 +40,11 @@ class StartupEdgePolicyMixin:
         requested_variant = str(
             getattr(self, "_edge_requested_variant", None) or
             strategy.get("variant_id") or "").strip() or None
+        trial_runtime = getattr(self, "_paper_trial_runtime", None)
+        if trial_runtime is not None:
+            configured_strategy = "rule"
+            requested_variant = str(
+                trial_runtime.descriptor.get("variant_id") or "").strip() or None
 
         edge_error = str(getattr(self, "_edge_error", None) or "").strip()
         records = [record for record in
@@ -122,6 +131,29 @@ class StartupEdgePolicyMixin:
              edge_error.startswith("no latest-passing validated edge")))
         edge_fault = bool(
             edge_required and resolved is None and not waiting_for_proof)
+        trial_status = (trial_runtime.status(runtime.get("paper_trial"))
+                        if trial_runtime is not None and isinstance(runtime, Mapping)
+                        else None)
+        if isinstance(trial_status, Mapping) and all(
+                trial_status.get(key) for key in (
+                    "candidate_id", "variant_id", "incumbent_identity")):
+            resolved = {
+                "candidate_id": trial_status["candidate_id"],
+                "variant_id": trial_status["variant_id"],
+                "family": trial_status.get("family"),
+                "incumbent_identity": trial_status["incumbent_identity"],
+                "proof": None,
+                "authorizing": False,
+                "proof_authority": False,
+            }
+        trial_blocker = None
+        if (isinstance(trial_status, Mapping) and
+                trial_status.get("entry_eligible") is not True):
+            trial_blockers = trial_status.get("blockers")
+            if isinstance(trial_blockers, list) and trial_blockers:
+                trial_blocker = str(trial_blockers[0])
+            else:
+                trial_blocker = "paper_trial_blocked"
 
         if runtime_error:
             blocker = "runtime_state_unavailable"
@@ -140,17 +172,22 @@ class StartupEdgePolicyMixin:
             blocker = "edge_resolution_failed"
         elif waiting_for_proof:
             blocker = "validated_edge_required"
+        elif trial_blocker:
+            blocker = trial_blocker
         else:
             blocker = None
 
-        armed = blocker in {None, "validated_edge_required"}
-        if armed and blocker == "validated_edge_required":
+        armed = (blocker in {None, "validated_edge_required"}
+                 if trial_runtime is None else blocker is None)
+        if trial_runtime is not None:
+            selection_state = "paper_trial" if armed else "blocked"
+        elif armed and blocker == "validated_edge_required":
             selection_state = "waiting_for_proof"
         elif armed:
             selection_state = "ready"
         else:
             selection_state = "blocked"
-        return {
+        result = {
             "configured_strategy": configured_strategy,
             "selection_mode": selection_mode,
             "requested_variant": requested_variant,
@@ -159,6 +196,9 @@ class StartupEdgePolicyMixin:
             "armed": armed,
             "state": selection_state,
         }
+        if trial_status is not None:
+            result["paper_trial"] = trial_status
+        return result
 
     @staticmethod
     def _feed_name(value: Any, *, default: str) -> str:
@@ -399,6 +439,13 @@ class StartupEdgePolicyMixin:
                 runtime.get("operator_pause") is not False):
             self._preflight_error = runtime.get("kill_reason") or "operator_pause"
             return False
+        trial_runtime = getattr(self, "_paper_trial_runtime", None)
+        if (trial_runtime is not None and
+                trial_runtime.pending_replacement and
+                not replacement_local_book_is_flat(runtime)):
+            self._preflight_error = REPLACEMENT_LOCAL_BOOK_ERROR
+            self._edge_error = REPLACEMENT_LOCAL_BOOK_ERROR
+            return False
         try:
             self.preflight()
         except Exception as exc:  # noqa: BLE001
@@ -412,6 +459,16 @@ class StartupEdgePolicyMixin:
                 self._preflight_error = f"startup reconciliation failed: {exc}"
                 self._event("cycle_blocked", {"reason": "reconciliation_failed", "error": str(exc)})
                 return False
+        if (trial_runtime is not None and
+                trial_runtime.pending_replacement and
+                not self._refresh_edge()):
+            self._preflight_error = (
+                "paper trial replacement cannot manage old exposure; restart "
+                "with the frozen incumbent until broker and local books are flat")
+            # Force a fresh broker snapshot on the next attempt so a newly
+            # flattened old book can complete the replacement safely.
+            self._reconciled = False
+            return False
         if not self._startup_cleanup_checked:
             try:
                 self._enforce_intraday_cleanup(
@@ -471,6 +528,89 @@ class StartupEdgePolicyMixin:
 
     def _refresh_edge(self) -> bool:
         """Refresh paper proofs or re-verify the one pinned live candidate."""
+        trial_runtime = getattr(self, "_paper_trial_runtime", None)
+        if trial_runtime is not None:
+            try:
+                snapshot = getattr(self, "_last_reconcile_snapshot", None)
+                runtime_before = state.load_state()
+                replacement_audit = trial_runtime.replacement_audit(
+                    runtime_before, snapshot)
+                if replacement_audit is not None:
+                    # Preserve the completed incumbent and stopping rationale
+                    # in the existing account-scoped journal before replacing
+                    # its single mutable runtime slot.  A failed audit write
+                    # leaves the old terminal state intact and blocks rollover.
+                    state.log_event(
+                        "paper_trial_terminal_snapshot",
+                        json.dumps(replacement_audit, sort_keys=True,
+                                   allow_nan=False, default=str),
+                        run_id=self.run_id, runtime_mode=self.mode)
+                self._runtime_state = state.update_state(
+                    lambda runtime: trial_runtime.update_runtime(
+                        runtime, broker_snapshot=snapshot))
+                status = trial_runtime.status(
+                    self._runtime_state.get("paper_trial"))
+                if status.get("entry_eligible") is True:
+                    self.cfg = trial_runtime.config
+                    self._edge_record = None
+                    self._edge_records = []
+                    self._edge_configs = [(None, self.cfg)]
+                    self._edge_error = None
+                    try:
+                        def resume(runtime: dict) -> dict:
+                            risk_day = runtime.get("risk_day")
+                            hard_stop = bool(
+                                runtime.get("state") in {
+                                    state.KILLED, state.DAY_STOPPED} or
+                                runtime.get("kill_reason") not in (
+                                    None, False, "") or
+                                (isinstance(risk_day, Mapping) and
+                                 risk_day.get("limit_hit") is True))
+                            if (self.running and not hard_stop and
+                                    runtime.get("state") == state.PAUSED and
+                                    runtime.get("operator_pause") is False):
+                                runtime["state"] = state.RUNNING
+                            return runtime
+                        self._runtime_state = state.update_state(resume)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return True
+                self._edge_record = None
+                self._edge_records = []
+                self._edge_configs = []
+                blockers = status.get("blockers")
+                self._edge_error = (str(blockers[0]) if isinstance(blockers, list)
+                                    and blockers else "paper trial is paused")
+                try:
+                    def pause_trial(runtime: dict) -> dict:
+                        risk_day = runtime.get("risk_day")
+                        hard_stop = bool(
+                            runtime.get("state") in {state.KILLED, state.DAY_STOPPED} or
+                            runtime.get("kill_reason") not in (None, False, "") or
+                            (isinstance(risk_day, Mapping) and
+                             risk_day.get("limit_hit") is True))
+                        if not hard_stop:
+                            runtime["state"] = state.PAUSED
+                        return runtime
+                    self._runtime_state = state.update_state(pause_trial)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    state.write_heartbeat(
+                        "paused", run_id=self.run_id,
+                        reason=self._edge_error,
+                        paper_selection=self._paper_selection_status())
+                except Exception:  # noqa: BLE001
+                    pass
+                return False
+            except Exception as exc:  # noqa: BLE001
+                trial_runtime.error = f"paper_trial_refresh_failed:{exc}"
+                self._edge_record = None
+                self._edge_records = []
+                self._edge_configs = []
+                self._edge_error = str(exc)
+                self._event("paper_trial_refresh_failed", {"error": str(exc)})
+                return False
         research = self._edge_base_cfg.get("research", {})
         if not isinstance(research, Mapping) or not research.get("enabled", False):
             return True

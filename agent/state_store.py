@@ -35,6 +35,9 @@ DEFAULT = {
     # ledger.  They ride the same atomic replacement as the trade close that
     # produced them, so a crash cannot book a close and forget its outcome.
     "edge_outbox": [],
+    # One explicitly configured, non-authorizing paper incumbent.  Outcomes
+    # stay here rather than entering the proof/learning outbox.
+    "paper_trial": {},
 }
 
 
@@ -60,7 +63,8 @@ def _validated(data: Mapping[str, Any]) -> dict:
             not fingerprint.startswith(f"alpaca-{value['runtime_mode']}-")):
         raise ValueError("account_fingerprint does not match runtime_mode")
     for key in ("active_trades", "protection", "opened_at",
-                "orders", "risk_day", "signal_sessions", "preflight"):
+                "orders", "risk_day", "signal_sessions", "preflight",
+                "paper_trial"):
         if not isinstance(value.get(key), dict):
             raise ValueError(f"{key} must be an object")
     sessions = value["signal_sessions"]
@@ -72,6 +76,13 @@ def _validated(data: Mapping[str, Any]) -> dict:
     outbox = value.get("edge_outbox")
     if not isinstance(outbox, list) or any(not isinstance(item, dict) for item in outbox):
         raise ValueError("edge_outbox must be a list of objects")
+    if value["paper_trial"]:
+        try:
+            from .paper_trial import validate_state as validate_paper_trial_state
+            value["paper_trial"] = validate_paper_trial_state(
+                value["paper_trial"])
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
     return value
 
 

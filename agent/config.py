@@ -108,6 +108,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # a pinned edge is never judged here at all.
         "trial": {"enabled": True, "min_sessions": 20, "min_trades": 20,
                   "min_mean_r": 0.0, "min_total_r": 0.0},
+        # Explicitly opt-in, non-authorizing paper experiment.  Empty identity
+        # fields are valid only while disabled.
+        "paper_trial": {
+            "enabled": False,
+            "trial_id": "",
+            "variant_id": "",
+            "accepted_session_report_root": "",
+            "max_review_sessions": 60,
+        },
     },
     "cycle": {"interval_seconds": 60},
 }
@@ -453,7 +462,7 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     llm["timeout_seconds"] = _num(llm, "timeout_seconds", "llm", .1, 120, 10)
     out["llm"] = llm
     research = _map(out.get("research"), "research")
-    _unknown(research, {"enabled", "require_validated_variant", "backtest_bar_fallback", "champion_min_confidence", "db_path", "strategy_llm", "proof", "trial"}, "research")
+    _unknown(research, {"enabled", "require_validated_variant", "backtest_bar_fallback", "champion_min_confidence", "db_path", "strategy_llm", "proof", "trial", "paper_trial"}, "research")
     research["enabled"] = _bool(research, "enabled", "research", True)
     research["require_validated_variant"] = _bool(
         research, "require_validated_variant", "research", True)
@@ -524,6 +533,72 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     trial["min_mean_r"] = _num(trial, "min_mean_r", "research.trial", -10, 10, 0.0)
     trial["min_total_r"] = _num(trial, "min_total_r", "research.trial", -1_000, 1_000, 0.0)
     research["trial"] = trial
+    paper_trial_defaults = DEFAULT_CONFIG["research"]["paper_trial"]
+    paper_trial = dict(paper_trial_defaults)
+    paper_trial.update(_map(
+        research.get("paper_trial", {}), "research.paper_trial"))
+    _unknown(paper_trial, {
+        "enabled", "trial_id", "variant_id",
+        "accepted_session_report_root", "max_review_sessions",
+    }, "research.paper_trial")
+    paper_trial["enabled"] = _bool(
+        paper_trial, "enabled", "research.paper_trial", False)
+    for key in ("trial_id", "variant_id", "accepted_session_report_root"):
+        if not isinstance(paper_trial.get(key), str):
+            raise ConfigError(f"research.paper_trial.{key} must be a string")
+        paper_trial[key] = paper_trial[key].strip()
+    paper_trial["max_review_sessions"] = _int(
+        paper_trial, "max_review_sessions", "research.paper_trial", 5, 500, 60)
+    if paper_trial["enabled"]:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                            paper_trial["trial_id"]):
+            raise ConfigError(
+                "research.paper_trial.trial_id must be an explicit stable identifier")
+        if not paper_trial["variant_id"]:
+            raise ConfigError(
+                "research.paper_trial.variant_id must name an exact diagnostic catalog arm")
+        if not paper_trial["accepted_session_report_root"]:
+            raise ConfigError(
+                "research.paper_trial.accepted_session_report_root is required")
+        try:
+            from .paper_trial import resolve_catalog_arm
+            resolve_catalog_arm(paper_trial["variant_id"])
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        if mode != "paper" or paper is not True or allow_live is not False:
+            raise ConfigError(
+                "research.paper_trial requires mode=paper, broker.paper=true, "
+                "and broker.allow_live=false")
+        if broker.get("provider") != "alpaca":
+            raise ConfigError("research.paper_trial requires broker.provider=alpaca")
+        if broker.get("data_feed") not in {"iex", "sip"}:
+            raise ConfigError(
+                "research.paper_trial requires an exact real-time IEX or SIP feed")
+        if strategy.get("execution_mode") != "shares" or set(
+                universe.get("asset_classes", ())) != {"us_equity"}:
+            raise ConfigError(
+                "research.paper_trial supports shares/us_equity only")
+        if llm.get("enabled") is not False:
+            raise ConfigError("research.paper_trial requires llm.enabled=false")
+        if research.get("enabled") is not True:
+            raise ConfigError("research.paper_trial requires research.enabled=true")
+        if research.get("require_validated_variant") is not True:
+            raise ConfigError(
+                "research.paper_trial requires the validated edge gate to remain enabled")
+        if trial.get("enabled") is not True:
+            raise ConfigError(
+                "research.paper_trial requires research.trial.enabled=true")
+        if session.get("require_exact_calendar") is not True:
+            raise ConfigError(
+                "research.paper_trial requires session.require_exact_calendar=true")
+        if execution.get("strict_market_data") is not True:
+            raise ConfigError(
+                "research.paper_trial requires execution.strict_market_data=true")
+        if paper_trial["max_review_sessions"] < trial["min_sessions"]:
+            raise ConfigError(
+                "research.paper_trial.max_review_sessions cannot be below "
+                "research.trial.min_sessions")
+    research["paper_trial"] = paper_trial
     proof["webhook_timeout_seconds"] = _num(
         proof, "webhook_timeout_seconds", "research.proof", 1, 30, 10)
     research["strategy_llm"] = strategy_llm

@@ -94,6 +94,20 @@
     "require_validated_variant": true,
     "backtest_bar_fallback": true,
     "champion_min_confidence": 0.95,
+    "trial": {
+      "enabled": true,
+      "min_sessions": 20,
+      "min_trades": 20,
+      "min_mean_r": 0.0,
+      "min_total_r": 0.0
+    },
+    "paper_trial": {
+      "enabled": false,
+      "trial_id": "",
+      "variant_id": "",
+      "accepted_session_report_root": "/app/shadow/session-acceptance",
+      "max_review_sessions": 60
+    },
     "strategy_llm": {
       "enabled": true,
       "provider": "openai",

@@ -19,8 +19,8 @@ from research.edge_lab import EdgeLedger
 from research.factory_core import initial_hypotheses
 from research.factory_ledger import FactoryLedger
 from research.trial import (
-    DEFAULT_MIN_SESSIONS, TRIAL_SCHEMA, promotable_report, review_trials,
-    trial_policy,
+    DEFAULT_MIN_SESSIONS, DEFAULT_MIN_TRADES, TRIAL_SCHEMA, promotable_report,
+    review_trials, trial_policy,
 )
 
 POLICY = {"research": {"trial": {"enabled": True, "min_sessions": 5,
@@ -64,7 +64,9 @@ class TrialPolicyTests(unittest.TestCase):
         policy = trial_policy(None)
         self.assertTrue(policy["enabled"])
         self.assertEqual(policy["min_sessions"], DEFAULT_MIN_SESSIONS)
-        self.assertGreaterEqual(policy["min_trades"], 20)
+        self.assertEqual(policy["min_sessions"], 20)
+        self.assertEqual(policy["min_trades"], DEFAULT_MIN_TRADES)
+        self.assertEqual(policy["min_trades"], 20)
 
     def test_configuration_overrides_the_window_and_the_floor(self):
         policy = trial_policy(POLICY)

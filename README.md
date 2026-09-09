@@ -380,13 +380,19 @@ adjusted automatically.
 
 ## How an edge reaches money
 
+The qualified-edge workflow below is separate from the opt-in, unvalidated
+paper-incumbent experiment. That experiment freezes one exact catalog arm on
+the Alpaca **paper** account while diagnostic shadow books run alongside it;
+it cannot grant proof or live authority. See
+[Paper incumbent and persistent shadows](docs/paper-shadow-trials.md).
+
 Four states, and only one transition a machine cannot make.
 
 | State | Who decides | Can it change on its own? |
 | --- | --- | --- |
 | **Research** — hypotheses, variants, gates | the factory | yes, continuously |
 | **Proved** — `validated`/`champion` plus a live-shadow marker | the gates and live ingestion | yes, on evidence |
-| **Trial** — trading the same Alpaca paper account, with outcomes scoped to its authorizing shadow proof | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
+| **Trial** — trading the same Alpaca paper account, with outcomes scoped to its authorizing shadow proof | automatic | yes: after the sample floor, a confidence-supported negative trial is parked; uncertain results remain inconclusive |
 | **Pinned** — an id you wrote into `config.yaml` | **you only** | **yes, on a sequential drift or trial stop; rolling-R is advisory, the pin context is retained, and no replacement is auto-selected** |
 
 Promotion is the one step that is never automatic. When an edge clears its
@@ -463,7 +469,8 @@ successful audit clears it.
 - Keep API keys in `.env` or a host secret; never commit them. Use trading
   permissions only and disable withdrawals.
 - Research, recorder, trader, and dashboard state is isolated in named
-  volumes. Runtime entries require a vehicle-local `validated` or `champion`
+  volumes. Outside the explicitly enabled paper-only experiment, runtime
+  entries require a vehicle-local `validated` or `champion`
   edge record whose latest shadow proof carries the research-side
   parity-matched live-ingestion marker; research cannot place orders or mutate
   broker state. A live preflight additionally requires the account to report
@@ -510,13 +517,15 @@ The lean deployment topology is:
 | `recorder` | Alpaca bars, quotes, and option snapshots (paper by default) | `runtime-data` |
 | `trader` | One paper intraday decision loop in the shipped `shares` execution profile; no overnight book | `runtime-data` |
 | `research` | Scheduled offline replay, evidence, reports, and shadow-WAL ingestion | `runtime-data`, research volumes |
-| `shadow` | Broker-free virtual evaluation and semantic replay parity | Read-only recorder/EdgeLedger inputs, isolated WAL |
+| `shadow` | Persistent broker-free diagnostic books, session acceptance, and semantic replay parity | Read-only recorder/EdgeLedger inputs, isolated WAL and acceptance reports |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 
 The plain supported Compose deployment starts offline research, the broker-free
 shadow service, and default shadow-WAL ingestion in the default startup. A fresh
-deployment must run these lanes long enough to produce a live-shadow-marked
-champion before the trader can open risk. It
+deployment with the shipped, disabled paper-experiment setting must run these
+lanes long enough to produce a live-shadow-marked champion before the trader
+can open risk. An explicit paper experiment is a separate non-authorizing
+exception, never an exception for live money. The recorder
 consumes the recorder's mixed corpus (bars, quotes, and option snapshots),
 which is written one append-only partition per New York session date under
 `runtime/research/recorded/sessions/` with a sidecar index; the cycle script
@@ -531,7 +540,11 @@ status, latest re-verified passing edges, per-edge live paper results, edge
 proof reports, and the execution journal.
 
 The Compose `shadow` service reads the recorder corpus and EdgeLedger read-only,
-has no broker credentials, and writes only its isolated shadow WAL.
+has no broker credentials, and writes only its isolated shadow volume. The
+fixed diagnostic cohort has persistent per-arm balances, positions, modeled
+orders/fills, and full-session acceptance reports. Neither those books nor
+operational acceptance reports can become an authorizing proof. The trader
+and research services read acceptance reports through read-only mounts.
 It evaluates eligible candidates in isolated virtual books from recorder events,
 creates exact-session candidate, paired synthetic root-control, and
 randomized-null replays, and quarantines mismatch/incomplete rows. The paired

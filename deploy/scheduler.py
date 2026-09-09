@@ -324,6 +324,8 @@ def run_scheduler(args) -> int:
         elif cycle_status in {"completed", "completed_no_edge",
                               "search_exhausted", "llm_provider_failure"}:
             final_status = (cycle_status if last_exit == 0 else "failed")
+        elif cycle_status == "waiting_for_forward_sessions":
+            final_status = (cycle_status if last_exit == 0 else "failed")
         else:
             final_status = "completed" if last_exit == 0 else "failed"
         write_status(

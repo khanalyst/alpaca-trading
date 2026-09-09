@@ -14,7 +14,11 @@ from typing import Mapping
 
 READINESS_SCHEMA = "research-readiness.v1"
 READINESS_MAX_HORIZON_SECONDS = 90 * 86400.0
-_READINESS_STATES = frozenset({"unknown", "pending", "ready", "blocked"})
+_READINESS_STATES = frozenset({
+    "unknown", "pending", "ready", "blocked", "not_run",
+    "waiting_for_forward_sessions", "input_ready",
+    "partition_upper_bound_sufficient",
+})
 _READINESS_FIELDS = frozenset({
     "schema", "state", "reason", "recorded_sessions",
     "heldout_min_sessions", "shadow_min_sessions", "heldout_fraction",
@@ -26,6 +30,11 @@ _READINESS_FIELDS = frozenset({
     "development_fraction", "offline_required_sessions",
     "shadow_tail_sessions", "shadow_selection_sessions",
     "shadow_confirmation_sessions",
+    "complete_forward_partition_count", "accepted_forward_partition_count",
+    "missing_acceptance_report_count", "rejected_acceptance_report_count",
+    "invalid_acceptance_report_count", "required_forward_sessions",
+    "readiness_session_count", "readiness_basis", "acceptance_required",
+    "authorizing",
 })
 
 
@@ -152,10 +161,23 @@ def structured_research_readiness(payload: object) -> dict | None:
         if value is not None:
             result[key] = value
     for key in ("offline_required_sessions", "shadow_tail_sessions",
-                "shadow_selection_sessions", "shadow_confirmation_sessions"):
+                "shadow_selection_sessions", "shadow_confirmation_sessions",
+                "complete_forward_partition_count",
+                "accepted_forward_partition_count",
+                "missing_acceptance_report_count",
+                "rejected_acceptance_report_count",
+                "invalid_acceptance_report_count", "required_forward_sessions",
+                "readiness_session_count"):
         value = _readiness_int(payload.get(key))
         if value is not None:
             result[key] = value
+    basis = payload.get("readiness_basis")
+    if basis in {"accepted_full_sessions",
+                 "complete_forward_partition_upper_bound"}:
+        result["readiness_basis"] = basis
+    for key in ("acceptance_required", "authorizing"):
+        if isinstance(payload.get(key), bool):
+            result[key] = payload[key]
     for key in ("heldout_fraction", "shadow_fraction",
                 "qualification_fraction", "development_fraction"):
         value = _readiness_number(payload.get(key), maximum=1.0)
@@ -296,6 +318,16 @@ def derive_research_readiness(progress: Mapping[str, object] | None = None,
         result["development_fraction"] = base["development_fraction"]
     if timestamp is not None:
         result["updated_ts"] = timestamp
+    for key in (
+            "complete_forward_partition_count",
+            "accepted_forward_partition_count",
+            "missing_acceptance_report_count",
+            "rejected_acceptance_report_count",
+            "invalid_acceptance_report_count", "required_forward_sessions",
+            "readiness_session_count", "readiness_basis",
+            "acceptance_required", "authorizing"):
+        if key in base:
+            result[key] = base[key]
     return result
 
 
@@ -356,6 +388,13 @@ class _BoundedCapture:
             cycle = structured_research_cycle(payload)
             if cycle is not None and len(self.research_cycles) < 8:
                 self.research_cycles.append(cycle)
+                nested_readiness = cycle.get("readiness")
+                # The terminal field describes the cheap partition census.
+                # Preserve any more detailed full-source readiness event that
+                # the same run already emitted after validation.
+                if (isinstance(nested_readiness, dict) and
+                        self.research_readiness is None):
+                    self.research_readiness = nested_readiness
                 nested_preflight = cycle.get("preflight")
                 if isinstance(nested_preflight, dict):
                     self.research_preflight = nested_preflight
@@ -454,7 +493,8 @@ def structured_research_cycle(payload: object) -> dict | None:
         return None
     status = str(payload.get("status") or "").lower()
     if status not in {"completed", "completed_no_edge", "no_data", "failed",
-                      "unevaluable", "search_exhausted", "llm_provider_failure"}:
+                      "unevaluable", "search_exhausted", "llm_provider_failure",
+                      "waiting_for_forward_sessions"}:
         return None
     outcomes = payload.get("outcomes")
     if not isinstance(outcomes, list):
@@ -478,6 +518,9 @@ def structured_research_cycle(payload: object) -> dict | None:
     preflight = structured_research_preflight(payload.get("preflight"))
     if preflight is not None:
         result["preflight"] = preflight
+    readiness = structured_research_readiness(payload.get("readiness"))
+    if readiness is not None:
+        result["readiness"] = readiness
     funnel = structured_research_funnel(payload.get("research_funnel"))
     if funnel is not None:
         result["research_funnel"] = funnel

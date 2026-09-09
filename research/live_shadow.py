@@ -40,12 +40,25 @@ from agent.contracts.rule import (
 )
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
-from deploy.recorder import INDEX_NAME as RECORDER_INDEX_NAME, corpus_partitions
+from deploy.recorder import (
+    INDEX_NAME as RECORDER_INDEX_NAME,
+    PARTITION_SOURCE_SCHEMA as RECORDER_PARTITION_SOURCE_SCHEMA,
+    corpus_partitions,
+)
 from research.costs import ReplayPolicy, replay_policy_for_session
 from research.diagnostic_shadow import (
     DIAGNOSTIC_ACTIVATION_SCHEMA, DIAGNOSTIC_CANDIDATE_PREFIX,
     DIAGNOSTIC_COHORT_SCHEMA, build_diagnostic_cohort,
     is_diagnostic_candidate,
+)
+from research.diagnostic_accounts import (
+    ACCOUNT_SCHEMA as DIAGNOSTIC_ACCOUNT_SCHEMA,
+    FILL_SCHEMA as DIAGNOSTIC_FILL_SCHEMA,
+    ORDER_SCHEMA as DIAGNOSTIC_ORDER_SCHEMA,
+    POSITION_SCHEMA as DIAGNOSTIC_POSITION_SCHEMA,
+    DiagnosticAccountBook, DiagnosticAccountError,
+    content_digest as diagnostic_content_digest,
+    new_account_state, validate_account_state, validate_position_state,
 )
 from research.quote_costs import cost_resolver_setup, reprice_ibr_result
 from research.stressed_cost_calibration import (
@@ -984,6 +997,56 @@ def _read_corpus_append(source: Path, offset: int) -> tuple[list[dict], int]:
     return rows, consumed
 
 
+def _recorded_partition_source_mode(source_path: str) -> str | None:
+    """Read one recorder partition's crash-safe historical source marker."""
+    source = Path(str(source_path or ""))
+    if not source.name.startswith("market-") or source.suffix != ".csv":
+        return None
+    marker = source.with_name(source.name + ".source.json")
+    if not marker.exists():
+        return None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ShadowError(
+            f"invalid recorder partition source marker {marker}") from exc
+    if (not isinstance(payload, Mapping) or
+            payload.get("schema") != RECORDER_PARTITION_SOURCE_SCHEMA or
+            payload.get("partition") != source.name or
+            payload.get("source_mode") != "historical_backfill"):
+        raise ShadowError(f"invalid recorder partition source marker {marker}")
+    return "historical_backfill"
+
+
+def _diagnostic_source_projection(
+        event: Mapping[str, Any],
+        source_modes: dict[str, str | None]) -> dict[str, Any]:
+    """Overlay durable recorder source provenance without rewriting the WAL."""
+    projected = dict(event)
+    try:
+        payload = (json.loads(event.get("event_json"))
+                   if isinstance(event.get("event_json"), str)
+                   else event.get("event_json"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return projected
+    if not isinstance(payload, Mapping):
+        return projected
+    source_path = str(event.get("source_path") or "")
+    if source_path not in source_modes:
+        source_modes[source_path] = _recorded_partition_source_mode(source_path)
+    marker_mode = source_modes[source_path]
+    row_mode = str(payload.get("source_mode") or "").strip().lower()
+    if row_mode and row_mode not in {"forward_observed", "historical_backfill"}:
+        raise ShadowError(f"unsupported diagnostic source mode {row_mode!r}")
+    if marker_mode is not None and row_mode and row_mode != marker_mode:
+        raise ShadowError(
+            f"diagnostic event source mode conflicts with {source_path}")
+    body = dict(payload)
+    body["source_mode"] = marker_mode or row_mode or "forward_observed"
+    projected["event_json"] = _json(body)
+    return projected
+
+
 def _compact_shadow_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
     """Keep all bars/options and every quote needed at a decision boundary.
 
@@ -1249,6 +1312,70 @@ class ShadowStore:
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(cohort_identity,candidate_id)
                 );
+                CREATE TABLE IF NOT EXISTS diagnostic_accounts (
+                    cohort_identity TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    starting_cash REAL NOT NULL,
+                    cash REAL NOT NULL,
+                    equity REAL,
+                    realized_pnl REAL NOT NULL,
+                    unrealized_pnl REAL,
+                    open_position_count INTEGER NOT NULL,
+                    closed_position_count INTEGER NOT NULL,
+                    order_count INTEGER NOT NULL,
+                    fill_count INTEGER NOT NULL,
+                    late_data_gap_count INTEGER NOT NULL,
+                    mark_status TEXT NOT NULL,
+                    last_event_key TEXT NOT NULL,
+                    last_event_at TEXT,
+                    state_json TEXT NOT NULL,
+                    state_digest TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(cohort_identity,candidate_id)
+                );
+                CREATE TABLE IF NOT EXISTS diagnostic_positions (
+                    position_id TEXT PRIMARY KEY,
+                    cohort_identity TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    mark_price REAL,
+                    unrealized_pnl REAL,
+                    realized_pnl REAL NOT NULL,
+                    late_data_gap INTEGER NOT NULL,
+                    entry_event_key TEXT NOT NULL,
+                    exit_event_key TEXT,
+                    state_json TEXT NOT NULL,
+                    state_digest TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS diagnostic_orders (
+                    order_id TEXT PRIMARY KEY,
+                    digest TEXT NOT NULL,
+                    cohort_identity TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    position_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    order_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS diagnostic_fills (
+                    fill_id TEXT PRIMARY KEY,
+                    digest TEXT NOT NULL,
+                    order_id TEXT NOT NULL UNIQUE,
+                    cohort_identity TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    position_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    fill_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
                 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
                   BEGIN SELECT RAISE(ABORT, 'shadow events are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
@@ -1269,9 +1396,27 @@ class ShadowStore:
                   BEGIN SELECT RAISE(ABORT, 'shadow trades are immutable'); END;
                 CREATE TRIGGER IF NOT EXISTS shadow_trades_no_delete BEFORE DELETE ON shadow_trades
                   BEGIN SELECT RAISE(ABORT, 'shadow trades are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_orders_no_update
+                  BEFORE UPDATE ON diagnostic_orders
+                  BEGIN SELECT RAISE(ABORT, 'diagnostic orders are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_orders_no_delete
+                  BEFORE DELETE ON diagnostic_orders
+                  BEGIN SELECT RAISE(ABORT, 'diagnostic orders are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_fills_no_update
+                  BEFORE UPDATE ON diagnostic_fills
+                  BEGIN SELECT RAISE(ABORT, 'diagnostic fills are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS diagnostic_fills_no_delete
+                  BEFORE DELETE ON diagnostic_fills
+                  BEGIN SELECT RAISE(ABORT, 'diagnostic fills are immutable'); END;
                 CREATE INDEX IF NOT EXISTS events_timestamp_idx ON events(timestamp);
                 CREATE INDEX IF NOT EXISTS events_inserted_at_idx
                   ON events(inserted_at,event_key);
+                CREATE INDEX IF NOT EXISTS diagnostic_positions_open_idx
+                  ON diagnostic_positions(cohort_identity,candidate_id,status,symbol);
+                CREATE INDEX IF NOT EXISTS diagnostic_orders_candidate_idx
+                  ON diagnostic_orders(cohort_identity,candidate_id,created_at);
+                CREATE INDEX IF NOT EXISTS diagnostic_fills_candidate_idx
+                  ON diagnostic_fills(cohort_identity,candidate_id,created_at);
             """)
             event_columns = {
                 str(row["name"]) for row in db.execute(
@@ -1580,12 +1725,374 @@ class ShadowStore:
             }
         return result
 
+    @staticmethod
+    def _diagnostic_account_values(state: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            float(state["starting_cash"]), float(state["cash"]),
+            state.get("equity"), float(state["realized_pnl"]),
+            state.get("unrealized_pnl"), int(state["open_position_count"]),
+            int(state["closed_position_count"]), int(state["order_count"]),
+            int(state["fill_count"]), int(state["late_data_gap_count"]),
+            str(state["mark_status"]), str(state.get("last_event_key") or ""),
+            state.get("last_event_at"), _json(state),
+            str(state["state_digest"]), time.time(),
+        )
+
+    def seed_diagnostic_accounts(
+            self, *, cohort_identity: str, candidate_ids: Sequence[str],
+            starting_cash: float) -> None:
+        """Add the current cohort's isolated cash books without replaying history."""
+        if self.readonly:
+            raise ShadowError("cannot seed diagnostic accounts on a read-only WAL")
+        with self._connection() as db:
+            for candidate_id in sorted({str(value) for value in candidate_ids}):
+                row = db.execute("""SELECT state_json,state_digest
+                    FROM diagnostic_accounts
+                    WHERE cohort_identity=? AND candidate_id=?""",
+                    (str(cohort_identity), candidate_id)).fetchone()
+                if row is None:
+                    state = new_account_state(
+                        cohort_identity=str(cohort_identity),
+                        candidate_id=candidate_id,
+                        starting_cash=float(starting_cash))
+                    db.execute("""INSERT INTO diagnostic_accounts
+                        (cohort_identity,candidate_id,starting_cash,cash,equity,
+                         realized_pnl,unrealized_pnl,open_position_count,
+                         closed_position_count,order_count,fill_count,
+                         late_data_gap_count,mark_status,last_event_key,
+                         last_event_at,state_json,state_digest,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (str(cohort_identity), candidate_id,
+                         *self._diagnostic_account_values(state)))
+                    continue
+                try:
+                    decoded = json.loads(row["state_json"])
+                    state = validate_account_state(
+                        decoded, cohort_identity=str(cohort_identity),
+                        candidate_id=candidate_id)
+                except (TypeError, ValueError, json.JSONDecodeError,
+                        DiagnosticAccountError) as exc:
+                    raise ShadowError("diagnostic account state is invalid") from exc
+                if str(row["state_digest"]) != str(state["state_digest"]):
+                    raise ShadowError("diagnostic account state digest mismatch")
+                if abs(float(state["starting_cash"]) - float(starting_cash)) > 1e-9:
+                    raise InputConflict(
+                        f"diagnostic account {candidate_id} starting cash changed")
+
+    def diagnostic_account_snapshot(
+            self, *, cohort_identity: str, candidate_id: str) -> dict[str, Any]:
+        """Return one validated account and only its still-open positions."""
+        with self._connection() as db:
+            account_row = db.execute("""SELECT state_json,state_digest
+                FROM diagnostic_accounts
+                WHERE cohort_identity=? AND candidate_id=?""",
+                (str(cohort_identity), str(candidate_id))).fetchone()
+            position_rows = db.execute("""SELECT state_json,state_digest
+                FROM diagnostic_positions
+                WHERE cohort_identity=? AND candidate_id=? AND status='open'
+                ORDER BY position_id""",
+                (str(cohort_identity), str(candidate_id))).fetchall()
+        if account_row is None:
+            raise ShadowError("diagnostic account is unavailable")
+        try:
+            account = validate_account_state(
+                json.loads(account_row["state_json"]),
+                cohort_identity=str(cohort_identity),
+                candidate_id=str(candidate_id))
+            positions = [validate_position_state(
+                json.loads(row["state_json"]),
+                cohort_identity=str(cohort_identity),
+                candidate_id=str(candidate_id)) for row in position_rows]
+        except (TypeError, ValueError, json.JSONDecodeError,
+                DiagnosticAccountError) as exc:
+            raise ShadowError("diagnostic account state is invalid") from exc
+        if str(account_row["state_digest"]) != str(account["state_digest"]):
+            raise ShadowError("diagnostic account state digest mismatch")
+        for row, position in zip(position_rows, positions):
+            if str(row["state_digest"]) != str(position["state_digest"]):
+                raise ShadowError("diagnostic position state digest mismatch")
+        return {"account": account, "positions": positions}
+
+    def diagnostic_account_summary(
+            self, *, cohort_identity: str,
+            candidate_ids: Sequence[str]) -> dict[str, Any]:
+        """Return bounded non-authorizing telemetry for the persistent books."""
+        wanted = sorted({str(value) for value in candidate_ids})
+        if not wanted:
+            return {
+                "schema": "diagnostic-forward-accounts-summary.v1",
+                "account_count": 0, "priced_account_count": 0,
+                "unpriced_account_count": 0, "open_positions": 0,
+                "closed_positions": 0, "orders": 0, "modeled_fills": 0,
+                "entry_fills": 0, "exit_fills": 0,
+                "late_data_gap_positions": 0, "cash": 0.0,
+                "equity": 0.0, "priced_equity": 0.0,
+                "realized_pnl": 0.0, "unrealized_pnl": 0.0,
+                "priced_unrealized_pnl": 0.0, "actual_fills": 0,
+                "by_candidate": [],
+            }
+        placeholders = ",".join("?" for _ in wanted)
+        params = (str(cohort_identity), *wanted)
+        with self._connection() as db:
+            rows = db.execute(f"""SELECT * FROM diagnostic_accounts
+                WHERE cohort_identity=? AND candidate_id IN ({placeholders})
+                ORDER BY candidate_id""", params).fetchall()
+            order_count = int(db.execute(f"""SELECT count(*)
+                FROM diagnostic_orders WHERE cohort_identity=?
+                AND candidate_id IN ({placeholders})""", params).fetchone()[0])
+            fill_rows = db.execute(f"""SELECT action,count(*) AS count
+                FROM diagnostic_fills WHERE cohort_identity=?
+                AND candidate_id IN ({placeholders}) GROUP BY action""",
+                params).fetchall()
+        by_candidate: list[dict[str, Any]] = []
+        cash = realized = 0.0
+        equity = unrealized = 0.0
+        all_priced = True
+        open_positions = closed_positions = late = fills = 0
+        for row in rows:
+            try:
+                state = validate_account_state(
+                    json.loads(row["state_json"]),
+                    cohort_identity=str(cohort_identity),
+                    candidate_id=str(row["candidate_id"]))
+            except (TypeError, ValueError, json.JSONDecodeError,
+                    DiagnosticAccountError) as exc:
+                raise ShadowError("diagnostic account state is invalid") from exc
+            if str(row["state_digest"]) != str(state["state_digest"]):
+                raise ShadowError("diagnostic account state digest mismatch")
+            priced = state.get("equity") is not None
+            all_priced = all_priced and priced
+            cash += float(state["cash"])
+            realized += float(state["realized_pnl"])
+            if priced:
+                equity += float(state["equity"])
+                unrealized += float(state["unrealized_pnl"] or 0.0)
+            open_positions += int(state["open_position_count"])
+            closed_positions += int(state["closed_position_count"])
+            late += int(state["late_data_gap_count"])
+            fills += int(state["fill_count"])
+            by_candidate.append({
+                "candidate_id": state["candidate_id"],
+                "cash": round(float(state["cash"]), 8),
+                "equity": (round(float(state["equity"]), 8)
+                           if priced else None),
+                "realized_pnl": round(float(state["realized_pnl"]), 8),
+                "unrealized_pnl": (round(float(state["unrealized_pnl"]), 8)
+                                   if priced else None),
+                "open_positions": int(state["open_position_count"]),
+                "closed_positions": int(state["closed_position_count"]),
+                "fills": int(state["fill_count"]),
+                "late_data_gaps": int(state["late_data_gap_count"]),
+                "mark_status": state["mark_status"],
+                "last_event_at": state.get("last_event_at"),
+            })
+        fill_counts = {str(row["action"]): int(row["count"])
+                       for row in fill_rows}
+        entry_fills = sum(count for action, count in fill_counts.items()
+                          if action.startswith("entry_"))
+        exit_fills = sum(count for action, count in fill_counts.items()
+                         if action.startswith("exit_"))
+        priced_count = sum(1 for item in by_candidate
+                           if item["equity"] is not None)
+        return {
+            "schema": "diagnostic-forward-accounts-summary.v1",
+            "account_count": len(by_candidate),
+            "priced_account_count": priced_count,
+            "unpriced_account_count": len(by_candidate) - priced_count,
+            "open_positions": open_positions,
+            "closed_positions": closed_positions,
+            "orders": order_count,
+            "modeled_fills": fills,
+            "entry_fills": entry_fills,
+            "exit_fills": exit_fills,
+            "late_data_gap_positions": late,
+            "cash": round(cash, 8),
+            "equity": round(equity, 8) if all_priced else None,
+            "priced_equity": round(equity, 8),
+            "realized_pnl": round(realized, 8),
+            "unrealized_pnl": round(unrealized, 8) if all_priced else None,
+            "priced_unrealized_pnl": round(unrealized, 8),
+            "actual_fills": 0,
+            "by_candidate": by_candidate[-64:],
+        }
+
+    @staticmethod
+    def _validated_immutable_diagnostic_record(
+            record: Mapping[str, Any], *, schema: str,
+            identity_key: str) -> tuple[str, str, dict[str, Any]]:
+        if not isinstance(record, Mapping) or record.get("schema") != schema:
+            raise ShadowError("diagnostic account record is invalid")
+        payload = dict(record)
+        identity = str(payload.get(identity_key) or "")
+        digest = str(payload.pop("digest", "") or "")
+        if (not identity or not digest or
+                diagnostic_content_digest(payload) != digest):
+            raise ShadowError("diagnostic account record digest mismatch")
+        return identity, digest, dict(record)
+
+    def _apply_diagnostic_account_batch(
+            self, db: sqlite3.Connection, *, cohort_identity: str,
+            candidate_id: str, account_batch: Mapping[str, Any]) -> None:
+        if (not isinstance(account_batch, Mapping) or
+                account_batch.get("schema") !=
+                "diagnostic-forward-account-batch.v1"):
+            raise ShadowError("diagnostic account batch is invalid")
+        account_update = account_batch.get("account")
+        if not isinstance(account_update, Mapping):
+            raise ShadowError("diagnostic account update is invalid")
+        try:
+            account = validate_account_state(
+                account_update.get("state"),
+                cohort_identity=str(cohort_identity),
+                candidate_id=str(candidate_id))
+        except DiagnosticAccountError as exc:
+            raise ShadowError("diagnostic account update is invalid") from exc
+        expected_account = account_update.get("previous_state_digest")
+        current = db.execute("""SELECT state_digest FROM diagnostic_accounts
+            WHERE cohort_identity=? AND candidate_id=?""",
+            (str(cohort_identity), str(candidate_id))).fetchone()
+        current_digest = str(current["state_digest"]) if current else None
+        if current_digest != str(account["state_digest"]):
+            if current_digest != expected_account:
+                raise InputConflict(
+                    f"diagnostic account {candidate_id} changed content")
+            if current is None:
+                db.execute("""INSERT INTO diagnostic_accounts
+                    (cohort_identity,candidate_id,starting_cash,cash,equity,
+                     realized_pnl,unrealized_pnl,open_position_count,
+                     closed_position_count,order_count,fill_count,
+                     late_data_gap_count,mark_status,last_event_key,last_event_at,
+                     state_json,state_digest,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (str(cohort_identity), str(candidate_id),
+                     *self._diagnostic_account_values(account)))
+            else:
+                db.execute("""UPDATE diagnostic_accounts SET
+                    starting_cash=?,cash=?,equity=?,realized_pnl=?,
+                    unrealized_pnl=?,open_position_count=?,
+                    closed_position_count=?,order_count=?,fill_count=?,
+                    late_data_gap_count=?,mark_status=?,last_event_key=?,
+                    last_event_at=?,state_json=?,state_digest=?,updated_at=?
+                    WHERE cohort_identity=? AND candidate_id=?""",
+                    (*self._diagnostic_account_values(account),
+                     str(cohort_identity), str(candidate_id)))
+        positions = account_batch.get("positions") or ()
+        if not isinstance(positions, Sequence) or isinstance(
+                positions, (str, bytes, bytearray)):
+            raise ShadowError("diagnostic position updates are invalid")
+        for update in positions:
+            if not isinstance(update, Mapping):
+                raise ShadowError("diagnostic position update is invalid")
+            try:
+                position = validate_position_state(
+                    update.get("state"), cohort_identity=str(cohort_identity),
+                    candidate_id=str(candidate_id))
+            except DiagnosticAccountError as exc:
+                raise ShadowError("diagnostic position update is invalid") from exc
+            position_id = str(position["position_id"])
+            row = db.execute("""SELECT state_digest FROM diagnostic_positions
+                WHERE position_id=?""", (position_id,)).fetchone()
+            current_digest = str(row["state_digest"]) if row else None
+            if current_digest == str(position["state_digest"]):
+                continue
+            if current_digest != update.get("previous_state_digest"):
+                raise InputConflict(
+                    f"diagnostic position {position_id} changed content")
+            values = (
+                str(cohort_identity), str(candidate_id),
+                str(position["symbol"]), str(position["status"]),
+                str(position["direction"]), float(position["quantity"]),
+                float(position["entry_price"]), position.get("mark_price"),
+                position.get("unrealized_pnl"),
+                float(position.get("realized_pnl") or 0.0),
+                int(position.get("late_data_gap") is True),
+                str(position["entry_event_key"]),
+                position.get("exit_event_key"), _json(position),
+                str(position["state_digest"]), time.time())
+            if row is None:
+                db.execute("""INSERT INTO diagnostic_positions
+                    (position_id,cohort_identity,candidate_id,symbol,status,
+                     direction,quantity,entry_price,mark_price,unrealized_pnl,
+                     realized_pnl,late_data_gap,entry_event_key,exit_event_key,
+                     state_json,state_digest,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (position_id, *values))
+            else:
+                db.execute("""UPDATE diagnostic_positions SET
+                    cohort_identity=?,candidate_id=?,symbol=?,status=?,
+                    direction=?,quantity=?,entry_price=?,mark_price=?,
+                    unrealized_pnl=?,realized_pnl=?,late_data_gap=?,
+                    entry_event_key=?,exit_event_key=?,state_json=?,
+                    state_digest=?,updated_at=? WHERE position_id=?""",
+                    (*values, position_id))
+        orders = account_batch.get("orders") or ()
+        fills = account_batch.get("fills") or ()
+        for record in orders:
+            order_id, digest, payload = (
+                self._validated_immutable_diagnostic_record(
+                    record, schema=DIAGNOSTIC_ORDER_SCHEMA,
+                    identity_key="order_id"))
+            existing = db.execute("""SELECT digest FROM diagnostic_orders
+                WHERE order_id=?""", (order_id,)).fetchone()
+            if existing is not None:
+                if str(existing["digest"]) != digest:
+                    raise InputConflict(
+                        f"diagnostic order {order_id} changed content")
+                continue
+            if (str(payload.get("cohort_identity") or "") !=
+                    str(cohort_identity) or
+                    str(payload.get("candidate_id") or "") !=
+                    str(candidate_id)):
+                raise ShadowError("diagnostic order identity conflicts")
+            db.execute("""INSERT INTO diagnostic_orders
+                (order_id,digest,cohort_identity,candidate_id,position_id,
+                 event_key,action,status,order_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (order_id, digest, str(cohort_identity), str(candidate_id),
+                 str(payload.get("position_id") or ""),
+                 str(payload.get("event_key") or ""),
+                 str(payload.get("action") or ""),
+                 str(payload.get("status") or ""), _json(payload), time.time()))
+        for record in fills:
+            fill_id, digest, payload = (
+                self._validated_immutable_diagnostic_record(
+                    record, schema=DIAGNOSTIC_FILL_SCHEMA,
+                    identity_key="fill_id"))
+            existing = db.execute("""SELECT digest FROM diagnostic_fills
+                WHERE fill_id=?""", (fill_id,)).fetchone()
+            if existing is not None:
+                if str(existing["digest"]) != digest:
+                    raise InputConflict(
+                        f"diagnostic fill {fill_id} changed content")
+                continue
+            order = db.execute("""SELECT candidate_id FROM diagnostic_orders
+                WHERE order_id=?""", (str(payload.get("order_id") or ""),)
+            ).fetchone()
+            if (order is None or str(order["candidate_id"]) !=
+                    str(candidate_id)):
+                raise ShadowError("diagnostic fill order is unavailable")
+            if (str(payload.get("cohort_identity") or "") !=
+                    str(cohort_identity) or
+                    str(payload.get("candidate_id") or "") !=
+                    str(candidate_id)):
+                raise ShadowError("diagnostic fill identity conflicts")
+            db.execute("""INSERT INTO diagnostic_fills
+                (fill_id,digest,order_id,cohort_identity,candidate_id,
+                 position_id,event_key,action,fill_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (fill_id, digest, str(payload.get("order_id") or ""),
+                 str(cohort_identity), str(candidate_id),
+                 str(payload.get("position_id") or ""),
+                 str(payload.get("event_key") or ""),
+                 str(payload.get("action") or ""), _json(payload), time.time()))
+
     def record_diagnostic_batch(
             self, *, cohort_identity: str, candidate_id: str,
             cursor_inserted_at: float, cursor_event_key: str,
             processed_events: int, rollups: Mapping[str, Mapping[str, int]],
             pending_sessions: Sequence[str], decisions: Sequence[Mapping[str, Any]],
-            warmup_session: str | None, max_decisions: int) -> int:
+            warmup_session: str | None, max_decisions: int,
+            account_batch: Mapping[str, Any] | None = None) -> int:
         """Atomically persist sparse decisions and advance one arm cursor."""
         if self.readonly:
             raise ShadowError("cannot update diagnostic progress on a read-only WAL")
@@ -1607,6 +2114,8 @@ class ShadowStore:
             "pending_sessions": sorted({str(day) for day in pending_sessions}),
             "decisions": normalized_decisions,
             "warmup_session": str(warmup_session or ""),
+            "account_batch": (dict(account_batch)
+                              if isinstance(account_batch, Mapping) else None),
         })
         inserted = 0
         with self._connection() as db:
@@ -1638,7 +2147,7 @@ class ShadowStore:
             if prior is not None and next_cursor == previous_cursor:
                 if previous_rollups.get("last_batch_identity") == batch_identity:
                     return 0
-                raise ShadowError(
+                raise InputConflict(
                     "diagnostic shadow equal-cursor batch conflicts with persisted progress")
 
             cumulative = dict(previous_rollups.get("cumulative") or {})
@@ -1758,6 +2267,10 @@ class ShadowStore:
                          str(candidate_id), decision_id,
                          str(decision.get("symbol") or ""), "open_incomplete",
                          quantity, entry, _json(plan), time.time()))
+            if account_batch is not None:
+                self._apply_diagnostic_account_batch(
+                    db, cohort_identity=str(cohort_identity),
+                    candidate_id=str(candidate_id), account_batch=account_batch)
             encoded_rollups = {
                 "cumulative": dict(sorted(cumulative.items())),
                 "sessions": sessions,
@@ -2747,6 +3260,10 @@ class ShadowRunner:
             payload = None
         if not isinstance(payload, Mapping):
             return False, "invalid_event_payload"
+        source_mode = str(
+            payload.get("source_mode") or "forward_observed").strip().lower()
+        if source_mode != "forward_observed":
+            return False, f"non_forward_source_mode:{source_mode or 'missing'}"
         observed_at = _timestamp(payload.get("observed_at"))
         activated_at = _timestamp(activation.get("activated_at"))
         if (observed_at is None or activated_at is None or
@@ -2897,6 +3414,10 @@ class ShadowRunner:
                     "candidate_errors": {}}
         cohort_identity = str(cohort.get("cohort_identity") or "")
         candidate_ids = [str(arm.get("candidate_id") or "") for arm in arms]
+        source_modes: dict[str, str | None] = {}
+        snapshot_rows = tuple(
+            _diagnostic_source_projection(row, source_modes)
+            for row in snapshot_rows)
         sessions = {
             session for row in snapshot_rows
             if (session := self._stored_event_session(row)) is not None
@@ -2910,6 +3431,9 @@ class ShadowRunner:
             context_rows = self.store.events_for_sessions(
                 sorted(sessions),
                 max_events=self.config.diagnostic_session_max_events)
+            context_rows = [
+                _diagnostic_source_projection(row, source_modes)
+                for row in context_rows]
         eligible_context = [
             row for row in context_rows
             if self._diagnostic_event_eligible(row, activation)
@@ -2964,11 +3488,6 @@ class ShadowRunner:
                     counts[key] = int(counts.get(key, 0)) + 1
                     rejected += 1
                     continue
-                if str(row.get("event_type") or "") not in {"bar", "bar_1m"}:
-                    counts = rollups.setdefault(session, {})
-                    counts["context_event"] = int(counts.get(
-                        "context_event", 0)) + 1
-                    continue
                 payload = self._stored_event_payload(row)
                 if payload is None or session == "unknown":
                     counts = rollups.setdefault(session, {})
@@ -2978,10 +3497,21 @@ class ShadowRunner:
                     counts[reject_key] = int(counts.get(reject_key, 0)) + 1
                     rejected += 1
                     continue
+                if str(row.get("event_type") or "") not in {
+                        "bar", "bar_1m", "quote"}:
+                    counts = rollups.setdefault(session, {})
+                    counts["context_event"] = int(counts.get(
+                        "context_event", 0)) + 1
+                    continue
+                if str(row.get("event_type") or "") == "quote":
+                    counts = rollups.setdefault(session, {})
+                    counts["context_event"] = int(counts.get(
+                        "context_event", 0)) + 1
                 session_events.setdefault(session, []).append(payload)
             for values in session_events.values():
                 values.sort(key=lambda row: (
-                    str(row.get("timestamp") or ""),
+                    (_availability_time(row) or
+                     datetime.min.replace(tzinfo=UTC)).isoformat(),
                     str(row.get("event_key") or "")))
             close_sessions = [
                 session for session in session_events
@@ -3006,16 +3536,19 @@ class ShadowRunner:
                 for item in active:
                     arm = item["arm"]
                     candidate_id = str(arm.get("candidate_id") or "")
-                    initial = self._portfolio_state(candidate_id)
+                    initial = self.store.diagnostic_account_snapshot(
+                        cohort_identity=cohort_identity,
+                        candidate_id=candidate_id)
                     selected_inputs = {
                         session: session_inputs[session]
                         for session in item["session_events"]
                     }
                     futures[pool.submit(
-                        self._evaluate_arm_snapshot, arm,
+                        self._evaluate_diagnostic_arm_snapshot, arm,
                         item["session_events"], selected_inputs,
                         context_bars, context_quotes, context_options,
-                        initial)] = candidate_id
+                        initial, str(activation.get("warmup_session") or ""))
+                    ] = candidate_id
                 for future in as_completed(futures):
                     candidate_id = futures[future]
                     try:
@@ -3063,7 +3596,8 @@ class ShadowRunner:
                 processed_events=len(rows), rollups=item["rollups"],
                 pending_sessions=item["close_sessions"], decisions=tagged,
                 warmup_session=str(activation.get("warmup_session") or ""),
-                max_decisions=self.config.max_decisions)
+                max_decisions=self.config.max_decisions,
+                account_batch=result.get("account_batch"))
 
         refreshed = self.store.diagnostic_progress(
             cohort_identity, candidate_ids, activation)
@@ -3112,6 +3646,18 @@ class ShadowRunner:
                 "rejection_counts": {"reject": 0, "preactivation": 0},
                 "quoteable_virtual_opens": 0, "unpriced_virtual_opens": 0,
                 "replay_modeled_fills": 0, "actual_fills": 0,
+                "forward_accounts": {
+                    "schema": "diagnostic-forward-accounts-summary.v1",
+                    "account_count": 0, "priced_account_count": 0,
+                    "unpriced_account_count": 0, "open_positions": 0,
+                    "closed_positions": 0, "orders": 0,
+                    "modeled_fills": 0, "entry_fills": 0,
+                    "exit_fills": 0, "late_data_gap_positions": 0,
+                    "cash": 0.0, "equity": 0.0, "priced_equity": 0.0,
+                    "realized_pnl": 0.0, "unrealized_pnl": 0.0,
+                    "priced_unrealized_pnl": 0.0,
+                    "actual_fills": 0, "by_candidate": [],
+                },
                 "poll_duration_seconds": round(max(0.0, poll_duration_seconds), 6),
                 "source_lag_seconds": None,
             }
@@ -3191,6 +3737,9 @@ class ShadowRunner:
                 warmup_decisions += 1
         accounts = [row for row in self.store.replay_accounts()
                     if str(row.get("candidate_id") or "") in candidate_ids]
+        forward_accounts = self.store.diagnostic_account_summary(
+            cohort_identity=str(cohort.get("cohort_identity") or ""),
+            candidate_ids=sorted(candidate_ids))
         modeled_fills = sum(int(row.get("trade_count") or 0) for row in accounts)
         warmup_modeled_fills = sum(
             int(row.get("trade_count") or 0) for row in accounts
@@ -3307,6 +3856,9 @@ class ShadowRunner:
             "unpriced_virtual_opens": unpriced,
             "replay_modeled_fills": modeled_fills,
             "warmup_replay_modeled_fills": warmup_modeled_fills,
+            "forward_accounts": forward_accounts,
+            "forward_modeled_fills": int(
+                forward_accounts.get("modeled_fills") or 0),
             "actual_fills": 0,
             "actual_fill_claims": False,
             "realized_pnl_authorizing": False,
@@ -3494,6 +4046,7 @@ class ShadowRunner:
                   bars: Mapping[str, list], quotes: Mapping[str, list],
                   options: Mapping[str, list]) -> tuple[str, str | None, dict, dict | None]:
         symbol = str(event.get("symbol") or "")
+        diagnostic_candidate = is_diagnostic_candidate(candidate)
         cfg = self._shadow_candidate_config(_safe_config(candidate))
         strategy = cfg.get("strategy", {})
         event_at = _availability_time(event)
@@ -3528,6 +4081,12 @@ class ShadowRunner:
                     {"session_date": session,
                      "equity_feed": expected_equity_feed,
                      "observed_equity_feed": observed_equity_feed}, None)
+        observed_source_mode = str(
+            event.get("source_mode") or "forward_observed").strip().lower()
+        if diagnostic_candidate and observed_source_mode != "forward_observed":
+            return ("no_data", "diagnostic source mode is not forward observed",
+                    {"session_date": session,
+                     "source_mode": observed_source_mode}, None)
         calendar_bounds = _recorded_session_bounds(
             self.config.corpus_path, session)
         if close_at is not None:
@@ -3544,6 +4103,9 @@ class ShadowRunner:
                   if _canonical_equity_feed(row.get("feed")) == expected_equity_feed
                   and (_canonical_equity_provider(row.get("provider")) ==
                        expected_equity_provider)
+                  and (not diagnostic_candidate or str(
+                      row.get("source_mode") or "forward_observed").strip().lower()
+                      == "forward_observed")
                   and _row_visible(row, event_at)
                   and (close_at is None or (
                       (calendar_bounds is None or
@@ -3579,6 +4141,9 @@ class ShadowRunner:
                         expected_equity_feed)
                     and (_canonical_equity_provider(row.get("provider")) ==
                          expected_equity_provider)
+                    and (not diagnostic_candidate or str(
+                        row.get("source_mode") or "forward_observed").strip().lower()
+                        == "forward_observed")
                     and _row_visible(row, event_at)
                     and (_event_end(row) or event_at) <= event_at
                     and ((_timestamp(row.get("timestamp")) or market_at)
@@ -3602,11 +4167,12 @@ class ShadowRunner:
             return "reject", f"signal exception: {type(exc).__name__}", {"error": str(exc)[:240]}, None
         base = {"session_date": session, "strategy_id": strategy_id,
                 "equity_feed": expected_equity_feed,
-                "equity_provider": expected_equity_provider,
                 "variant_id": candidate.get("variant_id"), "signal": signal,
                 "stress_calibration": self._stress_telemetry(
                     policy, symbol=symbol, timestamp=event_at,
                     vehicle=str(candidate.get("vehicle") or "equity"))}
+        if diagnostic_candidate:
+            base["equity_provider"] = expected_equity_provider
         if signal is None:
             if (rule_spec is not None and
                     rule_spec["family"] == "cross_sectional_residual"):
@@ -3629,8 +4195,14 @@ class ShadowRunner:
         signal["decision_timestamp"] = event_at.isoformat()
         signal["entry_timestamp"] = event_at.isoformat()
         base["signal"] = signal
+        quote_rows = quotes.get(symbol, ())
+        if diagnostic_candidate:
+            quote_rows = tuple(
+                row for row in quote_rows
+                if str(row.get("source_mode") or "forward_observed")
+                .strip().lower() == "forward_observed")
         quote = self._latest_quote(
-            quotes.get(symbol, ()), event_at,
+            quote_rows, event_at,
             expected_feed=expected_equity_feed,
             expected_provider=expected_equity_provider)
         snap: dict[str, Any] = {"price": _finite(event.get("close")) or _finite(event.get("open")),
@@ -3638,22 +4210,48 @@ class ShadowRunner:
                                 "spread_bps": None, "stale": True, "quote_stale": True,
                                 "session": session, "signal_ts": signal.get("signal_ts"),
                                 "equity_feed": expected_equity_feed}
+        if diagnostic_candidate:
+            snap["equity_provider"] = expected_equity_provider
         if quote is not None:
             quote_at = _timestamp(quote.get("timestamp"))
             bid, ask = _finite(quote.get("bid")), _finite(quote.get("ask"))
             age = None if quote_at is None else max(0.0, (event_at - quote_at).total_seconds())
             if bid and ask and bid > 0 and ask >= bid:
-                snap.update(price=(bid + ask) / 2, spread_bps=(ask - bid) / ((bid + ask) / 2) * 10_000,
+                snap.update(price=(bid + ask) / 2,
+                            spread_bps=(ask - bid) / ((bid + ask) / 2) * 10_000,
                             quote_ts=quote_at.isoformat() if quote_at else None,
                             quote_age_seconds=age,
                             stale=bool(age is None or age > policy.max_market_data_age_seconds),
                             quote_stale=bool(age is None or age > policy.max_market_data_age_seconds))
+                if diagnostic_candidate:
+                    snap.update(
+                        bid=bid, ask=ask, quote_as_of=quote.get("as_of"),
+                        quote_observed_at=quote.get("observed_at"),
+                        quote_feed=_canonical_equity_feed(quote.get("feed")),
+                        quote_provider=_canonical_equity_provider(
+                            quote.get("provider")),
+                        quote_source_mode=str(
+                            quote.get("source_mode") or
+                            "forward_observed").strip().lower())
         # The setup primitive consumes the exact signal geometry while the
         # quote fields above carry strict point-in-time freshness metadata.
         snap.update({key: value for key, value in signal.items()
                      if key not in {"symbol", "action"} and value is not None})
-        snap["price"] = snap.get("price") or _finite(signal.get("entry_price"))
-        snap["entry_price"] = _finite(signal.get("entry_price")) or snap.get("price")
+        if (diagnostic_candidate and
+                str(candidate.get("vehicle") or "equity") == "equity" and
+                _finite(snap.get("bid")) is not None and
+                _finite(snap.get("ask")) is not None):
+            # A diagnostic requested entry is priced from the executable side,
+            # never the midpoint.  Both sides remain in the immutable snapshot
+            # for later liquidation and spread audits.
+            snap["price"] = (float(snap["ask"])
+                             if str(signal.get("direction") or "") == "long"
+                             else float(snap["bid"]))
+            snap["entry_price"] = snap["price"]
+        else:
+            snap["price"] = snap.get("price") or _finite(signal.get("entry_price"))
+            snap["entry_price"] = (_finite(signal.get("entry_price")) or
+                                   snap.get("price"))
         if signal.get("range_high") is not None and signal.get("range_low") is not None:
             snap["ibr_range"] = {"high": signal.get("range_high"),
                                   "low": signal.get("range_low"),
@@ -3697,8 +4295,16 @@ class ShadowRunner:
             return "reject", f"portfolio state unavailable: {exc}", base, None
         risk = RiskEngine(cfg)
         try:
+            equity_overrides = getattr(self._worker_state, "equities", None)
+            current_equity = (
+                equity_overrides.get(str(candidate["candidate_id"]))
+                if isinstance(equity_overrides, Mapping) else
+                float(self.config.equity))
+            if _finite(current_equity) is None or float(current_equity) <= 0:
+                return ("reject", "persistent account equity unavailable",
+                        base | {"snapshot": snap}, None)
             risk_plan, why = risk.vet_open(
-                plan, float(self.config.equity), positions, {symbol: snap}, {},
+                plan, float(current_equity), positions, {symbol: snap}, {},
                 gross_notional, active_trades=active_trades,
                 now=event_at.timestamp())
         except Exception as exc:
@@ -4157,7 +4763,7 @@ class ShadowRunner:
     def _append_worker_open(state: tuple[list[dict], dict[str, dict], float],
                             plan: Mapping[str, Any], symbol: str
                             ) -> tuple[list[dict], dict[str, dict], float]:
-        """Advance one worker's private portfolio projection after an open."""
+        """Advance one legacy worker's private virtual-book projection."""
         positions, active_trades, gross_notional = state
         position = dict(plan)
         position["symbol"] = str(position.get("symbol") or symbol)
@@ -4179,12 +4785,7 @@ class ShadowRunner:
                                options: Mapping[str, Sequence[Mapping]],
                                initial_state: tuple[list[dict], dict[str, dict], float]
                                ) -> dict[str, Any]:
-        """Evaluate one immutable arm without touching the shadow WAL.
-
-        Every worker receives the same tuple-backed event snapshot.  The
-        private portfolio projection reproduces within-arm admission for
-        multiple events while keeping SQLite reads/writes out of the worker.
-        """
+        """Evaluate one legacy arm without touching the shadow WAL."""
         candidate_id = str(arm["candidate_id"])
         state = (list(initial_state[0]), dict(initial_state[1]),
                  float(initial_state[2]))
@@ -4192,7 +4793,6 @@ class ShadowRunner:
         decisions: list[dict[str, Any]] = []
         try:
             for session in sorted(session_events):
-                session_bars, session_quotes, session_options = session_inputs[session]
                 for event in session_events[session]:
                     symbol = str(event.get("symbol") or "")
                     event_key = str(event.get("event_key") or "")
@@ -4219,16 +4819,9 @@ class ShadowRunner:
                     if plan is not None:
                         state = self._append_worker_open(state, plan, symbol)
                         self._worker_state.portfolios[candidate_id] = state
-                # Session replay is parent-owned and normally closes complete
-                # virtual books before the next session.  Reset the private
-                # projection at this boundary; an incomplete replay remains
-                # durable in SQLite and blocks the next poll conservatively.
                 state = ([], {}, 0.0)
                 self._worker_state.portfolios[candidate_id] = state
         except Exception as exc:
-            # The parent records the bounded diagnostic in its poll result and
-            # continues sibling arms.  No partial worker output is committed,
-            # so a retry can deterministically recompute this candidate.
             return {"candidate_id": candidate_id, "decisions": [],
                     "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
         finally:
@@ -4238,6 +4831,135 @@ class ShadowRunner:
                 pass
         return {"candidate_id": candidate_id, "decisions": decisions,
                 "error": None}
+
+    def _evaluate_diagnostic_arm_snapshot(
+            self, arm: Mapping[str, Any],
+            session_events: Mapping[str, Sequence[Mapping]],
+            session_inputs: Mapping[str, tuple[Sequence[Mapping],
+                                                Sequence[Mapping],
+                                                Sequence[Mapping]]],
+            bars: Mapping[str, Sequence[Mapping]],
+            quotes: Mapping[str, Sequence[Mapping]],
+            options: Mapping[str, Sequence[Mapping]],
+            initial_state: Mapping[str, Any],
+            warmup_session: str | None = None) -> dict[str, Any]:
+        """Evaluate one immutable arm without touching the shadow WAL.
+
+        Every worker receives the same tuple-backed event snapshot.  The
+        private portfolio projection reproduces within-arm admission for
+        multiple events while keeping SQLite reads/writes out of the worker.
+        """
+        candidate_id = str(arm["candidate_id"])
+        cfg = self._shadow_candidate_config(_safe_config(arm))
+        strategy = cfg.get("strategy") if isinstance(
+            cfg.get("strategy"), Mapping) else {}
+        rule_spec = strategy.get("rule_spec") if isinstance(
+            strategy, Mapping) else None
+        if not isinstance(rule_spec, Mapping):
+            return {"candidate_id": candidate_id, "decisions": [],
+                    "error": "diagnostic rule specification unavailable"}
+        book = DiagnosticAccountBook(
+            account=initial_state.get("account") or {},
+            positions=initial_state.get("positions") or (), config=cfg,
+            policy=self._shadow_policy(cfg), rule_spec=rule_spec)
+        state = book.risk_state()
+        self._worker_state.portfolios = {candidate_id: state}
+        self._worker_state.equities = {candidate_id: book.equity}
+        decisions: list[dict[str, Any]] = []
+        warmup_session = str(warmup_session or "")
+        quote_rows = tuple(row for values in quotes.values() for row in values)
+        ordered_events: list[tuple[datetime, str, str, Mapping[str, Any]]] = []
+        for session, events in session_events.items():
+            if session not in session_inputs:
+                raise ShadowError(
+                    f"diagnostic session context {session} is unavailable")
+            for event in events:
+                available_at = _availability_time(event)
+                if available_at is None:
+                    raise ShadowError("diagnostic event availability is invalid")
+                ordered_events.append((
+                    available_at, str(event.get("event_key") or ""),
+                    str(session), event))
+        ordered_events.sort(key=lambda item: (item[0], item[1]))
+        persisted_at = _timestamp(book.account.get("last_event_at"))
+        account_watermark = (
+            (persisted_at, str(book.account.get("last_event_key") or ""))
+            if persisted_at is not None else None)
+        try:
+            for available_at, event_key, session, event in ordered_events:
+                # The insertion cursor can legitimately encounter a delayed
+                # event whose claimed availability precedes already committed
+                # account state. Consume it, but never rewind cash or positions.
+                if (account_watermark is not None and
+                        (available_at, event_key) <= account_watermark):
+                    continue
+                symbol = str(event.get("symbol") or "")
+                event_type = str(event.get("event_type") or "").lower()
+                if event_type == "quote":
+                    if not warmup_session or session > warmup_session:
+                        book.advance_quote_event(event, quote_rows=quote_rows)
+                        state = book.risk_state()
+                        self._worker_state.portfolios[candidate_id] = state
+                        self._worker_state.equities[candidate_id] = book.equity
+                    account_at = _timestamp(book.account.get("last_event_at"))
+                    if account_at is not None:
+                        account_watermark = (
+                            account_at,
+                            str(book.account.get("last_event_key") or ""))
+                    continue
+                # Existing positions consume this completed bar before a new
+                # signal is considered. A newly modeled entry can therefore
+                # never consume its own signal bar as exit data.
+                if not warmup_session or session > warmup_session:
+                    book.advance_completed_bar(event, quote_rows=quote_rows)
+                state = book.risk_state()
+                self._worker_state.portfolios[candidate_id] = state
+                self._worker_state.equities[candidate_id] = book.equity
+                if book.has_open(symbol):
+                    kind, reason, payload, plan = (
+                        "no_trade", "persistent diagnostic position is open",
+                        {"session_date": session,
+                         "strategy_id": arm.get("strategy_id"),
+                         "variant_id": arm.get("variant_id")}, None)
+                else:
+                    kind, reason, payload, plan = self._evaluate(
+                        arm, event, bars, quotes, options)
+                decisions.append({
+                    "candidate_id": candidate_id,
+                    "event_key": event_key,
+                    "session_date": session,
+                    "symbol": symbol,
+                    "kind": kind,
+                    "reason": reason,
+                    "payload": payload,
+                    "plan": plan,
+                })
+                if (plan is not None and
+                        (not warmup_session or session > warmup_session)):
+                    book.open_requested_position(
+                        event=event, plan=plan, quote_rows=quote_rows)
+                    state = book.risk_state()
+                    self._worker_state.portfolios[candidate_id] = state
+                    self._worker_state.equities[candidate_id] = book.equity
+                account_at = _timestamp(book.account.get("last_event_at"))
+                if account_at is not None:
+                    account_watermark = (
+                        account_at,
+                        str(book.account.get("last_event_key") or ""))
+        except Exception as exc:
+            # The parent records the bounded diagnostic in its poll result and
+            # continues sibling arms.  No partial worker output is committed,
+            # so a retry can deterministically recompute this candidate.
+            return {"candidate_id": candidate_id, "decisions": [],
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
+        finally:
+            for name in ("portfolios", "equities"):
+                try:
+                    delattr(self._worker_state, name)
+                except AttributeError:
+                    pass
+        return {"candidate_id": candidate_id, "decisions": decisions,
+                "account_batch": book.batch(), "error": None}
 
     def run_once(self) -> dict[str, Any]:
         poll_started = time.monotonic()
@@ -4403,6 +5125,13 @@ class ShadowRunner:
             diagnostic_activation = self._activate_diagnostic_cohort(
                 diagnostic_cohort, source_offsets=next_offsets,
                 forward_event_floor=float(forward_floor or 0.0))
+        if diagnostic_cohort is not None and diagnostic_activation is not None:
+            self.store.seed_diagnostic_accounts(
+                cohort_identity=str(diagnostic_cohort.get(
+                    "cohort_identity") or ""),
+                candidate_ids=[str(arm.get("candidate_id") or "")
+                               for arm in diagnostic_arms],
+                starting_cash=float(self.config.equity))
         diagnostic_rows, diagnostic_progress, diagnostic_event_watermark = (
             self._diagnostic_snapshot(
                 diagnostic_cohort, diagnostic_arms, diagnostic_activation))
