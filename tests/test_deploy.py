@@ -1947,7 +1947,12 @@ class DeployTests(unittest.TestCase):
         fake = _QuoteChunkFake()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "market.csv"
-            fixed_now = datetime.now(timezone.utc).replace(microsecond=0)
+            # Keep the two catch-up windows on one New York session date.  A
+            # wall-clock fixture near 06:00 UTC crosses New York midnight
+            # between the stale seed row and the fetched rows, so the
+            # historical provenance belongs to a different partition than
+            # ``stale_day`` and makes this regression intermittently fail.
+            fixed_now = datetime(2026, 9, 9, 18, 0, tzinfo=timezone.utc)
             stamp = fixed_now - timedelta(hours=3)
             row = {field: "" for field in recorder.FIELDS}
             row.update({
