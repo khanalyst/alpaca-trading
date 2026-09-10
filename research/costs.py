@@ -388,7 +388,8 @@ class ReplayPolicy:
                 raise CostError("strategy.latest_entry_time must be HH:MM") from exc
         force = strategy.get("force_flat_time")
         if force is None:
-            minutes = session.get("force_flat_minutes_before_close")
+            minutes = strategy.get("force_flat_minutes_before_close",
+                                   session.get("force_flat_minutes_before_close"))
             # The runtime session close is 16:00 ET; callers that provide only
             # the minute offset get the same force-flat wall clock.
             if minutes is not None:
@@ -396,7 +397,7 @@ class ReplayPolicy:
                     force = (datetime.combine(date.today(), time(16, 0)) -
                              timedelta(minutes=int(minutes))).time()
                 except (TypeError, ValueError):
-                    raise CostError("session.force_flat_minutes_before_close must be an integer")
+                    raise CostError("force_flat_minutes_before_close must be an integer")
         elif not isinstance(force, time):
             try:
                 force = time.fromisoformat(str(force))
@@ -405,9 +406,15 @@ class ReplayPolicy:
         require_exact = session.get("require_exact_calendar", False)
         if not isinstance(require_exact, bool):
             raise CostError("session.require_exact_calendar must be true or false")
-        flat_offset = session.get("force_flat_minutes_before_close", 10)
+        # Match the broker runtime's per-strategy override before the session
+        # default, including when the exact calendar reports an early close.
+        flat_offset = strategy.get("force_flat_minutes_before_close",
+                                   session.get("force_flat_minutes_before_close", 10))
         reject_offset = session.get("reject_new_entries_minutes_before_close", 5)
-        for name, value in (("session.force_flat_minutes_before_close", flat_offset),
+        flat_offset_name = ("strategy.force_flat_minutes_before_close"
+                            if "force_flat_minutes_before_close" in strategy
+                            else "session.force_flat_minutes_before_close")
+        for name, value in ((flat_offset_name, flat_offset),
                             ("session.reject_new_entries_minutes_before_close", reject_offset)):
             if value is not None and (isinstance(value, bool) or
                                       not isinstance(value, int) or value < 0):

@@ -29,6 +29,7 @@ from research.costs import (BAR, RESTING_BRACKET, RESTING_BRACKET_FILL_SCHEMA,
                             check_entry_slippage,
                             index_quotes, quote_fill, quote_fill_record,
                             cost_model_for_vehicle, risk_unit_report,
+                            replay_policy_for_session,
                             resting_bracket_fill_claim,
                             static_cost_config,
                             validate_resting_bracket_fill,
@@ -127,6 +128,34 @@ class CostModelTests(unittest.TestCase):
         self.assertEqual(runtime.max_stressed_cost_to_risk_ratio, .30)
         self.assertEqual(runtime.as_dict()["stressed_cost_scenario_bps"], 25.0)
         self.assertEqual(runtime.as_dict()["max_stressed_cost_to_risk_ratio"], .30)
+
+    def test_replay_force_flat_offset_matches_runtime_strategy_precedence(self):
+        for strategy, expected in (({"force_flat_minutes_before_close": 7}, 7),
+                                   ({}, 20)):
+            with self.subTest(strategy=strategy):
+                policy = ReplayPolicy.from_config({
+                    "strategy": strategy,
+                    "session": {"require_exact_calendar": True,
+                                "force_flat_minutes_before_close": 20},
+                })
+                self.assertEqual(policy.force_flat_minutes_before_close, expected)
+                self.assertEqual(policy.force_flat_time.isoformat(),
+                                 f"15:{60 - expected:02d}:00")
+                for close_hour in (18, 21):
+                    closed = BASE.replace(hour=close_hour, minute=0)
+                    effective = replay_policy_for_session(
+                        policy, session_open=BASE, session_close=closed,
+                        session_date=BASE.date())
+                    self.assertEqual(effective.force_flat_time.isoformat(),
+                                     f"{close_hour - 6:02d}:{60 - expected:02d}:00")
+
+    def test_replay_rejects_invalid_strategy_force_flat_offset(self):
+        for offset in (True, -1, 1.5, "7"):
+            with self.subTest(offset=offset), self.assertRaises(CostError):
+                ReplayPolicy.from_config({
+                    "strategy": {"force_flat_minutes_before_close": offset},
+                    "session": {"force_flat_minutes_before_close": 10},
+                })
 
     def test_research_stress_veto_matches_runtime_at_boundary(self):
         config = validate_config({"risk": {

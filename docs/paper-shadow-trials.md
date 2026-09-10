@@ -97,6 +97,12 @@ bar cannot retrospectively close its new position. An entirely post-deadline
 bar cannot earn a target fill. Missing executable deadline quotes leave the
 position open, unpriced, and flagged until the first later executable quote.
 
+The exact broker calendar supplies the force-flat deadline, including early
+closes. The strategy's `force_flat_minutes_before_close` overrides the session
+default, matching the broker runtime. Both deadline representations survive
+setup and risk sizing so the persistent book clamps its maximum hold to the
+same session boundary. Missing required calendar metadata prevents entry.
+
 `diagnostic_shadow.forward_accounts` exposes the summary and `by_candidate`
 rows, including `last_event_at`. Unknown marks stay unknown. Each row is an
 independent simulated account, not a portion of an actual Alpaca account;

@@ -434,14 +434,19 @@ class PlanCarriesTheHoldTests(unittest.TestCase):
 
     def test_risk_plan_forwards_the_hold_fields(self):
         risk = RiskEngine({"risk": {"risk_per_trade_pct": 1}})
+        force_flat = BASE.replace(hour=20, minute=50)
         decision = {"symbol": "SPY", "direction": "long", "entry_price": 101,
                     "stop_price": 99, "target_price": 105,
+                    "force_flat_at": force_flat.isoformat(),
+                    "force_flat_ts": force_flat.timestamp(),
                     "max_hold_bars": 3, "hold_deadline_ts": 1767622200.0}
         plan, why = risk.vet_open(decision, 10_000, [], {"SPY": {"price": 101}},
                                   {}, 0, now=0)
         self.assertIsNone(why)
         self.assertEqual(plan["max_hold_bars"], 3)
         self.assertEqual(plan["hold_deadline_ts"], 1767622200.0)
+        self.assertEqual(plan["force_flat_at"], decision["force_flat_at"])
+        self.assertEqual(plan.get("force_flat_ts"), decision["force_flat_ts"])
         plan, why = risk.vet_open({key: value for key, value in decision.items()
                                    if not key.startswith(("max_hold", "hold_"))},
                                   10_000, [], {"SPY": {"price": 101}}, {}, 0, now=0)

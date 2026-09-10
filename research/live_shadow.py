@@ -4089,7 +4089,11 @@ class ShadowRunner:
                      "source_mode": observed_source_mode}, None)
         calendar_bounds = _recorded_session_bounds(
             self.config.corpus_path, session)
+        force_flat_at = None
         if close_at is not None:
+            flat_minutes = (10 if policy.force_flat_minutes_before_close is None
+                            else policy.force_flat_minutes_before_close)
+            force_flat_at = close_at - timedelta(minutes=flat_minutes)
             local_day = market_at.astimezone(NEW_YORK).date()
             latest_at = (datetime.combine(local_day, policy.latest_entry_time,
                                           tzinfo=NEW_YORK).astimezone(UTC)
@@ -4098,6 +4102,11 @@ class ShadowRunner:
                 return ("no_trade", "session entry cutoff reached",
                         {"session_date": session,
                          "session_close": close_at.isoformat(),
+                         "calendar_source": calendar_source}, None)
+            if event_at >= force_flat_at:
+                return ("no_trade", "session force-flat cutoff reached",
+                        {"session_date": session,
+                         "force_flat_at": force_flat_at.isoformat(),
                          "calendar_source": calendar_source}, None)
         stream = [row for row in bars.get(symbol, [])
                   if _canonical_equity_feed(row.get("feed")) == expected_equity_feed
@@ -4194,6 +4203,11 @@ class ShadowRunner:
         signal = dict(signal)
         signal["decision_timestamp"] = event_at.isoformat()
         signal["entry_timestamp"] = event_at.isoformat()
+        if force_flat_at is not None:
+            # Setup and the persistent book need the same absolute deadline
+            # as the broker runtime, not just replay's session-local clock.
+            signal["force_flat_at"] = force_flat_at.isoformat()
+            signal["force_flat_ts"] = force_flat_at.timestamp()
         base["signal"] = signal
         quote_rows = quotes.get(symbol, ())
         if diagnostic_candidate:
