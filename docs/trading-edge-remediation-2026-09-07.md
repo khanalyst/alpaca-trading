@@ -145,7 +145,7 @@ authorizing filters. They are not represented by the new intraday context.
 The existing shared-book correlation cap remains the risk control; coarse
 dashboard exposure labels do not introduce an unvalidated beta-based allocator.
 
-Verification results and logs are recorded in
-[the handover](trading-edge-handover-2026-09-08.md). The user subsequently
+Verification results and logs are recorded in the
+[completion record](trading-edge-completion-2026-09-08.md). The user subsequently
 authorized committing and pushing the completed implementation to main. No
 broker orders, deployment or operator resume were performed.

@@ -1,6 +1,8 @@
 # Completion of the trading-edge handover
 
-Continuation of [the audit handover](trading-edge-handover-2026-09-08.md).
+Continuation of the September 8 audit handover, following
+[the audit](trading-edge-audit-2026-09-07.md) and
+[the remediation record](trading-edge-remediation-2026-09-07.md).
 This record distinguishes implementation, observed operation and evidence that
 still requires future market sessions. No positive edge is claimed.
 

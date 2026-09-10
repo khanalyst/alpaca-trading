@@ -1,6 +1,6 @@
 # Trading edge and research audit
 
-This is the pre-remediation audit of the pinned revisions below. For implemented changes and remaining work, read [the remediation record](trading-edge-remediation-2026-09-07.md) and [the handover](trading-edge-handover-2026-09-08.md).
+This is the pre-remediation audit of the pinned revisions below. For implemented changes and remaining work, read [the remediation record](trading-edge-remediation-2026-09-07.md).
 
 **Audit date:** 7 September 2026, Dubai. Initial deployment observations were collected around 21:15–21:20 UTC on 6 September; container state and the orphan partition were rechecked at 04:23 UTC on 7 September. Branch tips were rechecked at 04:30 UTC. **Verdict: a substantial research and execution scaffold, but no demonstrated deployable positive edge in the evidence inspected.** Main improves research integrity, but neither audited revision is ready to be trusted as a profitable day-trading product.
 
@@ -271,9 +271,9 @@ Detailed reproducible evidence is saved beside this report: [test and lifecycle 
 [rules]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/agent/contracts/rule.py#L34
 [exits]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/agent/contracts/rule.py#L836
 [partial-code]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/agent/execution_lifecycle.py#L2123
-[partial-proof]: trading-edge-handover-2026-09-08.md#retained-local-evidence
+[partial-proof]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence
 [cycle]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/agent/engine_cycle.py#L293
-[parent-probe]: trading-edge-handover-2026-09-08.md#retained-local-evidence
+[parent-probe]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence
 [pnl-writer]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/agent/execution_lifecycle.py#L2246
 [pnl-report]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/report.py#L31
 [dashboard-trades]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/deploy/dashboard.py#L338
@@ -285,14 +285,14 @@ Detailed reproducible evidence is saved beside this report: [test and lifecycle 
 [config]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/config.yaml#L25
 [trial]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/research/trial.py#L67
 [impact]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/research/quote_costs.py#L1077
-[host-snapshot]: trading-edge-handover-2026-09-08.md#retained-local-evidence
-[host-status]: trading-edge-handover-2026-09-08.md#retained-local-evidence
-[host-evidence]: trading-edge-handover-2026-09-08.md#retained-local-evidence
+[host-snapshot]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence
+[host-status]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence
+[host-evidence]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence
 [recorder-marker]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/deploy/recorder.py#L311
 [dataset-marker]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/deploy/research_dataset.py#L312
-[orphan-proof]: trading-edge-handover-2026-09-08.md#retained-local-evidence
-[host-log]: trading-edge-handover-2026-09-08.md#retained-local-evidence
-[historical]: trading-edge-handover-2026-09-08.md#retained-local-evidence
+[orphan-proof]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence
+[host-log]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence
+[historical]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence
 [variants]: trading-edge-historical-variants-2026-09-07.md
 [templates]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/research/factory_core.py#L155
 [dependencies]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/agent/contracts/rule.py#L219
@@ -307,4 +307,4 @@ Detailed reproducible evidence is saved beside this report: [test and lifecycle 
 [old-review]: https://github.com/khanalyst/alpaca-trading/blob/cdef4aac22f124265e4f387f337bba4f9a6ce8da/docs/trader-review-and-grading-2026-09-04.md#L266
 [readme]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/README.md#L90
 [cost-doc]: https://github.com/khanalyst/alpaca-trading/blob/958da0c2b8a8638c8d85e9562187b0c3189a3683/docs/measured-cost-model-2026-08-30.md#L125
-[verification]: trading-edge-handover-2026-09-08.md#retained-local-evidence
+[verification]: https://github.com/khanalyst/alpaca-trading/blob/dd71ae339fd2b0fff613a92656b5ba1c05351afd/docs/trading-edge-handover-2026-09-08.md#retained-local-evidence

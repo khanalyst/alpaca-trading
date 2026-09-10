@@ -634,4 +634,4 @@ Extracted read-only on 2026-09-07 Dubai time from existing deployment artifacts.
 
 ## Evidence
 
-[Full extracted metrics](trading-edge-handover-2026-09-08.md#retained-local-evidence) include refusals, isolated account totals, cost counterfactuals, reported uncertainty, and provenance. No parameters were changed for this audit.
+Full extracted metrics, retained in the local evidence directory, include refusals, isolated account totals, cost counterfactuals, reported uncertainty, and provenance. No parameters were changed for this audit.
