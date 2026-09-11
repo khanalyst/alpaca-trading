@@ -528,7 +528,8 @@ live-ingestion marker. The runtime resolves only that edge,
 re-verifies its proof/configuration at startup refresh, and does not
 auto-switch. Runtime LLM decisions are rejected independently by configuration
 validation and the Engine constructor. The authenticated live preflight also
-requires `pattern_day_trader=true`.
+requires explicit finite account buying power; nonpositive capacity still
+blocks every new entry at the entry-risk gate.
 Research lifecycle gates include fit/held-out structural floors, matched
 controls, placebo/falsification, fixed-rule rolling-origin stability,
 family-local/frozen-dependence-cluster/cycle-global FDR, sealed qualification

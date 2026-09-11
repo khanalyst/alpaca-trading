@@ -378,9 +378,10 @@ class StartupEdgePolicyMixin:
             raise AlpacaError(f"{self.mode} account is not active")
         if (self._number(_value(account, "equity", None)) or 0) <= 0:
             raise AlpacaError(f"{self.mode} account equity is unavailable")
-        if self.mode == "live" and _value(account, "pattern_day_trader", None) is not True:
+        if (self.mode == "live" and
+                self._number(_value(account, "buying_power", None)) is None):
             raise AlpacaError(
-                "live account must explicitly report pattern_day_trader=true")
+                "live account must explicitly report finite buying power")
         self._authorize_feeds(
             data_feed=data_feed, options_feed=options_feed,
             data_feed_missing=data_feed_missing,

@@ -275,15 +275,24 @@ class AlpacaProvider(AlpacaMarketDataMixin):
     def account(self) -> Account:
         try:
             value = self.session.trading.get_account()
-            pattern_day_trader = _value(value, "pattern_day_trader", False)
+            pattern_day_trader = _value(value, "pattern_day_trader", None)
             # Alpaca removed this field from GET /v2/account on 2026-07-06.
-            # Treat an omitted/null value as the conservative paper-account
-            # default while retaining strict validation for malformed values.
-            if pattern_day_trader is None:
-                pattern_day_trader = False
-            if not isinstance(pattern_day_trader, bool):
+            # Preserve an omitted/null value while retaining strict validation
+            # for legacy responses that still include it.
+            if (pattern_day_trader is not None and
+                    not isinstance(pattern_day_trader, bool)):
                 raise ValueError("account pattern_day_trader must be true or false")
-            return Account(id=_value(value, "id"), status=_text(_value(value, "status")), equity=Decimal(str(_value(value, "equity", 0))), cash=Decimal(str(_value(value, "cash", 0))), buying_power=Decimal(str(_value(value, "buying_power", 0))), currency=_text(_value(value, "currency"), "usd").upper(), pattern_day_trader=pattern_day_trader)
+            return Account(
+                id=_value(value, "id"),
+                status=_text(_value(value, "status")),
+                equity=Decimal(str(_value(value, "equity", 0))),
+                cash=Decimal(str(_value(value, "cash", 0))),
+                buying_power=_finite_decimal(
+                    _value(value, "buying_power", None),
+                    "account buying_power"),
+                currency=_text(_value(value, "currency"), "usd").upper(),
+                pattern_day_trader=pattern_day_trader,
+            )
         except AlpacaError:
             raise
         except Exception as exc:  # noqa: BLE001

@@ -27,6 +27,8 @@ _CRYPTO_BASES = {
     "UNI", "USDC", "USDT", "XLM", "XRP", "XTZ", "YFI",
 }
 _CRYPTO_QUOTES = {"USD", "USDC", "USDT", "BTC", "ETH"}
+_CRYPTO_PAIRS = frozenset(
+    base + quote for base in _CRYPTO_BASES for quote in _CRYPTO_QUOTES)
 
 
 def _text(value: Any) -> str:
@@ -49,8 +51,7 @@ def reject_crypto(value: Any, field: str = "instrument") -> None:
     if "/" in upper:
         raise ValueError(f"{field} must not be a slash pair")
     compact = upper.replace("-", "").replace("_", "")
-    if any(compact == base + quote for base in _CRYPTO_BASES
-           for quote in _CRYPTO_QUOTES):
+    if compact in _CRYPTO_PAIRS:
         raise ValueError(f"{field} must not be a crypto pair")
 
 

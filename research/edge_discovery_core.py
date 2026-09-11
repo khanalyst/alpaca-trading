@@ -949,29 +949,14 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             continue
         entry_index, sampled_entry_at = rng.choice(admissible)
         source_entry_bar = session_bars[entry_index]
-        source_ready = replay_available_at(
-            source_entry_bar,
-            allow_historical_backfill_diagnostics=(
-                policy.allow_historical_backfill_diagnostics),
-        )
-        if source_ready is None:
-            rows.append(_null_row(symbol, day, opportunity, vehicle,
-                                  "entry_bar_not_visible"))
-            continue
-        entry_at = max(sampled_entry_at, source_entry_bar.timestamp, source_ready)
-        entry_index = next((probe for probe in range(entry_index, len(session_bars))
-                            if session_bars[probe].timestamp >= entry_at), None)
-        if entry_index is None:
-            rows.append(_null_row(symbol, day, opportunity, vehicle,
-                                  "entry_bar_not_visible"))
-            continue
-        entry_bar = session_bars[entry_index]
+        entry_at = sampled_entry_at
+        entry_bar = source_entry_bar
         # A completed recorder bar is normally observed at its end.  A fresh
         # executable boundary quote can authorize a strict entry without
         # consuming that delayed OHLC; permissive bar fallback still requires
-        # the opening record itself to be visible at its timestamp.
+        # the opening record itself to be visible at the sampled boundary.
         entry_bar_visible = replay_open_is_available(
-            entry_bar, entry_bar.timestamp,
+            entry_bar, entry_at,
             allow_historical_backfill_diagnostics=(
                 policy.allow_historical_backfill_diagnostics),
         )
@@ -1414,7 +1399,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         diagnostic_evidence = historical_evidence or bar_fallback_diagnostic
         row = {"vehicle": vehicle, "symbol": symbol, "session_date": day,
                      "opportunity_id": opportunity, "direction": direction,
-                     "entry_timestamp": entry_bar.timestamp.isoformat(),
+                     "entry_timestamp": entry_at.isoformat(),
                      "exit_timestamp": exit_bar.end.isoformat(),
                      "quantity": quantity, "entry_price": entry,
                      "exit_price": exit_price, "entry_reference": entry_ref,

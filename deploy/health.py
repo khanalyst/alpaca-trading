@@ -30,6 +30,15 @@ from deploy.scheduler_output import (derive_research_readiness,
 
 MAX_RECORDER_INDEX_BYTES = 16 * 1024 * 1024
 AUTHORIZING_MARKET_DATA_MAX_AGE_SECONDS = 30.0
+SHADOW_COVERAGE_ARM_COUNT = 24
+SHADOW_COVERAGE_FAMILY_COUNT = 12
+SHADOW_COVERAGE_DATA_MAX_AGE_SECONDS = 30.0
+SHADOW_COVERAGE_CLOCK_SKEW_SECONDS = 5.0
+SHADOW_POSTACTIVATION_OBSERVATION_STATUSES = (
+    "quoteable_virtual_observations",
+    "signals_unpriced_no_virtual_fill_claim",
+    "observed_no_quoteable_virtual_opens",
+)
 NEW_YORK = ZoneInfo("America/New_York")
 
 
@@ -261,26 +270,174 @@ def _shadow_accounts_summary(value: object, arms: list[dict]) -> dict | None:
     return result
 
 
-def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
+def _shadow_identity(value: object, *, allow_empty: bool = False,
+                     limit: int = 160) -> str | None:
+    """Return an exact bounded identity; readiness never relies on truncation."""
+    if not isinstance(value, str):
+        return None
+    result = value.strip()
+    if len(result) > limit or (not result and not allow_empty):
+        return None
+    return result
+
+
+def _shadow_nonnegative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _shadow_catalog_state(
+        value: dict) -> tuple[list[dict], set[str], int, bool, bool]:
+    """Return bounded account identities plus exact catalog/epoch validity."""
+    raw_candidates = value.get("candidate_identities")
+    candidates: set[str] = set()
+    candidates_valid = bool(
+        isinstance(raw_candidates, list) and
+        len(raw_candidates) == SHADOW_COVERAGE_ARM_COUNT)
+    if isinstance(raw_candidates, list):
+        for raw_candidate in raw_candidates[:SHADOW_COVERAGE_ARM_COUNT]:
+            exact = _shadow_identity(raw_candidate)
+            if exact is None or exact in candidates:
+                candidates_valid = False
+            else:
+                candidates.add(exact)
+
+    raw_arms = value.get("arms")
+    arms: list[dict] = []
+    arm_ids: set[str] = set()
+    family_roles: dict[str, set[str]] = {}
+    code_values: set[str] = set()
+    cohort_values: set[str] = set()
+    arms_valid = bool(
+        isinstance(raw_arms, list) and
+        len(raw_arms) == SHADOW_COVERAGE_ARM_COUNT)
+    if isinstance(raw_arms, list):
+        for raw_arm in raw_arms[:SHADOW_COVERAGE_ARM_COUNT]:
+            if not isinstance(raw_arm, dict):
+                arms_valid = False
+                continue
+            arms.append({
+                key: _status_text(raw_arm.get(key))
+                for key in ("candidate_id", "family", "role", "variant_id")
+            })
+            candidate = _shadow_identity(raw_arm.get("candidate_id"))
+            family = _shadow_identity(raw_arm.get("family"))
+            role = _shadow_identity(raw_arm.get("role"), limit=20)
+            variant = _shadow_identity(raw_arm.get("variant_id"))
+            arm_code = _shadow_identity(raw_arm.get("code_identity"))
+            arm_cohort = _shadow_identity(raw_arm.get("cohort_identity"))
+            if (candidate is None or family is None or
+                    role not in {"baseline", "variant"} or variant is None or
+                    arm_code is None or arm_cohort is None or
+                    candidate in arm_ids):
+                arms_valid = False
+                continue
+            arm_ids.add(candidate)
+            family_roles.setdefault(family, set()).add(role)
+            code_values.add(arm_code)
+            cohort_values.add(arm_cohort)
+
+    catalog_valid = bool(
+        candidates_valid and arms_valid and candidates == arm_ids and
+        len(family_roles) == SHADOW_COVERAGE_FAMILY_COUNT and
+        all(roles == {"baseline", "variant"}
+            for roles in family_roles.values()))
+    code_identity = _shadow_identity(value.get("code_identity"))
+    cohort_identity = _shadow_identity(value.get("cohort_identity"))
+    activation_identity = _shadow_identity(value.get("activation_identity"))
+    identity_valid = bool(
+        catalog_valid and code_identity and cohort_identity and
+        activation_identity and code_values == {code_identity} and
+        cohort_values == {cohort_identity})
+    return arms, arm_ids, len(candidates), catalog_valid, identity_valid
+
+
+def _shadow_progress_projection(
+        value: object, *, arm_ids: set[str], activation: dict | None,
+        current: float | None, reported_processed: object) -> tuple[dict, str]:
+    """Project and validate all 24 equal post-activation cursors once."""
+    projected: dict[str, dict] = {}
+    exact_cursor_ids: set[str] = set()
+    cursor_values: list[tuple[float, str, int]] = []
+    processed_total = 0
+    invalid = False
+    postactivation_missing = False
+    future = False
+    stale = False
+    raw_count_valid = bool(
+        isinstance(value, dict) and len(value) == SHADOW_COVERAGE_ARM_COUNT)
+    if isinstance(value, dict):
+        for index, (raw_candidate, raw_cursor) in enumerate(value.items()):
+            if index >= SHADOW_COVERAGE_ARM_COUNT:
+                break
+            candidate = _status_text(raw_candidate)
+            if (candidate is not None and candidate not in projected and
+                    isinstance(raw_cursor, dict)):
+                projected[candidate] = {
+                    "last_inserted_at": _status_nonnegative_float(
+                        raw_cursor.get("last_inserted_at")),
+                    "last_event_key": _status_text(
+                        raw_cursor.get("last_event_key")),
+                    "processed_events": _status_nonnegative_int(
+                        raw_cursor.get("processed_events")),
+                }
+            exact_candidate = _shadow_identity(raw_candidate)
+            if (exact_candidate is None or exact_candidate in exact_cursor_ids or
+                    not isinstance(raw_cursor, dict)):
+                invalid = True
+                continue
+            exact_cursor_ids.add(exact_candidate)
+            stamp = _status_signed_float(raw_cursor.get("last_inserted_at"))
+            key = _shadow_identity(raw_cursor.get("last_event_key"))
+            count = _shadow_nonnegative_int(raw_cursor.get("processed_events"))
+            if stamp is None or stamp < 0 or key is None or count is None:
+                invalid = True
+                continue
+            cursor_values.append((stamp, key, count))
+            processed_total += count
+            if (count <= 0 or activation is None or
+                    (stamp, key) <= (
+                        activation["last_inserted_at"],
+                        activation["last_event_key"])):
+                postactivation_missing = True
+            if (current is None or
+                    stamp > current + SHADOW_COVERAGE_CLOCK_SKEW_SECONDS):
+                future = True
+            elif current - stamp > SHADOW_COVERAGE_DATA_MAX_AGE_SECONDS:
+                stale = True
+
+    if not raw_count_valid or exact_cursor_ids != arm_ids:
+        status = "arm_cursors_missing"
+    elif invalid:
+        status = "arm_cursor_invalid"
+    elif postactivation_missing:
+        status = "arm_post_activation_progress_missing"
+    elif future:
+        status = "arm_cursor_future"
+    elif stale:
+        status = "arm_cursor_stale"
+    elif (len(cursor_values) != SHADOW_COVERAGE_ARM_COUNT or
+          len(set(cursor_values)) != 1):
+        status = "arm_cursors_mismatch"
+    elif _shadow_nonnegative_int(reported_processed) != processed_total:
+        status = "diagnostic_processed_events_invalid"
+    else:
+        status = "ready"
+    return projected, status
+
+
+def _shadow_diagnostic_summary(
+        value: object, *, now: float | None = None,
+        candidate_errors_present: bool = False,
+        candidate_errors_clear: bool = False,
+        candidate_error_count: int | None = None) -> dict | None:
     """Validate and bound non-authorizing fixed-cohort shadow telemetry."""
     if not isinstance(value, dict):
         return None
 
-    candidate_ids = _status_string_list(
-        value.get("candidate_identities"), limit=25)
-    raw_arms = value.get("arms")
-    arms = ([item for item in raw_arms[:25] if isinstance(item, dict)]
-            if isinstance(raw_arms, list) else [])
-    family_roles: dict[str, set[str]] = {}
-    arm_candidate_ids: set[str] = set()
-    for arm in arms:
-        family = _status_text(arm.get("family"))
-        role = _status_text(arm.get("role"), limit=20)
-        candidate_id = _status_text(arm.get("candidate_id"))
-        if family and role in {"baseline", "variant"}:
-            family_roles.setdefault(family, set()).add(role)
-        if candidate_id:
-            arm_candidate_ids.add(candidate_id)
+    arms, arm_ids, candidate_count, catalog_valid, identity_consistent = (
+        _shadow_catalog_state(value))
 
     decision_raw = value.get("decision_counts")
     decision_raw = decision_raw if isinstance(decision_raw, dict) else {}
@@ -295,7 +452,6 @@ def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
     rejection_raw = value.get("rejection_counts")
     rejection_raw = rejection_raw if isinstance(rejection_raw, dict) else {}
 
-    source_lag = _status_nonnegative_float(value.get("source_lag_seconds"))
     poll_duration = _status_nonnegative_float(
         value.get("poll_duration_seconds"))
     flags = {
@@ -326,25 +482,102 @@ def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
     variant_count = _status_nonnegative_int(value.get("variant_count"))
     actual_fills = _status_nonnegative_int(value.get("actual_fills"))
     cohort_identity = _status_text(value.get("cohort_identity"))
+    code_identity = _status_text(value.get("code_identity"))
     activation_identity = _status_text(value.get("activation_identity"))
     activation_status = _status_text(value.get("activation_status"), limit=40)
     cohort_active = bool(
         cohort_identity and activation_identity and activation_status == "active")
+
     coverage_complete = bool(
-        families_total == 12 and families_covered == 12 and
-        isinstance(families_missing_raw, list) and not families_missing and
-        baseline_count == 12 and variant_count == 12 and
-        len(candidate_ids) == 24 and len(set(candidate_ids)) == 24 and
-        isinstance(raw_arms, list) and len(raw_arms) == 24 and len(arms) == 24 and
-        len(arm_candidate_ids) == 24 and
-        set(candidate_ids) == arm_candidate_ids and
-        len(family_roles) == 12 and
-        all(roles == {"baseline", "variant"}
-            for roles in family_roles.values()))
+        value.get("families_total") == SHADOW_COVERAGE_FAMILY_COUNT and
+        value.get("families_covered") == SHADOW_COVERAGE_FAMILY_COUNT and
+        families_missing_raw == [] and
+        value.get("baseline_count") == SHADOW_COVERAGE_FAMILY_COUNT and
+        value.get("variant_count") == SHADOW_COVERAGE_FAMILY_COUNT and
+        catalog_valid)
     metadata_valid = bool(
         value.get("schema") == "diagnostic-shadow-coverage.v1" and
         diagnostic_only and flags["online_fdr"] is False and
-        actual_fills == 0 and poll_duration is not None)
+        isinstance(value.get("actual_fills"), int) and
+        not isinstance(value.get("actual_fills"), bool) and
+        value.get("actual_fills") == 0 and poll_duration is not None)
+
+    raw_activation = value.get("activation_event_watermark")
+    activation_marker = None
+    if isinstance(raw_activation, dict):
+        activation_inserted = _status_signed_float(
+            raw_activation.get("last_inserted_at"))
+        raw_activation_key = raw_activation.get("last_event_key")
+        activation_key = _shadow_identity(
+            "" if raw_activation_key is None else raw_activation_key,
+            allow_empty=True)
+        activation_count = _shadow_nonnegative_int(raw_activation.get("count"))
+        activation_decisions = _shadow_nonnegative_int(
+            raw_activation.get("decision_event_count"))
+        if (activation_inserted is not None and activation_inserted >= 0 and
+                activation_key is not None and activation_count is not None and
+                activation_decisions is not None):
+            activation_marker = {
+                "last_inserted_at": activation_inserted,
+                "last_event_key": activation_key,
+                "count": activation_count,
+                "decision_event_count": activation_decisions,
+            }
+
+    current = _status_signed_float(time.time() if now is None else now)
+    activation_future = bool(
+        activation_marker is not None and current is not None and
+        activation_marker["last_inserted_at"] >
+        current + SHADOW_COVERAGE_CLOCK_SKEW_SECONDS)
+    observation_status = _status_text(
+        value.get("observation_status"), limit=80)
+    # Readiness requires a recognized producer state, not merely the absence
+    # of a known waiting state. Preserve malformed/unknown values as unready.
+    observation_ready = value.get("observation_status") in (
+        SHADOW_POSTACTIVATION_OBSERVATION_STATUSES)
+
+    raw_source_lag = _status_signed_float(value.get("source_lag_seconds"))
+    source_lag = (_status_nonnegative_float(value.get("source_lag_seconds"))
+                  if raw_source_lag is not None and raw_source_lag >= 0 else None)
+    source_data_fresh = (
+        raw_source_lag is not None and
+        0 <= raw_source_lag <= SHADOW_COVERAGE_DATA_MAX_AGE_SECONDS)
+
+    cursors, cursor_status = _shadow_progress_projection(
+        value.get("processed_event_cursors"), arm_ids=arm_ids,
+        activation=activation_marker, current=current,
+        reported_processed=value.get("processed_events"))
+    if cursor_status == "ready" and value.get("health_cursor_matches") is False:
+        cursor_status = "arm_health_cursor_mismatch"
+
+    if not metadata_valid:
+        readiness_status = "diagnostic_metadata_invalid"
+    elif not cohort_active:
+        readiness_status = "active_cohort_missing"
+    elif not coverage_complete:
+        readiness_status = "family_coverage_incomplete"
+    elif not identity_consistent:
+        readiness_status = "arm_identity_mismatch"
+    elif activation_marker is None:
+        readiness_status = "activation_watermark_invalid"
+    elif activation_future:
+        readiness_status = "activation_watermark_future"
+    elif raw_source_lag is None:
+        readiness_status = "fresh_data_unavailable"
+    elif raw_source_lag < 0:
+        readiness_status = "source_data_future"
+    elif not source_data_fresh:
+        readiness_status = "source_data_stale"
+    elif not observation_ready:
+        readiness_status = "post_activation_observation_missing"
+    elif not candidate_errors_present:
+        readiness_status = "candidate_errors_unknown"
+    elif not candidate_errors_clear:
+        readiness_status = "candidate_errors_present"
+    elif cursor_status != "ready":
+        readiness_status = cursor_status
+    else:
+        readiness_status = "ready"
 
     result = {
         "schema": _status_text(value.get("schema")),
@@ -362,14 +595,24 @@ def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
         "families_without_decisions": families_without_decisions,
         "baseline_count": baseline_count,
         "variant_count": variant_count,
-        "candidate_count": len(candidate_ids),
+        "candidate_count": candidate_count,
         "arms_total": len(arms),
         "cohort_identity": cohort_identity,
+        "code_identity": code_identity,
         "activation_identity": activation_identity,
         "activation_status": activation_status,
         "warmup_session": _status_text(value.get("warmup_session"), limit=40),
-        "observation_status": _status_text(
-            value.get("observation_status"), limit=80),
+        "observation_status": observation_status,
+        "candidate_errors_present": candidate_errors_present,
+        "candidate_errors_clear": candidate_errors_clear,
+        "candidate_error_count": candidate_error_count,
+        "processed_events": _status_nonnegative_int(
+            value.get("processed_events")),
+        "processed_event_cursors": cursors,
+        "cursor_count": len(cursors),
+        "cursor_status": cursor_status,
+        "readiness_status": readiness_status,
+        "data_max_age_seconds": SHADOW_COVERAGE_DATA_MAX_AGE_SECONDS,
         "decision_counts": {
             "total": _status_nonnegative_int(decision_raw.get("total")),
             "this_poll": _status_nonnegative_int(
@@ -398,7 +641,7 @@ def _shadow_diagnostic_summary(value: object, *, max_age: float) -> dict | None:
         "poll_duration_seconds": poll_duration,
         "source_lag_seconds": source_lag,
         "source_data_fresh": (
-            source_lag <= float(max_age) if source_lag is not None else None),
+            source_data_fresh if raw_source_lag is not None else None),
     }
     forward_accounts = (_shadow_accounts_summary(value.get("forward_accounts"), arms)
                         if diagnostic_only else None)
@@ -1006,8 +1249,17 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
     stress_calibration = heartbeat.get("stress_calibration")
     if not isinstance(stress_calibration, dict):
         stress_calibration = stale_tail.get("stress_calibration")
+    errors_present = "candidate_errors" in heartbeat
+    raw_errors = heartbeat.get("candidate_errors")
+    errors_clear = bool(
+        errors_present and isinstance(raw_errors, dict) and not raw_errors)
+    error_count = (min(len(raw_errors), 1_000_000_000)
+                   if isinstance(raw_errors, dict) else None)
     diagnostic = _shadow_diagnostic_summary(
-        heartbeat.get("diagnostic_shadow"), max_age=max_age)
+        heartbeat.get("diagnostic_shadow"), now=now,
+        candidate_errors_present=errors_present,
+        candidate_errors_clear=errors_clear,
+        candidate_error_count=error_count)
     liveness_ok = fresh and status == "running"
     if not fresh:
         coverage_status = "stale_heartbeat"
@@ -1021,12 +1273,8 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
         coverage_status = "active_cohort_missing"
     elif not diagnostic["coverage_complete"]:
         coverage_status = "family_coverage_incomplete"
-    elif diagnostic["source_lag_seconds"] is None:
-        coverage_status = "fresh_data_unavailable"
-    elif not diagnostic["source_data_fresh"]:
-        coverage_status = "source_data_stale"
     else:
-        coverage_status = "ready"
+        coverage_status = diagnostic["readiness_status"]
     coverage_ready = coverage_status == "ready"
     current = time.time() if now is None else float(now)
     try:
@@ -1043,8 +1291,12 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "heartbeat_age_seconds": heartbeat_age,
         "coverage_ready": coverage_ready,
         "coverage_status": coverage_status,
+        "coverage_scope": "current_poll_only",
         "diagnostic_shadow": diagnostic,
         "last_error": last_error,
+        "candidate_errors_present": errors_present,
+        "candidate_errors_clear": errors_clear,
+        "candidate_error_count": error_count,
         "candidates": heartbeat.get("candidates"),
         "events": heartbeat.get("events"),
         "decisions": heartbeat.get("decisions"),

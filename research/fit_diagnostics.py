@@ -34,8 +34,11 @@ from .maturity import causal_maturity_bars
 from .stats import clustered_mde_power_report
 from .signal_quality import (SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
                               measure_signal_quality)
-from .path_telemetry import (aggregate_path_telemetry, compute_path_telemetry,
-                             target_hold_reachability)
+from .path_telemetry import (
+    aggregate_path_telemetry, aggregate_pre_admission_path_telemetry,
+    compute_path_telemetry, compute_pre_admission_path_telemetry,
+    target_hold_reachability,
+)
 
 
 FIT_DIAGNOSTICS_SCHEMA = "fit-diagnostics.v1"
@@ -1447,6 +1450,8 @@ def measure_fit_diagnostics(
     # an empty diagnostic rather than an inferred path.
     path_rows: list[Mapping[str, Any]] = []
     for row in rows:
+        if row.get("no_trade") is True:
+            continue
         nested = row.get("path_telemetry")
         if isinstance(nested, Mapping):
             path_rows.append(nested)
@@ -1455,6 +1460,31 @@ def measure_fit_diagnostics(
             if measured.get("available"):
                 path_rows.append(measured)
     path_telemetry = aggregate_path_telemetry(path_rows)
+    pre_admission_plans = [row["pre_admission_plan"] for row in rows
+                           if isinstance(row.get("pre_admission_plan"), Mapping)]
+    pre_admission_index: dict[tuple[str, str], list[Any]] = {}
+    if pre_admission_plans:
+        for bar in bar_rows:
+            symbol = str(_row_value(bar, "symbol") or "").strip().upper()
+            raw_session = _row_value(bar, "session_date")
+            session = (raw_session.isoformat()
+                       if hasattr(raw_session, "isoformat") else
+                       str(raw_session)[:10] if raw_session not in (None, "") else "")
+            if symbol and session:
+                pre_admission_index.setdefault((symbol, session), []).append(bar)
+    pre_admission_rows = []
+    for plan in pre_admission_plans:
+        symbol = str(plan.get("symbol") or "").strip().upper()
+        raw_session = plan.get("session_date")
+        session = (raw_session.isoformat()
+                   if hasattr(raw_session, "isoformat") else
+                   str(raw_session)[:10] if raw_session not in (None, "") else "")
+        partition = (pre_admission_index.get((symbol, session), ())
+                     if symbol and session else bar_rows)
+        pre_admission_rows.append(
+            compute_pre_admission_path_telemetry(plan, partition))
+    pre_admission_path_telemetry = (
+        aggregate_pre_admission_path_telemetry(pre_admission_rows))
     target_hold = target_hold_reachability(
         path_rows,
         target_r=normalized.get("target_r"),
@@ -1587,6 +1617,7 @@ def measure_fit_diagnostics(
         "risk": _risk_summary(rows),
         "exits": _exit_summary(rows),
         "path_telemetry": path_telemetry,
+        "pre_admission_path_telemetry": pre_admission_path_telemetry,
         # This is a compact, fit-only projection of path telemetry.  It
         # contains no rows and is descriptive only; mutation code may use it
         # solely after coordinate exhaustion and all normal gates still run.
