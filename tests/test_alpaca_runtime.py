@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
+from importlib import metadata
 import inspect
 import os
 import sys
@@ -10,6 +11,7 @@ import types
 import pickle
 import unittest
 from unittest.mock import patch
+from uuid import UUID
 
 from agent.alpaca_domain import Asset, OptionContract, OrderRequest
 from agent.alpaca_provider import (AlpacaError, AlpacaProvider, AlpacaSession,
@@ -469,7 +471,7 @@ class AlpacaRuntimeTests(unittest.TestCase):
                                      "pattern_day_trader must be true or false"):
             provider.account()
 
-    def test_provider_defaults_missing_or_null_pattern_day_trader_to_false(self):
+    def test_provider_preserves_missing_or_null_pattern_day_trader(self):
         missing = object()
 
         class AccountTrading(TradingFake):
@@ -490,7 +492,7 @@ class AlpacaRuntimeTests(unittest.TestCase):
                     {"mode": "paper"},
                     session=AlpacaSession(
                         paper=True, trading_client=AccountTrading(value)))
-                self.assertFalse(provider.account().pattern_day_trader)
+                self.assertIsNone(provider.account().pattern_day_trader)
 
     def test_provider_accepts_boolean_pattern_day_trader(self):
         class BooleanPdtTrading(TradingFake):
@@ -510,6 +512,61 @@ class AlpacaRuntimeTests(unittest.TestCase):
                     session=AlpacaSession(
                         paper=True, trading_client=BooleanPdtTrading(value)))
                 self.assertIs(provider.account().pattern_day_trader, value)
+
+    def test_provider_rejects_missing_or_malformed_buying_power(self):
+        missing = object()
+
+        class AccountTrading(TradingFake):
+            def __init__(self, buying_power=missing):
+                self._buying_power = buying_power
+
+            def get_account(self):
+                account = {"id": "account", "status": "active",
+                           "equity": "100000", "cash": "100000",
+                           "currency": "USD"}
+                if self._buying_power is not missing:
+                    account["buying_power"] = self._buying_power
+                return account
+
+        for value in (missing, None, "not-a-number", "NaN", "Infinity",
+                      "-Infinity", True, False):
+            with self.subTest(value=value):
+                provider = AlpacaProvider(
+                    {"mode": "paper"},
+                    session=AlpacaSession(
+                        paper=True, trading_client=AccountTrading(value)))
+                with self.assertRaisesRegex(
+                        AlpacaError,
+                        "account buying_power must be (numeric|finite)"):
+                    provider.account()
+
+    def test_locked_sdk_trade_account_accepts_retired_fields_omitted(self):
+        try:
+            installed = metadata.version("alpaca-py")
+        except metadata.PackageNotFoundError:
+            self.skipTest("locked alpaca-py 0.43.5 is unavailable locally")
+        from alpaca.trading.models import TradeAccount
+
+        self.assertEqual(installed, "0.43.5")
+        for field in ("buying_power", "pattern_day_trader", "daytrade_count",
+                      "daytrading_buying_power"):
+            self.assertIsNone(TradeAccount.model_fields[field].default)
+        sdk_account = TradeAccount(
+            id=UUID("00000000-0000-0000-0000-000000000001"),
+            account_number="PA123456789", status="ACTIVE", currency="USD",
+            equity="100000", cash="100000", buying_power="100000")
+
+        class SdkAccountTrading(TradingFake):
+            def get_account(self):
+                return sdk_account
+
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(
+                paper=True, trading_client=SdkAccountTrading()))
+        account = provider.account()
+        self.assertEqual(account.buying_power, Decimal("100000"))
+        self.assertIsNone(account.pattern_day_trader)
 
     def test_market_status_does_not_construct_network_client(self):
         provider = AlpacaProvider({"mode": "paper"})

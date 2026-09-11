@@ -754,6 +754,25 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     "broker_tick_geometry_invalid", stage="risk_geometry",
                     decision_timestamp=signal_ready,
                     entry_timestamp=entry_at)
+        # Resolve the bounded clock once from the same point-in-time entry and
+        # policy used by admitted trades.  Rejected-plan metadata below reuses
+        # this value; it never scans a future bar or runs the exit transition.
+        force_flat_ts = None
+        if resolved_policy.force_flat_time is not None:
+            local_entry = entry_at.astimezone(ZoneInfo("America/New_York"))
+            force_flat_ts = local_entry.replace(
+                hour=resolved_policy.force_flat_time.hour,
+                minute=resolved_policy.force_flat_time.minute,
+                second=resolved_policy.force_flat_time.second,
+                microsecond=resolved_policy.force_flat_time.microsecond,
+            ).timestamp()
+        deadline_contract = exit_deadline(
+            entry_at, spec, force_flat_ts=force_flat_ts)
+        deadline = (None if deadline_contract is None else
+                    float(deadline_contract["timestamp"]))
+        deadline_reason = (None if deadline_contract is None else
+                           str(deadline_contract["reason"]))
+        thesis_deadline = thesis_exit_deadline(entry_at, spec)
         stress_geometry_requested = (
             resolved_policy.stressed_cost_scenario_bps is not None or
             resolved_policy.max_stressed_cost_to_risk_ratio is not None or
@@ -790,6 +809,65 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # strategy's risk and target semantics.
             stop_floor_binding = effective_distance > broker_normalized_distance + 1e-12
             if stop_floor_binding:
+                plan_evidence = entry_evidence or entry_bar
+                plan_identity = getattr(plan_evidence, "identity", None)
+
+                def evidence(name: str) -> Any:
+                    return getattr(
+                        plan_evidence, name, getattr(plan_identity, name, None))
+
+                def stamp(value: Any) -> str | None:
+                    return value.isoformat() if isinstance(value, datetime) else None
+                plan_feed = entry_feed or evidence("feed")
+                plan_provider = entry_provider or evidence("provider")
+                deadline_timestamp = (
+                    datetime.fromtimestamp(deadline, timezone.utc).isoformat()
+                    if deadline is not None else None)
+                pre_admission_plan = {
+                    "schema": "pre-admission-plan.v1", "scope": "point_in_time",
+                    "hypothetical_entry": True, "diagnostic_only": True,
+                    "authorizing": False, "symbol": signal_bar.symbol,
+                    "session_date": signal_bar.session_date.isoformat(),
+                    "direction": direction, "entry_timestamp": entry_at.isoformat(),
+                    # This is the resolved underlying reference, not the signal
+                    # close; the latter remains explicit for comparison.
+                    "entry_reference": float(entry_underlying),
+                    "authored_entry_reference": plan_entry,
+                    "entry_source": entry_source,
+                    "entry_provenance": {
+                        "source": entry_source, "feed": plan_feed,
+                        "provider": plan_provider,
+                        "market_timestamp": stamp(evidence("timestamp")),
+                        "as_of": stamp(evidence("as_of")),
+                        "observed_at": stamp(evidence("observed_at")),
+                        "source_mode": evidence("source_mode"),
+                    },
+                    "authored_stop_price": authored_stop,
+                    "authored_target_price": authored_target,
+                    "authored_stop_distance": authored_distance,
+                    "authored_target_distance": abs(authored_target - plan_entry),
+                    "authored_target_r": (
+                        float(spec["target_r"])
+                        if spec.get("target_r") is not None else None),
+                    "authored_max_hold_bars": (
+                        int(spec["max_hold_bars"])
+                        if spec.get("max_hold_bars") is not None else None),
+                    "tick_normalized_stop_price": stop,
+                    "tick_normalized_target_price": target,
+                    "tick_normalized_stop_distance": broker_normalized_distance,
+                    "tick_normalized_target_distance": abs(target - entry_underlying),
+                    "exit_deadline_timestamp": deadline_timestamp,
+                    "exit_deadline_reason": deadline_reason,
+                    "exit_deadline": {"timestamp": deadline_timestamp,
+                                      "reason": deadline_reason},
+                    "stress_scenario_bps": stop_geometry_scenario,
+                    "stress_max_cost_to_risk_ratio": (
+                        resolved_policy.max_stressed_cost_to_risk_ratio),
+                    "required_stop_floor_bps": stop_floor_bps,
+                    "required_tick_rounded_stop_distance": effective_distance,
+                    "required_tick_rounded_stop_distance_bps": (
+                        effective_distance / entry_underlying * 10_000.0),
+                }
                 geometry_telemetry = {
                     "authored_stop_distance": authored_distance,
                     "authored_stop_distance_bps": (
@@ -801,6 +879,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                         resolved_policy.max_stressed_cost_to_risk_ratio),
                     "stop_geometry_activation_reason": (
                         stop_geometry_activation_reason),
+                    "pre_admission_plan": pre_admission_plan,
                 }
                 return _unpriced(
                     signal_bar, entry_bar, signal_bar.session_date, direction,
@@ -831,22 +910,6 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         # the trade is admitted instead of overspending the authored budget.
         real_risk = max(0.0, entry_underlying - stop if direction == "long"
                         else stop - entry_underlying)
-        force_flat_ts = None
-        if resolved_policy.force_flat_time is not None:
-            local_entry = entry_at.astimezone(ZoneInfo("America/New_York"))
-            force_flat_ts = local_entry.replace(
-                hour=resolved_policy.force_flat_time.hour,
-                minute=resolved_policy.force_flat_time.minute,
-                second=resolved_policy.force_flat_time.second,
-                microsecond=resolved_policy.force_flat_time.microsecond,
-            ).timestamp()
-        deadline_contract = exit_deadline(
-            entry_at, spec, force_flat_ts=force_flat_ts)
-        deadline = (None if deadline_contract is None else
-                    float(deadline_contract["timestamp"]))
-        deadline_reason = (None if deadline_contract is None else
-                           str(deadline_contract["reason"]))
-        thesis_deadline = thesis_exit_deadline(entry_at, spec)
         last_index = entry_index
         # The existing replay intentionally resolves a hold on the last
         # observed bar when the next bar is non-adjacent.  Keep that P&L path
@@ -2736,17 +2799,8 @@ def replacement_hypothesis(previous: Mapping[str, Any], diagnostic: Mapping[str,
     current = str(previous["family"])
     offset = 2 if diagnostic.get("primary_failure") == "insufficient_signals" else 1
     family = RULE_FAMILIES[(RULE_FAMILIES.index(current) + generation + offset) % len(RULE_FAMILIES)]
-    seed = dict(previous["rule_spec"])
-    seed.update({
-        "family": family,
-        "confirmation": ("volume" if diagnostic.get("primary_failure") in
-                         {"negative_expectancy", "low_win_rate"} else "trend"),
-        "threshold_bps": min(500.0, max(0.0, float(seed["threshold_bps"]) + 3 * generation)),
-        "lookback": min(120, max(3, int(seed["lookback"]) + generation)),
-    })
-    seed["slow_lookback"] = max(int(seed["slow_lookback"]), int(seed["lookback"]) + 5)
-    spec = validate_rule_spec(seed)
     vehicle = str(previous["vehicle"])
+    spec = discovery_spec(0, family=family, vehicle=vehicle)
     hid = _hypothesis_id(vehicle, slot, generation, spec)
     return StrategyHypothesis(
         hid, slot, generation, vehicle, family, _thesis(spec), _falsification(spec), spec,

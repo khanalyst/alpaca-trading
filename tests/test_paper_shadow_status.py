@@ -99,7 +99,7 @@ class PaperShadowStatusTests(unittest.TestCase):
                               "mark_status": "unpriced", "unbounded": "discard"}],
         }
         raw["rejection_counts"]["by_reason"] = {"stressed_cost": 10, "bad_count": -1}
-        projected = health._shadow_diagnostic_summary(raw, max_age=30)
+        projected = health._shadow_diagnostic_summary(raw)
         accounts = projected["forward_accounts"]
         self.assertFalse(accounts["authorizing"])
         self.assertEqual(accounts["realized_pnl"], -12.5)
@@ -109,7 +109,7 @@ class PaperShadowStatusTests(unittest.TestCase):
         self.assertNotIn("unbounded", accounts["by_candidate"][0])
         self.assertEqual(projected["rejection_counts"]["by_reason"], {"stressed_cost": 10})
         raw["forward_accounts"]["actual_fills"] = 1
-        self.assertNotIn("forward_accounts", health._shadow_diagnostic_summary(raw, max_age=30))
+        self.assertNotIn("forward_accounts", health._shadow_diagnostic_summary(raw))
 
     def test_default_policy_is_explicit_and_paper_experiment_remains_opt_in(self):
         config = load_config(ROOT / "config.yaml")

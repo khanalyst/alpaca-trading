@@ -73,7 +73,8 @@ from .stats import benjamini_yekutieli, stable_seed
 from .fit_diagnostics import (bar_coverage_telemetry,
                                collapse_behavior_aliases,
                                measure_fit_diagnostics, _fit_prefixes)
-from .signal_quality import (SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
+from .signal_quality import (DEFAULT_HORIZONS,
+                             SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
                              SIGNAL_QUALITY_SCHEMA, measure_signal_quality)
 from .factory_report import research_funnel, research_verdict
 from .source_validation import SourceValidationError, validate_source
@@ -2346,22 +2347,9 @@ def _screen_bar_cells(bars: Sequence[Any]) -> int:
 
 
 def _screen_primary_horizon(spec: Mapping[str, Any], quality: Mapping[str, Any]) -> int | None:
-    """Choose the deterministic quality horizon nearest the configured hold."""
+    """Return the authored hold only when its exact quality metric exists."""
     metrics = quality.get("horizon_metrics")
     if not isinstance(metrics, Mapping):
-        return None
-    horizons: list[int] = []
-    for key in metrics:
-        text = str(key)
-        if not text.endswith("m"):
-            continue
-        try:
-            value = int(text[:-1])
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if value > 0:
-            horizons.append(value)
-    if not horizons:
         return None
     try:
         hold = int(spec.get("max_hold_bars"))
@@ -2369,9 +2357,7 @@ def _screen_primary_horizon(spec: Mapping[str, Any], quality: Mapping[str, Any])
         return None
     if hold <= 0:
         return None
-    # Minimize distance; ties choose the shorter horizon so a hold cap is
-    # never silently rounded beyond the observed finite quality ladder.
-    return min(sorted(set(horizons)), key=lambda value: (abs(value - hold), value))
+    return hold if isinstance(metrics.get(f"{hold}m"), Mapping) else None
 
 
 def _signal_quality_screen_record(
@@ -2379,12 +2365,11 @@ def _signal_quality_screen_record(
         primary_horizon: int | None = None) -> dict[str, Any]:
     """Project one signal-quality result to a deterministic screen record.
 
-    Only a complete all-cell ``no_actionable_signal`` or adequately powered
-    nonpositive-control outcome can suppress replay.  The compact provenance
-    must also prove at least one mature, evaluator-tested prefix per fit cell;
-    missing counts are fail-open. Everything else is deliberately fail-open:
-    malformed, partial, underpowered, and unknown values remain scheduled for
-    the normal worker.
+    Only a complete all-cell ``no_actionable_signal`` can suppress replay. The
+    compact provenance must also prove at least one mature, evaluator-tested
+    prefix per fit cell; missing counts are fail-open. Everything else is
+    deliberately fail-open: malformed, partial, underpowered, negative point
+    estimates, and unknown values remain scheduled for the normal worker.
     The digest covers the complete API result but the durable record carries
     only status/reason/counts, keeping this hand-off non-authorizing and
     compact.
@@ -2604,26 +2589,25 @@ def _signal_quality_screen_record(
             "candidate_minus_control_t_stat": selected.get(
                 "candidate_minus_control_t_stat"),
         }
-        if (candidate_count >= 30 and matched_count >= 30 and
-                coverage is not None and coverage >= .80 and delta_value <= 0.0):
-            record.update({"status": "complete_nonpositive_control",
-                           "reason": "nonpositive_fit_control_delta"})
-        elif matched_count < 30 or coverage is None or coverage < .80:
+        if matched_count < 30 or coverage is None or coverage < .80:
             record.update({"status": "underpowered_control",
                            "reason": "primary_horizon_underpowered"})
         else:
+            # The current quality contract has no independently verified
+            # session-cluster upper bound.  A nonpositive point estimate is
+            # useful diagnostic context, but it cannot suppress ordinary
+            # replay or bypass the existing held-out/proof/FDR gates.
             record.update({"status": "complete_actionable_signal",
                            "reason": "actionable_signal_present"})
     else:
         record.update({"status": "unknown", "reason": "unexpected_rejections"})
-    if record["status"] in {"complete_zero_actionable_signal",
-                             "complete_nonpositive_control"}:
+    if record["status"] == "complete_zero_actionable_signal":
         record = _seal_signal_quality_screen_record(record, quality=quality)
     return record
 
 
 def _screen_record_can_skip(record: Any, *, variant_id: str) -> bool:
-    """Require a complete fit-only zero-signal or negative-control contract."""
+    """Require a complete fit-only zero-actionable-signal contract."""
     if not isinstance(record, Mapping):
         return False
     if (record.get("schema") != SIGNAL_QUALITY_SCREEN_SCHEMA or
@@ -2675,9 +2659,10 @@ def _screen_record_can_skip(record: Any, *, variant_id: str) -> bool:
     reason = str(record.get("reason") or "")
     zero_signal = (status == "complete_zero_actionable_signal" and
                    reason == "no_actionable_signal")
-    nonpositive = (status == "complete_nonpositive_control" and
-                   reason == "nonpositive_fit_control_delta")
-    if not (zero_signal or nonpositive):
+    # Older sealed point-estimate records remain structurally readable, but
+    # fail open because this schema never carried an independently verified
+    # session-level upper bound.
+    if not zero_signal:
         return False
     try:
         raw_event_count = record.get("event_count")
@@ -2693,29 +2678,6 @@ def _screen_record_can_skip(record: Any, *, variant_id: str) -> bool:
         return False
     if fit_cells <= 0:
         return False
-    if nonpositive:
-        primary = record.get("primary_horizon")
-        if not isinstance(primary, Mapping):
-            return False
-        try:
-            candidate_count = primary.get("candidate_count")
-            matched_count = primary.get("matched_count")
-            coverage = float(primary.get("matched_coverage"))
-            delta = float(primary.get("candidate_minus_control_bps"))
-            horizon = int(primary.get("horizon_minutes"))
-            if (isinstance(candidate_count, bool) or
-                    isinstance(matched_count, bool) or
-                    candidate_count is None or matched_count is None or
-                    int(candidate_count) != float(candidate_count) or
-                    int(matched_count) != float(matched_count) or
-                    int(candidate_count) < 30 or int(matched_count) < 30 or
-                    int(matched_count) > int(candidate_count) or
-                    not math.isfinite(coverage) or coverage < .80 or
-                    not math.isfinite(delta) or delta > 0.0 or horizon <= 0):
-                return False
-        except (TypeError, ValueError, OverflowError):
-            return False
-        return True
     if event_count != 0:
         return False
     rejection_counts = record.get("event_rejection_counts")
@@ -2791,6 +2753,8 @@ def _signal_quality_screen_worker(payload: Mapping[str, Any]) -> dict[str, Any]:
                     fit_bars, spec, policy=payload.get("policy"))
                 quality = measure_signal_quality(
                     fit_bars, spec, policy=payload.get("policy"),
+                    horizons=tuple(sorted({*DEFAULT_HORIZONS,
+                                           int(spec["max_hold_bars"])})),
                     precomputed_first_signals=(
                         None if spec["family"] == "cross_sectional_residual" else
                         prefix["first_signals"]),
@@ -4651,8 +4615,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         # A cheap, fit-only signal-quality screen runs before fit diagnostics
         # and before any full replay.  It is intentionally narrower than a
         # gate: only a complete zero-event result where every fit cell was
-        # explicitly classified ``no_actionable_signal`` or an adequately
-        # powered nonpositive-control result may skip replay.
+        # explicitly classified ``no_actionable_signal`` may skip replay.
         # Unknown, malformed, partial, underpowered, and worker-failure
         # outcomes all fail open and retain their candidate in ``specs``.
         screen_tasks = [task for task in scheduled
@@ -4709,8 +4672,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                         "digest": None,
                     }
                 # A record that does not satisfy an explicit complete
-                # zero-signal or adequately powered nonpositive-control
-                # contract remains in the expensive replay queue.
+                # zero-signal contract remains in the expensive replay queue.
                 can_skip = _screen_record_can_skip(
                     record, variant_id=variant_id)
                 if not can_skip:
@@ -4734,8 +4696,6 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             skipped_status = (
                 "complete_zero_actionable_signal"
                 if screen_statuses == {"complete_zero_actionable_signal"}
-                else "complete_nonpositive_control"
-                if screen_statuses == {"complete_nonpositive_control"}
                 else "complete")
             task["signal_quality_screen_digest"] = screen_digest
             task["signal_quality_screen_status"] = (
@@ -4745,8 +4705,6 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             task["signal_quality_screen_reason"] = (
                 "no_actionable_signal" if all_screened and
                 skipped_status == "complete_zero_actionable_signal" else
-                "nonpositive_fit_control_delta" if all_screened and
-                skipped_status == "complete_nonpositive_control" else
                 "complete_fit_screen_no_edge" if all_screened
                 else "actionable_signal_or_fail_open")
             task["specs"] = kept_specs
@@ -4767,11 +4725,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             # on every cycle.  The p=1 placeholder keys above still enter all
             # multiplicity corrections; this terminal event does not invent a
             # gate, account, or held-out result.
-            # Every retained record passed the same explicit skip contract;
-            # this includes a deterministic mixture of zero-signal and
-            # nonpositive-control statuses.  Treat that complete set as one
+            # Every excluded record passed the same explicit all-cell
+            # zero-actionable-signal contract. Treat that complete set as one
             # terminal no-edge outcome rather than leaving the hypothesis in
-            # ``testing`` with no replay work to advance it.  A changed corpus
+            # ``testing`` with no replay work to advance it. A changed corpus
             # still creates a new identity and lets normal slot reseeding run.
             screen_terminal = all_screened
             event_status = ("bounded_space_exhausted" if screen_terminal

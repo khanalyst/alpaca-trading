@@ -21,10 +21,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _diagnostic_coverage(*, source_lag: float | None = 5.0,
-                         active: bool = True) -> dict:
+                         active: bool = True, now: float = 100.0) -> dict:
     families = [f"family_{index}" for index in range(12)]
     arms = []
     candidate_ids = []
+    code_identity = "diagnostic-code"
+    cohort_identity = "diagnostic-cohort"
     for family in families:
         for role in ("baseline", "variant"):
             candidate_id = f"shadow:{family}:{role}"
@@ -34,7 +36,23 @@ def _diagnostic_coverage(*, source_lag: float | None = 5.0,
                 "family": family,
                 "role": role,
                 "variant_id": f"rule.{family}.{role}",
+                "code_identity": code_identity,
+                "cohort_identity": cohort_identity,
             })
+    activation_watermark = {
+        "count": 48,
+        "decision_event_count": 24,
+        "last_inserted_at": now - 10.0,
+        "last_event_key": "activation-event",
+    }
+    cursors = {
+        candidate_id: {
+            "last_inserted_at": now - 5.0,
+            "last_event_key": "forward-event",
+            "processed_events": 1,
+        }
+        for candidate_id in candidate_ids
+    }
     return {
         "schema": "diagnostic-shadow-coverage.v1",
         "enabled": True,
@@ -50,8 +68,10 @@ def _diagnostic_coverage(*, source_lag: float | None = 5.0,
         "families_without_decisions": [],
         "baseline_count": 12,
         "variant_count": 12,
-        "cohort_identity": "diagnostic-cohort",
+        "cohort_identity": cohort_identity,
+        "code_identity": code_identity,
         "activation_identity": "forward-activation" if active else None,
+        "activation_event_watermark": activation_watermark,
         "activation_status": "active" if active else "preregistered",
         "warmup_session": "2026-09-08",
         "candidate_identities": candidate_ids,
@@ -72,6 +92,8 @@ def _diagnostic_coverage(*, source_lag: float | None = 5.0,
         "unpriced_virtual_opens": 0,
         "replay_modeled_fills": 0,
         "warmup_replay_modeled_fills": 0,
+        "processed_events": 24,
+        "processed_event_cursors": cursors,
         "actual_fills": 0,
         "actual_fill_claims": False,
         "realized_pnl_authorizing": False,
@@ -391,7 +413,8 @@ class ParallelRuntimeStatusTests(unittest.TestCase):
             path.write_text(json.dumps({
                 "status": "running",
                 "updated_ts": 100,
-                "diagnostic_shadow": _diagnostic_coverage(),
+                "candidate_errors": {},
+                "diagnostic_shadow": _diagnostic_coverage(now=100),
             }), encoding="utf-8")
 
             result = health.shadow(path, 60, now=100)
@@ -407,7 +430,11 @@ class ParallelRuntimeStatusTests(unittest.TestCase):
         self.assertEqual(diagnostic["variant_count"], 12)
         self.assertEqual(diagnostic["candidate_count"], 24)
         self.assertEqual(diagnostic["arms_total"], 24)
+        self.assertEqual(len(diagnostic["processed_event_cursors"]), 24)
+        self.assertEqual(diagnostic["cursor_status"], "ready")
         self.assertEqual(diagnostic["actual_fills"], 0)
+        self.assertFalse(diagnostic["authorizing"])
+        self.assertFalse(diagnostic["proof_authority"])
         self.assertNotIn("arms", diagnostic)
         self.assertNotIn("candidate_identities", diagnostic)
         self.assertNotIn("unexpected_detail", diagnostic)
@@ -422,22 +449,28 @@ class ParallelRuntimeStatusTests(unittest.TestCase):
             cases = []
             cases.append((
                 {"status": "running", "updated_ts": 0,
+                 "candidate_errors": {},
                  "diagnostic_shadow": complete},
                 False, "stale_heartbeat"))
             cases.append((
                 {"status": "running", "updated_ts": 100,
-                 "diagnostic_shadow": _diagnostic_coverage(source_lag=None)},
+                 "candidate_errors": {},
+                 "diagnostic_shadow": _diagnostic_coverage(
+                     source_lag=None, now=100)},
                 True, "fresh_data_unavailable"))
             incomplete = deepcopy(complete)
             incomplete["families_covered"] = 11
             incomplete["families_missing"] = ["family_11"]
             cases.append((
                 {"status": "running", "updated_ts": 100,
+                 "candidate_errors": {},
                  "diagnostic_shadow": incomplete},
                 True, "family_coverage_incomplete"))
             cases.append((
                 {"status": "running", "updated_ts": 100,
-                 "diagnostic_shadow": _diagnostic_coverage(active=False)},
+                 "candidate_errors": {},
+                 "diagnostic_shadow": _diagnostic_coverage(
+                     active=False, now=100)},
                 True, "active_cohort_missing"))
 
             for heartbeat, service_alive, coverage_status in cases:
@@ -486,10 +519,12 @@ class ParallelRuntimeStatusTests(unittest.TestCase):
             }), encoding="utf-8")
             shadow = root / "shadow"
             shadow.mkdir()
+            now = time.time()
             (shadow / "health.json").write_text(json.dumps({
                 "status": "running",
-                "updated_ts": time.time(),
-                "diagnostic_shadow": _diagnostic_coverage(),
+                "updated_ts": now,
+                "candidate_errors": {},
+                "diagnostic_shadow": _diagnostic_coverage(now=now),
             }), encoding="utf-8")
 
             result = dashboard.snapshot(root)
@@ -511,9 +546,11 @@ class ParallelRuntimeStatusTests(unittest.TestCase):
                 "requested paper pair",
                 "Diagnostic shadow",
                 "coverage ready",
+                "evaluations / no-trade decisions",
                 "proof authority",
                 "Zero actual fills is not a profit claim"):
             self.assertIn(marker, dashboard.HTML)
+        self.assertNotIn("evaluations / no signal", dashboard.HTML)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -11,6 +11,7 @@ is fabricated when a safe exit cannot be reconstructed.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
@@ -45,7 +46,10 @@ from deploy.recorder import (
     PARTITION_SOURCE_SCHEMA as RECORDER_PARTITION_SOURCE_SCHEMA,
     corpus_partitions,
 )
-from research.costs import ReplayPolicy, replay_policy_for_session
+from research.costs import (
+    RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy, check_entry_slippage,
+    replay_policy_for_session,
+)
 from research.diagnostic_shadow import (
     DIAGNOSTIC_ACTIVATION_SCHEMA, DIAGNOSTIC_CANDIDATE_PREFIX,
     DIAGNOSTIC_COHORT_SCHEMA, build_diagnostic_cohort,
@@ -399,60 +403,95 @@ def _row_visible(row: Mapping[str, Any], at: datetime) -> bool:
     return available is not None and available <= at
 
 
-def _recorded_session_bounds(corpus_path: Path, session: str) -> tuple[datetime, datetime] | None:
-    """Read the recorder's Alpaca-calendar close for one session.
+@dataclass(frozen=True)
+class _RecordedSessionCalendarSnapshot:
+    """Immutable, process-safe projection of one recorder calendar sidecar."""
 
-    The sidecar is recorder-owned and rewritten atomically.  Missing legacy
-    calendar metadata deliberately falls back to the regular close in replay;
-    newly recorded early closes use the exact broker calendar boundary.
-    """
+    sessions: tuple[str, ...]
+    bounds: tuple[tuple[datetime, datetime], ...]
+
+    def get(self, session: str) -> tuple[datetime, datetime] | None:
+        day = str(session)
+        index = bisect_left(self.sessions, day)
+        if index >= len(self.sessions) or self.sessions[index] != day:
+            return None
+        return self.bounds[index]
+
+    def items(self) -> Iterable[tuple[str, tuple[datetime, datetime]]]:
+        return zip(self.sessions, self.bounds)
+
+
+def _load_recorded_session_calendar(
+        corpus_path: Path) -> _RecordedSessionCalendarSnapshot:
+    """Read and validate one poll-local recorder calendar snapshot."""
     index_path = corpus_path.parent / RECORDER_INDEX_NAME
     try:
         payload = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-    calendar = payload.get("session_calendar") if isinstance(payload, Mapping) else None
-    value = calendar.get(session) if isinstance(calendar, Mapping) else None
-    if not isinstance(value, Mapping):
-        return None
-    opened = _timestamp(value.get("open"))
-    closed = _timestamp(value.get("close"))
-    if (opened is None or closed is None or opened >= closed or
-            opened.astimezone(NEW_YORK).date().isoformat() != session or
-            closed.astimezone(NEW_YORK).date().isoformat() != session):
-        return None
-    return opened, closed
-
-
-def _recorded_session_calendar(corpus_path: Path) -> dict[str, tuple[datetime, datetime]]:
-    """Return validated, already-closed sessions from the recorder sidecar."""
-    index_path = corpus_path.parent / RECORDER_INDEX_NAME
-    try:
-        payload = json.loads(index_path.read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return {}
+        return _RecordedSessionCalendarSnapshot((), ())
     calendar = payload.get("session_calendar") if isinstance(payload, Mapping) else None
     if not isinstance(calendar, Mapping):
-        return {}
+        return _RecordedSessionCalendarSnapshot((), ())
+    entries: list[tuple[str, tuple[datetime, datetime]]] = []
+    for raw_session, value in calendar.items():
+        session = str(raw_session)
+        if not isinstance(value, Mapping):
+            continue
+        # Explicit closed-day markers are valid calendar facts, but they do
+        # not authorize any session rows and therefore have no bounds entry.
+        if value.get("status") == "closed":
+            continue
+        opened = _timestamp(value.get("open"))
+        closed = _timestamp(value.get("close"))
+        if (opened is None or closed is None or opened >= closed or
+                opened.astimezone(NEW_YORK).date().isoformat() != session or
+                closed.astimezone(NEW_YORK).date().isoformat() != session):
+            continue
+        entries.append((session, (opened, closed)))
+    entries.sort(key=lambda item: item[0])
+    return _RecordedSessionCalendarSnapshot(
+        tuple(session for session, _bounds in entries),
+        tuple(bounds for _session, bounds in entries))
+
+
+def _recorded_session_bounds(
+        corpus_path: Path, session: str, *,
+        calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+        ) -> tuple[datetime, datetime] | None:
+    """Return exact bounds from one snapshot, reading fresh when standalone."""
+    snapshot = (calendar_snapshot if calendar_snapshot is not None else
+                _load_recorded_session_calendar(corpus_path))
+    return snapshot.get(session)
+
+
+def _recorded_session_calendar(
+        corpus_path: Path, *,
+        calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+        ) -> dict[str, tuple[datetime, datetime]]:
+    """Return validated, already-closed sessions from the recorder sidecar."""
+    snapshot = (calendar_snapshot if calendar_snapshot is not None else
+                _load_recorded_session_calendar(corpus_path))
     now = datetime.now(UTC)
-    result: dict[str, tuple[datetime, datetime]] = {}
-    for session in calendar:
-        day = str(session)
-        bounds = _recorded_session_bounds(corpus_path, day)
-        if bounds is not None and bounds[1] <= now:
-            result[day] = bounds
-    return result
+    return {session: bounds for session, bounds in snapshot.items()
+            if bounds[1] <= now}
 
 
-def _recorded_session_close(corpus_path: Path, session: str) -> datetime | None:
-    bounds = _recorded_session_bounds(corpus_path, session)
+def _recorded_session_close(
+        corpus_path: Path, session: str, *,
+        calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+        ) -> datetime | None:
+    bounds = _recorded_session_bounds(
+        corpus_path, session, calendar_snapshot=calendar_snapshot)
     return bounds[1] if bounds is not None else None
 
 
 def _session_close(corpus_path: Path, session: str, *,
-                   require_exact_calendar: bool = False) -> tuple[datetime | None, str]:
+                   require_exact_calendar: bool = False,
+                   calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+                   ) -> tuple[datetime | None, str]:
     """Resolve the exact close, retaining an explicit legacy fallback label."""
-    recorded = _recorded_session_close(corpus_path, session)
+    recorded = _recorded_session_close(
+        corpus_path, session, calendar_snapshot=calendar_snapshot)
     if recorded is not None:
         return recorded, "recorder_alpaca_calendar"
     if require_exact_calendar:
@@ -2836,6 +2875,43 @@ class ShadowStore:
                 rows = db.execute("SELECT * FROM decisions ORDER BY created_at,decision_id").fetchall()
             return [dict(row) for row in rows]
 
+    def decision_event_keys(self, candidate_ids: Sequence[str],
+                            sessions: Sequence[str]
+                            ) -> dict[tuple[str, str], set[str]]:
+        """Bulk-read persisted event identities for candidate/session pairs."""
+        normalized_candidates = sorted({
+            str(candidate_id) for candidate_id in candidate_ids
+            if str(candidate_id).strip()
+        })
+        normalized_sessions = sorted({
+            str(session) for session in sessions if str(session).strip()
+        })
+        if not normalized_candidates or not normalized_sessions:
+            return {}
+        result: dict[tuple[str, str], set[str]] = {}
+        # Keep each statement below SQLite's common 999-variable ceiling while
+        # retaining one connection for the complete poll snapshot.
+        chunk_size = 400
+        with self._connection() as db:
+            for candidate_offset in range(0, len(normalized_candidates), chunk_size):
+                candidate_chunk = normalized_candidates[
+                    candidate_offset:candidate_offset + chunk_size]
+                candidate_marks = ",".join("?" for _ in candidate_chunk)
+                for session_offset in range(0, len(normalized_sessions), chunk_size):
+                    session_chunk = normalized_sessions[
+                        session_offset:session_offset + chunk_size]
+                    session_marks = ",".join("?" for _ in session_chunk)
+                    rows = db.execute(
+                        "SELECT candidate_id,session_date,event_key FROM decisions "
+                        f"WHERE candidate_id IN ({candidate_marks}) "
+                        f"AND session_date IN ({session_marks})",
+                        (*candidate_chunk, *session_chunk)).fetchall()
+                    for row in rows:
+                        key = (str(row["candidate_id"]),
+                               str(row["session_date"]))
+                        result.setdefault(key, set()).add(str(row["event_key"]))
+        return result
+
     def decision_count(self) -> int:
         """Return a scalar decision count without materializing WAL rows."""
         with self._connection() as db:
@@ -3389,14 +3465,17 @@ class ShadowRunner:
 
     def _diagnostic_session_complete(
             self, arm: Mapping[str, Any], session: str,
-            bars: Sequence[Mapping[str, Any]]) -> bool:
+            bars: Sequence[Mapping[str, Any]], *,
+            calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+            ) -> bool:
         cfg = self._shadow_candidate_config(_safe_config(arm))
         session_cfg = cfg.get("session") if isinstance(
             cfg.get("session"), Mapping) else {}
         close, _source = _session_close(
             self.config.corpus_path, session,
             require_exact_calendar=bool(session_cfg.get(
-                "require_exact_calendar", False)))
+                "require_exact_calendar", False)),
+            calendar_snapshot=calendar_snapshot)
         return bool(close is not None and any(
             (_event_end(row) or datetime.min.replace(tzinfo=UTC)) >= close
             for row in bars))
@@ -3407,11 +3486,16 @@ class ShadowRunner:
             activation: Mapping[str, Any] | None, *,
             snapshot_rows: Sequence[Mapping[str, Any]],
             progress: Mapping[str, Mapping[str, Any]],
-            replay_identity: Mapping[str, Any]) -> dict[str, Any]:
+            replay_identity: Mapping[str, Any],
+            calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+            ) -> dict[str, Any]:
         """Evaluate sparse forward diagnostics independently of gate progress."""
         if cohort is None or activation is None or not arms:
             return {"this_poll_decisions": 0, "provenance_rejections": 0,
                     "candidate_errors": {}}
+        resolved_calendar = (
+            calendar_snapshot if calendar_snapshot is not None else
+            _load_recorded_session_calendar(self.config.corpus_path))
         cohort_identity = str(cohort.get("cohort_identity") or "")
         candidate_ids = [str(arm.get("candidate_id") or "") for arm in arms]
         source_modes: dict[str, str | None] = {}
@@ -3517,7 +3601,8 @@ class ShadowRunner:
                 session for session in session_events
                 if session != "unknown" and session in session_inputs and
                 self._diagnostic_session_complete(
-                    arm, session, session_inputs[session][0])
+                    arm, session, session_inputs[session][0],
+                    calendar_snapshot=resolved_calendar)
             ]
             work[candidate_id] = {
                 "arm": arm, "rows": arm_rows, "rollups": rollups,
@@ -3547,7 +3632,8 @@ class ShadowRunner:
                         self._evaluate_diagnostic_arm_snapshot, arm,
                         item["session_events"], selected_inputs,
                         context_bars, context_quotes, context_options,
-                        initial, str(activation.get("warmup_session") or ""))
+                        initial, str(activation.get("warmup_session") or ""),
+                        resolved_calendar)
                     ] = candidate_id
                 for future in as_completed(futures):
                     candidate_id = futures[future]
@@ -3607,14 +3693,16 @@ class ShadowRunner:
             for session in refreshed[candidate_id].get("pending_sessions") or ():
                 inputs = session_inputs.get(str(session))
                 if inputs is None or not self._diagnostic_session_complete(
-                        arm, str(session), inputs[0]):
+                        arm, str(session), inputs[0],
+                        calendar_snapshot=resolved_calendar):
                     continue
                 try:
                     complete = self._replay(
                         arm, str(session), inputs[0], inputs[1],
                         self.store.decisions(candidate_id), inputs[2],
                         replay_identity=replay_identity,
-                        diagnostic_activation=activation)
+                        diagnostic_activation=activation,
+                        calendar_snapshot=resolved_calendar)
                     if complete:
                         self.store.complete_diagnostic_replay(
                             cohort_identity=cohort_identity,
@@ -4044,7 +4132,9 @@ class ShadowRunner:
 
     def _evaluate(self, candidate: Mapping[str, Any], event: Mapping[str, Any],
                   bars: Mapping[str, list], quotes: Mapping[str, list],
-                  options: Mapping[str, list]) -> tuple[str, str | None, dict, dict | None]:
+                  options: Mapping[str, list], *,
+                  calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+                  ) -> tuple[str, str | None, dict, dict | None]:
         symbol = str(event.get("symbol") or "")
         diagnostic_candidate = is_diagnostic_candidate(candidate)
         cfg = self._shadow_candidate_config(_safe_config(candidate))
@@ -4058,9 +4148,16 @@ class ShadowRunner:
         session = market_at.astimezone(NEW_YORK).date().isoformat()
         session_cfg = cfg.get("session") if isinstance(cfg.get("session"), Mapping) else {}
         require_exact_calendar = bool(session_cfg.get("require_exact_calendar", False))
+        worker_calendar = getattr(
+            self._worker_state, "calendar_snapshot", None)
+        resolved_calendar = (
+            calendar_snapshot if calendar_snapshot is not None else
+            worker_calendar if worker_calendar is not None else
+            _load_recorded_session_calendar(self.config.corpus_path))
         close_at, calendar_source = _session_close(
             self.config.corpus_path, session,
-            require_exact_calendar=require_exact_calendar)
+            require_exact_calendar=require_exact_calendar,
+            calendar_snapshot=resolved_calendar)
         if require_exact_calendar and close_at is None:
             return ("no_data", "exact broker calendar metadata unavailable",
                     {"session_date": session,
@@ -4088,7 +4185,8 @@ class ShadowRunner:
                     {"session_date": session,
                      "source_mode": observed_source_mode}, None)
         calendar_bounds = _recorded_session_bounds(
-            self.config.corpus_path, session)
+            self.config.corpus_path, session,
+            calendar_snapshot=resolved_calendar)
         force_flat_at = None
         if close_at is not None:
             flat_minutes = (10 if policy.force_flat_minutes_before_close is None
@@ -4201,6 +4299,11 @@ class ShadowRunner:
         # entry boundary; replay compares these fields rather than deriving a
         # synthetic next-bar timestamp from the market event alone.
         signal = dict(signal)
+        # Keep the authored signal reference distinct from the executable
+        # quote used below.  Diagnostic pricing deliberately re-anchors entry
+        # geometry to bid/ask, but the runtime slippage guard compares that
+        # quote with the unmodified authored value.
+        authored_entry_reference = signal.get("entry_price")
         signal["decision_timestamp"] = event_at.isoformat()
         signal["entry_timestamp"] = event_at.isoformat()
         if force_flat_at is not None:
@@ -4251,8 +4354,53 @@ class ShadowRunner:
         # quote fields above carry strict point-in-time freshness metadata.
         snap.update({key: value for key, value in signal.items()
                      if key not in {"symbol", "action"} and value is not None})
-        if (diagnostic_candidate and
-                str(candidate.get("vehicle") or "equity") == "equity" and
+        diagnostic_equity = bool(
+            diagnostic_candidate and
+            str(candidate.get("vehicle") or "equity") == "equity")
+        entry_slippage: dict[str, Any] | None = None
+        entry_slippage_context: dict[str, Any] | None = None
+        entry_slippage_reason: str | None = None
+        if diagnostic_equity:
+            direction = str(signal.get("direction") or "").strip().lower()
+            entry_side = ("buy" if direction == "long" else
+                          "sell" if direction == "short" else direction)
+            executable_entry_reference = (
+                quote.get("ask") if quote is not None and direction == "long"
+                else quote.get("bid") if quote is not None and direction == "short"
+                else None)
+            execution_cfg = cfg.get("execution")
+            configured_slippage_cap = (
+                execution_cfg.get(
+                    "max_slippage_bps", RUNTIME_MAX_SLIPPAGE_BPS)
+                if isinstance(execution_cfg, Mapping) else
+                RUNTIME_MAX_SLIPPAGE_BPS if execution_cfg is None else None)
+            entry_slippage, entry_slippage_reason = check_entry_slippage(
+                entry_side, authored_entry_reference,
+                executable_entry_reference, configured_slippage_cap)
+            # The helper intentionally clears all numeric telemetry when any
+            # input is malformed.  Retain each independently valid reference
+            # for audit without relaxing that fail-closed decision contract.
+            def preserved_reference(value: Any) -> float | None:
+                if isinstance(value, (bool, str, bytes, bytearray)):
+                    return None
+                number = _finite(value)
+                return (number if number is not None and number > 0 else None)
+
+            entry_slippage_context = {
+                "authored_entry_reference": preserved_reference(
+                    authored_entry_reference),
+                "executable_entry_reference": preserved_reference(
+                    executable_entry_reference),
+                "entry_slippage": entry_slippage,
+            }
+            snap.update(entry_slippage_context)
+            # Keep rejection payloads JSON-safe even when a diagnostic signal
+            # supplies a non-finite or otherwise malformed entry reference.
+            persisted_signal = dict(signal)
+            persisted_signal["entry_price"] = entry_slippage_context[
+                "authored_entry_reference"]
+            base["signal"] = persisted_signal
+        if (diagnostic_equity and
                 _finite(snap.get("bid")) is not None and
                 _finite(snap.get("ask")) is not None):
             # A diagnostic requested entry is priced from the executable side,
@@ -4288,7 +4436,8 @@ class ShadowRunner:
                         base | {"snapshot": snap}, None)
             snap["option_chain"] = option_rows
         if snap["stale"] or snap["quote_stale"]:
-            return "unpriced", "stale or unavailable quote", base | {"snapshot": snap}, None
+            return ("unpriced", "stale or unavailable quote",
+                    base | {"snapshot": snap}, None)
         try:
             plan, why = build_setup_plan(signal, snap, cfg)
         except Exception as exc:
@@ -4325,6 +4474,15 @@ class ShadowRunner:
             return "reject", f"risk exception: {type(exc).__name__}", base, None
         if risk_plan is None:
             return "reject", why or "risk rejected", base | {"snapshot": snap}, None
+        if entry_slippage_context is not None:
+            plan.update(entry_slippage_context)
+            risk_plan = dict(risk_plan)
+            risk_plan.update(entry_slippage_context)
+            if entry_slippage_reason is not None:
+                return "reject", entry_slippage_reason, base | {
+                    "snapshot": snap, "setup_plan": plan,
+                    "risk_plan": risk_plan,
+                }, None
         return "open_incomplete", "virtual open; fills and P&L incomplete", base | {
             "snapshot": snap, "setup_plan": plan, "risk_plan": risk_plan,
         }, risk_plan
@@ -4367,12 +4525,75 @@ class ShadowRunner:
             gross_notional += notional
         return positions, active_trades, gross_notional
 
+    def _replay_session_window(
+            self, candidate: Mapping[str, Any], session: str,
+            session_bars: Sequence[Mapping],
+            session_quotes: Sequence[Mapping],
+            session_options: Sequence[Mapping] | None = None,
+            *,
+            calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+            ) -> dict[str, Any]:
+        """Resolve the exact candidate/calendar replay window once."""
+        cfg = self._shadow_candidate_config(_safe_config(candidate))
+        session_cfg = (cfg.get("session")
+                       if isinstance(cfg.get("session"), Mapping) else {})
+        require_exact_calendar = bool(
+            session_cfg.get("require_exact_calendar", False))
+        resolved_calendar = (calendar_snapshot if calendar_snapshot is not None else
+                             _load_recorded_session_calendar(
+                                 self.config.corpus_path))
+        calendar_bounds = _recorded_session_bounds(
+            self.config.corpus_path, session,
+            calendar_snapshot=resolved_calendar)
+        calendar_close, calendar_source = _session_close(
+            self.config.corpus_path, session,
+            require_exact_calendar=require_exact_calendar,
+            calendar_snapshot=resolved_calendar)
+        if require_exact_calendar and calendar_close is None:
+            session_bars = ()
+            session_quotes = ()
+            session_options = ()
+        in_session_bars = tuple(
+            row for row in session_bars
+            if calendar_close is None or (
+                (_timestamp(row.get("timestamp")) or calendar_close) <
+                calendar_close and
+                (_event_end(row) or calendar_close) <= calendar_close))
+        in_session_quotes = tuple(
+            row for row in session_quotes
+            if calendar_close is None or
+            (_timestamp(row.get("timestamp")) or calendar_close) <=
+            calendar_close)
+        in_session_options = tuple(
+            row for row in (session_options or ())
+            if calendar_close is None or
+            (_timestamp(row.get("timestamp")) or calendar_close) <=
+            calendar_close)
+        complete = bool(
+            calendar_close is not None and
+            any((_event_end(row) or datetime.min.replace(tzinfo=UTC)) >=
+                calendar_close for row in in_session_bars))
+        return {
+            "config": cfg,
+            "require_exact_calendar": require_exact_calendar,
+            "calendar_bounds": calendar_bounds,
+            "calendar_close": calendar_close,
+            "calendar_source": calendar_source,
+            "bars": in_session_bars,
+            "quotes": in_session_quotes,
+            "options": in_session_options,
+            "complete": complete,
+        }
+
     def _replay(self, candidate: Mapping[str, Any], session: str,
                 session_bars: Sequence[Mapping], session_quotes: Sequence[Mapping],
                 decisions: Sequence[Mapping],
                 session_options: Sequence[Mapping] | None = None, *,
                 replay_identity: Mapping[str, Any] | None = None,
-                diagnostic_activation: Mapping[str, Any] | None = None) -> bool:
+                diagnostic_activation: Mapping[str, Any] | None = None,
+                replay_window: Mapping[str, Any] | None = None,
+                calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+                ) -> bool:
         candidate_id = str(candidate["candidate_id"])
         diagnostic = is_diagnostic_candidate(candidate)
         replay_identity = dict(replay_identity or {})
@@ -4393,26 +4614,18 @@ class ShadowRunner:
         # digest so a corrected/stale option snapshot cannot be mistaken for
         # the same replay window merely because the underlying bars/quotes
         # were unchanged.
-        cfg = self._shadow_candidate_config(_safe_config(candidate))
-        session_cfg = cfg.get("session") if isinstance(cfg.get("session"), Mapping) else {}
-        require_exact_calendar = bool(session_cfg.get("require_exact_calendar", False))
-        calendar_close, calendar_source = _session_close(
-            self.config.corpus_path, session,
-            require_exact_calendar=require_exact_calendar)
-        if require_exact_calendar and calendar_close is None:
-            session_bars = ()
-            session_quotes = ()
-            session_options = ()
-        in_session_bars = [row for row in session_bars
-                           if calendar_close is None or (
-                               (_timestamp(row.get("timestamp")) or calendar_close) < calendar_close
-                               and (_event_end(row) or calendar_close) <= calendar_close)]
-        in_session_quotes = [row for row in session_quotes
-                             if calendar_close is None or
-                             (_timestamp(row.get("timestamp")) or calendar_close) <= calendar_close]
-        in_session_options = [row for row in (session_options or ())
-                              if calendar_close is None or
-                              (_timestamp(row.get("timestamp")) or calendar_close) <= calendar_close]
+        window = (dict(replay_window) if replay_window is not None else
+                  self._replay_session_window(
+                      candidate, session, session_bars, session_quotes,
+                      session_options,
+                      calendar_snapshot=calendar_snapshot))
+        cfg = dict(window["config"])
+        require_exact_calendar = bool(window["require_exact_calendar"])
+        calendar_close = window["calendar_close"]
+        calendar_source = str(window["calendar_source"])
+        in_session_bars = list(window["bars"])
+        in_session_quotes = list(window["quotes"])
+        in_session_options = list(window["options"])
         replay_policy = _session_policy(
             cfg, calendar_close, policy=self._shadow_policy(cfg))
         expected_equity_feed = replay_policy.equity_feed
@@ -4484,9 +4697,7 @@ class ShadowRunner:
                                                   datetime.now(UTC))),
                                    "replay_signatures": replay_signatures,
                                    **identity_details}
-        complete = bool(calendar_close is not None and
-                        any((_event_end(row) or datetime.min.replace(tzinfo=UTC)) >=
-                            calendar_close for row in in_session_bars))
+        complete = bool(window["complete"])
         if diagnostic and not complete:
             # Diagnostic replay is a close-only modeled outcome. Intraday
             # explanation is retained in sparse decisions/rollups instead of
@@ -4523,8 +4734,7 @@ class ShadowRunner:
             if feed_mismatches:
                 raise ShadowError(
                     f"equity feed mismatch: expected {expected_equity_feed}")
-            calendar_bounds = _recorded_session_bounds(
-                self.config.corpus_path, session)
+            calendar_bounds = window.get("calendar_bounds")
             if require_exact_calendar and calendar_bounds is None:
                 raise ShadowError("exact broker calendar metadata unavailable")
             normalized_bar_rows = []
@@ -4797,15 +5007,19 @@ class ShadowRunner:
                                bars: Mapping[str, Sequence[Mapping]],
                                quotes: Mapping[str, Sequence[Mapping]],
                                options: Mapping[str, Sequence[Mapping]],
-                               initial_state: tuple[list[dict], dict[str, dict], float]
+                               initial_state: tuple[list[dict], dict[str, dict], float],
+                               calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
                                ) -> dict[str, Any]:
         """Evaluate one legacy arm without touching the shadow WAL."""
         candidate_id = str(arm["candidate_id"])
         state = (list(initial_state[0]), dict(initial_state[1]),
                  float(initial_state[2]))
-        self._worker_state.portfolios = {candidate_id: state}
         decisions: list[dict[str, Any]] = []
         try:
+            self._worker_state.portfolios = {candidate_id: state}
+            self._worker_state.calendar_snapshot = (
+                calendar_snapshot if calendar_snapshot is not None else
+                _load_recorded_session_calendar(self.config.corpus_path))
             for session in sorted(session_events):
                 for event in session_events[session]:
                     symbol = str(event.get("symbol") or "")
@@ -4839,10 +5053,11 @@ class ShadowRunner:
             return {"candidate_id": candidate_id, "decisions": [],
                     "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
         finally:
-            try:
-                del self._worker_state.portfolios
-            except AttributeError:
-                pass
+            for name in ("portfolios", "calendar_snapshot"):
+                try:
+                    delattr(self._worker_state, name)
+                except AttributeError:
+                    pass
         return {"candidate_id": candidate_id, "decisions": decisions,
                 "error": None}
 
@@ -4856,7 +5071,9 @@ class ShadowRunner:
             quotes: Mapping[str, Sequence[Mapping]],
             options: Mapping[str, Sequence[Mapping]],
             initial_state: Mapping[str, Any],
-            warmup_session: str | None = None) -> dict[str, Any]:
+            warmup_session: str | None = None,
+            calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+            ) -> dict[str, Any]:
         """Evaluate one immutable arm without touching the shadow WAL.
 
         Every worker receives the same tuple-backed event snapshot.  The
@@ -4877,29 +5094,34 @@ class ShadowRunner:
             positions=initial_state.get("positions") or (), config=cfg,
             policy=self._shadow_policy(cfg), rule_spec=rule_spec)
         state = book.risk_state()
-        self._worker_state.portfolios = {candidate_id: state}
-        self._worker_state.equities = {candidate_id: book.equity}
         decisions: list[dict[str, Any]] = []
-        warmup_session = str(warmup_session or "")
-        quote_rows = tuple(row for values in quotes.values() for row in values)
-        ordered_events: list[tuple[datetime, str, str, Mapping[str, Any]]] = []
-        for session, events in session_events.items():
-            if session not in session_inputs:
-                raise ShadowError(
-                    f"diagnostic session context {session} is unavailable")
-            for event in events:
-                available_at = _availability_time(event)
-                if available_at is None:
-                    raise ShadowError("diagnostic event availability is invalid")
-                ordered_events.append((
-                    available_at, str(event.get("event_key") or ""),
-                    str(session), event))
-        ordered_events.sort(key=lambda item: (item[0], item[1]))
-        persisted_at = _timestamp(book.account.get("last_event_at"))
-        account_watermark = (
-            (persisted_at, str(book.account.get("last_event_key") or ""))
-            if persisted_at is not None else None)
         try:
+            self._worker_state.portfolios = {candidate_id: state}
+            self._worker_state.equities = {candidate_id: book.equity}
+            self._worker_state.calendar_snapshot = (
+                calendar_snapshot if calendar_snapshot is not None else
+                _load_recorded_session_calendar(self.config.corpus_path))
+            warmup_session = str(warmup_session or "")
+            quote_rows = tuple(row for values in quotes.values() for row in values)
+            ordered_events: list[
+                tuple[datetime, str, str, Mapping[str, Any]]] = []
+            for session, events in session_events.items():
+                if session not in session_inputs:
+                    raise ShadowError(
+                        f"diagnostic session context {session} is unavailable")
+                for event in events:
+                    available_at = _availability_time(event)
+                    if available_at is None:
+                        raise ShadowError(
+                            "diagnostic event availability is invalid")
+                    ordered_events.append((
+                        available_at, str(event.get("event_key") or ""),
+                        str(session), event))
+            ordered_events.sort(key=lambda item: (item[0], item[1]))
+            persisted_at = _timestamp(book.account.get("last_event_at"))
+            account_watermark = (
+                (persisted_at, str(book.account.get("last_event_key") or ""))
+                if persisted_at is not None else None)
             for available_at, event_key, session, event in ordered_events:
                 # The insertion cursor can legitimately encounter a delayed
                 # event whose claimed availability precedes already committed
@@ -4967,7 +5189,7 @@ class ShadowRunner:
             return {"candidate_id": candidate_id, "decisions": [],
                     "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
         finally:
-            for name in ("portfolios", "equities"):
+            for name in ("portfolios", "equities", "calendar_snapshot"):
                 try:
                     delattr(self._worker_state, name)
                 except AttributeError:
@@ -4977,6 +5199,11 @@ class ShadowRunner:
 
     def run_once(self) -> dict[str, Any]:
         poll_started = time.monotonic()
+        # The recorder rewrites its sidecar atomically.  Parse it once for this
+        # poll and pass the immutable value through every worker/replay path so
+        # a concurrent correction cannot split one poll across two calendars.
+        calendar_snapshot = _load_recorded_session_calendar(
+            self.config.corpus_path)
         # Validate the mutable operational pointer before writing anything.
         # Older code identities are readable for rollover; malformed or
         # self-digest-mismatched manifests are never silently replaced.
@@ -5260,7 +5487,8 @@ class ShadowRunner:
                 diagnostic_cohort, diagnostic_arms, diagnostic_activation,
                 snapshot_rows=diagnostic_rows,
                 progress=diagnostic_progress,
-                replay_identity=replay_identity)
+                replay_identity=replay_identity,
+                calendar_snapshot=calendar_snapshot)
             diagnostic_errors = diagnostic_result.get("candidate_errors") or {}
             decision_count = self.store.decision_count()
             result = {
@@ -5288,15 +5516,18 @@ class ShadowRunner:
                 "diagnostic_candidates": len(diagnostic_arms),
                 **prune,
             }
-            result["diagnostic_shadow"] = self._diagnostic_coverage(
+            diagnostic_coverage = self._diagnostic_coverage(
                 diagnostic_cohort, diagnostic_activation,
                 this_poll_decisions=int(diagnostic_result.get(
                     "this_poll_decisions") or 0),
                 preactivation_rejections=int(diagnostic_result.get(
                     "provenance_rejections") or 0),
-                poll_duration_seconds=time.monotonic() - poll_started)
-            result["poll_duration_seconds"] = result[
-                "diagnostic_shadow"]["poll_duration_seconds"]
+                poll_duration_seconds=0.0)
+            poll_duration_seconds = round(
+                max(0.0, time.monotonic() - poll_started), 6)
+            diagnostic_coverage["poll_duration_seconds"] = poll_duration_seconds
+            result["diagnostic_shadow"] = diagnostic_coverage
+            result["poll_duration_seconds"] = poll_duration_seconds
             result["source_lag_seconds"] = result[
                 "diagnostic_shadow"]["source_lag_seconds"]
             return result
@@ -5310,7 +5541,9 @@ class ShadowRunner:
         # has no normalized events.  This is what makes an all-arm missing
         # middle session visible instead of letting the union of replay rows
         # silently skip it.
-        for session, bounds in _recorded_session_calendar(self.config.corpus_path).items():
+        for session, bounds in _recorded_session_calendar(
+                self.config.corpus_path,
+                calendar_snapshot=calendar_snapshot).items():
             catalog.setdefault(session, {
                 "session_date": session,
                 "open": bounds[0].isoformat(),
@@ -5325,7 +5558,9 @@ class ShadowRunner:
             if stamp is None:
                 continue
             session = stamp.astimezone(NEW_YORK).date().isoformat()
-            bounds = _recorded_session_bounds(self.config.corpus_path, session)
+            bounds = _recorded_session_bounds(
+                self.config.corpus_path, session,
+                calendar_snapshot=calendar_snapshot)
             event_end = _event_end(event)
             if bounds is None or event_end is None or event_end < bounds[1]:
                 continue
@@ -5443,6 +5678,9 @@ class ShadowRunner:
                 tuple(json.loads(_json(dict(row))) for row in session_quotes),
                 tuple(json.loads(_json(dict(row))) for row in session_options),
             )
+        persisted_event_keys = self.store.decision_event_keys(
+            sorted(arm_ids),
+            sorted(set(frozen_session_events) - replay_only_sessions))
         event_watermark = {
             "count": len(frozen_events),
             "events_digest": _digest([
@@ -5537,7 +5775,8 @@ class ShadowRunner:
         diagnostic_result = self._run_diagnostic_poll(
             diagnostic_cohort, diagnostic_arms, diagnostic_activation,
             snapshot_rows=diagnostic_rows, progress=diagnostic_progress,
-            replay_identity=replay_identity)
+            replay_identity=replay_identity,
+            calendar_snapshot=calendar_snapshot)
 
         # Dispatch one immutable session at a time.  The parent commits
         # decisions and performs replay before the next session is submitted,
@@ -5549,7 +5788,6 @@ class ShadowRunner:
         authorizing_errors: dict[str, str] = {}
         failed_arms: set[str] = set()
         replay_blocked = False
-        replay_decisions: dict[str, list[dict[str, Any]]] = {}
         for session in sorted(set(frozen_session_events) | replay_only_sessions):
             is_replay_only = session in replay_only_sessions
             session_inputs_one = {session: frozen_session_inputs[session]}
@@ -5558,14 +5796,27 @@ class ShadowRunner:
                                   if is_replay_only else arm_ids)
             eligible_events_by_arm: dict[str, tuple[dict, ...]] = {}
             active_arms: list[dict[str, Any]] = []
+            session_success = bool(session_candidates)
+            if any(candidate_id in failed_arms or candidate_id not in arm_by_id
+                   for candidate_id in session_candidates):
+                session_success = False
             for arm in arms:
                 candidate_id = str(arm["candidate_id"])
                 if candidate_id not in session_candidates or candidate_id in failed_arms:
                     continue
-                eligible_events_by_arm[candidate_id] = tuple(
-                    frozen_session_events[session])
-                active_arms.append(arm)
-            session_success = bool(active_arms)
+                session_rows = tuple(frozen_session_events[session])
+                if is_replay_only:
+                    eligible_rows = session_rows
+                else:
+                    seen = persisted_event_keys.get((candidate_id, session), set())
+                    eligible_rows = tuple(
+                        row for row in session_rows
+                        if str(row.get("event_key") or "") not in seen)
+                eligible_events_by_arm[candidate_id] = eligible_rows
+                if is_replay_only or eligible_rows:
+                    active_arms.append(arm)
+            active_candidate_ids = {
+                str(arm["candidate_id"]) for arm in active_arms}
             initial_states = {
                 str(arm["candidate_id"]): self._portfolio_state(
                     str(arm["candidate_id"])) for arm in active_arms}
@@ -5579,7 +5830,8 @@ class ShadowRunner:
                                         str(arm["candidate_id"])]},
                                     session_inputs_one,
                                     frozen_bars, frozen_quotes, frozen_options,
-                                    initial_states[str(arm["candidate_id"])]): arm
+                                    initial_states[str(arm["candidate_id"])],
+                                    calendar_snapshot): arm
                         for arm in active_arms}
                     for future in as_completed(futures):
                         arm = futures[future]
@@ -5596,6 +5848,8 @@ class ShadowRunner:
                 session_success = False
 
             # Stable candidate/event/session order is the sole write order.
+            successful_evaluations: set[str] = set()
+            replay_decisions: dict[str, list[dict[str, Any]]] = {}
             for result in worker_results:
                 candidate_id = str(result.get("candidate_id") or "")
                 if result.get("error"):
@@ -5627,14 +5881,25 @@ class ShadowRunner:
                                 "event_key": str(decision.get("event_key") or "")}),
                             symbol=str(decision.get("symbol") or ""),
                             plan=decision["plan"])
+                successful_evaluations.add(candidate_id)
                 if is_replay_only:
                     replay_decisions[candidate_id] = decisions
 
             # Replay is parent-only and runs before the next session barrier.
             session_bars, session_quotes, session_options = frozen_session_inputs[session]
-            for result in worker_results:
-                candidate_id = str(result.get("candidate_id") or "")
-                if result.get("error"):
+            for candidate_id in sorted(session_candidates):
+                if candidate_id in failed_arms or candidate_id not in arm_by_id:
+                    continue
+                if (candidate_id in active_candidate_ids and
+                        candidate_id not in successful_evaluations):
+                    session_success = False
+                    continue
+                replay_window = self._replay_session_window(
+                    arm_by_id[candidate_id], session, session_bars,
+                    session_quotes, session_options,
+                    calendar_snapshot=calendar_snapshot)
+                if not is_replay_only and not replay_window["complete"]:
+                    session_success = False
                     continue
                 try:
                     rows = self.store.decisions(candidate_id)
@@ -5654,7 +5919,8 @@ class ShadowRunner:
                     complete = self._replay(
                         arm_by_id[candidate_id], session, session_bars,
                         session_quotes, rows, session_options,
-                        replay_identity=replay_identity)
+                        replay_identity=replay_identity,
+                        replay_window=replay_window)
                     if complete is not True:
                         session_success = False
                 except Exception as exc:
@@ -5763,18 +6029,22 @@ class ShadowRunner:
             })
         capacity = sorted(capacity, key=lambda item: (
             item["candidate_id"], item["session_date"]))[-64:]
+        decision_count = self.store.decision_count()
         diagnostic_coverage = self._diagnostic_coverage(
             diagnostic_cohort, diagnostic_activation,
             this_poll_decisions=int(diagnostic_result.get(
                 "this_poll_decisions") or 0),
             preactivation_rejections=int(diagnostic_result.get(
                 "provenance_rejections") or 0),
-            poll_duration_seconds=time.monotonic() - poll_started)
+            poll_duration_seconds=0.0)
+        poll_duration_seconds = round(
+            max(0.0, time.monotonic() - poll_started), 6)
+        diagnostic_coverage["poll_duration_seconds"] = poll_duration_seconds
         return {"candidates": len(candidates),
                 "authorizing_candidates": len(candidates),
                 "diagnostic_candidates": len(diagnostic_arms),
                 "ingested_events": ingested,
-                "events": len(events), "decisions": self.store.decision_count(),
+                "events": len(events), "decisions": decision_count,
                 "conflicts": conflicts, "invalid_events": invalid_events,
                 "manifest_digest": manifest_digest,
                 "candidate_errors": dict(sorted(candidate_errors.items())),
@@ -5787,8 +6057,7 @@ class ShadowRunner:
                 "signal_dispositions": signal_dispositions,
                 "stress_calibration": calibration_status,
                 "diagnostic_shadow": diagnostic_coverage,
-                "poll_duration_seconds": diagnostic_coverage[
-                    "poll_duration_seconds"],
+                "poll_duration_seconds": poll_duration_seconds,
                 "source_lag_seconds": diagnostic_coverage[
                     "source_lag_seconds"],
                 **prune}

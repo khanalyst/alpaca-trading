@@ -572,7 +572,7 @@ class LiveShadowTests(unittest.TestCase):
                 "SELECT candidate_id FROM virtual_books").fetchall()
         self.assertTrue({row[0] for row in books}.issubset({first["candidate_id"], second["candidate_id"]}))
 
-    def test_incomplete_replay_is_diagnostic_and_does_not_touch_edge(self):
+    def test_incomplete_session_defers_replay_and_does_not_touch_edge(self):
         candidate = self._candidate(status="demoted")
         self._write_rows(include_quote=True)
         before = self.edge.read_bytes()
@@ -582,9 +582,7 @@ class LiveShadowTests(unittest.TestCase):
             row = db.execute(
                 "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
                 (candidate["candidate_id"],)).fetchone()
-        self.assertIsNotNone(row)
-        self.assertIn(row[0], {"incomplete", "mismatch", "match"})
-        json.loads(row[1])
+        self.assertIsNone(row)
 
     def test_bounds_are_enforced(self):
         self._candidate()

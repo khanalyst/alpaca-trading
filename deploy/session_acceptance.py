@@ -597,6 +597,21 @@ def sample_reasons(sample: Mapping[str, object], *, expected: Sequence[str] | No
     if not isinstance(diag, Mapping):
         reasons.append("diagnostic_coverage_missing")
         diag = {}
+    # Raw acceptance evidence must meet the same fixed-cohort contract as
+    # current-poll health. The additional checks below retain session-wide
+    # chronology and the established detailed refusal reasons.
+    raw_errors = shadow.get("candidate_errors")
+    readiness = health._shadow_diagnostic_summary(
+        dict(diag), now=captured,
+        candidate_errors_present=(
+            shadow.get("candidate_errors_present") is True and
+            "candidate_errors" in shadow),
+        candidate_errors_clear=isinstance(raw_errors, dict) and not raw_errors,
+        candidate_error_count=(
+            len(raw_errors) if isinstance(raw_errors, dict) else None))
+    if readiness is None or readiness["readiness_status"] != "ready":
+        reasons.append(readiness["readiness_status"] if readiness is not None
+                       else "diagnostic_metadata_missing")
     reasons.extend(_diagnostic_reasons(
         diag, max_age=freshness, captured_ts=captured,
         session_open_ts=opened))
@@ -692,8 +707,8 @@ def _diagnostic_reasons(diag: Mapping[str, object], *, max_age: float,
         reasons.append("shadow_source_lag_future")
     elif source_lag > max_age:
         reasons.append("shadow_source_lag_stale")
-    if _text(diag.get("observation_status")) in (
-            None, "awaiting_forward_activation", "no_post_activation_events"):
+    if diag.get("observation_status") not in (
+            health.SHADOW_POSTACTIVATION_OBSERVATION_STATUSES):
         reasons.append("post_activation_observation_missing")
     activation = _activation_marker(diag)
     if activation is None:

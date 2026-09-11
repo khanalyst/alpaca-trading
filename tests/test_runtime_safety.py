@@ -1780,6 +1780,42 @@ class RuntimeSafetyTests(unittest.TestCase):
                 "verified_gate": {"passes": True, "heldout_delta": .1,
                                   "heldout_trades": 20}}
 
+    def _live_engine_for_account(self, account, *, db_name):
+        db = Path(self.runtime_tmp.name) / db_name
+        ledger = EdgeLedger(db)
+        pinned = self._prove(ledger, "ibr.baseline")
+        proof = self._verified_proof(config_hash=pinned["config_hash"])
+
+        class LiveProvider(FakeProvider):
+            paper = False
+            endpoint = "https://api.alpaca.markets"
+            data_feed = "iex"
+            options_feed = "indicative"
+
+            def account(self):
+                return account
+
+        provider = LiveProvider()
+        with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
+                patch.object(EdgeLedger, "latest_verified_run",
+                             return_value=proof), \
+                patch.object(EdgeLedger, "eligibility",
+                             return_value={"eligible": True,
+                                           "latest_verified_run": proof}):
+            cfg = validate_config({
+                "mode": "live",
+                "broker": {"paper": False, "allow_live": True,
+                           "data_feed": "iex", "options_feed": "indicative"},
+                "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                             "selection_mode": "specific"},
+                "research": {"enabled": True,
+                             "require_validated_variant": True,
+                             "db_path": str(db)},
+            })
+            engine = Engine(cfg, light=True, provider=provider)
+        self.addCleanup(engine.close)
+        return engine, provider
+
     def test_live_edge_is_pinned_and_never_switches_after_demotion(self):
         db = Path(self.runtime_tmp.name) / "live-edge.sqlite3"
         ledger = EdgeLedger(db)
@@ -1892,34 +1928,72 @@ class RuntimeSafetyTests(unittest.TestCase):
                                            "latest_verified_run": proof}):
             self.assertIsNone(resolve_validated_variant(cfg, db_path=db))
 
-    def test_live_preflight_requires_explicit_pdt_eligibility(self):
-        db = Path(self.runtime_tmp.name) / "live-pdt.sqlite3"
-        ledger = EdgeLedger(db)
-        self._prove(ledger, "ibr.baseline")
+    def test_live_preflight_accepts_modern_and_legacy_pdt_shapes(self):
+        missing = object()
+        for index, value in enumerate((missing, None, True, False)):
+            with self.subTest(pattern_day_trader=value):
+                account = {"id": "a", "status": "active",
+                           "equity": Decimal("100000"),
+                           "cash": Decimal("100000"),
+                           "buying_power": Decimal("100000")}
+                if value is not missing:
+                    account["pattern_day_trader"] = value
+                engine, _ = self._live_engine_for_account(
+                    account, db_name=f"live-pdt-{index}.sqlite3")
+                self.assertEqual(
+                    engine.preflight()["account"]["buying_power"],
+                    Decimal("100000"))
 
-        class LiveProvider(FakeProvider):
-            paper = False
-            endpoint = "https://api.alpaca.markets"
+    def test_live_preflight_rejects_missing_or_malformed_buying_power(self):
+        missing = object()
+        for index, value in enumerate(
+                (missing, None, "NaN", "Infinity", True)):
+            with self.subTest(buying_power=value):
+                account = {"id": "a", "status": "active",
+                           "equity": Decimal("100000"),
+                           "cash": Decimal("100000"),
+                           "pattern_day_trader": True}
+                if value is not missing:
+                    account["buying_power"] = value
+                engine, _ = self._live_engine_for_account(
+                    account, db_name=f"live-buying-power-{index}.sqlite3")
+                with self.assertRaisesRegex(
+                        AlpacaError, "explicitly report finite buying power"):
+                    engine.preflight()
 
-        with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
-                patch.object(EdgeLedger, "latest_verified_run",
-                             return_value=self._verified_proof()), \
-                patch.object(
-                    EdgeLedger, "eligibility",
-                    return_value={"eligible": True,
-                                  "latest_verified_run": self._verified_proof(
-                                      config_hash=self._prove(ledger, "ibr.baseline")["config_hash"])}):
-            cfg = validate_config({
-                "mode": "live", "broker": {"paper": False, "allow_live": True},
-                "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
-                             "selection_mode": "specific"},
-                "research": {"enabled": True, "require_validated_variant": True,
-                             "db_path": str(db)},
-            })
-            engine = Engine(cfg, light=True, provider=LiveProvider())
-        self.addCleanup(engine.close)
-        with self.assertRaisesRegex(AlpacaError, "pattern_day_trader=true"):
-            engine.preflight()
+    def test_nonpositive_buying_power_allows_startup_but_rejects_entry(self):
+        for index, value in enumerate((Decimal("0"), Decimal("-1"))):
+            with self.subTest(buying_power=value):
+                account = {"id": "a", "status": "active",
+                           "equity": Decimal("100000"),
+                           "cash": Decimal("100000"),
+                           "buying_power": value}
+                engine, provider = self._live_engine_for_account(
+                    account, db_name=f"live-nonpositive-{index}.sqlite3")
+                self.assertIs(engine.preflight()["account"], account)
+                plan = {
+                    "direction": "long", "entry_price": Decimal("100"),
+                    "stop_price": Decimal("99"),
+                    "target_price": Decimal("102"),
+                    "stop_distance": Decimal("1"),
+                    "notional": Decimal("1"),
+                }
+                signal = {
+                    "direction": "long", "execution_profile": "shares",
+                    "entry_price": Decimal("100"),
+                    "stop_price": Decimal("99"),
+                    "target_price": Decimal("102"),
+                }
+                row = {"quote": {"timestamp": provider.now,
+                                  "bid": Decimal("99.99"),
+                                  "ask": Decimal("100")},
+                       "bars": []}
+                with patch.object(engine.risk, "vet_open",
+                                  return_value=(plan, None)):
+                    order = engine._risk_order(
+                        "SPY", signal, row, account, [], provider.now)
+                self.assertIsNone(order)
+                self.assertEqual(provider.orders_sent, [])
 
     def test_live_engine_cannot_bypass_validated_edge_gate(self):
         class LiveProvider(FakeProvider):

@@ -200,6 +200,7 @@ def zero_signal_quality_screen_worker(payload):
 
 
 def nonpositive_signal_quality_screen_worker(payload):
+    """Return the legacy sealed point-estimate screen shape."""
     screens = {}
     for raw_spec in payload.get("specs", ()):
         spec = validate_rule_spec(raw_spec)
@@ -225,7 +226,7 @@ def nonpositive_signal_quality_screen_worker(payload):
 
 
 def mixed_signal_quality_screen_worker(payload):
-    """Return individually skippable zero and nonpositive screen records."""
+    """Return one proven zero plus one legacy nonpositive screen record."""
     screens = {}
     for index, raw_spec in enumerate(payload.get("specs", ())):
         spec = validate_rule_spec(raw_spec)
@@ -753,65 +754,51 @@ class StrategyFactoryTests(unittest.TestCase):
             self.assertEqual(screen["status"], "complete")
             self.assertEqual(screen["reason"], "actionable_signal_or_fail_open")
 
-    def test_complete_nonpositive_screen_closes_hypothesis_without_replay(self):
+    def test_complete_nonpositive_screen_fails_open_to_replay(self):
         rows = losing_breakouts(sessions=12)
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
                 patch.object(factory_module, "_signal_quality_screen_worker",
                              side_effect=nonpositive_signal_quality_screen_worker), \
-                patch.object(factory_module, "_worker") as replay:
+                patch.object(factory_module, "_worker",
+                             side_effect=fake_adequate_worker) as replay:
             db = Path(directory) / "nonpositive.sqlite3"
             result = run_factory(
                 rows, db_path=db, strategies=1, variants_per_strategy=2,
                 workers=1, min_trades=1, min_sessions=1, alpha=1.0)
-            self.assertEqual(replay.call_count, 0)
-            self.assertEqual(result["variants"], 0)
+            self.assertGreater(replay.call_count, 0)
+            self.assertGreater(result["variants"], 0)
             screen = next(iter(result["signal_quality_screens"].values()))
-            self.assertEqual(screen["status"], "complete_nonpositive_control")
-            self.assertEqual(screen["reason"],
-                             "nonpositive_fit_control_delta")
-            hypothesis = FactoryLedger(db).hypotheses(vehicle="equity")[0]
-            self.assertEqual(hypothesis["status"], "bounded_space_exhausted")
-            event = FactoryLedger(db).events(hypothesis["hypothesis_id"])[-1]
-            self.assertEqual(event["status"], "bounded_space_exhausted")
-            self.assertIn("no replay or gate was authorized", event["reason"])
-            self.assertFalse(event["payload"]["authorizing"])
-            self.assertTrue(event["payload"]["diagnostic_only"])
+            self.assertEqual(screen["status"], "complete")
+            self.assertEqual(screen["reason"], "actionable_signal_or_fail_open")
+            self.assertTrue(all(
+                item["status"] == "complete_nonpositive_control"
+                for item in screen["variants"].values()))
 
-    def test_mixed_complete_screen_closes_without_replay_and_reseeds_on_new_corpus(self):
-        """All individually skippable statuses share one terminal no-edge result."""
+    def test_mixed_zero_and_nonpositive_screen_replays_retained_candidate(self):
+        """Only the proven zero is removed; the point estimate reaches replay."""
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
                 patch.object(factory_module, "_signal_quality_screen_worker",
                              side_effect=mixed_signal_quality_screen_worker), \
-                patch.object(factory_module, "_worker") as replay:
+                patch.object(factory_module, "_worker",
+                             side_effect=fake_adequate_worker) as replay:
             db = Path(directory) / "mixed-screen.sqlite3"
-            first = run_factory(
+            result = run_factory(
                 losing_breakouts(sessions=12), db_path=db, strategies=1,
                 variants_per_strategy=2, workers=1, min_trades=1,
                 min_sessions=1, alpha=1.0)
-            self.assertEqual(replay.call_count, 0)
-            screen = next(iter(first["signal_quality_screens"].values()))
+            self.assertGreater(replay.call_count, 0)
+            replayed_specs = replay.call_args.args[0]["specs"]
+            self.assertEqual(len(replayed_specs), 1)
+            self.assertEqual(result["variants"], 1)
+            screen = next(iter(result["signal_quality_screens"].values()))
             self.assertEqual(screen["status"], "complete")
-            self.assertEqual(screen["reason"], "complete_fit_screen_no_edge")
-            self.assertEqual(first["active_slots"], 0)
-            ledger = FactoryLedger(db)
-            self.assertEqual(ledger.hypotheses(vehicle="equity")[0]["status"],
-                             "bounded_space_exhausted")
-            first_id = ledger.hypotheses(vehicle="equity")[0]["hypothesis_id"]
-
-            # A changed corpus gets a new experiment identity and lets the
-            # normal slot-reseed path evaluate the next current hypothesis.
-            second = run_factory(
-                losing_breakouts(sessions=13), db_path=db, strategies=1,
-                variants_per_strategy=2, workers=1, min_trades=1,
-                min_sessions=1, alpha=1.0)
-            self.assertEqual(replay.call_count, 0)
-            self.assertEqual(second["active_slots"], 0)
-            hypotheses = ledger.hypotheses(vehicle="equity")
-            self.assertEqual(len(hypotheses), 2)
-            self.assertNotEqual(hypotheses[-1]["hypothesis_id"], first_id)
-            self.assertEqual(hypotheses[-1]["status"], "bounded_space_exhausted")
+            self.assertEqual(screen["reason"], "actionable_signal_or_fail_open")
+            self.assertEqual(
+                sorted(item["status"] for item in screen["variants"].values()),
+                ["complete_nonpositive_control",
+                 "complete_zero_actionable_signal"])
 
     def test_screen_terminal_reseed_waits_for_new_corpus(self):
         """A later corpus can rotate the closed screen hypothesis normally."""
@@ -836,7 +823,7 @@ class StrategyFactoryTests(unittest.TestCase):
             self.assertEqual([item["generation"] for item in hypotheses], [0, 1])
             self.assertNotEqual(hypotheses[0]["family"], hypotheses[1]["family"])
 
-    def test_complete_nonpositive_control_screen_skips_only_with_adequate_match(self):
+    def test_nonpositive_control_point_estimate_is_diagnostic_only(self):
         quality = {
             "schema": "signal-quality.v2",
             "scope": "fit_only", "authorizing": False,
@@ -853,21 +840,36 @@ class StrategyFactoryTests(unittest.TestCase):
         record = factory_module._signal_quality_screen_record(
             quality, variant_id="variant", fit_cells=32,
             primary_horizon=60)
-        self.assertEqual(record["status"], "complete_nonpositive_control")
+        self.assertEqual(record["status"], "complete_actionable_signal")
         self.assertEqual(record["primary_horizon"]["matched_count"], 30)
         self.assertAlmostEqual(record["primary_horizon"]["matched_coverage"],
                                30 / 32)
-        self.assertTrue(factory_module._screen_record_can_skip(
+        self.assertFalse(factory_module._screen_record_can_skip(
             record, variant_id="variant"))
-        tampered_digest = {**record, "digest": "f" * 64}
+
+        zero_quality = {
+            "schema": "signal-quality.v2",
+            "scope": "fit_only", "authorizing": False,
+            "diagnostic_only": True, "variant_id": "variant",
+            "event_count": 0,
+            "event_rejection_counts": {"no_actionable_signal": 32},
+            "eligibility_provenance": _quality_eligibility(
+                32, status="predicate_no_actionable_signal"),
+        }
+        zero_record = factory_module._signal_quality_screen_record(
+            zero_quality, variant_id="variant", fit_cells=32,
+            primary_horizon=60)
+        self.assertTrue(factory_module._screen_record_can_skip(
+            zero_record, variant_id="variant"))
+        tampered_digest = {**zero_record, "digest": "f" * 64}
         self.assertFalse(factory_module._screen_record_can_skip(
             tampered_digest, variant_id="variant"))
-        tampered_scope = {**record,
-                          "provenance": {**record["provenance"],
+        tampered_scope = {**zero_record,
+                          "provenance": {**zero_record["provenance"],
                                          "scope": "heldout"}}
         self.assertFalse(factory_module._screen_record_can_skip(
         tampered_scope, variant_id="variant"))
-        malformed = {key: value for key, value in record.items()
+        malformed = {key: value for key, value in zero_record.items()
                      if key != "provenance"}
         malformed["digest"] = "arbitrary-nonempty-string"
         self.assertFalse(factory_module._screen_record_can_skip(

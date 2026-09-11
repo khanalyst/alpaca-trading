@@ -20,7 +20,8 @@ from research.fit_diagnostics import measure_fit_diagnostics
 from research.live_shadow import ShadowConfig, ShadowRunner
 from research.market_data import normalize_underlying_bar
 from research.signal_quality import measure_signal_quality
-from research.strategy_factory import _signal_quality_screen_worker
+from research.strategy_factory import (_screen_record_can_skip,
+                                       _signal_quality_screen_worker)
 
 
 SPEC = validate_rule_spec({
@@ -272,9 +273,16 @@ class CrossSectionalIntegrationTests(unittest.TestCase):
             "policy": BAR_FALLBACK,
             "hypothesis": {"hypothesis_id": "cross-sectional"},
         })
-        record = result["screens"][rule_variant_id(SPEC)]
-        self.assertEqual(record["status"], "complete_actionable_signal")
-        self.assertEqual(record["reason"], "actionable_signal_present")
+        variant_id = rule_variant_id(SPEC)
+        record = result["screens"][variant_id]
+        self.assertEqual(record["status"], "underpowered_control")
+        self.assertEqual(record["reason"], "primary_horizon_underpowered")
+        self.assertEqual(record["primary_horizon"]["horizon_minutes"],
+                         SPEC["max_hold_bars"])
+        self.assertGreater(record["event_count"], 0)
+        self.assertEqual(record["eligibility_provenance"]["status"],
+                         "actionable_signal")
+        self.assertFalse(_screen_record_can_skip(record, variant_id=variant_id))
 
     def test_fit_diagnostics_report_missing_context_as_unknown(self):
         quality = measure_signal_quality(

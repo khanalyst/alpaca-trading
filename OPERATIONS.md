@@ -108,11 +108,12 @@ live credentials, config, and
 `ALPACA_AGENT_RUNTIME_ROOT` separate from paper; never run both against shared
 state or a shared account.
 
-The authenticated live preflight requires the account to report
-`pattern_day_trader=true` in addition to endpoint, identity, active status,
-equity, asset, clock, and calendar checks. A missing or false PDT flag blocks
-startup. If any mode guard or preflight fails, stop the process, preserve the
-evidence, and correct the scoped configuration before retrying.
+The authenticated live preflight requires explicit finite account buying power
+in addition to endpoint, identity, active status, equity, asset, clock, and
+calendar checks. Zero or negative buying power does not block cleanup or
+reconciliation at startup, but the entry-risk gate rejects every new entry. If
+any mode guard or preflight fails, stop the process, preserve the evidence, and
+correct the scoped configuration before retrying.
 
 ## Start, stop, and pause
 
@@ -744,7 +745,7 @@ organization controls.
 
 | Symptom | Action |
 | --- | --- |
-| mode/endpoint guard failure | Restore the scoped paper or live guard, check the endpoint, and restart only after authenticated `main.py check`; live also needs `pattern_day_trader=true`. |
+| mode/endpoint guard failure | Restore the scoped paper or live guard, check the endpoint, and restart only after authenticated `main.py check`; live also requires explicit finite account buying power. |
 | `market closed` or stale calendar | Do not force an entry; refresh the calendar and wait for the next regular session. |
 | Missing bars/quotes | Run the recorder `--probe`, inspect `failure_kind`/`last_error`, and verify the exact VM credentials can read the configured IEX feed (and, only when enabled, OPRA). `Up` is process liveness, not proof of successful writes; mark the interval unavailable. |
 | Option chain lacks a valid single-leg long contract | Skip the trade. Never substitute a multi-leg, uncovered, or short option. |

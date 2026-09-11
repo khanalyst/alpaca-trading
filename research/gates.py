@@ -1131,29 +1131,12 @@ def paired_delta(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
                  vehicle: str, equity_feed: str = "iex",
                  equity_provider: str | None = "alpaca") -> dict:
     """Compare matched vehicle-local rows without pooling unmatched outcomes."""
-    left = [row for row in _authorizing_rows(
-            candidate, vehicle=vehicle, equity_feed=equity_feed,
-            equity_provider=equity_provider)
-            if row.get("vehicle", vehicle) == vehicle]
-    right = [row for row in _authorizing_rows(
-             baseline, vehicle=vehicle, equity_feed=equity_feed,
-             equity_provider=equity_provider)
-             if row.get("vehicle", vehicle) == vehicle]
-    def unique(rows: Iterable[Mapping]) -> dict:
-        by_key: dict = {}
-        duplicates: set = set()
-        for row in rows:
-            key = row.get("opportunity_id", row.get("entry_timestamp"))
-            if key in by_key:
-                duplicates.add(key)
-            else:
-                by_key[key] = row
-        for key in duplicates:
-            by_key.pop(key, None)
-        return by_key
-
-    left_by_key = unique(left)
-    right_by_key = unique(right)
+    left_by_key = _unique_by_match_key(
+        candidate, vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
+    right_by_key = _unique_by_match_key(
+        baseline, vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
     deltas = []
     r_deltas = []
     for key, row in left_by_key.items():

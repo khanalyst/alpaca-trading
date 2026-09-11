@@ -10,6 +10,7 @@ than being silently rolled forward.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -19,6 +20,9 @@ from typing import Any, Mapping, Sequence
 
 PATH_TELEMETRY_SCHEMA = "path-telemetry.v1"
 PATH_AGGREGATE_SCHEMA = "path-telemetry-aggregate.v1"
+PRE_ADMISSION_PATH_TELEMETRY_SCHEMA = "pre-admission-path-telemetry.v1"
+PRE_ADMISSION_PATH_AGGREGATE_SCHEMA = (
+    "pre-admission-path-telemetry-aggregate.v1")
 TARGET_HOLD_REACHABILITY_SCHEMA = "target-hold-reachability.v1"
 
 # This is intentionally a finite, preregistered ladder.  The factory's
@@ -393,6 +397,235 @@ def aggregate_path_telemetry(rows: Sequence[Any]) -> dict[str, Any]:
     }
 
 
+def compute_pre_admission_path_telemetry(
+        plan: Mapping[str, Any], bars: Sequence[Any]) -> dict[str, Any]:
+    """Measure one rejected plan on caller-supplied fit bars only.
+
+    The entry is hypothetical and the barriers stay fixed at the authored,
+    broker-tick-normalized prices.  This does not simulate fills, P&L,
+    breakeven amendments, trailing stops, or dynamic target updates.
+    """
+    plan = dict(plan) if isinstance(plan, Mapping) else {}
+    deadline_value = plan.get("exit_deadline")
+    deadline_meta = deadline_value if isinstance(deadline_value, Mapping) else {}
+    direction = str(plan.get("direction") or "").strip().lower()
+    entry_at = _datetime(plan.get("entry_timestamp"))
+    deadline = _datetime(plan.get("exit_deadline_timestamp") or
+                         deadline_meta.get("timestamp"))
+    entry, stop, target, risk = (_number(plan.get(name)) for name in (
+        "entry_reference", "tick_normalized_stop_price",
+        "tick_normalized_target_price", "authored_stop_distance"))
+    copied_numbers = (
+        "authored_entry_reference", "authored_stop_price",
+        "authored_target_price", "authored_stop_distance",
+        "authored_target_distance", "authored_target_r",
+        "tick_normalized_stop_price", "tick_normalized_target_price",
+        "tick_normalized_stop_distance", "tick_normalized_target_distance",
+        "stress_scenario_bps", "stress_max_cost_to_risk_ratio",
+        "required_stop_floor_bps", "required_tick_rounded_stop_distance",
+        "required_tick_rounded_stop_distance_bps")
+    provenance = plan.get("entry_provenance")
+    result = {
+        "schema": PRE_ADMISSION_PATH_TELEMETRY_SCHEMA,
+        "scope": "fit_only", "hypothetical_entry": True,
+        "diagnostic_only": True, "authorizing": False,
+        "fixed_barrier_model": "fixed_authored_tick_normalized",
+        "fixed_authored_barrier_diagnostic": True,
+        "models_trailing_or_breakeven_outcome": False,
+        "fill_claimed": False, "pnl_computed": False,
+        "symbol": _trade_symbol(plan), "session_date": _trade_session(plan),
+        "direction": direction, "entry_reference": entry,
+        "entry_timestamp": entry_at.isoformat() if entry_at else None,
+        "entry_source": plan.get("entry_source"),
+        "entry_provenance": dict(provenance) if isinstance(provenance, Mapping) else {},
+        "horizon_timestamp": deadline.isoformat() if deadline else None,
+        "exit_deadline_reason": (plan.get("exit_deadline_reason") or
+                                 deadline_meta.get("reason")),
+        "authored_max_hold_bars": plan.get("authored_max_hold_bars"),
+        **{name: _number(plan.get(name)) for name in copied_numbers},
+    }
+
+    def finish(status: str, reason: str | None = None, *,
+               path: Sequence[tuple[datetime, datetime, Any]] = (),
+               barrier: str | None = None, reached_at: datetime | None = None,
+               ambiguous: bool = False) -> dict[str, Any]:
+        favorable: list[float] = []
+        adverse: list[float] = []
+        for _stamp, _ended, row in path:
+            high, low = (float(_number(_value(row, name)))
+                         for name in ("high", "low"))
+            favorable.append(high - entry if direction == "long" else entry - low)
+            adverse.append(low - entry if direction == "long" else entry - high)
+        mfe, mae = ((max([0.0, *favorable]), min([0.0, *adverse]))
+                    if favorable else (None, None))
+        censored, unavailable = status == "censored", status == "unavailable"
+        result.update({
+            "status": status, "available": bool(path) and not unavailable,
+            "usable": status == "usable", "censored": censored,
+            "right_censored": censored, "unavailable": unavailable,
+            "gap_detected": reason == "internal_gap",
+            "unavailable_reason": reason if unavailable else None,
+            "censor_reason": reason if censored else None,
+            "observed_bars": len(path),
+            "horizon_reached": bool(path and path[-1][1] == deadline),
+            "mfe_bps": mfe / entry * 10_000.0 if mfe is not None else None,
+            "mae_bps": mae / entry * 10_000.0 if mae is not None else None,
+            "mfe_authored_r": mfe / risk if mfe is not None else None,
+            "mae_authored_r": mae / risk if mae is not None else None,
+            "authored_r_unit": "authored_stop_distance",
+            "fixed_barrier_first_reached": barrier,
+            "fixed_barrier_reached_at": reached_at.isoformat() if reached_at else None,
+            "fixed_barrier_same_bar_ambiguous": ambiguous,
+            "fixed_barrier_tie_policy": "stop_first",
+            "unambiguous_usable": status == "usable" and not ambiguous,
+        })
+        return result
+
+    invalid = next((reason for condition, reason in (
+        (entry_at is None, "invalid_entry_timestamp"),
+        (deadline is None or (entry_at is not None and deadline <= entry_at),
+         "invalid_exit_deadline"),
+        (entry is None or entry <= 0, "invalid_entry_reference"),
+        (direction not in {"long", "short"}, "invalid_direction"),
+        (risk is None or risk <= 0, "invalid_authored_stop_distance"),
+        (not (stop is not None and stop > 0 and target is not None and target > 0 and
+              ((direction == "long" and stop < entry < target) or
+               (direction == "short" and target < entry < stop))),
+         "invalid_fixed_barrier_geometry")) if condition), None)
+    if invalid:
+        return finish("unavailable", invalid)
+
+    symbol, session = _trade_symbol(plan), _trade_session(plan)
+    records: list[tuple[datetime, datetime | None, Any, bool]] = []
+    for row in bars:
+        row_symbol, row_session = _value(row, "symbol"), _value(row, "session_date")
+        normalized_session = (row_session.isoformat()
+                              if hasattr(row_session, "isoformat") else
+                              str(row_session)[:10] if row_session not in (None, "") else None)
+        if ((symbol is not None and str(row_symbol or "").upper() != symbol) or
+                (session is not None and normalized_session != session)):
+            continue
+        stamp = _bar_start(row)
+        if stamp is None:
+            continue
+        ended = _datetime(_value(row, "end"))
+        interval = _number(_value(row, "interval_seconds"))
+        if ended is None and interval is not None and interval > 0:
+            ended = stamp + timedelta(seconds=interval)
+        opened, high, low, closed = (_number(_value(row, name)) for name in (
+            "open", "high", "low", "close"))
+        prices = (opened, high, low, closed)
+        valid = bool(ended is not None and ended > stamp and
+                     all(price is not None and price > 0 for price in prices) and
+                     low <= min(opened, closed) <= max(opened, closed) <= high)
+        records.append((stamp, ended, row, valid))
+    records.sort(key=lambda item: item[0])
+
+    exact = [record for record in records if record[0] == entry_at]
+    if len(exact) > 1:
+        return finish("unavailable", "duplicate_entry_bar")
+    if exact and not exact[0][3]:
+        return finish("unavailable", "malformed_entry_bar")
+    if not exact:
+        partial = any(valid and ended is not None and stamp < entry_at < ended
+                      for stamp, ended, _row, valid in records)
+        return finish("censored" if partial else "unavailable",
+                      "partial_entry_bar" if partial else "entry_bar_missing")
+
+    path: list[tuple[datetime, datetime, Any]] = []
+    barrier = reached_at = reason = None
+    ambiguous = False
+    relevant = [record for record in records if entry_at <= record[0] < deadline]
+    stamp_counts = Counter(stamp for stamp, _ended, _row, _valid in relevant)
+    for stamp, ended, row, valid in relevant:
+        if stamp_counts[stamp] > 1:
+            reason = "duplicate_bar"
+        elif not valid or ended is None:
+            reason = "malformed_bar"
+        elif path and stamp != path[-1][1]:
+            reason = "internal_gap"
+        elif ended > deadline:
+            reason = "partial_deadline_bar"
+        if reason:
+            break
+        path.append((stamp, ended, row))
+        high, low = (float(_number(_value(row, name))) for name in ("high", "low"))
+        hit_stop = low <= stop if direction == "long" else high >= stop
+        hit_target = high >= target if direction == "long" else low <= target
+        if barrier is None and (hit_stop or hit_target):
+            ambiguous = hit_stop and hit_target
+            barrier, reached_at = ("stop" if hit_stop else "target"), ended
+    if reason is None and (not path or path[-1][1] < deadline):
+        reason = "observed_data_end"
+    return finish("censored" if reason else "usable", reason, path=path,
+                  barrier=barrier, reached_at=reached_at, ambiguous=ambiguous)
+
+
+def aggregate_pre_admission_path_telemetry(
+        rows: Sequence[Any]) -> dict[str, Any]:
+    """Aggregate rejected-plan paths without mixing them with executed trades."""
+    items: list[Mapping[str, Any]] = []
+    for raw in rows:
+        item = (raw.get("pre_admission_path_telemetry")
+                if isinstance(raw, Mapping) else None)
+        item = item if isinstance(item, Mapping) else raw
+        if isinstance(item, Mapping):
+            items.append(item)
+    statuses = Counter(str(item.get("status") or "unavailable") for item in items)
+    def outcome(item: Mapping[str, Any]) -> str:
+        reached = item.get("fixed_barrier_first_reached")
+        if reached:
+            return str(reached)
+        return "neither" if item.get("status") == "usable" else "unknown"
+
+    outcomes = Counter(outcome(item) for item in items)
+    metric_items = [item for item in items
+                    if item.get("status") == "usable" and
+                    not item.get("right_censored")]
+    count = lambda name: int(statuses.get(name, 0))
+    reasons = lambda name: dict(sorted(Counter(
+        str(item.get(name)) for item in items if item.get(name)).items()))
+    return {
+        "schema": PRE_ADMISSION_PATH_AGGREGATE_SCHEMA,
+        "scope": "fit_only", "hypothetical_entry": True,
+        "diagnostic_only": True, "authorizing": False,
+        "fixed_barrier_model": "fixed_authored_tick_normalized",
+        "fixed_authored_barrier_diagnostic": True,
+        "models_trailing_or_breakeven_outcome": False,
+        "fill_claimed": False, "pnl_computed": False,
+        "metric_scope": "uncensored_full_horizon_only",
+        "metric_row_count": len(metric_items),
+        "plan_count": len(items),
+        "status_counts": {name: count(name)
+                          for name in ("usable", "censored", "unavailable")},
+        "usable": count("usable"), "censored": count("censored"),
+        "unavailable": count("unavailable"),
+        "unambiguous_usable": sum(bool(item.get("unambiguous_usable"))
+                                  for item in items),
+        "same_bar_ambiguous": sum(
+            bool(item.get("fixed_barrier_same_bar_ambiguous"))
+            for item in items),
+        "censor_reason_counts": reasons("censor_reason"),
+        "unavailable_reason_counts": reasons("unavailable_reason"),
+        "fixed_barrier_first_reached": dict(sorted(outcomes.items())),
+        "mfe_bps": _metric([item.get("mfe_bps") for item in metric_items]),
+        "mae_bps": _metric([item.get("mae_bps") for item in metric_items]),
+        "mfe_authored_r": _metric(
+            [item.get("mfe_authored_r") for item in metric_items]),
+        "mae_authored_r": _metric(
+            [item.get("mae_authored_r") for item in metric_items]),
+        "cost_geometry": {
+            name: _metric([item.get(name) for item in items])
+            for name in (
+                "stress_scenario_bps", "stress_max_cost_to_risk_ratio",
+                "authored_stop_distance", "tick_normalized_stop_distance",
+                "required_stop_floor_bps",
+                "required_tick_rounded_stop_distance",
+                "required_tick_rounded_stop_distance_bps")
+        },
+    }
+
+
 def target_hold_reachability(
         rows: Sequence[Any], *, target_r: float | None = None,
         max_hold_bars: int | None = None,
@@ -608,9 +841,13 @@ target_hold_geometry = target_hold_reachability
 
 __all__ = [
     "PATH_AGGREGATE_SCHEMA", "PATH_TELEMETRY_SCHEMA",
+    "PRE_ADMISSION_PATH_AGGREGATE_SCHEMA",
+    "PRE_ADMISSION_PATH_TELEMETRY_SCHEMA",
     "TARGET_HOLD_HOLD_LADDER", "TARGET_HOLD_MIN_USABLE",
     "TARGET_HOLD_REACHABILITY_SCHEMA", "TARGET_HOLD_TARGET_LADDER",
-    "aggregate_path_telemetry", "build_path_telemetry", "compute_path_telemetry",
+    "aggregate_path_telemetry", "aggregate_pre_admission_path_telemetry",
+    "build_path_telemetry", "compute_path_telemetry",
+    "compute_pre_admission_path_telemetry",
     "measure_path_telemetry", "path_telemetry", "render_path_telemetry_json",
     "render_path_telemetry_svg", "summarize_path_telemetry",
     "summarize_target_hold_reachability", "target_hold_geometry",

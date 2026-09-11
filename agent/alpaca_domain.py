@@ -353,7 +353,7 @@ class Account:
     cash: Decimal
     buying_power: Decimal
     currency: str = "USD"
-    pattern_day_trader: bool = False
+    pattern_day_trader: bool | None = None
 
 
 @dataclass(frozen=True)
