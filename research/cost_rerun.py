@@ -23,8 +23,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -47,6 +49,7 @@ from .quote_costs import (measure_quote_costs, cost_model_from_schedule,
                           measured_cost_resolver, schedule_costs_block,
                           bucket_label, QuoteCostError)
 from .stressed_cost_calibration import activation_overlay, calibrate_stressed_cost
+from .source_validation import validate_source
 
 RERUN_SCHEMA = "cost-rerun.v1"
 EVIDENCE_SCHEMA = "cost-rerun-evidence.v1"
@@ -460,6 +463,64 @@ def write_immutable_evidence(path: str | Path,
     return payload
 
 
+def publish_calibration_evidence(latest: str | Path,
+                                 artifact: Mapping[str, Any]) -> dict[str, str]:
+    """Archive content-addressed measurements and atomically refresh a view.
+
+    The mutable latest view is for discovery, never an automatic activation.
+    Runtime configuration must explicitly select a verified immutable path.
+    The previous latest artifact is archived before it can be replaced.
+    """
+    latest = Path(latest)
+    archive = latest.parent / (latest.stem + ".artifacts")
+
+    def checked(payload: Mapping[str, Any]) -> tuple[dict, str]:
+        body = dict(payload)
+        supplied = body.pop("content_hash", None)
+        digest = content_hash(body)
+        if (body.get("schema") != "stressed-cost-calibration.v1" or
+                body.get("diagnostic_only") is not True or
+                body.get("authorizing") is not False or supplied != digest):
+            raise ValueError("calibration publication requires a valid diagnostic artifact hash")
+        return {**body, "content_hash": digest}, digest
+
+    payload, digest = checked(artifact)
+    if latest.is_symlink():
+        raise ValueError("calibration latest view must not be a symlink")
+    if archive.is_symlink():
+        raise ValueError("calibration archive directory must not be a symlink")
+    prior = checked(json.loads(latest.read_text(encoding="utf-8"))) if latest.exists() else None
+    archive.mkdir(parents=True, exist_ok=True)
+
+    def retain(value: dict, identity: str) -> Path:
+        path = archive / (identity + ".json")
+        if path.exists():
+            if path.is_symlink() or json.loads(path.read_text(encoding="utf-8")) != value:
+                raise ValueError("existing calibration archive conflicts with its content hash")
+        else:
+            write_immutable_evidence(path, value)
+        return path
+
+    if prior is not None:
+        retain(*prior)
+    immutable = retain(payload, digest)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=latest.parent,
+                                         prefix=".calibration-", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, latest)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+    return {"artifact_path": str(immutable), "latest_path": str(latest),
+            "content_hash": digest}
+
+
 def verify_cost_evidence(report: Mapping[str, Any] | None) -> tuple[bool, str | None]:
     """Verify a persisted diagnostic report without authorizing it."""
     if not isinstance(report, Mapping):
@@ -622,20 +683,44 @@ def run_cost_rerun(
 
 def _prepare_cost_calibration(
         corpus: str | Path | Sequence[Mapping[str, Any]], *,
-        runtime_config: Mapping[str, Any], min_quotes_per_cell: int):
+        runtime_config: Mapping[str, Any], min_quotes_per_cell: int,
+        allow_quote_only: bool = False):
     """Measure fit/held-out quote schedules without replaying a cohort."""
     policy_source = ReplayPolicy.from_config(runtime_config)
+    source = validate_source(corpus, diagnostic_only=True)
     raw, bars, snapshot_map, quote_rows = _read_discovery_rows(
         corpus, require_provenance=True,
+        allow_quote_only=allow_quote_only,
         expected_equity_feed=policy_source.equity_feed,
         expected_provider=policy_source.equity_provider)
+    if content_hash(raw) != source.get("content_hash"):
+        close = getattr(quote_rows, "close", None)
+        if callable(close):
+            close()
+        raise ValueError("cost calibration source changed after validation")
+    try:
+        return _measure_calibration_rows(
+            raw, bars, snapshot_map, quote_rows, policy_source,
+            runtime_config=runtime_config, min_quotes_per_cell=min_quotes_per_cell,
+            source_validation=source)
+    except BaseException:
+        close = getattr(quote_rows, "close", None)
+        if callable(close):
+            close()
+        raise
+
+
+def _measure_calibration_rows(raw, bars, snapshot_map, quote_rows, policy_source, *,
+                              runtime_config, min_quotes_per_cell,
+                              source_validation):
+    """Measure already-validated rows; the caller owns any quote index."""
     quotes = (quote_rows if callable(getattr(quote_rows, "quote_fill", None))
               else list(quote_rows))
     def raw_quotes():
         for item in raw:
             if not isinstance(item, Mapping):
                 continue
-            kind = str(item.get("kind", "quote")).strip().lower()
+            kind = str(item.get("kind") or "bar").strip().lower()
             if kind in {"quote", "quote_snapshot", "equity_quote",
                         "underlying_quote", ""}:
                 yield item
@@ -700,6 +785,7 @@ def _prepare_cost_calibration(
         "feed": sorted(schedule.get("measured", {}).get("feeds") or []),
         "runtime_provider": policy_source.equity_provider,
         "runtime_feed": policy_source.equity_feed,
+        "source_validation": source_validation,
         "fit_sessions": sorted(fit_sessions),
         "validation_sessions": sorted(validation_sessions),
         "fit_sessions_hash": _session_hash(sorted(fit_sessions)),
@@ -724,7 +810,13 @@ def run_cost_calibration(
     policy, bars, snapshots, quotes, schedule, validation_schedule, reason, calibration, \
         fit_sessions, validation_sessions, fit_quotes, validation_quotes, provenance = _prepare_cost_calibration(
             corpus, runtime_config=runtime_config,
-            min_quotes_per_cell=min_quotes_per_cell)
+            min_quotes_per_cell=min_quotes_per_cell, allow_quote_only=True)
+    try:
+        quote_count = _collection_count(quotes)
+    finally:
+        close = getattr(quotes, "close", None)
+        if callable(close):
+            close()
     report = {
         "schema": "stressed-cost-calibration-run.v1",
         "diagnostic_only": True, "authorizing": False,
@@ -739,7 +831,7 @@ def run_cost_calibration(
         "activation": activation_overlay(
             calibration, expected_provider=policy.equity_provider,
             expected_feed=policy.equity_feed),
-        "bars": len(bars), "quotes": _collection_count(quotes),
+        "bars": len(bars), "quotes": quote_count,
         "evidence": _evidence_manifest(
             provenance=provenance, runtime_config=runtime_config, specs=(),
             schedule=schedule, validation_schedule=validation_schedule,
@@ -887,7 +979,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="write the fitted cost schedule here")
     parser.add_argument("--calibration-only", action="store_true",
                         help="measure held-out stress without replaying; --out writes the runtime artifact")
+    parser.add_argument("--publish-latest", type=Path, default=None,
+                        help="calibration-only: archive immutable artifacts and refresh a nonactivating latest view")
     args = parser.parse_args(argv)
+    if args.publish_latest is not None and not args.calibration_only:
+        parser.error("--publish-latest requires --calibration-only")
+    destinations = [path.resolve() for path in
+                    (args.out, args.schedule_out, args.publish_latest) if path is not None]
+    if len(destinations) != len(set(destinations)):
+        parser.error("--out, --schedule-out and --publish-latest must be different paths")
 
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
     specs = load_frozen_specs(args.specs) if args.specs is not None else None
@@ -920,13 +1020,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.schedule_out is not None:
         write_immutable_evidence(args.schedule_out, report["cost_schedule"])
         print(f"  wrote {args.schedule_out}")
+    if args.publish_latest is not None:
+        publication = publish_calibration_evidence(
+            args.publish_latest, report["stress_calibration"])
+        print(json.dumps({"schema": "calibration-publication.v1", **publication,
+                          "authorizing": False, "runtime_config_changed": False}, sort_keys=True))
     return 0
 
 
 __all__ = ["ArmResult", "EVIDENCE_SCHEMA", "RERUN_SCHEMA",
            "deterministic_cohort", "main", "render_text",
            "run_cost_calibration", "run_cost_rerun",
-           "verify_cost_evidence", "write_immutable_evidence"]
+           "verify_cost_evidence", "write_immutable_evidence", "publish_calibration_evidence"]
 
 
 if __name__ == "__main__":

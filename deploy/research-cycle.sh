@@ -265,6 +265,10 @@ cycle_outcomes=()
 cycle_research_funnel='{}'
 cycle_research_verdict='{}'
 cycle_cost_diagnostic='{}'
+preacceptance_diagnostic_once="${ALPACA_RESEARCH_PREACCEPTANCE_DIAGNOSTIC_ONCE:-0}"
+preacceptance_underpowered=0
+preacceptance_wait_reason=""
+diagnostic_output=""
 # Every terminal cycle carries a bounded preflight record. ``not_run`` is
 # explicit for failures that happen before the provider probe.
 llm_preflight_record='{"schema":"research-llm-preflight.v1","status":"not_run","reason":"provider preflight was not reached","evidence":{}}'
@@ -416,6 +420,50 @@ trap on_exit EXIT
 write_direct_status "running" "startup" 0 1 "steps" "both" || true
 start_direct_heartbeat
 
+case "$preacceptance_diagnostic_once" in
+  0|1) ;;
+  *) finish "failed" "ALPACA_RESEARCH_PREACCEPTANCE_DIAGNOSTIC_ONCE must be 0 or 1" 3 ;;
+esac
+if [ "$preacceptance_diagnostic_once" -eq 1 ]; then
+  diagnostic_output="${ALPACA_RESEARCH_DIAGNOSTIC_OUTPUT:-}"
+  [ -n "$diagnostic_output" ] || \
+    finish "failed" "pre-acceptance diagnostic mode requires ALPACA_RESEARCH_DIAGNOSTIC_OUTPUT" 3
+  if [[ "$diagnostic_output" != /* ]]; then
+    diagnostic_output="$repo_root/$diagnostic_output"
+  fi
+  if [ -e "$diagnostic_output" ] || [ -L "$diagnostic_output" ] || \
+     [ -e "${diagnostic_output}.manifest.json" ] || \
+     [ -L "${diagnostic_output}.manifest.json" ]; then
+    finish "failed" "pre-acceptance diagnostic output and manifest must not already exist" 3
+  fi
+  [ -n "${ALPACA_RESEARCH_SNAPSHOT_ROOT:-}" ] || \
+    finish "failed" "pre-acceptance diagnostic mode requires ALPACA_RESEARCH_SNAPSHOT_ROOT" 3
+  diagnostic_snapshot_root="${ALPACA_RESEARCH_SNAPSHOT_ROOT}"
+  if [[ "$diagnostic_snapshot_root" != /* ]]; then
+    diagnostic_snapshot_root="$repo_root/$diagnostic_snapshot_root"
+  fi
+  if "$python_bin" - "$diagnostic_snapshot_root" "$diagnostic_output" <<'PY'
+from pathlib import Path
+import sys
+snapshot, output = (Path(value).resolve() for value in sys.argv[1:])
+raise SystemExit(0 if output == snapshot or snapshot in output.parents else 1)
+PY
+  then
+    finish "failed" "pre-acceptance diagnostic output must be outside the sealed snapshot" 3
+  fi
+  [ -n "${ALPACA_RESEARCH_ACCEPTANCE_ROOT:-}" ] || \
+    finish "failed" "pre-acceptance diagnostic mode requires ALPACA_RESEARCH_ACCEPTANCE_ROOT" 3
+  [ -z "${ALPACA_RESEARCH_DATASET:-}" ] || \
+    finish "failed" "pre-acceptance diagnostic mode accepts only a verified sealed snapshot" 3
+  if [[ ! "${ALPACA_RESEARCH_SESSION_WINDOW:-}" =~ ^0*[1-9][0-9]*$ ]]; then
+    finish "failed" "pre-acceptance diagnostic mode requires a positive ALPACA_RESEARCH_SESSION_WINDOW" 3
+  fi
+  if [[ ! "${ALPACA_RESEARCH_MAX_SOURCE_BYTES:-}" =~ ^0*[1-9][0-9]*$ ]]; then
+    finish "failed" "pre-acceptance diagnostic mode requires a positive ALPACA_RESEARCH_MAX_SOURCE_BYTES" 3
+  fi
+  llm_preflight_record='{"schema":"research-llm-preflight.v1","status":"not_run","reason":"pre-acceptance diagnostic mode skips provider preflight","evidence":{}}'
+fi
+
 # Load only provider keys from an optional, separate dotenv-style file. Never
 # source arbitrary shell and never consult the broker credential file.
 load_llm_secrets() {
@@ -446,7 +494,9 @@ load_llm_secrets() {
   done < "$source"
 }
 
-load_llm_secrets
+if [ "$preacceptance_diagnostic_once" -ne 1 ]; then
+  load_llm_secrets
+fi
 
 # Feed selection is part of the autonomous-research contract. Do this
 # preflight before dataset work so a non-real-time or mismatched equity
@@ -574,14 +624,23 @@ PY
 )" || finish "failed" "research partition census result is invalid" 3
   census_ran=1
   if [ -n "$acceptance_root" ] && [ "${census_gate%%$'\n'*}" = "1" ]; then
+    if [ "$preacceptance_diagnostic_once" -eq 1 ]; then
+      preacceptance_underpowered=1
+      preacceptance_wait_reason="${census_gate#*$'\n'}"
+      return 0
+    fi
     finish "waiting_for_forward_sessions" "${census_gate#*$'\n'}" 0
+  fi
+  if [ "$preacceptance_diagnostic_once" -eq 1 ]; then
+    finish "failed" "sealed snapshot is not structurally underpowered; run research.diagnostic_suite as a standalone diagnostic instead" 3
   fi
 }
 
 # The normal recorder path is censused before provider calls, snapshot copying,
 # capacity checks, or preprocessing. An explicit external dataset retains its
 # legacy flow because it has no trusted recorder acceptance contract.
-if [ -n "$acceptance_root" ] && [ -z "$preflight_dataset" ] && \
+if [ "$preacceptance_diagnostic_once" -ne 1 ] && \
+   [ -n "$acceptance_root" ] && [ -z "$preflight_dataset" ] && \
    { [ -z "$snapshot_root" ] || [ "$snapshot_create" -eq 1 ]; }; then
   run_partition_census "$recorded_root/sessions" "$recorded_root"
 fi
@@ -590,6 +649,7 @@ fi
 # not let an empty/default /dev/null secret silently open an authentication
 # circuit and make a deterministic cycle look model-assisted.  Deterministic
 # research remains available by setting research.strategy_llm.enabled=false.
+if [ "$preacceptance_diagnostic_once" -ne 1 ]; then
 set +e
 llm_provider="$($python_bin - "$agent_config" <<'PY'
 import sys
@@ -667,18 +727,23 @@ case "$llm_preflight_status" in
     finish "failed" "strategy LLM preflight failed" 3
     ;;
 esac
+fi
 
 # Resolve selected lanes before preprocessing the dataset.  Equity-only
 # research may safely ignore indicative option snapshots in a mixed corpus;
 # explicitly selecting option/all instead requires executable OPRA evidence.
-set +e
-vehicles="$("$python_bin" "$repo_root/research.py" vehicles \
-  --agent-config "$agent_config" \
-  --vehicles "${ALPACA_RESEARCH_VEHICLES:-equity}")"
-vehicle_status=$?
-set -e
-if [ "$vehicle_status" -ne 0 ] || [ -z "$vehicles" ]; then
-  finish "failed" "no research vehicle resolved from the agent config" 3
+if [ "$preacceptance_diagnostic_once" -eq 1 ]; then
+  vehicles="equity"
+else
+  set +e
+  vehicles="$("$python_bin" "$repo_root/research.py" vehicles \
+    --agent-config "$agent_config" \
+    --vehicles "${ALPACA_RESEARCH_VEHICLES:-equity}")"
+  vehicle_status=$?
+  set -e
+  if [ "$vehicle_status" -ne 0 ] || [ -z "$vehicles" ]; then
+    finish "failed" "no research vehicle resolved from the agent config" 3
+  fi
 fi
 option_research_selected=0
 for vehicle in $vehicles; do
@@ -1102,7 +1167,8 @@ feed="${configured_feed:-iex}"
 emit_progress "validation" 0 1 "steps" "both"
 set +e
 validation_diagnostic_flag=""
-if [ "${ALPACA_FACTORY_DIAGNOSTIC_ONLY:-0}" = "1" ]; then
+if [ "${ALPACA_FACTORY_DIAGNOSTIC_ONLY:-0}" = "1" ] || \
+   [ "$preacceptance_diagnostic_once" -eq 1 ]; then
   validation_diagnostic_flag="--diagnostic-only"
 fi
 "$python_bin" "$repo_root/research.py" validate-data "$validated_input" \
@@ -1241,6 +1307,32 @@ print(json.dumps({
 }, sort_keys=True, separators=(",", ":")), flush=True)
 PY
 
+if [ "$preacceptance_diagnostic_once" -eq 1 ]; then
+  if [ "$snapshot_verified" -ne 1 ] || [ "$census_ran" -ne 1 ] || \
+     [ "$preacceptance_underpowered" -ne 1 ] || \
+     [ -z "$preacceptance_wait_reason" ]; then
+    finish "failed" "pre-acceptance diagnostic prerequisites were not preserved; run research.diagnostic_suite as a standalone diagnostic" 3
+  fi
+  if [ -e "$diagnostic_output" ] || [ -L "$diagnostic_output" ] || \
+     [ -e "${diagnostic_output}.manifest.json" ] || \
+     [ -L "${diagnostic_output}.manifest.json" ]; then
+    finish "failed" "pre-acceptance diagnostic output and manifest must remain unique" 3
+  fi
+  emit_progress "diagnostic_inventory" 0 43 "arms" "equity"
+  set +e
+  (cd "$repo_root" && "$python_bin" -m research.diagnostic_suite \
+    --data "$validated_input" --agent-config "$agent_config" \
+    --out "$diagnostic_output" --diagnostic-only --workers 2)
+  diagnostic_status=$?
+  set -e
+  if [ "$diagnostic_status" -ne 2 ] || [ ! -s "$diagnostic_output" ] || \
+     [ ! -s "${diagnostic_output}.manifest.json" ]; then
+    finish "failed" "pre-acceptance diagnostic suite failed or omitted immutable output" 3
+  fi
+  emit_progress "diagnostic_inventory" 43 43 "arms" "equity"
+  finish "waiting_for_forward_sessions" "$preacceptance_wait_reason" 0
+fi
+
 if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
   emit_progress "backtest" 0 1 "steps" "equity"
   set +e
@@ -1272,7 +1364,7 @@ if [ "${ALPACA_RESEARCH_STRESS_CALIBRATION_ENABLED:-0}" = "1" ] && [ -s "$quotes
   (cd "$repo_root" && "$python_bin" -m research.cost_rerun --calibration-only \
     --corpus "$quotes_input" --config "$agent_config" \
     --min-quotes-per-cell "${ALPACA_RESEARCH_STRESS_MIN_QUOTES_PER_CELL:-500}" \
-    --out "$stress_calibration_report")
+    --publish-latest "$stress_calibration_report")
   stress_calibration_status=$?
   set -e
   if [ "$stress_calibration_status" -ne 0 ]; then

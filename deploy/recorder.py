@@ -151,6 +151,10 @@ def _initialize_cycle_telemetry(target: dict) -> dict:
         "index_preparation_seconds": 0.0,
         "calendar_preparation_seconds": 0.0,
         "fetch_projection_seconds": 0.0,
+        "bars_fetch_seconds": 0.0,
+        "quotes_fetch_seconds": 0.0,
+        "equity_projection_seconds": 0.0,
+        "options_fetch_projection_seconds": 0.0,
         "validation_ingest_seconds": 0.0,
         "revision_validation_save_seconds": 0.0,
         "durable_save_seconds": 0.0,
@@ -347,6 +351,9 @@ def _cadence_telemetry(output: Path, *, interval: float,
         "configured_interval_seconds": float(interval),
         "cycle_started_ts": float(cycle_started_ts),
         "cycle_completed_ts": float(cycle_completed_ts),
+        "cycle_duration_seconds": max(0.0, cycle_completed_ts - cycle_started_ts),
+        "cycle_overrun_seconds": max(
+            0.0, cycle_completed_ts - cycle_started_ts - float(interval)),
         "realized_interval_seconds": realized,
         "realized_intervals_seconds": realized_values[-128:],
         "realized_interval_p50_seconds": quantile(.50),
@@ -2327,6 +2334,7 @@ def _record_once_locked(provider: AlpacaProvider, symbols: list[str], output: Pa
             config=config, include_options=include_options,
             option_limit=option_limit, option_hold=option_hold,
             calendar=calendar, capture_policy=capture_policy,
+            refresh_quote_end=(cycle_now is None and capture_policy == "forward_only"),
             telemetry=telemetry)
     finally:
         recent_store.close()
@@ -2340,6 +2348,7 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                             option_hold: timedelta,
                             calendar: CalendarCache | None,
                             capture_policy: str,
+                            refresh_quote_end: bool = False,
                             telemetry: dict | None = None) -> int:
     """Run one recorder cycle with an already validated disk-backed index."""
     session_cfg = (config or {}).get("session") if isinstance(config, dict) else {}
@@ -2424,6 +2433,14 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             cursor, window_end = request_window
         else:
             window_end = min(cursor + window, now)
+        quote_end_limit = None
+        refresh_current_quotes = bool(refresh_quote_end and window_end >= now)
+        if refresh_quote_end and calendar is not None:
+            session = calendar.session(_session_date(window_end))
+            if session is not None and session.open <= window_end <= session.close:
+                quote_end_limit = session.close.astimezone(timezone.utc)
+            else:
+                refresh_current_quotes = False
         with _timed_cycle_phase(telemetry, "fetch_projection_seconds"):
             fetched_rows = list(_rows(
                 provider, symbols, window_end, feed=resolved_feed, config=config,
@@ -2435,7 +2452,9 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                 # request's lower bound.
                 include_options=bool(include_options and window_end >= now),
                 option_limit=option_limit,
-                start=cursor, option_pins=frozenset(pins), observed_at=now))
+                start=cursor, option_pins=frozenset(pins), observed_at=now,
+                refresh_quote_end=refresh_current_quotes,
+                quote_end_limit=quote_end_limit, telemetry=telemetry))
         total_rows += len(fetched_rows)
         _increment_cycle_telemetry(
             telemetry, "projected_rows", len(fetched_rows))

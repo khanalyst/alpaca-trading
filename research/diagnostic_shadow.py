@@ -10,16 +10,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Mapping
 
 from agent.contracts.rule import RULE_FAMILIES, rule_variant_id, validate_rule_spec
 from agent.registry import validate_contract_config
+from agent.variants import apply as apply_variant, load_registry
 from research.factory_core import template_hypothesis
 
 
 DIAGNOSTIC_COHORT_SCHEMA = "diagnostic-shadow-cohort.v1"
 DIAGNOSTIC_ACTIVATION_SCHEMA = "diagnostic-shadow-activation.v1"
 DIAGNOSTIC_CANDIDATE_PREFIX = "shadow:diagnostic:"
+IBR_BROKER_ONLY_LIMITS = (
+    "shortability", "buying_power", "pending_orders", "actual_fills",
+)
 
 # These deltas are fixed design choices, not adaptations to observed returns.
 # Each changes one executable entry coordinate from its canonical family root;
@@ -124,6 +129,86 @@ def _arm_config(policy: Mapping[str, Any], spec: Mapping[str, Any], *,
     return config
 
 
+def _ibr_logical_arms(runtime: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Resolve the existing equity IBR registry through its runtime adapter."""
+    base = _plain_mapping(runtime)
+    strategy = dict(base.get("strategy") or {})
+    strategy.update({"id": "ibr", "version": "v1",
+                     "execution_mode": "shares"})
+    strategy.pop("rule_spec", None)
+    base["strategy"] = strategy
+    registry = load_registry(Path(__file__).with_name("variants.yaml"))
+    variants = [
+        variant for variant in registry.values()
+        if variant.strategy_id == "ibr" and "equity" in variant.vehicles
+    ]
+    if len(variants) != 7:
+        raise RuntimeError(
+            "diagnostic IBR cohort requires the seven registered equity variants")
+    baseline = next(
+        variant for variant in variants
+        if variant.variant_id == "ibr.baseline")
+    # Resolve contract defaults through the registry adapter before applying
+    # dotted overrides.  This supports mounted rule configurations that omit
+    # optional IBR fields without inventing a second set of defaults here.
+    variant_base = apply_variant(baseline, base)
+    arms: list[dict[str, Any]] = []
+    for variant in variants:
+        applied = apply_variant(variant, variant_base)
+        policy = _policy_config(applied)
+        configured_strategy = policy.get("strategy")
+        if not isinstance(configured_strategy, Mapping):
+            raise RuntimeError("diagnostic IBR strategy configuration is unavailable")
+        overrides = list(variant.overrides.items())
+        role = "baseline" if variant.variant_id == "ibr.baseline" else "variant"
+        arms.append({
+            "strategy_id": "ibr",
+            "family": "ibr",
+            "role": role,
+            "base_version": variant.base_version,
+            "variant_id": variant.variant_id,
+            "variant_axis": None if not overrides else overrides[0][0],
+            "variant_value": None if not overrides else overrides[0][1],
+            "hypothesis": variant.hypothesis,
+            "config": policy,
+            "spec_identity": content_identity({
+                "strategy_id": "ibr",
+                "base_version": variant.base_version,
+                "variant_id": variant.variant_id,
+                "strategy": dict(configured_strategy),
+            }),
+        })
+    return arms
+
+
+def _ibr_arm_config(policy: Mapping[str, Any], *, family: str, role: str,
+                    code_identity: str, runtime_config_identity: str,
+                    policy_config_identity: str, cohort_identity: str,
+                    spec_identity: str) -> dict[str, Any]:
+    config = _plain_mapping(policy)
+    config["diagnostic_shadow"] = {
+        "schema": DIAGNOSTIC_COHORT_SCHEMA,
+        "diagnostic_only": True,
+        "authorizing": False,
+        "gate_eligible": False,
+        "promotion_eligible": False,
+        "online_fdr": False,
+        "family": family,
+        "role": role,
+        "spec_identity": spec_identity,
+        "runtime_config_identity": runtime_config_identity,
+        "policy_config_identity": policy_config_identity,
+        "code_identity": code_identity,
+        "cohort_identity": cohort_identity,
+        "runtime_parity": {
+            "shared_signal_setup_risk": True,
+            "broker_only_equivalence": "unsupported",
+            "unsupported_observations": list(IBR_BROKER_ONLY_LIMITS),
+        },
+    }
+    return config
+
+
 def _logical_arms() -> list[dict[str, Any]]:
     arms: list[dict[str, Any]] = []
     for slot, family in enumerate(RULE_FAMILIES):
@@ -151,10 +236,13 @@ def _logical_arms() -> list[dict[str, Any]]:
 
 
 def build_diagnostic_cohort(runtime_config: Mapping[str, Any], *,
-                            code_identity: str) -> dict[str, Any]:
-    """Build the fixed 24-arm cohort for one explicit code/config epoch."""
+                            code_identity: str,
+                            include_ibr: bool = False) -> dict[str, Any]:
+    """Build the fixed rule cohort and optionally its registered IBR arms."""
     if not isinstance(runtime_config, Mapping):
         raise TypeError("diagnostic shadow requires a mounted runtime config mapping")
+    if not isinstance(include_ibr, bool):
+        raise TypeError("include_ibr must be true or false")
     code_identity = str(code_identity).strip()
     if not code_identity:
         raise ValueError("diagnostic shadow code identity is required")
@@ -163,6 +251,11 @@ def build_diagnostic_cohort(runtime_config: Mapping[str, Any], *,
     runtime_config_identity = content_identity(runtime)
     policy_config_identity = content_identity(policy)
     logical_arms = _logical_arms()
+    if include_ibr:
+        logical_arms.extend(_ibr_logical_arms(runtime))
+    families = list(RULE_FAMILIES)
+    if include_ibr:
+        families.append("ibr")
     cohort_body = {
         "schema": DIAGNOSTIC_COHORT_SCHEMA,
         "diagnostic_only": True,
@@ -173,25 +266,39 @@ def build_diagnostic_cohort(runtime_config: Mapping[str, Any], *,
         "code_identity": code_identity,
         "runtime_config_identity": runtime_config_identity,
         "policy_config_identity": policy_config_identity,
-        "families": list(RULE_FAMILIES),
-        "families_total": len(RULE_FAMILIES),
-        "baseline_count": len(RULE_FAMILIES),
-        "variant_count": len(RULE_FAMILIES),
+        "families": families,
+        "families_total": len(families),
+        "baseline_count": sum(
+            1 for arm in logical_arms if arm.get("role") == "baseline"),
+        "variant_count": sum(
+            1 for arm in logical_arms if arm.get("role") == "variant"),
         "registered_arms": len(logical_arms),
         "selection_policy": "fixed_preregistered_no_online_selection",
         "risk_cost_policy": "unchanged_mounted_runtime_policy",
         "logical_arms": logical_arms,
     }
+    if include_ibr:
+        cohort_body["include_ibr"] = True
     cohort_digest = content_identity(cohort_body)
     cohort_identity = f"{DIAGNOSTIC_CANDIDATE_PREFIX}cohort:{cohort_digest}"
     arms: list[dict[str, Any]] = []
     for logical in logical_arms:
-        config = _arm_config(
-            policy, logical["rule_spec"], family=str(logical["family"]),
-            role=str(logical["role"]), code_identity=code_identity,
-            runtime_config_identity=runtime_config_identity,
-            policy_config_identity=policy_config_identity,
-            cohort_identity=cohort_identity)
+        strategy_id = str(logical.get("strategy_id") or "rule")
+        if strategy_id == "rule":
+            config = _arm_config(
+                policy, logical["rule_spec"], family=str(logical["family"]),
+                role=str(logical["role"]), code_identity=code_identity,
+                runtime_config_identity=runtime_config_identity,
+                policy_config_identity=policy_config_identity,
+                cohort_identity=cohort_identity)
+        else:
+            config = _ibr_arm_config(
+                logical["config"], family=str(logical["family"]),
+                role=str(logical["role"]), code_identity=code_identity,
+                runtime_config_identity=runtime_config_identity,
+                policy_config_identity=policy_config_identity,
+                cohort_identity=cohort_identity,
+                spec_identity=str(logical["spec_identity"]))
         config_identity = content_identity(config)
         config["diagnostic_shadow"]["config_identity"] = config_identity
         validate_contract_config(config)
@@ -209,18 +316,17 @@ def build_diagnostic_cohort(runtime_config: Mapping[str, Any], *,
             "code_identity": code_identity,
         }
         candidate_id = f"{DIAGNOSTIC_CANDIDATE_PREFIX}{content_identity(arm_identity)}"
-        arms.append({
+        arm = {
             "candidate_id": candidate_id,
-            "strategy_id": "rule",
+            "strategy_id": strategy_id,
             "vehicle": "equity",
             "status": "diagnostic",
-            "base_version": "v1",
+            "base_version": str(logical.get("base_version") or "v1"),
             "variant_id": logical["variant_id"],
             "family": logical["family"],
             "role": logical["role"],
             "variant_axis": logical["variant_axis"],
             "variant_value": logical["variant_value"],
-            "rule_spec": logical["rule_spec"],
             "spec_identity": logical["spec_identity"],
             "config_identity": arm_identity["config_identity"],
             "code_identity": code_identity,
@@ -235,8 +341,16 @@ def build_diagnostic_cohort(runtime_config: Mapping[str, Any], *,
                 "variant_axis": logical["variant_axis"],
                 "cohort_identity": cohort_identity,
             },
-        })
-    arms.sort(key=lambda arm: (str(arm["family"]), str(arm["role"])))
+        }
+        if strategy_id == "rule":
+            arm["rule_spec"] = logical["rule_spec"]
+        else:
+            arm["hypothesis"] = logical["hypothesis"]
+            arm["runtime_parity"] = config["diagnostic_shadow"][
+                "runtime_parity"]
+        arms.append(arm)
+    arms.sort(key=lambda arm: (
+        str(arm["family"]), str(arm["role"]), str(arm["variant_id"])))
     result = dict(cohort_body)
     result.pop("logical_arms", None)
     result.update({

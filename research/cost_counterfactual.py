@@ -600,7 +600,9 @@ def _terminal_error(row: Mapping[str, Any]) -> str | None:
     if (reason == "stressed_cost_risk_limit" or stage == "cost_stress") and \
             row.get("signal_opportunity") is not True:
         return "cost_gate_signal_opportunity_mismatch"
-    if reason == "stressed_cost_risk_limit" and stage != "cost_stress":
+    # Authored geometry is checked before sizing; admissible geometry is then
+    # checked again against sized account risk. Both emit this canonical veto.
+    if reason == "stressed_cost_risk_limit" and stage not in {"risk_geometry", "cost_stress"}:
         return "cost_gate_stage_mismatch"
     if stage == "cost_stress" and reason != "stressed_cost_risk_limit":
         return "cost_stage_reason_mismatch"

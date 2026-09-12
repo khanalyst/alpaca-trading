@@ -39,7 +39,13 @@ def parser() -> argparse.ArgumentParser:
                    help="mounted runtime config used unchanged for diagnostic policy")
     p.add_argument("--diagnostic", action=argparse.BooleanOptionalAction,
                    default=True,
-                   help="run the fixed 24-arm non-authorizing family cohort")
+                   help="run the non-authorizing rule cohort with optional IBR arms")
+    include_ibr = os.environ.get("ALPACA_SHADOW_INCLUDE_IBR", "0")
+    if include_ibr not in {"0", "1"}:
+        p.error("ALPACA_SHADOW_INCLUDE_IBR must be 0 or 1")
+    p.add_argument("--diagnostic-include-ibr", action=argparse.BooleanOptionalAction,
+                   default=include_ibr == "1",
+                   help="add the seven registered IBR arms to the diagnostic cohort")
     p.add_argument("--health-file", type=Path,
                    help="durable polling heartbeat (defaults beside shadow DB)")
     p.add_argument("--acceptance-root", type=Path,
@@ -118,7 +124,10 @@ def _record_acceptance(args: argparse.Namespace, health_file: Path,
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    if args.diagnostic_include_ibr and not args.diagnostic:
+        argument_parser.error("--diagnostic-include-ibr requires diagnostic mode")
     runtime_config = (load_runtime_config(args.config)
                       if args.diagnostic else None)
     config = ShadowConfig(
@@ -130,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
         retention_days=args.retention_days,
         poll_seconds=args.interval,
         diagnostic=args.diagnostic,
+        diagnostic_include_ibr=args.diagnostic_include_ibr,
         runtime_config=runtime_config,
         runtime_config_path=args.config)
     runner = ShadowRunner(config)

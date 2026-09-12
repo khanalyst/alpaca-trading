@@ -287,24 +287,42 @@ def _validated_diagnostic_cohort(value: Any, *,
     digest = str(value.get("cohort_digest") or "")
     if expected_identity != f"{DIAGNOSTIC_CANDIDATE_PREFIX}cohort:{digest}":
         raise ShadowError("diagnostic shadow cohort digest mismatch")
+    include_ibr = value.get("include_ibr", False)
+    if not isinstance(include_ibr, bool):
+        raise ShadowError("diagnostic shadow cohort IBR mode is invalid")
+    expected_arms = 31 if include_ibr else 24
+    expected_families = 13 if include_ibr else 12
+    expected_baselines = 13 if include_ibr else 12
+    expected_variants = 18 if include_ibr else 12
     arms = value.get("arms")
-    if not isinstance(arms, list) or len(arms) != 24:
+    if not isinstance(arms, list) or len(arms) != expected_arms:
         raise ShadowError("diagnostic shadow cohort arm structure is invalid")
-    family_roles: dict[str, set[str]] = {}
+    family_roles: dict[str, dict[str, int]] = {}
     for arm in arms:
         if not isinstance(arm, Mapping):
             raise ShadowError("diagnostic shadow cohort arm structure is invalid")
-        family_roles.setdefault(str(arm.get("family") or ""), set()).add(
-            str(arm.get("role") or ""))
-    if (len(family_roles) != 12 or
-            any(roles != {"baseline", "variant"}
-                for roles in family_roles.values())):
+        family = str(arm.get("family") or "")
+        role = str(arm.get("role") or "")
+        counts = family_roles.setdefault(family, {})
+        counts[role] = int(counts.get(role, 0)) + 1
+    ordinary = [counts for family, counts in family_roles.items()
+                if family != "ibr"]
+    ibr_counts = family_roles.get("ibr")
+    if (len(family_roles) != expected_families or len(ordinary) != 12 or
+            any(counts != {"baseline": 1, "variant": 1}
+                for counts in ordinary) or
+            (include_ibr and ibr_counts != {"baseline": 1, "variant": 6}) or
+            (not include_ibr and ibr_counts is not None) or
+            value.get("families_total") != expected_families or
+            value.get("baseline_count") != expected_baselines or
+            value.get("variant_count") != expected_variants or
+            value.get("registered_arms") != expected_arms):
         raise ShadowError("diagnostic shadow cohort family coverage is invalid")
     identities = value.get("candidate_identities")
     expected_candidates = [str(arm.get("candidate_id") or "")
                            for arm in arms if isinstance(arm, Mapping)]
     if (not isinstance(identities, list) or identities != expected_candidates or
-            len(set(expected_candidates)) != 24 or
+            len(set(expected_candidates)) != expected_arms or
             any(not candidate.startswith(DIAGNOSTIC_CANDIDATE_PREFIX)
                 for candidate in expected_candidates)):
         raise ShadowError("diagnostic shadow cohort candidate identities are invalid")
@@ -419,6 +437,19 @@ class _RecordedSessionCalendarSnapshot:
 
     def items(self) -> Iterable[tuple[str, tuple[datetime, datetime]]]:
         return zip(self.sessions, self.bounds)
+
+
+@dataclass(frozen=True)
+class _PreparedDiagnosticEvent:
+    """One decoded, provenance-checked WAL event shared by every cohort arm."""
+
+    row: Mapping[str, Any]
+    payload: dict[str, Any] | None
+    session: str | None
+    available_at: datetime | None
+    cursor: tuple[float, str]
+    eligible: bool
+    rejection_reason: str | None
 
 
 def _load_recorded_session_calendar(
@@ -1057,19 +1088,18 @@ def _recorded_partition_source_mode(source_path: str) -> str | None:
     return "historical_backfill"
 
 
-def _diagnostic_source_projection(
+def _diagnostic_projected_payload(
         event: Mapping[str, Any],
-        source_modes: dict[str, str | None]) -> dict[str, Any]:
-    """Overlay durable recorder source provenance without rewriting the WAL."""
-    projected = dict(event)
+        source_modes: dict[str, str | None]) -> dict[str, Any] | None:
+    """Decode one WAL payload and overlay durable recorder provenance."""
     try:
         payload = (json.loads(event.get("event_json"))
                    if isinstance(event.get("event_json"), str)
                    else event.get("event_json"))
     except (TypeError, ValueError, json.JSONDecodeError):
-        return projected
+        return None
     if not isinstance(payload, Mapping):
-        return projected
+        return None
     source_path = str(event.get("source_path") or "")
     if source_path not in source_modes:
         source_modes[source_path] = _recorded_partition_source_mode(source_path)
@@ -1082,6 +1112,17 @@ def _diagnostic_source_projection(
             f"diagnostic event source mode conflicts with {source_path}")
     body = dict(payload)
     body["source_mode"] = marker_mode or row_mode or "forward_observed"
+    return body
+
+
+def _diagnostic_source_projection(
+        event: Mapping[str, Any],
+        source_modes: dict[str, str | None]) -> dict[str, Any]:
+    """Overlay durable recorder source provenance without rewriting the WAL."""
+    projected = dict(event)
+    body = _diagnostic_projected_payload(event, source_modes)
+    if body is None:
+        return projected
     projected["event_json"] = _json(body)
     return projected
 
@@ -1171,6 +1212,8 @@ class ShadowConfig:
     stress_calibration_path: str | Path | None = None
     stress_calibration_enabled: bool | None = None
     stress_calibration_artifact: Mapping[str, Any] | None = None
+    # Appended to preserve the positional constructor contract above.
+    diagnostic_include_ibr: bool = False
 
     def __post_init__(self) -> None:
         for name in ("max_candidates", "max_events", "max_decisions",
@@ -1192,6 +1235,10 @@ class ShadowConfig:
                            _poll_interval(self.poll_seconds))
         if not isinstance(self.diagnostic, bool):
             raise ValueError("diagnostic must be true or false")
+        if not isinstance(self.diagnostic_include_ibr, bool):
+            raise ValueError("diagnostic_include_ibr must be true or false")
+        if self.diagnostic_include_ibr and not self.diagnostic:
+            raise ValueError("diagnostic_include_ibr requires diagnostic mode")
         if self.diagnostic and not isinstance(self.runtime_config, Mapping):
             raise ValueError(
                 "diagnostic shadow requires the mounted --config mapping")
@@ -1450,6 +1497,8 @@ class ShadowStore:
                 CREATE INDEX IF NOT EXISTS events_timestamp_idx ON events(timestamp);
                 CREATE INDEX IF NOT EXISTS events_inserted_at_idx
                   ON events(inserted_at,event_key);
+                CREATE INDEX IF NOT EXISTS decisions_candidate_session_idx
+                  ON decisions(candidate_id,session_date);
                 CREATE INDEX IF NOT EXISTS diagnostic_positions_open_idx
                   ON diagnostic_positions(cohort_identity,candidate_id,status,symbol);
                 CREATE INDEX IF NOT EXISTS diagnostic_orders_candidate_idx
@@ -1472,6 +1521,20 @@ class ShadowStore:
                      source_path: str | None = None,
                      source_offset_start: int | None = None,
                      source_offset_end: int | None = None) -> tuple[str, bool]:
+        """Persist one recorder event in its own durable transaction."""
+        with self._connection() as db:
+            return self._ingest_event(
+                db, row, max_events=max_events, source_path=source_path,
+                source_offset_start=source_offset_start,
+                source_offset_end=source_offset_end)
+
+    def _ingest_event(self, db: sqlite3.Connection,
+                      row: Mapping[str, Any], *, max_events: int,
+                      source_path: str | None = None,
+                      source_offset_start: int | None = None,
+                      source_offset_end: int | None = None) -> tuple[str, bool]:
+        """Persist one event through a caller-owned atomic poll transaction."""
+        del max_events  # The bound applies to each compacted poll snapshot.
         event_key = str(row.get("event_key") or "").strip()
         if not event_key:
             raise ShadowError("recorder row has no event_key")
@@ -1480,13 +1543,12 @@ class ShadowStore:
         # a changed payload for an old key is always a hard conflict.
         payload = _row_payload(row)
         digest = _digest(payload)
-        with self._connection() as db:
-            existing = db.execute("SELECT digest FROM events WHERE event_key=?",
-                                  (event_key,)).fetchone()
-            if existing is not None:
-                if existing["digest"] != digest:
-                    raise InputConflict(f"event_key {event_key} changed content")
-                return event_key, False
+        existing = db.execute("SELECT digest FROM events WHERE event_key=?",
+                              (event_key,)).fetchone()
+        if existing is not None:
+            if existing["digest"] != digest:
+                raise InputConflict(f"event_key {event_key} changed content")
+            return event_key, False
         payload, event = _normalize_row(row)
         timestamp = _timestamp(payload.get("timestamp"))
         as_of = _timestamp(payload.get("as_of") or payload.get("timestamp"))
@@ -1494,26 +1556,27 @@ class ShadowStore:
             raise ShadowError(f"event {event_key} has invalid timestamp")
         symbol = str(payload.get("symbol") or getattr(event, "symbol", ""))
         event_type = str(payload.get("event_type") or "").lower()
-        with self._connection() as db:
-            db.execute("""INSERT INTO events
-                (event_key,digest,event_json,event_type,symbol,timestamp,as_of,inserted_at,
-                 source_path,source_offset_start,source_offset_end)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (event_key, digest, _json(payload), event_type, symbol,
-                 timestamp.isoformat(), as_of.isoformat() if as_of else None,
-                 time.time(), (str(source_path) if source_path else None),
-                 (int(source_offset_start)
-                  if source_offset_start is not None else None),
-                 (int(source_offset_end)
-                  if source_offset_end is not None else None)))
-            cursor = db.execute("SELECT last_timestamp,last_event_key FROM cursor WHERE scope='corpus'").fetchone()
-            if cursor is None or (timestamp.isoformat(), event_key) >= (cursor[0], cursor[1]):
-                db.execute("""INSERT INTO cursor(scope,last_event_key,last_timestamp,last_digest,updated_at)
-                    VALUES('corpus',?,?,?,?)
-                    ON CONFLICT(scope) DO UPDATE SET last_event_key=excluded.last_event_key,
-                        last_timestamp=excluded.last_timestamp,last_digest=excluded.last_digest,
-                        updated_at=excluded.updated_at""",
-                    (event_key, timestamp.isoformat(), digest, time.time()))
+        db.execute("""INSERT INTO events
+            (event_key,digest,event_json,event_type,symbol,timestamp,as_of,inserted_at,
+             source_path,source_offset_start,source_offset_end)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (event_key, digest, _json(payload), event_type, symbol,
+             timestamp.isoformat(), as_of.isoformat() if as_of else None,
+             time.time(), (str(source_path) if source_path else None),
+             (int(source_offset_start)
+              if source_offset_start is not None else None),
+             (int(source_offset_end)
+              if source_offset_end is not None else None)))
+        cursor = db.execute(
+            "SELECT last_timestamp,last_event_key FROM cursor WHERE scope='corpus'"
+        ).fetchone()
+        if cursor is None or (timestamp.isoformat(), event_key) >= (cursor[0], cursor[1]):
+            db.execute("""INSERT INTO cursor(scope,last_event_key,last_timestamp,last_digest,updated_at)
+                VALUES('corpus',?,?,?,?)
+                ON CONFLICT(scope) DO UPDATE SET last_event_key=excluded.last_event_key,
+                    last_timestamp=excluded.last_timestamp,last_digest=excluded.last_digest,
+                    updated_at=excluded.updated_at""",
+                (event_key, timestamp.isoformat(), digest, time.time()))
         return event_key, True
 
     def event_count(self) -> int:
@@ -2131,6 +2194,7 @@ class ShadowStore:
             processed_events: int, rollups: Mapping[str, Mapping[str, int]],
             pending_sessions: Sequence[str], decisions: Sequence[Mapping[str, Any]],
             warmup_session: str | None, max_decisions: int,
+            cohort_candidate_ids: Sequence[str] | None = None,
             account_batch: Mapping[str, Any] | None = None) -> int:
         """Atomically persist sparse decisions and advance one arm cursor."""
         if self.readonly:
@@ -2141,8 +2205,8 @@ class ShadowStore:
                        for kind, count in counts.items()}
             for day, counts in rollups.items()
         }
-        normalized_decisions = sorted(
-            (_json(dict(decision)) for decision in decisions))
+        decision_digests = sorted(
+            _digest(dict(decision)) for decision in decisions)
         batch_identity = _digest({
             "schema": "diagnostic-shadow-batch.v1",
             "cohort_identity": str(cohort_identity),
@@ -2151,7 +2215,7 @@ class ShadowStore:
             "processed_events": int(processed_events),
             "rollups": normalized_rollups,
             "pending_sessions": sorted({str(day) for day in pending_sessions}),
-            "decisions": normalized_decisions,
+            "decision_digests": decision_digests,
             "warmup_session": str(warmup_session or ""),
             "account_batch": (dict(account_batch)
                               if isinstance(account_batch, Mapping) else None),
@@ -2217,27 +2281,37 @@ class ShadowStore:
                 str(day) for day in pending_sessions
                 if str(day) and str(day) not in completed_sessions)
 
-            cohort_candidate_ids: list[str] = []
-            for candidate_row in db.execute(
-                    "SELECT candidate_id,config_json FROM candidates"):
-                try:
-                    candidate_config = json.loads(candidate_row["config_json"])
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    candidate_config = None
-                marker = (candidate_config.get("diagnostic_shadow")
-                          if isinstance(candidate_config, Mapping) else None)
-                if (isinstance(marker, Mapping) and
-                        marker.get("diagnostic_only") is True and
-                        str(marker.get("cohort_identity") or "") ==
-                        str(cohort_identity)):
-                    cohort_candidate_ids.append(str(
-                        candidate_row["candidate_id"]))
-            if str(candidate_id) not in cohort_candidate_ids:
-                cohort_candidate_ids.append(str(candidate_id))
-            placeholders = ",".join("?" for _ in cohort_candidate_ids)
+            known_cohort_candidate_ids = sorted({
+                str(value) for value in (cohort_candidate_ids or ())
+                if str(value).strip()
+            })
+            if not known_cohort_candidate_ids:
+                for candidate_row in db.execute(
+                        "SELECT candidate_id,config_json FROM candidates"):
+                    try:
+                        candidate_config = json.loads(
+                            candidate_row["config_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        candidate_config = None
+                    marker = (candidate_config.get("diagnostic_shadow")
+                              if isinstance(candidate_config, Mapping) else None)
+                    if (isinstance(marker, Mapping) and
+                            marker.get("diagnostic_only") is True and
+                            str(marker.get("cohort_identity") or "") ==
+                            str(cohort_identity)):
+                        known_cohort_candidate_ids.append(str(
+                            candidate_row["candidate_id"]))
+            if str(candidate_id) not in known_cohort_candidate_ids:
+                known_cohort_candidate_ids.append(str(candidate_id))
+            placeholders = ",".join(
+                "?" for _ in known_cohort_candidate_ids)
             diagnostic_count = int(db.execute(
                 f"SELECT count(*) FROM decisions WHERE candidate_id IN "
-                f"({placeholders})", tuple(cohort_candidate_ids)).fetchone()[0])
+                f"({placeholders})",
+                tuple(known_cohort_candidate_ids)).fetchone()[0])
+            persistent_decisions: list[tuple[
+                str, str, str, str, str | None, dict[str, Any], Any]] = []
+            seen_decision_keys: set[str] = set()
             for decision in decisions:
                 kind = str(decision.get("kind") or "no_data")
                 if kind not in persistent_kinds:
@@ -2277,6 +2351,15 @@ class ShadowStore:
                     }
                     marker["representative_session_date"] = session_date
                     payload["diagnostic_shadow"] = marker
+                if event_key in seen_decision_keys:
+                    continue
+                seen_decision_keys.add(event_key)
+                persistent_decisions.append((
+                    event_key, session_date, kind,
+                    str(decision.get("symbol") or ""),
+                    decision.get("reason"), payload, plan))
+            for (event_key, session_date, kind, symbol, reason,
+                 payload, plan) in persistent_decisions:
                 decision_id = _digest({"candidate_id": candidate_id,
                                        "event_key": event_key})
                 exists = db.execute(
@@ -2289,10 +2372,10 @@ class ShadowStore:
                         f"diagnostic shadow decision bound {max_decisions} exceeded")
                 db.execute("""INSERT INTO decisions
                     (decision_id,candidate_id,event_key,session_date,symbol,kind,
-                     reason,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    reason,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
                     (decision_id, str(candidate_id), event_key, session_date,
-                     str(decision.get("symbol") or ""), kind,
-                     decision.get("reason"), _json(payload), time.time()))
+                     symbol, kind,
+                     reason, _json(payload), time.time()))
                 inserted += 1
                 if (kind == "open_incomplete" and isinstance(plan, Mapping) and
                         (not warmup_session or session_date > warmup_session)):
@@ -2304,7 +2387,7 @@ class ShadowStore:
                         (_digest({"candidate_id": candidate_id,
                                   "decision_id": decision_id}),
                          str(candidate_id), decision_id,
-                         str(decision.get("symbol") or ""), "open_incomplete",
+                         symbol, "open_incomplete",
                          quantity, entry, _json(plan), time.time()))
             if account_batch is not None:
                 self._apply_diagnostic_account_batch(
@@ -2875,6 +2958,32 @@ class ShadowStore:
                 rows = db.execute("SELECT * FROM decisions ORDER BY created_at,decision_id").fetchall()
             return [dict(row) for row in rows]
 
+    def decisions_for_session(self, candidate_id: str,
+                              session_date: str) -> list[dict]:
+        """Read only the immutable decision prefix needed by one replay."""
+        with self._connection() as db:
+            rows = db.execute("""SELECT * FROM decisions
+                WHERE candidate_id=? AND session_date=?
+                ORDER BY created_at,decision_id""",
+                (str(candidate_id), str(session_date))).fetchall()
+        return [dict(row) for row in rows]
+
+    def decision_rollup(self, candidate_ids: Sequence[str]) -> list[dict]:
+        """Aggregate decision telemetry for an explicit bounded candidate set."""
+        wanted = sorted({str(value) for value in candidate_ids
+                         if str(value).strip()})
+        if not wanted:
+            return []
+        placeholders = ",".join("?" for _ in wanted)
+        with self._connection() as db:
+            rows = db.execute(f"""SELECT candidate_id,session_date,kind,
+                       count(*) AS count
+                FROM decisions WHERE candidate_id IN ({placeholders})
+                GROUP BY candidate_id,session_date,kind
+                ORDER BY candidate_id,session_date,kind""",
+                tuple(wanted)).fetchall()
+        return [dict(row) for row in rows]
+
     def decision_event_keys(self, candidate_ids: Sequence[str],
                             sessions: Sequence[str]
                             ) -> dict[tuple[str, str], set[str]]:
@@ -3012,6 +3121,22 @@ class ShadowStore:
                     WHERE candidate_id=? ORDER BY session_date,replay_digest""",
                                   (candidate_id,)).fetchall()
             return [dict(row) for row in rows]
+
+    def replay_trade_count_rollup(
+            self, candidate_ids: Sequence[str]) -> list[dict]:
+        """Aggregate modeled replay trades for an explicit candidate set."""
+        wanted = sorted({str(value) for value in candidate_ids
+                         if str(value).strip()})
+        if not wanted:
+            return []
+        placeholders = ",".join("?" for _ in wanted)
+        with self._connection() as db:
+            rows = db.execute(f"""SELECT session_date,
+                       coalesce(sum(trade_count),0) AS trade_count
+                FROM shadow_accounts WHERE candidate_id IN ({placeholders})
+                GROUP BY session_date ORDER BY session_date""",
+                tuple(wanted)).fetchall()
+        return [dict(row) for row in rows]
 
     def replay_metadata(self, candidate_id: str | None = None) -> list[dict]:
         """Return replay diffs joined to their immutable account summaries.
@@ -3278,15 +3403,29 @@ def _safe_config(candidate: Mapping[str, Any]) -> dict:
 class ShadowRunner:
     """Incrementally ingest, evaluate, and replay one broker-free corpus."""
 
-    def __init__(self, config: ShadowConfig):
+    def __init__(self, config: ShadowConfig, *,
+                 _offline_diagnostic: bool = False):
         self.config = config
-        self.store = ShadowStore(config.shadow_db, retention_days=config.retention_days)
-        self._factory_roots = _read_factory_rule_roots(config.edge_db)
+        if _offline_diagnostic:
+            if config.diagnostic is not True:
+                raise ValueError(
+                    "offline diagnostic worker requires diagnostic mode")
+            self.store: ShadowStore | None = None
+            self._factory_roots = {}
+        else:
+            self.store = ShadowStore(
+                config.shadow_db, retention_days=config.retention_days)
+            self._factory_roots = _read_factory_rule_roots(config.edge_db)
         # Workers install an in-memory portfolio projection for their arm.
         # Thread-local state keeps the existing ``_evaluate`` call contract
         # (and test seams) while ensuring no worker mutates or observes a
         # sibling candidate's virtual book.
         self._worker_state = threading.local()
+
+    @classmethod
+    def for_offline_diagnostic(cls, config: ShadowConfig) -> "ShadowRunner":
+        """Build a diagnostic evaluator without opening either ledger."""
+        return cls(config, _offline_diagnostic=True)
 
     def _prepare_diagnostic_cohort(self) -> tuple[
             dict[str, Any] | None, list[dict[str, Any]], dict[str, Any] | None]:
@@ -3294,7 +3433,8 @@ class ShadowRunner:
         if not self.config.diagnostic:
             return None, [], None
         cohort = build_diagnostic_cohort(
-            self.config.runtime_config or {}, code_identity=_replay_code_hash())
+            self.config.runtime_config or {}, code_identity=_replay_code_hash(),
+            include_ibr=self.config.diagnostic_include_ibr)
         cohort = self.store.save_diagnostic_cohort(cohort)
         arms = [dict(arm) for arm in cohort.get("arms", ())
                 if isinstance(arm, Mapping)]
@@ -3314,10 +3454,10 @@ class ShadowRunner:
             forward_event_floor=float(forward_event_floor))
 
     @staticmethod
-    def _diagnostic_event_provenance(
-            event: Mapping[str, Any],
+    def _diagnostic_payload_provenance(
+            event: Mapping[str, Any], payload: Mapping[str, Any] | None,
             activation: Mapping[str, Any]) -> tuple[bool, str | None]:
-        """Validate insertion, recorder-offset, and observation-time causality."""
+        """Validate insertion, recorder-offset, and decoded payload causality."""
         watermark = activation.get("activation_event_watermark")
         floor = (_finite(watermark.get("last_inserted_at"))
                  if isinstance(watermark, Mapping) else None)
@@ -3328,12 +3468,6 @@ class ShadowRunner:
         if (floor is None or inserted is None or
                 (inserted, event_key) <= (floor, floor_key)):
             return False, "preactivation_insertion"
-        try:
-            payload = (json.loads(event.get("event_json"))
-                       if isinstance(event.get("event_json"), str)
-                       else event.get("event_json"))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            payload = None
         if not isinstance(payload, Mapping):
             return False, "invalid_event_payload"
         source_mode = str(
@@ -3362,6 +3496,14 @@ class ShadowRunner:
                 source_end <= activation_offset):
             return False, "preactivation_source_offset"
         return True, None
+
+    @classmethod
+    def _diagnostic_event_provenance(
+            cls, event: Mapping[str, Any],
+            activation: Mapping[str, Any]) -> tuple[bool, str | None]:
+        """Validate insertion, recorder-offset, and observation-time causality."""
+        return cls._diagnostic_payload_provenance(
+            event, cls._stored_event_payload(event), activation)
 
     @classmethod
     def _diagnostic_event_eligible(cls, event: Mapping[str, Any],
@@ -3398,6 +3540,10 @@ class ShadowRunner:
                                  session == warmup_session else
                                  "forward_diagnostic"),
         }
+        runtime_parity = arm.get("runtime_parity")
+        if isinstance(runtime_parity, Mapping):
+            result["diagnostic_shadow"]["runtime_parity"] = dict(
+                runtime_parity)
         return result
 
     @staticmethod
@@ -3425,6 +3571,60 @@ class ShadowRunner:
         if inserted is None:
             raise ShadowError("diagnostic event insertion cursor is invalid")
         return float(inserted), str(event.get("event_key") or "")
+
+    @classmethod
+    def _prepare_diagnostic_event(
+            cls, event: Mapping[str, Any], *,
+            source_modes: dict[str, str | None],
+            activation: Mapping[str, Any]) -> _PreparedDiagnosticEvent:
+        """Decode and classify one immutable WAL row once per poll."""
+        row = dict(event)
+        payload = _diagnostic_projected_payload(row, source_modes)
+        stamp = (_timestamp(payload.get("as_of") or payload.get("timestamp"))
+                 if isinstance(payload, Mapping) else None)
+        session = (stamp.astimezone(NEW_YORK).date().isoformat()
+                   if stamp is not None else None)
+        available_at = (_availability_time(payload)
+                        if isinstance(payload, Mapping) else None)
+        eligible, reason = cls._diagnostic_payload_provenance(
+            row, payload, activation)
+        return _PreparedDiagnosticEvent(
+            row=row, payload=payload, session=session,
+            available_at=available_at,
+            cursor=cls._stored_event_cursor(row), eligible=eligible,
+            rejection_reason=reason)
+
+    @staticmethod
+    def _group_prepared_diagnostic_rows(
+            event_rows: Sequence[_PreparedDiagnosticEvent]) -> tuple[
+                dict[str, list[dict]], dict[str, list[dict]],
+                dict[str, list[dict]]]:
+        """Build validated market maps without reparsing prepared payloads."""
+        bars: dict[str, list[dict]] = {}
+        quotes: dict[str, list[dict]] = {}
+        options: dict[str, list[dict]] = {}
+        for prepared in event_rows:
+            payload = prepared.payload
+            if not isinstance(payload, Mapping):
+                continue
+            try:
+                _normalize_row(payload)
+            except (TypeError, ValueError, NormalizationError):
+                continue
+            plain = dict(payload)
+            symbol = str(prepared.row.get("symbol") or "")
+            event_type = str(prepared.row.get("event_type") or "")
+            if event_type in {"bar", "bar_1m"}:
+                bars.setdefault(symbol, []).append(plain)
+            elif event_type == "quote":
+                quotes.setdefault(symbol, []).append(plain)
+            elif event_type in {"option", "option_snapshot"}:
+                underlying = str(plain.get("underlying") or "")
+                options.setdefault(underlying, []).append(plain)
+        for values in (bars, quotes, options):
+            for key in values:
+                values[key].sort(key=lambda row: str(row.get("timestamp") or ""))
+        return bars, quotes, options
 
     def _diagnostic_snapshot(
             self, cohort: Mapping[str, Any] | None,
@@ -3499,57 +3699,52 @@ class ShadowRunner:
         cohort_identity = str(cohort.get("cohort_identity") or "")
         candidate_ids = [str(arm.get("candidate_id") or "") for arm in arms]
         source_modes: dict[str, str | None] = {}
-        snapshot_rows = tuple(
-            _diagnostic_source_projection(row, source_modes)
+        prepared_snapshot = tuple(
+            self._prepare_diagnostic_event(
+                row, source_modes=source_modes, activation=activation)
             for row in snapshot_rows)
         sessions = {
-            session for row in snapshot_rows
-            if (session := self._stored_event_session(row)) is not None
+            prepared.session for prepared in prepared_snapshot
+            if prepared.session is not None
         }
         for item in progress.values():
             sessions.update(str(day) for day in
                             (item.get("pending_sessions") or ()) if str(day))
 
-        context_rows: list[dict[str, Any]] = []
+        prepared_context: list[_PreparedDiagnosticEvent] = []
         if sessions:
             context_rows = self.store.events_for_sessions(
                 sorted(sessions),
                 max_events=self.config.diagnostic_session_max_events)
-            context_rows = [
-                _diagnostic_source_projection(row, source_modes)
+            prepared_context = [
+                self._prepare_diagnostic_event(
+                    row, source_modes=source_modes, activation=activation)
                 for row in context_rows]
         eligible_context = [
-            row for row in context_rows
-            if self._diagnostic_event_eligible(row, activation)
+            prepared for prepared in prepared_context if prepared.eligible
         ]
-        context_bars, context_quotes, context_options = self._group_event_rows(
-            eligible_context)
+        context_bars, context_quotes, context_options = (
+            self._group_prepared_diagnostic_rows(eligible_context))
 
-        def payload_session(row: Mapping[str, Any]) -> str | None:
-            payload = self._stored_event_payload(row)
-            if payload is None:
-                return None
-            stamp = _timestamp(payload.get("as_of") or payload.get("timestamp"))
-            return (stamp.astimezone(NEW_YORK).date().isoformat()
-                    if stamp is not None else None)
-
-        session_inputs: dict[str, tuple[tuple[dict, ...], tuple[dict, ...],
-                                             tuple[dict, ...]]] = {}
-        for session in sorted(sessions):
-            session_inputs[session] = (
-                tuple(row for values in context_bars.values() for row in values
-                      if (_timestamp(row.get("as_of") or row.get("timestamp")) or
-                          datetime.min.replace(tzinfo=UTC)).astimezone(
-                              NEW_YORK).date().isoformat() == session),
-                tuple(row for values in context_quotes.values() for row in values
-                      if (_timestamp(row.get("as_of") or row.get("timestamp")) or
-                          datetime.min.replace(tzinfo=UTC)).astimezone(
-                              NEW_YORK).date().isoformat() == session),
-                tuple(row for values in context_options.values() for row in values
-                      if (_timestamp(row.get("as_of") or row.get("timestamp")) or
-                          datetime.min.replace(tzinfo=UTC)).astimezone(
-                              NEW_YORK).date().isoformat() == session),
-            )
+        session_by_event_key = {
+            str(prepared.payload.get("event_key") or ""): prepared.session
+            for prepared in eligible_context
+            if isinstance(prepared.payload, Mapping)
+        }
+        session_input_lists: dict[str, list[list[dict]]] = {
+            session: [[], [], []] for session in sessions}
+        for index, grouped in enumerate(
+                (context_bars, context_quotes, context_options)):
+            for values in grouped.values():
+                for row in values:
+                    session = session_by_event_key.get(
+                        str(row.get("event_key") or ""))
+                    if session in session_input_lists:
+                        session_input_lists[session][index].append(row)
+        session_inputs = {
+            session: (tuple(values[0]), tuple(values[1]), tuple(values[2]))
+            for session, values in session_input_lists.items()
+        }
 
         work: dict[str, dict[str, Any]] = {}
         provenance_rejections = 0
@@ -3558,21 +3753,22 @@ class ShadowRunner:
             arm_progress = progress[candidate_id]
             cursor = (float(arm_progress.get("last_inserted_at") or 0.0),
                       str(arm_progress.get("last_event_key") or ""))
-            arm_rows = [row for row in snapshot_rows
-                        if self._stored_event_cursor(row) > cursor]
+            arm_rows = [prepared for prepared in prepared_snapshot
+                        if prepared.cursor > cursor]
             rollups: dict[str, dict[str, int]] = {}
-            session_events: dict[str, list[dict[str, Any]]] = {}
+            prepared_session_events: dict[
+                str, list[_PreparedDiagnosticEvent]] = {}
             rejected = 0
-            for row in arm_rows:
-                session = payload_session(row) or "unknown"
-                ok, reason = self._diagnostic_event_provenance(row, activation)
-                if not ok:
-                    key = f"provenance_reject:{reason or 'unknown'}"
+            for prepared in arm_rows:
+                session = prepared.session or "unknown"
+                if not prepared.eligible:
+                    key = ("provenance_reject:"
+                           f"{prepared.rejection_reason or 'unknown'}")
                     counts = rollups.setdefault(session, {})
                     counts[key] = int(counts.get(key, 0)) + 1
                     rejected += 1
                     continue
-                payload = self._stored_event_payload(row)
+                payload = prepared.payload
                 if payload is None or session == "unknown":
                     counts = rollups.setdefault(session, {})
                     reject_key = ("provenance_reject:invalid_event_payload"
@@ -3581,22 +3777,25 @@ class ShadowRunner:
                     counts[reject_key] = int(counts.get(reject_key, 0)) + 1
                     rejected += 1
                     continue
-                if str(row.get("event_type") or "") not in {
+                if str(prepared.row.get("event_type") or "") not in {
                         "bar", "bar_1m", "quote"}:
                     counts = rollups.setdefault(session, {})
                     counts["context_event"] = int(counts.get(
                         "context_event", 0)) + 1
                     continue
-                if str(row.get("event_type") or "") == "quote":
+                if str(prepared.row.get("event_type") or "") == "quote":
                     counts = rollups.setdefault(session, {})
                     counts["context_event"] = int(counts.get(
                         "context_event", 0)) + 1
-                session_events.setdefault(session, []).append(payload)
-            for values in session_events.values():
-                values.sort(key=lambda row: (
-                    (_availability_time(row) or
-                     datetime.min.replace(tzinfo=UTC)).isoformat(),
-                    str(row.get("event_key") or "")))
+                prepared_session_events.setdefault(session, []).append(prepared)
+            session_events: dict[str, list[dict[str, Any]]] = {}
+            for session, values in prepared_session_events.items():
+                values.sort(key=lambda prepared: (
+                    prepared.available_at or datetime.min.replace(tzinfo=UTC),
+                    prepared.cursor[1]))
+                session_events[session] = [
+                    prepared.payload for prepared in values
+                    if prepared.payload is not None]
             close_sessions = [
                 session for session in session_events
                 if session != "unknown" and session in session_inputs and
@@ -3614,6 +3813,27 @@ class ShadowRunner:
         worker_results: dict[str, dict[str, Any]] = {}
         candidate_errors: dict[str, str] = {}
         active = [item for item in work.values() if item["session_events"]]
+        market_events_by_key = {
+            str(event.get("event_key") or ""): event
+            for item in active
+            for values in item["session_events"].values()
+            for event in values
+            if str(event.get("event_type") or "").lower() != "quote"
+        }
+        views_by_identity: dict[
+            tuple[str | None, str | None, bool],
+            dict[str, dict[str, Any]]] = {}
+        market_views_by_candidate: dict[str, dict[str, dict[str, Any]]] = {}
+        for item in active:
+            arm = item["arm"]
+            candidate_id = str(arm.get("candidate_id") or "")
+            identity = self._diagnostic_market_view_identity(arm)
+            if identity not in views_by_identity:
+                views_by_identity[identity] = self._build_diagnostic_market_views(
+                    arm, tuple(market_events_by_key.values()),
+                    context_bars, context_quotes, context_options,
+                    resolved_calendar)
+            market_views_by_candidate[candidate_id] = views_by_identity[identity]
         if active:
             with ThreadPoolExecutor(max_workers=self.config.max_workers,
                                     thread_name_prefix="diagnostic-shadow") as pool:
@@ -3633,7 +3853,8 @@ class ShadowRunner:
                         item["session_events"], selected_inputs,
                         context_bars, context_quotes, context_options,
                         initial, str(activation.get("warmup_session") or ""),
-                        resolved_calendar)
+                        resolved_calendar,
+                        market_views_by_candidate[candidate_id])
                     ] = candidate_id
                 for future in as_completed(futures):
                     candidate_id = futures[future]
@@ -3675,7 +3896,7 @@ class ShadowRunner:
                         f"{DIAGNOSTIC_REASON_ROLLUP_PREFIX}{kind}:{reason}")
                     session_rollup[reason_key] = int(
                         session_rollup.get(reason_key, 0)) + 1
-            cursor = self._stored_event_cursor(rows[-1])
+            cursor = rows[-1].cursor
             this_poll_decisions += self.store.record_diagnostic_batch(
                 cohort_identity=cohort_identity, candidate_id=candidate_id,
                 cursor_inserted_at=cursor[0], cursor_event_key=cursor[1],
@@ -3683,6 +3904,7 @@ class ShadowRunner:
                 pending_sessions=item["close_sessions"], decisions=tagged,
                 warmup_session=str(activation.get("warmup_session") or ""),
                 max_decisions=self.config.max_decisions,
+                cohort_candidate_ids=candidate_ids,
                 account_batch=result.get("account_batch"))
 
         refreshed = self.store.diagnostic_progress(
@@ -3699,7 +3921,8 @@ class ShadowRunner:
                 try:
                     complete = self._replay(
                         arm, str(session), inputs[0], inputs[1],
-                        self.store.decisions(candidate_id), inputs[2],
+                        self.store.decisions_for_session(
+                            candidate_id, str(session)), inputs[2],
                         replay_identity=replay_identity,
                         diagnostic_activation=activation,
                         calendar_snapshot=resolved_calendar)
@@ -3755,8 +3978,7 @@ class ShadowRunner:
         covered = sorted({str(arm.get("family") or "") for arm in arms
                           if str(arm.get("family") or "")})
         expected = [str(value) for value in cohort.get("families", ())]
-        decisions = [row for row in self.store.decisions()
-                     if str(row.get("candidate_id") or "") in candidate_ids]
+        decision_rollup = self.store.decision_rollup(sorted(candidate_ids))
         progress = (self.store.diagnostic_progress(
             str(cohort.get("cohort_identity") or ""), sorted(candidate_ids),
             activation) if isinstance(activation, Mapping) else {})
@@ -3805,7 +4027,7 @@ class ShadowRunner:
             str(arm.get("candidate_id") or ""): str(arm.get("family") or "")
             for arm in arms}
         observed_candidate_ids = {
-            str(row.get("candidate_id") or "") for row in decisions}
+            str(row.get("candidate_id") or "") for row in decision_rollup}
         observed_candidate_ids.update(
             candidate_id for candidate_id, item in progress.items()
             if int(item.get("processed_events") or 0) > 0)
@@ -3818,35 +4040,35 @@ class ShadowRunner:
         warmup_session = (str(activation.get("warmup_session"))
                           if isinstance(activation, Mapping) and
                           activation.get("warmup_session") else None)
-        for row in decisions:
+        decision_total = 0
+        quoteable = 0
+        warmup_quoteable = 0
+        for row in decision_rollup:
             kind = str(row.get("kind") or "unknown")
-            by_kind[kind] = by_kind.get(kind, 0) + 1
+            count = int(row.get("count") or 0)
+            decision_total += count
+            by_kind[kind] = by_kind.get(kind, 0) + count
             if warmup_session and str(row.get("session_date") or "") == warmup_session:
-                warmup_decisions += 1
-        accounts = [row for row in self.store.replay_accounts()
-                    if str(row.get("candidate_id") or "") in candidate_ids]
+                warmup_decisions += count
+                if kind == "open_incomplete":
+                    warmup_quoteable += count
+            elif kind == "open_incomplete":
+                quoteable += count
+        replay_trade_rollup = self.store.replay_trade_count_rollup(
+            sorted(candidate_ids))
         forward_accounts = self.store.diagnostic_account_summary(
             cohort_identity=str(cohort.get("cohort_identity") or ""),
             candidate_ids=sorted(candidate_ids))
-        modeled_fills = sum(int(row.get("trade_count") or 0) for row in accounts)
+        modeled_fills = sum(
+            int(row.get("trade_count") or 0) for row in replay_trade_rollup)
         warmup_modeled_fills = sum(
-            int(row.get("trade_count") or 0) for row in accounts
+            int(row.get("trade_count") or 0) for row in replay_trade_rollup
             if warmup_session and str(row.get("session_date") or "") == warmup_session)
         watermark = self.store.event_watermark()
         latest = (_timestamp(watermark.get("last_available_at")) or
                   _timestamp(watermark.get("last_timestamp")))
         source_lag = (max(0.0, time.time() - latest.timestamp())
                       if latest is not None else None)
-        quoteable = sum(
-            1 for row in decisions
-            if str(row.get("kind") or "") == "open_incomplete" and
-            (not warmup_session or
-             str(row.get("session_date") or "") > warmup_session))
-        warmup_quoteable = sum(
-            1 for row in decisions
-            if str(row.get("kind") or "") == "open_incomplete" and
-            warmup_session and
-            str(row.get("session_date") or "") == warmup_session)
         unpriced = int(evaluated_by_kind.get("unpriced", 0))
         evaluated_decisions = sum(
             int(count) for kind, count in evaluated_by_kind.items()
@@ -3854,7 +4076,7 @@ class ShadowRunner:
             not str(kind).startswith("provenance_reject:"))
         if activation is None:
             observation_status = "awaiting_forward_activation"
-        elif not decisions and evaluated_decisions <= 0:
+        elif decision_total <= 0 and evaluated_decisions <= 0:
             observation_status = "no_post_activation_events"
         elif quoteable:
             observation_status = "quoteable_virtual_observations"
@@ -3900,6 +4122,7 @@ class ShadowRunner:
             "candidate_identities": sorted(candidate_ids),
             "arms": [{
                 "candidate_id": arm.get("candidate_id"),
+                "strategy_id": arm.get("strategy_id"),
                 "family": arm.get("family"),
                 "role": arm.get("role"),
                 "variant_id": arm.get("variant_id"),
@@ -3907,10 +4130,12 @@ class ShadowRunner:
                 "config_identity": arm.get("config_identity"),
                 "code_identity": arm.get("code_identity"),
                 "cohort_identity": arm.get("cohort_identity"),
+                **({"runtime_parity": dict(arm["runtime_parity"])}
+                   if isinstance(arm.get("runtime_parity"), Mapping) else {}),
             } for arm in sorted(arms, key=lambda item: str(
                 item.get("candidate_id") or ""))],
             "decision_counts": {
-                "total": len(decisions),
+                "total": decision_total,
                 "this_poll": int(this_poll_decisions),
                 "by_kind": dict(sorted(by_kind.items())),
                 "warmup": warmup_decisions,
@@ -4097,6 +4322,173 @@ class ShadowRunner:
                 values[key].sort(key=lambda row: str(row.get("timestamp") or ""))
         return bars, quotes, options
 
+    def _diagnostic_market_view_identity(
+            self, arm: Mapping[str, Any]) -> tuple[str | None, str | None, bool]:
+        """Return the arm fields that can change point-in-time market inputs."""
+        cfg = self._shadow_candidate_config(_safe_config(arm))
+        session_cfg = (cfg.get("session")
+                       if isinstance(cfg.get("session"), Mapping) else {})
+        policy = self._shadow_policy(cfg)
+        return (policy.equity_feed, policy.equity_provider,
+                bool(session_cfg.get("require_exact_calendar", False)))
+
+    def _build_diagnostic_market_views(
+            self, arm: Mapping[str, Any], events: Sequence[Mapping[str, Any]],
+            bars: Mapping[str, Sequence[Mapping]],
+            quotes: Mapping[str, Sequence[Mapping]],
+            options: Mapping[str, Sequence[Mapping]],
+            calendar_snapshot: _RecordedSessionCalendarSnapshot,
+            ) -> dict[str, dict[str, Any]]:
+        """Resolve each causal market prefix once for equivalent cohort arms."""
+        cfg = self._shadow_candidate_config(_safe_config(arm))
+        session_cfg = (cfg.get("session")
+                       if isinstance(cfg.get("session"), Mapping) else {})
+        require_exact_calendar = bool(
+            session_cfg.get("require_exact_calendar", False))
+        base_policy = self._shadow_policy(cfg)
+        expected_feed = base_policy.equity_feed
+        expected_provider = base_policy.equity_provider
+        # Context rows are immutable for the poll.  Parse their temporal and
+        # provenance fields once instead of repeating that work for every
+        # decision instant in the same symbol/session prefix.
+        prepared_bars: dict[str, list[tuple[Any, ...]]] = {}
+        for symbol, rows in bars.items():
+            values = prepared_bars.setdefault(str(symbol), [])
+            for row in rows:
+                stamp = _timestamp(row.get("timestamp"))
+                as_of = _timestamp(row.get("as_of"))
+                observed = _timestamp(
+                    row.get("observed_at") or row.get("as_of") or
+                    row.get("timestamp"))
+                available = (max(value for value in (stamp, as_of or stamp,
+                                                      observed)
+                                 if value is not None)
+                             if stamp is not None and
+                             (as_of is not None or not row.get("as_of")) and
+                             observed is not None else None)
+                ended = as_of or (
+                    stamp + timedelta(minutes=1) if stamp is not None else None)
+                values.append((
+                    row, _canonical_equity_feed(row.get("feed")),
+                    _canonical_equity_provider(row.get("provider")),
+                    str(row.get("source_mode") or "forward_observed")
+                    .strip().lower(), stamp, ended, available))
+        prepared_quotes: dict[str, list[tuple[Any, ...]]] = {}
+        for symbol, rows in quotes.items():
+            values = prepared_quotes.setdefault(str(symbol), [])
+            for row in rows:
+                stamp = _timestamp(row.get("timestamp"))
+                as_of = _timestamp(row.get("as_of") or row.get("timestamp"))
+                observed = _timestamp(
+                    row.get("observed_at") or row.get("as_of") or
+                    row.get("timestamp"))
+                available = (max(stamp, as_of, observed)
+                             if stamp is not None and as_of is not None and
+                             observed is not None else None)
+                values.append((
+                    row, _canonical_equity_feed(row.get("feed")),
+                    _canonical_equity_provider(row.get("provider")),
+                    str(row.get("source_mode") or "forward_observed")
+                    .strip().lower(), stamp, available,
+                    _finite(row.get("bid")), _finite(row.get("ask"))))
+        prepared_options: dict[str, list[tuple[Any, ...]]] = {}
+        for symbol, rows in options.items():
+            values = prepared_options.setdefault(str(symbol), [])
+            for row in rows:
+                stamp = _timestamp(row.get("timestamp"))
+                as_of = _timestamp(row.get("as_of") or row.get("timestamp"))
+                observed = _timestamp(
+                    row.get("observed_at") or row.get("as_of") or
+                    row.get("timestamp"))
+                available = (max(stamp, as_of, observed)
+                             if stamp is not None and as_of is not None and
+                             observed is not None else None)
+                values.append((
+                    row, stamp, available,
+                    str(row.get("feed") or "").strip().lower()))
+        session_metadata: dict[
+            str, tuple[datetime | None,
+                       tuple[datetime, datetime] | None]] = {}
+        views: dict[str, dict[str, Any]] = {}
+        for event in events:
+            event_key = str(event.get("event_key") or "")
+            event_at = _availability_time(event)
+            market_at = _timestamp(event.get("timestamp") or event.get("as_of"))
+            if not event_key or event_at is None or market_at is None:
+                continue
+            session = market_at.astimezone(NEW_YORK).date().isoformat()
+            if session not in session_metadata:
+                close_at, _calendar_source = _session_close(
+                    self.config.corpus_path, session,
+                    require_exact_calendar=require_exact_calendar,
+                    calendar_snapshot=calendar_snapshot)
+                calendar_bounds = _recorded_session_bounds(
+                    self.config.corpus_path, session,
+                    calendar_snapshot=calendar_snapshot)
+                session_metadata[session] = (close_at, calendar_bounds)
+            close_at, calendar_bounds = session_metadata[session]
+            symbol = str(event.get("symbol") or "")
+            stream = tuple(
+                row for (row, feed, provider, source_mode, stamp, ended,
+                         available) in prepared_bars.get(symbol, ())
+                if feed == expected_feed and provider == expected_provider
+                and source_mode == "forward_observed"
+                and available is not None and available <= event_at
+                and (close_at is None or (
+                    (calendar_bounds is None or
+                     (stamp or close_at) >= calendar_bounds[0])
+                    and (stamp or close_at) < close_at
+                    and (ended or close_at) <= close_at)))
+            benchmark = tuple(
+                row for (row, feed, provider, source_mode, stamp, ended,
+                         available) in prepared_bars.get(
+                             CROSS_SECTIONAL_BENCHMARK, ())
+                if feed == expected_feed and provider == expected_provider
+                and source_mode == "forward_observed"
+                and available is not None and available <= event_at
+                and (ended or event_at) <= event_at
+                and ((stamp or market_at)
+                     .astimezone(NEW_YORK).date().isoformat() == session)
+            )
+            quote = None
+            latest_quote_key = None
+            for (row, feed, provider, source_mode, stamp, available, bid,
+                 ask) in prepared_quotes.get(symbol, ()):
+                if (feed != expected_feed or provider != expected_provider or
+                        source_mode != "forward_observed" or stamp is None or
+                        stamp > event_at or available is None or
+                        available > event_at or bid is None or ask is None or
+                        bid <= 0 or ask < bid):
+                    continue
+                quote_key = (stamp, available)
+                if latest_quote_key is None or quote_key > latest_quote_key:
+                    latest_quote_key = quote_key
+                    quote = row
+            option_rows: list[dict[str, Any]] = []
+            for row, stamp, available, feed in prepared_options.get(symbol, ()):
+                if (stamp is not None and stamp <= event_at and
+                        available is not None and available <= event_at and
+                        feed == "opra"):
+                    item = dict(row)
+                    item.setdefault("quote_ts", stamp.isoformat())
+                    item.setdefault(
+                        "quote_age_seconds",
+                        max(0.0, (event_at - stamp).total_seconds()))
+                    option_rows.append(item)
+            views[event_key] = {
+                "equity_feed": expected_feed,
+                "equity_provider": expected_provider,
+                "require_exact_calendar": require_exact_calendar,
+                "stream": stream,
+                "completed_stream": tuple(
+                    row for row in stream
+                    if (_event_end(row) or event_at) <= event_at),
+                "benchmark": benchmark,
+                "quote": quote,
+                "option_rows": tuple(option_rows),
+            }
+        return views
+
     def _load_events(self) -> tuple[list[dict], dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
         floor = self.store.forward_event_floor() or 0.0
         event_rows = self.store.events(inserted_after=floor)
@@ -4127,8 +4519,8 @@ class ShadowRunner:
             if stamp is not None and stamp <= at and _row_visible(row, at):
                 bid, ask = _finite(row.get("bid")), _finite(row.get("ask"))
                 if bid is not None and ask is not None and bid > 0 and ask >= bid:
-                    valid.append((stamp, row))
-        return max(valid, key=lambda pair: pair[0])[1] if valid else None
+                    valid.append((stamp, _availability_time(row), row))
+        return max(valid, key=lambda item: (item[0], item[1]))[2] if valid else None
 
     def _evaluate(self, candidate: Mapping[str, Any], event: Mapping[str, Any],
                   bars: Mapping[str, list], quotes: Mapping[str, list],
@@ -4164,6 +4556,8 @@ class ShadowRunner:
                      "calendar_source": calendar_source}, None)
         policy = _session_policy(
             cfg, close_at, policy=self._shadow_policy(cfg))
+        strategy_id = str(
+            candidate.get("strategy_id") or strategy.get("id") or "ibr")
         expected_equity_feed = policy.equity_feed
         expected_equity_provider = policy.equity_provider
         observed_equity_provider = _canonical_equity_provider(event.get("provider"))
@@ -4187,6 +4581,18 @@ class ShadowRunner:
         calendar_bounds = _recorded_session_bounds(
             self.config.corpus_path, session,
             calendar_snapshot=resolved_calendar)
+        prepared_views = getattr(
+            self._worker_state, "diagnostic_market_views", None)
+        prepared_view = (
+            prepared_views.get(str(event.get("event_key") or ""))
+            if diagnostic_candidate and isinstance(prepared_views, Mapping)
+            else None)
+        if (not isinstance(prepared_view, Mapping) or
+                prepared_view.get("equity_feed") != expected_equity_feed or
+                prepared_view.get("equity_provider") != expected_equity_provider or
+                prepared_view.get("require_exact_calendar") is not
+                require_exact_calendar):
+            prepared_view = None
         force_flat_at = None
         if close_at is not None:
             flat_minutes = (10 if policy.force_flat_minutes_before_close is None
@@ -4196,7 +4602,15 @@ class ShadowRunner:
             latest_at = (datetime.combine(local_day, policy.latest_entry_time,
                                           tzinfo=NEW_YORK).astimezone(UTC)
                          if policy.latest_entry_time is not None else close_at)
-            if event_at >= close_at or event_at >= latest_at:
+            latest_entry_reached = event_at >= latest_at
+            if (diagnostic_candidate and strategy_id == "ibr" and
+                    policy.latest_entry_time is not None):
+                # The live IBR gate compares at minute precision and permits
+                # the configured cutoff minute itself.
+                latest_entry_reached = (
+                    event_at.astimezone(NEW_YORK).time().replace(
+                        second=0, microsecond=0) > policy.latest_entry_time)
+            if event_at >= close_at or latest_entry_reached:
                 return ("no_trade", "session entry cutoff reached",
                         {"session_date": session,
                          "session_close": close_at.isoformat(),
@@ -4206,22 +4620,26 @@ class ShadowRunner:
                         {"session_date": session,
                          "force_flat_at": force_flat_at.isoformat(),
                          "calendar_source": calendar_source}, None)
-        stream = [row for row in bars.get(symbol, [])
-                  if _canonical_equity_feed(row.get("feed")) == expected_equity_feed
-                  and (_canonical_equity_provider(row.get("provider")) ==
-                       expected_equity_provider)
-                  and (not diagnostic_candidate or str(
-                      row.get("source_mode") or "forward_observed").strip().lower()
-                      == "forward_observed")
-                  and _row_visible(row, event_at)
-                  and (close_at is None or (
-                      (calendar_bounds is None or
-                       (_timestamp(row.get("timestamp")) or close_at) >= calendar_bounds[0])
-                      and (_timestamp(row.get("timestamp")) or close_at) < close_at
-                      and (_event_end(row) or close_at) <= close_at))]
+        stream = (list(prepared_view.get("stream") or ())
+                  if prepared_view is not None else [
+                      row for row in bars.get(symbol, [])
+                      if (_canonical_equity_feed(row.get("feed")) ==
+                          expected_equity_feed)
+                      and (_canonical_equity_provider(row.get("provider")) ==
+                           expected_equity_provider)
+                      and (not diagnostic_candidate or str(
+                          row.get("source_mode") or "forward_observed")
+                          .strip().lower() == "forward_observed")
+                      and _row_visible(row, event_at)
+                      and (close_at is None or (
+                          (calendar_bounds is None or
+                           (_timestamp(row.get("timestamp")) or close_at) >=
+                           calendar_bounds[0])
+                          and (_timestamp(row.get("timestamp")) or close_at) <
+                          close_at
+                          and (_event_end(row) or close_at) <= close_at))])
         if len(stream) < 2:
             return "no_data", "insufficient bars", {"session_date": session}, None
-        strategy_id = str(candidate.get("strategy_id") or strategy.get("id") or "ibr")
         rule_context = None
         rule_spec = None
         if strategy_id == "rule":
@@ -4240,25 +4658,88 @@ class ShadowRunner:
             if rule_spec["family"] == "cross_sectional_residual":
                 # Relative signals may consume only completed SPY bars that
                 # were observable at the same decision instant as the subject.
-                stream = [row for row in stream
-                          if (_event_end(row) or event_at) <= event_at]
-                benchmark = tuple(
-                    row for row in bars.get(CROSS_SECTIONAL_BENCHMARK, ())
-                    if (_canonical_equity_feed(row.get("feed")) ==
-                        expected_equity_feed)
-                    and (_canonical_equity_provider(row.get("provider")) ==
-                         expected_equity_provider)
-                    and (not diagnostic_candidate or str(
-                        row.get("source_mode") or "forward_observed").strip().lower()
-                        == "forward_observed")
-                    and _row_visible(row, event_at)
-                    and (_event_end(row) or event_at) <= event_at
-                    and ((_timestamp(row.get("timestamp")) or market_at)
-                         .astimezone(NEW_YORK).date().isoformat() == session)
-                )
+                if prepared_view is not None:
+                    stream = list(prepared_view.get("completed_stream") or ())
+                    benchmark = tuple(prepared_view.get("benchmark") or ())
+                else:
+                    stream = [row for row in stream
+                              if (_event_end(row) or event_at) <= event_at]
+                    benchmark = tuple(
+                        row for row in bars.get(CROSS_SECTIONAL_BENCHMARK, ())
+                        if (_canonical_equity_feed(row.get("feed")) ==
+                            expected_equity_feed)
+                        and (_canonical_equity_provider(row.get("provider")) ==
+                             expected_equity_provider)
+                        and (not diagnostic_candidate or str(
+                            row.get("source_mode") or "forward_observed")
+                            .strip().lower() == "forward_observed")
+                        and _row_visible(row, event_at)
+                        and (_event_end(row) or event_at) <= event_at
+                        and ((_timestamp(row.get("timestamp")) or market_at)
+                             .astimezone(NEW_YORK).date().isoformat() == session)
+                    )
                 rule_context = MappingProxyType({
                     CROSS_SECTIONAL_BENCHMARK: benchmark,
                 })
+        quote = None
+        if diagnostic_candidate and strategy_id == "ibr":
+            if prepared_view is not None:
+                quote = prepared_view.get("quote")
+            else:
+                quote_rows = tuple(
+                    row for row in quotes.get(symbol, ())
+                    if str(row.get("source_mode") or "forward_observed")
+                    .strip().lower() == "forward_observed")
+                quote = self._latest_quote(
+                    quote_rows, event_at,
+                    expected_feed=expected_equity_feed,
+                    expected_provider=expected_equity_provider)
+            quote_at = (_timestamp(quote.get("timestamp"))
+                        if isinstance(quote, Mapping) else None)
+            bid = (_finite(quote.get("bid"))
+                   if isinstance(quote, Mapping) else None)
+            ask = (_finite(quote.get("ask"))
+                   if isinstance(quote, Mapping) else None)
+            quote_age = (None if quote_at is None else
+                         max(0.0, (event_at - quote_at).total_seconds()))
+            freshness_invalid = bool(isinstance(quote, Mapping) and any(
+                flag in quote and not isinstance(quote.get(flag), bool)
+                for flag in ("stale", "quote_stale")))
+            if (not isinstance(quote, Mapping) or quote_at is None or
+                    bid is None or ask is None or bid <= 0 or ask < bid or
+                    quote_age is None or
+                    quote_age > policy.max_market_data_age_seconds or
+                    freshness_invalid or quote.get("stale") is True or
+                    quote.get("quote_stale") is True):
+                return ("unpriced", "stale or unavailable quote", {
+                    "session_date": session, "strategy_id": strategy_id,
+                    "equity_feed": expected_equity_feed,
+                    "equity_provider": expected_equity_provider,
+                    "variant_id": candidate.get("variant_id"),
+                    "signal": None,
+                }, None)
+            spread_bps = (ask - bid) / ((ask + bid) / 2.0) * 10_000.0
+            prepared_stream = []
+            for row in stream:
+                item = dict(row)
+                bar_at = _timestamp(item.get("timestamp"))
+                ended_at = _event_end(item)
+                item.update({
+                    "bid": bid,
+                    "ask": ask,
+                    "spread_bps": spread_bps,
+                    "bar_age_seconds": (
+                        None if ended_at is None else
+                        max(0.0, (event_at - ended_at).total_seconds())),
+                    "timestamp_age_seconds": (
+                        None if bar_at is None else
+                        max(0.0, (event_at - bar_at).total_seconds())),
+                    "data_age_seconds": (
+                        None if ended_at is None else
+                        max(0.0, (event_at - ended_at).total_seconds())),
+                })
+                prepared_stream.append(item)
+            stream = prepared_stream
         try:
             if strategy_id == "rule":
                 signal = (generate_rule_signal(
@@ -4268,8 +4749,37 @@ class ShadowRunner:
                               symbol, stream, config=cfg, now=event_at,
                               bars_by_symbol=rule_context))
             else:
+                session_state = None
+                persisted_sessions = None
+                prior_session = None
+                if diagnostic_candidate:
+                    persisted_sessions = getattr(
+                        self._worker_state, "signal_sessions", None)
+                    if not isinstance(persisted_sessions, dict):
+                        return (
+                            "reject",
+                            "diagnostic IBR signal session state unavailable",
+                            {"session_date": session,
+                             "strategy_id": strategy_id}, None)
+                    prior_session = persisted_sessions.get(symbol.upper())
+                    session_state = {
+                        "signals": ({(symbol, prior_session)}
+                                    if prior_session else set())}
                 signal = generate_ibr_signal(
-                    symbol, stream, config=cfg, now=event_at)
+                    symbol, stream, config=cfg, now=event_at,
+                    session_state=session_state)
+                if signal is not None and diagnostic_candidate:
+                    emitted_session = str(signal.get("session") or "")
+                    if len(emitted_session) != 10:
+                        raise ShadowError(
+                            "diagnostic IBR signal session is invalid")
+                    if prior_session == emitted_session:
+                        signal = None
+                    else:
+                        # Match runtime ordering: the first qualifying signal
+                        # consumes the arm/symbol session before setup, risk,
+                        # or executable-pricing refusal can occur.
+                        persisted_sessions[symbol.upper()] = emitted_session
         except Exception as exc:
             return "reject", f"signal exception: {type(exc).__name__}", {"error": str(exc)[:240]}, None
         base = {"session_date": session, "strategy_id": strategy_id,
@@ -4312,16 +4822,19 @@ class ShadowRunner:
             signal["force_flat_at"] = force_flat_at.isoformat()
             signal["force_flat_ts"] = force_flat_at.timestamp()
         base["signal"] = signal
-        quote_rows = quotes.get(symbol, ())
-        if diagnostic_candidate:
-            quote_rows = tuple(
-                row for row in quote_rows
-                if str(row.get("source_mode") or "forward_observed")
-                .strip().lower() == "forward_observed")
-        quote = self._latest_quote(
-            quote_rows, event_at,
-            expected_feed=expected_equity_feed,
-            expected_provider=expected_equity_provider)
+        if quote is None and prepared_view is not None:
+            quote = prepared_view.get("quote")
+        elif quote is None:
+            quote_rows = quotes.get(symbol, ())
+            if diagnostic_candidate:
+                quote_rows = tuple(
+                    row for row in quote_rows
+                    if str(row.get("source_mode") or "forward_observed")
+                    .strip().lower() == "forward_observed")
+            quote = self._latest_quote(
+                quote_rows, event_at,
+                expected_feed=expected_equity_feed,
+                expected_provider=expected_equity_provider)
         snap: dict[str, Any] = {"price": _finite(event.get("close")) or _finite(event.get("open")),
                                 "close": _finite(event.get("close")),
                                 "spread_bps": None, "stale": True, "quote_stale": True,
@@ -4357,6 +4870,7 @@ class ShadowRunner:
         diagnostic_equity = bool(
             diagnostic_candidate and
             str(candidate.get("vehicle") or "equity") == "equity")
+        executable_entry_reference = None
         entry_slippage: dict[str, Any] | None = None
         entry_slippage_context: dict[str, Any] | None = None
         entry_slippage_reason: str | None = None
@@ -4420,17 +4934,22 @@ class ShadowRunner:
                                   "width": signal.get("range_width"),
                                   "complete": True}
         if str(candidate.get("vehicle") or "equity") == "option":
-            option_rows = []
-            for row in options.get(symbol, ()):
-                stamp = _timestamp(row.get("timestamp"))
-                if (stamp is not None and stamp <= event_at and
-                        _row_visible(row, event_at) and
-                        str(row.get("feed") or "").strip().lower() == "opra"):
-                    item = dict(row)
-                    item.setdefault("quote_ts", stamp.isoformat())
-                    age = max(0.0, (event_at - stamp).total_seconds())
-                    item.setdefault("quote_age_seconds", age)
-                    option_rows.append(item)
+            if prepared_view is not None:
+                option_rows = [dict(row) for row in
+                               (prepared_view.get("option_rows") or ())]
+            else:
+                option_rows = []
+                for row in options.get(symbol, ()):
+                    stamp = _timestamp(row.get("timestamp"))
+                    if (stamp is not None and stamp <= event_at and
+                            _row_visible(row, event_at) and
+                            str(row.get("feed") or "").strip().lower() == "opra"):
+                        item = dict(row)
+                        item.setdefault("quote_ts", stamp.isoformat())
+                        age = max(
+                            0.0, (event_at - stamp).total_seconds())
+                        item.setdefault("quote_age_seconds", age)
+                        option_rows.append(item)
             if not option_rows:
                 return ("unpriced", "executable OPRA option chain unavailable",
                         base | {"snapshot": snap}, None)
@@ -4438,13 +4957,27 @@ class ShadowRunner:
         if snap["stale"] or snap["quote_stale"]:
             return ("unpriced", "stale or unavailable quote",
                     base | {"snapshot": snap}, None)
+        setup_snapshot = snap
+        if diagnostic_equity and strategy_id == "ibr":
+            # Live IBR constructs its authored stop/target from the signal
+            # close, then replaces only entry with the executable quote before
+            # risk admission. Keep that ordering without changing rule arms.
+            setup_snapshot = dict(snap)
+            setup_snapshot["price"] = authored_entry_reference
+            setup_snapshot["entry_price"] = authored_entry_reference
         try:
-            plan, why = build_setup_plan(signal, snap, cfg)
+            plan, why = build_setup_plan(signal, setup_snapshot, cfg)
         except Exception as exc:
             return "reject", f"setup exception: {type(exc).__name__}", base, None
         if plan is None:
             return "reject", why or "setup rejected", base | {"snapshot": snap}, None
         plan = dict(plan)
+        if diagnostic_equity and strategy_id == "ibr":
+            executable = _finite(executable_entry_reference)
+            if executable is None or executable <= 0:
+                return ("unpriced", "executable entry quote unavailable",
+                        base | {"snapshot": snap}, None)
+            plan["entry_price"] = executable
         plan["decision_timestamp"] = event_at.isoformat()
         plan["entry_timestamp"] = event_at.isoformat()
         plan["equity_feed"] = expected_equity_feed
@@ -5073,6 +5606,8 @@ class ShadowRunner:
             initial_state: Mapping[str, Any],
             warmup_session: str | None = None,
             calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
+            diagnostic_market_views: Mapping[
+                str, Mapping[str, Any]] | None = None,
             ) -> dict[str, Any]:
         """Evaluate one immutable arm without touching the shadow WAL.
 
@@ -5084,15 +5619,21 @@ class ShadowRunner:
         cfg = self._shadow_candidate_config(_safe_config(arm))
         strategy = cfg.get("strategy") if isinstance(
             cfg.get("strategy"), Mapping) else {}
+        strategy_id = str(arm.get("strategy_id") or
+                          strategy.get("id") or "")
         rule_spec = strategy.get("rule_spec") if isinstance(
             strategy, Mapping) else None
-        if not isinstance(rule_spec, Mapping):
+        if strategy_id == "rule" and not isinstance(rule_spec, Mapping):
             return {"candidate_id": candidate_id, "decisions": [],
                     "error": "diagnostic rule specification unavailable"}
+        if strategy_id not in {"rule", "ibr"}:
+            return {"candidate_id": candidate_id, "decisions": [],
+                    "error": "diagnostic strategy is unsupported"}
         book = DiagnosticAccountBook(
             account=initial_state.get("account") or {},
             positions=initial_state.get("positions") or (), config=cfg,
-            policy=self._shadow_policy(cfg), rule_spec=rule_spec)
+            policy=self._shadow_policy(cfg),
+            rule_spec=(rule_spec if strategy_id == "rule" else None))
         state = book.risk_state()
         decisions: list[dict[str, Any]] = []
         try:
@@ -5101,8 +5642,64 @@ class ShadowRunner:
             self._worker_state.calendar_snapshot = (
                 calendar_snapshot if calendar_snapshot is not None else
                 _load_recorded_session_calendar(self.config.corpus_path))
+            self._worker_state.diagnostic_market_views = (
+                diagnostic_market_views or {})
+            if strategy_id == "ibr":
+                self._worker_state.signal_sessions = book.signal_sessions
             warmup_session = str(warmup_session or "")
-            quote_rows = tuple(row for values in quotes.values() for row in values)
+            quote_cache: dict[tuple[str, ...], tuple[Mapping[str, Any], ...]] = {}
+
+            def relevant_quote_rows(symbol: str) -> tuple[Mapping[str, Any], ...]:
+                wanted = {str(symbol)}
+                wanted.update(
+                    str(position.get("symbol") or "")
+                    for position in book.positions.values()
+                    if position.get("status") == "open")
+                key = tuple(sorted(value for value in wanted if value))
+                cached = quote_cache.get(key)
+                if cached is None:
+                    cached = tuple(
+                        row for value in key for row in quotes.get(value, ()))
+                    quote_cache[key] = cached
+                return cached
+
+            def advance_empty_book(event: Mapping[str, Any], *,
+                                   available_at: datetime) -> bool:
+                """Apply the exact no-position account transition in O(1)."""
+                if any(position.get("status") == "open"
+                       for position in book.positions.values()):
+                    return False
+                def canonical(value: Any) -> str:
+                    return str(value or "").strip().lower().replace("-", "_")
+                observed_feed = canonical(event.get("feed"))
+                observed_provider = canonical(event.get("provider"))
+                expected_feed = canonical(book.policy.equity_feed)
+                expected_provider = canonical(book.policy.equity_provider)
+                if observed_feed == "delayed":
+                    observed_feed = "delayed_sip"
+                if expected_feed == "delayed":
+                    expected_feed = "delayed_sip"
+                if observed_provider == "delayed":
+                    observed_provider = "delayed_sip"
+                if expected_provider == "delayed":
+                    expected_provider = "delayed_sip"
+                if (str(event.get("source_mode") or "forward_observed")
+                        .strip().lower() != "forward_observed" or
+                        observed_feed != expected_feed or
+                        observed_provider != expected_provider):
+                    return True
+                book.account.update({
+                    "unrealized_pnl": 0.0,
+                    "equity": float(book.account["cash"]),
+                    "mark_status": "priced",
+                    "open_position_count": 0,
+                    "late_data_gap_count": 0,
+                    "last_event_key": str(event.get("event_key") or ""),
+                    "last_event_at": available_at.isoformat(),
+                })
+                self._worker_state.equities[candidate_id] = book.equity
+                return True
+
             ordered_events: list[
                 tuple[datetime, str, str, Mapping[str, Any]]] = []
             for session, events in session_events.items():
@@ -5133,10 +5730,14 @@ class ShadowRunner:
                 event_type = str(event.get("event_type") or "").lower()
                 if event_type == "quote":
                     if not warmup_session or session > warmup_session:
-                        book.advance_quote_event(event, quote_rows=quote_rows)
-                        state = book.risk_state()
-                        self._worker_state.portfolios[candidate_id] = state
-                        self._worker_state.equities[candidate_id] = book.equity
+                        if not advance_empty_book(
+                                event, available_at=available_at):
+                            book.advance_quote_event(
+                                event,
+                                quote_rows=relevant_quote_rows(symbol))
+                            state = book.risk_state()
+                            self._worker_state.portfolios[candidate_id] = state
+                            self._worker_state.equities[candidate_id] = book.equity
                     account_at = _timestamp(book.account.get("last_event_at"))
                     if account_at is not None:
                         account_watermark = (
@@ -5147,10 +5748,14 @@ class ShadowRunner:
                 # signal is considered. A newly modeled entry can therefore
                 # never consume its own signal bar as exit data.
                 if not warmup_session or session > warmup_session:
-                    book.advance_completed_bar(event, quote_rows=quote_rows)
-                state = book.risk_state()
-                self._worker_state.portfolios[candidate_id] = state
-                self._worker_state.equities[candidate_id] = book.equity
+                    if not advance_empty_book(
+                            event, available_at=available_at):
+                        book.advance_completed_bar(
+                            event,
+                            quote_rows=relevant_quote_rows(symbol))
+                        state = book.risk_state()
+                        self._worker_state.portfolios[candidate_id] = state
+                        self._worker_state.equities[candidate_id] = book.equity
                 if book.has_open(symbol):
                     kind, reason, payload, plan = (
                         "no_trade", "persistent diagnostic position is open",
@@ -5173,7 +5778,8 @@ class ShadowRunner:
                 if (plan is not None and
                         (not warmup_session or session > warmup_session)):
                     book.open_requested_position(
-                        event=event, plan=plan, quote_rows=quote_rows)
+                        event=event, plan=plan,
+                        quote_rows=relevant_quote_rows(symbol))
                     state = book.risk_state()
                     self._worker_state.portfolios[candidate_id] = state
                     self._worker_state.equities[candidate_id] = book.equity
@@ -5189,7 +5795,8 @@ class ShadowRunner:
             return {"candidate_id": candidate_id, "decisions": [],
                     "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
         finally:
-            for name in ("portfolios", "equities", "calendar_snapshot"):
+            for name in ("portfolios", "equities", "calendar_snapshot",
+                         "diagnostic_market_views", "signal_sessions"):
                 try:
                     delattr(self._worker_state, name)
                 except AttributeError:
@@ -5198,6 +5805,9 @@ class ShadowRunner:
                 "account_batch": book.batch(), "error": None}
 
     def run_once(self) -> dict[str, Any]:
+        if self.store is None:
+            raise ShadowError(
+                "offline diagnostic worker cannot run the persistent poll")
         poll_started = time.monotonic()
         # The recorder rewrites its sidecar atomically.  Parse it once for this
         # poll and pass the immutable value through every worker/replay path so
@@ -5293,49 +5903,55 @@ class ShadowRunner:
             not isinstance(detail, Mapping) or not detail.get("session_date")
             for detail in quarantine.values())
         quarantine_overflow = QUARANTINE_OVERFLOW_KEY in quarantine
-        for raw in selected:
-            event_key = str(raw.get("event_key") or "")
-            source_provenance = source_for_event.get(event_key)
-            source_key = source_provenance[0] if source_provenance else None
-            try:
-                _, added = self.store.ingest_event(
-                    raw, max_events=self.config.max_events,
-                    source_path=(source_provenance[0]
-                                 if source_provenance else None),
-                    source_offset_start=(source_provenance[1]
-                                         if source_provenance else None),
-                    source_offset_end=(source_provenance[2]
-                                       if source_provenance else None))
-            except InputConflict:
-                conflicts += 1
-                raise
-            except NormalizationError:
-                # Keep the source offset before this malformed event.  The
-                # event is explicitly quarantined and its local session is
-                # blocked, so an operator can correct the recorder row and the
-                # next poll will retry the exact same bytes.  Advancing over
-                # it would permanently skip an unknown/incomplete session.
-                invalid_events += 1
-                if source_key:
-                    invalid_sources.add(source_key)
-                stamp = _timestamp(raw.get("as_of") or raw.get("timestamp"))
-                session = (stamp.astimezone(NEW_YORK).date().isoformat()
-                           if stamp is not None else None)
-                if session:
-                    invalid_sessions.add(session)
-                else:
-                    unknown_quarantine = True
-                quarantine[event_key or _digest(raw)] = {
-                    "event_key": event_key,
-                    "source": source_key,
-                    "session_date": session,
-                    "reason": "normalization_error",
-                }
-                continue
-            if event_key in quarantine:
-                resolved_quarantine.add(event_key)
-            if added:
-                ingested += 1
+        # Event rows commit as one batch; source offsets commit afterwards.
+        # A crash before the first commit rolls the batch back. A crash between
+        # commits retries already-durable events with the same deterministic
+        # keys, without duplicating them or skipping uncommitted source bytes.
+        with self.store._connection() as ingest_db:
+            for raw in selected:
+                event_key = str(raw.get("event_key") or "")
+                source_provenance = source_for_event.get(event_key)
+                source_key = source_provenance[0] if source_provenance else None
+                try:
+                    _, added = self.store._ingest_event(
+                        ingest_db, raw, max_events=self.config.max_events,
+                        source_path=(source_provenance[0]
+                                     if source_provenance else None),
+                        source_offset_start=(source_provenance[1]
+                                             if source_provenance else None),
+                        source_offset_end=(source_provenance[2]
+                                           if source_provenance else None))
+                except InputConflict:
+                    conflicts += 1
+                    raise
+                except NormalizationError:
+                    # Keep the source offset before this malformed event.  The
+                    # event is explicitly quarantined and its local session is
+                    # blocked, so an operator can correct the recorder row and
+                    # the next poll will retry the exact same bytes.  Advancing
+                    # over it would permanently skip an unknown/incomplete
+                    # session.
+                    invalid_events += 1
+                    if source_key:
+                        invalid_sources.add(source_key)
+                    stamp = _timestamp(raw.get("as_of") or raw.get("timestamp"))
+                    session = (stamp.astimezone(NEW_YORK).date().isoformat()
+                               if stamp is not None else None)
+                    if session:
+                        invalid_sessions.add(session)
+                    else:
+                        unknown_quarantine = True
+                    quarantine[event_key or _digest(raw)] = {
+                        "event_key": event_key,
+                        "source": source_key,
+                        "session_date": session,
+                        "reason": "normalization_error",
+                    }
+                    continue
+                if event_key in quarantine:
+                    resolved_quarantine.add(event_key)
+                if added:
+                    ingested += 1
         # Only commit offsets for sources whose complete forward batch was
         # normalized.  Other sources remain at their previous boundary and
         # are retried after correction; already-ingested rows are idempotent.
@@ -6077,6 +6693,7 @@ def _parser() -> argparse.ArgumentParser:
                         default=Path(__file__).resolve().parents[1] / "config.yaml")
     parser.add_argument("--diagnostic", action=argparse.BooleanOptionalAction,
                         default=True)
+    parser.add_argument("--diagnostic-include-ibr", action="store_true")
     parser.add_argument("--once", action="store_true", help="ingest and evaluate one cycle")
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
@@ -6096,6 +6713,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                        diagnostic_session_max_events=(
                            args.diagnostic_session_max_events),
                        diagnostic=args.diagnostic,
+                       diagnostic_include_ibr=args.diagnostic_include_ibr,
                        runtime_config=runtime_config,
                        runtime_config_path=args.config)
     interval = cfg.poll_seconds

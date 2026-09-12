@@ -10,7 +10,7 @@ alongside the diagnostic decision cursor.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
@@ -162,6 +162,29 @@ def validate_account_state(state: Mapping[str, Any], *,
         value = result.get(name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise DiagnosticAccountError(f"diagnostic account {name} is invalid")
+    signal_sessions = result.get("signal_sessions")
+    if signal_sessions is not None:
+        valid_sessions = isinstance(signal_sessions, Mapping)
+        if valid_sessions:
+            valid_sessions = len(signal_sessions) <= 10_000
+        if valid_sessions:
+            for symbol, session in signal_sessions.items():
+                if (not isinstance(symbol, str) or not symbol or
+                        len(symbol) > 32 or not isinstance(session, str)):
+                    valid_sessions = False
+                    break
+                try:
+                    parsed_session = date.fromisoformat(session)
+                except ValueError:
+                    valid_sessions = False
+                    break
+                if parsed_session.isoformat() != session:
+                    valid_sessions = False
+                    break
+        if not valid_sessions:
+            raise DiagnosticAccountError(
+                "diagnostic account signal sessions are invalid")
+        result["signal_sessions"] = dict(signal_sessions)
     return result
 
 
@@ -188,7 +211,8 @@ class DiagnosticAccountBook:
 
     def __init__(self, *, account: Mapping[str, Any],
                  positions: Sequence[Mapping[str, Any]], config: Mapping[str, Any],
-                 policy: ReplayPolicy, rule_spec: Mapping[str, Any]):
+                 policy: ReplayPolicy,
+                 rule_spec: Mapping[str, Any] | None):
         cohort = str(account.get("cohort_identity") or "")
         candidate = str(account.get("candidate_id") or "")
         self.account = validate_account_state(
@@ -211,7 +235,8 @@ class DiagnosticAccountBook:
         self.fills: list[dict[str, Any]] = []
         self.config = deepcopy(dict(config))
         self.policy = policy
-        self.rule_spec = deepcopy(dict(rule_spec))
+        self.rule_spec = (deepcopy(dict(rule_spec))
+                          if isinstance(rule_spec, Mapping) else None)
         self.costs: CostResolverSetup = cost_resolver_setup(
             self.config, vehicle="equity")
 
@@ -226,6 +251,21 @@ class DiagnosticAccountBook:
     @property
     def equity(self) -> float | None:
         return _finite(self.account.get("equity"))
+
+    @property
+    def signal_sessions(self) -> dict[str, str]:
+        """Return the bounded per-symbol IBR emission ledger for this arm."""
+        sessions = self.account.get("signal_sessions")
+        if sessions is None:
+            # Accounts created by older 24-arm epochs did not carry IBR state.
+            # Add it lazily so their stored digest remains valid until a new
+            # IBR transition is actually committed.
+            sessions = {}
+            self.account["signal_sessions"] = sessions
+        if not isinstance(sessions, dict):
+            raise DiagnosticAccountError(
+                "diagnostic account signal sessions are invalid")
+        return sessions
 
     def has_open(self, symbol: str) -> bool:
         wanted = str(symbol).upper()
@@ -877,11 +917,14 @@ class DiagnosticAccountBook:
                 target_lookback=plan.get("target_lookback"),
                 exit_before_ts=plan.get("exit_before_ts"))
             deadline_contract = exit_deadline(
-                entry_at, self.rule_spec,
+                entry_at, self.rule_spec or {},
                 force_flat_ts=plan.get("force_flat_ts"))
         except Exception as exc:
             raise DiagnosticAccountError(
                 f"diagnostic exit state is invalid: {exc}") from exc
+        if self.rule_spec is None and deadline_contract is None:
+            raise DiagnosticAccountError(
+                "diagnostic IBR force-flat deadline is unavailable")
         deadline = (None if deadline_contract is None else {
             "timestamp": datetime.fromtimestamp(
                 float(deadline_contract["timestamp"]), UTC).isoformat(),

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 from agent.alpaca_provider import AlpacaProvider
@@ -367,15 +369,33 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                 }
 
 
+@contextmanager
+def _market_phase(telemetry: dict | None, name: str):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        if telemetry is not None:
+            telemetry[name] = round(float(telemetry.get(name, 0.0)) +
+                                    max(0.0, time.perf_counter() - started), 6)
+
+
 def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
           *, feed: str | None = None, config: dict | None = None,
           include_options: bool = False, option_limit: int = 5,
           start: datetime | None = None,
           option_pins: frozenset[str] = frozenset(),
-          observed_at: datetime | None = None):
+          observed_at: datetime | None = None,
+          refresh_quote_end: bool = False,
+          quote_end_limit: datetime | None = None,
+          telemetry: dict | None = None):
     start = start or now - timedelta(minutes=3)
     if start.tzinfo is None or start.utcoffset() is None or start > now:
         raise ValueError("recorder start must be an aware timestamp at or before now")
+    if quote_end_limit is not None and (
+            quote_end_limit.tzinfo is None or quote_end_limit.utcoffset() is None or
+            quote_end_limit < now):
+        raise ValueError("quote end limit must be aware and at or after now")
     # The provider owns environment/config precedence and canonicalization.
     # ``feed`` remains an explicit test seam; production callers leave it unset.
     feed = _canonical_feed(
@@ -385,17 +405,35 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     # A quote watermark can fall partway through a minute. Round only the bar
     # request back to its start so an updated previous-minute bar is observed
     # by the overlap; quote acquisition keeps its original bounded window.
-    bars = _call_market_data(provider.bars, symbols,
-                              start=start.replace(second=0, microsecond=0), end=now,
+    if telemetry is not None:
+        telemetry["bar_request_end_at"] = now.isoformat()
+    with _market_phase(telemetry, "bars_fetch_seconds"):
+        bars = _call_market_data(provider.bars, symbols,
+                                 start=start.replace(second=0, microsecond=0), end=now,
+                                 feed=feed)
+    bars_received = datetime.now(timezone.utc)
+    # Only real-time forward capture opts in. Explicit replay/catch-up bounds
+    # remain deterministic, and an exact session close remains a hard cap.
+    quote_end = max(now, bars_received) if refresh_quote_end else now
+    if quote_end_limit is not None:
+        quote_end = min(quote_end, quote_end_limit)
+    if telemetry is not None:
+        telemetry["bars_received_at"] = bars_received.isoformat()
+        telemetry["quote_request_end_at"] = quote_end.isoformat()
+    with _market_phase(telemetry, "quotes_fetch_seconds"):
+        quotes = _call_quotes(provider.quotes, symbols, start=start, end=quote_end,
                               feed=feed)
-    quotes = _call_quotes(provider.quotes, symbols, start=start, end=now,
-                          feed=feed)
     # ``now`` is the requested window end captured before network I/O. The
     # observation timestamp must reflect when the responses were actually
     # available or a quote arriving during the request can incorrectly have
     # as_of > observed_at.
-    observation = max(observed_at or now, datetime.now(timezone.utc))
+    quotes_received = datetime.now(timezone.utc)
+    observation = max(observed_at or now, quotes_received)
+    if telemetry is not None:
+        telemetry["quotes_received_at"] = quotes_received.isoformat()
     observed = observation.isoformat()
+    projection_started = time.perf_counter()
+    latest_bar = latest_quote = None
     for raw_symbol, values in bars.items():
         symbol = validate_equity_symbol(raw_symbol)
         for bar in values:
@@ -412,6 +450,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             # in-progress OHLC row under its immutable event key.
             if bar_complete > now:
                 continue
+            latest_bar = max(latest_bar or bar_start, bar_start)
             yield {
                 "event_key": _event_key("bar_1m", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca",
@@ -431,8 +470,10 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             timestamp = _iso(getattr(quote, "timestamp", None))
             if not _point_in_time(timestamp):
                 continue
-            if _timestamp(timestamp) > now + timedelta(seconds=5):
+            quote_timestamp = _timestamp(timestamp)
+            if quote_timestamp > quote_end + timedelta(seconds=5):
                 raise RuntimeError(f"quote {symbol!r} timestamp is in the future")
+            latest_quote = max(latest_quote or quote_timestamp, quote_timestamp)
             yield {
                 "event_key": _event_key("quote", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca",
@@ -442,10 +483,19 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
                 "low": "", "close": "", "volume": "", "bid": _value(quote.bid),
                 "ask": _value(quote.ask), "last": _value(quote.last),
             }
+    if telemetry is not None:
+        telemetry["equity_projection_seconds"] = round(
+            float(telemetry.get("equity_projection_seconds", 0.0)) +
+            max(0.0, time.perf_counter() - projection_started), 6)
+        if latest_bar is not None:
+            telemetry["last_bar_market_ts"] = latest_bar.isoformat()
+        if latest_quote is not None:
+            telemetry["last_quote_market_ts"] = latest_quote.isoformat()
     if include_options:
-        yield from _option_rows(
-            provider, symbols, quotes, now, feed=feed, config=config,
-            limit=max(1, min(MAX_OPTION_LIMIT, int(option_limit))),
-            minimum_timestamp=start,
-            observed_at=observation,
-            pinned=frozenset(str(item).upper() for item in option_pins))
+        with _market_phase(telemetry, "options_fetch_projection_seconds"):
+            yield from _option_rows(
+                provider, symbols, quotes, now, feed=feed, config=config,
+                limit=max(1, min(MAX_OPTION_LIMIT, int(option_limit))),
+                minimum_timestamp=start,
+                observed_at=observation,
+                pinned=frozenset(str(item).upper() for item in option_pins))

@@ -878,34 +878,23 @@ def _recorder_cadence(attempt: dict) -> dict:
     cadence = dict(raw) if isinstance(raw, dict) else {}
     interval = cadence.get("configured_interval_seconds",
                            attempt.get("configured_interval_seconds"))
-    try:
-        interval = float(interval) if interval is not None else None
-    except (TypeError, ValueError):
-        interval = None
+    interval = _status_nonnegative_float(interval)
     realized_values: list[float] = []
     raw_values = cadence.get("realized_intervals_seconds",
                             attempt.get("realized_intervals_seconds"))
     if isinstance(raw_values, (list, tuple)):
         for value in raw_values[-128:]:
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                continue
-            if number >= 0:
+            number = _status_nonnegative_float(value)
+            if number is not None:
                 realized_values.append(number)
-    current = cadence.get("realized_interval_seconds")
-    try:
-        if current is not None and float(current) >= 0:
-            realized_values.append(float(current))
-    except (TypeError, ValueError):
-        pass
-    gap = cadence.get("gap_seconds")
-    try:
-        gap = float(gap) if gap is not None else None
-    except (TypeError, ValueError):
-        gap = None
-    p50 = cadence.get("realized_interval_p50_seconds")
-    p95 = cadence.get("realized_interval_p95_seconds")
+    # The producer already includes the current interval in the history.
+    # Older status payloads may have only the summary, so retain that fallback.
+    current = _status_nonnegative_float(cadence.get("realized_interval_seconds"))
+    if not realized_values and current is not None:
+        realized_values.append(current)
+    gap = _status_nonnegative_float(cadence.get("gap_seconds"))
+    p50 = _status_nonnegative_float(cadence.get("realized_interval_p50_seconds"))
+    p95 = _status_nonnegative_float(cadence.get("realized_interval_p95_seconds"))
     if p50 is None:
         p50 = _quantile(realized_values, .50)
     if p95 is None:
@@ -917,10 +906,45 @@ def _recorder_cadence(attempt: dict) -> dict:
         "realized_interval_p50_seconds": p50,
         "realized_interval_p95_seconds": p95,
         "gap_seconds": gap,
+        "cycle_duration_seconds": _status_nonnegative_float(
+            cadence.get("cycle_duration_seconds")),
+        "cycle_overrun_seconds": _status_nonnegative_float(
+            cadence.get("cycle_overrun_seconds")),
         "gap_detected": bool(cadence.get("gap_detected", gap is not None and
                                            interval is not None and gap > 0)),
         "samples": len(realized_values),
     }
+
+
+def _recorder_cycle_telemetry(attempt: dict) -> dict:
+    """Expose bounded phase evidence, never arbitrary provider payloads."""
+    raw = attempt.get("cycle_telemetry")
+    if not isinstance(raw, dict) or raw.get("schema") != "recorder-cycle-telemetry.v1":
+        return {}
+    result = {"schema": raw["schema"]}
+    for key in (
+            "corpus_migration_seconds", "index_preparation_seconds",
+            "calendar_preparation_seconds", "fetch_projection_seconds",
+            "bars_fetch_seconds", "quotes_fetch_seconds", "equity_projection_seconds",
+            "options_fetch_projection_seconds", "validation_ingest_seconds",
+            "revision_validation_save_seconds", "durable_save_seconds",
+            "csv_partition_flush_fsync_seconds", "recent_key_transaction_seconds",
+            "index_json_save_seconds", "windows_completed", "projected_rows",
+            "session_rows", "unique_rows"):
+        value = _status_nonnegative_float(raw.get(key))
+        if value is not None:
+            result[key] = value
+    for key in ("bar_request_end_at", "quote_request_end_at", "bars_received_at",
+                "quotes_received_at", "last_bar_market_ts", "last_quote_market_ts"):
+        value = raw.get(key)
+        if isinstance(value, str) and len(value) <= 40:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                result[key] = parsed.isoformat()
+    return result
 
 
 def recorder(path: Path, max_age: float, *, now: float | None = None,
@@ -1103,6 +1127,7 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
                                    current - watermark_epoch),
         "partition_provenance": dict(sorted(partition_sources.items())[-64:]),
         "cadence": cadence,
+        "cycle_telemetry": _recorder_cycle_telemetry(attempt),
         **market_readiness,
     }
     if coverage_reason:

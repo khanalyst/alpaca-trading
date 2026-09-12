@@ -371,6 +371,7 @@ def _bar_session(bar: UnderlyingBar) -> str:
 def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
                          force_quote_index: bool = False,
                          require_provenance: bool = False,
+                         allow_quote_only: bool = False,
                          expected_equity_feed: str = "iex",
                          expected_provider: str | None = None) -> tuple[
         list[dict], list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
@@ -380,6 +381,8 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
     in-memory sequence. Files are streamed line by line; what the replay then
     computes is identical either way.
     """
+    if not isinstance(allow_quote_only, bool):
+        raise TypeError("allow_quote_only must be boolean")
     if isinstance(data, (str, Path)):
         source = Path(data)
         size = _corpus_size(source)
@@ -395,7 +398,7 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
                 raw_rows, require_provenance=require_provenance,
                 expected_equity_feed=expected_equity_feed,
                 expected_provider=expected_provider)
-            if not bars:
+            if not bars and not allow_quote_only:
                 raise DiscoveryError("discovery corpus contains no underlying bars")
             return raw_rows, bars, snapshots, quotes
         hasher = hashlib.sha256()
@@ -427,7 +430,7 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
             raise
         hasher.update(b"]")
         raw_rows = _StreamingRawRows(source, count, hasher.hexdigest())
-        if not bars:
+        if not bars and not allow_quote_only:
             quote_index.close()
             raise DiscoveryError("discovery corpus contains no underlying bars")
         return raw_rows, bars, snapshots, quotes
@@ -452,7 +455,7 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
                 raw_rows, require_provenance=require_provenance,
                 expected_equity_feed=expected_equity_feed,
                 expected_provider=expected_provider)
-    if not bars:
+    if not bars and not allow_quote_only:
         raise DiscoveryError("discovery corpus contains no underlying bars")
     return raw_rows, bars, snapshots, quotes
 
