@@ -260,15 +260,16 @@ historical endpoint reconstructs, so the option lane still needs recorded
 sessions. And **history alone is not enough**: `_simulate_trade` takes at most
 one trade per symbol-session, so the 100-trade held-out floor and 30-cluster
 session floor are as much a universe-width requirement as a history-length one.
-The shipped default universe is 24 liquid ETFs spanning broad-market, size,
-sector, international, rates/credit, metals, and semiconductor exposures (the
-exact operator-approved list is in `config.yaml`). This improves opportunity
-capacity, but real signal rates still require sufficient history. Floor
-feasibility fails closed when 100 held-out trades
-cannot be supported; widen `universe.symbols` and/or the backfill window, never
-lower the evidence floor. A universe expansion requires an operator-approved
-exact symbol list, recorder coverage for that list, and a new identity/proof;
-do not reuse an older proof after changing the list. Event conditioning requires
+The shipped default universe is a fixed 24-symbol ETF list spanning broad-market,
+size, sector, international, rates/credit, metals, and semiconductor exposures
+(the exact operator-approved list is in `config.yaml`). This is a configuration
+fact, not a measured capacity claim. Diagnose symbol/feed coverage and collect
+valid forward-observed evidence; historical backfill can support diagnostics but
+cannot count as accepted forward proof. Floor feasibility fails closed when 100
+held-out trades cannot be supported. A symbol expansion is not an automatic
+remedy: it requires a separate approved universe/feed scope, exact symbol list,
+recorder coverage, and a new identity/proof epoch; do not reuse an older proof
+after changing the list. Event conditioning requires
 a point-in-time event source with provider/as-of/observation provenance. Prior-
 session, true multi-timeframe, and cross-sectional features require explicit
 replay context and fail closed when it is missing or ambiguous.
@@ -347,8 +348,8 @@ floor:
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | run the lane at all |
-| `min_sessions` | `30` | sessions before a verdict |
-| `min_trades` | `100` | trades before a verdict |
+| `min_sessions` | `20` | sessions before a verdict |
+| `min_trades` | `20` | trades before a verdict |
 | `min_total_r` | `0.0` | total R the window must beat |
 | `min_mean_r` | `0.0` | mean R per trade it must beat |
 
@@ -614,9 +615,10 @@ Selecting the separate `options` execution profile remains paper-only and
 requires reviewed OPRA evidence and controls. The dashboard reports proved
 option edges that the default `shares` runtime cannot execute, so that evidence
 is visible rather than silently discarded.
-Multi-symbol expansion remains deferred until a known-positive end-to-end
-reproduction; partial exits remain unimplemented while broker lifecycle and
-position reconciliation risks are unresolved.
+Multi-symbol expansion is not an automatic remedy: it requires a separate
+approved universe/feed scope, exact symbol list, recorder coverage, and a new
+identity/proof epoch. Partial exits remain unimplemented while broker lifecycle
+and position reconciliation risks are unresolved.
 
 Execution calibration is disabled by default. Offline discovery/factory work
 continues, but shadow ingestion reports `calibration_disabled` until

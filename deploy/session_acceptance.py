@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from deploy import health
+from research.diagnostic_cohort_contract import validate_cohort_layout
 
 
 SCHEMA = "session-acceptance.v1"
@@ -379,6 +380,7 @@ def capture_sample(recorder_root: str | Path, shadow_health_path: str | Path,
                                       configured_symbols=symbols)
     shadow_health = health.shadow(Path(shadow_health_path), freshness, now=captured)
     diag = _diagnostic(raw_shadow, shadow_health)
+    cohort_contract = validate_cohort_layout(diag)
     errors, errors_present = _error_map(raw_shadow, diag)
     provenance = recorder_health.get("provenance")
     shadow_provenance = shadow_health.get("provenance")
@@ -429,6 +431,7 @@ def capture_sample(recorder_root: str | Path, shadow_health_path: str | Path,
             "poll_duration_seconds": raw_shadow.get(
                 "poll_duration_seconds", diag.get("poll_duration_seconds")),
             "diagnostic_shadow": diag,
+            "cohort_contract": cohort_contract,
             "provenance": shadow_provenance,
         },
         "identities": {
@@ -673,9 +676,14 @@ def _activation_marker(diag: Mapping[str, object]) -> dict | None:
 
 
 def _progress_snapshot(
-        diag: Mapping[str, object]) -> dict[str, tuple[float, str, int]] | None:
+        diag: Mapping[str, object], *,
+        candidate_ids: Sequence[str] | None = None
+        ) -> dict[str, tuple[float, str, int]] | None:
     cursors = _cursor_map(diag)
-    if len(cursors) != 24:
+    expected_ids = set(candidate_ids or ())
+    if not expected_ids or len(expected_ids) not in (24, 31):
+        return None
+    if len(cursors) != len(expected_ids) or set(cursors) != expected_ids:
         return None
     result: dict[str, tuple[float, str, int]] = {}
     for candidate_id, cursor in cursors.items():
@@ -720,12 +728,26 @@ def _diagnostic_reasons(diag: Mapping[str, object], *, max_age: float,
     elif (session_open_ts is not None and
           activation["last_inserted_at"] >= session_open_ts):
         reasons.append("activation_not_pre_session")
+    contract = validate_cohort_layout(diag)
+    declared_contract = diag.get("cohort_contract")
+    if declared_contract is not None:
+        nested = validate_cohort_layout(declared_contract)
+        if nested is None or nested != contract:
+            contract = None
     arms = diag.get("arms")
     candidates = diag.get("candidate_identities")
-    if not isinstance(arms, list) or len(arms) != 24:
+    if contract is None:
+        if not isinstance(arms, list) or len(arms) not in (24, 31):
+            reasons.append("arms_count_invalid")
+        else:
+            reasons.append("cohort_contract_invalid")
+        return reasons
+    expected_arm_count = int(contract["arm_count"])
+    if not isinstance(arms, list) or len(arms) != expected_arm_count:
         reasons.append("arms_count_invalid")
         return reasons
-    if not isinstance(candidates, list) or len(candidates) != 24 or len(set(map(str, candidates))) != 24:
+    if (not isinstance(candidates, list) or len(candidates) != expected_arm_count or
+            len(set(map(str, candidates))) != expected_arm_count):
         reasons.append("candidate_identities_invalid")
     families: dict[str, set[str]] = {}
     arm_ids: set[str] = set()
@@ -750,9 +772,14 @@ def _diagnostic_reasons(diag: Mapping[str, object], *, max_age: float,
             code_values.add(str(arm["code_identity"]))
         if _text(arm.get("cohort_identity")):
             cohort_values.add(str(arm["cohort_identity"]))
-    if len(families) != 12 or any(value != {"baseline", "variant"} for value in families.values()):
+    if (len(families) != contract["family_count"] or
+            any(value != {"baseline", "variant"}
+                for family, value in families.items() if family != "ibr") or
+            (expected_arm_count == 31 and families.get("ibr") is None) or
+            (expected_arm_count == 24 and "ibr" in families)):
         reasons.append("arm_family_coverage_invalid")
-    if isinstance(candidates, list) and len(candidates) == 24 and set(map(str, candidates)) != arm_ids:
+    if (isinstance(candidates, list) and len(candidates) == expected_arm_count and
+            set(map(str, candidates)) != arm_ids):
         reasons.append("candidate_arm_identity_mismatch")
     if len(code_values) != 1 or len(cohort_values) != 1:
         reasons.append("arm_identity_metadata_invalid")
@@ -761,7 +788,7 @@ def _diagnostic_reasons(diag: Mapping[str, object], *, max_age: float,
     if len(cohort_values) == 1 and _text(diag.get("cohort_identity")) not in cohort_values:
         reasons.append("arm_cohort_identity_mismatch")
     cursors = _cursor_map(diag)
-    if len(cursors) != 24 or set(cursors) != arm_ids:
+    if len(cursors) != expected_arm_count or set(cursors) != arm_ids:
         reasons.append("arm_cursors_missing")
     else:
         values: list[tuple[object, object, object]] = []
@@ -793,7 +820,9 @@ def _diagnostic_reasons(diag: Mapping[str, object], *, max_age: float,
             reasons.append("diagnostic_processed_events_invalid")
     if diag.get("health_cursor_matches") is False:
         reasons.append("arm_health_cursor_mismatch")
-    if diag.get("families_total") != 12 or diag.get("baseline_count") != 12 or diag.get("variant_count") != 12:
+    if (diag.get("families_total") != contract["family_count"] or
+            diag.get("baseline_count") != contract["baseline_count"] or
+            diag.get("variant_count") != contract["variant_count"]):
         reasons.append("diagnostic_family_counts_invalid")
     return reasons
 
@@ -883,6 +912,7 @@ def summarize_session(samples: Sequence[Mapping[str, object]], *, session: Mappi
     duration_values: list[float] = []
     activation_markers: list[dict] = []
     progress_snapshots: list[dict[str, tuple[float, str, int]]] = []
+    cohort_contracts: list[dict] = []
     quote_age_values: list[float] = []
     bar_event_age_values: list[float] = []
     bar_publication_lag_values: list[float] = []
@@ -927,8 +957,20 @@ def summarize_session(samples: Sequence[Mapping[str, object]], *, session: Mappi
                 duration_values.append(value)
             diag = shadow.get("diagnostic_shadow")
             if isinstance(diag, Mapping):
+                derived_contract = validate_cohort_layout(diag)
+                declared_contract = shadow.get("cohort_contract")
+                if declared_contract is None:
+                    declared_contract = diag.get("cohort_contract")
+                if declared_contract is not None:
+                    declared_contract = validate_cohort_layout(declared_contract)
+                    if declared_contract != derived_contract:
+                        derived_contract = None
+                if derived_contract is not None:
+                    cohort_contracts.append(derived_contract)
                 marker = _activation_marker(diag)
-                progress = _progress_snapshot(diag)
+                progress = _progress_snapshot(
+                    diag,
+                    candidate_ids=(derived_contract or {}).get("candidate_ids"))
                 if marker is not None and progress is not None:
                     activation_markers.append(marker)
                     progress_snapshots.append(progress)
@@ -966,6 +1008,11 @@ def summarize_session(samples: Sequence[Mapping[str, object]], *, session: Mappi
         reasons.append("identity_drift")
     if len(identity_values) != len(ordered):
         reasons.append("identity_evidence_missing")
+    cohort_contract = cohort_contracts[-1] if cohort_contracts else None
+    if (len(cohort_contracts) != len(ordered) or
+            any(contract != cohort_contract for contract in cohort_contracts)):
+        reasons.append("cohort_contract_drift")
+        cohort_contract = None
     progress_summary = {
         "arms": 0, "snapshots": len(progress_snapshots),
         "all_arms_progressed": False, "minimum_processed_events": None,
@@ -979,7 +1026,10 @@ def summarize_session(samples: Sequence[Mapping[str, object]], *, session: Mappi
         candidate_ids = set(first)
         identities_stable = all(set(snapshot) == candidate_ids
                                 for snapshot in progress_snapshots)
-        if len(candidate_ids) != 24 or not identities_stable:
+        expected_arm_count = (int(cohort_contract["arm_count"])
+                              if cohort_contract is not None else None)
+        if (expected_arm_count is None or len(candidate_ids) != expected_arm_count or
+                not identities_stable):
             reasons.append("arm_cursor_identity_drift")
         marker_stable = bool(activation_markers) and all(
             marker == activation_markers[0] for marker in activation_markers)
@@ -1005,7 +1055,8 @@ def summarize_session(samples: Sequence[Mapping[str, object]], *, session: Mappi
                    for candidate_id in candidate_ids]
                   if identities_stable else [])
         all_progressed = bool(
-            len(candidate_ids) == 24 and not regression and deltas and
+            expected_arm_count is not None and
+            len(candidate_ids) == expected_arm_count and not regression and deltas and
             all(value > 0 for value in deltas))
         if not all_progressed:
             reasons.append("session_arm_progress_missing")
@@ -1076,6 +1127,7 @@ def summarize_session(samples: Sequence[Mapping[str, object]], *, session: Mappi
         "storage_growth": _storage_growth(ordered),
         "identities": (dict(zip(("deployment", "code", "cohort", "activation"), identity_values[-1]))
                        if identity_values else {key: None for key in ("deployment", "code", "cohort", "activation")}),
+        "cohort_contract": cohort_contract,
         "warmup_sessions": sorted(warmups),
         "arm_progress": _latest_arm_progress(ordered),
         "post_activation_progress": progress_summary,

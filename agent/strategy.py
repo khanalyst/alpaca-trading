@@ -167,7 +167,7 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
             direction == "short" and not (target < entry < stop)):
         return None, "stop/target side validation failed"
     spread = _finite(symbol_snapshot.get("spread_bps"))
-    max_spread = _finite(strategy.get("max_spread_bps"), 25.0) or 25.0
+    max_spread = _finite(strategy.get("max_spread_bps"), 25.0)
     if spread is None or spread > max_spread:
         return None, "spread is unavailable or too wide"
     if symbol_snapshot.get("stale") is not False or symbol_snapshot.get("quote_stale") is not False:
@@ -266,7 +266,7 @@ def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
         return None, "IBR signal must use the next completed bar"
     # If the market adapter did not provide a precomputed signal, enforce the
     # same close/buffer/relative-volume rule here from the snapshot fields.
-    buffer_bps = _finite(strategy.get("breakout_buffer_bps"), 5.0) or 5.0
+    buffer_bps = _finite(strategy.get("breakout_buffer_bps"), 5.0)
     buffer = entry * buffer_bps / 10000.0
     close = _finite(symbol_snapshot.get("close", entry)) or entry
     if direction == "long" and close <= float(rng["high"]) + buffer:
@@ -274,7 +274,7 @@ def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
     if direction == "short" and close >= float(rng["low"]) - buffer:
         return None, "IBR close did not break the lower range"
     relative_volume = _finite(symbol_snapshot.get("relative_volume"))
-    min_rv = _finite(strategy.get("min_relative_volume"), 1.0) or 1.0
+    min_rv = _finite(strategy.get("min_relative_volume"), 1.0)
     if relative_volume is None:
         return None, "relative volume is unavailable"
     if relative_volume < min_rv:
@@ -282,7 +282,7 @@ def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
     if bool(symbol_snapshot.get("halt") or symbol_snapshot.get("halted")):
         return None, "symbol is halted"
     spread = _finite(symbol_snapshot.get("spread_bps"))
-    max_spread = _finite(strategy.get("max_spread_bps"), 25.0) or 25.0
+    max_spread = _finite(strategy.get("max_spread_bps"), 25.0)
     if spread is None:
         return None, "spread is unavailable"
     if spread > max_spread:

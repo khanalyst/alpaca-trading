@@ -59,4 +59,4 @@ This sample demonstrates that IEX volume is not consolidated market volume and t
 
 ## Retained evidence
 
-Raw registration, full arm results, normalized inputs and paired responses are retained locally under `outputs/trading-edge-completion-2026-09-08/` and on the host under `/app/runtime/research/experiments/`. They are not added to Git. The compact arm summary is suitable for the read-only dashboard diagnostics directory. The deployed runtime and completed CI are tracked in [the completion record](trading-edge-completion-2026-09-08.md).
+Raw registration, full arm results, normalized inputs and paired responses are retained locally under `outputs/trading-edge-completion-2026-09-08/` and on the host under `/app/runtime/research/experiments/`. They are not added to Git. The compact arm summary is suitable for the read-only dashboard diagnostics directory. Current deployment and verification status are tracked in [current findings](current-findings.md); the measurements on this page remain the frozen September 8 study.

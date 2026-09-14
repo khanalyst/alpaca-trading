@@ -103,6 +103,25 @@ class MarketEntryRiskMixin:
     def _bar_mapping(bar: Any, symbol: str) -> dict:
         row = _plain(bar)
         if not isinstance(row, Mapping):
+            # ``alpaca-py`` normally reaches this seam as the provider-neutral
+            # ``Bar`` dataclass, but injected/raw clients may expose a regular
+            # attribute DTO (including slots-only objects).  Keep the
+            # conversion permissive at this boundary so availability metadata
+            # can be inspected without requiring a mapping-only provider.
+            try:
+                row = dict(vars(bar))
+            except (TypeError, ValueError):
+                row = {
+                    name: getattr(bar, name)
+                    for name in (
+                        "symbol", "timestamp", "as_of", "observed_at",
+                        "interval_seconds", "open", "high", "low", "close",
+                        "volume", "trade_count", "vwap", "feed", "provider",
+                        "atr", "halt",
+                    )
+                    if hasattr(bar, name)
+                }
+        if not isinstance(row, Mapping):
             return {}
         out = dict(row)
         out["symbol"] = validate_equity_symbol(out.get("symbol") or symbol)
@@ -121,6 +140,49 @@ class MarketEntryRiskMixin:
         raw = bar.get("interval_seconds")
         interval = 60.0 if raw in (None, "") else cls._number(raw)
         return interval if interval is not None and interval > 0 else None
+
+    @classmethod
+    def _observation_availability(
+            cls, row: Mapping[str, Any], now: datetime, *, kind: str,
+    ) -> tuple[datetime | None, str | None]:
+        """Resolve a bar/quote's causal event and observation boundaries.
+
+        Raw Alpaca rows are valid even though the SDK DTO has no ``as_of`` or
+        ``observed_at`` attributes.  Those fields are therefore optional at
+        this live boundary, but when a caller supplies either one it is a
+        safety assertion: malformed, naive, non-finite, or future values make
+        that row unusable. Bar completion is checked separately; observation
+        metadata cannot make an unfinished candle eligible.
+
+        Returning a reason instead of raising keeps one bad provider row from
+        aborting the symbol/cycle while making the fail-closed decision
+        observable to callers and tests.
+        """
+        if (not isinstance(now, datetime) or now.tzinfo is None or
+                now.utcoffset() is None):
+            return None, f"{kind}_availability_clock_malformed"
+        timestamp = cls._timestamp(row.get("timestamp"))
+        if timestamp is None:
+            return None, f"{kind}_timestamp_malformed"
+        if timestamp > now:
+            return None, f"{kind}_timestamp_future"
+
+        available = timestamp
+        for field in ("as_of", "observed_at"):
+            # Provider-neutral Alpaca DTOs omit these fields.  ``None`` is the
+            # equivalent of omission for SDK objects and remains compatible
+            # with the live provider's normal response shape.  Any other
+            # explicitly present value must parse and be causal.
+            if field not in row or row.get(field) is None:
+                continue
+            boundary = cls._timestamp(row.get(field))
+            if boundary is None:
+                return None, f"{kind}_{field}_malformed"
+            if boundary > now:
+                return None, f"{kind}_{field}_future"
+            if boundary > available:
+                available = boundary
+        return available, None
 
     def _universe(self) -> list[str]:
         universe = self.cfg.get("universe", {})
@@ -182,9 +244,25 @@ class MarketEntryRiskMixin:
             except (TypeError, ValueError, AttributeError):
                 # One malformed symbol/bar row must not abort the cycle.
                 continue
-            normalized_bars = [item for item in normalized_bars
-                               if item.get("symbol") == symbol and
-                               self._timestamp(item.get("timestamp")) is not None]
+            causal_bars = []
+            for item in normalized_bars:
+                if item.get("symbol") != symbol:
+                    continue
+                _available_at, availability_reason = self._observation_availability(
+                    item, now, kind="bar")
+                if availability_reason is not None:
+                    # Keep the collector fail-closed per row: a malformed or
+                    # future bar cannot enter the feature prefix, while an
+                    # otherwise valid earlier prefix remains usable.  The
+                    # reason is deliberately explicit for operational logs
+                    # and focused tests; no provider row is trusted merely
+                    # because it was the final list item.
+                    log.debug(
+                        "market bar rejected for %s: %s", symbol,
+                        availability_reason)
+                    continue
+                causal_bars.append(item)
+            normalized_bars = causal_bars
             normalized_bars.sort(
                 key=lambda item: self._timestamp(item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc))
             normalized_bars = [item for item in normalized_bars if self._completed(item, now)]
@@ -201,9 +279,13 @@ class MarketEntryRiskMixin:
                     for flag in ("stale", "quote_stale"))
                 if quote_flags_invalid or quote_item.get("stale") is True or quote_item.get("quote_stale") is True:
                     continue
-                quote_ts = self._timestamp(quote_item.get("timestamp"))
-                if quote_ts is None:
+                _available_at, availability_reason = self._observation_availability(
+                    quote_item, now, kind="quote")
+                if availability_reason is not None:
+                    log.debug("market quote rejected for %s: %s", symbol,
+                              availability_reason)
                     continue
+                quote_ts = self._timestamp(quote_item.get("timestamp"))
                 normalized_quotes.append((quote_ts, quote_item))
             # Provider order is not an ordering contract; choose the newest
             # valid, aware quote rather than trusting the final list item.

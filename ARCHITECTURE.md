@@ -126,7 +126,10 @@ A normal cycle follows these gates:
 5. Load the permitted universe and collect the latest valid bars, quotes, and
    (for the option profile) option-chain snapshots.
 6. Resolve a vehicle-compatible proved edge from the research ledger and
-   generate its deterministic rule/IBR signal.
+   generate its deterministic rule/IBR signal. The separately enabled
+   [paper-incumbent trial](docs/paper-shadow-trials.md) instead resolves one
+   frozen diagnostic rule under its account-bound paper-only contract; it
+   creates no validated-edge proof and leaves the other safety gates intact.
 7. Build a setup plan, then let `RiskEngine` validate prices, stops, daily P&L,
    gross/open risk, option identity, liquidity, freshness, debit, multiplier,
    and contract count.

@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from agent.contracts.rule import RULE_FAMILIES, rule_variant_id, validate_rule_spec
 from agent.registry import validate_contract_config
 from agent.variants import apply as apply_variant, load_registry
+from research.diagnostic_cohort_contract import validate_cohort_layout
 from research.factory_core import template_hypothesis
 
 
@@ -359,6 +360,10 @@ def build_diagnostic_cohort(runtime_config: Mapping[str, Any], *,
         "arms": arms,
         "candidate_identities": [str(arm["candidate_id"]) for arm in arms],
     })
+    contract = validate_cohort_layout(result)
+    if contract is None:  # pragma: no cover - catalog changes fail closed
+        raise RuntimeError("diagnostic cohort contract is invalid")
+    result["cohort_contract"] = contract
     return result
 
 

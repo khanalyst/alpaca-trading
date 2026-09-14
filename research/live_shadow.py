@@ -55,6 +55,7 @@ from research.diagnostic_shadow import (
     DIAGNOSTIC_COHORT_SCHEMA, build_diagnostic_cohort,
     is_diagnostic_candidate,
 )
+from research.diagnostic_cohort_contract import validate_cohort_layout
 from research.diagnostic_accounts import (
     ACCOUNT_SCHEMA as DIAGNOSTIC_ACCOUNT_SCHEMA,
     FILL_SCHEMA as DIAGNOSTIC_FILL_SCHEMA,
@@ -287,6 +288,9 @@ def _validated_diagnostic_cohort(value: Any, *,
     digest = str(value.get("cohort_digest") or "")
     if expected_identity != f"{DIAGNOSTIC_CANDIDATE_PREFIX}cohort:{digest}":
         raise ShadowError("diagnostic shadow cohort digest mismatch")
+    contract = validate_cohort_layout(value)
+    if contract is None:
+        raise ShadowError("diagnostic shadow cohort layout is invalid")
     include_ibr = value.get("include_ibr", False)
     if not isinstance(include_ibr, bool):
         raise ShadowError("diagnostic shadow cohort IBR mode is invalid")
@@ -294,6 +298,8 @@ def _validated_diagnostic_cohort(value: Any, *,
     expected_families = 13 if include_ibr else 12
     expected_baselines = 13 if include_ibr else 12
     expected_variants = 18 if include_ibr else 12
+    if contract["arm_count"] != expected_arms:
+        raise ShadowError("diagnostic shadow cohort arm structure is invalid")
     arms = value.get("arms")
     if not isinstance(arms, list) or len(arms) != expected_arms:
         raise ShadowError("diagnostic shadow cohort arm structure is invalid")
@@ -3953,6 +3959,7 @@ class ShadowRunner:
                 "families_total": 12, "families_covered": 0,
                 "families_missing": [], "baseline_count": 0,
                 "variant_count": 0, "candidate_identities": [],
+                "cohort_contract": None,
                 "decision_counts": {"total": 0, "this_poll": 0, "by_kind": {}},
                 "rejection_counts": {"reject": 0, "preactivation": 0},
                 "quoteable_virtual_opens": 0, "unpriced_virtual_opens": 0,
@@ -4120,6 +4127,7 @@ class ShadowRunner:
             "activation_status": ("active" if activation_identity else "preregistered"),
             "warmup_session": warmup_session,
             "candidate_identities": sorted(candidate_ids),
+            "cohort_contract": cohort.get("cohort_contract"),
             "arms": [{
                 "candidate_id": arm.get("candidate_id"),
                 "strategy_id": arm.get("strategy_id"),

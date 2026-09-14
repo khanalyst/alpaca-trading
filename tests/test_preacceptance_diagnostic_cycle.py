@@ -234,14 +234,34 @@ def _terminal(result: subprocess.CompletedProcess) -> dict:
 class PreacceptanceDiagnosticCycleTests(unittest.TestCase):
     def test_default_underpowered_cycle_still_exits_before_measurement(self):
         with tempfile.TemporaryDirectory() as directory:
-            result, calls = _run(Path(directory), opt_in=False)
+            root = Path(directory)
+            result, calls = _run(root, opt_in=False)
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(_terminal(result)["status"],
                          "waiting_for_forward_sessions")
+        census = next(call for call in calls
+                      if call and call[0].endswith("/research_census.py"))
+        self.assertEqual(census[census.index("--runtime-config") + 1],
+                         str(root / "config.json"))
+        self.assertEqual(census[census.index("--shadow-health") + 1],
+                         str(root / "health.json"))
+        self.assertEqual(census[census.index("--shadow-db") + 1],
+                         str(root / "shadow.sqlite3"))
         self.assertFalse(any(call[:2] == ["-m", "research.diagnostic_suite"]
                              for call in calls))
         self.assertFalse(any("llm-preflight" in call for call in calls))
+
+    def test_cycle_forwards_explicit_ibr_epoch_mode_to_census(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls = _run(
+                Path(directory), opt_in=False,
+                overrides={"ALPACA_SHADOW_INCLUDE_IBR": "1"})
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        census = next(call for call in calls
+                      if call and call[0].endswith("/research_census.py"))
+        self.assertIn("--diagnostic-include-ibr", census)
 
     def test_opt_in_runs_only_bounded_diagnostic_then_restores_wait(self):
         with tempfile.TemporaryDirectory() as directory:

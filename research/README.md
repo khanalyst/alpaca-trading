@@ -28,12 +28,13 @@ trader, and dashboard with one plain `docker compose up -d` command; systemd
 uses the same defaults.
 
 The recorder samples on a fixed 30-second cadence and keeps durable per-symbol
-quote and completed-bar watermarks. Research readiness requires both watermarks
-to be no older than 30 seconds for each required symbol; a quote watermark
-cannot stand in for a bar watermark. Exact Alpaca calendar metadata records
-holidays and early closes. Scheduler liveness is reported separately from
-research evidence/readiness, so an alive scheduler is not evidence of a ready
-corpus or a validated edge.
+quote and completed-bar watermarks. Research readiness requires quote age no
+older than 30 seconds and completed bars no more than 30 seconds past their next
+publication deadline for each required symbol; a quote watermark cannot stand
+in for a bar watermark. Raw bar age remains telemetry. Exact Alpaca calendar
+metadata records holidays and early closes. Scheduler liveness is reported
+separately from research evidence/readiness, so an alive scheduler is not
+evidence of a ready corpus or a validated edge.
 
 ## Normalized data
 
@@ -88,13 +89,18 @@ The authorizing evidence floors are immutable: backtest/factory windows require
 100 trades, 30 complete sessions, and 30 session clusters; qualification
 requires 100 trades and 30 complete sessions/clusters; the parity-matched
 live-shadow tail requires 150 trades and 30 complete sessions. These are
-evidence floors, not tuning knobs. The shipped default universe is 24 liquid
-ETFs spanning broad-market, size, sector, international, rates/credit, metals,
-and semiconductor exposures (the exact list is in `config.yaml`), improving
-opportunity capacity, but real signal rates still require sufficient history.
-Replay allows at most one trade per symbol-session; floor feasibility fails
-closed when a required floor cannot be supported. Widen history and/or
-`universe.symbols`, never lower a floor.
+evidence floors, not tuning knobs. The shipped default universe is a fixed
+24-symbol ETF list spanning broad-market, size, sector, international,
+rates/credit, metals, and semiconductor exposures (the exact list is in
+`config.yaml`). This is a configuration fact, not a measured capacity claim.
+Real signal rates and floor feasibility still require valid observations.
+Diagnose symbol/feed coverage and collect valid forward-observed evidence;
+historical backfill can support diagnostics but cannot count as accepted forward
+proof. Replay allows at most one trade per symbol-session; floor feasibility
+fails closed when a required floor cannot be supported. A symbol expansion is
+not an automatic remedy: it requires a separate approved universe/feed scope,
+exact list, recorder coverage, and a new identity/proof epoch. Never lower a
+floor.
 
 Qualification is powered at a minimum of 100 trades, 30 complete sessions, and
 30 session-level clusters. Replay epoch 6 retains the epoch-5 point-in-time,
@@ -349,10 +355,11 @@ frozen into a hash-verified map. Strong clusters receive an additional
 cluster-level BY veto, and runtime allocation admits at most the strongest edge
 per verified frozen cluster; an unavailable map never grants independence.
 
-Remaining extension boundaries are explicit. Universe expansion requires an
+Remaining extension boundaries are explicit. Universe expansion is a separate
+approved universe/feed scope, not an automatic remedy; it requires an
 operator-approved exact symbol list, recorder coverage for that list, and a new
-identity/proof. Event conditioning requires a point-in-time event source with
-provider, `as_of`, and observation provenance. Prior-session, true
+identity/proof epoch. Event conditioning requires a point-in-time event source
+with provider, `as_of`, and observation provenance. Prior-session, true
 multi-timeframe, and cross-sectional features require explicit replay context;
 missing or ambiguous context fails closed. Shadow quarantine is not an auto-skip:
 an unresolved session blocks watermark/FDR advancement until source correction

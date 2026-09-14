@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from agent.config import ConfigError, load_config as load_runtime_config
+from agent.contracts.rule import RULE_FAMILIES
 from deploy import dashboard, health, shadow as shadow_service
 from research.diagnostic_shadow import build_diagnostic_cohort
 
@@ -22,14 +23,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _diagnostic_coverage(*, source_lag: float | None = 5.0,
                          active: bool = True, now: float = 100.0) -> dict:
-    families = [f"family_{index}" for index in range(12)]
+    families = list(RULE_FAMILIES)
     arms = []
     candidate_ids = []
     code_identity = "diagnostic-code"
     cohort_identity = "diagnostic-cohort"
     for family in families:
         for role in ("baseline", "variant"):
-            candidate_id = f"shadow:{family}:{role}"
+            candidate_id = f"shadow:diagnostic:{family}:{role}"
             candidate_ids.append(candidate_id)
             arms.append({
                 "candidate_id": candidate_id,

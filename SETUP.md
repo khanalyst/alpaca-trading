@@ -16,10 +16,12 @@ systems:
 2. **A trader** that is *forbidden from placing any order* until the research
    side has produced a rule that survived every test.
 
-On a brand-new install the trader will start, connect, report healthy — and
-place no trades at all, possibly for weeks. **That is the system working
-correctly, not a fault.** Most of this guide is about getting the research side
-fed and readable so that silence is informative rather than worrying.
+In the default validated-edge mode, a brand-new install's trader will start,
+connect, report healthy — and place no trades at all, possibly for weeks. **That
+is the system working correctly, not a fault.** Most of this guide is about
+getting the research side fed and readable so that silence is informative rather
+than worrying. The separate opt-in [paper-incumbent trial](docs/paper-shadow-trials.md)
+has its own guarded profile and is not part of this default setup.
 
 ### Words you will meet
 
@@ -48,9 +50,10 @@ fed and readable so that silence is informative rather than worrying.
 | First live-shadow-validated edge | Trader begins placing paper trades under risk limits. |
 | Ongoing | Proved rules are not re-tuned; lifecycle and safety guards still monitor them while slots keep searching. |
 
-**Without a historical backfill this takes months** — the recorder only samples
-forward in real time. Step 10 fixes that and is the single biggest thing you
-can do to shorten the wait.
+**Without a historical backfill, diagnostic research starts months behind** — the
+recorder only samples forward in real time. Backfill can accelerate diagnostics,
+but it does not count as accepted forward evidence; valid forward collection is
+still required for authorizing gates.
 
 ### What you need before starting
 
@@ -272,12 +275,15 @@ takes:
 **`universe.symbols`** defaults to `["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "VTI", "VO", "VB", "EFA", "EEM", "TLT", "HYG", "GLD", "SLV", "SMH"]`.
 Research takes at most one trade per symbol per session, so the 100-trade
 evidence floor is as much a *universe width* requirement as a history-length
-one. The 24-symbol default improves opportunity capacity, but real signal
-rates still require sufficient history. Floor feasibility fails closed when the
-100-trade floor cannot be supported; widen history and/or `universe.symbols`,
-never lower the floor. Any expansion requires an operator-approved exact list,
-recorded coverage for that list, and a new candidate identity/proof; it is not a
-parameter-only tuning arm. Keep the list to US equity/ETF symbols.
+one. The shipped default is a fixed 24-symbol ETF list, not a measured capacity
+claim; real signal rates still require sufficient history and valid observations.
+Diagnose symbol/feed coverage and collect valid forward-observed evidence.
+Historical backfill can support diagnostics, but cannot count as accepted forward
+proof. Floor feasibility fails closed when the 100-trade floor cannot be
+supported. A symbol expansion is not an automatic remedy: it requires a
+separately approved universe/feed scope, exact list, recorder coverage, and a new
+identity/proof epoch; never lower the floor. Keep the list to US equity/ETF
+symbols.
 
 Future event conditioning requires a point-in-time event source with provider,
 `as_of`, and observation provenance. Prior-session, true multi-timeframe, and
@@ -419,7 +425,9 @@ docker compose run --rm trader python main.py flatten --reason paper-smoke-recov
 
 ## 10. Backfill historical market data
 
-This is the step that turns "months before anything happens" into "days".
+This step seeds diagnostic history quickly; it does not turn historical rows into
+accepted forward evidence. The recorder still must collect valid forward
+sessions for authorizing gates.
 
 The recorder only samples forward in real time, so a fresh install has no
 history. Backfill fetches completed sessions from Alpaca and writes the
@@ -526,9 +534,10 @@ docker compose logs --tail=150 trader
 docker compose exec -T watchdog python deploy/health.py watchdog
 ```
 
-**Expected:** the trader starts, reports healthy, and places **no trades**. On
-a fresh deployment it must remain idle because no live-shadow-marked validated
-edge exists. Do not
+**Expected:** the trader starts, reports healthy, and places **no trades**. In
+the default validated-edge mode, a fresh deployment must remain idle because no
+live-shadow-marked validated edge exists. The separate opt-in [paper-incumbent
+trial](docs/paper-shadow-trials.md) has its own guarded profile. Do not
 disable `research.require_validated_variant` to force entries — that guard is
 part of the boundary standing between you and trading an unproven or
 live-shadow-unmarked rule.
@@ -722,8 +731,10 @@ independence.
 The trade floors bind separately — 100 executed trades in each partition — and
 the arithmetic above assumes every session produces trades, which no strategy
 does. Treat the resulting multi-month corpus requirement as a floor on
-patience, not a schedule. This is why step 10 and a wider `universe.symbols`
-matter so much.
+patience, not a schedule. Diagnose symbol/feed coverage and collect valid
+forward evidence; historical backfill can support diagnostics only. A universe
+expansion requires a separate approved universe/feed scope and a new
+identity/proof epoch, so it is not an automatic remedy.
 
 Those are development/promotion floors. Complete statistical rejection is
 stricter: each variant also needs at least 30 held-out sessions, a 95%
@@ -732,8 +743,9 @@ negative rolling-forward windows. Until then the report says `underpowered` or
 `adequate_negative_inconclusive`; it does not call the edge disproved.
 
 Live shadow requires at least 150 trades across 30 complete, parity-matched
-sessions. A separate paper trial is reviewed only after its configured 100
-trades across 30 sessions. Replay epoch 6 retains epoch-5 boundaries and also
+sessions. The nonauthorizing paper-incumbent review requires 20 accepted full
+sessions and 20 closed parent outcomes, and pauses for review at its 60-session
+maximum. Replay epoch 6 retains epoch-5 boundaries and also
 seals paired synthetic root-control shadow replays, diagnostic historical-
 backfill provenance with exact calendar metadata, durable live-shadow FDR
 binding, chronological paired inference, finite BY input validation, and
@@ -758,9 +770,11 @@ intended versus delivered risk, provider/feed provenance, pricing source,
 configured limits, and pass/fail/unknown row counts for operator review; they do
 not expand exits or authorize proof.
 
-Multi-symbol expansion is deferred until a known-positive end-to-end
-reproduction. Partial exits remain unimplemented because broker lifecycle and
-position reconciliation risks have not been accepted for production.
+Multi-symbol expansion is not an automatic remedy: it requires a separate
+approved universe/feed scope, exact symbol list, recorder coverage, and a new
+identity/proof epoch. Partial exits remain unimplemented because broker
+lifecycle and position reconciliation risks have not been accepted for
+production.
 
 ## 14. Read the reports
 
@@ -1022,8 +1036,8 @@ place.
 | --- | --- | --- |
 | Trader healthy but never trades | No live-shadow-marked validated edge yet | Expected. Check `factory report`, ShadowRunner, and `edge ingest-shadow`. |
 | `research-cycle` says `no_data` | Corpus empty or path wrong | Re-run step 10; check the recorder volume. |
-| `research-cycle` says `completed_no_edge` every night | Normal, or too little data | Check `factory report` — if variants show `underpowered`, widen `universe.symbols` and backfill more. |
-| Every variant fails only on "held-out sample big enough" | Universe too narrow | Add symbols. This is the most common first-deployment wall. |
+| `research-cycle` says `completed_no_edge` every night | Normal, or too little data | Check `factory report`, recorder readiness, and exact symbol/feed coverage; collect valid forward-observed evidence. Historical backfill is diagnostic only. |
+| Every variant fails only on "held-out sample big enough" | Coverage or corpus may be insufficient | Diagnose symbol/feed coverage and source provenance; collect valid forward evidence. Do not add symbols automatically: expansion requires a separate approved universe/feed scope, recorder coverage, and a new identity/proof epoch. |
 | Authentication fails | Live keys in the paper file, or unentitled feed | Recheck step 5. |
 | `docker compose config` errors | Missing export | Re-run step 8. |
 | Watchdog says `acted` | It flattened a stale trader's positions | Reconcile per OPERATIONS.md before restarting. |

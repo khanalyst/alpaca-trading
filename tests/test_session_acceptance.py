@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from agent.contracts.rule import RULE_FAMILIES
 from deploy import shadow as shadow_service
 from deploy.session_acceptance import (
     DIAGNOSTIC_COVERAGE_SCHEMA,
@@ -43,8 +44,7 @@ SESSION = {
 def _arms(processed_events: int, cursor_at: float) -> tuple[list[dict], dict]:
     arms = []
     cursors = {}
-    for family_number in range(12):
-        family = f"family_{family_number:02d}"
+    for family in RULE_FAMILIES:
         for role in ("baseline", "variant"):
             candidate = f"shadow:diagnostic:{family}:{role}"
             arms.append({

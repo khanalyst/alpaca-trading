@@ -13,6 +13,7 @@ from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import stat
@@ -140,6 +141,20 @@ def resolve_catalog_arm(variant_id: str) -> dict[str, Any]:
     return _plain(matches[0])
 
 
+def _paper_trial_include_ibr() -> bool:
+    """Resolve the canonical diagnostic cohort mode for paper trials.
+
+    Compose owns the deployment-specific default, while this process must be
+    safe when run directly outside Compose.  Keep the raw value strict so a
+    typo cannot silently select a different frozen cohort.
+    """
+    value = os.environ.get("ALPACA_SHADOW_INCLUDE_IBR", "0")
+    if value not in {"0", "1"}:
+        raise PaperTrialError(
+            "ALPACA_SHADOW_INCLUDE_IBR must be exactly 0 or 1")
+    return value == "1"
+
+
 def runtime_code_identity(root: str | Path | None = None) -> str:
     """Match the bounded code identity used by diagnostic live shadow."""
     repo = Path(root) if root is not None else Path(__file__).resolve().parents[1]
@@ -189,8 +204,10 @@ def build_descriptor(config: Mapping[str, Any]) -> dict[str, Any]:
     if block.get("enabled") is not True:
         raise PaperTrialError("paper trial is not enabled")
     arm = resolve_catalog_arm(str(block.get("variant_id") or ""))
+    include_ibr = _paper_trial_include_ibr()
     code_identity = runtime_code_identity()
-    cohort = build_diagnostic_cohort(config, code_identity=code_identity)
+    cohort = build_diagnostic_cohort(
+        config, code_identity=code_identity, include_ibr=include_ibr)
     candidates = [candidate for candidate in cohort.get("arms", ())
                   if isinstance(candidate, Mapping) and
                   candidate.get("variant_id") == arm.get("variant_id")]
@@ -207,6 +224,7 @@ def build_descriptor(config: Mapping[str, Any]) -> dict[str, Any]:
         "role": str(arm.get("role") or ""),
         "spec_identity": str(arm.get("spec_identity") or ""),
         "cohort_identity": str(cohort.get("cohort_identity") or ""),
+        "include_ibr": include_ibr,
         "code_identity": code_identity,
         "policy": policy,
         "policy_identity": content_identity(policy),
@@ -268,6 +286,7 @@ def new_state(descriptor: Mapping[str, Any], config: Mapping[str, Any], *,
         "spec_identity": descriptor["spec_identity"],
         "code_identity": descriptor["code_identity"],
         "cohort_identity": descriptor["cohort_identity"],
+        "include_ibr": descriptor.get("include_ibr", False),
         "report_identities": {
             "deployment": None,
             "code": descriptor["code_identity"],
@@ -307,6 +326,12 @@ def validate_state(value: Mapping[str, Any] | None) -> dict[str, Any]:
                 "cohort_identity", "accepted_session_report_root"):
         if not isinstance(result.get(key), str) or not result[key].strip():
             raise PaperTrialError(f"paper_trial runtime {key} is invalid")
+    include_ibr = result.get("include_ibr", False)
+    if not isinstance(include_ibr, bool):
+        raise PaperTrialError("paper_trial runtime include_ibr is invalid")
+    # States written before cohort mode was frozen are the original 24-arm
+    # mode.  Normalize that omission for identity comparisons and persistence.
+    result["include_ibr"] = include_ibr
     activated = result.get("activation_confirmed")
     activation_fingerprint = result.get("activation_account_fingerprint")
     if not isinstance(activated, bool):
@@ -356,11 +381,13 @@ def validate_state(value: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def _same_incumbent(state_value: Mapping[str, Any],
                     descriptor: Mapping[str, Any]) -> bool:
-    return all(state_value.get(key) == descriptor.get(key) for key in (
+    return (state_value.get("include_ibr", False) ==
+            descriptor.get("include_ibr", False) and
+            all(state_value.get(key) == descriptor.get(key) for key in (
         "trial_id", "candidate_id", "variant_id", "incumbent_identity",
         "policy_identity", "spec_identity", "code_identity", "cohort_identity",
         "accepted_session_report_root", "max_review_sessions",
-    ))
+    )))
 
 
 def _order_status(value: Any) -> str:

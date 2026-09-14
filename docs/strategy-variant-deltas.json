@@ -1,0 +1,151 @@
+{
+  "all_one_coordinate": true,
+  "pair_count": 12,
+  "pairs": [
+    {
+      "baseline_id": "rule.cross-sectional-residual.374375e771a64864",
+      "changes": {
+        "threshold_bps": {
+          "baseline": 12,
+          "variant": 16
+        }
+      },
+      "family": "cross_sectional_residual",
+      "one_coordinate": true,
+      "variant_id": "rule.cross-sectional-residual.2969f7f47855f157"
+    },
+    {
+      "baseline_id": "rule.mean-reversion.e8a26abe2aef631e",
+      "changes": {
+        "zscore": {
+          "baseline": 1.5,
+          "variant": 1.75
+        }
+      },
+      "family": "mean_reversion",
+      "one_coordinate": true,
+      "variant_id": "rule.mean-reversion.9fb941032e03c02b"
+    },
+    {
+      "baseline_id": "rule.momentum-continuation.fe74f73cfc7d082a",
+      "changes": {
+        "threshold_bps": {
+          "baseline": 18,
+          "variant": 24
+        }
+      },
+      "family": "momentum_continuation",
+      "one_coordinate": true,
+      "variant_id": "rule.momentum-continuation.984cbcedd4a2846a"
+    },
+    {
+      "baseline_id": "rule.opening-drive.393e7229056fc663",
+      "changes": {
+        "threshold_bps": {
+          "baseline": 30,
+          "variant": 40
+        }
+      },
+      "family": "opening_drive",
+      "one_coordinate": true,
+      "variant_id": "rule.opening-drive.560520e6c8c85b1e"
+    },
+    {
+      "baseline_id": "rule.opening-range-breakout.0eb200d3136d80ee",
+      "changes": {
+        "threshold_bps": {
+          "baseline": 5,
+          "variant": 8
+        }
+      },
+      "family": "opening_range_breakout",
+      "one_coordinate": true,
+      "variant_id": "rule.opening-range-breakout.4b10682772f81284"
+    },
+    {
+      "baseline_id": "rule.opening-range-fade.d5785d9e70b56def",
+      "changes": {
+        "threshold_bps": {
+          "baseline": 8,
+          "variant": 12
+        }
+      },
+      "family": "opening_range_fade",
+      "one_coordinate": true,
+      "variant_id": "rule.opening-range-fade.be61630d346f0923"
+    },
+    {
+      "baseline_id": "rule.range-expansion.a9871756f22463a5",
+      "changes": {
+        "volume_multiplier": {
+          "baseline": 2,
+          "variant": 2.5
+        }
+      },
+      "family": "range_expansion",
+      "one_coordinate": true,
+      "variant_id": "rule.range-expansion.f7fd1b25f2f95ba6"
+    },
+    {
+      "baseline_id": "rule.trend-pullback.a2b51fa10dd145fd",
+      "changes": {
+        "threshold_bps": {
+          "baseline": 15,
+          "variant": 20
+        }
+      },
+      "family": "trend_pullback",
+      "one_coordinate": true,
+      "variant_id": "rule.trend-pullback.946cfe961a9f767d"
+    },
+    {
+      "baseline_id": "rule.volatility-breakout.651520055477ae38",
+      "changes": {
+        "compression_bps": {
+          "baseline": 55,
+          "variant": 65
+        }
+      },
+      "family": "volatility_breakout",
+      "one_coordinate": true,
+      "variant_id": "rule.volatility-breakout.30aa361de5e11ca7"
+    },
+    {
+      "baseline_id": "rule.volume-breakout.30fece6e3f9b9fd6",
+      "changes": {
+        "volume_multiplier": {
+          "baseline": 1.5,
+          "variant": 1.75
+        }
+      },
+      "family": "volume_breakout",
+      "one_coordinate": true,
+      "variant_id": "rule.volume-breakout.a68b65c3c8e96ff4"
+    },
+    {
+      "baseline_id": "rule.vwap-reversion.ab97bfe87ed566de",
+      "changes": {
+        "threshold_bps": {
+          "baseline": 25,
+          "variant": 35
+        }
+      },
+      "family": "vwap_reversion",
+      "one_coordinate": true,
+      "variant_id": "rule.vwap-reversion.cf8b38b12c9bf952"
+    },
+    {
+      "baseline_id": "rule.vwap-trend.349de232c3d7a18c",
+      "changes": {
+        "threshold_bps": {
+          "baseline": 8,
+          "variant": 12
+        }
+      },
+      "family": "vwap_trend",
+      "one_coordinate": true,
+      "variant_id": "rule.vwap-trend.588bc47ed64d051e"
+    }
+  ],
+  "schema": "rule-variant-delta-review.v1"
+}

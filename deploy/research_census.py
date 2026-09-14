@@ -17,6 +17,7 @@ import json
 import math
 from pathlib import Path
 import re
+import sqlite3
 import stat
 import sys
 from typing import Iterable
@@ -40,6 +41,8 @@ MAX_METADATA_BYTES = 1024 * 1024
 MAX_PARTITIONS = 100_000
 MAX_ACCEPTANCE_FRESHNESS_SECONDS = 30.0
 CLOCK_SKEW_TOLERANCE_SECONDS = 5.0
+MAX_EPOCH_CONTEXT_AGE_SECONDS = 180.0
+EPOCH_CONTEXT_SCHEMA = "research-epoch-context.v1"
 
 
 class CensusError(ValueError):
@@ -77,6 +80,134 @@ def _nonnegative_int(value: object) -> int | None:
     return value
 
 
+def _identity(value: object) -> str | None:
+    """Return one bounded non-empty identity token."""
+    if not isinstance(value, str) or not value or len(value) > 256 or value != value.strip():
+        return None
+    if value.lower() in {"unknown", "unset", "none", "null", "unavailable"}:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return None
+    return value
+
+
+def _symbols(value: object) -> list[str] | None:
+    """Normalize an exact configured symbol catalog, rejecting drift."""
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        symbol = item.strip().upper()
+        if not symbol or symbol != item.strip() or symbol in result:
+            return None
+        result.append(symbol)
+    return sorted(result)
+
+
+def _cohort_layout(value: object) -> dict | None:
+    """Validate the shared diagnostic cohort contract."""
+    try:
+        from research.diagnostic_cohort_contract import validate_cohort_layout
+    except ImportError as exc:
+        raise CensusError("diagnostic cohort contract is unavailable") from exc
+    try:
+        validated = validate_cohort_layout(value)
+    except (TypeError, ValueError):
+        validated = None
+    return dict(validated) if isinstance(validated, Mapping) else None
+
+
+def _context_identities(value: Mapping[str, object]) -> dict[str, str | None]:
+    provenance = value.get("provenance")
+    provenance = provenance if isinstance(provenance, Mapping) else {}
+    return {
+        "deployment": _identity(provenance.get("identity")),
+        "code": _identity(value.get("code_identity")),
+        "cohort": _identity(value.get("cohort_identity")),
+        "activation": _identity(value.get("activation_identity")),
+    }
+
+
+def _normalize_context(value: Mapping[str, object] | None) -> dict | None:
+    """Normalize the explicit current-epoch context supplied by the caller.
+
+    The accepted shape is the ``research-epoch-context.v1`` envelope with
+    ``verified``/``updated_ts``, four ``identities`` (deployment, code, cohort,
+    activation), exact ``expected_symbols``, validated ``cohort_contract``,
+    and runtime/policy ``config_identities``.  No report-provided aliases or
+    opaque epoch fields are inferred here.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    raw_identities = value.get("identities")
+    identities = (dict(raw_identities)
+                  if isinstance(raw_identities, Mapping) else None)
+    symbols = _symbols(value.get("expected_symbols"))
+    contract = _cohort_layout(value.get("cohort_contract"))
+    updated = _number(value.get("updated_ts"))
+    raw_configs = value.get("config_identities")
+    config_identities = (dict(raw_configs)
+                         if isinstance(raw_configs, Mapping) else None)
+    return {
+        "schema": value.get("schema"),
+        "verified": value.get("verified") is True,
+        "context_error": _identity(value.get("context_error")),
+        "updated_ts": updated,
+        "identities": identities,
+        "expected_symbols": symbols,
+        "cohort_contract": contract,
+        "config_identities": config_identities,
+        "include_ibr": value.get("include_ibr"),
+    }
+
+
+def _context_reason(value: Mapping[str, object] | None, *, now: datetime) -> str | None:
+    """Return a fail-closed reason for a current epoch context."""
+    context = _normalize_context(value)
+    if context is None:
+        return "current epoch context is missing"
+    if context.get("context_error"):
+        return str(context["context_error"])
+    if context.get("verified") is not True:
+        return "current epoch context is not verified"
+    if context.get("schema") != EPOCH_CONTEXT_SCHEMA:
+        return "current epoch context schema is invalid"
+    identities = context.get("identities")
+    if (not isinstance(identities, Mapping) or any(
+            not _identity(identities.get(key))
+            for key in ("deployment", "code", "cohort", "activation"))):
+        return "current epoch identities are incomplete"
+    if context.get("expected_symbols") is None:
+        return "current epoch expected symbols are missing"
+    if context.get("cohort_contract") is None:
+        return "current epoch cohort contract is invalid"
+    contract = context["cohort_contract"]
+    if (not isinstance(contract, Mapping) or
+            contract.get("code_identity") != identities.get("code") or
+            contract.get("cohort_identity") != identities.get("cohort")):
+        return "current epoch cohort identities are inconsistent"
+    include_ibr = context.get("include_ibr")
+    if (not isinstance(include_ibr, bool) or
+            contract.get("arm_count") != (31 if include_ibr else 24)):
+        return "current epoch cohort mode is inconsistent"
+    config_identities = context.get("config_identities")
+    if (not isinstance(config_identities, Mapping) or any(
+            not _identity(config_identities.get(key))
+            for key in ("runtime", "policy"))):
+        return "current epoch config identities are incomplete"
+    updated = context.get("updated_ts")
+    if updated is None:
+        return "current epoch context freshness is missing"
+    now_ts = now.timestamp()
+    if updated > now_ts + CLOCK_SKEW_TOLERANCE_SECONDS:
+        return "current epoch context timestamp is in the future"
+    if now_ts - updated > MAX_EPOCH_CONTEXT_AGE_SECONDS:
+        return "current epoch context is stale"
+    return None
+
+
 def _regular_file(path: Path, *, label: str, max_bytes: int | None = None) -> int:
     if path.is_symlink():
         raise CensusError(f"{label} must not be a symlink: {path}")
@@ -111,6 +242,163 @@ def _read_object(path: Path, *, label: str, required: bool = False) -> dict | No
     if not isinstance(value, dict):
         raise CensusError(f"{label} must be a JSON object: {path}")
     return value
+
+
+def _read_immutable_activation(path: Path, cohort_identity: str) -> dict:
+    """Read one activation row from the shadow WAL without opening writes."""
+    if path.is_symlink():
+        raise CensusError(f"shadow database must not be a symlink: {path}")
+    _regular_file(path, label="shadow database")
+    try:
+        # ``mode=ro`` is important: census is a read-only preflight and must
+        # not create a SQLite journal, repair the WAL, or mutate its metadata.
+        uri = f"file:{path.resolve()}?mode=ro"
+        database = sqlite3.connect(uri, uri=True)
+        try:
+            row = database.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (f"diagnostic-shadow-activation.v1:{cohort_identity}",),
+            ).fetchone()
+        finally:
+            database.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise CensusError(f"current epoch activation metadata is unavailable: {exc}") from exc
+    if row is None:
+        raise CensusError("current epoch activation metadata is missing")
+    try:
+        value = json.loads(row[0])
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CensusError("current epoch activation metadata is malformed") from exc
+    if not isinstance(value, Mapping):
+        raise CensusError("current epoch activation metadata is malformed")
+    try:
+        from research.live_shadow import _validated_diagnostic_activation
+        value = _validated_diagnostic_activation(
+            value, cohort_identity=cohort_identity)
+    except ImportError as exc:
+        raise CensusError("current epoch activation validator is unavailable") from exc
+    except Exception as exc:
+        raise CensusError(f"current epoch activation metadata is invalid: {exc}") from exc
+    return dict(value)
+
+
+def load_current_epoch_context(*, shadow_health: Path,
+                               shadow_db: Path,
+                               recorded_root: Path,
+                               runtime_config_path: Path,
+                               now: datetime | None = None,
+                               max_age_seconds: float = MAX_EPOCH_CONTEXT_AGE_SECONDS,
+                               expected_deployment: str | None = None,
+                               include_ibr: bool = False) -> dict:
+    """Build a verified context from mounted shadow health and activation.
+
+    The health heartbeat supplies the current code/cohort/activation catalog;
+    the immutable activation row supplies the binding that prevents a forged
+    or stale heartbeat from selecting a prior epoch.  Recorder symbols are
+    read from its index, never from an acceptance report.
+    """
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise CensusError("current epoch context time must be timezone-aware")
+    current = current.astimezone(timezone.utc)
+    if (isinstance(max_age_seconds, bool) or
+            not isinstance(max_age_seconds, (int, float)) or
+            not math.isfinite(float(max_age_seconds)) or max_age_seconds <= 0):
+        raise CensusError("current epoch context freshness bound is invalid")
+    if not isinstance(include_ibr, bool):
+        raise CensusError("current epoch diagnostic IBR mode is invalid")
+    health = _read_object(Path(shadow_health), label="shadow health", required=True)
+    assert health is not None
+    if health.get("schema") != "shadow-health.v1":
+        raise CensusError("current epoch shadow health schema is invalid")
+    updated = _number(health.get("updated_ts"))
+    if updated is None:
+        raise CensusError("current epoch shadow health timestamp is invalid")
+    now_ts = current.timestamp()
+    if updated > now_ts + CLOCK_SKEW_TOLERANCE_SECONDS:
+        raise CensusError("current epoch shadow health timestamp is in the future")
+    if now_ts - updated > float(max_age_seconds):
+        raise CensusError("current epoch shadow health is stale")
+    diagnostic = health.get("diagnostic_shadow")
+    if not isinstance(diagnostic, Mapping):
+        raise CensusError("current epoch shadow health diagnostic catalog is missing")
+    contract = _cohort_layout(diagnostic)
+    if contract is None:
+        raise CensusError("current epoch shadow health cohort catalog is invalid")
+    declared_contract = diagnostic.get("cohort_contract")
+    if (declared_contract is not None and
+            _cohort_layout(declared_contract) != contract):
+        raise CensusError("current epoch shadow health cohort contract drifts from arm catalog")
+    identities = _context_identities({**dict(diagnostic),
+                                      "provenance": health.get("provenance")})
+    if any(identities.get(key) is None for key in (
+            "deployment", "code", "cohort", "activation")):
+        raise CensusError("current epoch shadow health identities are incomplete")
+    if _identity(expected_deployment) is None:
+        raise CensusError("current deployment identity is unavailable")
+    if identities["deployment"] != _identity(expected_deployment):
+        raise CensusError("current epoch deployment identity mismatches shadow health")
+    try:
+        from research.live_shadow import _replay_code_hash
+        expected_code = _replay_code_hash()
+    except Exception as exc:
+        raise CensusError("current replay code identity is unavailable") from exc
+    if identities["code"] != expected_code:
+        raise CensusError("current epoch code identity mismatches current replay code")
+    activation = _read_immutable_activation(
+        Path(shadow_db), str(identities["cohort"]))
+    if (activation.get("cohort_identity") != identities["cohort"] or
+            activation.get("code_identity") != identities["code"] or
+            activation.get("activation_identity") != identities["activation"]):
+        raise CensusError("current epoch immutable activation identity mismatches shadow health")
+    config_identities = {
+        "runtime": _identity(activation.get("runtime_config_identity")),
+        "policy": _identity(activation.get("policy_config_identity")),
+    }
+    if any(value is None for value in config_identities.values()):
+        raise CensusError("current epoch immutable activation config identities are incomplete")
+    try:
+        from agent.config import load_config
+        from research.diagnostic_shadow import build_diagnostic_cohort
+        runtime_config = load_config(Path(runtime_config_path))
+        expected_cohort = build_diagnostic_cohort(
+            runtime_config, code_identity=expected_code,
+            include_ibr=include_ibr)
+    except Exception as exc:
+        raise CensusError("current runtime config cannot rebuild diagnostic cohort") from exc
+    expected_contract = _cohort_layout(expected_cohort)
+    if expected_contract is None or expected_contract != contract:
+        raise CensusError("current epoch cohort catalog mismatches current runtime config")
+    expected_configs = {
+        "runtime": _identity(expected_cohort.get("runtime_config_identity")),
+        "policy": _identity(expected_cohort.get("policy_config_identity")),
+    }
+    if expected_configs != config_identities:
+        raise CensusError("current epoch config identities mismatch current runtime config")
+    recorded = Path(recorded_root)
+    index = _read_object(recorded / ".recorder-index.json",
+                         label="recorder index", required=True)
+    assert index is not None
+    expected_symbols = _symbols(index.get("configured_symbols"))
+    if expected_symbols is None:
+        raise CensusError("current epoch recorder symbol catalog is invalid")
+    runtime_universe = runtime_config.get("universe")
+    runtime_symbols = (_symbols(runtime_universe.get("symbols"))
+                       if isinstance(runtime_universe, Mapping) else None)
+    if runtime_symbols is None or runtime_symbols != expected_symbols:
+        raise CensusError("current epoch recorder symbols mismatch runtime universe")
+    return {
+        "schema": EPOCH_CONTEXT_SCHEMA,
+        "verified": True,
+        "updated_ts": updated,
+        "identities": {key: str(value) for key, value in identities.items()},
+        "expected_symbols": expected_symbols,
+        "cohort_contract": contract,
+        "config_identities": config_identities,
+        "activation": dict(activation),
+        "include_ibr": include_ibr,
+        "source": "shadow_health_and_immutable_activation",
+    }
 
 
 def _metadata_candidates(paths: Sequence[Path], recorded_root: Path | None,
@@ -215,7 +503,8 @@ def _source_for_partition(name: str, marker: Mapping[str, object] | None,
 
 def _acceptance_for_partition(root: Path, day: str,
                               calendar: Mapping[str, object], *,
-                              now: datetime) -> tuple[str, str]:
+                              now: datetime,
+                              current_context: Mapping[str, object] | None = None) -> tuple[str, str]:
     path = root / f"session-{day}.report.json"
     if not path.exists():
         return "missing", "accepted full-session report is missing"
@@ -229,6 +518,8 @@ def _acceptance_for_partition(root: Path, day: str,
     sample_counts = payload.get("sample_counts")
     expected_symbols = payload.get("expected_symbols")
     finalized_ts = _number(payload.get("finalized_ts"))
+    context = current_context
+    context_reason = _context_reason(context, now=now)
     expected_open = _timestamp(calendar.get("open"))
     expected_close = _timestamp(calendar.get("close"))
     observed_open = (_timestamp(session.get("open"))
@@ -249,6 +540,9 @@ def _acceptance_for_partition(root: Path, day: str,
         return "invalid", "session acceptance report contract is invalid"
     if payload.get("accepted") is not True:
         return "rejected", "full-session operational acceptance was rejected"
+    if context_reason is not None:
+        return "invalid", context_reason
+    normalized_context = _normalize_context(context)
     if (payload.get("status") != "accepted" or
             payload.get("reasons") not in ([], ()) or
             payload.get("reason_counts") != {}):
@@ -270,6 +564,14 @@ def _acceptance_for_partition(root: Path, day: str,
                 symbol != symbol.strip().upper()
                 for symbol in expected_symbols)):
         return "invalid", "accepted session report symbol coverage is invalid"
+    report_symbols = _symbols(expected_symbols)
+    if report_symbols is None:
+        return "invalid", "accepted session report symbol coverage is invalid"
+    if normalized_context is not None:
+        expected_context_symbols = normalized_context.get("expected_symbols")
+        if (expected_context_symbols is None or
+                report_symbols != expected_context_symbols):
+            return "invalid", "accepted session report symbols do not match current epoch"
     coverage = payload.get("coverage")
     if not isinstance(coverage, Mapping):
         return "invalid", "accepted session report coverage is missing"
@@ -298,7 +600,11 @@ def _acceptance_for_partition(root: Path, day: str,
             coverage.get("closed_at_report") is not True):
         return "invalid", "accepted session report coverage is invalid"
     progress = payload.get("post_activation_progress")
-    if (not isinstance(progress, Mapping) or progress.get("arms") != 24 or
+    expected_contract = (normalized_context.get("cohort_contract")
+                         if normalized_context is not None else None)
+    if (expected_contract is None or
+            not isinstance(progress, Mapping) or
+            progress.get("arms") != expected_contract.get("arm_count") or
             progress.get("snapshots") != sample_counts.get("total") or
             progress.get("all_arms_progressed") is not True or
             _nonnegative_int(progress.get("minimum_processed_events")) in (None, 0) or
@@ -353,6 +659,15 @@ def _acceptance_for_partition(root: Path, day: str,
             not str(identities.get(key)).strip()
             for key in ("deployment", "code", "cohort", "activation"))):
         return "invalid", "accepted session report identities are incomplete"
+    if normalized_context is not None:
+        expected_identities = normalized_context.get("identities")
+        if (not isinstance(expected_identities, Mapping) or any(
+                identities.get(key) != expected_identities.get(key)
+                for key in ("deployment", "code", "cohort", "activation"))):
+            return "invalid", "accepted session report identities do not match current epoch"
+        report_contract = _cohort_layout(payload.get("cohort_contract"))
+        if report_contract is None or report_contract != expected_contract:
+            return "invalid", "accepted session report cohort contract does not match current epoch"
     return "accepted", "accepted full-session operational report matches partition"
 
 
@@ -381,6 +696,8 @@ def _empty_result(*, source_kind: str, partition_root: Path | None,
         "acceptance_root": (str(acceptance_root)
                             if acceptance_root is not None else None),
         "acceptance_required": acceptance_root is not None,
+        "epoch_context": {"status": "unknown",
+                          "reason": "census was not authoritative"},
         "eligible_historical_partition_count": 0,
         "coverage": {"status": "unknown", "reason": "census was not authoritative"},
         "activation": {"status": "unknown", "reason": "census cannot observe activation"},
@@ -395,7 +712,8 @@ def census(source: Path | Sequence[Path] | Iterable[Path] | None = None, *,
            recorded_root: Path | None = None, trusted_recorder: bool = False,
            diagnostic_only: bool = False, now: datetime | None = None,
            backtest_minimum_sessions: int = 30,
-           acceptance_root: Path | None = None) -> dict:
+           acceptance_root: Path | None = None,
+           current_context: Mapping[str, object] | None = None) -> dict:
     """Return a conservative exact-calendar partition census.
 
     The source selection intentionally delegates to ``research_dataset`` so a
@@ -456,6 +774,10 @@ def census(source: Path | Sequence[Path] | Iterable[Path] | None = None, *,
         if acceptance_path.exists() and not acceptance_path.is_dir():
             raise CensusError("acceptance root must be a directory")
 
+    epoch_context = current_context
+    epoch_context_reason = (_context_reason(epoch_context, now=current)
+                            if acceptance_path is not None else None)
+
     _check_metadata_files(paths, recorded_root)
     marker_calendar = _partition_calendar_sidecars(paths, recorded_root) or {}
     marker_sources = _partition_source_sidecars(paths, recorded_root) or {}
@@ -513,7 +835,8 @@ def census(source: Path | Sequence[Path] | Iterable[Path] | None = None, *,
         acceptance_reason = "acceptance root was not supplied"
         if acceptance_path is not None and eligible and source_mode == "forward_observed":
             acceptance_status, acceptance_reason = _acceptance_for_partition(
-                acceptance_path, day, calendar, now=current)
+                acceptance_path, day, calendar, now=current,
+                current_context=epoch_context)
             if acceptance_status == "accepted":
                 counts["accepted_forward"] += 1
             elif acceptance_status == "missing":
@@ -543,10 +866,14 @@ def census(source: Path | Sequence[Path] | Iterable[Path] | None = None, *,
     required = int(backtest_minimum_sessions)
     structurally_underpowered = readiness_count < required
     if structurally_underpowered and acceptance_path is not None:
-        reason = (
-            f"{eligible_forward} complete forward partitions exist but only "
-            f"{accepted_forward} have accepted full-session reports; "
-            f"{required} are required")
+        if epoch_context_reason is not None:
+            reason = (f"current epoch acceptance context unavailable: "
+                      f"{epoch_context_reason}")
+        else:
+            reason = (
+                f"{eligible_forward} complete forward partitions exist but only "
+                f"{accepted_forward} have accepted full-session reports; "
+                f"{required} are required")
     elif structurally_underpowered:
         reason = "forward partition upper bound is below the backtest session minimum"
     elif acceptance_path is not None:
@@ -575,6 +902,14 @@ def census(source: Path | Sequence[Path] | Iterable[Path] | None = None, *,
         "acceptance_root": (str(acceptance_path.resolve())
                             if acceptance_path is not None else None),
         "acceptance_required": acceptance_path is not None,
+        "epoch_context": {
+            "status": ("unknown" if acceptance_path is None else
+                       "verified" if epoch_context_reason is None else "invalid"),
+            "reason": ("acceptance root was not supplied"
+                       if acceptance_path is None else
+                       "current epoch context is verified"
+                       if epoch_context_reason is None else epoch_context_reason),
+        },
         "backtest_minimum_sessions": required,
         "required_forward_sessions": required,
         "readiness_session_count": readiness_count,
@@ -630,11 +965,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--partition-root", type=Path, required=True)
     parser.add_argument("--session-window", type=int, default=0)
     parser.add_argument("--recorded-root", type=Path)
+    parser.add_argument("--runtime-config", type=Path,
+                        help="mounted runtime config used to rebuild the current cohort")
     parser.add_argument("--acceptance-root", type=Path)
     parser.add_argument("--trusted-recorder", action="store_true")
     parser.add_argument("--diagnostic-only", action="store_true")
     parser.add_argument("--summary-only", action="store_true",
                         help="omit per-partition records from CLI output")
+    parser.add_argument("--shadow-health", type=Path,
+                        help="mounted shadow health heartbeat for current epoch binding")
+    parser.add_argument("--shadow-db", type=Path,
+                        help="mounted read-only shadow WAL containing immutable activation")
+    parser.add_argument("--context-max-age", type=float,
+                        default=MAX_EPOCH_CONTEXT_AGE_SECONDS,
+                        help="maximum shadow-health age for current epoch context")
+    parser.add_argument("--diagnostic-include-ibr", action="store_true",
+                        help="bind the current epoch to the seven registered IBR arms")
     parser.add_argument("--now")
     args = parser.parse_args(argv)
     now = _timestamp(args.now) if args.now else None
@@ -643,6 +989,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                    "reason": "--now must be an aware ISO timestamp"}
         print(json.dumps(payload, sort_keys=True))
         return 3
+    current_context = None
+    if args.acceptance_root is not None and (
+            args.shadow_health is not None or args.shadow_db is not None):
+        if (args.shadow_health is None or args.shadow_db is None or
+                args.recorded_root is None or args.runtime_config is None):
+            current_context = {
+                "schema": EPOCH_CONTEXT_SCHEMA,
+                "verified": False,
+                "context_error": (
+                    "current epoch context requires shadow health, shadow database, "
+                    "recorded root, and runtime config"),
+            }
+        else:
+            from deploy.provenance import deployment_provenance
+            expected_deployment = deployment_provenance().get("identity")
+            try:
+                current_context = load_current_epoch_context(
+                    shadow_health=args.shadow_health, shadow_db=args.shadow_db,
+                    recorded_root=args.recorded_root,
+                    runtime_config_path=args.runtime_config, now=now,
+                    max_age_seconds=args.context_max_age,
+                    expected_deployment=expected_deployment,
+                    include_ibr=args.diagnostic_include_ibr)
+            except CensusError as exc:
+                current_context = {
+                    "schema": EPOCH_CONTEXT_SCHEMA,
+                    "verified": False,
+                    "context_error": str(exc),
+                }
     try:
         payload = census(
             partition_root=args.partition_root,
@@ -652,7 +1027,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             diagnostic_only=args.diagnostic_only,
             now=now,
             backtest_minimum_sessions=_minimum_sessions(),
-            acceptance_root=args.acceptance_root)
+            acceptance_root=args.acceptance_root,
+            current_context=current_context)
     except CensusError as exc:
         payload = {"schema": SCHEMA, "status": "error", "reason": str(exc)}
         print(json.dumps(payload, sort_keys=True))

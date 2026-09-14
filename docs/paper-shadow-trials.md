@@ -36,6 +36,30 @@ The minimal configuration shape is:
 }
 ```
 
+## Separate opt-in paper profile
+
+The shipped `config.yaml` remains unchanged: `research.paper_trial` is disabled
+with empty `trial_id` and `variant_id`. The separate
+`deploy/paper-orb.config.json` profile differs only in
+`research.paper_trial.enabled`, `.trial_id`, and `.variant_id`. It names
+`trial_id: paper-orb-baseline-20260914-v1` and the exact
+catalog variant `rule.opening-range-breakout.0eb200d3136d80ee`; the normal
+`strategy.variant_id: auto` remains, but `PaperTrialRuntime` overrides it with
+that one catalog spec and does not select an adaptive winner.
+
+Compose reads `${ALPACA_AGENT_CONFIG_FILE:-./config.yaml}` for all services. An
+operator may explicitly select the profile with
+`export ALPACA_AGENT_CONFIG_FILE=./deploy/paper-orb.config.json`; this document
+does not claim that the profile is released or activated. Before any operator
+`resume`, run the authenticated preflight and reconcile both the broker and
+local book to a confirmed flat state with no working orders.
+
+Compose defaults `ALPACA_SHADOW_INCLUDE_IBR=1` and passes the same strict `0`/`1`
+mode through the trader, watchdog, research, and shadow services; an operator
+may explicitly use `0` for the 24-rule catalog. Direct CLI use defaults to `0`;
+export `ALPACA_SHADOW_INCLUDE_IBR=1` when it must match Compose's default
+31-arm catalog.
+
 Keep `enabled: false` until an exact arm is selected and the account-scoped
 preflight and flat-book checks pass. Do not reset the paper account or delete
 runtime state to change variants. List the exact catalog identities locally:
@@ -85,10 +109,14 @@ they never enter the authorizing EdgeLedger/FDR outbox.
 
 ## Parallel shadow books
 
-Each arm of the fixed 24-arm diagnostic cohort has its own persistent cash,
-positions, modeled orders, fills, and net P&L. State and the consumed-event cursor
-commit together, so retries cannot credit a close twice. Cash carries across
-sessions and restarts. The activation session remains warmup-only.
+Each arm of the configured diagnostic cohort has its own persistent cash,
+positions, modeled orders, fills, and net P&L. Compose defaults
+`ALPACA_SHADOW_INCLUDE_IBR=1`, producing 31 arms (24 rule arms plus seven IBR
+arms); explicit `0` selects the 24-rule catalog. State and the consumed-event
+cursor commit together, so retries cannot credit a close twice. Cash carries
+across sessions and restarts. The activation session remains warmup-only.
+Deployment-specific cohort and release status is tracked in the [current
+findings](current-findings.md).
 
 Entries and market exits use causal, exact-feed/provider forward quotes:
 buys use the ask, sells use the bid, with modeled slippage and fees. Resting
@@ -118,7 +146,8 @@ It writes bounded append-only samples and atomic
 `/app/shadow/session-acceptance`. No separate monitoring daemon is added.
 
 Acceptance requires full exact-calendar coverage, stable deployment/code/cohort/
-activation identities, all 24 arms, genuine post-activation event progress,
+activation identities, all arms in the active catalog (31 in default Compose;
+24 when `ALPACA_SHADOW_INCLUDE_IBR=0`), genuine post-activation event progress,
 and current symbol observations. An unchanged heartbeat or cursor is not a
 completed day. Warmup must precede the counted session.
 

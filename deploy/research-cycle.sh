@@ -544,6 +544,32 @@ acceptance_root="${ALPACA_RESEARCH_ACCEPTANCE_ROOT:-}"
 if [ -n "$acceptance_root" ] && [[ "$acceptance_root" != /* ]]; then
   acceptance_root="$repo_root/$acceptance_root"
 fi
+# The acceptance directory is mounted beside the shadow heartbeat and its
+# SQLite WAL in Compose.  Operators may override both paths for deterministic
+# offline runs; an absent/malformed mount is surfaced as waiting evidence by
+# the census instead of falling back to report-provided identities.
+shadow_health_path="${ALPACA_RESEARCH_SHADOW_HEALTH_FILE:-}"
+shadow_db_path="${ALPACA_SHADOW_DB:-}"
+shadow_include_ibr="${ALPACA_SHADOW_INCLUDE_IBR:-0}"
+case "$shadow_include_ibr" in
+  0|1) ;;
+  *) finish "failed" "ALPACA_SHADOW_INCLUDE_IBR must be 0 or 1" 3 ;;
+esac
+if [ -n "$acceptance_root" ]; then
+  shadow_mount_root="$(dirname "$acceptance_root")"
+  if [ -z "$shadow_health_path" ]; then
+    shadow_health_path="$shadow_mount_root/health.json"
+  fi
+  if [ -z "$shadow_db_path" ]; then
+    shadow_db_path="$shadow_mount_root/shadow.sqlite3"
+  fi
+fi
+if [ -n "$shadow_health_path" ] && [[ "$shadow_health_path" != /* ]]; then
+  shadow_health_path="$repo_root/$shadow_health_path"
+fi
+if [ -n "$shadow_db_path" ] && [[ "$shadow_db_path" != /* ]]; then
+  shadow_db_path="$repo_root/$shadow_db_path"
+fi
 
 session_window="${ALPACA_RESEARCH_SESSION_WINDOW:-0}"
 case "$session_window" in
@@ -586,12 +612,22 @@ run_partition_census() {
   local census_args=(
     --partition-root "$census_partition_root"
     --recorded-root "$census_recorded_root"
+    --runtime-config "$agent_config"
     --session-window "$session_window"
     --trusted-recorder
     --summary-only
   )
   if [ -n "$acceptance_root" ]; then
     census_args+=(--acceptance-root "$acceptance_root")
+    if [ "$shadow_include_ibr" = "1" ]; then
+      census_args+=(--diagnostic-include-ibr)
+    fi
+    if [ -n "$shadow_health_path" ]; then
+      census_args+=(--shadow-health "$shadow_health_path")
+    fi
+    if [ -n "$shadow_db_path" ]; then
+      census_args+=(--shadow-db "$shadow_db_path")
+    fi
   fi
   set +e
   census_output="$($python_bin "$repo_root/deploy/research_census.py" \

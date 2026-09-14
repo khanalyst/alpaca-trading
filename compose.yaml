@@ -89,6 +89,8 @@ services:
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
       ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
       ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      # Freeze the same diagnostic catalog in the paper incumbent and shadow.
+      ALPACA_SHADOW_INCLUDE_IBR: ${ALPACA_SHADOW_INCLUDE_IBR:-1}
       ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
       ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
       ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
@@ -144,6 +146,8 @@ services:
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
       ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
       ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      # Recovery constructs the same paper-incumbent runtime as the trader.
+      ALPACA_SHADOW_INCLUDE_IBR: ${ALPACA_SHADOW_INCLUDE_IBR:-1}
       ALPACA_DEPLOYMENT_COMMIT: ${ALPACA_DEPLOYMENT_COMMIT:-unknown}
       ALPACA_DEPLOYMENT_IMAGE: ${ALPACA_DEPLOYMENT_IMAGE:-alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}}
       ALPACA_DEPLOYMENT_IMAGE_DIGEST: ${ALPACA_DEPLOYMENT_IMAGE_DIGEST:-}
@@ -236,6 +240,7 @@ services:
       ALPACA_FACTORY_MAX_GENERATIONS: ${ALPACA_FACTORY_MAX_GENERATIONS:-5}
       ALPACA_EDGE_DB: ${ALPACA_EDGE_DB:-runtime/research/edge_lab.sqlite3}
       ALPACA_SHADOW_DB: ${ALPACA_SHADOW_DB:-/app/shadow/shadow.sqlite3}
+      ALPACA_SHADOW_INCLUDE_IBR: ${ALPACA_SHADOW_INCLUDE_IBR:-1}
       ALPACA_SHADOW_INGEST_ENABLED: ${ALPACA_SHADOW_INGEST_ENABLED:-1}
       ALPACA_SHADOW_MIN_TRADES: ${ALPACA_SHADOW_MIN_TRADES:-150}
       ALPACA_SHADOW_MIN_SESSIONS: ${ALPACA_SHADOW_MIN_SESSIONS:-30}
@@ -405,7 +410,7 @@ services:
 
 configs:
   agent_config:
-    file: ./config.yaml
+    file: ${ALPACA_AGENT_CONFIG_FILE:-./config.yaml}
 
 secrets:
   agent_credentials:

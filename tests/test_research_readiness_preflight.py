@@ -10,10 +10,14 @@ from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
+from agent.config import load_config
 from deploy import scheduler, scheduler_output
+from research.diagnostic_shadow import build_diagnostic_cohort
+from research.live_shadow import ShadowStore, _replay_code_hash
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +28,8 @@ def _config(path: Path, *, llm_enabled: bool) -> None:
         "mode": "paper",
         "broker": {"paper": True, "allow_live": False,
                    "data_feed": "iex", "options_feed": "opra"},
-        "universe": {"asset_classes": ["us_equity"]},
+        "universe": {"symbols": ["AAPL", "MSFT"],
+                     "asset_classes": ["us_equity"]},
         "session": {"require_exact_calendar": True},
         "strategy": {"selection_mode": "all_proved",
                      "execution_mode": "shares"},
@@ -100,12 +105,78 @@ def _session(recorded: Path, acceptance: Path, day: str, *, accepted: bool) -> N
     }), encoding="utf-8")
 
 
+def _prepare_epoch(root: Path, config: Path, recorded: Path) -> dict:
+    """Create the explicit current epoch mounted by the shadow service."""
+    runtime = load_config(config)
+    symbols = sorted(runtime["universe"]["symbols"])
+    recorded.mkdir(parents=True, exist_ok=True)
+    (recorded / ".recorder-index.json").write_text(json.dumps({
+        "schema": "recorder-index.v1", "configured_symbols": symbols,
+    }), encoding="utf-8")
+    deployment = "d" * 40
+    code = _replay_code_hash()
+    cohort = build_diagnostic_cohort(runtime, code_identity=code,
+                                     include_ibr=False)
+    shadow_db = root / "shadow.sqlite3"
+    activation = ShadowStore(shadow_db).save_diagnostic_activation(
+        cohort=cohort,
+        activation_event_watermark={"last_inserted_at": 1.0},
+        source_offsets={}, forward_event_floor=1.0)
+    diagnostic = {
+        "code_identity": code,
+        "cohort_identity": cohort["cohort_identity"],
+        "activation_identity": activation["activation_identity"],
+        "candidate_identities": cohort["candidate_identities"],
+        "cohort_contract": cohort["cohort_contract"],
+        "arms": [{key: arm[key] for key in (
+            "candidate_id", "family", "role", "variant_id",
+            "code_identity", "cohort_identity")}
+                 for arm in cohort["arms"]],
+    }
+    (root / "health.json").write_text(json.dumps({
+        "schema": "shadow-health.v1", "status": "running",
+        "updated_ts": time.time(), "provenance": {"identity": deployment},
+        "diagnostic_shadow": diagnostic,
+    }), encoding="utf-8")
+    return {
+        "identities": {"deployment": deployment, "code": code,
+                        "cohort": cohort["cohort_identity"],
+                        "activation": activation["activation_identity"]},
+        "symbols": symbols, "contract": cohort["cohort_contract"],
+    }
+
+
+def _bind_reports_to_epoch(acceptance: Path, epoch: dict) -> None:
+    for path in acceptance.glob("session-*.report.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["expected_symbols"] = list(epoch["symbols"])
+        payload["identities"] = dict(epoch["identities"])
+        payload["cohort_contract"] = epoch["contract"]
+        progress = payload.get("post_activation_progress")
+        if isinstance(progress, dict):
+            progress["arms"] = epoch["contract"]["arm_count"]
+        freshness = payload.get("freshness")
+        if isinstance(freshness, dict):
+            sample_counts = payload.get("sample_counts")
+            total = sample_counts.get("total", 0) if isinstance(
+                sample_counts, dict) else 0
+            observations = total * len(epoch["symbols"])
+            for key in ("quote_event_age_seconds",
+                        "bar_publication_deadline_lag_seconds",
+                        "bar_event_age_seconds"):
+                if isinstance(freshness.get(key), dict):
+                    freshness[key]["count"] = observations
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _run(root: Path, *, llm_enabled: bool, max_source_bytes: int,
          dataset: Path | None = None) -> subprocess.CompletedProcess:
     recorded = root / "recorded"
     acceptance = root / "acceptance"
     config = root / "config.json"
     _config(config, llm_enabled=llm_enabled)
+    epoch = _prepare_epoch(root, config, recorded)
+    _bind_reports_to_epoch(acceptance, epoch)
     env = dict(
         os.environ,
         PYTHON=sys.executable,
@@ -117,7 +188,15 @@ def _run(root: Path, *, llm_enabled: bool, max_source_bytes: int,
         ALPACA_RESEARCH_LLM_SECRETS_FILE="/dev/null",
         ALPACA_RESEARCH_MAX_SOURCE_BYTES=str(max_source_bytes),
         ALPACA_FACTORY_ENABLED="0",
+        ALPACA_SHADOW_DB=str(root / "shadow.sqlite3"),
+        ALPACA_SHADOW_INCLUDE_IBR="0",
+        ALPACA_DEPLOYMENT_COMMIT="d" * 40,
     )
+    for key in ("ALPACA_BUILD_COMMIT", "GIT_COMMIT", "ALPACA_DEPLOYMENT_IMAGE",
+                "ALPACA_AGENT_IMAGE", "IMAGE_NAME",
+                "ALPACA_DEPLOYMENT_IMAGE_DIGEST", "ALPACA_IMAGE_DIGEST",
+                "IMAGE_DIGEST", "ALPACA_AGENT_IMAGE_TAG"):
+        env.pop(key, None)
     if dataset is None:
         env.pop("ALPACA_RESEARCH_DATASET", None)
     else:

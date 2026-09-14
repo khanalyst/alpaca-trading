@@ -27,11 +27,13 @@ from deploy.provenance import deployment_parity, deployment_provenance
 from deploy.scheduler_output import (derive_research_readiness,
                                      structured_research_preflight,
                                      structured_research_progress)
+from research.diagnostic_cohort_contract import validate_cohort_layout
 
 MAX_RECORDER_INDEX_BYTES = 16 * 1024 * 1024
 AUTHORIZING_MARKET_DATA_MAX_AGE_SECONDS = 30.0
 SHADOW_COVERAGE_ARM_COUNT = 24
 SHADOW_COVERAGE_FAMILY_COUNT = 12
+SHADOW_SUPPORTED_ARM_COUNTS = (24, 31)
 SHADOW_COVERAGE_DATA_MAX_AGE_SECONDS = 30.0
 SHADOW_COVERAGE_CLOCK_SKEW_SECONDS = 5.0
 SHADOW_POSTACTIVATION_OBSERVATION_STATUSES = (
@@ -251,7 +253,7 @@ def _shadow_accounts_summary(value: object, arms: list[dict]) -> dict | None:
     projected = []
     seen = set()
     candidates = value.get("by_candidate")
-    for raw in candidates[:24] if isinstance(candidates, list) else []:
+    for raw in candidates[:31] if isinstance(candidates, list) else []:
         if not isinstance(raw, dict):
             continue
         candidate = _status_text(raw.get("candidate_id"))
@@ -288,75 +290,59 @@ def _shadow_nonnegative_int(value: object) -> int | None:
 
 
 def _shadow_catalog_state(
-        value: dict) -> tuple[list[dict], set[str], int, bool, bool]:
-    """Return bounded account identities plus exact catalog/epoch validity."""
-    raw_candidates = value.get("candidate_identities")
-    candidates: set[str] = set()
-    candidates_valid = bool(
-        isinstance(raw_candidates, list) and
-        len(raw_candidates) == SHADOW_COVERAGE_ARM_COUNT)
-    if isinstance(raw_candidates, list):
-        for raw_candidate in raw_candidates[:SHADOW_COVERAGE_ARM_COUNT]:
-            exact = _shadow_identity(raw_candidate)
-            if exact is None or exact in candidates:
-                candidates_valid = False
-            else:
-                candidates.add(exact)
+        value: dict) -> tuple[list[dict], set[str], int, bool, bool, dict | None]:
+    """Return exact catalog identities and the shared validated layout.
 
+    The producer is allowed to publish either supported catalog size.  No
+    list is sliced to the legacy 24-arm denominator: an extra or malformed
+    arm makes the catalog invalid and therefore unready.
+    """
+    raw_candidates = value.get("candidate_identities")
+    if raw_candidates is None:
+        raw_candidates = value.get("candidate_ids")
+    candidate_count = len(raw_candidates) if isinstance(raw_candidates, list) else 0
     raw_arms = value.get("arms")
     arms: list[dict] = []
     arm_ids: set[str] = set()
-    family_roles: dict[str, set[str]] = {}
-    code_values: set[str] = set()
-    cohort_values: set[str] = set()
-    arms_valid = bool(
-        isinstance(raw_arms, list) and
-        len(raw_arms) == SHADOW_COVERAGE_ARM_COUNT)
-    if isinstance(raw_arms, list):
-        for raw_arm in raw_arms[:SHADOW_COVERAGE_ARM_COUNT]:
+    if isinstance(raw_arms, list) and len(raw_arms) <= 64:
+        for raw_arm in raw_arms:
             if not isinstance(raw_arm, dict):
-                arms_valid = False
                 continue
+            candidate = _shadow_identity(raw_arm.get("candidate_id"))
+            if candidate is not None:
+                arm_ids.add(candidate)
             arms.append({
                 key: _status_text(raw_arm.get(key))
                 for key in ("candidate_id", "family", "role", "variant_id")
             })
-            candidate = _shadow_identity(raw_arm.get("candidate_id"))
-            family = _shadow_identity(raw_arm.get("family"))
-            role = _shadow_identity(raw_arm.get("role"), limit=20)
-            variant = _shadow_identity(raw_arm.get("variant_id"))
-            arm_code = _shadow_identity(raw_arm.get("code_identity"))
-            arm_cohort = _shadow_identity(raw_arm.get("cohort_identity"))
-            if (candidate is None or family is None or
-                    role not in {"baseline", "variant"} or variant is None or
-                    arm_code is None or arm_cohort is None or
-                    candidate in arm_ids):
-                arms_valid = False
-                continue
-            arm_ids.add(candidate)
-            family_roles.setdefault(family, set()).add(role)
-            code_values.add(arm_code)
-            cohort_values.add(arm_cohort)
-
-    catalog_valid = bool(
-        candidates_valid and arms_valid and candidates == arm_ids and
-        len(family_roles) == SHADOW_COVERAGE_FAMILY_COUNT and
-        all(roles == {"baseline", "variant"}
-            for roles in family_roles.values()))
+    contract = validate_cohort_layout(value)
+    declared_contract = value.get("cohort_contract")
+    if declared_contract is not None:
+        nested = validate_cohort_layout(declared_contract)
+        if nested is None or contract is None or nested != contract:
+            contract = None
+    if contract is None and candidate_count not in SHADOW_SUPPORTED_ARM_COUNTS:
+        # Do not project an unsupported catalog size as a usable denominator.
+        candidate_count = 0
+        arms = []
+    catalog_valid = contract is not None
     code_identity = _shadow_identity(value.get("code_identity"))
     cohort_identity = _shadow_identity(value.get("cohort_identity"))
     activation_identity = _shadow_identity(value.get("activation_identity"))
     identity_valid = bool(
         catalog_valid and code_identity and cohort_identity and
-        activation_identity and code_values == {code_identity} and
-        cohort_values == {cohort_identity})
-    return arms, arm_ids, len(candidates), catalog_valid, identity_valid
+        activation_identity and contract["code_identity"] == code_identity and
+        contract["cohort_identity"] == cohort_identity)
+    if contract is not None:
+        arm_ids = set(contract["candidate_ids"])
+    return arms, arm_ids, candidate_count, catalog_valid, identity_valid, contract
 
 
 def _shadow_progress_projection(
         value: object, *, arm_ids: set[str], activation: dict | None,
         current: float | None, reported_processed: object) -> tuple[dict, str]:
-    """Project and validate all 24 equal post-activation cursors once."""
+    """Project and validate every supported arm's post-activation cursor."""
+    expected_count = len(arm_ids)
     projected: dict[str, dict] = {}
     exact_cursor_ids: set[str] = set()
     cursor_values: list[tuple[float, str, int]] = []
@@ -366,11 +352,10 @@ def _shadow_progress_projection(
     future = False
     stale = False
     raw_count_valid = bool(
-        isinstance(value, dict) and len(value) == SHADOW_COVERAGE_ARM_COUNT)
-    if isinstance(value, dict):
-        for index, (raw_candidate, raw_cursor) in enumerate(value.items()):
-            if index >= SHADOW_COVERAGE_ARM_COUNT:
-                break
+        isinstance(value, dict) and expected_count in SHADOW_SUPPORTED_ARM_COUNTS and
+        len(value) == expected_count)
+    if isinstance(value, dict) and expected_count in SHADOW_SUPPORTED_ARM_COUNTS:
+        for raw_candidate, raw_cursor in value.items():
             candidate = _status_text(raw_candidate)
             if (candidate is not None and candidate not in projected and
                     isinstance(raw_cursor, dict)):
@@ -417,7 +402,7 @@ def _shadow_progress_projection(
         status = "arm_cursor_future"
     elif stale:
         status = "arm_cursor_stale"
-    elif (len(cursor_values) != SHADOW_COVERAGE_ARM_COUNT or
+    elif (len(cursor_values) != expected_count or
           len(set(cursor_values)) != 1):
         status = "arm_cursors_mismatch"
     elif _shadow_nonnegative_int(reported_processed) != processed_total:
@@ -436,7 +421,7 @@ def _shadow_diagnostic_summary(
     if not isinstance(value, dict):
         return None
 
-    arms, arm_ids, candidate_count, catalog_valid, identity_consistent = (
+    arms, arm_ids, candidate_count, catalog_valid, identity_consistent, contract = (
         _shadow_catalog_state(value))
 
     decision_raw = value.get("decision_counts")
@@ -472,9 +457,9 @@ def _shadow_diagnostic_summary(
         flags["realized_pnl_authorizing"] is False
     )
     families_missing_raw = value.get("families_missing")
-    families_missing = _status_string_list(families_missing_raw, limit=12)
+    families_missing = _status_string_list(families_missing_raw, limit=31)
     families_without_decisions = _status_string_list(
-        value.get("families_without_decisions"), limit=12)
+        value.get("families_without_decisions"), limit=31)
     families_total = _status_nonnegative_int(value.get("families_total"))
     families_covered = _status_nonnegative_int(
         value.get("families_covered"))
@@ -488,12 +473,14 @@ def _shadow_diagnostic_summary(
     cohort_active = bool(
         cohort_identity and activation_identity and activation_status == "active")
 
+    expected_counts = contract or {}
     coverage_complete = bool(
-        value.get("families_total") == SHADOW_COVERAGE_FAMILY_COUNT and
-        value.get("families_covered") == SHADOW_COVERAGE_FAMILY_COUNT and
+        contract is not None and
+        value.get("families_total") == expected_counts.get("family_count") and
+        value.get("families_covered") == expected_counts.get("family_count") and
         families_missing_raw == [] and
-        value.get("baseline_count") == SHADOW_COVERAGE_FAMILY_COUNT and
-        value.get("variant_count") == SHADOW_COVERAGE_FAMILY_COUNT and
+        value.get("baseline_count") == expected_counts.get("baseline_count") and
+        value.get("variant_count") == expected_counts.get("variant_count") and
         catalog_valid)
     metadata_valid = bool(
         value.get("schema") == "diagnostic-shadow-coverage.v1" and
@@ -597,6 +584,9 @@ def _shadow_diagnostic_summary(
         "variant_count": variant_count,
         "candidate_count": candidate_count,
         "arms_total": len(arms),
+        "arm_count": expected_counts.get("arm_count"),
+        "family_count": expected_counts.get("family_count"),
+        "cohort_contract": contract,
         "cohort_identity": cohort_identity,
         "code_identity": code_identity,
         "activation_identity": activation_identity,

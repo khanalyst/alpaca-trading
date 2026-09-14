@@ -9,8 +9,10 @@ Options are single-leg long calls or puts
 (buy-to-open, sell-to-close); multi-leg and naked/short option structures are
 unsupported. No performance claim is made.
 
-The current remediation state and evidence boundary are recorded in
-[docs/trading-edge-remediation-2026-09-07.md](docs/trading-edge-remediation-2026-09-07.md).
+The current pending work, deployment status and evidence boundary are recorded in
+[docs/current-findings.md](docs/current-findings.md).
+The [strategy and variant review](docs/strategy-variant-review.md) maps all 43
+registered equity arms to their actual signals, parameters and evidence gaps.
 
 ## What this repository does
 
@@ -248,10 +250,12 @@ partial-feed, or stale legs cannot authorize proof.
 
 The recorder runs on a fixed-deadline 30-second cadence (deadlines are anchored
 to the schedule, not to the previous request's completion) and durably records
-per-symbol quote and completed-bar watermarks. Readiness requires both watermarks to be no
-older than 30 seconds for every required symbol; quote and bar readiness are not
-substituted for one another. Exact Alpaca calendar metadata records holidays and
-early closes explicitly. Scheduler service liveness is reported separately from
+per-symbol quote and completed-bar watermarks. Readiness requires quote age no
+older than 30 seconds and completed bars no more than 30 seconds past their next
+publication deadline for every required symbol; quote and bar readiness are not
+substituted for one another. Raw bar age remains telemetry, not an impossible
+continuous age bound. Exact Alpaca calendar metadata records holidays and early
+closes explicitly. Scheduler service liveness is reported separately from
 research evidence and readiness, so an alive scheduler does not imply a ready
 corpus or a validated edge.
 
@@ -306,15 +310,17 @@ available. If all later runtime LLM calls fail, the terminal status is
 
 ### Boundaries for future research extensions
 
-The shipped 24-symbol ETF universe is an explicit operator-approved expansion;
-any later universe change still requires an exact symbol list, recorder coverage
-for that list, and a new identity/proof. Event conditioning requires a
-point-in-time event source with its own provider, `as_of`, and observation
-provenance. Prior-session, true multi-timeframe, and cross-sectional features
-require explicit context in the replay input; missing or ambiguous context fails
-closed. Shadow quarantine is not an auto-skip: an unresolved quarantined session
-blocks watermark/FDR advancement until its source is corrected and the bounded
-parity replay completes.
+The shipped universe is a fixed 24-symbol ETF list, not a measured capacity
+claim. Any later universe change is a separate approved universe/feed scope and
+requires an exact symbol list, recorder coverage for that list, and a new
+identity/proof epoch; it is not an automatic remedy. Historical backfill remains
+diagnostic and cannot serve as accepted forward proof. Event conditioning
+requires a point-in-time event source with its own provider, `as_of`, and
+observation provenance. Prior-session, true multi-timeframe, and cross-sectional
+features require explicit context in the replay input; missing or ambiguous
+context fails closed. Shadow quarantine is not an auto-skip: an unresolved
+quarantined session blocks watermark/FDR advancement until its source is
+corrected and the bounded parity replay completes.
 
 ### Costs and authorization checks
 
@@ -569,10 +575,9 @@ winners are based on completed parent trades across the full journal, with
 unknown costs left unknown. Charts show observed account equity, drawdown, net
 payoffs, uncertainty, and recorded entry context. Account equity is explicitly
 not adjusted for cash transfers. Direct research progress is separate from the
-scheduler heartbeat. See the [September 7 remediation record](docs/trading-edge-remediation-2026-09-07.md)
-for the fixed experiment cohort.
-The [September 8 completion record](docs/trading-edge-completion-2026-09-08.md)
-tracks the subsequent fixes and deployment. The [frozen strategy and feed comparison](docs/trading-edge-comparison-2026-09-08.md)
+scheduler heartbeat. See the [current findings](docs/current-findings.md)
+for verified pending work, deployment status and evidence limitations.
+The [frozen strategy and feed comparison](docs/trading-edge-comparison-2026-09-08.md)
 retains all twelve arms and their execution refusals; it establishes no deployable positive edge.
 
 The CLI answers the same questions without a browser:
@@ -647,8 +652,10 @@ remains paper-only with the `shares` execution profile; scheduled research
 therefore runs the equity vehicle only by default. Set
 `ALPACA_RESEARCH_VEHICLES=all` explicitly to run equity and option research
 independently; each vehicle keeps its own calibration and authorization
-evidence, and option research does not enable option execution. Seed months of
-history in one command instead of waiting for the recorder to accumulate it:
+evidence, and option research does not enable option execution. Backfill can
+seed diagnostic history for inspection, but historical rows do not count as
+accepted forward evidence; valid forward collection remains required for
+authorizing gates:
 
 For the plain supported Compose deployment, first provide both credential
 paths, then start every paper service (including scheduled research and the
@@ -679,17 +686,22 @@ diagnostic replay policy and are marked `diagnostic_historical_backfill`; they
 are never authorizing evidence or a live-shadow authorization. Options are not
 backfilled and still need recorded sessions. The shipped default universe is
 24 liquid ETFs spanning broad-market, size, sector, international, rates/credit,
-metals, and semiconductor exposures (the exact list is in `config.yaml`).
-This improves opportunity capacity, but real signal rates still require
-sufficient history. Floor
-feasibility fails closed when the 100-trade held-out floor cannot be met;
-widen the history and/or `universe.symbols`, never lower the evidence floor. On a
-fresh ledger, `run` starts safely but will not submit entries: first collect an
+metals, and semiconductor exposures (the exact list is in `config.yaml`). This
+fixed list is a configuration fact, not a measured capacity claim. Diagnose
+symbol/feed coverage and collect valid forward-observed evidence; historical
+backfill can serve diagnostics but cannot satisfy accepted forward proof. Floor
+feasibility fails closed when the 100-trade held-out floor cannot be met. A
+symbol expansion is not an automatic remedy: it requires a separately approved
+universe/feed scope, exact list, recorder coverage, and a new identity/proof
+epoch; never lower the evidence floor. In the default validated-edge mode, a
+fresh ledger's `run` starts safely but will not submit entries: first collect an
 initial corpus, let offline research pass its backtest/forward prerequisites,
 then run the broker-free ShadowRunner and the research-side `edge ingest-shadow`
 on a strictly newer recorder tail. Only that complete parity-matched live proof
-can authorize validation/champion selection. This delay is an intentional
-evidence gate, not a startup error.
+can authorize validation/champion selection. The separate opt-in
+[paper-incumbent trial](docs/paper-shadow-trials.md) has its own guarded profile;
+it does not change this default. This delay is an intentional evidence gate, not
+a startup error.
 
 Backtest/factory evidence requires 100 trades plus 30 complete sessions/clusters;
 sealed qualification requires 100 trades plus 30 complete sessions/clusters;
@@ -731,8 +743,9 @@ release blocker. Root discovery includes the deployment and research suites.
 There is no overnight strategy, withdrawal flow, default unattended live
 deployment, multi-leg/naked option path, crypto path, partial-exit workflow, or
 assertion that any generated signal has positive expectancy. Multi-symbol
-expansion is deferred until a known-positive end-to-end reproduction; partial
-exits remain unimplemented because broker lifecycle and position reconciliation
-would otherwise be unsafe. Any live launch requires a separate
+expansion is not an automatic remedy: it requires a separate approved
+universe/feed scope, exact list, recorder coverage, and a new identity/proof
+epoch. Partial exits remain unimplemented because broker lifecycle and position
+reconciliation would otherwise be unsafe. Any live launch requires a separate
 reviewed config/runtime scope, provider guard, named edge, risk policy,
 session-close behaviour, tests, and operational controls.

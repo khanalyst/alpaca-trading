@@ -20,6 +20,7 @@ from research.live_shadow import (DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS,
                                   ShadowConfig, ShadowRunner,
                                   _next_shadow_cadence_deadline)  # noqa: E402
 from agent.config import load_config as load_runtime_config  # noqa: E402
+from deploy.provenance import deployment_provenance  # noqa: E402
 from deploy.session_acceptance import (  # noqa: E402
     DEFAULT_MAX_AGE_SECONDS,
     DEFAULT_SAMPLE_GAP_TOLERANCE_SECONDS,
@@ -75,7 +76,11 @@ def _write_health(path: Path, status: str, **detail) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": "shadow-health.v1", "status": str(status),
-        "updated_ts": time.time(), "pid": os.getpid(), **detail,
+        "updated_ts": time.time(), "pid": os.getpid(),
+        # Bind the heartbeat to the immutable build that produced it.  The
+        # research cycle consumes this field read-only when selecting the
+        # current acceptance epoch; a missing/unknown identity fails closed.
+        "provenance": deployment_provenance(), **detail,
     }
     temporary = path.with_name(
         f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")

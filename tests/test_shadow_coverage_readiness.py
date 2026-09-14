@@ -125,7 +125,8 @@ class ShadowCoverageReadinessTests(unittest.TestCase):
     def test_errors_or_missing_observations_never_become_ready(self):
         failed = self._project(
             _diagnostic_coverage(now=NOW),
-            candidate_errors={"shadow:family_0:baseline": "failed"})
+            candidate_errors={
+                "shadow:diagnostic:opening_range_breakout:baseline": "failed"})
         self.assertTrue(failed["ok"])
         self.assertFalse(failed["coverage_ready"])
         self.assertEqual(failed["coverage_status"], "candidate_errors_present")

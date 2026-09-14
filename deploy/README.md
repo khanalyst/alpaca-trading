@@ -81,9 +81,29 @@ entitlement failure (`iex_entitlement_required` or
 subscription failure from an empty or temporarily stale corpus. IEX is a
 limited venue view rather than consolidated SIP; sparse coverage is expected
 and is never repaired by relabeling another feed. New exact-feed evidence needs
-a fresh research/shadow proof epoch. Readiness requires both quote and completed
-bar watermarks to be no older than 30 seconds for every required symbol; an
-alive recorder or scheduler is not evidence of readiness or research quality.
+a fresh research/shadow proof epoch. Readiness requires quote age no older than
+30 seconds and completed bars no more than 30 seconds past their next
+publication deadline for every required symbol; raw bar age remains telemetry.
+An alive recorder or scheduler is not evidence of readiness or research quality.
+
+Diagnostic coverage accepts exactly 24 rule arms, or 31 arms when the seven
+registered IBR variants are enabled. Compose defaults
+`ALPACA_SHADOW_INCLUDE_IBR=1` and passes the same strict `0`/`1` mode through
+the trader, watchdog, research, and shadow services; an operator may explicitly
+use `0` for the 24-rule catalog. Health, full-session acceptance and census
+validate the complete catalog, not a reported arm count. The research cycle
+reads `health.json` and `shadow.sqlite3` beside
+the acceptance directory, with `ALPACA_RESEARCH_SHADOW_HEALTH_FILE` and
+`ALPACA_SHADOW_DB` as explicit path overrides. Accepted reports count only when
+their deployment, code, cohort, activation and exact symbols match the current
+mounted configuration and immutable activation. A missing or stale context is
+waiting evidence, not an accepted session. Historical reports are retained
+across releases but do not carry readiness into a new epoch. For current local
+repair and rollout status, see the [current findings](../docs/current-findings.md).
+The exact opt-in paper-incumbent profile and its guarded preflight are documented
+in [paper-shadow-trials.md](../docs/paper-shadow-trials.md), using
+[paper-orb.config.json](paper-orb.config.json) only as a separate operator
+selection.
 
 Compose limits each catch-up cycle to two request windows with
 `ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE`. Each window commits its watermark before
@@ -177,8 +197,9 @@ strategy slots over all twelve bounded rule families and four isolated variant
 accounts per strategy; each isolated book is processed by one bounded worker.
 The twelfth family, `cross_sectional_residual`, is shares-only, uses SPY as its
 benchmark, and requires synchronized one-minute context. It does not replace
-the 24-ETF universe; future family or universe changes require evidence from
-the screen and cross-sectional report.
+the fixed 24-ETF universe; future family or universe changes are separate
+approved scopes requiring exact screen/feed evidence, recorder coverage, and a
+new identity/proof epoch.
 Scheduled research evaluates the equity vehicle only by default because runtime
 execution remains the single `shares` profile. Set
 `ALPACA_RESEARCH_VEHICLES=all` explicitly to evaluate both equity and option
@@ -259,18 +280,19 @@ obligations). All
 output remains diagnostic-only with descriptive P&L and no threshold-selection
 or promotion authority.
 
-The shipped/default universe is 24 liquid ETFs spanning broad-market, size,
-sector, international, rates/credit, metals, and semiconductor exposures (the
-exact list is in `config.yaml`), improving opportunity capacity. Authorizing floors
-are immutable: backtest/factory requires 100 trades and 30 complete
-sessions/clusters; sealed qualification requires 100 trades and 30 complete
-sessions/clusters; parity-matched live shadow requires 150 trades and 30
-complete sessions. Real signal rates still require sufficient history, and
-floor feasibility fails closed; widen history and/or the configured universe,
-never lower a floor. Multi-symbol expansion is deferred until a known-positive
-end-to-end reproduction; any eventual expansion requires an operator-approved
-exact symbol list, recorder coverage for that list, and a new candidate
-identity/proof, not a parameter-only tuning arm. Partial exits remain
+The shipped/default universe is a fixed 24-symbol ETF list spanning broad-market,
+size, sector, international, rates/credit, metals, and semiconductor exposures
+(the exact list is in `config.yaml`). This is a configuration fact, not a
+measured capacity claim. Authorizing floors are immutable: backtest/factory
+requires 100 trades and 30 complete sessions/clusters; sealed qualification
+requires 100 trades and 30 complete sessions/clusters; parity-matched live shadow
+requires 150 trades and 30 complete sessions. Diagnose symbol/feed coverage and
+collect valid forward-observed evidence; historical backfill can support
+diagnostics but cannot count as accepted forward proof. Floor feasibility fails
+closed; a symbol expansion is not an automatic remedy and requires a separate
+approved universe/feed scope, exact symbol list, recorder coverage, and a new
+identity/proof epoch. Never lower a floor or reuse a proof after changing the
+list. Partial exits remain
 unimplemented because broker lifecycle and position reconciliation risk are not
 accepted. Effective breadth is a persisted/re-verified matched
 symbol/session diagnostic and never counts as extra independent N. Before each
@@ -432,7 +454,7 @@ can therefore transition to `validated` and be selected by the shipped
 paper-only `selection_mode: specific` / `variant_id: auto` resolver even while
 calibration remains `bootstrap_unknown`. This is narrow PAPER eligibility under
 `broker.allow_live: false`; it is not live-money authorization. The fixed
-24-arm diagnostic cohort is non-authorizing and never enters this ingestion
+24/31-arm diagnostic cohort is non-authorizing and never enters this ingestion
 path. Once the journal is nonempty, insufficient, stale, mixed-vehicle, or
 optimistic calibration blocks new ingestion, but that calibration check does
 not revoke a candidate already validated by an earlier run.
@@ -629,7 +651,10 @@ Automatic cache identity derivation from historical partition markers is disable
 those partitions may still receive recorder writes. The pre-existing explicit
 `ALPACA_RESEARCH_IMMUTABLE_SOURCE_IDENTITY` opt-in requires the caller to supply
 an actually frozen source. `historical_source_fingerprint` is diagnostic only;
-it does not certify immutability. A sealed snapshot protocol is unfinished.
+it does not certify immutability. Sealed snapshot creation and verification are
+implemented in `research_snapshot.py`; the research cycle verifies the snapshot
+before using its immutable cache identity. A growing recorder corpus is not an
+immutable snapshot.
 A valid calendar marker without its CSV is ignored on recorder rebuild;
 malformed markers still fail validation. Startup publishes its lease before
 preflight; unexpected exits preserve the last work phase, and older jobs cannot

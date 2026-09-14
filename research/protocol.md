@@ -47,16 +47,21 @@ The finite rule grammar contains twelve families. The twelfth,
 `cross_sectional_residual`, is shares-only, benchmarks SPY, and requires
 synchronized one-minute context. It is an additional bounded hypothesis path,
 not a replacement for the shipped 24-ETF universe; future family or universe
-changes require evidence from the fit screen and cross-sectional report.
+changes require a separately approved scope, exact symbol/feed coverage,
+screen evidence, and a new identity/proof epoch.
 
 Production replay requires exact Alpaca calendar metadata for every session,
 including early closes. Missing metadata is a refusal; no fixed 16:00 close is
 promoted as a fallback.
 
 The recorder samples on a fixed 30-second cadence and durably tracks a quote
-watermark and a completed-bar watermark for every symbol. Readiness requires
-both to be no older than 30 seconds; neither watermark can substitute for the
-other. Alpaca calendar metadata records holidays as explicit closed sessions.
+watermark and a completed-bar watermark for every symbol. Full-session
+acceptance requires quote age no greater than 30 seconds and completed-bar
+publication-deadline lag no greater than 30 seconds. Raw bar age remains
+visible; re-fetching an old bar cannot refresh its completion watermark.
+Neither observation substitutes for the other, and runtime entry freshness
+limits are unchanged. Alpaca calendar metadata records holidays as explicit
+closed sessions.
 Scheduler liveness is a separate operational dimension from research evidence
 and readiness.
 
@@ -632,12 +637,16 @@ final window rather than each carrying its own; a corpus too thin to seal a
 window or to support rolling-origin folds is underpowered, not failed.
 
 The held-out trade floor is evidence, not a tuning knob. The shipped default
-universe is 24 liquid ETFs spanning broad-market, size, sector, international,
+universe is a fixed 24-symbol ETF list spanning broad-market, size, sector,
+international,
 rates/credit, metals, and semiconductor exposures (the exact list is in
-`config.yaml`), improving opportunity capacity, but real signal rates still require
-sufficient history. Replay allows at most one trade per symbol-session; floor
-feasibility fails closed when 100 held-out trades cannot be supported. Widen
-history and/or the universe, never lower the floor.
+`config.yaml`). This configuration does not establish measured opportunity
+capacity. Diagnose exact symbol/feed coverage and collect valid forward
+observations; historical backfill remains diagnostic, not accepted forward
+proof. Replay allows at most one trade per symbol-session; floor feasibility
+fails closed when 100 held-out trades cannot be supported. A universe expansion
+requires a separate approved scope, exact coverage, and a new identity/proof
+epoch. Never lower the floor to admit an underpowered sample.
 
 The complete gate is durably persisted and re-verified before validation or
 champion selection. Re-verification recomputes the analysis — matched deltas,

@@ -216,11 +216,13 @@ def _save_status(output: Path, payload: dict) -> dict:
     root = _corpus_root(output)
     root.mkdir(parents=True, exist_ok=True)
     value = {
-        "schema": STATUS_SCHEMA,
         "updated_ts": time.time(),
         "capture_policy": os.getenv("ALPACA_RECORDER_CAPTURE_POLICY", "catch_up"),
         "provenance": deployment_provenance(),
         **payload,
+        # Log events may use recorder-error.v1; the durable status envelope
+        # must remain readable on failed attempts as well as successful ones.
+        "schema": STATUS_SCHEMA,
     }
     temporary = root / (STATUS_NAME + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
