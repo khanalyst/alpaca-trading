@@ -50,7 +50,9 @@ that one catalog spec and does not select an adaptive winner.
 Compose reads `${ALPACA_AGENT_CONFIG_FILE:-./config.yaml}` for all services. An
 operator may explicitly select the profile with
 `export ALPACA_AGENT_CONFIG_FILE=./deploy/paper-orb.config.json`; this document
-does not claim that the profile is released or activated. Before any operator
+records the current release and account-bound activation in the
+[September 15 paper activation receipt](paper-activation-2026-09-15.json),
+without claiming a profitability result. Before any operator
 `resume`, run the authenticated preflight and reconcile both the broker and
 local book to a confirmed flat state with no working orders.
 
@@ -116,7 +118,8 @@ arms); explicit `0` selects the 24-rule catalog. State and the consumed-event
 cursor commit together, so retries cannot credit a close twice. Cash carries
 across sessions and restarts. The activation session remains warmup-only.
 Deployment-specific cohort and release status is tracked in the [current
-findings](current-findings.md).
+findings](current-findings.md) and the [September 15 paper activation
+receipt](paper-activation-2026-09-15.json).
 
 Entries and market exits use causal, exact-feed/provider forward quotes:
 buys use the ask, sells use the bid, with modeled slippage and fees. Resting

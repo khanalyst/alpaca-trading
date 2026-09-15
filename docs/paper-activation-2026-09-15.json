@@ -1,0 +1,258 @@
+{
+  "schema": "paper-activation-verification.v1",
+  "observed_at_utc": "2026-09-15T08:03:31.107222+00:00",
+  "release": {
+    "code_commit": "c7f996a269b34b4eae8a2408ed298aa62fc3e3b6",
+    "github_main_push": "succeeded",
+    "repository": "https://github.com/khanalyst/alpaca-trading",
+    "ci_run": "https://github.com/khanalyst/alpaca-trading/actions/runs/34823981072",
+    "ci_conclusion": "success",
+    "ci_jobs": {
+      "container": "success",
+      "runtime": "success",
+      "research": "success",
+      "factory": "success",
+      "edge": "success"
+    },
+    "deployed_image": "alpaca-agent-trading:paper-orb-c7f996a",
+    "deployed_image_id": "sha256:7c83182979530015850598da3ba7463e83c87b6d72ad2e6bbe63e55ea9aa827a",
+    "deployed_config": "deploy/paper-orb.config.json",
+    "profile_sha256": "1d8dd1a29f57ef6559ac6302ebc977a8c82f5be745027b07a3469ccbfdd43797",
+    "all_other_deployment_env_values_preserved": true,
+    "verification_scope": "Runtime image and frozen identities remain pinned to this code commit; a later documentation-only receipt commit is not a new runtime release."
+  },
+  "verification": {
+    "prior_software_verification": "release-verification-2026-09-14.json",
+    "new_image_offline_regression_tests": {
+      "tests": 28,
+      "failures": 0,
+      "errors": 0,
+      "result": "OK",
+      "broker_network_enabled": false
+    },
+    "recorder_probe": {
+      "result": "probe_ok",
+      "feed": "iex",
+      "capture_policy": "forward_only",
+      "corpus_rows_written": 0,
+      "observed_at_utc": "2026-09-15T07:43:33.906978+00:00"
+    },
+    "authenticated_preflight_at_utc": "2026-09-15T07:52:20.935550+00:00",
+    "locked_resume": {
+      "observed_at_utc": "2026-09-15T07:57:18.819398+00:00",
+      "resumed": true,
+      "broker_positions": 0,
+      "broker_orders": 0,
+      "active_trades": 0,
+      "protection": 0,
+      "account_bound": true,
+      "manual_state_edits": false
+    },
+    "services_observed_at_utc": "2026-09-15T08:01:40.125072+00:00",
+    "services": {
+      "recorder": {
+        "state": "running",
+        "health": "healthy",
+        "restart_count": 0,
+        "code_commit": "c7f996a269b34b4eae8a2408ed298aa62fc3e3b6",
+        "profile": "deploy/paper-orb.config.json"
+      },
+      "trader": {
+        "state": "running",
+        "health": "healthy",
+        "restart_count": 0,
+        "code_commit": "c7f996a269b34b4eae8a2408ed298aa62fc3e3b6",
+        "profile": "deploy/paper-orb.config.json"
+      },
+      "watchdog": {
+        "state": "running",
+        "health": "healthy",
+        "restart_count": 0,
+        "code_commit": "c7f996a269b34b4eae8a2408ed298aa62fc3e3b6",
+        "profile": "deploy/paper-orb.config.json"
+      },
+      "research": {
+        "state": "running",
+        "health": "healthy",
+        "restart_count": 0,
+        "code_commit": "c7f996a269b34b4eae8a2408ed298aa62fc3e3b6",
+        "profile": "deploy/paper-orb.config.json"
+      },
+      "shadow": {
+        "state": "running",
+        "health": "healthy",
+        "restart_count": 0,
+        "code_commit": "c7f996a269b34b4eae8a2408ed298aa62fc3e3b6",
+        "profile": "deploy/paper-orb.config.json"
+      },
+      "dashboard": {
+        "state": "running",
+        "health": "healthy",
+        "restart_count": 0,
+        "code_commit": "c7f996a269b34b4eae8a2408ed298aa62fc3e3b6",
+        "profile": "deploy/paper-orb.config.json"
+      }
+    },
+    "runtime": {
+      "account_active": true,
+      "broker_open_orders": 0,
+      "broker_positions": 0,
+      "config": {
+        "allow_live": false,
+        "paper": true,
+        "profile_sha256": "1d8dd1a29f57ef6559ac6302ebc977a8c82f5be745027b07a3469ccbfdd43797",
+        "require_validated_variant": true,
+        "risk": {
+          "daily_loss_limit_pct": 2,
+          "max_concurrent_positions": 3,
+          "max_gross_exposure_pct": 50,
+          "max_open_risk_pct": 2,
+          "max_position_notional_pct": 25,
+          "max_stressed_cost_to_risk_ratio": 0.3,
+          "min_confidence": 0,
+          "options_max_dte": 60,
+          "options_max_spread_pct": 10,
+          "options_min_dte": 7,
+          "risk_per_trade_pct": 0.5,
+          "stressed_cost_calibration_enabled": false,
+          "stressed_cost_calibration_path": "",
+          "stressed_cost_scenario_bps": 25
+        },
+        "runtime_llm_enabled": false
+      },
+      "daily_limit_hit": false,
+      "endpoint": "https://paper-api.alpaca.markets",
+      "heartbeat": {
+        "reason": "outside_regular_session",
+        "status": "running",
+        "ts": null,
+        "updated_ts": 1789459382.4150345
+      },
+      "kill_reason": null,
+      "local_book_flat": true,
+      "market_open": false,
+      "next_open": "2026-09-15 09:30:00-04:00",
+      "observed_at": "2026-09-15T08:03:31.107222+00:00",
+      "operator_pause": false,
+      "paper_selection": {
+        "armed": true,
+        "blocker_code": null,
+        "requested_variant": "rule.opening-range-breakout.0eb200d3136d80ee",
+        "resolved_proof": null,
+        "resolved_variant": "rule.opening-range-breakout.0eb200d3136d80ee",
+        "selection_mode": "paper_trial",
+        "state": "paper_trial"
+      },
+      "prior_session": {
+        "accepted": false,
+        "authorizing": false,
+        "reasons": [
+          "cadence_evidence_missing",
+          "duration_evidence_missing",
+          "post_activation_progress_evidence_missing",
+          "samples_missing",
+          "warmup_session_unknown"
+        ],
+        "session": {
+          "close": "2026-09-14T20:00:00+00:00",
+          "date": "2026-09-14",
+          "open": "2026-09-14T13:30:00+00:00",
+          "source": "alpaca_calendar"
+        },
+        "session_date": null,
+        "status": "rejected"
+      },
+      "runtime_mode": "paper",
+      "shadow": {
+        "activation_identity": "shadow:diagnostic:activation:d81fa29390110c9594f078dc417884e7b488c97aee8071cb3bbd21eb151d2bd9",
+        "activation_status": "active",
+        "actual_fill_claims": false,
+        "actual_fills": 0,
+        "arm_count": 31,
+        "candidate_errors": {},
+        "code_matches_paper": true,
+        "cohort_matches_paper": true,
+        "diagnostic_candidates": 31,
+        "forward_account_fields": [
+          "account_count",
+          "actual_fills",
+          "by_candidate",
+          "cash",
+          "closed_positions",
+          "entry_fills",
+          "equity",
+          "exit_fills",
+          "late_data_gap_positions",
+          "modeled_fills",
+          "open_positions",
+          "orders",
+          "priced_account_count",
+          "priced_equity",
+          "priced_unrealized_pnl",
+          "realized_pnl",
+          "schema",
+          "unpriced_account_count",
+          "unrealized_pnl"
+        ],
+        "last_error": null,
+        "modeled_accounts": 31,
+        "paper_variant_present": true,
+        "status": "running",
+        "strategies": {
+          "ibr": 7,
+          "rule": 24
+        },
+        "unique_arm_count": 31
+      },
+      "state": "RUNNING",
+      "trial": {
+        "accepted_sessions": 0,
+        "activation_account_bound": true,
+        "activation_confirmed": true,
+        "authorizing": false,
+        "blockers": [],
+        "candidate_id": "shadow:diagnostic:cc2b555df924388dca86bec51fc607fe11468405f4358ed6d1b3d2e6f562cf3b",
+        "closed_outcomes": 0,
+        "code_identity": "fb6c116cb4d58fd3a2e382f0091a19f3e1330eb5d4665cb939cfe62e5ad7ab19",
+        "cohort_identity": "shadow:diagnostic:cohort:8cf4e1fdaefd34d3611a57f1e1bb7fbe3741dbf320bb1574165e2a8ae192fb1f",
+        "family": "opening_range_breakout",
+        "include_ibr": true,
+        "incumbent_identity": "2f02fc0ec886e893e12f65767186670138b63f093dd7a547a4469eaf8a3f9508",
+        "max_review_sessions": 60,
+        "proof_authority": false,
+        "required_sessions": 20,
+        "required_trades": 20,
+        "started_on": "2026-09-15",
+        "state": "running",
+        "trial_id": "paper-orb-baseline-20260914-v1",
+        "variant_id": "rule.opening-range-breakout.0eb200d3136d80ee"
+      },
+      "verification_passed": true
+    }
+  },
+  "rollback_backup": {
+    "scope": "All four stopped Compose named volumes, prior source archive, Compose/config files and private deployment environment; no market-data/cache exclusions.",
+    "backup_completed_before_runtime_start": true,
+    "separate_durable_device_verified": true,
+    "off_host_copy_verified": true,
+    "compressed_bytes": 13808696993,
+    "uncompressed_tar_bytes": 74448189440,
+    "volumes_sha256": "cda4844ff37b0352d4d7f67c56ac0475df83bebc9525eca27685dbe446793dd3",
+    "old_source_commit": "c9368e2a4d2ccd6f9d1bca5b6fdcea9cb5b69c2d",
+    "old_source_archive_sha256": "04e8ab94fa120490f5b44a42eee3ac4479c24acbdf38058986400a1f74cde231",
+    "remote_archive_test": "zstd integrity and full tar listing passed",
+    "off_host_archive_test": "SHA-256 matched remote archive; zstd integrity passed",
+    "private_local_artifact": "outputs/paper-activation-2026-09-14/rollback-volumes-c9368e2.tar.zst",
+    "artifact_published_to_github": false
+  },
+  "limitations": [
+    "The services remained stopped during the backup approval delay. September 14 was not collected and its acceptance report is rejected; it cannot count as forward evidence.",
+    "The trial ID contains the September 14 plan date. Actual account-bound activation started on September 15, as recorded by the runtime; it was not backdated.",
+    "September 15 is activation-day warmup, not an accepted trial session. A later complete matching session can count only after all operational acceptance checks pass.",
+    "The market was closed during verification. The next broker-reported regular open was September 15 at 09:30 America/New_York (17:30 Asia/Dubai). Live-market freshness, fills and costs remain to be observed.",
+    "No manual smoke order, strategy retuning, forced trade, account reset, or live-money permission was used.",
+    "Zero accepted trial sessions and zero closed trial outcomes are not a positive or negative profitability verdict. The trial needs 20 accepted sessions and 20 closed outcomes, with review required at 60 accepted sessions.",
+    "Diagnostic shadow fills are modeled, not actual Alpaca paper fills. The 31 modeled accounts have no broker execution authority.",
+    "All risk, feed, session, cost and proof controls remain unchanged. A paper pass never grants live trading authority."
+  ]
+}
