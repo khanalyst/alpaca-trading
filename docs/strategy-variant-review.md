@@ -16,7 +16,8 @@ the frozen mechanism structure was read from
 `mechanism_cohort()` in the [mechanism cohort](../research/mechanism_cohort.py).
 
 The latest retained diagnostic evidence is historical and execution-limited; see
-the retained [edge-results JSON](edge-results-2026-09-12.json):
+the archived [edge-results JSON](https://github.com/khanalyst/alpaca-trading/blob/8068c73deb157d14fb84e49514c8f8eb8d0e9de5/docs/edge-results-2026-09-12.json),
+which is historical evidence rather than current performance:
 36 rule/mechanism arms were execution-blocked and 7 runtime IBR arms were
 unavailable because the corpus had historical bars but no contemporaneous
 quotes. The separate legacy seven-arm IBR comparison had six negative arms and
@@ -41,11 +42,15 @@ or calibration change is authorized here. The next useful evidence is
 untouched accepted forward quotes and costs, not five to ten more strategies on
 the examined data.
 
-Software-contract work in this review is separate from signal evidence: the
-24/31 readiness contract, current-epoch census binding,
-recorder-error payload/schema preservation, future-observed bar/quote exclusion,
-and explicit-zero setup handling are implementation concerns. Full test counts,
-pass status, and deployment status are intentionally not claimed here.
+Software-contract work in this review is separate from signal evidence. The
+24/31 readiness contract, current-epoch census binding, recorder-error
+payload/schema preservation, future-observed bar/quote exclusion, and
+explicit-zero setup handling are already implemented in `c7f996a`. Historical
+software verification records 2,099 full-suite tests passed in the archived
+[release verification](https://github.com/khanalyst/alpaca-trading/blob/8068c73deb157d14fb84e49514c8f8eb8d0e9de5/docs/release-verification-2026-09-14.json),
+and the September 15 activation receipt records `verification_passed: true`.
+These software checks do not establish strategy performance or accepted trial
+sessions.
 
 ## Parameter realism
 
@@ -154,7 +159,7 @@ maximum spread 25 bps, latest entry 15:00, and force-flat 10 minutes before the
 close. Its relative-volume candidate is candidate-bar volume divided by the
 opening-range mean minute volume from the feed; it is not historical same-minute
 RVOL or consolidated participation.
-The setup-coercion repair keeps an explicit 0 bps buffer as zero for both long
+The setup-coercion implementation keeps an explicit 0 bps buffer as zero for both long
 and short paths; that software contract is not a profitability result.
 
 ATR includes the completed breakout bar and does not create future lookahead.
@@ -170,26 +175,19 @@ live-eligible based on this review or on the historical one-share comparison.
 
 ## Ordered next research steps
 
-1. Verify CI and an explicitly authorized rollout of the locally tested repairs,
-   including explicit-zero setup handling. Follow [current findings](current-findings.md)
-   for passed test results and pending deployment status; this review is not
-   session acceptance evidence.
-2. Freeze a new evaluation epoch and bind every census, arm, data-availability
-   decision, and recorder status to that epoch. Confirm that no future-observed
-   bar or quote can enter a signal or outcome.
-3. Obtain untouched accepted forward equity quotes for the exact registered
+1. Obtain untouched accepted forward equity quotes for the exact registered
    arms, preserving provider/feed, timestamps, spread, slippage, fee, and fill
    provenance. Keep the 24 rule, 12 mechanism, and 7 IBR identities separate.
-4. Measure realized cost and signal reach by arm, side, symbol, and time of day.
+2. Measure realized cost and signal reach by arm, side, symbol, and time of day.
    Apply the existing cost/risk gate without widening stops or changing risk
    limits to rescue a failing arm.
-5. Evaluate the predeclared mechanism comparators with correlated-session and
+3. Evaluate the predeclared mechanism comparators with correlated-session and
    multiple-testing controls; do not pool overlapping trades into a causal
    winner. Treat bundle comparisons as bundles and keep each comparator exact.
-6. For IBR, measure the seven one-coordinate axes with broker constraints and
+4. For IBR, measure the seven one-coordinate axes with broker constraints and
    actual-fill observability. For feed-sensitive volume signals, establish a
    separate feed identity before interpreting volume as participation.
-7. Keep the nonauthorizing diagnostic shadow separate from proof: it can precede
+5. Keep the nonauthorizing diagnostic shadow separate from proof: it can precede
    profitability proof and is not a promotion. Broker-connected shadow,
    promotion, or live activation may be considered only after untouched forward
    evidence clears the applicable execution, risk, and evidence gates. This
@@ -199,10 +197,13 @@ live-eligible based on this review or on the historical one-share comparison.
 
 Coverage is 43/43 unique registered equity arms: 24 rule diagnostic-shadow
 arms, 12 `intraday-mechanisms.v1` arms, and 7 IBR registry arms. Verification
-performed: read-only inventory resolution from the source builder, read-only
-mechanism manifest inspection, exact-ID/spec cross-check, and consistency
-review against the retained 12 September edge results and the stated cost
-geometry. No profitability backtest, parameter search, live order, deployment,
-or final test-suite claim was performed here. Historical bars without
-contemporaneous quotes cannot establish executable edge. This review does not
-replace the implementation-validation status in the current findings.
+performed here was review-only: read-only inventory resolution from the source
+builder, read-only mechanism manifest inspection, exact-ID/spec cross-check,
+and consistency review against the retained 12 September edge results and the
+stated cost geometry. No profitability backtest, parameter search, live order,
+or deployment was performed here. The archived software verification records
+2,099 full-suite tests passed; that historical software result and the
+activation receipt’s `verification_passed` status do not establish executable
+edge or accepted trial sessions. Historical bars without contemporaneous
+quotes cannot establish executable edge. This review does not replace the
+implementation-validation status in the current findings.

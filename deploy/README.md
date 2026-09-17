@@ -86,6 +86,17 @@ a fresh research/shadow proof epoch. Readiness requires quote age no older than
 publication deadline for every required symbol; raw bar age remains telemetry.
 An alive recorder or scheduler is not evidence of readiness or research quality.
 
+Recorder `cycle_telemetry` separates recent-key preparation, insert, expiry,
+count, metadata update and durable commit time. Shadow `diagnostic_shadow.phase_metrics`
+separates preparation/context, market views, worker elapsed time, persistence/replay
+and coverage. These bounded measurements are non-authorizing and never replace
+quote freshness, publication deadlines or complete-session acceptance. Worker
+aggregate time sums overlapping wall durations; it is not CPU time.
+For a broker-free storage control, `python deploy/profile_recorder_keys.py` uses
+disposable synthetic databases only, retains FULL durability for every candidate,
+checks exact final membership, and includes connection-close/checkpoint cost.
+Its results are specific to the machine and fixture, not a live-readiness verdict.
+
 Diagnostic coverage accepts exactly 24 rule arms, or 31 arms when the seven
 registered IBR variants are enabled. Compose defaults
 `ALPACA_SHADOW_INCLUDE_IBR=1` and passes the same strict `0`/`1` mode through

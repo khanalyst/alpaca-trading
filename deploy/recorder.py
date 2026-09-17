@@ -160,11 +160,20 @@ def _initialize_cycle_telemetry(target: dict) -> dict:
         "durable_save_seconds": 0.0,
         "csv_partition_flush_fsync_seconds": 0.0,
         "recent_key_transaction_seconds": 0.0,
+        "recent_key_value_preparation_seconds": 0.0,
+        "recent_key_insert_seconds": 0.0,
+        "recent_key_expiry_delete_seconds": 0.0,
+        "recent_key_count_seconds": 0.0,
+        "recent_key_metadata_update_seconds": 0.0,
+        "recent_key_transaction_commit_seconds": 0.0,
         "index_json_save_seconds": 0.0,
         "windows_completed": 0,
         "projected_rows": 0,
         "session_rows": 0,
         "unique_rows": 0,
+        "recent_key_incoming_count": 0,
+        "recent_key_expired_count": 0,
+        "recent_key_current_count": 0,
     })
     return target
 
@@ -833,7 +842,7 @@ class RecentKeyIndex:
         }
 
     def commit_cycle(self, entries, *, floor: datetime | None,
-                     signature: str) -> dict:
+                     signature: str, telemetry: dict | None = None) -> dict:
         """Atomically publish one cycle's exact recent-key state.
 
         CSV partitions are already durable when this begins.  Keeping inserts,
@@ -842,18 +851,27 @@ class RecentKeyIndex:
         while ensuring a fault in any phase leaves the prior SQLite state
         intact.  The aggregate JSON index is published only after this commit.
         """
-        values = [(str(key), _recent_key_timestamp(stamp))
-                  for key, stamp in entries]
+        with _timed_cycle_phase(
+                telemetry, "recent_key_value_preparation_seconds"):
+            values = [(str(key), _recent_key_timestamp(stamp))
+                      for key, stamp in entries]
+        if telemetry is not None:
+            # The input size is known without another database operation.  The
+            # other counts below are published only after COMMIT succeeds.
+            telemetry["recent_key_incoming_count"] = len(values)
         metadata_values = {
             "schema": self.schema,
             "corpus_signature": signature,
         }
+        expired_count = 0
+        count = 0
         try:
-            with self.db:
-                # Begin before the read-only count too: even an empty or
-                # duplicate-only capture binds one internally consistent state.
-                self.db.execute("BEGIN IMMEDIATE")
-                if values:
+            # Begin before the read-only count too: even an empty or
+            # duplicate-only capture binds one internally consistent state.
+            self.db.execute("BEGIN IMMEDIATE")
+            if values:
+                with _timed_cycle_phase(
+                        telemetry, "recent_key_insert_seconds"):
                     try:
                         self.db.executemany(
                             "INSERT INTO recent_keys(event_key,event_ts) "
@@ -861,25 +879,43 @@ class RecentKeyIndex:
                     except sqlite3.IntegrityError as exc:
                         raise RuntimeError(
                             "recorder recent-key index repeats an event_key") from exc
-                if floor is not None:
-                    self.db.execute(
+            if floor is not None:
+                with _timed_cycle_phase(
+                        telemetry, "recent_key_expiry_delete_seconds"):
+                    deleted = self.db.execute(
                         "DELETE FROM recent_keys WHERE event_ts < ?",
                         (_recent_key_timestamp(floor),))
+                    # SQLite reports affected rows for DELETE without requiring
+                    # a second full-table COUNT scan.
+                    expired_count = max(0, int(deleted.rowcount))
+            with _timed_cycle_phase(telemetry, "recent_key_count_seconds"):
                 row = self.db.execute(
                     "SELECT COUNT(*) FROM recent_keys").fetchone()
                 count = int(row[0]) if row is not None else 0
-                metadata_values["count"] = str(count)
+            metadata_values["count"] = str(count)
+            with _timed_cycle_phase(
+                    telemetry, "recent_key_metadata_update_seconds"):
                 self.db.executemany(
                     "INSERT INTO metadata(key,value) VALUES (?,?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     sorted(metadata_values.items()))
-        except Exception:
-            # Connection context management performs the rollback.  Keep this
-            # explicit guard so a future refactor cannot accidentally publish
-            # metadata after any failed insert or prune operation.
+            with _timed_cycle_phase(
+                    telemetry, "recent_key_transaction_commit_seconds"):
+                # Keep the commit explicit: this is the one durable COMMIT for
+                # the transaction and its latency is measured independently.
+                self.db.commit()
+        except BaseException:
+            # Keep this explicit guard so every failed phase, including a
+            # failed COMMIT or interrupted worker, leaves prior state intact.
+            # This matches the connection context manager's rollback contract.
+            # Counts are deliberately not copied on this path: they describe
+            # only successfully published state.
             if self.db.in_transaction:
                 self.db.rollback()
             raise
+        if telemetry is not None:
+            telemetry["recent_key_expired_count"] = expired_count
+            telemetry["recent_key_current_count"] = count
         return {
             "schema": self.schema,
             "name": RECENT_KEY_INDEX_NAME,
@@ -1340,7 +1376,8 @@ def _save_index(output: Path, index: dict,
                 with _timed_cycle_phase(
                         telemetry, "recent_key_transaction_seconds"):
                     metadata = recent_store.commit_cycle(
-                        recent_entries, floor=floor, signature=signature)
+                        recent_entries, floor=floor, signature=signature,
+                        telemetry=telemetry)
         finally:
             if owned_store is not None:
                 owned_store.close()

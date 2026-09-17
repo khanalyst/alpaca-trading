@@ -1,7 +1,9 @@
 """Recorder timing evidence and real-time quote boundaries stay distinct."""
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -34,12 +36,30 @@ class RecorderMeasurementTests(unittest.TestCase):
             "bars_fetch_seconds": 12.0, "quotes_fetch_seconds": float("nan"),
             "unique_rows": True, "projected_rows": 10,
             "index_json_save_seconds": -1,
+            "recent_key_value_preparation_seconds": 0.003,
+            "recent_key_insert_seconds": 0.004,
+            "recent_key_expiry_delete_seconds": 0.005,
+            "recent_key_count_seconds": 0.006,
+            "recent_key_metadata_update_seconds": 0.007,
+            "recent_key_transaction_commit_seconds": 0.008,
+            "recent_key_incoming_count": 4,
+            "recent_key_expired_count": 2,
+            "recent_key_current_count": 8,
             "bars_received_at": stamp, "quotes_received_at": "invalid",
             "last_bar_market_ts": "2026-09-09T14:30:00",
             "api_key": "must-not-be-exposed", "arbitrary": {"payload": "secret"},
         }}
         expected = {"schema": "recorder-cycle-telemetry.v1",
                     "bars_fetch_seconds": 12.0, "projected_rows": 10.0,
+                    "recent_key_value_preparation_seconds": 0.003,
+                    "recent_key_insert_seconds": 0.004,
+                    "recent_key_expiry_delete_seconds": 0.005,
+                    "recent_key_count_seconds": 0.006,
+                    "recent_key_metadata_update_seconds": 0.007,
+                    "recent_key_transaction_commit_seconds": 0.008,
+                    "recent_key_incoming_count": 4.0,
+                    "recent_key_expired_count": 2.0,
+                    "recent_key_current_count": 8.0,
                     "bars_received_at": stamp}
         self.assertEqual(health._recorder_cycle_telemetry(attempt), expected)
         with tempfile.TemporaryDirectory() as directory:
@@ -59,6 +79,101 @@ class RecorderMeasurementTests(unittest.TestCase):
         self.assertEqual(result["realized_interval_seconds"], 60.0)
         self.assertEqual(result["cycle_duration_seconds"], 43.0)
         self.assertEqual(result["cycle_overrun_seconds"], 13.0)
+
+    def test_recent_key_commit_reports_bounded_phase_timings_and_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / recorder.RECENT_KEY_INDEX_NAME
+            telemetry = {}
+            with recorder.RecentKeyIndex(database, create=True) as recent:
+                recent.add_many([("old", "2026-08-08T13:00:00+00:00")])
+                recent.bind(signature="before")
+                result = recent.commit_cycle(
+                    [("new", "2026-08-08T13:02:00+00:00")],
+                    floor=datetime(2026, 8, 8, 13, 1,
+                                   tzinfo=timezone.utc),
+                    signature="after", telemetry=telemetry)
+
+            phase_fields = (
+                "recent_key_value_preparation_seconds",
+                "recent_key_insert_seconds",
+                "recent_key_expiry_delete_seconds",
+                "recent_key_count_seconds",
+                "recent_key_metadata_update_seconds",
+                "recent_key_transaction_commit_seconds",
+            )
+            for field in phase_fields:
+                self.assertIn(field, telemetry)
+                self.assertTrue(
+                    isinstance(telemetry[field], (int, float)) and
+                    telemetry[field] >= 0 and
+                    telemetry[field] != float("inf") and
+                    telemetry[field] == telemetry[field])
+            self.assertEqual(result["count"], 1)
+            self.assertEqual(telemetry["recent_key_incoming_count"], 1)
+            self.assertEqual(telemetry["recent_key_expired_count"], 1)
+            self.assertEqual(telemetry["recent_key_current_count"], 1)
+
+    def test_recent_key_commit_failure_rolls_back_without_success_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / recorder.RECENT_KEY_INDEX_NAME
+            telemetry = {}
+            with recorder.RecentKeyIndex(database, create=True) as recent:
+                recent.add_many([("old", "2026-08-08T13:00:00+00:00")])
+                recent.bind(signature="before")
+                before = (
+                    list(recent.db.execute(
+                        "SELECT event_key,event_ts FROM recent_keys "
+                        "ORDER BY event_key")),
+                    recent.metadata(),
+                )
+
+                def deny_commit(action, first, _second, _database, _source):
+                    if action == sqlite3.SQLITE_TRANSACTION and first == "COMMIT":
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                recent.db.set_authorizer(deny_commit)
+                with self.assertRaises(sqlite3.DatabaseError):
+                    recent.commit_cycle(
+                        [("new", "2026-08-08T13:02:00+00:00")],
+                        floor=datetime(2026, 8, 8, 13, 1,
+                                       tzinfo=timezone.utc),
+                        signature="after", telemetry=telemetry)
+                recent.db.set_authorizer(None)
+                self.assertEqual(
+                    list(recent.db.execute(
+                        "SELECT event_key,event_ts FROM recent_keys "
+                        "ORDER BY event_key")), before[0])
+                self.assertEqual(recent.metadata(), before[1])
+
+            self.assertEqual(telemetry.get("recent_key_current_count", 0), 0)
+            self.assertEqual(telemetry.get("recent_key_expired_count", 0), 0)
+
+    def test_recent_key_interrupt_rolls_back_before_connection_closes(self):
+        original_phase = recorder._timed_cycle_phase
+
+        @contextmanager
+        def interrupt(telemetry, name):
+            if name == "recent_key_metadata_update_seconds":
+                raise KeyboardInterrupt()
+            with original_phase(telemetry, name):
+                yield
+
+        with tempfile.TemporaryDirectory() as directory:
+            with recorder.RecentKeyIndex(Path(directory) / "keys.sqlite3",
+                                         create=True) as recent:
+                recent.add_many([("old", "2026-08-08T13:00:00+00:00")])
+                recent.bind(signature="before")
+                with patch.object(recorder, "_timed_cycle_phase", interrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        recent.commit_cycle(
+                            [("new", "2026-08-08T13:02:00+00:00")],
+                            floor=datetime(2026, 8, 8, 13, 1, tzinfo=timezone.utc),
+                            signature="after", telemetry={})
+                self.assertFalse(recent.db.in_transaction)
+                self.assertTrue(recent.contains("old"))
+                self.assertFalse(recent.contains("new"))
+                self.assertEqual(recent.metadata()["corpus_signature"], "before")
 
 
 class RecorderQuoteBoundaryTests(unittest.TestCase):

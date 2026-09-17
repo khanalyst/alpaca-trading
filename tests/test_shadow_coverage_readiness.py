@@ -16,6 +16,31 @@ NOW = 100.0
 
 
 class ShadowCoverageReadinessTests(unittest.TestCase):
+    def test_phase_metrics_are_bounded_and_cannot_change_readiness(self):
+        raw = _diagnostic_coverage(now=NOW)
+        candidate = raw["candidate_identities"][0]
+        raw["source_lag_seconds"] = 60.0
+        before = self._project(raw, candidate_errors={})
+        raw["phase_metrics"] = {
+            "authorizing": True, "diagnostic_only": False,
+            "total_seconds": 0.001, "workers_seconds": float("nan"),
+            "market_views_seconds": -1, "coverage_seconds": True,
+            "untrusted": "do not publish",
+            "worker_seconds": {"aggregate_seconds": 0.1,
+                               "max_seconds": float("inf"),
+                               "by_candidate": {candidate: 0.01,
+                                                "unknown": 123}},
+        }
+        result = self._project(raw, candidate_errors={})
+        self.assertEqual(result["coverage_status"], before["coverage_status"])
+        self.assertFalse(result["coverage_ready"])
+        self.assertEqual(result["diagnostic_shadow"]["phase_metrics"], {
+            "diagnostic_only": True, "authorizing": False,
+            "total_seconds": 0.001,
+            "worker_seconds": {"aggregate_seconds": 0.1,
+                               "by_candidate": {candidate: 0.01}},
+        })
+
     def _project(self, diagnostic: dict, *, updated_ts: float = NOW,
                  max_age: float = 180.0, candidate_errors=()) -> dict:
         heartbeat = {

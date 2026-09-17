@@ -22,7 +22,7 @@
     "verification_scope": "Runtime image and frozen identities remain pinned to this code commit; a later documentation-only receipt commit is not a new runtime release."
   },
   "verification": {
-    "prior_software_verification": "release-verification-2026-09-14.json",
+    "prior_software_verification": "https://github.com/khanalyst/alpaca-trading/blob/8068c73deb157d14fb84e49514c8f8eb8d0e9de5/docs/release-verification-2026-09-14.json",
     "new_image_offline_regression_tests": {
       "tests": 28,
       "failures": 0,

@@ -15,7 +15,9 @@ from research import live_shadow as live_shadow_module
 from research.diagnostic_accounts import DiagnosticAccountBook
 from research.diagnostic_shadow import build_diagnostic_cohort
 from research.edge_ledger import EdgeLedger
-from research.live_shadow import ShadowConfig, ShadowRunner, ShadowStore
+from research.live_shadow import (
+    InputConflict, ShadowConfig, ShadowRunner, ShadowStore,
+    _PreparedDiagnosticEvent)
 
 
 FIELDS = [
@@ -218,11 +220,19 @@ class ShadowDiagnosticPerformanceTests(unittest.TestCase):
             result = runner.run_once()
 
         self.assertEqual(result["candidate_errors"], {})
+        # Preserve the baseline direct preparation contract: incremental
+        # rows are prepared once, then independently prepared in context.
         self.assertEqual(prepare.call_count, len(rows) * 2)
         self.assertEqual(market_views.call_count, 1)
         self.assertEqual(evaluate.call_count, 24 * 8)
         self.assertEqual(
             result["diagnostic_shadow"]["processed_events"], 24 * len(rows))
+        phase_metrics = result["diagnostic_shadow"]["phase_metrics"]
+        self.assertGreaterEqual(phase_metrics["total_seconds"],
+                                phase_metrics["coverage_seconds"])
+        self.assertEqual(
+            set(phase_metrics["worker_seconds"]["by_candidate"]),
+            set(result["diagnostic_shadow"]["candidate_identities"]))
 
     def test_coverage_uses_filtered_rollups_not_full_table_materialization(self):
         runner = ShadowRunner(ShadowConfig(
@@ -243,6 +253,33 @@ class ShadowDiagnosticPerformanceTests(unittest.TestCase):
         self.assertTrue(coverage["enabled"])
         self.assertEqual(coverage["candidate_identities"],
                          sorted(cohort["candidate_identities"]))
+
+    def test_diagnostic_cursor_suffix_handles_equal_and_mixed_event_cursors(self):
+        def prepared(inserted_at: float, event_key: str):
+            return _PreparedDiagnosticEvent(
+                row={"event_key": event_key}, payload=None, session=None,
+                available_at=None, cursor=(inserted_at, event_key),
+                eligible=False, rejection_reason=None)
+
+        rows = tuple(prepared(*cursor) for cursor in (
+            (100.0, "a"), (100.0, "z"), (101.0, "a")))
+        cursors = tuple(item.cursor for item in rows)
+        self.assertEqual(
+            [item.cursor for item in ShadowRunner._diagnostic_cursor_suffix(
+                rows, cursors, (100.0, "a"))],
+            [(100.0, "z"), (101.0, "a")])
+        self.assertEqual(
+            [item.cursor for item in ShadowRunner._diagnostic_cursor_suffix(
+                rows, cursors, (100.0, "z"))],
+            [(101.0, "a")])
+
+    def test_wal_event_key_conflicts_cannot_change_union_winner(self):
+        store = ShadowStore(self.shadow)
+        stamp = datetime(2026, 9, 8, 13, 30, tzinfo=timezone.utc)
+        row = self._bar("SPY", stamp)
+        store.ingest_event(row, max_events=10)
+        with self.assertRaises(InputConflict):
+            store.ingest_event({**row, "close": "101"}, max_events=10)
 
 
 if __name__ == "__main__":  # pragma: no cover

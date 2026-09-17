@@ -577,8 +577,9 @@ payoffs, uncertainty, and recorded entry context. Account equity is explicitly
 not adjusted for cash transfers. Direct research progress is separate from the
 scheduler heartbeat. See the [current findings](docs/current-findings.md)
 for verified pending work, deployment status and evidence limitations.
-The [frozen strategy and feed comparison](docs/trading-edge-comparison-2026-09-08.md)
-retains all twelve arms and their execution refusals; it establishes no deployable positive edge.
+The [archived frozen strategy and feed comparison](https://github.com/khanalyst/alpaca-trading/blob/8068c73deb157d14fb84e49514c8f8eb8d0e9de5/docs/trading-edge-comparison-2026-09-08.md)
+retains all twelve arms and their execution refusals as historical evidence;
+it is not current performance and establishes no deployable positive edge.
 
 The CLI answers the same questions without a browser:
 

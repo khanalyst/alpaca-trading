@@ -21,3 +21,6 @@ research/results/factory/
 # Imported VM databases/results are audit fixtures only; production and test
 # code must use explicit temporary stores or configured runtime paths.
 vm-import/
+
+# Private off-host research-reset backup, account journal, and recovery receipts.
+/outputs/research-reset-2026-09-16/

@@ -1,5 +1,6 @@
 """Exact, bounded and crash-safe migration of the recorder's overlap cache."""
 from copy import deepcopy
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -18,7 +19,7 @@ class RecentKeyLayoutTests(unittest.TestCase):
         recorder._append_partitions(corpus, rows)
         recorder._save_index(corpus, recorder._scan_corpus(corpus))
         database = root / recorder.RECENT_KEY_INDEX_NAME
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             db.execute("DROP INDEX recent_keys_event_ts")
             db.execute("ALTER TABLE recent_keys RENAME TO current_keys")
             db.execute("CREATE TABLE recent_keys(event_key TEXT PRIMARY KEY, "
@@ -108,7 +109,7 @@ class RecentKeyLayoutTests(unittest.TestCase):
     def test_mismatched_legacy_count_cannot_authorize_cache_only_migration(self):
         with tempfile.TemporaryDirectory() as directory:
             corpus, database, _before, rows = self.fixture(Path(directory))
-            with sqlite3.connect(database) as db:
+            with closing(sqlite3.connect(database)) as db, db:
                 db.execute("DELETE FROM recent_keys WHERE event_key=?", (rows[-1]["event_key"],))
             self.assertIsNone(recorder._load_index(corpus))
             with patch.object(recorder, "_scan_corpus", wraps=recorder._scan_corpus) as scan:
@@ -119,7 +120,7 @@ class RecentKeyLayoutTests(unittest.TestCase):
     def test_corrupt_legacy_timestamp_falls_back_to_the_corpus(self):
         with tempfile.TemporaryDirectory() as directory:
             corpus, database, _before, rows = self.fixture(Path(directory))
-            with sqlite3.connect(database) as db:
+            with closing(sqlite3.connect(database)) as db, db:
                 db.execute("UPDATE recent_keys SET event_ts='not-a-timestamp' WHERE event_key=?",
                            (rows[-1]["event_key"],))
             with patch.object(recorder, "_scan_corpus", wraps=recorder._scan_corpus) as scan:
@@ -132,7 +133,7 @@ class RecentKeyLayoutTests(unittest.TestCase):
             with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 corpus, database, _before, rows = self.fixture(root)
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     db.execute("DROP INDEX recent_keys_event_ts")
                     if corrupt != "missing_time_index":
                         db.execute("ALTER TABLE recent_keys RENAME TO old_keys")

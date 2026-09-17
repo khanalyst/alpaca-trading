@@ -11,7 +11,7 @@ is fabricated when a safe exit cannot be reconstructed.
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
@@ -456,6 +456,25 @@ class _PreparedDiagnosticEvent:
     cursor: tuple[float, str]
     eligible: bool
     rejection_reason: str | None
+
+
+def _diagnostic_phase_metrics() -> dict[str, Any]:
+    """Return bounded, non-authorizing diagnostic phase timing telemetry."""
+    return {
+        "diagnostic_only": True,
+        "authorizing": False,
+        "preparation_context_seconds": 0.0,
+        "market_views_seconds": 0.0,
+        "workers_seconds": 0.0,
+        "worker_seconds": {
+            "aggregate_seconds": 0.0,
+            "max_seconds": 0.0,
+            "by_candidate": {},
+        },
+        "persistence_replay_seconds": 0.0,
+        "coverage_seconds": 0.0,
+        "total_seconds": 0.0,
+    }
 
 
 def _load_recorded_session_calendar(
@@ -3601,6 +3620,19 @@ class ShadowRunner:
             rejection_reason=reason)
 
     @staticmethod
+    def _diagnostic_cursor_suffix(
+            prepared: Sequence[_PreparedDiagnosticEvent],
+            cursors: Sequence[tuple[float, str]],
+            cursor: tuple[float, str]) -> Sequence[_PreparedDiagnosticEvent]:
+        """Return the strict insertion-cursor suffix in logarithmic lookup.
+
+        Rows are sorted once per poll.  Cursor keys use a numeric insertion
+        timestamp followed by the event key, so equal timestamps remain
+        deterministic even when arms have heterogeneous cursor positions.
+        """
+        return prepared[bisect_right(cursors, cursor):]
+
+    @staticmethod
     def _group_prepared_diagnostic_rows(
             event_rows: Sequence[_PreparedDiagnosticEvent]) -> tuple[
                 dict[str, list[dict]], dict[str, list[dict]],
@@ -3696,19 +3728,23 @@ class ShadowRunner:
             calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
             ) -> dict[str, Any]:
         """Evaluate sparse forward diagnostics independently of gate progress."""
+        phase_metrics = _diagnostic_phase_metrics()
         if cohort is None or activation is None or not arms:
             return {"this_poll_decisions": 0, "provenance_rejections": 0,
-                    "candidate_errors": {}}
+                    "candidate_errors": {}, "phase_metrics": phase_metrics}
+        preparation_started = time.monotonic()
         resolved_calendar = (
             calendar_snapshot if calendar_snapshot is not None else
             _load_recorded_session_calendar(self.config.corpus_path))
         cohort_identity = str(cohort.get("cohort_identity") or "")
         candidate_ids = [str(arm.get("candidate_id") or "") for arm in arms]
         source_modes: dict[str, str | None] = {}
-        prepared_snapshot = tuple(
-            self._prepare_diagnostic_event(
+        prepared_snapshot = tuple(sorted(
+            (self._prepare_diagnostic_event(
                 row, source_modes=source_modes, activation=activation)
-            for row in snapshot_rows)
+             for row in snapshot_rows),
+            key=lambda prepared: prepared.cursor))
+        prepared_cursors = tuple(prepared.cursor for prepared in prepared_snapshot)
         sessions = {
             prepared.session for prepared in prepared_snapshot
             if prepared.session is not None
@@ -3759,8 +3795,8 @@ class ShadowRunner:
             arm_progress = progress[candidate_id]
             cursor = (float(arm_progress.get("last_inserted_at") or 0.0),
                       str(arm_progress.get("last_event_key") or ""))
-            arm_rows = [prepared for prepared in prepared_snapshot
-                        if prepared.cursor > cursor]
+            arm_rows = list(self._diagnostic_cursor_suffix(
+                prepared_snapshot, prepared_cursors, cursor))
             rollups: dict[str, dict[str, int]] = {}
             prepared_session_events: dict[
                 str, list[_PreparedDiagnosticEvent]] = {}
@@ -3816,16 +3852,41 @@ class ShadowRunner:
             }
             provenance_rejections += rejected
 
+        phase_metrics["preparation_context_seconds"] = round(
+            max(0.0, time.monotonic() - preparation_started), 6)
+
         worker_results: dict[str, dict[str, Any]] = {}
         candidate_errors: dict[str, str] = {}
         active = [item for item in work.values() if item["session_events"]]
-        market_events_by_key = {
-            str(event.get("event_key") or ""): event
-            for item in active
-            for values in item["session_events"].values()
-            for event in values
-            if str(event.get("event_type") or "").lower() != "quote"
-        }
+        market_started = time.monotonic()
+        active_cursors = []
+        for item in active:
+            arm_id = str(item["arm"].get("candidate_id") or "")
+            arm_progress = progress[arm_id]
+            active_cursors.append((
+                float(arm_progress.get("last_inserted_at") or 0.0),
+                str(arm_progress.get("last_event_key") or "")))
+        minimum_active_cursor = min(active_cursors) if active_cursors else None
+        # Every active arm receives a suffix of the same immutable snapshot.
+        # Build the market-event union from that snapshot once instead of
+        # walking each arm's repeated event list.
+        market_events_by_key: dict[str, Mapping[str, Any]] = {}
+        if minimum_active_cursor is not None:
+            for prepared in self._diagnostic_cursor_suffix(
+                    prepared_snapshot, prepared_cursors,
+                    minimum_active_cursor):
+                if (not prepared.eligible or prepared.payload is None or
+                        prepared.session is None or
+                        str(prepared.row.get("event_type") or "")
+                        not in {"bar", "bar_1m"}):
+                    continue
+                event_key = str(prepared.payload.get("event_key") or
+                                prepared.row.get("event_key") or "")
+                if event_key:
+                    # Durable WAL keys are unique.  Keep the old dict-union
+                    # last-winner behavior defensively for synthetic or
+                    # directly supplied duplicate snapshots.
+                    market_events_by_key[event_key] = prepared.payload
         views_by_identity: dict[
             tuple[str | None, str | None, bool],
             dict[str, dict[str, Any]]] = {}
@@ -3840,7 +3901,36 @@ class ShadowRunner:
                     context_bars, context_quotes, context_options,
                     resolved_calendar)
             market_views_by_candidate[candidate_id] = views_by_identity[identity]
+        phase_metrics["market_views_seconds"] = round(
+            max(0.0, time.monotonic() - market_started), 6)
+        workers_started = time.monotonic()
+        worker_durations: dict[str, float] = {}
         if active:
+            def evaluate_timed(
+                    item: Mapping[str, Any], initial: Mapping[str, Any],
+                    selected_inputs: Mapping[str, Any],
+                    candidate_id: str) -> tuple[dict[str, Any], float]:
+                started = time.monotonic()
+                try:
+                    try:
+                        result = self._evaluate_diagnostic_arm_snapshot(
+                            item["arm"], item["session_events"],
+                            selected_inputs, context_bars, context_quotes,
+                            context_options,
+                            initial,
+                            str(activation.get("warmup_session") or ""),
+                            resolved_calendar,
+                            market_views_by_candidate[candidate_id])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        result = {
+                            "candidate_id": candidate_id, "decisions": [],
+                            "error": (f"{type(exc).__name__}: "
+                                      f"{str(exc)[:240]}"),
+                        }
+                finally:
+                    elapsed = max(0.0, time.monotonic() - started)
+                return result, elapsed
+
             with ThreadPoolExecutor(max_workers=self.config.max_workers,
                                     thread_name_prefix="diagnostic-shadow") as pool:
                 futures = {}
@@ -3855,23 +3945,32 @@ class ShadowRunner:
                         for session in item["session_events"]
                     }
                     futures[pool.submit(
-                        self._evaluate_diagnostic_arm_snapshot, arm,
-                        item["session_events"], selected_inputs,
-                        context_bars, context_quotes, context_options,
-                        initial, str(activation.get("warmup_session") or ""),
-                        resolved_calendar,
-                        market_views_by_candidate[candidate_id])
+                        evaluate_timed, item, initial, selected_inputs,
+                        candidate_id)
                     ] = candidate_id
                 for future in as_completed(futures):
                     candidate_id = futures[future]
                     try:
-                        worker_results[candidate_id] = future.result()
+                        result, elapsed = future.result()
+                        worker_results[candidate_id] = result
+                        worker_durations[candidate_id] = round(
+                            max(0.0, elapsed), 6)
                     except Exception as exc:  # pragma: no cover - defensive
                         worker_results[candidate_id] = {
                             "candidate_id": candidate_id, "decisions": [],
                             "error": f"{type(exc).__name__}: {str(exc)[:240]}",
                         }
+                        worker_durations[candidate_id] = 0.0
+        phase_metrics["workers_seconds"] = round(
+            max(0.0, time.monotonic() - workers_started), 6)
+        worker_values = list(worker_durations.values())
+        phase_metrics["worker_seconds"] = {
+            "aggregate_seconds": round(sum(worker_values), 6),
+            "max_seconds": round(max(worker_values), 6) if worker_values else 0.0,
+            "by_candidate": dict(sorted(worker_durations.items())),
+        }
 
+        persistence_started = time.monotonic()
         this_poll_decisions = 0
         for candidate_id, item in work.items():
             rows = item["rows"]
@@ -3940,10 +4039,19 @@ class ShadowRunner:
                 except Exception as exc:
                     candidate_errors[candidate_id] = (
                         f"{type(exc).__name__}: {str(exc)[:240]}")
+        phase_metrics["persistence_replay_seconds"] = round(
+            max(0.0, time.monotonic() - persistence_started), 6)
+        phase_metrics["total_seconds"] = round(sum((
+            float(phase_metrics["preparation_context_seconds"]),
+            float(phase_metrics["market_views_seconds"]),
+            float(phase_metrics["workers_seconds"]),
+            float(phase_metrics["persistence_replay_seconds"]),
+        )), 6)
         return {
             "this_poll_decisions": int(this_poll_decisions),
             "provenance_rejections": int(provenance_rejections),
             "candidate_errors": dict(sorted(candidate_errors.items())),
+            "phase_metrics": phase_metrics,
         }
 
     def _diagnostic_coverage(
@@ -3951,7 +4059,8 @@ class ShadowRunner:
             activation: Mapping[str, Any] | None, *,
             this_poll_decisions: int = 0,
             preactivation_rejections: int = 0,
-            poll_duration_seconds: float = 0.0) -> dict[str, Any]:
+            poll_duration_seconds: float = 0.0,
+            phase_metrics: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Return bounded, explicitly non-authorizing cohort telemetry."""
         if cohort is None:
             return {
@@ -3978,6 +4087,8 @@ class ShadowRunner:
                 },
                 "poll_duration_seconds": round(max(0.0, poll_duration_seconds), 6),
                 "source_lag_seconds": None,
+                "phase_metrics": dict(phase_metrics or
+                                        _diagnostic_phase_metrics()),
             }
         candidate_ids = {str(value) for value in
                          cohort.get("candidate_identities", ())}
@@ -4191,6 +4302,8 @@ class ShadowRunner:
             "incremental_max_events": int(self.config.max_events),
             "session_context_max_events": int(
                 self.config.diagnostic_session_max_events),
+            "phase_metrics": dict(phase_metrics or
+                                   _diagnostic_phase_metrics()),
         }
 
     def _shadow_policy(self, config: Mapping[str, Any]) -> ReplayPolicy:
@@ -6140,16 +6253,26 @@ class ShadowRunner:
                 "diagnostic_candidates": len(diagnostic_arms),
                 **prune,
             }
+            coverage_started = time.monotonic()
             diagnostic_coverage = self._diagnostic_coverage(
                 diagnostic_cohort, diagnostic_activation,
                 this_poll_decisions=int(diagnostic_result.get(
                     "this_poll_decisions") or 0),
                 preactivation_rejections=int(diagnostic_result.get(
                     "provenance_rejections") or 0),
-                poll_duration_seconds=0.0)
+                poll_duration_seconds=0.0,
+                phase_metrics=diagnostic_result.get("phase_metrics"))
+            coverage_seconds = max(0.0, time.monotonic() - coverage_started)
             poll_duration_seconds = round(
                 max(0.0, time.monotonic() - poll_started), 6)
             diagnostic_coverage["poll_duration_seconds"] = poll_duration_seconds
+            phase_metrics = dict(diagnostic_coverage.get("phase_metrics") or
+                                 _diagnostic_phase_metrics())
+            phase_metrics["coverage_seconds"] = round(coverage_seconds, 6)
+            # Keep the total as the complete poll elapsed time; coverage is
+            # diagnostic telemetry and must remain included in that total.
+            phase_metrics["total_seconds"] = poll_duration_seconds
+            diagnostic_coverage["phase_metrics"] = phase_metrics
             result["diagnostic_shadow"] = diagnostic_coverage
             result["poll_duration_seconds"] = poll_duration_seconds
             result["source_lag_seconds"] = result[
@@ -6654,16 +6777,26 @@ class ShadowRunner:
         capacity = sorted(capacity, key=lambda item: (
             item["candidate_id"], item["session_date"]))[-64:]
         decision_count = self.store.decision_count()
+        coverage_started = time.monotonic()
         diagnostic_coverage = self._diagnostic_coverage(
             diagnostic_cohort, diagnostic_activation,
             this_poll_decisions=int(diagnostic_result.get(
                 "this_poll_decisions") or 0),
             preactivation_rejections=int(diagnostic_result.get(
                 "provenance_rejections") or 0),
-            poll_duration_seconds=0.0)
+            poll_duration_seconds=0.0,
+            phase_metrics=diagnostic_result.get("phase_metrics"))
+        coverage_seconds = max(0.0, time.monotonic() - coverage_started)
         poll_duration_seconds = round(
             max(0.0, time.monotonic() - poll_started), 6)
         diagnostic_coverage["poll_duration_seconds"] = poll_duration_seconds
+        phase_metrics = dict(diagnostic_coverage.get("phase_metrics") or
+                             _diagnostic_phase_metrics())
+        phase_metrics["coverage_seconds"] = round(coverage_seconds, 6)
+        # Keep the total as the complete poll elapsed time; coverage is
+        # diagnostic telemetry and must remain included in that total.
+        phase_metrics["total_seconds"] = poll_duration_seconds
+        diagnostic_coverage["phase_metrics"] = phase_metrics
         return {"candidates": len(candidates),
                 "authorizing_candidates": len(candidates),
                 "diagnostic_candidates": len(diagnostic_arms),

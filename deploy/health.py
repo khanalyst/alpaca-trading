@@ -412,6 +412,34 @@ def _shadow_progress_projection(
     return projected, status
 
 
+def _shadow_phase_metrics(value: object, arm_ids: set[str]) -> dict:
+    """Expose allowlisted timing diagnostics without granting readiness."""
+    if not isinstance(value, dict):
+        return {}
+    result = {"diagnostic_only": True, "authorizing": False}
+    for key in ("preparation_context_seconds", "market_views_seconds",
+                "workers_seconds", "persistence_replay_seconds",
+                "coverage_seconds", "total_seconds"):
+        number = _status_nonnegative_float(value.get(key))
+        if number is not None:
+            result[key] = number
+    workers = value.get("worker_seconds")
+    if isinstance(workers, dict):
+        projected = {}
+        for key in ("aggregate_seconds", "max_seconds"):
+            number = _status_nonnegative_float(workers.get(key))
+            if number is not None:
+                projected[key] = number
+        per_arm = workers.get("by_candidate")
+        if isinstance(per_arm, dict):
+            projected["by_candidate"] = {
+                candidate: number for candidate in sorted(arm_ids)[:31]
+                if (number := _status_nonnegative_float(
+                    per_arm.get(candidate))) is not None}
+        result["worker_seconds"] = projected
+    return result
+
+
 def _shadow_diagnostic_summary(
         value: object, *, now: float | None = None,
         candidate_errors_present: bool = False,
@@ -629,6 +657,7 @@ def _shadow_diagnostic_summary(
             value.get("warmup_replay_modeled_fills")),
         "actual_fills": actual_fills,
         "poll_duration_seconds": poll_duration,
+        "phase_metrics": _shadow_phase_metrics(value.get("phase_metrics"), arm_ids),
         "source_lag_seconds": source_lag,
         "source_data_fresh": (
             source_data_fresh if raw_source_lag is not None else None),
@@ -919,6 +948,11 @@ def _recorder_cycle_telemetry(attempt: dict) -> dict:
             "options_fetch_projection_seconds", "validation_ingest_seconds",
             "revision_validation_save_seconds", "durable_save_seconds",
             "csv_partition_flush_fsync_seconds", "recent_key_transaction_seconds",
+            "recent_key_value_preparation_seconds", "recent_key_insert_seconds",
+            "recent_key_expiry_delete_seconds", "recent_key_count_seconds",
+            "recent_key_metadata_update_seconds", "recent_key_transaction_commit_seconds",
+            "recent_key_incoming_count", "recent_key_expired_count",
+            "recent_key_current_count",
             "index_json_save_seconds", "windows_completed", "projected_rows",
             "session_rows", "unique_rows"):
         value = _status_nonnegative_float(raw.get(key))
