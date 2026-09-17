@@ -157,6 +157,35 @@ docker compose start trader
 flattens orders, and it rejects killed or daily-risk-stopped runtimes. Do not
 manually edit `state.json` or the SQLite journal to force a resume.
 
+### Retire an unobserved paper trial without resuming
+
+An explicitly approved code/profile correction can require replacing a frozen
+paper incumbent. `deploy/cancel_paper_trial.py` handles only a running trial
+with zero accepted sessions and zero outcomes. It requires an existing
+`operator_pause=true`, a free runtime lock, an empty local book, and a fresh
+authenticated flat account on the exact Alpaca paper endpoint. Merely stopping
+the container is not an operator-pause confirmation.
+
+Back up the state and journal first. With the trader stopped and the reviewed
+image selected, supply the exact persisted trial and incumbent identities:
+
+```bash
+docker compose run --rm --no-deps trader python deploy/cancel_paper_trial.py \
+  --config /app/config.yaml \
+  --confirm-trial-id "EXACT_TRIAL_ID" \
+  --confirm-incumbent-identity "EXACT_INCUMBENT_IDENTITY" \
+  --reason "Approved code correction; keep paper trading paused"
+```
+
+The command performs broker GETs only. It durably journals the original trial
+and safety state before marking the trial `operator_cancelled`; it preserves
+the pause, daily-stop/kill state, original verdict, and evidence. Retries verify
+the same audit, and missing or tampered audit records fail closed. Cancellation
+is not a failed profitability result, a promotion, a replacement activation, or
+a resume. A subsequent replacement still requires the existing terminal/flat
+guards and a separately verified new identity. Do not roll an older image back
+onto this state unless it supports the cancellation lifecycle.
+
 ## Reconciliation and incident response
 
 Capture these artifacts before changing state:

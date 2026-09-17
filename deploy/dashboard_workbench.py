@@ -10,6 +10,7 @@ import sqlite3
 import time
 from zoneinfo import ZoneInfo
 
+from deploy import recorder_corpus_path
 from deploy.market_observations import epoch, read_bars
 from agent.order_timing import TIMING_FIELDS
 from deploy.research_dataset import (_apply_calendar, _partition_calendar_sidecars,
@@ -204,7 +205,8 @@ def research_evidence(root, selected):
                         if matches(item, selected):
                             rows.append(item)
     return {"records": rows[-200:], "authorizing": False,
-            "reason": "Recorded diagnostics and proof artifacts; this view does not authorize trading"}
+            "evidence_scope": "retained_history_across_epochs",
+            "reason": "Retained diagnostics and proof artifacts can predate the current recorder period; this view does not authorize trading"}
 
 
 def candles(root, selected):
@@ -217,7 +219,7 @@ def candles(root, selected):
     begin = datetime.combine(first - timedelta(days=7), datetime.min.time(), NY).timestamp()
     end = datetime.combine(last + timedelta(days=1), datetime.min.time(), NY).timestamp()
     cutoff = stamp(selected["as_of"]) if selected["as_of"] else time.time()
-    recorded = root / "runtime/research/recorded"
+    recorded = recorder_corpus_path(root)
     paths = [recorded / "sessions" / f"market-{(first - timedelta(days=7) + timedelta(days=i)).isoformat()}.csv"
              for i in range((last - first).days + 8)]
     paths = [p for p in paths if p.is_file() and not p.is_symlink()]
@@ -295,6 +297,8 @@ def candles(root, selected):
     series = {name: [r for r in aggregate(minutes) if first.isoformat() <= r["session_date"] <= last.isoformat()]
               for name, minutes in (("1m", 1), ("5m", 5), ("15m", 15), ("1d", "1d"))}
     return {"available": any(series.values()), "source": source, "series": series,
+            "corpus_root": str(recorded.relative_to(root.resolve())),
+            "feed": selected["feed"],
             "prior_session": prior, "as_of": cutoff, "incomplete_source": incomplete,
             "reason": "Only complete contiguous bars and exact recorded session boundaries are displayed"}
 

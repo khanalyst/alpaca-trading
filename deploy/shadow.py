@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 import uuid
@@ -16,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from research.live_shadow import (DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS,
+                                  DEFAULT_REPLAY_SESSION_MAX_EVENTS,
                                   DEFAULT_MAX_WORKERS, DEFAULT_RETENTION_DAYS,
                                   ShadowConfig, ShadowRunner,
                                   _next_shadow_cadence_deadline)  # noqa: E402
@@ -64,6 +66,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--diagnostic-session-max-events", type=int,
                    default=DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS,
                    help="bounded full-session context available to diagnostics")
+    p.add_argument("--replay-session-max-events", type=int,
+                   default=DEFAULT_REPLAY_SESSION_MAX_EVENTS,
+                   help="bounded complete-session replay, separate from poll ingestion")
     p.add_argument("--max-decisions", type=int, default=100_000)
     p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                    help="bounded parallel candidate evaluators (default: %(default)s)")
@@ -128,28 +133,40 @@ def _record_acceptance(args: argparse.Namespace, health_file: Path,
         }
 
 
-def main(argv: list[str] | None = None) -> int:
-    argument_parser = parser()
-    args = argument_parser.parse_args(argv)
-    if args.diagnostic_include_ibr and not args.diagnostic:
-        argument_parser.error("--diagnostic-include-ibr requires diagnostic mode")
-    runtime_config = (load_runtime_config(args.config)
-                      if args.diagnostic else None)
-    config = ShadowConfig(
-        corpus_path=args.corpus, edge_db=args.edge_db, shadow_db=args.shadow_db,
-        max_candidates=args.max_candidates, max_events=args.max_events,
-        max_decisions=args.max_decisions,
-        diagnostic_session_max_events=args.diagnostic_session_max_events,
-        max_workers=args.max_workers,
-        retention_days=args.retention_days,
-        poll_seconds=args.interval,
-        diagnostic=args.diagnostic,
-        diagnostic_include_ibr=args.diagnostic_include_ibr,
-        runtime_config=runtime_config,
-        runtime_config_path=args.config)
-    runner = ShadowRunner(config)
-    health_file = args.health_file or args.shadow_db.with_name("shadow-health.json")
-    interval = config.poll_seconds
+def _open_shadow_wal_anchor(path: Path) -> sqlite3.Connection:
+    """Hold a query-only, autocommit handle for the shadow WAL lifetime.
+
+    A read-only SQLite connection cannot reliably keep the ``-wal``/``-shm``
+    sidecars available on a read-only census mount after the last writer
+    disconnects.  The deployed shadow process owns the writable shadow mount,
+    so keep one normal-mode handle open for its lifetime while preventing any
+    accidental mutation.  ``mode=rw`` preserves startup fail-closed behavior
+    if the initialized store disappears instead of silently creating a new
+    database.
+    """
+    uri = f"{path.resolve().as_uri()}?mode=rw"
+    connection = sqlite3.connect(uri, uri=True, timeout=30,
+                                  isolation_level=None)
+    try:
+        pragma_cursor = connection.execute("PRAGMA query_only=ON")
+        pragma_cursor.close()
+        cursor = connection.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        try:
+            cursor.fetchone()
+        finally:
+            cursor.close()
+        if connection.in_transaction:
+            raise sqlite3.OperationalError(
+                "shadow WAL anchor unexpectedly holds a transaction")
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _run_shadow_loop(args: argparse.Namespace, runner: ShadowRunner,
+                     health_file: Path, interval: float) -> int:
+    """Run the bounded shadow polling loop until one-shot completion."""
     # Anchor before work so poll duration is included in the configured cadence.
     next_tick: float | None = time.monotonic()
     while True:
@@ -192,6 +209,38 @@ def main(argv: list[str] | None = None) -> int:
         next_tick = _next_shadow_cadence_deadline(
             next_tick, now, interval)
         time.sleep(max(0.0, next_tick - time.monotonic()))
+
+
+def main(argv: list[str] | None = None) -> int:
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    if args.diagnostic_include_ibr and not args.diagnostic:
+        argument_parser.error("--diagnostic-include-ibr requires diagnostic mode")
+    runtime_config = (load_runtime_config(args.config)
+                      if args.diagnostic else None)
+    config = ShadowConfig(
+        corpus_path=args.corpus, edge_db=args.edge_db, shadow_db=args.shadow_db,
+        max_candidates=args.max_candidates, max_events=args.max_events,
+        max_decisions=args.max_decisions,
+        diagnostic_session_max_events=args.diagnostic_session_max_events,
+        replay_session_max_events=args.replay_session_max_events,
+        max_workers=args.max_workers,
+        retention_days=args.retention_days,
+        poll_seconds=args.interval,
+        diagnostic=args.diagnostic,
+        diagnostic_include_ibr=args.diagnostic_include_ibr,
+        runtime_config=runtime_config,
+        runtime_config_path=args.config)
+    runner = ShadowRunner(config)
+    health_file = args.health_file or args.shadow_db.with_name("shadow-health.json")
+    interval = config.poll_seconds
+    # The runner initialized this exact store. Never publish a successful poll
+    # when the reader-mount lifetime guarantee could not be established.
+    anchor = _open_shadow_wal_anchor(args.shadow_db)
+    try:
+        return _run_shadow_loop(args, runner, health_file, interval)
+    finally:
+        anchor.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

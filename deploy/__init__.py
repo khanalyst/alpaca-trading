@@ -3,7 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+
+def recorder_corpus_path(root: Path) -> Path:
+    """Resolve one configured recorder epoch for all read-only surfaces."""
+    raw = str(os.getenv("ALPACA_RECORDER_CORPUS_ROOT") or
+              "runtime/research/recorded").strip()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = candidate.resolve()
+    if not candidate.is_relative_to((root / "runtime").resolve()):
+        raise ValueError(
+            "ALPACA_RECORDER_CORPUS_ROOT must remain inside runtime")
+    return candidate
 
 
 def load_config(path: str | Path) -> dict:

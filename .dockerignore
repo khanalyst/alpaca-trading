@@ -10,3 +10,7 @@ __pycache__
 .DS_Store
 vm-import
 work
+# Private backups, operator receipts and local agent scratch are never image input.
+outputs
+.codex-work
+research-llm.env

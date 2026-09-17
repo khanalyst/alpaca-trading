@@ -29,7 +29,7 @@ history remains recoverable in the archive.
 `running` but paused, with **0 accepted sessions, 0 closed outcomes, and no
 new orders**. A read-only authenticated broker check at **2026-09-16
 19:34 UTC** found zero positions and zero open orders on the paper endpoint;
-`live=false`. There is no residual paper risk. The fresh shadow activation
+`live=false`. No residual exposure was observed in that snapshot. The fresh shadow activation
 identity is `77f6cece47a97b5507ef2f34fc3e84581fc77fea0bda75029dd63de02c009546`;
 its warmup date is 2026-09-16.
 
@@ -44,6 +44,10 @@ its warmup date is 2026-09-16.
   `ShadowError: shadow replay validation event bound 20000 exceeded`; the
   other five service checks were healthy. The paper trial was paused with no
   residual risk. Disk usage was 4.5 GB used, 121 GB free (4%).
+- At **2026-09-17 15:21 UTC**, the deployed server was still on image
+  `c7f996a`; shadow replay still failed at the 20,000-event bound, fresh
+  accepted sessions remained at zero, quotes were stale during market open,
+  and the paper trial remained paused.
 - The 5-second idle disk sample (**0.38% busy**) and 0.062-second recorder
   cycle are market-closed observations, not latency proof. Keep this health
   snapshot separate from the later database diagnostic below.
@@ -69,28 +73,54 @@ failure is on the gate-evidence replay path, not on the 31 diagnostic arms.
 These matched replay rows are not proof of qualification or broker fills.
 No cap was raised and no events were truncated.
 
-The existing `deploy/dashboard.py` immutable fallback checks for an absent or
-empty WAL before opening an immutable reader. A live writer can commit between
-those operations, so copying this fallback into census is not an approved fix.
-The proposed minimal writer-side long-lived, nontransactional SQLite
-connection in `deploy/shadow.py` would preserve the WAL/SHM relationship, but
-it still needs narrow tests and review. A replay-correctness change in
-`research/live_shadow.py` changes evidence identity. The active running trial
-rejects that identity change even with zero observations, and there is no
-explicit abandon/retire API. Do not invent a terminal trial state.
+The deployed dashboard's immutable fallback checks for an absent or empty WAL
+before opening an immutable reader. A live writer can commit between those
+operations. The local correction removes that fallback: an unavailable normal
+read-only connection reports unavailable instead of returning a potentially
+stale snapshot. The writer-side long-lived, nontransactional SQLite connection
+in `deploy/shadow.py` preserves the WAL/SHM relationship for normal read-only
+census consumers. Both corrections are included in this source revision but
+not yet deployed.
+
+The implemented replay fix gives each session an independent
+200,000-event budget (configurable up to a hard maximum of 1,000,000), retains
+the 20,000-event incremental bound, and keeps diagnostics at 200,000 events.
+Quote-context compaction is O(n log n); context overflow fails closed without
+truncating rows. The deployed trial remains running but paused; the implemented
+operator-cancellation path is audit-preserving for this
+zero-evidence trial: GET-only broker flat check, journaled before-state, and
+never resume. No cancellation or terminal state has completed on the deployed
+server. The workbench now selects the configured fresh corpus and labels
+retained historical evidence. These software changes are not yet deployed.
+
+Source verification passed: the 84-test combined replay/ingestion suite, the
+52-test operator/runtime/cohort/status suite, and the 190-test deployment/UI/
+WAL suite. After removing the dashboard immutable fallback, four focused
+dashboard reader tests passed, including visibility of new WAL commits and
+refusal to write. Test counts overlap and should not be summed. Compilation,
+diff checks, and the disposable synthetic recorder-key profiler also passed;
+none of these checks establishes production latency or profitability.
 
 ## Pending priorities
 
-1. Review and narrowly test the writer-side WAL/SHM fix and the bounded,
-   complete-session replay fix. These are proposed changes only; no new code
-   changes will be deployed under the data-reset approval.
-2. Obtain direction for an audit-preserving trial transition before deploying
-   any code-identity change. Preserve the frozen trial record and do not
-   silently replace, abandon, or retire it.
+1. Complete GitHub CI for this fix revision, then perform a verified paused
+   rollout of the writer WAL lifetime, independent replay/context budgets,
+   current-corpus workbench and historical labels, and audited zero-evidence
+   trial cancellation. Do not report deployment until it is verified.
+2. Execute the audited cancellation only after that test/push gate: perform a
+   GET-only broker flat check, journal the before-state, and never resume the
+   paused paper trial. Preserve its frozen record and do not claim a completed
+   cancellation or terminal state before rollout evidence exists.
 3. Run a market-open latency benchmark and collect valid fresh sessions with
    IEX quote coverage, freshness, completed-bar publication, cadence, and all
    required symbols/arms. Closed-market health and local microbenchmarks are
-   insufficient.
+   insufficient. `gate_sessions()` still returns all matched authorizing
+   sessions, and every poll replays them again. Those replay updates refresh
+   retention timestamps, so active historical work can keep growing. The
+   complete-session budget/streaming fix resolves the immediate 20,000-row
+   failure, not this scaling problem. Any future reuse must verify the exact
+   code, configuration, calendar, source, and evidence identities; skipping
+   validation or deleting negative sessions is not an acceptable optimization.
 4. Measure executable paper costs, fills, slippage, rejection, and protection
    behavior; keep modeled shadow fills separate. The unchanged 25 bps stress /
    0.30 cost-risk ceiling requires about 83.33 bps of stop distance before
@@ -105,14 +135,55 @@ explicit abandon/retire API. Do not invent a terminal trial state.
    comparisons on untouched data. Re-running examined history or adding
    variants does not substitute for forward confirmation.
 
+## Why negative results can still be visible
+
+The deployed read-only API check at **2026-09-17 15:21 UTC** returned **no
+research Markdown reports and no research-workbench records**, seven candidates,
+zero proved edges and zero paper outcomes. The scheduler still reported zero
+accepted sessions of 30 required, with one rejected completed partition. It
+was blocked by the missing current shadow catalog after the replay error, not
+by a newly measured loss. The recorder was running on the fresh September 16
+root but its quotes were stale at this market-open observation. Latency is
+therefore still an open operational issue.
+
+Historical studies were retained deliberately. The archived September 12
+inventory classified 43 arms as **36 execution-blocked, six negative net point
+estimates, and one small positive estimate**. The positive `ibr.range.45`
+result was only **+$1.055386 over 42 one-share hypothetical trades**, with
+partial runtime parity and no quotes; it was not a qualified edge. Blocked
+zero-trade arms have unknown expectancy, not negative expectancy.
+
+The archived September 10 structured audit records 650 hypothetical variant
+trades: **-$2,549.15 reference-price P&L**, **$25,599.69 modeled execution drag**,
+**$1,599.98 modeled fees**, and **-$29,748.81 net** (rounding applies).
+79.08% ended by time exit. Thus costs explain most of that historical modeled
+loss, but the reference-price result was also weak. These are previously
+examined, bar-filled simulations—not actual broker losses or fresh results.
+The separate September 11 report says eight of twelve mechanisms were positive
+before costs and all twelve negative afterward in a diagnostic counterfactual;
+that report assertion was inspected, not independently rerun this turn.
+
+The archived source members are `docs/edge-results-2026-09-12.json`,
+`outputs/negative-performance-audit-2026-09-10/derived-findings.json`, and
+`outputs/edge-evidence-fix-2026-09-11/RESULTS.md` in the verified report-cleanup
+archive below. The gap is sufficient after-cost signal value and reliable
+forward evidence, not simply too few variants. No strategy parameters or cost
+assumptions were relaxed to manufacture a positive result.
+
 ## Historical work and separate research
 
 The **September 15** latency baseline (99.47% persistent-disk busy and a
-42.81-second recorder cycle) is historical. The local **303 targeted tests**
-and local benchmarks remain accurate as unreleased verification; they do not
-demonstrate a server latency reduction. Profiling/optimization changes remain
-local and unreleased, and no journal mode, durability, freshness, risk,
-strategy, feed, cohort, or cadence setting was changed.
+42.81-second recorder cycle) is historical. Profile/shadow-recorder
+instrumentation and the report-cleanup archive are on local and GitHub `main`
+at commit `83b72dc`; full CI succeeded in the
+[GitHub Actions run](https://github.com/khanalyst/alpaca-trading/actions/runs/35208859786).
+The local **303 targeted tests** and local benchmarks remain accurate as
+unreleased verification; they do not demonstrate a server latency reduction.
+The new fixes listed above are source-verified but not deployed. No journal
+mode, durability, freshness threshold, risk, strategy, feed, or cadence setting
+was changed. A rollout changes the code/evidence identity and must establish
+a new verified trial identity without resuming trading. No strategy or
+risk-gate change is pending.
 
 Point-in-time catalyst/news/corporate-action inputs; factor, sector and
 duration exposure; hedged residual execution; later-signal comparisons; and
@@ -125,6 +196,6 @@ artifacts only after verified archival; negative research history was retained.
 The earlier report cleanup removed 145 superseded reports/logs, not the current
 research-reset archive. Its local originals remain recoverable from
 `outputs/findings-cleanup-2026-09-15/superseded-reports.tar.gz`; the four tracked
-reports remain in Git commit `8068c73deb157d14fb84e49514c8f8eb8d0e9de5`.
+reports and cleanup archive are represented in GitHub `main` commit `83b72dc`.
 The older `outputs/paper-activation-2026-09-14/rollback-volumes-c9368e2.tar.zst`
 backup also remains untouched.

@@ -128,7 +128,8 @@ def _paper_trial_summary(value: object) -> dict | None:
             value.get("proof_authority") is not False):
         return None
     state = value.get("state")
-    if state not in {"running", "passed", "failed", "review_required", "blocked"}:
+    if state not in {"running", "passed", "failed", "review_required",
+                     "operator_cancelled", "blocked"}:
         return None
     eligible = value.get("entry_eligible")
     if not isinstance(eligible, bool) or (eligible and state not in {"running", "passed"}):

@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from deploy import health, load_config
+from deploy import health, load_config, recorder_corpus_path as _recorder_corpus_path
 from deploy.provenance import deployment_provenance
 from deploy.scheduler_output import (derive_research_readiness,
                                      structured_research_preflight,
@@ -78,21 +78,6 @@ def _json_file(path: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
-
-
-def _recorder_corpus_path(root: Path) -> Path:
-    """Resolve the current recorder epoch inside the mounted runtime tree."""
-    raw = str(os.getenv("ALPACA_RECORDER_CORPUS_ROOT") or
-              "runtime/research/recorded").strip()
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    candidate = candidate.resolve()
-    runtime_root = (root / "runtime").resolve()
-    if not candidate.is_relative_to(runtime_root):
-        raise ValueError(
-            "ALPACA_RECORDER_CORPUS_ROOT must remain inside runtime")
-    return candidate
 
 
 def _safe_state(path: Path) -> dict:
@@ -155,15 +140,11 @@ def _portfolio_exposure(trades: Sequence[dict]) -> dict:
 
 
 def _ro_connect(path: Path) -> sqlite3.Connection:
-    """Open a journal without requiring writes beside a WAL-mode database.
+    """Read a live journal through SQLite's normal WAL-consistent reader.
 
-    SQLite normally creates ``-shm`` state when the database header says WAL,
-    even for a ``mode=ro`` connection.  The dashboard deliberately receives a
-    read-only volume, so a fully checkpointed journal with no remaining WAL
-    sidecar otherwise fails with ``unable to open database file``.  In that
-    exact case an immutable connection is safe: there is no uncheckpointed WAL
-    to ignore.  If a non-empty WAL exists, fail closed instead of presenting a
-    stale main-database snapshot.
+    A missing WAL at one instant does not prove the database is immutable:
+    a writer can commit immediately afterward. If the read-only mount lacks
+    usable sidecars, report unavailable rather than bypassing WAL visibility.
     """
 
     def opened(uri: str) -> sqlite3.Connection:
@@ -180,17 +161,7 @@ def _ro_connect(path: Path) -> sqlite3.Connection:
             raise
         return connection
 
-    try:
-        return opened(f"file:{path}?mode=ro")
-    except sqlite3.OperationalError:
-        wal = path.with_name(f"{path.name}-wal")
-        try:
-            wal_pending = wal.is_file() and wal.stat().st_size > 0
-        except OSError:
-            wal_pending = True
-        if wal_pending:
-            raise
-        return opened(f"file:{path}?mode=ro&immutable=1")
+    return opened(f"{path.resolve().as_uri()}?mode=ro")
 
 
 def _tables(connection: sqlite3.Connection) -> set[str]:
@@ -918,12 +889,19 @@ def _reports(root: Path) -> list[dict]:
     rows = []
     for path in candidates:
         try:
+            if path.is_symlink() or not path.resolve().is_relative_to(
+                    (root / "research" / "results").resolve()):
+                continue
             stat = path.stat()
             relative = path.relative_to(root).as_posix()
         except OSError:
             continue
+        # A filename or modification time cannot bind evidence to the current
+        # code/corpus/activation. Keep it visible without implying a fresh run.
         rows.append({"path": relative, "updated_ts": stat.st_mtime,
-                     "size_bytes": stat.st_size})
+                     "size_bytes": stat.st_size,
+                     "epoch_binding": "unverified", "authorizing": False,
+                     "evidence_scope": "historical_or_unbound"})
     return sorted(rows, key=lambda row: row["updated_ts"], reverse=True)[:100]
 
 
@@ -1119,6 +1097,8 @@ def snapshot(root: Path) -> dict:
         "trial": trial,
         "research": {
             "available": edge_path.is_file(),
+            "ledger_scope": "retained_history_across_epochs",
+            "current_recorder_root": str(recorder_path.relative_to(root.resolve())),
             "service_optional": True,
             "entry_gate_required": bool(
                 config.get("research", {}).get("enabled", True) and
@@ -1231,6 +1211,7 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  c=card('Research process — direct research status');row(c,'status',direct.status,direct.running?'ok':'warn');row(c,'job',direct.job_id);row(c,'process',direct.pid);row(c,'scheduler ownership',direct.scheduler_managed===null?'unknown':direct.scheduler_managed?'managed':'direct');row(c,'build',direct.build_identity);row(c,'started',when(direct.started_ts));row(c,'process lease',when(direct.lease_ts));const dp=direct.progress||{};row(c,'phase',dp.phase);row(c,'completed work',dp.done===undefined?'—':dp.done+'/'+dp.total+' '+(dp.unit||''));row(c,'last progress',when(dp.updated_ts));row(c,'dataset',(direct.dataset||{}).source);row(c,'source identity',(direct.dataset||{}).source_identity);row(c,'outcome',(direct.terminal||{}).reason);if(!direct.running)c.append(el('p','No fresh running process lease. A saved result is not an active job.','muted'));
  evidenceCharts(d);
  c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);row(c,'tradeable vehicle',d.research.tradeable_vehicle);row(c,'proved but untradeable',d.research.untradeable_proved_edges,d.research.untradeable_proved_edges?'warn':'ok');c.append(el('p',d.research.note||'No research status.','muted'));
+ row(c,'Ledger scope','Retained history across research periods');row(c,'Current recorder period',d.research.current_recorder_root);
  c=card('Proved edges — evidence at promotion',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
  c=card('Live paper results by edge',true);const lp=d.edge.live_paper||[];if(!lp.length){c.append(el('p','No paper outcomes recorded yet. Results appear once a deployed edge closes its first trade.','muted'))}else{table(c,lp,['status','vehicle','variant_id','outcomes','sessions','last_session','total_r','mean_r','win_rate','net_pnl','rolling_r','guard','rolling_action'])};
  c=card('Recorded portfolio exposure',true);const exposure=d.trader.exposure||{};table(c,exposure.groups||[],['group','positions','gross_usd','net_usd']);row(c,'positions without a comparable exposure',exposure.unpriced_or_unmapped_positions);c.append(el('p','Recorded price notional, excluding pending orders. Shared ETF exposure is not an independent bet count; no beta hedge is estimated.','muted'));
@@ -1265,7 +1246,8 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  row(c,'fills on this page',(jr.trades||[]).length);row(c,'total fills',jr.total_fills);row(c,'next page',jr.has_more?'available':'none');
 
  const lr=d.learning||{};
- c=card('What research learned',true);
+ c=card('What research learned — retained history',true);
+ c.append(el('p','Prior research results are retained across fresh data periods. They are not results of a new run unless their evidence identity matches.','muted'));
  if(!lr.available){c.append(el('p','No recorded reasons yet.','muted'))}
  else{const s=lr.summary||{};row(c,'reasons recorded',s.recorded);row(c,'graded against a gate',s.graded);row(c,'built on an earlier lesson',s.built_on_a_prior_lesson);row(c,'from live paper trials',s.from_live_trials);row(c,'authored by the model',s.llm_authored);
   table(c,(lr.lessons||[]).slice(0,40),['verdict','kind','proposed_by','family','reason','built_on','changed','heldout_delta'])}
@@ -1276,7 +1258,7 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  if(!(ca.versions||[]).length){c.append(el('p','No configuration versions recorded yet. One is written the first time the trader starts.','muted'))}
  else{table(c,ca.versions,['config_version_id','when','mode','actor','source','changes','changed_paths','previous_version_id'])}
 
- c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
+ c=card('Historical / unbound research reports',true);c.append(el('p','These reports are not verified as current-period results. File modification time is not an evidence date.','muted'));(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path+' — '+x.evidence_scope),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}
 function candleChart(parent,name,points){
  const box=el('div');box.append(el('h3',name+' candles'));parent.append(box);
@@ -1290,7 +1272,7 @@ function candleChart(parent,name,points){
 document.getElementById('workbench-form').addEventListener('submit',async event=>{
  event.preventDefault();const out=document.getElementById('workbench-result');out.replaceChildren(el('p','Loading recorded evidence…'));
  try{const query=new URLSearchParams(new FormData(event.target));const response=await fetch('/api/workbench?'+query);const d=await response.json();if(!response.ok)throw Error(d.error||'Evidence unavailable');out.replaceChildren();
- const c=d.candles||{},e=d.evidence||{};row(out,'Evidence source',d.filters.source);row(out,'Chart source',c.source||c.reason);if(c.incomplete_source)out.append(el('p','Some source files exceeded the read bound. This is an incomplete chart window.','warn'));
+ const c=d.candles||{},e=d.evidence||{};row(out,'Evidence source',d.filters.source);if(e.evidence_scope)row(out,'Evidence scope','Retained history across research periods');row(out,'Chart source',c.source||c.reason);if(c.corpus_root)row(out,'Chart data period',c.corpus_root);if(c.incomplete_source)out.append(el('p','Some source files exceeded the read bound. This is an incomplete chart window.','warn'));
  for(const [name,points] of Object.entries(c.series||{}))candleChart(out,name,points);
  if(c.prior_session){row(out,'Prior complete session',c.prior_session.session_date);row(out,'Prior high / low / close',[c.prior_session.high,c.prior_session.low,c.prior_session.close].join(' / '))}
  if(e.parents){out.append(el('h3','Completed parent trades'));table(out,e.parents.map(r=>({...r,when:r.ts})),['symbol','variant_id','when','gross','fees','net','r_multiple','hold_minutes','exit_reason']);out.append(el('p','Holding time uses recorded fill timestamps where available, otherwise the journal interval.','muted'));out.append(el('h3','Recorded signal and risk events'));table(out,Object.entries(e.signal_funnel||{}).map(([event,count])=>({event,count})),['event','count']);out.append(el('h3','Exit distribution'));table(out,Object.entries(e.exit_distribution||{}).map(([reason,count])=>({reason,count})),['reason','count']);if(e.path_metrics)out.append(el('p',e.path_metrics.reason,'muted'))}

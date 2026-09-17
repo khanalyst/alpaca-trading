@@ -379,6 +379,11 @@ class _StockDataFake:
 
 
 class DeployTests(unittest.TestCase):
+    def test_container_context_excludes_private_backups_and_provider_secret(self):
+        ignored = set(Path(".dockerignore").read_text().splitlines())
+        self.assertTrue({"outputs", ".codex-work", "research-llm.env", ".env"}
+                        .issubset(ignored))
+
     def _calibration_normalizer(self, report, *, bootstrap=False,
                                 journal_present=True):
         """Execute the research-cycle calibration normalizer in isolation."""
@@ -1384,7 +1389,8 @@ class DeployTests(unittest.TestCase):
                         "quarantine_through_session": "2026-08-14"}
 
         with tempfile.TemporaryDirectory() as directory, patch.object(
-                shadow_service, "ShadowRunner", Runner):
+                shadow_service, "ShadowRunner", Runner), patch.object(
+                shadow_service, "_open_shadow_wal_anchor"):
             health_path = Path(directory) / "health.json"
             code = shadow_service.main([
                 "--once", "--shadow-db", str(Path(directory) / "shadow.db"),
@@ -3996,7 +4002,7 @@ class DeployTests(unittest.TestCase):
         self.assertFalse(view["available"])
         self.assertEqual(view["trades"], [])
 
-    def test_dashboard_read_only_wal_falls_back_only_without_pending_wal(self):
+    def test_dashboard_read_only_wal_failure_never_uses_immutable_fallback(self):
         class Connection:
             def __init__(self, broken=False):
                 self.broken = broken
@@ -4017,27 +4023,37 @@ class DeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             journal = Path(directory) / "journal.db"
             journal.touch()
-            broken, fallback = Connection(True), Connection()
-            calls = []
+            for contents in (None, b"", b"pending"):
+                with self.subTest(wal_contents=contents):
+                    if contents is not None:
+                        journal.with_name("journal.db-wal").write_bytes(contents)
+                    broken = Connection(True)
+                    with patch.object(dashboard.sqlite3, "connect",
+                                      return_value=broken) as connect:
+                        with self.assertRaises(sqlite3.OperationalError):
+                            dashboard._ro_connect(journal)
+                    self.assertTrue(broken.closed)
+                    connect.assert_called_once()
+                    self.assertTrue(connect.call_args.args[0].endswith("?mode=ro"))
+                    self.assertNotIn("immutable", connect.call_args.args[0])
 
-            def connect(database, **_kwargs):
-                calls.append(database)
-                return broken if len(calls) == 1 else fallback
-
-            with patch.object(dashboard.sqlite3, "connect", side_effect=connect):
-                opened = dashboard._ro_connect(journal)
-            self.assertIs(opened, fallback)
-            self.assertTrue(broken.closed)
-            self.assertIn("immutable=1", calls[1])
-            opened.close()
-
-            journal.with_name("journal.db-wal").write_bytes(b"pending")
-            calls.clear()
-            broken = Connection(True)
-            with patch.object(dashboard.sqlite3, "connect", return_value=broken):
-                with self.assertRaises(sqlite3.OperationalError):
-                    dashboard._ro_connect(journal)
-            self.assertTrue(broken.closed)
+    def test_dashboard_normal_reader_observes_new_wal_commits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal?encoded#.db"
+            with closing(sqlite3.connect(journal)) as writer:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE observations (value INTEGER)")
+                writer.execute("INSERT INTO observations VALUES (1)")
+                writer.commit()
+                with closing(dashboard._ro_connect(journal)) as reader:
+                    self.assertEqual(reader.execute(
+                        "SELECT value FROM observations").fetchone()[0], 1)
+                    writer.execute("UPDATE observations SET value=2")
+                    writer.commit()
+                    self.assertEqual(reader.execute(
+                        "SELECT value FROM observations").fetchone()[0], 2)
+                    with self.assertRaises(sqlite3.OperationalError):
+                        reader.execute("UPDATE observations SET value=3")
 
     def test_dashboard_surfaces_the_config_audit_trail(self):
         import copy as copier

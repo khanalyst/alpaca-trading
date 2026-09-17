@@ -91,6 +91,11 @@ DEFAULT_MAX_EVENTS = 20_000
 DEFAULT_MAX_DECISIONS = 100_000
 DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS = 200_000
 MAX_DIAGNOSTIC_SESSION_MAX_EVENTS = 1_000_000
+# Replay correction is loaded one recorder session at a time.  This bound is
+# intentionally independent from the incremental poll and diagnostic context
+# limits: a valid replay session may contain more than one poll's 20k rows.
+DEFAULT_REPLAY_SESSION_MAX_EVENTS = 200_000
+MAX_REPLAY_SESSION_MAX_EVENTS = 1_000_000
 # Candidate evaluation is CPU-heavy but deliberately bounded.  SQLite/WAL
 # mutation remains parent-owned; workers only inspect the frozen snapshot.
 DEFAULT_MAX_WORKERS = 4
@@ -402,6 +407,24 @@ def _timestamp(value: Any) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed.astimezone(UTC)
+
+
+def _session_utc_range(session: Any) -> tuple[datetime, datetime]:
+    """Return one recorder session's exact NY-midnight UTC bounds.
+
+    Constructing both midnights in local time preserves 23/25-hour windows
+    across DST transitions.  Adding 24 hours after converting the opening
+    midnight to UTC would silently include/exclude one hour at those edges.
+    """
+    raw = str(session).strip()
+    try:
+        day = date.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise ShadowError(f"shadow replay session date is invalid: {raw}") from exc
+    local_open = datetime.combine(day, dt_time.min, tzinfo=NEW_YORK)
+    local_close = datetime.combine(
+        day + timedelta(days=1), dt_time.min, tzinfo=NEW_YORK)
+    return local_open.astimezone(UTC), local_close.astimezone(UTC)
 
 
 def _availability_time(row: Mapping[str, Any]) -> datetime | None:
@@ -1239,11 +1262,13 @@ class ShadowConfig:
     stress_calibration_artifact: Mapping[str, Any] | None = None
     # Appended to preserve the positional constructor contract above.
     diagnostic_include_ibr: bool = False
+    # Appended after every existing field to preserve positional callers.
+    replay_session_max_events: int = DEFAULT_REPLAY_SESSION_MAX_EVENTS
 
     def __post_init__(self) -> None:
         for name in ("max_candidates", "max_events", "max_decisions",
                      "diagnostic_session_max_events", "max_workers",
-                     "retention_days"):
+                     "retention_days", "replay_session_max_events"):
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value or int(value) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -1254,6 +1279,10 @@ class ShadowConfig:
             raise ValueError(
                 "diagnostic_session_max_events must be <= "
                 f"{MAX_DIAGNOSTIC_SESSION_MAX_EVENTS}")
+        if int(self.replay_session_max_events) > MAX_REPLAY_SESSION_MAX_EVENTS:
+            raise ValueError(
+                "replay_session_max_events must be <= "
+                f"{MAX_REPLAY_SESSION_MAX_EVENTS}")
         if _finite(self.equity) is None or float(self.equity) <= 0:
             raise ValueError("equity must be positive and finite")
         object.__setattr__(self, "poll_seconds",
@@ -2955,12 +2984,8 @@ class ShadowStore:
         """Read bounded immutable events for replay-correction sessions only."""
         ranges: list[tuple[str, str]] = []
         for raw in sorted({str(value) for value in sessions if str(value).strip()}):
-            try:
-                day = date.fromisoformat(raw)
-            except ValueError:
-                continue
-            opened = datetime.combine(day, dt_time.min, tzinfo=NEW_YORK).astimezone(UTC)
-            ranges.append((opened.isoformat(), (opened + timedelta(days=1)).isoformat()))
+            opened, closed = _session_utc_range(raw)
+            ranges.append((opened.isoformat(), closed.isoformat()))
         if not ranges:
             return []
         clauses = " OR ".join("(timestamp>=? AND timestamp<?)" for _ in ranges)
@@ -2974,6 +2999,46 @@ class ShadowStore:
             raise ShadowError(
                 f"shadow replay validation event bound {max_events} exceeded")
         return [dict(row) for row in rows]
+
+    def count_events_for_sessions(self, sessions: Sequence[str], *,
+                                  max_events: int,
+                                  event_types: Sequence[str] | None = None
+                                  ) -> dict[str, int]:
+        """Preflight per-session replay bounds without materializing rows.
+
+        The caller uses this before writing a poll manifest.  Counts are
+        independent per session, so a valid 29k-row session is accepted even
+        when several replay sessions are pending; an individual overflow
+        fails closed without returning a partial replay prefix.
+        """
+        normalized = sorted({str(value).strip() for value in sessions
+                             if str(value).strip()})
+        if not normalized:
+            return {}
+        ranges = [_session_utc_range(session) for session in normalized]
+        result: dict[str, int] = {}
+        normalized_types = sorted({str(value).strip().lower()
+                                   for value in (event_types or ())
+                                   if str(value).strip()})
+        with self._connection() as db:
+            for session, (opened, closed) in zip(normalized, ranges):
+                type_clause = ""
+                type_params: tuple[str, ...] = ()
+                if normalized_types:
+                    marks = ",".join("?" for _ in normalized_types)
+                    type_clause = f" AND event_type IN ({marks})"
+                    type_params = tuple(normalized_types)
+                count = int(db.execute(
+                    "SELECT count(*) FROM events "
+                    f"WHERE timestamp>=? AND timestamp<?{type_clause}",
+                    (opened.isoformat(), closed.isoformat(), *type_params)
+                ).fetchone()[0])
+                if count > int(max_events):
+                    raise ShadowError(
+                        f"shadow replay validation event bound {max_events} "
+                        f"exceeded for session {session}")
+                result[session] = count
+        return result
 
     def decisions(self, candidate_id: str | None = None) -> list[dict]:
         with self._connection() as db:
@@ -4618,10 +4683,107 @@ class ShadowRunner:
 
     def _load_events_for_sessions(self, sessions: Sequence[str]) -> tuple[
             list[dict], dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
-        event_rows = self.store.events_for_sessions(
-            sessions, max_events=self.config.max_events)
+        normalized = sorted({str(value).strip() for value in sessions
+                             if str(value).strip()})
+        event_rows: list[dict] = []
+        # Full-session correction is deliberately loaded one session at a
+        # time.  Keep this helper tolerant of a sequence for existing private
+        # callers, while applying the independent bound to every session.
+        for session in normalized:
+            event_rows.extend(self.store.events_for_sessions(
+                [session], max_events=self.config.replay_session_max_events))
         bars, quotes, options = self._group_event_rows(event_rows)
         return event_rows, bars, quotes, options
+
+    @staticmethod
+    def _quote_frontier_add(
+            frontier: dict[tuple[str, str, str], list[dict]],
+            rows: Sequence[Mapping[str, Any]]) -> None:
+        """Append valid historical quotes before the next session boundary."""
+        for raw in rows:
+            row = dict(raw)
+            stamp = _timestamp(row.get("timestamp"))
+            available = _availability_time(row)
+            bid, ask = _finite(row.get("bid")), _finite(row.get("ask"))
+            if (stamp is None or available is None or bid is None or ask is None
+                    or bid <= 0 or ask < bid):
+                continue
+            symbol = str(row.get("symbol") or "")
+            group = (symbol,
+                     _canonical_equity_feed(row.get("feed")) or "",
+                     _canonical_equity_provider(row.get("provider")) or "")
+            frontier.setdefault(group, []).append(row)
+
+    @staticmethod
+    def _quote_frontier_size(
+            frontier: Mapping[tuple[str, str, str], Sequence[Mapping]]) -> int:
+        return sum(len(rows) for rows in frontier.values())
+
+    @staticmethod
+    def _quote_frontier_compact(
+            frontier: dict[tuple[str, str, str], list[dict]],
+            horizon: datetime) -> None:
+        """Discard quote rows dominated before the next session's opening.
+
+        A later timestamp cannot discard an earlier quote before that later
+        timestamp is visible.  Restricting dominance to rows whose timestamp
+        is already before ``horizon`` makes the reduction exact for every
+        event at or after the next recorder session open, while retaining
+        delayed/out-of-order rows that can still become visible later.
+        """
+        for group, rows in list(frontier.items()):
+            eligible: list[tuple[dict, datetime, datetime]] = []
+            for row in rows:
+                stamp = _timestamp(row.get("timestamp"))
+                available = _availability_time(row)
+                if stamp is not None and available is not None:
+                    eligible.append((row, stamp, available))
+            eligible.sort(key=lambda item: item[1])
+            # A later timestamp already visible before the horizon dominates
+            # an earlier timestamp when its availability is no later.  Scan
+            # timestamp groups from right to left, carrying only the minimum
+            # availability of strictly later groups; equal timestamps are
+            # never compared, preserving the original max() tie winner.
+            min_later_available: datetime | None = None
+            survivor_groups: list[list[dict]] = []
+            index = len(eligible)
+            while index:
+                end = index
+                stamp = eligible[index - 1][1]
+                while index and eligible[index - 1][1] == stamp:
+                    index -= 1
+                group_rows = eligible[index:end]
+                if stamp <= horizon and min_later_available is not None:
+                    survivors = [
+                        row for row, _, available in group_rows
+                        if available < min_later_available]
+                else:
+                    survivors = [row for row, _, _ in group_rows]
+                survivor_groups.append(survivors)
+                if stamp <= horizon:
+                    group_min = min(available for _, _, available in group_rows)
+                    if (min_later_available is None or
+                            group_min < min_later_available):
+                        min_later_available = group_min
+            frontier[group] = [
+                row for group_rows in reversed(survivor_groups)
+                for row in group_rows]
+
+    @staticmethod
+    def _merge_quote_context(
+            base: Mapping[str, Sequence[Mapping]],
+            frontier: Mapping[tuple[str, str, str], Sequence[Mapping]],
+            session_quotes: Mapping[str, Sequence[Mapping]]) -> dict[str, list[dict]]:
+        """Combine current, compact historical, and target-session quotes."""
+        result = {str(symbol): [dict(row) for row in rows]
+                  for symbol, rows in base.items()}
+        for rows in frontier.values():
+            for row in rows:
+                result.setdefault(str(row.get("symbol") or ""), []).append(
+                    dict(row))
+        for symbol, rows in session_quotes.items():
+            result.setdefault(str(symbol), []).extend(dict(row) for row in rows)
+        return result
 
     @staticmethod
     def _latest_quote(rows: Sequence[Mapping], at: datetime, *,
@@ -6380,26 +6542,89 @@ class ShadowRunner:
         replay_only_sessions = {
             session for _candidate_id, session in gate_pairs
             if session not in session_inputs}
+        legacy_replay_context = False
         if replay_only_sessions:
-            old_events, old_bars, old_quotes, old_options = (
-                self._load_events_for_sessions(sorted(replay_only_sessions)))
-            for target, source in ((bars, old_bars), (quotes, old_quotes),
-                                  (options, old_options)):
-                for symbol, values in source.items():
-                    target.setdefault(symbol, []).extend(values)
-            for session in sorted(replay_only_sessions):
-                session_events[session] = [
-                    row for row in old_events
-                    if row.get("event_type") in {"bar", "bar_1m"}
-                    and row_session(row) == session]
-                session_inputs[session] = (
-                    [row for values in old_bars.values() for row in values
-                     if row_session(row) == session],
-                    [row for values in old_quotes.values() for row in values
-                     if row_session(row) == session],
-                    [row for values in old_options.values() for row in values
-                     if row_session(row) == session],
-                )
+            # Full-session correction is intentionally preflighted before the
+            # manifest and diagnostic writes.  Each session gets its own
+            # bound; several pending sessions do not consume one aggregate
+            # 20k/200k allowance or return a truncated replay prefix.
+            replay_counts = self.store.count_events_for_sessions(
+                sorted(replay_only_sessions),
+                max_events=self.config.replay_session_max_events)
+            replay_candidate_ids = {
+                candidate_id for candidate_id, session in gate_pairs
+                if session in replay_only_sessions}
+            # A current-session arm is evaluated against the same frozen
+            # market maps.  If any evaluated arm lacks exact calendar bounds,
+            # retain the bounded legacy context for all arms rather than
+            # silently dropping historical bars for that arm.
+            def arm_requires_exact_calendar(arm: Mapping[str, Any]) -> bool:
+                arm_session = _safe_config(arm).get("session")
+                return bool(isinstance(arm_session, Mapping) and
+                            arm_session.get("require_exact_calendar", False))
+
+            legacy_replay_context = any(
+                not arm_requires_exact_calendar(arm) for arm in arms)
+            for candidate_id in sorted(replay_candidate_ids):
+                arm = next((item for item in arms
+                            if str(item.get("candidate_id") or "") ==
+                            candidate_id), None)
+                if arm is None:
+                    raise ShadowError(
+                        f"replay candidate {candidate_id} is unavailable")
+                if not arm_requires_exact_calendar(arm):
+                    # Legacy candidates retain the historical all-context
+                    # evaluator contract below, but only within one explicit
+                    # bounded compatibility snapshot.  Never silently drop
+                    # prior bars/quotes/options when calendar metadata is
+                    # unavailable.
+                    legacy_replay_context = True
+                    continue
+                if not legacy_replay_context:
+                    for session in replay_only_sessions:
+                        if _recorded_session_bounds(
+                                self.config.corpus_path, session,
+                                calendar_snapshot=calendar_snapshot) is None:
+                            raise ShadowError(
+                                f"replay session calendar metadata unavailable: "
+                                f"{session}")
+            if not legacy_replay_context and any(
+                    str(arm.get("vehicle") or "") == "option"
+                    and str(arm.get("candidate_id") or "") in
+                    replay_candidate_ids for arm in arms):
+                option_counts = self.store.count_events_for_sessions(
+                    sorted(replay_only_sessions),
+                    max_events=self.config.replay_session_max_events,
+                    event_types=("option", "option_snapshot"))
+                if sum(option_counts.values()) > self.config.replay_session_max_events:
+                    raise ShadowError(
+                        "replay option context bound "
+                        f"{self.config.replay_session_max_events} exceeded")
+            if legacy_replay_context:
+                aggregate = sum(replay_counts.values())
+                if aggregate > self.config.replay_session_max_events:
+                    raise ShadowError(
+                        "legacy replay context bound "
+                        f"{self.config.replay_session_max_events} exceeded")
+                old_events, old_bars, old_quotes, old_options = (
+                    self._load_events_for_sessions(sorted(replay_only_sessions)))
+                for target, source in ((bars, old_bars), (quotes, old_quotes),
+                                      (options, old_options)):
+                    for symbol, values in source.items():
+                        target.setdefault(symbol, []).extend(values)
+                for session in sorted(replay_only_sessions):
+                    session_events[session] = [
+                        row for row in old_events
+                        if row.get("event_type") in {"bar", "bar_1m"}
+                        and row_session(row) == session]
+                    session_inputs[session] = (
+                        [row for values in old_bars.values() for row in values
+                         if row_session(row) == session],
+                        [row for values in old_quotes.values() for row in values
+                         if row_session(row) == session],
+                        [row for values in old_options.values() for row in values
+                         if row_session(row) == session],
+                    )
 
         # Convert all worker inputs to detached JSON values and tuples.  The
         # tuples are never handed to a mutating path, making the poll snapshot
@@ -6535,9 +6760,96 @@ class ShadowRunner:
         authorizing_errors: dict[str, str] = {}
         failed_arms: set[str] = set()
         replay_blocked = False
+        # Historical quote context is reduced to a point-in-time skyline as
+        # replay sessions advance.  This preserves the old cross-session
+        # quote lookup without retaining every prior session row.  Option
+        # snapshots remain lossless and are bounded explicitly below.
+        replay_quote_frontier: dict[tuple[str, str, str], list[dict]] = {}
+        replay_option_context: dict[str, list[dict]] = {}
         for session in sorted(set(frozen_session_events) | replay_only_sessions):
             is_replay_only = session in replay_only_sessions
-            session_inputs_one = {session: frozen_session_inputs[session]}
+            if is_replay_only and not legacy_replay_context:
+                old_events, old_bars, old_quotes, old_options = (
+                    self._load_events_for_sessions([session]))
+                session_rows = tuple(
+                    json.loads(_json(dict(row))) for row in old_events
+                    if row.get("event_type") in {"bar", "bar_1m"}
+                    and row_session(row) == session)
+                target_inputs = (
+                    tuple(json.loads(_json(dict(row)))
+                          for values in old_bars.values() for row in values
+                          if row_session(row) == session),
+                    tuple(json.loads(_json(dict(row)))
+                          for values in old_quotes.values() for row in values
+                          if row_session(row) == session),
+                    tuple(json.loads(_json(dict(row)))
+                          for values in old_options.values() for row in values
+                          if row_session(row) == session),
+                )
+                session_inputs_one = {session: target_inputs}
+                calendar_bounds = _recorded_session_bounds(
+                    self.config.corpus_path, session,
+                    calendar_snapshot=calendar_snapshot)
+                if calendar_bounds is None:
+                    raise ShadowError(
+                        f"replay session calendar metadata unavailable: "
+                        f"{session}")
+                self._quote_frontier_compact(
+                    replay_quote_frontier, calendar_bounds[0])
+                target_quote_count = sum(len(values)
+                                         for values in old_quotes.values())
+                if (self._quote_frontier_size(replay_quote_frontier) +
+                        target_quote_count >
+                        self.config.replay_session_max_events):
+                    raise ShadowError(
+                        "replay quote context bound "
+                        f"{self.config.replay_session_max_events} exceeded")
+                bars_for_eval = {
+                    str(symbol): tuple(values)
+                    for symbol, values in frozen_bars.items()}
+                for symbol, values in old_bars.items():
+                    bars_for_eval.setdefault(str(symbol), tuple())
+                    bars_for_eval[str(symbol)] = (
+                        *bars_for_eval[str(symbol)],
+                        *(json.loads(_json(dict(row))) for row in values
+                          if row_session(row) == session))
+                quotes_for_eval = self._merge_quote_context(
+                    frozen_quotes, replay_quote_frontier, old_quotes)
+                for symbol, values in old_options.items():
+                    replay_option_context.setdefault(str(symbol), []).extend(
+                        json.loads(_json(dict(row))) for row in values)
+                option_context_count = sum(
+                    len(values) for values in replay_option_context.values())
+                if option_context_count > self.config.replay_session_max_events:
+                    raise ShadowError(
+                        "replay option context bound "
+                        f"{self.config.replay_session_max_events} exceeded")
+                options_for_eval = {
+                    str(symbol): tuple(values)
+                    for symbol, values in frozen_options.items()}
+                for symbol, values in replay_option_context.items():
+                    options_for_eval.setdefault(str(symbol), tuple())
+                    options_for_eval[str(symbol)] = (
+                        *options_for_eval[str(symbol)], *values)
+                # Update immutable context after composing this target's
+                # inputs; later sessions may observe these rows, never vice
+                # versa.
+                self._quote_frontier_add(
+                    replay_quote_frontier,
+                    [row for values in old_quotes.values() for row in values])
+            else:
+                session_rows = tuple(frozen_session_events[session])
+                session_inputs_one = {session: frozen_session_inputs[session]}
+                bars_for_eval = frozen_bars
+                quotes_for_eval = self._merge_quote_context(
+                    frozen_quotes, replay_quote_frontier, {})
+                options_for_eval = {
+                    str(symbol): tuple(values)
+                    for symbol, values in frozen_options.items()}
+                for symbol, values in replay_option_context.items():
+                    options_for_eval.setdefault(str(symbol), tuple())
+                    options_for_eval[str(symbol)] = (
+                        *options_for_eval[str(symbol)], *values)
             session_candidates = ({candidate_id for candidate_id, value in gate_pairs
                                    if value == session}
                                   if is_replay_only else arm_ids)
@@ -6551,7 +6863,6 @@ class ShadowRunner:
                 candidate_id = str(arm["candidate_id"])
                 if candidate_id not in session_candidates or candidate_id in failed_arms:
                     continue
-                session_rows = tuple(frozen_session_events[session])
                 if is_replay_only:
                     eligible_rows = session_rows
                 else:
@@ -6576,7 +6887,8 @@ class ShadowRunner:
                                     {session: eligible_events_by_arm[
                                         str(arm["candidate_id"])]},
                                     session_inputs_one,
-                                    frozen_bars, frozen_quotes, frozen_options,
+                                    bars_for_eval, quotes_for_eval,
+                                    options_for_eval,
                                     initial_states[str(arm["candidate_id"])],
                                     calendar_snapshot): arm
                         for arm in active_arms}
@@ -6633,7 +6945,7 @@ class ShadowRunner:
                     replay_decisions[candidate_id] = decisions
 
             # Replay is parent-only and runs before the next session barrier.
-            session_bars, session_quotes, session_options = frozen_session_inputs[session]
+            session_bars, session_quotes, session_options = session_inputs_one[session]
             for candidate_id in sorted(session_candidates):
                 if candidate_id in failed_arms or candidate_id not in arm_by_id:
                     continue
@@ -6696,7 +7008,8 @@ class ShadowRunner:
         # Any unresolved worker/replay/quarantine state leaves the floor in
         # place for a deterministic retry; immutable evidence is never pruned.
         floor_eligible = bool(
-            frozen_session_events and not replay_blocked and
+            frozen_session_events and not replay_only_sessions and
+            not replay_blocked and
             not authorizing_errors and not failed_arms and
             not invalid_sessions and not unknown_quarantine and
             not pending_repairs)
@@ -6841,6 +7154,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--diagnostic-session-max-events", type=int,
         default=DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS)
+    parser.add_argument(
+        "--replay-session-max-events", type=int,
+        default=DEFAULT_REPLAY_SESSION_MAX_EVENTS)
     return parser
 
 
@@ -6853,6 +7169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                        max_workers=args.max_workers,
                        diagnostic_session_max_events=(
                            args.diagnostic_session_max_events),
+                       replay_session_max_events=args.replay_session_max_events,
                        diagnostic=args.diagnostic,
                        diagnostic_include_ibr=args.diagnostic_include_ibr,
                        runtime_config=runtime_config,
@@ -6883,6 +7200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS", "DEFAULT_EQUITY",
+    "DEFAULT_REPLAY_SESSION_MAX_EVENTS", "MAX_REPLAY_SESSION_MAX_EVENTS",
     "DEFAULT_MAX_WORKERS", "DEFAULT_RETENTION_DAYS", "InputConflict",
     "_opportunity_capacity", "_signal_dispositions", "REPLAY_QUARANTINE_META_KEY",
     "SESSION_CATALOG_META_KEY", "REPLAY_QUARANTINE_OVERFLOW_KEY",

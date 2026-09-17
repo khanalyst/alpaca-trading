@@ -38,6 +38,20 @@ def trial_selection():
 
 
 class PaperShadowStatusTests(unittest.TestCase):
+    def test_operator_cancelled_trial_stays_visible_and_ineligible(self):
+        value = trial_selection()
+        value.update(state="blocked", armed=False,
+                     blocker_code="paper_trial_operator_cancelled")
+        value["paper_trial"].update(
+            state="operator_cancelled", entry_eligible=False,
+            blockers=["paper_trial_operator_cancelled"])
+        projected = health.paper_selection_summary(value)
+        self.assertEqual(projected["paper_trial"]["state"], "operator_cancelled")
+        self.assertFalse(projected["paper_trial"]["entry_eligible"])
+        self.assertFalse(projected["paper_trial"]["authorizing"])
+        value["paper_trial"]["entry_eligible"] = True
+        self.assertIsNone(health.paper_selection_summary(value))
+
     def test_paper_experiment_roundtrips_without_invented_proof(self):
         value = trial_selection()
         projected = health.paper_selection_summary(value)

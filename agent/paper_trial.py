@@ -31,10 +31,12 @@ SCHEMA = "paper-incumbent-trial.v1"
 OUTCOME_SCHEMA = "paper-incumbent-outcome.v1"
 REPORT_SCHEMA = "session-acceptance-report.v1"
 TERMINAL_AUDIT_SCHEMA = "paper-incumbent-terminal-audit.v1"
+OPERATOR_CANCELLATION_SCHEMA = "paper-incumbent-operator-cancellation.v1"
+OPERATOR_CANCELLATION_AUDIT_KIND = "paper_trial_operator_cancelled"
 REPLACEMENT_LOCAL_BOOK_ERROR = (
     "paper trial replacement requires restart with the frozen incumbent "
     "until the old local book is flat")
-TERMINAL_STATES = {"failed", "review_required"}
+TERMINAL_STATES = {"failed", "review_required", "operator_cancelled"}
 ACTIVE_STATES = {"running", "passed"}
 MAX_ACCEPTED_SESSIONS = 500
 MAX_OUTCOMES = 10_000
@@ -372,6 +374,71 @@ def validate_state(value: Mapping[str, Any] | None) -> dict[str, Any]:
         raise PaperTrialError("paper_trial evidence state is invalid")
     if not isinstance(blockers, list) or any(not isinstance(item, str) for item in blockers):
         raise PaperTrialError("paper_trial blockers are invalid")
+    if result.get("state") == "operator_cancelled":
+        cancellation = result.get("operator_cancellation")
+        if not isinstance(cancellation, Mapping):
+            raise PaperTrialError(
+                "operator-cancelled paper trial is missing its cancellation record")
+        if cancellation.get("schema") != OPERATOR_CANCELLATION_SCHEMA:
+            raise PaperTrialError(
+                "operator-cancelled paper trial cancellation schema is invalid")
+        for key in ("audit_id", "prestate_digest", "reason",
+                    "account_fingerprint"):
+            if not isinstance(cancellation.get(key), str) or not str(
+                    cancellation[key]).strip():
+                raise PaperTrialError(
+                    f"operator-cancelled paper trial {key} is invalid")
+        if (re.fullmatch(r"[0-9a-f]{64}", cancellation["audit_id"]) is None or
+                re.fullmatch(r"[0-9a-f]{64}", cancellation["prestate_digest"])
+                is None):
+            raise PaperTrialError(
+                "operator-cancelled paper trial cancellation digest is invalid")
+        reason = cancellation["reason"]
+        if (not 0 < len(reason) <= 500 or any(ord(char) < 32 for char in reason)):
+            raise PaperTrialError(
+                "operator-cancelled paper trial cancellation reason is invalid")
+        account_fingerprint = cancellation["account_fingerprint"]
+        if (not account_fingerprint.startswith("alpaca-paper-") or
+                len(account_fingerprint) > 80):
+            raise PaperTrialError(
+                "operator-cancelled paper trial account binding is invalid")
+        if (result.get("activation_confirmed") is True and
+                account_fingerprint != result.get("activation_account_fingerprint")):
+            raise PaperTrialError(
+                "operator-cancelled paper trial account binding is invalid")
+        recorded_ts = cancellation.get("recorded_ts")
+        if (isinstance(recorded_ts, bool) or
+                not isinstance(recorded_ts, (int, float)) or
+                not math.isfinite(float(recorded_ts)) or float(recorded_ts) <= 0):
+            raise PaperTrialError(
+                "operator-cancelled paper trial recorded time is invalid")
+        flat_observation = cancellation.get("flat_observation")
+        if (not isinstance(flat_observation, Mapping) or
+                flat_observation.get("positions_empty") is not True or
+                flat_observation.get("open_orders_empty") is not True or
+                isinstance(flat_observation.get("positions_count"), bool) or
+                not isinstance(flat_observation.get("positions_count"), int) or
+                isinstance(flat_observation.get("open_orders_count"), bool) or
+                not isinstance(flat_observation.get("open_orders_count"), int) or
+                flat_observation.get("positions_count") != 0 or
+                flat_observation.get("open_orders_count") != 0):
+            raise PaperTrialError(
+                "operator-cancelled paper trial flat observation is invalid")
+        observed_at_ts = flat_observation.get("observed_at_ts")
+        if (isinstance(observed_at_ts, bool) or
+                not isinstance(observed_at_ts, (int, float)) or
+                not math.isfinite(float(observed_at_ts)) or
+                float(observed_at_ts) <= 0):
+            raise PaperTrialError(
+                "operator-cancelled paper trial observed time is invalid")
+        try:
+            from .paper_trial_operator import verify_operator_cancellation
+            verify_operator_cancellation(result, cancellation)
+        except PaperTrialError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise PaperTrialError(
+                f"operator-cancelled paper trial audit is unavailable: {exc}") from exc
     for key in ("max_review_sessions", "required_sessions", "required_trades"):
         number = result.get(key)
         if isinstance(number, bool) or not isinstance(number, int) or number < 1:
@@ -771,6 +838,10 @@ def refresh_state(state_value: Mapping[str, Any], descriptor: Mapping[str, Any],
     current = validate_state(state_value)
     if not _same_incumbent(current, descriptor):
         raise PaperTrialError("active paper trial identity/config changed")
+    if current.get("state") == "operator_cancelled":
+        # Cancellation is an audited lifecycle decision, not a statistical
+        # verdict.  Keep the old evidence and verdict byte-for-byte stable.
+        return current
     if current.get("activation_confirmed") is not True:
         raise PaperTrialError(
             "paper trial cannot accrue evidence before flat-book activation")
@@ -892,6 +963,8 @@ def public_status(state_value: Mapping[str, Any] | None, *,
         blockers.insert(0, "paper_trial_failed")
     elif current["state"] == "review_required":
         blockers.insert(0, "paper_trial_review_required")
+    elif current["state"] == "operator_cancelled":
+        blockers.insert(0, "paper_trial_operator_cancelled")
     if error:
         blockers.insert(0, str(error))
     blockers = list(dict.fromkeys(blockers))[:8]
@@ -954,7 +1027,7 @@ class PaperTrialRuntime:
                 "accepted_sessions", "outcomes", "verdict", "blockers",
                 "report_identities", "max_review_sessions",
                 "required_sessions", "required_trades", "authorizing",
-                "proof_authority",
+                "proof_authority", "operator_cancellation",
             )
         }
         audit = {
@@ -1053,7 +1126,8 @@ class PaperTrialRuntime:
 __all__ = [
     "ACTIVE_STATES", "OUTCOME_SCHEMA", "PaperTrialError",
     "PaperTrialRuntime", "REPORT_SCHEMA", "REPLACEMENT_LOCAL_BOOK_ERROR",
-    "SCHEMA", "TERMINAL_AUDIT_SCHEMA",
+    "SCHEMA", "TERMINAL_AUDIT_SCHEMA", "TERMINAL_STATES",
+    "OPERATOR_CANCELLATION_SCHEMA", "OPERATOR_CANCELLATION_AUDIT_KIND",
     "build_descriptor", "effective_config", "merge_outcomes", "new_state",
     "outcome_entry", "paper_trial_block", "paper_trial_enabled",
     "public_status", "refresh_state", "replacement_book_is_flat",

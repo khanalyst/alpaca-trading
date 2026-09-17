@@ -12,7 +12,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from deploy.recorder import INDEX_NAME, iter_corpus_rows
 from deploy.recorder_market import _event_key
@@ -25,6 +25,7 @@ from research.live_shadow import (InputConflict, ShadowConfig, ShadowRunner,
                                    _replay_signature,
                                    _shadow_signature, _signature_diffs,
                                    _replay_code_hash,
+                                   _session_utc_range,
                                    _opportunity_capacity,
                                    _safe_config,
                                    _signal_dispositions,
@@ -212,6 +213,47 @@ class LiveShadowTests(unittest.TestCase):
     def _run(self, **kwargs):
         return run_shadow_once(ShadowConfig(self.corpus, self.edge, self.shadow, **kwargs))
 
+    def _seed_replay_gate(self, runner, candidate, session):
+        """Create immutable matched gate evidence for one replay session."""
+        runner.store.upsert_candidate(candidate)
+        replay_digest = f"replay-{session}"
+        runner.store.replay_diff(
+            candidate_id=candidate["candidate_id"], session_date=session,
+            source_digest="source", shadow_digest="shadow",
+            replay_digest=replay_digest, status="match",
+            details={"complete": True, "signature_match": True})
+        runner.store.record_replay_evidence(
+            candidate_id=candidate["candidate_id"], session_date=session,
+            replay_digest=replay_digest, vehicle="equity",
+            starting_cash=100_000, ending_cash=100_000, realized_pnl=0.0,
+            trades=[{"vehicle": "equity", "symbol": "SPY",
+                     "session_date": session,
+                     "opportunity_id": f"SPY:{session}",
+                     "net_pnl": 0.0, "return_value": 0.0,
+                     "no_trade": True}],
+            replay_status="match")
+
+    def _write_exact_calendar(self, sessions):
+        payload = {"session_calendar": {}}
+        for session in sessions:
+            payload["session_calendar"][session] = {
+                "open": f"{session}T14:30:00+00:00",
+                "close": f"{session}T21:00:00+00:00",
+                "source": "alpaca_calendar",
+            }
+        (self.corpus.parent / INDEX_NAME).write_text(
+            json.dumps(payload), encoding="utf-8")
+
+    def _replay_bar(self, session, *, index=0):
+        stamp = datetime.fromisoformat(
+            f"{session}T20:59:{index:02d}+00:00")
+        row = self._replay_row(
+            timestamp=stamp.isoformat(),
+            as_of=(stamp + timedelta(minutes=1)).isoformat())
+        row["observed_at"] = (stamp + timedelta(minutes=2)).isoformat()
+        row["event_key"] = _event_key("bar_1m", "SPY", stamp.isoformat())
+        return row
+
     def test_ingest_is_idempotent_and_stale_data_is_explicit(self):
         candidate = self._candidate()
         self._write_rows()
@@ -236,6 +278,7 @@ class LiveShadowTests(unittest.TestCase):
         self.assertEqual(manifest["manifest_digest"], first["manifest_digest"])
         self.assertEqual(manifest["event_watermark"]["count"], 3)
         self.assertEqual(manifest["replay_code_hash"], _replay_code_hash())
+        self.assertNotIn("replay_session_max_events", manifest)
 
     def test_no_candidate_poll_skips_historical_materialization(self):
         """An empty candidate set must not copy a large immutable WAL."""
@@ -589,6 +632,164 @@ class LiveShadowTests(unittest.TestCase):
         self._write_rows()
         with self.assertRaises(Exception):
             self._run(max_events=2)
+
+    def test_replay_session_bound_allows_more_than_incremental_poll_limit(self):
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_events=2,
+            replay_session_max_events=20_001))
+        for index in range(20_001):
+            stamp = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc) + \
+                timedelta(seconds=index)
+            row = self._replay_row(
+                timestamp=stamp.isoformat(),
+                as_of=(stamp + timedelta(minutes=1)).isoformat())
+            row["observed_at"] = (stamp + timedelta(minutes=2)).isoformat()
+            row["event_key"] = _event_key(
+                "bar_1m", "SPY", stamp.isoformat())
+            runner.store.ingest_event(row, max_events=2)
+        rows, bars, quotes, options = runner._load_events_for_sessions(
+            ["2026-01-02"])
+        self.assertEqual(len(rows), 20_001)
+        self.assertEqual(len(bars["SPY"]), 20_001)
+        self.assertEqual(quotes, {})
+        self.assertEqual(options, {})
+
+    def test_replay_sessions_are_loaded_sequentially_with_independent_bound(self):
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_events=2,
+            replay_session_max_events=20_000))
+        with patch.object(runner.store, "events_for_sessions",
+                          side_effect=[[], []]) as load:
+            runner._load_events_for_sessions(
+                ["2026-01-03", "2026-01-02"])
+        self.assertEqual(load.call_args_list, [
+            call(["2026-01-02"], max_events=20_000),
+            call(["2026-01-03"], max_events=20_000),
+        ])
+
+    def test_replay_overflow_preflight_leaves_floor_and_manifest_unchanged(self):
+        candidate = self._candidate(config={
+            "strategy": {"id": "ibr", "version": "v1",
+                         "variant_id": "ibr.baseline"},
+            "risk": {"risk_per_trade_pct": 1}, "execution": {},
+            "session": {"require_exact_calendar": True}})
+        self._write_exact_calendar(["2026-01-02"])
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_events=2,
+            replay_session_max_events=1))
+        self._seed_replay_gate(runner, candidate, "2026-01-02")
+        for index in (0, 1):
+            runner.store.ingest_event(
+                self._replay_bar("2026-01-02", index=index), max_events=2)
+        before_floor = time.time() + 3600.0
+        runner.store.save_forward_event_floor(before_floor)
+        with self.assertRaisesRegex(ShadowError, "bound 1 exceeded"):
+            runner.run_once()
+        self.assertEqual(runner.store.forward_event_floor(), before_floor)
+        self.assertIsNone(runner.store.latest_manifest_for_rollover())
+
+    def test_replay_exact_calendar_sessions_dispatch_one_at_a_time(self):
+        candidate = self._candidate(config={
+            "strategy": {"id": "ibr", "version": "v1",
+                         "variant_id": "ibr.baseline"},
+            "risk": {"risk_per_trade_pct": 1}, "execution": {},
+            "session": {"require_exact_calendar": True}})
+        sessions = ["2026-01-02", "2026-01-03"]
+        self._write_exact_calendar(sessions)
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_events=2,
+            replay_session_max_events=20_000))
+        for session in sessions:
+            self._seed_replay_gate(runner, candidate, session)
+            runner.store.ingest_event(
+                self._replay_bar(session), max_events=2)
+        before_floor = time.time() + 3600.0
+        runner.store.save_forward_event_floor(before_floor)
+        with patch.object(runner, "_load_events_for_sessions",
+                          wraps=runner._load_events_for_sessions) as load:
+            result = runner.run_once()
+        self.assertEqual([item.args[0] for item in load.call_args_list],
+                         [["2026-01-02"], ["2026-01-03"]])
+        manifest = runner.store.manifest(result["manifest_digest"])
+        self.assertEqual(manifest["replay_validation_sessions"], sessions)
+        self.assertEqual(runner.store.forward_event_floor(), before_floor)
+
+    def test_replay_session_date_validation_and_dst_window_are_exact(self):
+        opened, closed = _session_utc_range("2026-03-08")
+        self.assertEqual(opened.isoformat(), "2026-03-08T05:00:00+00:00")
+        self.assertEqual(closed.isoformat(), "2026-03-09T04:00:00+00:00")
+        self.assertEqual(closed - opened, timedelta(hours=23))
+        store = ShadowStore(self.shadow)
+        with self.assertRaisesRegex(ShadowError, "session date is invalid"):
+            store.count_events_for_sessions(["not-a-date"], max_events=10)
+        with self.assertRaisesRegex(ShadowError, "session date is invalid"):
+            store.events_for_sessions(["not-a-date"], max_events=10)
+
+    def test_quote_frontier_matches_full_cross_session_visibility(self):
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
+        rows = []
+        for index, (minute, observed_delay) in enumerate(
+                ((0, 0), (0, 20), (2, 0))):
+            stamp = start + timedelta(minutes=minute)
+            observed = stamp + timedelta(seconds=observed_delay)
+            rows.append({
+                "event_key": f"quote-frontier-{index}",
+                "event_type": "quote", "symbol": "SPY",
+                "timestamp": stamp.isoformat(),
+                "as_of": stamp.isoformat(),
+                "observed_at": observed.isoformat(),
+                "provider": "alpaca", "feed": "iex",
+                "bid": str(100 + index), "ask": str(100.1 + index),
+            })
+        frontier = {}
+        runner._quote_frontier_add(frontier, rows)
+        runner._quote_frontier_compact(frontier, start)
+        compact = runner._merge_quote_context({}, frontier, {})["SPY"]
+        for offset in (5, 65, 125, 180):
+            at = start + timedelta(seconds=offset)
+            expected = runner._latest_quote(rows, at,
+                                            expected_feed="iex",
+                                            expected_provider="alpaca")
+            actual = runner._latest_quote(compact, at,
+                                          expected_feed="iex",
+                                          expected_provider="alpaca")
+            self.assertEqual(
+                expected.get("event_key") if expected else None,
+                actual.get("event_key") if actual else None)
+
+    def test_quote_frontier_compaction_preserves_equal_timestamps(self):
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
+        rows = []
+        for index, (stamp_offset, observed_offset) in enumerate(
+                ((10, 0), (10, 10), (20, 0))):
+            stamp = start + timedelta(seconds=stamp_offset)
+            observed = stamp + timedelta(seconds=observed_offset)
+            rows.append({
+                "event_key": f"tie-frontier-{index}",
+                "event_type": "quote", "symbol": "SPY",
+                "timestamp": stamp.isoformat(),
+                "as_of": stamp.isoformat(),
+                "observed_at": observed.isoformat(),
+                "provider": "alpaca", "feed": "iex",
+                "bid": "100", "ask": "101",
+            })
+        frontier = {}
+        runner._quote_frontier_add(frontier, rows)
+        runner._quote_frontier_compact(
+            frontier, start + timedelta(seconds=15))
+        compact = runner._merge_quote_context({}, frontier, {})["SPY"]
+        at = start + timedelta(seconds=15)
+        expected = runner._latest_quote(rows, at,
+                                        expected_feed="iex",
+                                        expected_provider="alpaca")
+        actual = runner._latest_quote(compact, at,
+                                      expected_feed="iex",
+                                      expected_provider="alpaca")
+        self.assertEqual(expected["event_key"], actual["event_key"])
+        self.assertTrue({"tie-frontier-0", "tie-frontier-1"}.issubset(
+            {row["event_key"] for row in compact}))
 
     def test_known_event_conflict_check_skips_repeat_normalization(self):
         self._candidate()

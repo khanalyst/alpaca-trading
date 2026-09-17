@@ -1,17 +1,78 @@
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from deploy import recorder_corpus_path
+from deploy.dashboard import _reports
 from deploy.dashboard_workbench import workbench
 from deploy.market_observations import append_observations
 from tests.test_market_observations import bar
 
 
 class WorkbenchTests(unittest.TestCase):
+    def test_configured_epoch_is_shared_and_old_chart_is_not_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, close in (("recorded", 101), ("recorded-fresh", 102)):
+                recorded = root / "runtime/research" / name
+                sessions = recorded / "sessions"
+                sessions.mkdir(parents=True)
+                partition = sessions / "market-2026-09-08.csv"
+                partition.write_text("event_type\n")
+                marker = {"schema": "recorder-partition-calendar.v1",
+                          "partition": partition.name, "source": "alpaca_calendar",
+                          "status": "open", "open": "2026-09-08T13:30:00+00:00",
+                          "close": "2026-09-08T20:00:00+00:00"}
+                partition.with_name(partition.name + ".calendar.json").write_text(json.dumps(marker))
+                append_observations(recorded / "bar-observations.sqlite3", [bar(close=close)])
+            fresh = root / "runtime/research/recorded-fresh"
+            for value in ("runtime/research/recorded-fresh", str(fresh)):
+                with self.subTest(value=value), patch.dict(
+                        os.environ, {"ALPACA_RECORDER_CORPUS_ROOT": value}):
+                    self.assertEqual(recorder_corpus_path(root), fresh.resolve())
+                    result = workbench(root, {"symbol": "SPY", "feed": "iex",
+                        "start_date": "2026-09-08", "as_of": "2026-09-08T13:32:00+00:00"})
+                    candles = result["candles"]
+                    self.assertTrue(candles["available"], candles)
+                    self.assertEqual(candles["series"]["1m"][0]["close"], 102)
+                    self.assertEqual(candles["corpus_root"], "runtime/research/recorded-fresh")
+
+    def test_chart_epoch_cannot_escape_runtime_by_path_or_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime").mkdir()
+            (root / "outside").mkdir()
+            (root / "runtime/escape").symlink_to(root / "outside", target_is_directory=True)
+            for value in ("outside", "runtime/escape"):
+                with self.subTest(value=value), patch.dict(
+                        os.environ, {"ALPACA_RECORDER_CORPUS_ROOT": value}):
+                    with self.assertRaisesRegex(ValueError, "inside runtime"):
+                        recorder_corpus_path(root)
+                    result = workbench(root, {"symbol": "SPY", "feed": "iex",
+                        "start_date": "2026-09-08"})
+                    self.assertFalse(result["candles"]["available"])
+
+    def test_reports_and_research_records_are_not_relabelled_as_current(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reports = root / "research/results"
+            reports.mkdir(parents=True)
+            (reports / "freshly-copied-old-results.md").write_text("net: -123\n")
+            rows = _reports(root)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["epoch_binding"], "unverified")
+            self.assertEqual(rows[0]["evidence_scope"], "historical_or_unbound")
+            self.assertFalse(rows[0]["authorizing"])
+            evidence = workbench(root, {"source": "research"})["evidence"]
+            self.assertEqual(evidence["evidence_scope"], "retained_history_across_epochs")
+            self.assertFalse(evidence["authorizing"])
+
     def test_partial_parent_is_excluded_and_net_retry_fills_are_summed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

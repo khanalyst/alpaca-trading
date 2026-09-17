@@ -23,6 +23,13 @@ class _Clock:
 
 
 class ShadowServiceCadenceTests(unittest.TestCase):
+    def setUp(self):
+        # These runner doubles isolate scheduling; real SQLite lifetime and
+        # failed-anchor startup are exercised in test_shadow_wal_lifetime.
+        anchor = patch.object(shadow_service, "_open_shadow_wal_anchor")
+        anchor.start()
+        self.addCleanup(anchor.stop)
+
     def _repeating_poll(self, duration: float) -> tuple[_Clock, list[float]]:
         clock = _Clock()
         starts: list[float] = []
@@ -171,6 +178,28 @@ class ShadowServiceCadenceTests(unittest.TestCase):
 
         self.assertIn("      - deploy/shadow.py", shadow)
         self.assertNotIn("research/live_shadow.py", shadow)
+
+    def test_wrapper_keeps_replay_budget_separate_from_poll_and_diagnostics(self):
+        observed = []
+
+        class Runner:
+            def __init__(self, config):
+                observed.append(config)
+
+            def run_once(self):
+                return {"candidate_errors": {}}
+
+        with patch.object(shadow_service, "ShadowRunner", Runner), \
+             patch.object(shadow_service, "_write_health"), \
+             patch.object(shadow_service, "_record_acceptance", return_value={}), \
+             patch("builtins.print"):
+            self.assertEqual(shadow_service.main([
+                "--no-diagnostic", "--once",
+                "--replay-session-max-events", "250000",
+            ]), 0)
+        self.assertEqual(observed[0].replay_session_max_events, 250000)
+        self.assertEqual(observed[0].max_events, 20000)
+        self.assertEqual(observed[0].diagnostic_session_max_events, 200000)
 
 
 if __name__ == "__main__":
