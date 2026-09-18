@@ -1,5 +1,6 @@
 """Focused parity checks for the fixed-SPY residual rule family."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +17,9 @@ from agent.contracts.rule import (
 from agent.engine_cycle import _rule_runtime_bars
 from research.costs import ReplayPolicy
 from research.factory_core import _simulate_trade, simulate_account
-from research.fit_diagnostics import measure_fit_diagnostics
+from research.fit_diagnostics import _fit_prefixes, measure_fit_diagnostics
 from research.live_shadow import ShadowConfig, ShadowRunner
-from research.market_data import normalize_underlying_bar
+from research.market_data import normalize_underlying_bar, replay_bar_prefix
 from research.signal_quality import measure_signal_quality
 from research.strategy_factory import (_screen_record_can_skip,
                                        _signal_quality_screen_worker)
@@ -253,6 +254,89 @@ class CrossSectionalIntegrationTests(unittest.TestCase):
         self.assertEqual(row["no_signal_reason"], "benchmark_context_missing")
         self.assertEqual(row["benchmark_symbol"], "SPY")
         self.assertIn(row["candidate_behavior_identity"], row["opportunity_id"])
+
+    def test_future_observed_benchmark_is_unavailable_in_every_research_path(self):
+        for multiplier in (1, 2):
+            late = [replace(
+                bar, open=bar.open * multiplier, high=bar.high * multiplier,
+                low=bar.low * multiplier, close=bar.close * multiplier,
+                identity=replace(bar.identity,
+                                 observed_at=bar.end + timedelta(days=1)))
+                    for bar in self.spy]
+            with self.subTest(future_price_multiplier=multiplier):
+                context = {"SPY": tuple(late)}
+                quality = measure_signal_quality(
+                    self.qqq, SPEC, policy=BAR_FALLBACK, horizons=(1,),
+                    bars_by_symbol=context)
+                fit = measure_fit_diagnostics(
+                    self.qqq, SPEC, policy=BAR_FALLBACK, bars_by_symbol=context)
+                replay = _simulate_trade(
+                    self.qqq, SPEC, [], "equity", policy=BAR_FALLBACK,
+                    bars_by_symbol=context)
+                self.assertEqual(quality["event_count"], 0)
+                self.assertEqual(fit["first_signal"]["signals"], 0)
+                self.assertEqual(quality["market_context"]["reason"],
+                                 "benchmark_context_missing")
+                self.assertEqual(fit["market_context"]["reason"],
+                                 "benchmark_context_missing")
+                self.assertEqual(replay["execution_disposition"], "no_signal")
+                self.assertEqual(replay["no_signal_reason"],
+                                 "benchmark_context_missing")
+
+    def test_delayed_decision_uses_only_context_known_at_that_decision(self):
+        subject = list(self.qqq)
+        decision = subject[3].end + timedelta(seconds=30)
+        subject[3] = replace(subject[3], identity=replace(
+            subject[3].identity, observed_at=decision))
+        benchmark = list(self.spy)
+        benchmark[3] = replace(benchmark[3], identity=replace(
+            benchmark[3].identity,
+            observed_at=benchmark[3].end + timedelta(seconds=15)))
+        context = {"SPY": tuple(benchmark)}
+        prefixes = _fit_prefixes(
+            subject, SPEC, policy=BAR_FALLBACK, bars_by_symbol=context)
+        replay = _simulate_trade(
+            subject, SPEC, [], "equity", policy=BAR_FALLBACK,
+            bars_by_symbol=context)
+        quality = measure_signal_quality(
+            subject, SPEC, policy=BAR_FALLBACK, horizons=(1,),
+            bars_by_symbol=context)
+        self.assertEqual(quality["event_count"], 1)
+        first = prefixes["first_signals"][0]
+        self.assertEqual(first["decision_timestamp"], decision.isoformat())
+        self.assertEqual(replay["decision_timestamp"], decision.isoformat())
+        self.assertEqual(first["market_context_digest"],
+                         replay["market_context_digest"])
+
+    def test_backfill_benchmark_requires_explicit_diagnostic_opt_in(self):
+        historical = tuple(replace(bar, identity=replace(
+            bar.identity, source_mode="historical_backfill",
+            observed_at=bar.end + timedelta(days=1))) for bar in self.spy)
+        context = {"SPY": historical}
+        for allowed in (False, True):
+            policy = replace(BAR_FALLBACK,
+                             allow_historical_backfill_diagnostics=allowed)
+            quality = measure_signal_quality(
+                self.qqq, SPEC, policy=policy, horizons=(1,),
+                bars_by_symbol=context)
+            fit = measure_fit_diagnostics(
+                self.qqq, SPEC, policy=policy, bars_by_symbol=context)
+            replay = _simulate_trade(
+                self.qqq, SPEC, [], "equity", policy=policy,
+                bars_by_symbol=context)
+            self.assertEqual(quality["event_count"], int(allowed))
+            self.assertEqual(fit["first_signal"]["signals"], int(allowed))
+            self.assertEqual(replay["execution_disposition"],
+                             "candidate" if allowed else "no_signal")
+
+    def test_context_prefix_never_exposes_incomplete_or_future_market_bars(self):
+        cutoff = self.spy[3].timestamp
+        self.assertEqual(replay_bar_prefix(
+            self.spy, signal_timestamp=cutoff, decision_timestamp=cutoff),
+            tuple(self.spy[:3]))
+        self.assertEqual(replay_bar_prefix(
+            self.spy, signal_timestamp=cutoff,
+            decision_timestamp=self.spy[-1].end), tuple(self.spy[:4]))
 
     def test_fit_diagnostics_and_factory_screen_use_synchronized_context(self):
         corpus = [*self.qqq, *self.spy]

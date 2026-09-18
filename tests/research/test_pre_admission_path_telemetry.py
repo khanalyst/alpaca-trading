@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -191,10 +192,17 @@ class PreAdmissionPathTelemetryTests(unittest.TestCase):
 
     def test_nonpositive_ohlc_is_malformed_at_entry_or_later(self):
         normalized = _bars(RISING + FLAT)
+        # Validated UnderlyingBar construction now rejects these prices.
+        # Exercise telemetry's defense in depth with an unvalidated object
+        # payload, as well as the mapping payloads below.
+        malformed_objects = [SimpleNamespace(**{
+            **vars(row), "open": 0, "high": 0, "low": -1, "close": 0,
+            "session_date": row.session_date,
+        }) for row in normalized[:2]]
         entry_cases = [
             _bar(0, 0, 0, -1, 0),
             _bar(0, -2, -1, -3, -2),
-            replace(normalized[0], open=0, high=0, low=-1, close=0),
+            malformed_objects[0],
         ]
         for row in entry_cases:
             with self.subTest(entry=row):
@@ -206,7 +214,7 @@ class PreAdmissionPathTelemetryTests(unittest.TestCase):
         later_cases = [
             _bar(1, 0, 0, -1, 0),
             _bar(1, -2, -1, -3, -2),
-            replace(normalized[1], open=0, high=0, low=-1, close=0),
+            malformed_objects[1],
         ]
         for row in later_cases:
             with self.subTest(later=row):

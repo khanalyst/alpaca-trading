@@ -1,8 +1,9 @@
 """The deployed IBR opt-in cannot enable an authorizing or broker lane."""
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -47,9 +48,12 @@ class IBRShadowOperationsTests(unittest.TestCase):
                 patch.object(shadow, "ShadowRunner") as runner, \
                 patch.object(shadow, "_record_acceptance", return_value={"accepted": False}), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            shadow_db = Path(directory) / "shadow.sqlite3"
+            with closing(sqlite3.connect(shadow_db)) as connection:
+                connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
             runner.return_value.run_once.return_value = {"candidate_errors": {}}
             result = shadow.main([
-                "--once", "--shadow-db", str(Path(directory) / "shadow.sqlite3")])
+                "--once", "--shadow-db", str(shadow_db)])
         config = runner.call_args.args[0]
         self.assertEqual(result, 0)
         self.assertTrue(config.diagnostic)

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -305,12 +307,13 @@ class ParallelRuntimeStatusTests(unittest.TestCase):
         fallback = research_cycle.index('if [ -z "$dataset" ]', explicit)
         self.assertLess(explicit, fallback)
         self.assertIn('[ -z "$preflight_dataset" ]', research_cycle)
-        # Historical workbench evidence remains on its original durable path;
-        # only the live recorder-health view follows the current corpus epoch.
+        # The workbench follows the same current-corpus resolver as the other
+        # live views; its retained research evidence still carries historical
+        # provenance rather than being relabelled as current.
         workbench = (ROOT / "deploy/dashboard_workbench.py").read_text(
             encoding="utf-8")
-        self.assertIn('recorded = root / "runtime/research/recorded"',
-                      workbench)
+        self.assertIn("from deploy import recorder_corpus_path", workbench)
+        self.assertIn("recorded = recorder_corpus_path(root)", workbench)
 
     def test_dashboard_live_recorder_view_uses_only_configured_corpus(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -361,11 +364,14 @@ class ParallelRuntimeStatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _write_config(root)
+            shadow_db = root / "shadow.sqlite3"
+            with closing(sqlite3.connect(shadow_db)) as connection:
+                connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
             args = [
                 "--config", str(root / "config.yaml"),
                 "--corpus", str(root / "market.csv"),
                 "--edge-db", str(root / "edge.sqlite3"),
-                "--shadow-db", str(root / "shadow.sqlite3"),
+                "--shadow-db", str(shadow_db),
                 "--health-file", str(root / "health.json"),
                 "--once",
             ]

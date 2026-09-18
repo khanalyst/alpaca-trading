@@ -1875,6 +1875,9 @@ def _verify_bar_continuity(rows: list[dict], latest_bars: dict[str, datetime],
         gaps: list[tuple[datetime, datetime]] = []
         latest = previous
         if previous is None:
+            for before, current in zip(fresh, fresh[1:]):
+                if _regular_session_gap(before, current, calendar, maximum):
+                    gaps.append((before, current))
             latest = fresh[-1] if fresh else None
         elif not fresh:
             if _regular_session_gap(previous, now, calendar, maximum):

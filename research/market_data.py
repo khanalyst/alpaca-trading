@@ -85,15 +85,24 @@ def parse_timestamp(value: Any, *, name: str = "timestamp") -> datetime:
 
 
 def _number(value: Any, name: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool):
+        raise NormalizationError(f"{name} must be numeric, not boolean")
     try:
         result = float(_required(value, name))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise NormalizationError(f"{name} must be numeric") from exc
     if result != result or result in (float("inf"), float("-inf")):
         raise NormalizationError(f"{name} must be finite")
     if positive and result <= 0:
         raise NormalizationError(f"{name} must be positive")
     return result
+
+
+def _bar_interval(value: Any) -> int:
+    seconds = _number(value, "interval_seconds", positive=True)
+    if not seconds.is_integer():
+        raise NormalizationError("interval_seconds must be a positive integer")
+    return int(seconds)
 
 
 def _field(payload: Mapping[str, Any], *names: str, default: Any = None) -> Any:
@@ -340,16 +349,20 @@ class UnderlyingBar:
             raise NormalizationError(str(exc)) from exc
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
             raise NormalizationError("bar timestamp must include a timezone")
-        values = (self.open, self.high, self.low, self.close, self.volume)
-        if not all(math.isfinite(float(value)) for value in values):
-            raise NormalizationError("bar values must be finite")
+        for name in ("open", "high", "low", "close", "volume"):
+            number = _number(getattr(self, name), name,
+                             positive=name != "volume")
+            object.__setattr__(self, name, number)
         if (self.high < max(self.open, self.close) or
                 self.low > min(self.open, self.close) or self.high < self.low):
             raise NormalizationError("OHLC bounds are inconsistent")
         if self.volume < 0:
             raise NormalizationError("volume cannot be negative")
-        if self.interval_seconds <= 0:
-            raise NormalizationError("interval_seconds must be positive")
+        object.__setattr__(self, "interval_seconds", _bar_interval(self.interval_seconds))
+        try:
+            self.end
+        except (OverflowError, ValueError) as exc:
+            raise NormalizationError("bar interval exceeds the timestamp range") from exc
         if (self.session_open is None) != (self.session_close is None):
             raise NormalizationError(
                 "session_open and session_close must be supplied together")
@@ -415,6 +428,35 @@ class UnderlyingBar:
     @property
     def feed_id(self) -> str:
         return self.identity.feed_id
+
+
+def replay_bar_prefix(
+        records: Iterable[UnderlyingBar], *, signal_timestamp: datetime,
+        decision_timestamp: datetime,
+        allow_historical_backfill_diagnostics: bool = False,
+) -> tuple[UnderlyingBar, ...]:
+    """Select completed, observable context without sorting or repairing it.
+
+    Market time bounds the statistic to the subject's signal bar; decision
+    time bounds what was actually known, including delayed observations.
+    The explicit historical diagnostic policy is shared with subject bars.
+    """
+    if any(not isinstance(value, datetime) or value.tzinfo is None or
+           value.utcoffset() is None
+           for value in (signal_timestamp, decision_timestamp)):
+        return ()
+    day = signal_timestamp.astimezone(NEW_YORK).date()
+    return tuple(
+        row for row in records
+        if isinstance(row, UnderlyingBar) and row.session_date == day and
+        row.timestamp <= signal_timestamp and row.end <= decision_timestamp and
+        (allow_historical_backfill_diagnostics or
+         not historical_backfill_record(row)) and
+        replay_record_is_available(
+            row, decision_timestamp,
+            allow_historical_backfill_diagnostics=(
+                allow_historical_backfill_diagnostics))
+    )
 
 
 @dataclass(frozen=True)
@@ -612,12 +654,23 @@ def option_has_liquidity(snapshot: Any) -> bool:
 
 
 def normalize_underlying_bar(payload: Mapping[str, Any], *, provider: str | None = None,
-                              feed: str | None = None, interval_seconds: int = 60) -> UnderlyingBar:
+                              feed: str | None = None,
+                              interval_seconds: int | None = None) -> UnderlyingBar:
     """Normalize an Alpaca-like OHLCV mapping into a :class:`UnderlyingBar`."""
-    if interval_seconds <= 0:
-        raise NormalizationError("interval_seconds must be positive")
+    supplied_interval = _field(payload, "interval_seconds")
+    row_interval = (_bar_interval(supplied_interval)
+                    if supplied_interval is not None else None)
+    requested_interval = (_bar_interval(interval_seconds)
+                          if interval_seconds is not None else None)
+    if (row_interval is not None and requested_interval is not None and
+            row_interval != requested_interval):
+        raise NormalizationError("interval_seconds override conflicts with row metadata")
+    resolved_interval = row_interval or requested_interval or 60
+    if (str(payload.get("event_type") or "").strip().lower() == "bar_1m" and
+            resolved_interval != 60):
+        raise NormalizationError("bar_1m interval_seconds must be 60")
     ts = parse_timestamp(_field(payload, "timestamp", "ts", "t", "time"))
-    values = {name: _number(_field(payload, name, name[0]), name)
+    values = {name: _number(_field(payload, name, name[0]), name, positive=True)
               for name in ("open", "high", "low", "close")}
     if values["high"] < max(values["open"], values["close"]) or values["low"] > min(values["open"], values["close"]):
         raise NormalizationError("OHLC bounds are inconsistent")
@@ -631,7 +684,7 @@ def normalize_underlying_bar(payload: Mapping[str, Any], *, provider: str | None
         **values,
         volume=volume,
         identity=_identity(payload, provider=provider, feed=feed, timestamp=ts),
-        interval_seconds=interval_seconds,
+        interval_seconds=resolved_interval,
         session_open=(None if _field(payload, "session_open", "session_open_at") is None
                       else parse_timestamp(_field(payload, "session_open", "session_open_at"),
                                            name="session_open")),
@@ -732,7 +785,7 @@ __all__ = [
     "normalize_option_snapshot", "normalize_quote",
     "normalize_underlying_bar", "option_has_liquidity",
     "historical_backfill_record", "parse_timestamp", "record_available_at",
-    "record_is_available", "replay_available_at",
+    "record_is_available", "replay_available_at", "replay_bar_prefix",
     "replay_open_is_available", "replay_record_is_available",
     "NEW_YORK", "UTC",
 ]

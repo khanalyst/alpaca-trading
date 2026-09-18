@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 
 from .contracts import finite as _finite
-from .contracts.ibr import build_ibr_range
+from .contracts.ibr import build_ibr_range, ibr_range_summary
 from .contracts.rule import (BAR_SECONDS, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5,
                              RuleSpecError, hold_deadline, thesis_exit_deadline,
                              MIN_STOP_DISTANCE_FRACTION, rule_variant_id,
@@ -38,28 +38,27 @@ def variant_identity(cfg: Mapping) -> str:
 
 
 def _range_for_snapshot(snapshot: Mapping, cfg: Mapping) -> dict | None:
-    raw = snapshot.get("ibr_range") or snapshot.get("ibr") or snapshot.get("range")
-    if isinstance(raw, Mapping):
-        try:
-            high = float(raw.get("high", raw.get("ibr_high")))
-            low = float(raw.get("low", raw.get("ibr_low")))
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(high) or not math.isfinite(low) or high <= low:
-            return None
-        out = dict(raw); out.update({"high": high, "low": low, "width": high - low})
-        return out
+    for key in ("ibr_range", "ibr", "range"):
+        if key in snapshot:
+            raw = snapshot.get(key)
+            return ibr_range_summary(raw) if isinstance(raw, Mapping) else None
     bars = snapshot.get("bars") or snapshot.get("candles")
     if isinstance(bars, (list, tuple)):
-        return build_ibr_range(bars, config=cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {})
-    high = _finite(snapshot.get("ibr_high", snapshot.get("range_high")))
-    low = _finite(snapshot.get("ibr_low", snapshot.get("range_low")))
-    if high is None or low is None or high <= low:
-        return None
-    return {"high": high, "low": low, "width": high - low,
-            "session": snapshot.get("session") or snapshot.get("ibr_session"),
-            "complete": bool(snapshot.get("ibr_complete", True)),
-            "range_end_ts": snapshot.get("range_end_ts")}
+        built = build_ibr_range(
+            bars, config=cfg.get("strategy", cfg)
+            if isinstance(cfg, Mapping) else {})
+        return ibr_range_summary(built) if built is not None else None
+    flat = {
+        "high": snapshot.get("ibr_high", snapshot.get("range_high")),
+        "low": snapshot.get("ibr_low", snapshot.get("range_low")),
+        "session": snapshot.get("session") or snapshot.get("ibr_session"),
+        "complete": bool(snapshot.get("ibr_complete", True)),
+        "range_end_ts": snapshot.get("range_end_ts"),
+    }
+    for key in ("width", "volume_mean", "width_pct", "atr"):
+        if key in snapshot:
+            flat[key] = snapshot[key]
+    return ibr_range_summary(flat)
 
 
 def _default_force_flat(signal_ts: float, strategy: Mapping) -> str | None:

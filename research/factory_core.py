@@ -46,6 +46,7 @@ from .gates import max_drawdown_of
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           historical_backfill_record, option_has_liquidity,
                           replay_available_at, replay_open_is_available,
+                          replay_bar_prefix,
                           replay_record_is_available)
 from .maturity import causal_maturity_bars
 from .path_telemetry import compute_path_telemetry
@@ -452,16 +453,21 @@ def _immutable_bars_by_symbol(
 
 def _visible_rule_context(
         bars_by_symbol: Mapping[str, Sequence[UnderlyingBar]], *,
-        day: date, cutoff: datetime, policy: ReplayPolicy,
+        cutoff: datetime, decision_timestamp: datetime, policy: ReplayPolicy,
 ) -> Mapping[str, tuple[UnderlyingBar, ...]]:
-    """Return the immutable benchmark prefix observable at ``cutoff``."""
+    """Return context through the signal bar, visible at actual decision time."""
     benchmark = bars_by_symbol.get(CROSS_SECTIONAL_BENCHMARK, ())
-    visible = tuple(
-        row for row in benchmark
-        if row.session_date == day and row.timestamp <= cutoff and
-        _visible(row, cutoff + timedelta(minutes=1), policy)
-    )
+    visible = replay_bar_prefix(
+        benchmark, signal_timestamp=cutoff, decision_timestamp=decision_timestamp,
+        allow_historical_backfill_diagnostics=(
+            policy.allow_historical_backfill_diagnostics))
     return MappingProxyType({CROSS_SECTIONAL_BENCHMARK: visible})
+
+
+def _signal_ready_timestamp(bars: Sequence[UnderlyingBar],
+                            policy: ReplayPolicy) -> datetime:
+    available = (_available(bar, policy) for bar in bars)
+    return max([bars[-1].end, *(stamp for stamp in available if stamp is not None)])
 
 
 def _at_or_before_force_flat(timestamp: datetime, policy: ReplayPolicy) -> bool:
@@ -550,10 +556,13 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             gapped_prefixes += 1
             continue
         evaluated_prefixes += 1
+        signal_ready = None
         if spec["family"] == "cross_sectional_residual":
+            signal_ready = _signal_ready_timestamp(
+                session_bars[feature_start:index + 1], resolved_policy)
             context = _visible_rule_context(
-                market_context, day=signal_bar.session_date,
-                cutoff=signal_bar.timestamp, policy=resolved_policy)
+                market_context, cutoff=signal_bar.timestamp,
+                decision_timestamp=signal_ready, policy=resolved_policy)
             context_evidence.extend(
                 bar for rows in context.values() for bar in rows)
             trace = evaluate_rule_signal_trace(
@@ -575,10 +584,11 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         if spec["family"] == "cross_sectional_residual":
             cross_context_valid_prefixes += 1
         entry_bar = session_bars[index + 1]
-        available = [_available(item, resolved_policy)
-                     for item in session_bars[feature_start:index + 1]
-                     if _available(item, resolved_policy) is not None]
-        signal_ready = max([signal_bar.end, *available], default=None)
+        if signal_ready is None:
+            # Non-contextual families do not need this timestamp until a
+            # predicate fires. Keep no-signal prefixes off this extra path.
+            signal_ready = _signal_ready_timestamp(
+                session_bars[feature_start:index + 1], resolved_policy)
         if signal_ready is None:
             last_refusal = _unpriced(
                 signal_bar, entry_bar, signal_bar.session_date,

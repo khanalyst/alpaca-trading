@@ -1,4 +1,4 @@
-# Pending work — September 17, 2026
+# Pending work — September 18, 2026
 
 This is the single active pending list. The [strategy review](strategy-variant-review.md)
 covers all 43 registered arms and their research questions. The
@@ -51,6 +51,64 @@ its warmup date is 2026-09-16.
 - The 5-second idle disk sample (**0.38% busy**) and 0.062-second recorder
   cycle are market-closed observations, not latency proof. Keep this health
   snapshot separate from the later database diagnostic below.
+- No fresh runtime or broker-state check was performed for the September 18
+  local changes; the runtime and broker observations above remain dated
+  snapshots, not current state.
+
+## September 18 local correctness fixes (source-only)
+
+These are local working-tree corrections, not committed, pushed, or deployed
+this turn. They are separate from the historical `c7f996a` repairs described
+below. They leave all frozen registered strategy IDs/specs, risk limits, and
+cost assumptions unchanged, but change the code identity; prior evidence and
+activation state therefore cannot be carried over as a shortcut.
+
+- Research-bar normalization now rejects booleans and nonpositive prices,
+  invalid volume, conflicting row/override durations, and `bar_1m` intervals
+  other than 60 seconds. Explicit duration metadata is preserved. Direct rule
+  evaluation validates OHLCV and an explicit 60-second interval. Volume
+  confirmation/breakout requires positive current volume and positive prior
+  mean; VWAP requires explicit valid volume and a positive total while allowing
+  a zero current bar.
+- Now-aware runtime generation requires completed one-minute bars, aware and
+  available timestamps, and symbol consistency; cross-sectional evaluation
+  requires only the intended SPY context. Benchmark fit, signal quality, and
+  replay now share completed point-in-time context at the actual subject
+  decision time, so future-observed data cannot generate diagnostics.
+  Historical backfill remains an explicit diagnostic opt-in.
+- Live SDK bar validation is stricter. The recorder rejects an explicit row
+  symbol/key mismatch and detects internal session gaps even in its first
+  observation window. IBR replay/live evaluation shares the close-relative
+  buffer predicate for the `close_confirmed` boundary; the separately hashed
+  legacy wick mode is retained and was not retuned. Direct IBR validation now
+  rejects malformed bars and range summaries in both signal and setup paths;
+  decision-time checks exclude future observations and bound ATR history.
+  Explicit minute intervals are validated. A supplied `max_ibr_width_pct`
+  mapping value must be finite and nonnegative, preserving zero versus omission.
+  Replay rejects a timezone configuration other than `America/New_York`;
+  aware UTC market timestamps remain valid.
+
+Final local verification passed all **2,173 discovered tests** across disjoint
+shards: edge 61, factory 6, research 1,147, and runtime 959, with zero failures,
+errors, or skips. Compilation and diff checks passed. Independent synthetic
+parity checks across all 24 registered rule arms found no output or ID changes
+on the tested valid prefixes; these checks are not market-performance evidence.
+The verified runtime and replay code identities both equal
+`cbcf60629069166d708d7dbde17930081c7dd6d9b770fdb562253d648dd4bbf1`.
+No new market-profitability run, orders, deployment, resume, cancellation, or
+deletion occurred this turn.
+
+## Pending validated rollout and diagnostic recompute
+
+Complete the pending CI and a verified paused rollout of the local corrections
+and the previously committed WAL/replay fixes under the new code/evidence identity
+before using their outputs. Then recompute benchmark-fit, signal-quality, and
+replay diagnostics on the unchanged frozen arms/specs and untouched forward
+data, using the shared completed point-in-time context at each actual subject
+decision time. Do not reuse prior evidence or activate from a recompute;
+historical backfill remains diagnostic-only by explicit opt-in. The paused
+trial's cancellation remains authorized-flat/audited only, and fresh forward
+data plus market-open latency evidence remain required.
 
 ## Replay and census blockers
 
@@ -93,7 +151,7 @@ never resume. No cancellation or terminal state has completed on the deployed
 server. The workbench now selects the configured fresh corpus and labels
 retained historical evidence. These software changes are not yet deployed.
 
-Source verification passed: the 84-test combined replay/ingestion suite, the
+Historical source verification for the prior repair passed: the 84-test combined replay/ingestion suite, the
 52-test operator/runtime/cohort/status suite, and the 190-test deployment/UI/
 WAL suite. After removing the dashboard immutable fallback, four focused
 dashboard reader tests passed, including visibility of new WAL commits and

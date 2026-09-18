@@ -25,6 +25,7 @@ from agent.contracts.rule import (
     session_minutes, validate_rule_spec,
 )
 from .market_data import (historical_backfill_record, replay_available_at,
+                           replay_bar_prefix,
                            replay_record_is_available)
 from .maturity import causal_maturity_bars
 
@@ -459,8 +460,13 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
             continue
         eligible_prefix = True
         if spec["family"] == "cross_sectional_residual":
+            context = {CROSS_SECTIONAL_BENCHMARK: replay_bar_prefix(
+                (bars_by_symbol or {}).get(CROSS_SECTIONAL_BENCHMARK, ()),
+                signal_timestamp=_timestamp(rows[index]),
+                decision_timestamp=decision,
+                allow_historical_backfill_diagnostics=allow_backfill)}
             trace = evaluate_rule_signal_trace(
-                rows[:index + 1], spec, bars_by_symbol=bars_by_symbol,
+                rows[:index + 1], spec, bars_by_symbol=context,
                 symbol=symbol)
             signal = trace.get("signal")
             if signal is None:

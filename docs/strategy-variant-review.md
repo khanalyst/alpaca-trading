@@ -1,4 +1,4 @@
-# Strategy and variant review — 14 September 2026
+# Strategy and variant review — 18 September 2026
 
 ## Scope and key gaps
 
@@ -31,6 +31,60 @@ profitability run was performed for this review.
 
 No positive edge is proven, and no arm is live-eligible from these results.
 
+## September 18 local correctness fixes (source-only)
+
+The September 18 changes are local working-tree corrections: they were not
+committed, pushed, or deployed this turn. They are separate from the
+historical `c7f996a` repairs noted below. All 43 frozen registered strategy
+IDs/specs, risk limits, and cost assumptions remain unchanged, but the code
+identity changes, so prior evidence cannot be carried over and no activation
+shortcut is valid.
+
+Research-bar normalization now rejects boolean/nonpositive prices, invalid
+volume, row/override duration conflicts, and `bar_1m` intervals other than 60
+seconds while preserving explicit duration metadata. Direct rule evaluation
+validates OHLCV and explicit 60-second intervals; volume confirmation/breakout
+requires positive current and prior-mean volume, while VWAP requires explicit
+valid volume and a positive total but permits zero current volume. Now-aware
+runtime generation requires completed bars, aware available timestamps, and
+symbol consistency, with only the required SPY context for cross-sectional
+evaluation.
+
+Benchmark fit, signal quality, and replay now use the same completed,
+point-in-time context at the actual subject decision time; future-observed data
+cannot generate diagnostics. Historical backfill remains an explicit diagnostic
+opt-in. Live SDK bar validation is tightened; the recorder rejects explicit
+symbol/key mismatches and detects internal gaps in its first window. IBR
+replay/live `close_confirmed` now shares the close-relative buffer predicate;
+the separately hashed legacy wick mode is retained and not retuned. Direct IBR
+checks reject malformed bars and range summaries in both signal and setup
+paths, validate explicit minute intervals, and bound observations and ATR
+history at decision time. A supplied `max_ibr_width_pct` mapping value must
+be finite and nonnegative, preserving explicit-zero versus omission behavior.
+Replay requires the `America/New_York` timezone configuration; aware UTC
+market timestamps remain valid.
+
+Final local verification passed all **2,173 discovered tests** across disjoint
+shards: edge 61, factory 6, research 1,147, and runtime 959, with zero failures,
+errors, or skips. Compilation and diff checks passed. Independent synthetic
+parity checks across all 24 registered rule arms found no output or ID changes
+on the tested valid prefixes; they do not establish market profitability.
+No new market-profitability run, orders, deployment, resume, cancellation, or
+deletion occurred for this review. Previously reported runtime and broker state
+remains a dated snapshot, not a fresh check.
+
+## Pending validated rollout and diagnostic recompute
+
+Complete CI and a verified paused rollout of these local corrections together
+with the previously committed WAL/replay fixes under the new code/evidence identity.
+Then recompute benchmark-fit, signal-quality, and replay diagnostics for the
+same 43 frozen arms on untouched forward data, using the shared completed
+point-in-time context at each actual subject decision time. Do not reuse prior
+evidence or activate from diagnostic recompute; historical backfill remains
+diagnostic-only by explicit opt-in. This is not a profitability run or a
+promotion decision. Fresh forward quotes/costs and market-open latency evidence
+remain open requirements.
+
 The main evidence gap is executable forward quotes and cost measurement. The
 25 bps stress and 0.30 cost/risk ceiling imply an 83.33 bps minimum stop before
 ticks; a 30 bps floor alone cannot pass that geometry, although a 1 ATR stop
@@ -42,7 +96,8 @@ or calibration change is authorized here. The next useful evidence is
 untouched accepted forward quotes and costs, not five to ten more strategies on
 the examined data.
 
-Software-contract work in this review is separate from signal evidence. The
+Historical `c7f996a` software-contract repairs are separate from the September
+18 local fixes and from signal evidence. The
 24/31 readiness contract, current-epoch census binding, recorder-error
 payload/schema preservation, future-observed bar/quote exclusion, and
 explicit-zero setup handling are already implemented in `c7f996a`. Historical
@@ -196,14 +251,16 @@ live-eligible based on this review or on the historical one-share comparison.
 ## Verification and limitations
 
 Coverage is 43/43 unique registered equity arms: 24 rule diagnostic-shadow
-arms, 12 `intraday-mechanisms.v1` arms, and 7 IBR registry arms. Verification
-performed here was review-only: read-only inventory resolution from the source
+arms, 12 `intraday-mechanisms.v1` arms, and 7 IBR registry arms. The September 14
+inventory review was read-only: inventory resolution from the source
 builder, read-only mechanism manifest inspection, exact-ID/spec cross-check,
 and consistency review against the retained 12 September edge results and the
 stated cost geometry. No profitability backtest, parameter search, live order,
-or deployment was performed here. The archived software verification records
+or deployment was performed in that review. The archived software verification records
 2,099 full-suite tests passed; that historical software result and the
 activation receipt’s `verification_passed` status do not establish executable
 edge or accepted trial sessions. Historical bars without contemporaneous
-quotes cannot establish executable edge. This review does not replace the
-implementation-validation status in the current findings.
+quotes cannot establish executable edge. The September 18 local changes passed
+all 2,173 full-suite tests and the focused synthetic parity checks described
+above. This review does not replace the implementation-validation status in
+the current findings.

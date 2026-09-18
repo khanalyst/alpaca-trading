@@ -295,6 +295,13 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     strategy["min_ibr_width_atr"] = _num(strategy, "min_ibr_width_atr", "strategy", 0, 100, .25)
     strategy["max_ibr_width_atr"] = _num(strategy, "max_ibr_width_atr", "strategy", 0, 100, 3)
     strategy["atr_period"] = _int(strategy, "atr_period", "strategy", 1, 500, 14)
+    # This is an optional IBR-only guard.  Keep omission absent from the
+    # canonical config (the contract interprets it as infinity), while an
+    # explicitly supplied value—including numeric zero—is validated and
+    # normalized here rather than passing through unchecked.
+    if "max_ibr_width_pct" in strategy:
+        strategy["max_ibr_width_pct"] = _num(
+            strategy, "max_ibr_width_pct", "strategy", 0, float("inf"))
     strategy["max_spread_bps"] = _num(strategy, "max_spread_bps", "strategy", 0, 10_000, 25)
     strategy["stale_minutes"] = _num(
         strategy, "stale_minutes", "strategy", 1.0 / 60.0, 1440, .5)

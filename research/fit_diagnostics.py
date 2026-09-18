@@ -29,6 +29,7 @@ from .costs import (STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     stressed_cost_usd)
 from .market_data import (historical_backfill_record, record_available_at,
                            record_is_available, replay_available_at,
+                           replay_bar_prefix,
                            replay_record_is_available)
 from .maturity import causal_maturity_bars
 from .stats import clustered_mde_power_report
@@ -824,8 +825,13 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             prefix_status["eligible"] += 1
             session_had_eligible_prefix = True
             if spec["family"] == "cross_sectional_residual":
+                context = {CROSS_SECTIONAL_BENCHMARK: replay_bar_prefix(
+                    market_context.get(CROSS_SECTIONAL_BENCHMARK, ()),
+                    signal_timestamp=_timestamp(rows[index]),
+                    decision_timestamp=decision_timestamp,
+                    allow_historical_backfill_diagnostics=allow_backfill)}
                 trace = evaluate_rule_signal_trace(
-                    rows[:index + 1], spec, bars_by_symbol=market_context,
+                    rows[:index + 1], spec, bars_by_symbol=context,
                     symbol=symbol)
             else:
                 trace = evaluate_rule_signal_trace(rows[:index + 1], spec)
@@ -848,7 +854,7 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 cell_signals += 1
             if trace.get("signal") is not None and first is None:
                 metadata = (evaluate_rule_signal_metadata(
-                    rows[:index + 1], spec, bars_by_symbol=market_context,
+                    rows[:index + 1], spec, bars_by_symbol=context,
                     symbol=symbol)
                     if spec["family"] == "cross_sectional_residual" else
                     evaluate_rule_signal_metadata(rows[:index + 1], spec))

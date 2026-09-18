@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import unittest
 
-from agent.config import validate_config
+from agent.config import ConfigError, validate_config
 from agent.contracts.ibr import build_ibr_range, evaluate_ibr_breakout
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from agent.strategy import build_setup_plan
@@ -41,6 +41,38 @@ def _snapshot(cfg, *, close=100.1, relative_volume=2.0, spread_bps=1.0):
 
 
 class StrategyZeroParameterTests(unittest.TestCase):
+    def test_setup_rejects_malformed_nested_and_flat_ibr_ranges(self):
+        cfg = _ibr_config()
+        decision = {"symbol": "SPY", "direction": "long"}
+        nested = _snapshot(cfg, close=1.1)
+        nested["ibr_range"].update(high=1.0, low=0.5, volume_mean=10.0)
+        self.assertIsNotNone(build_setup_plan(decision, nested, cfg)[0])
+        nested["ibr_range"]["high"] = True
+        nested["ibr_high"] = 101.0
+        nested["ibr_low"] = 99.0
+        plan, reason = build_setup_plan(decision, nested, cfg)
+        self.assertIsNone(plan)
+        self.assertEqual(reason, "IBR range is incomplete")
+
+        flat = _snapshot(cfg, close=1.1)
+        flat.pop("ibr_range")
+        flat["ibr_high"] = 1.0
+        flat["ibr_low"] = 0.5
+        self.assertIsNotNone(build_setup_plan(decision, flat, cfg)[0])
+        flat["ibr_high"] = True
+        plan, reason = build_setup_plan(decision, flat, cfg)
+        self.assertIsNone(plan)
+        self.assertEqual(reason, "IBR range is incomplete")
+
+    def test_optional_max_ibr_width_pct_validates_without_changing_omission(self):
+        omitted = _ibr_config()
+        self.assertNotIn("max_ibr_width_pct", omitted["strategy"])
+        explicit_zero = _ibr_config(max_ibr_width_pct=0)
+        self.assertEqual(explicit_zero["strategy"]["max_ibr_width_pct"], 0.0)
+        for value in (True, -1, float("nan"), float("inf"), "2"):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                _ibr_config(max_ibr_width_pct=value)
+
     def test_registered_zero_buffer_signal_and_setup_agree_in_both_directions(self):
         variant = load_registry(ROOT / "research" / "variants.yaml")["ibr.buffer.0bps"]
         cfg = apply(variant, _ibr_config())

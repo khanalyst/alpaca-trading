@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -539,10 +541,13 @@ class SessionAcceptanceTests(unittest.TestCase):
              patch.object(shadow_service, "record_poll", side_effect=poll) as recorder, \
              patch("builtins.print"):
             root = Path(directory)
+            shadow_db = root / "shadow.sqlite3"
+            with closing(sqlite3.connect(shadow_db)) as connection:
+                connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
             result = shadow_service.main([
                 "--no-diagnostic", "--once",
                 "--corpus", str(root / "recorded" / "data.csv"),
-                "--shadow-db", str(root / "shadow.sqlite3"),
+                "--shadow-db", str(shadow_db),
             ])
 
         self.assertEqual(result, 0)

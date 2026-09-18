@@ -153,16 +153,37 @@ def normalize_bar(value: Any, symbol: str | None = None, feed: str | None = None
     close_price = _decimal_or_none(_value(value, "close"))
     if any(price is None for price in (open_price, high_price, low_price, close_price)):
         raise ValueError("bar OHLC values are required")
+    prices = {
+        "open": open_price, "high": high_price,
+        "low": low_price, "close": close_price,
+    }
+    if any(price <= 0 for price in prices.values()):
+        raise ValueError("bar OHLC values must be finite and positive")
+    if (low_price > high_price or open_price < low_price or
+            open_price > high_price or close_price < low_price or
+            close_price > high_price):
+        raise ValueError("bar OHLC values have inconsistent bounds")
+    raw_timestamp = _value(value, "timestamp")
+    timestamp = _dt(raw_timestamp)
+    if (timestamp is None or timestamp.tzinfo is None or
+            timestamp.utcoffset() is None):
+        raise ValueError("bar timestamp must be timezone-aware")
+    raw_volume = _value(value, "volume", 0)
+    volume = _decimal_or_none(raw_volume)
+    if volume is None:
+        raise ValueError("bar volume must be finite and nonnegative")
+    if volume < 0:
+        raise ValueError("bar volume must be finite and nonnegative")
     response_feed = _value(value, "feed")
     effective_feed = response_feed if response_feed not in (None, "") else feed
     return Bar(
         symbol=str(_value(value, "symbol", symbol) or symbol or "").upper(),
-        timestamp=_dt(_value(value, "timestamp")) or datetime.min,
+        timestamp=timestamp,
         open=open_price,
         high=high_price,
         low=low_price,
         close=close_price,
-        volume=_decimal_or_none(_value(value, "volume", 0)),
+        volume=volume,
         trade_count=_value(value, "trade_count"),
         vwap=_decimal_or_none(_value(value, "vwap")),
         feed=_canonical_feed(effective_feed, options=False),

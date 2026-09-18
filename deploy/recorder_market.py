@@ -159,6 +159,18 @@ def _assert_row_feed(actual: str, requested: str, *, kind: str) -> None:
             f"feed {requested!r}")
 
 
+def _assert_row_symbol(value, expected: str, *, kind: str) -> None:
+    """Reject an explicit row symbol that disagrees with its response key."""
+    explicit = (value.get("symbol") if isinstance(value, dict)
+                else getattr(value, "symbol", None))
+    if explicit in (None, ""):
+        return
+    if str(explicit).strip().upper() != expected.upper():
+        raise RuntimeError(
+            f"{kind} response symbol {explicit!r} does not match mapping "
+            f"key {expected!r}")
+
+
 def _iso(value) -> str:
     return value.isoformat() if isinstance(value, datetime) else _value(value)
 
@@ -437,6 +449,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     for raw_symbol, values in bars.items():
         symbol = validate_equity_symbol(raw_symbol)
         for bar in values:
+            _assert_row_symbol(bar, symbol, kind="bar")
             bar_feed = _row_feed(bar, feed)
             _assert_row_feed(bar_feed, feed, kind="bar")
             timestamp = _iso(getattr(bar, "timestamp", None))
@@ -465,6 +478,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     for raw_symbol, values in quotes.items():
         symbol = validate_equity_symbol(raw_symbol)
         for quote in values:
+            _assert_row_symbol(quote, symbol, kind="quote")
             quote_feed = _row_feed(quote, feed)
             _assert_row_feed(quote_feed, feed, kind="quote")
             timestamp = _iso(getattr(quote, "timestamp", None))

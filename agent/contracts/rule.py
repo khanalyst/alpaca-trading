@@ -1200,6 +1200,16 @@ def _value(row: Any, name: str, default=None):
     return row.get(name, default) if isinstance(row, Mapping) else getattr(row, name, default)
 
 
+_MISSING = object()
+
+
+def _supplied_value(row: Any, name: str) -> Any:
+    """Return a row field without conflating omission with an explicit null."""
+    if isinstance(row, Mapping):
+        return row[name] if name in row else _MISSING
+    return getattr(row, name, _MISSING)
+
+
 def _number(row: Any, name: str, default=0.0) -> float:
     try:
         value = float(_value(row, name, default))
@@ -1220,6 +1230,178 @@ def _timestamp(row: Any) -> datetime | None:
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return None
+
+
+def _strict_datetime(value: Any) -> datetime | None:
+    """Parse a supplied point-in-time value without assuming a timezone."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        return value.astimezone(timezone.utc)
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            number = float(value)
+            if not math.isfinite(number):
+                return None
+            return datetime.fromtimestamp(number, timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_rule_input_rows(rows: Sequence[Any]) -> tuple[bool, str]:
+    """Validate the OHLC(V) fields consumed by the signal evaluator.
+
+    ``volume`` remains optional for non-volume families because provider
+    neutral bars may legitimately omit it.  If a caller supplies it, however,
+    it must be finite and nonnegative; volume-dependent predicates apply the
+    stricter explicit-positive evidence check below.
+    """
+    for index, row in enumerate(rows):
+        raw_interval = _supplied_value(row, "interval_seconds")
+        if raw_interval is not _MISSING:
+            if isinstance(raw_interval, bool):
+                return False, f"input_interval_invalid:{index}"
+            try:
+                interval = float(raw_interval)
+            except (TypeError, ValueError, OverflowError):
+                return False, f"input_interval_invalid:{index}"
+            if not math.isfinite(interval) or interval != BAR_SECONDS:
+                return False, f"input_interval_invalid:{index}"
+        prices: dict[str, float] = {}
+        for field in ("open", "high", "low", "close"):
+            raw = _supplied_value(row, field)
+            if raw is _MISSING or isinstance(raw, bool):
+                return False, f"input_ohlcv_invalid:{field}:{index}"
+            try:
+                number = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                return False, f"input_ohlcv_invalid:{field}:{index}"
+            if not math.isfinite(number) or number <= 0:
+                return False, f"input_ohlcv_invalid:{field}:{index}"
+            prices[field] = number
+        if (prices["high"] < max(prices["open"], prices["close"]) or
+                prices["low"] > min(prices["open"], prices["close"]) or
+                prices["high"] < prices["low"]):
+            return False, f"input_ohlcv_inconsistent:{index}"
+        raw_volume = _supplied_value(row, "volume")
+        if raw_volume is not _MISSING:
+            if isinstance(raw_volume, bool):
+                return False, f"input_volume_invalid:{index}"
+            try:
+                volume = float(raw_volume)
+            except (TypeError, ValueError, OverflowError):
+                return False, f"input_volume_invalid:{index}"
+            if not math.isfinite(volume) or volume < 0:
+                return False, f"input_volume_invalid:{index}"
+    return True, "passed"
+
+
+def _volume_evidence_passes(rows: Sequence[Any]) -> bool:
+    """Require explicit finite current/prior volume with positive evidence."""
+    if len(rows) < 2:
+        return False
+    values: list[float] = []
+    for row in rows:
+        raw = _supplied_value(row, "volume")
+        if raw is _MISSING or isinstance(raw, bool):
+            return False
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(value):
+            return False
+        values.append(value)
+    current = values[-1]
+    prior_mean = mean(values[:-1])
+    return current > 0 and math.isfinite(prior_mean) and prior_mean > 0
+
+
+def _vwap_volume_inputs_pass(rows: Sequence[Any]) -> bool:
+    """Require explicit nonnegative VWAP volumes with a positive denominator."""
+    if not rows:
+        return False
+    total = 0.0
+    for row in rows:
+        raw = _supplied_value(row, "volume")
+        if raw is _MISSING or isinstance(raw, bool):
+            return False
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(value) or value < 0:
+            return False
+        total += value
+    return math.isfinite(total) and total > 0
+
+
+def _generation_inputs_available(symbol: Any, bars: Sequence[Any],
+                                 now: datetime) -> bool:
+    """Validate runtime-only completion, identity, and availability bounds."""
+    if (not isinstance(now, datetime) or now.tzinfo is None or
+            now.utcoffset() is None):
+        return False
+    try:
+        current = now.astimezone(timezone.utc)
+        current_ts = current.timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return False
+    requested = str(symbol or "").strip().upper()
+    if not requested or isinstance(bars, (str, bytes)):
+        return False
+    try:
+        rows = list(bars)
+    except TypeError:
+        return False
+    previous: datetime | None = None
+    for row in rows:
+        raw_stamp = _supplied_value(row, "timestamp")
+        if raw_stamp is _MISSING:
+            raw_stamp = _supplied_value(row, "ts")
+        stamp = _strict_datetime(raw_stamp)
+        if stamp is None:
+            return False
+        if previous is not None and stamp <= previous:
+            return False
+        previous = stamp
+        if stamp.timestamp() + BAR_SECONDS > current_ts:
+            return False
+        row_symbol = _row_symbol(row)
+        if row_symbol is not None and row_symbol != requested:
+            return False
+        raw_interval = _supplied_value(row, "interval_seconds")
+        if raw_interval is not _MISSING:
+            if isinstance(raw_interval, bool):
+                return False
+            try:
+                interval = float(raw_interval)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if not math.isfinite(interval) or interval != BAR_SECONDS:
+                return False
+        for field in ("as_of", "observed_at"):
+            supplied = _supplied_value(row, field)
+            if supplied is _MISSING:
+                continue
+            available_at = _strict_datetime(supplied)
+            if available_at is None or available_at.timestamp() > current_ts:
+                return False
+    return True
 
 
 def _row_symbol(row: Any) -> str | None:
@@ -1397,6 +1579,9 @@ def _cross_sectional_direction(
     if any(stamp not in by_timestamp for stamp in stamps):
         return None, "benchmark_context_misaligned", metadata
     benchmark = [by_timestamp[stamp] for stamp in stamps]
+    benchmark_valid, _benchmark_reason = _validate_rule_input_rows(benchmark)
+    if not benchmark_valid:
+        return None, "cross_sectional_price_unavailable", metadata
     subject_start = _number(subject[0], "close")
     subject_end = _number(subject[-1], "close")
     benchmark_start = _number(benchmark[0], "close")
@@ -1521,8 +1706,13 @@ def _confirmation(direction: str, rows: Sequence[Any], spec: Mapping[str, Any],
     if kind == "volume":
         if len(rows) <= spec["lookback"]:
             return False
-        prior = [_number(row, "volume") for row in rows[-spec["lookback"] - 1:-1]]
-        return bool(prior and _number(rows[-1], "volume") >= mean(prior) * spec["volume_multiplier"])
+        evidence = rows[-spec["lookback"] - 1:]
+        if not _volume_evidence_passes(evidence):
+            return False
+        prior = [float(_supplied_value(row, "volume"))
+                 for row in evidence[:-1]]
+        current = float(_supplied_value(evidence[-1], "volume"))
+        return bool(current >= mean(prior) * spec["volume_multiplier"])
     atr = _atr(rows, spec["atr_period"])
     close = closes[-1] if closes else 0.0
     # ``compression_bps`` is an upper bound everywhere: volatility
@@ -1554,12 +1744,33 @@ def _session_prefix(bars: Sequence[Any], current: Any) -> list[Any]:
     return prefix
 
 
+def _volume_input_rows(bars: Sequence[Any], current: Any,
+                       spec: Mapping[str, Any]) -> Sequence[Any] | None:
+    """Return the exact prefix whose volume is part of the active evidence."""
+    confirmations = {str(spec.get("confirmation") or "none")}
+    confirmations.update(str(item) for item in spec.get("confirmations") or ())
+    if (spec.get("family") == "volume_breakout" or "volume" in confirmations):
+        return bars[-int(spec["lookback"]) - 1:]
+    if (spec.get("family") in {"vwap_reversion", "vwap_trend"} or
+            spec.get("target_mode") == "session_vwap"):
+        return _session_prefix(bars, current)
+    return None
+
+
 def _vwap(bars: Sequence[Any]) -> float | None:
     """Volume-weighted average typical price over *bars*, or ``None``."""
     weighted = 0.0
     volume = 0.0
     for row in bars:
-        size = _number(row, "volume")
+        raw_size = _supplied_value(row, "volume")
+        if raw_size is _MISSING or isinstance(raw_size, bool):
+            return None
+        try:
+            size = float(raw_size)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(size) or size < 0:
+            return None
         if size <= 0:
             continue
         typical = (_number(row, "high") + _number(row, "low") +
@@ -1749,9 +1960,14 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
         previous = bars[-spec["lookback"] - 1:-1]
         high = max(_number(row, "high") for row in previous)
         low = min(_number(row, "low") for row in previous)
-        average_volume = mean(_number(row, "volume") for row in previous)
-        volume_ok = average_volume > 0 and _number(current, "volume") >= (
-            average_volume * spec["volume_multiplier"])
+        evidence = [*previous, current]
+        if not _volume_evidence_passes(evidence):
+            volume_ok = False
+        else:
+            average_volume = mean(
+                float(_supplied_value(row, "volume")) for row in previous)
+            current_volume = float(_supplied_value(current, "volume"))
+            volume_ok = current_volume >= average_volume * spec["volume_multiplier"]
         if volume_ok and close > high * (1 + threshold):
             direction = "long"
         elif volume_ok and close < low * (1 - threshold):
@@ -1838,12 +2054,42 @@ def _evaluate_rule_signal_staged(
     if not stage("minimum_prefix", len(bars) >= needed,
                  "passed" if len(bars) >= needed else "insufficient_prefix"):
         return None, stages, family_metadata
+    inputs_ok, input_reason = _validate_rule_input_rows(bars)
+    if not inputs_ok:
+        # Keep the long-standing relative-family diagnostic reason for a
+        # missing/invalid close while still rejecting it before any family
+        # predicate can consume a coerced zero.
+        if (spec["family"] == "cross_sectional_residual" and
+                input_reason.startswith("input_ohlcv_invalid:close:")):
+            input_reason = "cross_sectional_price_unavailable"
+        if not stage("input_ohlcv", False, input_reason):
+            return None, stages, family_metadata
+    stage("input_ohlcv", True, "passed")
     current = bars[-1]
     close = _number(current, "close")
-    opened = _number(current, "open", close)
+    opened = _number(current, "open")
     if not stage("positive_close", close > 0,
                  "passed" if close > 0 else "nonpositive_close"):
         return None, stages, family_metadata
+    volume_rows = _volume_input_rows(bars, current, spec)
+    confirmations = {str(spec.get("confirmation") or "none")}
+    confirmations.update(str(item) for item in spec.get("confirmations") or ())
+    strict_volume_evidence = (
+        spec.get("family") == "volume_breakout" or "volume" in confirmations)
+    if strict_volume_evidence:
+        volume_valid = (volume_rows is not None and
+                        _volume_evidence_passes(volume_rows))
+    else:
+        volume_valid = (volume_rows is not None and
+                        _vwap_volume_inputs_pass(volume_rows))
+    if volume_rows is not None and not volume_valid:
+        if not stage(
+                "volume_input", False,
+                ("explicit_positive_volume_required" if strict_volume_evidence
+                 else "explicit_nonnegative_volume_required")):
+            return None, stages, family_metadata
+    elif volume_rows is not None:
+        stage("volume_input", True, "passed")
     if spec["family"] == "cross_sectional_residual":
         direction, family_reason, family_metadata = _cross_sectional_direction(
             bars, spec, bars_by_symbol=bars_by_symbol, symbol=symbol)
@@ -2048,13 +2294,25 @@ def generate_rule_signal(
             str(strategy.get("execution_mode") or "").lower() not in
             {"share", "shares", "equity"}):
         return None
+    if now is not None and not _generation_inputs_available(symbol, bars, now):
+        return None
+    if (now is not None and normalized["family"] == "cross_sectional_residual" and
+            isinstance(bars_by_symbol, Mapping)):
+        benchmark_context = [(key, value) for key, value in bars_by_symbol.items()
+                             if str(key).strip().upper() == CROSS_SECTIONAL_BENCHMARK]
+        if len(benchmark_context) > 1:
+            return None
+        for _context_symbol, context_rows in benchmark_context:
+            if not _generation_inputs_available(
+                    CROSS_SECTIONAL_BENCHMARK, context_rows, now):
+                return None
     signal = evaluate_rule_signal(
         bars, normalized, bars_by_symbol=bars_by_symbol, symbol=symbol)
     if signal is None:
         return None
     stamp = datetime.fromtimestamp(float(signal["signal_ts"]), timezone.utc)
     if now is not None:
-        current = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        current = now.astimezone(timezone.utc)
         if stamp > current:
             return None
     signal["symbol"] = str(symbol).upper()

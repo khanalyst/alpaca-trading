@@ -19,6 +19,7 @@ from agent.contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
     quantize_equity_bracket,
 )
+from agent.contracts.ibr import close_breaks_range
 from agent.contracts.rule import canonical_exit_reason
 from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS,
                                   MIN_STOP_DISTANCE_FRACTION)
@@ -96,6 +97,10 @@ class IBRConfig:
         if not isinstance(resolved, ReplayPolicy):
             raise ReplayError("policy must be a ReplayPolicy or mapping")
         object.__setattr__(self, "policy", resolved)
+        if self.timezone != "America/New_York":
+            raise ReplayError(
+                "IBR replay timezone must be America/New_York; "
+                f"got {self.timezone!r}")
         try:
             ZoneInfo(self.timezone)
         except Exception as exc:
@@ -681,13 +686,14 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     # below, and the hold window — not across the whole post-range period.  A
     # minute missing at 15:40 does not invalidate a 10:05 breakout, and
     # rejecting the session for it deletes good observations.
-    # Express the buffer against the range boundary.  Using the signal close
-    # as the denominator makes the effective threshold subtly depend on the
-    # size of the move (and is asymmetric with the short side); a registered
-    # ``N`` bps buffer means exactly N bps beyond the completed range high/low.
-    breakout_buffer = cfg.breakout_buffer_bps / 10_000.0
-    buffer_long = lambda bar: bar.close > high * (1.0 + breakout_buffer)
-    buffer_short = lambda bar: bar.close < low * (1.0 - breakout_buffer)
+    # Express the buffer against the range boundary using the completed
+    # signal close as the denominator, matching the live contract exactly.
+    # The shared predicate keeps the long/short asymmetry intentional and
+    # prevents replay from drifting at the threshold.
+    buffer_long = lambda bar: close_breaks_range(
+        bar.close, high, cfg.breakout_buffer_bps, "long")
+    buffer_short = lambda bar: close_breaks_range(
+        bar.close, low, cfg.breakout_buffer_bps, "short")
     def breaks(bar: UnderlyingBar) -> bool:
         return ((buffer_long(bar) or buffer_short(bar)) if cfg.close_confirmed
                 else (bar.high > high or bar.low < low))

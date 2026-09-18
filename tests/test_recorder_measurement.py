@@ -252,6 +252,39 @@ class RecorderQuoteBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "quote.*future"):
             self._rows(refresh_quote_end=True)
 
+    def test_rows_reject_explicit_symbol_mismatch_for_bars_and_quotes(self):
+        started = self.started
+
+        class MismatchProvider:
+            data_feed = "iex"
+
+            def __init__(self, kind):
+                self.kind = kind
+
+            def bars(self, symbols, **kwargs):
+                if self.kind != "bar":
+                    return {}
+                return {"SPY": [SimpleNamespace(
+                    symbol="aapl", timestamp=started.replace(second=0),
+                    open=100, high=101, low=99, close=100, volume=10)]}
+
+            def quotes(self, symbols, **kwargs):
+                if self.kind != "quote":
+                    return {}
+                return {"SPY": [SimpleNamespace(
+                    symbol="AAPL", timestamp=started, bid=99,
+                    ask=101, last=100)]}
+
+        for kind in ("bar", "quote"):
+            with self.subTest(kind=kind):
+                provider = MismatchProvider(kind)
+                with patch.object(recorder_market, "datetime", self.clock):
+                    with self.assertRaisesRegex(
+                            RuntimeError, rf"{kind} response symbol"):
+                        list(recorder_market._rows(
+                            provider, ["SPY"], started,
+                            start=started - timedelta(minutes=1)))
+
 
 if __name__ == "__main__":
     unittest.main()

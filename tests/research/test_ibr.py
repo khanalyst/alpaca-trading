@@ -68,7 +68,52 @@ def bars_to_close():
     return rows
 
 
+def close_confirmed_boundary_bars(direction: str, close: float):
+    start = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
+    rows = []
+    for index in range(30):
+        if direction == "long":
+            opened, high, low, ended = 99.5, 100.0, 99.0, 99.5
+        else:
+            opened, high, low, ended = 100.5, 101.0, 100.0, 100.5
+        rows.append((start + timedelta(minutes=index), opened, high, low, ended))
+    signal_at = start + timedelta(minutes=30)
+    rows.extend((
+        (signal_at, close, close + 0.1, close - 0.1, close),
+        (signal_at + timedelta(minutes=1), close, close + 0.1,
+         close - 0.1, close),
+    ))
+    return [normalize_underlying_bar({
+        "symbol": "SPY", "timestamp": ts.isoformat(), "open": opened,
+        "high": high, "low": low, "close": ended, "volume": 1,
+        "provider": "alpaca", "feed": "sip",
+    }) for ts, opened, high, low, ended in rows]
+
+
 class IBRReplayTests(unittest.TestCase):
+    def test_close_confirmed_replay_matches_live_close_relative_buffer(self):
+        # At 5 bps above 100, 100.05001 clears the old range-relative replay
+        # threshold but not the live close-relative threshold.  The short
+        # mirror exercises the opposite side of the same boundary.
+        for direction, close, expected in (
+                ("long", 100.05001, False),
+                ("long", 100.05003, True),
+                ("short", 99.95001, True),
+                ("short", 99.94999, True)):
+            with self.subTest(direction=direction, close=close):
+                result = replay_ibr(
+                    close_confirmed_boundary_bars(direction, close),
+                    config=permissive_config(
+                        range_minutes=30, close_confirmed=True,
+                        breakout_buffer_bps=5.0, stop_pct=.01,
+                        target_pct=.02, costs=FREE),
+                )
+                self.assertEqual(bool(result.trades), expected)
+
+    def test_replay_rejects_non_new_york_timezone_identity(self):
+        with self.assertRaisesRegex(ReplayError, "America/New_York"):
+            IBRConfig(timezone="UTC")
+
     def test_source_preflight_rejects_historical_default_and_accepts_diagnostic(self):
         historical = [replace(
             bar,

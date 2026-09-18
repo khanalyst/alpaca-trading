@@ -54,10 +54,51 @@ def _dt(value, tz: ZoneInfo = ZoneInfo(DEFAULT_IBR_TIMEZONE)) -> datetime | None
         return None
 
 
+def _strict_dt(value, tz: ZoneInfo = ZoneInfo(DEFAULT_IBR_TIMEZONE)) -> datetime | None:
+    """Parse a supplied instant without inventing a timezone.
+
+    Runtime callers must provide an aware instant.  ``_dt`` intentionally
+    remains permissive for legacy session/date configuration, while market
+    rows and ``now`` use this fail-closed parser.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        try:
+            return value.astimezone(tz)
+        except (OverflowError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        try:
+            return parsed.astimezone(tz)
+        except (OverflowError, ValueError):
+            return None
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if abs(number) > 100_000_000_000:
+        number /= 1000.0
+    try:
+        return datetime.fromtimestamp(number, timezone.utc).astimezone(tz)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _bar_time(bar: Mapping) -> datetime | None:
     for key in ("timestamp", "ts", "time", "datetime", "start"):
         if key in bar:
-            return _dt(bar.get(key))
+            return _strict_dt(bar.get(key))
     return None
 
 
@@ -66,6 +107,111 @@ def _bar_value(bar: Mapping, *keys: str) -> float | None:
         if key in bar:
             return finite(bar.get(key))
     return None
+
+
+def _raw_number(bar: Mapping, *keys: str) -> tuple[bool, float | None]:
+    """Return (valid, value), preserving missing-vs-invalid input."""
+    for key in keys:
+        if key not in bar:
+            continue
+        value = bar.get(key)
+        if isinstance(value, bool):
+            return False, None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return False, None
+        if not math.isfinite(number):
+            return False, None
+        return True, number
+    return True, None
+
+
+def _valid_bar_payload(bar: Mapping) -> bool:
+    """Validate direct OHLCV input without changing omitted-field semantics."""
+    if not isinstance(bar, Mapping):
+        return False
+    if "interval_seconds" in bar:
+        interval = bar.get("interval_seconds")
+        try:
+            interval_number = float(interval)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (isinstance(interval, bool) or not isinstance(interval, (int, float)) or
+                not math.isfinite(interval_number) or interval_number != 60.0):
+            return False
+    valid_high, high = _raw_number(bar, "high", "h")
+    valid_low, low = _raw_number(bar, "low", "l")
+    valid_close, close = _raw_number(bar, "close", "c")
+    if (not valid_high or not valid_low or not valid_close or
+            high is None or low is None or close is None or
+            high <= 0 or low <= 0 or close <= 0):
+        return False
+    valid_open, opening = _raw_number(bar, "open", "o")
+    if not valid_open or (opening is not None and opening <= 0):
+        return False
+    valid_volume, volume = _raw_number(bar, "volume", "v")
+    if not valid_volume or (volume is not None and volume < 0):
+        return False
+    if high < low or high < close or low > close:
+        return False
+    if opening is not None and (high < opening or low > opening):
+        return False
+    # Optional numeric fields are safety assertions when supplied.  They are
+    # not required for legacy direct fixtures.
+    for names, lower in (
+            (("atr", "atr_1m", "atr_pct"), 0.0),
+            (("relative_volume",), 0.0),
+            (("spread_bps", "spread_pct"), 0.0),
+            (("data_age_seconds", "stale_seconds"), 0.0),
+            (("bid",), 0.0), (("ask",), 0.0)):
+        valid, number = _raw_number(bar, *names)
+        if not valid or (number is not None and number < lower):
+            return False
+        if names in (("bid",), ("ask",)) and number is not None and number <= 0:
+            return False
+    return True
+
+
+def _bar_available(bar: Mapping, timestamp: datetime) -> datetime | None:
+    """Return the earliest instant a completed direct bar is usable."""
+    values = [timestamp + timedelta(minutes=1)]
+    for key in ("as_of", "asof", "observed_at", "received_at", "ingested_at",
+                "available_at"):
+        if key not in bar:
+            continue
+        if bar.get(key) is None:
+            # Provider DTOs commonly expose optional provenance attributes as
+            # None; this is equivalent to omission at the direct boundary.
+            continue
+        boundary = _strict_dt(bar.get(key))
+        if boundary is None:
+            return None
+        values.append(boundary)
+    return max(values)
+
+
+def close_breaks_range(close: float, boundary: float, breakout_buffer_bps: float,
+                       direction: str) -> bool:
+    """Apply the live close-confirmed breakout predicate.
+
+    The buffer is relative to the completed signal close, with the range
+    boundary remaining the comparison anchor.  Keeping this pure predicate in
+    the contract lets replay and live signal generation share exact parity.
+    """
+    if direction not in {"long", "short"}:
+        return False
+    try:
+        close = float(close)
+        boundary = float(boundary)
+        bps = float(breakout_buffer_bps)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (not math.isfinite(close) or not math.isfinite(boundary) or
+            not math.isfinite(bps) or close <= 0 or boundary <= 0 or bps < 0):
+        return False
+    buffer = close * bps / 10000.0
+    return close > boundary + buffer if direction == "long" else close < boundary - buffer
 
 
 def atr_series(bars: Iterable[Mapping], period: int = 14) -> list[float | None]:
@@ -140,6 +286,22 @@ class IBRConfig:
     stale_minutes: float = 0.5
     max_spread_bps: float = 25.0
 
+    def __post_init__(self) -> None:
+        # ``inf`` is the omitted/default policy.  Any supplied finite value
+        # must be an actual nonnegative number; mapping callers are checked
+        # before construction and direct construction is checked here.
+        if (isinstance(self.max_ibr_width_pct, bool) or
+                not isinstance(self.max_ibr_width_pct, (int, float))):
+            raise ValueError("max_ibr_width_pct must be a finite nonnegative number")
+        try:
+            value = float(self.max_ibr_width_pct)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "max_ibr_width_pct must be a finite nonnegative number") from exc
+        if math.isnan(value) or value < 0 or (math.isinf(value) and value != float("inf")):
+            raise ValueError("max_ibr_width_pct must be a finite nonnegative number")
+        object.__setattr__(self, "max_ibr_width_pct", value)
+
     @classmethod
     def from_mapping(cls, value: Mapping | None = None) -> "IBRConfig":
         value = value if isinstance(value, Mapping) else {}
@@ -156,6 +318,19 @@ class IBRConfig:
             kwargs["breakout_buffer_bps"] = float(value["breakout_buffer_pct"]) * 100
         if "max_ibr_width_pct" not in kwargs and "max_range_width_pct" in value:
             kwargs["max_ibr_width_pct"] = value["max_range_width_pct"]
+        if "max_ibr_width_pct" in kwargs:
+            supplied = kwargs["max_ibr_width_pct"]
+            try:
+                supplied_number = float(supplied)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "max_ibr_width_pct must be a finite nonnegative number") from exc
+            if (isinstance(supplied, bool) or
+                    not isinstance(supplied, (int, float)) or
+                    not math.isfinite(supplied_number) or supplied_number < 0):
+                raise ValueError(
+                    "max_ibr_width_pct must be a finite nonnegative number")
+            kwargs["max_ibr_width_pct"] = supplied_number
         # Config may use one nested session string ("09:30-09:45").
         session = value.get("session")
         if isinstance(session, str) and "-" in session:
@@ -226,16 +401,16 @@ def build_ibr_range(
         low = _bar_value(raw, "low", "l")
         close = _bar_value(raw, "close", "c")
         volume = _bar_value(raw, "volume", "v")
-        if ts is None or high is None or low is None or close is None:
+        if ts is None or not _valid_bar_payload(raw):
             continue
-        if high < low or low <= 0 or close <= 0:
+        if _bar_available(raw, ts) is None:
             continue
         # Timestamp is bar open; only bars wholly inside the opening window
         # and already closed at evaluation time can contribute.
         close_ts = ts + timedelta(minutes=1)
         if ts < start or close_ts > end:
             continue
-        rows.append((ts, high, low, close, max(0.0, volume or 0.0)))
+        rows.append((ts, high, low, close, volume if volume is not None else 0.0))
     rows.sort(key=lambda item: item[0])
     expected = max(1, int(cfg.range_minutes))
     # A complete IBR needs every minute; accepting a sparse range would make
@@ -266,16 +441,59 @@ def build_ibr_range(
     return result
 
 
-def _range_from_mapping(value: Mapping) -> dict | None:
+def _strict_nonnegative(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def ibr_range_summary(value: Mapping) -> dict | None:
+    """Validate and summarize an externally supplied IBR range.
+
+    Range width is always recomputed from the validated positive boundaries.
+    Optional numeric metadata is preserved when valid, but an explicitly
+    malformed value fails closed rather than being silently discarded.
+    """
     if not isinstance(value, Mapping):
         return None
-    high = finite(value.get("high", value.get("ibr_high")))
-    low = finite(value.get("low", value.get("ibr_low")))
-    if high is None or low is None or high <= low:
+    high_key = "high" if "high" in value else "ibr_high"
+    low_key = "low" if "low" in value else "ibr_low"
+    if high_key not in value or low_key not in value:
         return None
+    high = value.get(high_key)
+    low = value.get(low_key)
+    if isinstance(high, bool) or isinstance(low, bool):
+        return None
+    try:
+        high = float(high)
+        low = float(low)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (not math.isfinite(high) or not math.isfinite(low) or
+            high <= 0 or low <= 0 or high <= low):
+        return None
+    for key in ("width", "volume_mean", "width_pct", "atr"):
+        if key not in value:
+            continue
+        metadata = _strict_nonnegative(value.get(key))
+        if metadata is None or (key == "width" and metadata <= 0):
+            return None
     out = dict(value)
     out.update({"high": high, "low": low, "width": high - low})
+    for key in ("volume_mean", "width_pct", "atr"):
+        if key in out:
+            out[key] = float(out[key])
     return out
+
+
+def _range_from_mapping(value: Mapping) -> dict | None:
+    return ibr_range_summary(value)
 
 
 def evaluate_ibr_breakout(
@@ -297,7 +515,10 @@ def evaluate_ibr_breakout(
     high = _bar_value(bar, "high", "h")
     low = _bar_value(bar, "low", "l")
     volume = _bar_value(bar, "volume", "v")
-    if ts is None or close is None or high is None or low is None:
+    if ts is None or not _valid_bar_payload(bar):
+        return None
+    available = _bar_available(bar, ts)
+    if available is None:
         return None
     close_ts = ts + timedelta(minutes=1)
     end = _dt(rng.get("range_end_ts") or rng.get("range_end"), cfg.zone)
@@ -317,13 +538,13 @@ def evaluate_ibr_breakout(
     session_start, _ = cfg.session_bounds(session)
     if local_ts.date().isoformat() != session or local_ts < session_start or local_ts.time() > latest:
         return None
+    current = None
     if now is not None:
-        current = _dt(now, cfg.zone)
-        if current:
-            if close_ts > current:
-                return None
-            if (current - close_ts).total_seconds() > cfg.stale_minutes * 60:
-                return None
+        current = _strict_dt(now, cfg.zone)
+        if current is None or available > current or close_ts > current:
+            return None
+        if (current - close_ts).total_seconds() > cfg.stale_minutes * 60:
+            return None
     data_age = finite(bar.get("data_age_seconds", bar.get("stale_seconds")))
     if data_age is not None and data_age > cfg.stale_minutes * 60:
         return None
@@ -352,7 +573,37 @@ def evaluate_ibr_breakout(
         # future row from the caller's source sequence.
         history = bar.get("history") or bar.get("bars") or bar.get("_bars")
         if isinstance(history, Iterable) and not isinstance(history, (str, bytes, Mapping)):
-            values = atr_series(history, period=int(getattr(cfg, "atr_period", 14)))
+            bounded_history = []
+            previous_history_ts = None
+            history_valid = True
+            for item in history:
+                if not isinstance(item, Mapping):
+                    history_valid = False
+                    break
+                item_ts = _bar_time(item)
+                if item_ts is None:
+                    history_valid = False
+                    break
+                if item_ts > ts:
+                    continue
+                if (previous_history_ts is not None and
+                        item_ts < previous_history_ts):
+                    history_valid = False
+                    break
+                previous_history_ts = item_ts
+                if not _valid_bar_payload(item):
+                    history_valid = False
+                    break
+                item_available = _bar_available(item, item_ts)
+                if item_available is None:
+                    history_valid = False
+                    break
+                if current is not None and item_available > current:
+                    continue
+                bounded_history.append(item)
+            values = (atr_series(
+                bounded_history, period=int(getattr(cfg, "atr_period", 14)))
+                      if history_valid else [])
             if values:
                 atr = values[-1]
     if atr is not None and "atr_pct" in bar:
@@ -369,9 +620,10 @@ def evaluate_ibr_breakout(
         relvol = volume / mean_volume
     if relvol is None or relvol < cfg.min_relative_volume:
         return None
-    buffer = max(0.0, close * cfg.breakout_buffer_bps / 10000.0)
-    direction = "long" if close > float(rng["high"]) + buffer else (
-        "short" if close < float(rng["low"]) - buffer else None)
+    direction = ("long" if close_breaks_range(
+        close, float(rng["high"]), cfg.breakout_buffer_bps, "long") else
+        "short" if close_breaks_range(
+            close, float(rng["low"]), cfg.breakout_buffer_bps, "short") else None)
     if direction is None:
         return None
     entry = close
@@ -456,7 +708,44 @@ def generate_ibr_signal(
 ) -> dict | None:
     """Build the opening range and scan completed bars for the first signal."""
     cfg = config if isinstance(config, IBRConfig) else IBRConfig.from_mapping(config)
-    rows = [bar for bar in (bars or ()) if isinstance(bar, Mapping)]
+    current = None
+    if now is not None:
+        current = _strict_dt(now, cfg.zone)
+        if current is None:
+            return None
+    raw_rows = [bar for bar in (bars or ()) if isinstance(bar, Mapping)]
+    session_date = None
+    for bar in raw_rows:
+        timestamp = _bar_time(bar)
+        if timestamp is not None:
+            session_date = timestamp.astimezone(cfg.zone).date()
+            break
+    if session_date is None:
+        return None
+    session_start, _ = cfg.session_bounds(session_date)
+    latest = _parse_clock(cfg.latest_entry_time, time(11, 0))
+    rows = []
+    for bar in raw_rows:
+        timestamp = _bar_time(bar)
+        if timestamp is None:
+            return None
+        available = _bar_available(bar, timestamp)
+        if available is None:
+            return None
+        # A future recorder row is simply not in the current feature prefix;
+        # its malformed OHLC must not become observable before availability.
+        if current is not None and available > current:
+            continue
+        local_timestamp = timestamp.astimezone(cfg.zone)
+        eligible_current_session = (
+            local_timestamp.date() == session_date and
+            local_timestamp >= session_start and
+            local_timestamp.time() <= latest)
+        if not _valid_bar_payload(bar):
+            if eligible_current_session:
+                return None
+            continue
+        rows.append(bar)
     rows.sort(key=lambda row: _bar_time(row) or datetime.min.replace(tzinfo=timezone.utc))
     # Production OHLCV adapters may return plain dictionaries.  Attach ATR
     # before scanning so configured width bounds have a point-in-time value.

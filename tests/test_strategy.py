@@ -3,7 +3,9 @@ from datetime import datetime, timedelta, timezone
 
 from agent import strategy
 from agent.config import validate_config
-from agent.contracts.ibr import build_ibr_range, evaluate_exit, evaluate_ibr_breakout
+from agent.contracts.ibr import (build_ibr_range, evaluate_exit,
+                                  evaluate_ibr_breakout, generate_ibr_signal,
+                                  IBRConfig)
 from agent.contracts.rule import (MIN_STOP_DISTANCE_FRACTION,
                                   generate_rule_signal, rule_variant_id,
                                   validate_rule_spec)
@@ -16,6 +18,120 @@ def bars(start, *, high=100.5, low=99.5, close=100.0, volume=10.0):
 
 
 class IBRContractTests(unittest.TestCase):
+    def test_direct_range_summary_rejects_malformed_metadata_and_intervals(self):
+        start = datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc)
+        opening = build_ibr_range(bars(start))
+        candidate = {"timestamp": start + timedelta(minutes=15),
+                     "high": 102, "low": 100, "close": 101, "volume": 20,
+                     "relative_volume": 2.0}
+        self.assertIsNotNone(evaluate_ibr_breakout(opening, candidate))
+        for malformed in (
+                {"high": True, "low": 0.5},
+                {"high": 100.5, "low": 0},
+                {"high": 100.5, "low": 99.5, "volume_mean": float("nan")},
+                {"high": 100.5, "low": 99.5, "width_pct": -1},
+                {"high": 100.5, "low": 99.5, "atr": "bad"},
+        ):
+            with self.subTest(malformed=malformed):
+                supplied = dict(opening, **malformed)
+                self.assertIsNone(evaluate_ibr_breakout(
+                    supplied, candidate, config={"strategy": {
+                        "min_relative_volume": 1}}))
+        for interval in (True, 59, 61, "60"):
+            with self.subTest(interval=interval):
+                supplied = dict(candidate, interval_seconds=interval)
+                self.assertIsNone(evaluate_ibr_breakout(opening, supplied))
+        malformed_opening = [dict(row) for row in bars(start)]
+        malformed_opening[0]["interval_seconds"] = 59
+        self.assertIsNone(generate_ibr_signal(
+            "SPY", malformed_opening + [candidate]))
+
+    def test_direct_ibr_config_rejects_invalid_optional_width_pct(self):
+        self.assertEqual(IBRConfig.from_mapping({}).max_ibr_width_pct,
+                         float("inf"))
+        self.assertEqual(IBRConfig.from_mapping({
+            "strategy": {"max_ibr_width_pct": 0}}).max_ibr_width_pct, 0.0)
+        for value in (True, float("nan"), float("inf"), -1, "1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                IBRConfig.from_mapping({"strategy": {
+                    "max_ibr_width_pct": value}})
+
+    def test_direct_contract_rejects_malformed_ohlcv_without_clamping(self):
+        start = datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc)
+        opening = build_ibr_range(bars(start))
+        base = {"timestamp": start + timedelta(minutes=15),
+                "high": 102, "low": 100, "close": 101, "volume": 20}
+        self.assertIsNotNone(evaluate_ibr_breakout(opening, base))
+        for field, value in (("high", 0), ("low", 0),
+                             ("close", True), ("high", float("nan")),
+                             ("volume", -1), ("high", 100),):
+            with self.subTest(field=field, value=value):
+                malformed = dict(base)
+                malformed[field] = value
+                if field == "high" and value == 100:
+                    malformed["low"] = 101
+                self.assertIsNone(evaluate_ibr_breakout(opening, malformed))
+
+        negative_opening = bars(start)
+        negative_opening[0] = dict(negative_opening[0], volume=-1)
+        self.assertIsNone(build_ibr_range(negative_opening))
+
+    def test_direct_contract_requires_causal_now_and_bounds_atr_history(self):
+        start = datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc)
+        opening = build_ibr_range(bars(start, high=100.5, low=99.5))
+        candidate_at = start + timedelta(minutes=15)
+        candidate = {
+            "timestamp": candidate_at, "high": 102, "low": 100,
+            "close": 101, "volume": 20,
+            "history": [
+                {"timestamp": candidate_at - timedelta(minutes=2),
+                 "high": 101, "low": 100, "close": 100.5},
+                {"timestamp": candidate_at - timedelta(minutes=1),
+                 "high": 101, "low": 100, "close": 100.5},
+                # A future wide bar must not change the candidate ATR.
+                {"timestamp": candidate_at + timedelta(minutes=1),
+                 "high": 200, "low": 1, "close": 100.0},
+            ],
+        }
+        cfg = {"strategy": {"atr_period": 2,
+                             "min_ibr_width_atr": 0.5,
+                             "max_ibr_width_atr": 2.0,
+                             "breakout_buffer_bps": 5,
+                             "min_relative_volume": 1}}
+        self.assertIsNotNone(evaluate_ibr_breakout(opening, candidate,
+                                                    config=cfg))
+        malformed_history = dict(candidate, history=[
+            {"timestamp": candidate_at - timedelta(minutes=2),
+             "high": 99, "low": 100, "close": 100.5},
+            {"timestamp": candidate_at - timedelta(minutes=1),
+             "high": 101, "low": 100, "close": 100.5},
+        ])
+        self.assertIsNone(evaluate_ibr_breakout(
+            opening, malformed_history, config=cfg))
+        delayed = dict(candidate, observed_at=candidate_at + timedelta(minutes=2))
+        self.assertIsNone(evaluate_ibr_breakout(
+            opening, delayed, config={"strategy": {
+                **cfg["strategy"], "stale_minutes": 5.0}},
+            now=candidate_at + timedelta(minutes=1)))
+        self.assertIsNone(evaluate_ibr_breakout(opening, candidate,
+                                                config=cfg, now="invalid"))
+        self.assertIsNone(evaluate_ibr_breakout(opening, candidate,
+                                                config=cfg,
+                                                now=candidate_at.replace(tzinfo=None)))
+
+    def test_generator_does_not_consume_future_opening_observation(self):
+        start = datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc)
+        opening = [dict(row) for row in bars(start)]
+        opening[0]["observed_at"] = start + timedelta(minutes=16, seconds=1)
+        candidate = {"timestamp": start + timedelta(minutes=15),
+                     "high": 102, "low": 100, "close": 101, "volume": 20}
+        self.assertIsNone(generate_ibr_signal(
+            "SPY", [*opening, candidate], now=start + timedelta(minutes=16)))
+        malformed = [dict(row) for row in bars(start)]
+        malformed[0]["high"] = 0
+        self.assertIsNone(generate_ibr_signal(
+            "SPY", malformed + [candidate], now=start + timedelta(minutes=16)))
+
     def test_range_uses_new_york_session_across_dst(self):
         # 09:30 New York is 13:30 UTC in March and 14:30 UTC in November.
         for start in (datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc),

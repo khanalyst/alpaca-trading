@@ -5,6 +5,7 @@ from decimal import Decimal
 import unittest
 
 from agent.alpaca_domain import Bar
+from agent.alpaca_sdk import normalize_bar
 from agent.market_entry_risk import MarketEntryRiskMixin
 
 
@@ -135,6 +136,17 @@ class MarketEntryAvailabilityTests(unittest.TestCase):
             volume=Decimal("1000"))
         provider_result = self._collect([provider_dto], now)
         self.assertEqual(len(provider_result["SPY"]["bars"]), 1)
+
+    def test_sdk_normalized_bar_is_accepted_by_risk_collector(self):
+        now = START + timedelta(minutes=1)
+        normalized = normalize_bar({
+            "symbol": "SPY", "timestamp": START.isoformat(),
+            "open": 100, "high": 101, "low": 99, "close": 100.5,
+            "volume": 1000,
+        })
+        result = self._collect([normalized], now)
+        self.assertEqual(len(result["SPY"]["bars"]), 1)
+        self.assertEqual(result["SPY"]["bars"][0]["symbol"], "SPY")
 
     def test_quote_observation_boundaries_are_causal_and_well_formed(self):
         now = START + timedelta(minutes=1)

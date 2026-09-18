@@ -165,6 +165,30 @@ class AlpacaRuntimeTests(unittest.TestCase):
             "symbol": "SPY", "timestamp": "2026-08-07T14:00:00+00:00",
             "bid_price": 1, "ask_price": 2}, feed="iex").feed, "iex")
 
+    def test_bar_normalization_rejects_malformed_ohlcv_and_timestamp(self):
+        from agent.alpaca_sdk import normalize_bar
+
+        valid = {
+            "symbol": "SPY", "timestamp": "2026-08-07T14:00:00+00:00",
+            "open": 100, "high": 101, "low": 99, "close": 100.5,
+            "volume": 10,
+        }
+        self.assertIsNotNone(normalize_bar(valid).timestamp.tzinfo)
+        invalid = (
+            ({**valid, "open": 0}, "positive"),
+            ({**valid, "high": 99}, "inconsistent bounds"),
+            ({**valid, "volume": -1}, "nonnegative"),
+            ({**valid, "volume": "NaN"}, "finite"),
+            ({key: value for key, value in valid.items() if key != "timestamp"},
+             "timezone-aware"),
+            ({**valid, "timestamp": "2026-08-07T14:00:00"},
+             "timezone-aware"),
+        )
+        for payload, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    normalize_bar(payload)
+
     def test_option_response_feed_mismatch_is_rejected_for_snapshots_and_candidates(self):
         chain = {
             "SPY260821C00600000": {

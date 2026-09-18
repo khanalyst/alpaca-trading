@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import unittest
 
@@ -18,6 +19,60 @@ from research.market_data import (
 
 
 class MarketDataNormalizationTests(unittest.TestCase):
+    def _valid_bar_payload(self):
+        return {
+            "symbol": "SPY", "timestamp": "2026-09-17T13:30:00Z",
+            "open": 100, "high": 101, "low": 99, "close": 100.5,
+            "volume": 10, "provider": "alpaca", "feed": "iex",
+        }
+
+    def test_bar_prices_and_volume_never_accept_boolean_or_nonpositive_prices(self):
+        payload = self._valid_bar_payload()
+        bar = normalize_underlying_bar(payload)
+        for field in ("open", "high", "low", "close"):
+            for invalid in (True, False, 0, -1, float("nan"), float("inf")):
+                with self.subTest(field=field, invalid=invalid):
+                    with self.assertRaises(NormalizationError):
+                        normalize_underlying_bar({**payload, field: invalid})
+                    with self.assertRaises(NormalizationError):
+                        replace(bar, **{field: invalid})
+        for invalid in (True, False, -1, float("nan"), float("inf")):
+            with self.subTest(volume=invalid):
+                with self.assertRaises(NormalizationError):
+                    normalize_underlying_bar({**payload, "volume": invalid})
+                with self.assertRaises(NormalizationError):
+                    replace(bar, volume=invalid)
+        self.assertEqual(normalize_underlying_bar({**payload, "volume": 0}).volume, 0)
+
+    def test_bar_interval_metadata_is_preserved_and_conflicts_fail_closed(self):
+        payload = self._valid_bar_payload()
+        self.assertEqual(normalize_underlying_bar(payload).interval_seconds, 60)
+        for value in (300, "300", 300.0):
+            with self.subTest(value=value):
+                bar = normalize_underlying_bar({**payload, "interval_seconds": value})
+                self.assertEqual(bar.interval_seconds, 300)
+                self.assertEqual(bar.end - bar.timestamp, timedelta(minutes=5))
+        self.assertEqual(normalize_underlying_bar(payload, interval_seconds=300)
+                         .interval_seconds, 300)
+        with self.assertRaisesRegex(NormalizationError, "conflicts"):
+            normalize_underlying_bar({**payload, "interval_seconds": 300},
+                                     interval_seconds=60)
+        with self.assertRaisesRegex(NormalizationError, "bar_1m"):
+            normalize_underlying_bar({**payload, "event_type": "bar_1m",
+                                      "interval_seconds": 300})
+
+    def test_bar_interval_rejects_malformed_values_in_all_construction_paths(self):
+        payload = self._valid_bar_payload()
+        bar = normalize_underlying_bar(payload)
+        for invalid in (True, False, 0, -1, 1.5, "", "bad", float("nan"), float("inf")):
+            with self.subTest(value=invalid):
+                with self.assertRaises(NormalizationError):
+                    normalize_underlying_bar({**payload, "interval_seconds": invalid})
+                with self.assertRaises(NormalizationError):
+                    normalize_underlying_bar(payload, interval_seconds=invalid)
+                with self.assertRaises(NormalizationError):
+                    replace(bar, interval_seconds=invalid)
+
     def test_bar_carries_feed_asof_and_new_york_session(self):
         bar = normalize_underlying_bar({
             "symbol": "SPY",

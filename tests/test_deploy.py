@@ -3264,6 +3264,22 @@ class DeployTests(unittest.TestCase):
             feed="sip", policy="strict")
         self.assertEqual(adjacent["SPY"]["status"], "covered")
 
+    def test_recorder_checks_adjacent_gaps_in_fresh_bar_window(self):
+        first = datetime(2026, 9, 14, 13, 30, tzinfo=timezone.utc)
+        second = datetime(2026, 9, 14, 13, 37, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 14, 13, 38, tzinfo=timezone.utc)
+        rows = [{"event_type": "bar_1m", "symbol": "SPY",
+                 "timestamp": stamp.isoformat()}
+                for stamp in (first, second)]
+        observed = recorder._verify_bar_continuity(
+            rows, {}, now, ["SPY"], feed="iex", policy="observe")
+        self.assertEqual(observed["SPY"]["status"], "gap_observed")
+        self.assertEqual(observed["SPY"]["window_gap_count"], 1)
+        self.assertEqual(observed["SPY"]["window_max_gap_seconds"], 420)
+        with self.assertRaisesRegex(RuntimeError, "continuity gap"):
+            recorder._verify_bar_continuity(
+                rows, {}, now, ["SPY"], feed="iex", policy="strict")
+
     def test_recorder_loads_precoverage_v1_index(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
