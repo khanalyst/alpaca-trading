@@ -1,4 +1,4 @@
-# Strategy and variant review — 18 September 2026
+# Strategy and variant review — 19 September 2026
 
 ## Scope and key gaps
 
@@ -31,14 +31,18 @@ profitability run was performed for this review.
 
 No positive edge is proven, and no arm is live-eligible from these results.
 
-## September 18 local correctness fixes (source-only)
+## Released correctness fixes and deployment
 
-The September 18 changes are local working-tree corrections: they were not
-committed, pushed, or deployed this turn. They are separate from the
-historical `c7f996a` repairs noted below. All 43 frozen registered strategy
-IDs/specs, risk limits, and cost assumptions remain unchanged, but the code
-identity changes, so prior evidence cannot be carried over and no activation
-shortcut is valid.
+The September 18 corrections are released in commit
+`79c48c90fd6449fd46f5c762384f9f42264cbb43`, present on local, GitHub, and VM
+`main`. Full GitHub CI succeeded across all four test shards and the container
+in [run 35360972940](https://github.com/khanalyst/alpaca-trading/actions/runs/35360972940).
+The VM is pinned to image `alpaca-agent-trading:signal-fix-79c48c9`, digest
+`sha256:da939d12584c9a193fb92001697d14af100c4efc28749fba7375089fa96b4067`;
+services restarted **2026-09-18 18:32 UTC** and the six-service
+postverification was healthy with zero restarts. A later documentation-only
+commit does not require changing this image or proof identity. All 43 frozen
+strategy IDs/specs, risk limits, and cost assumptions remain unchanged.
 
 Research-bar normalization now rejects boolean/nonpositive prices, invalid
 volume, row/override duration conflicts, and `bar_1m` intervals other than 60
@@ -64,26 +68,27 @@ be finite and nonnegative, preserving explicit-zero versus omission behavior.
 Replay requires the `America/New_York` timezone configuration; aware UTC
 market timestamps remain valid.
 
-Final local verification passed all **2,173 discovered tests** across disjoint
-shards: edge 61, factory 6, research 1,147, and runtime 959, with zero failures,
-errors, or skips. Compilation and diff checks passed. Independent synthetic
-parity checks across all 24 registered rule arms found no output or ID changes
-on the tested valid prefixes; they do not establish market profitability.
-No new market-profitability run, orders, deployment, resume, cancellation, or
-deletion occurred for this review. Previously reported runtime and broker state
-remains a dated snapshot, not a fresh check.
+The earlier local verification passed all **2,173 discovered tests** across
+disjoint shards: edge 61, factory 6, research 1,147, and runtime 959, with zero
+failures, errors, or skips. Compilation and diff checks passed. Independent
+synthetic parity checks across all 24 registered rule arms found no output or
+ID changes on the tested valid prefixes; they do not establish market
+profitability. No new profitability run, orders, resume, cancellation, or paper
+activation occurred for this review. The frozen paper trial remains paused
+under its old identity with zero accepted sessions/outcomes; deployment is not
+paper activation.
 
-## Pending validated rollout and diagnostic recompute
+## Pending post-release evidence
 
-Complete CI and a verified paused rollout of these local corrections together
-with the previously committed WAL/replay fixes under the new code/evidence identity.
-Then recompute benchmark-fit, signal-quality, and replay diagnostics for the
-same 43 frozen arms on untouched forward data, using the shared completed
-point-in-time context at each actual subject decision time. Do not reuse prior
-evidence or activate from diagnostic recompute; historical backfill remains
-diagnostic-only by explicit opt-in. This is not a profitability run or a
-promotion decision. Fresh forward quotes/costs and market-open latency evidence
-remain open requirements.
+The release and paused rollout are complete. No fresh accepted count was
+observed in postverification (the last pre-release state was 0/30), and there
+were no quoteable opens, replay fills, or actual fills. Recompute benchmark-fit,
+signal-quality, and replay diagnostics only on untouched forward data for the
+same 43 frozen arms, using completed point-in-time context at each decision
+time. Do not reuse prior evidence or activate from a diagnostic recompute;
+historical backfill remains diagnostic-only. Fresh forward quotes/costs,
+market-open latency, after-cost validation, and the paper/research evidence
+gates remain open requirements. No positive edge is proven.
 
 The main evidence gap is executable forward quotes and cost measurement. The
 25 bps stress and 0.30 cost/risk ceiling imply an 83.33 bps minimum stop before
@@ -96,8 +101,8 @@ or calibration change is authorized here. The next useful evidence is
 untouched accepted forward quotes and costs, not five to ten more strategies on
 the examined data.
 
-Historical `c7f996a` software-contract repairs are separate from the September
-18 local fixes and from signal evidence. The
+Historical `c7f996a` software-contract repairs are separate from the released
+September 18 fixes and from signal evidence. The
 24/31 readiness contract, current-epoch census binding, recorder-error
 payload/schema preservation, future-observed bar/quote exclusion, and
 explicit-zero setup handling are already implemented in `c7f996a`. Historical
@@ -255,12 +260,13 @@ arms, 12 `intraday-mechanisms.v1` arms, and 7 IBR registry arms. The September 1
 inventory review was read-only: inventory resolution from the source
 builder, read-only mechanism manifest inspection, exact-ID/spec cross-check,
 and consistency review against the retained 12 September edge results and the
-stated cost geometry. No profitability backtest, parameter search, live order,
-or deployment was performed in that review. The archived software verification records
+stated cost geometry. No profitability backtest, parameter search, or live order
+was performed in that review; its deployment status was not the subject of that
+inventory. The archived software verification records
 2,099 full-suite tests passed; that historical software result and the
 activation receipt’s `verification_passed` status do not establish executable
 edge or accepted trial sessions. Historical bars without contemporaneous
-quotes cannot establish executable edge. The September 18 local changes passed
+quotes cannot establish executable edge. The released September 18 fixes passed
 all 2,173 full-suite tests and the focused synthetic parity checks described
 above. This review does not replace the implementation-validation status in
 the current findings.
