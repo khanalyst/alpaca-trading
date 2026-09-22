@@ -1,0 +1,154 @@
+{
+ "schema": "spread-reference.v1",
+ "authorizing": false,
+ "diagnostic_only": true,
+ "basis": "tick-implied floor and Corwin-Schultz high-low estimator over 19 sessions",
+ "note": "Not a fitted quote schedule and not a cost source. Compare a fitted costs.measured_quote schedule against this before trusting it.",
+ "shipped_global_spread_bps": 4.0,
+ "symbols": {
+  "DIA": {
+   "median_price": 527.7,
+   "one_tick_bps": 0.19,
+   "corwin_schultz_median_bps": 0.744,
+   "shipped_overstatement_x": 21.1
+  },
+  "EEM": {
+   "median_price": 67.15,
+   "one_tick_bps": 1.489,
+   "corwin_schultz_median_bps": 1.138,
+   "shipped_overstatement_x": 2.7
+  },
+  "EFA": {
+   "median_price": 106.87,
+   "one_tick_bps": 0.936,
+   "corwin_schultz_median_bps": 0.69,
+   "shipped_overstatement_x": 4.3
+  },
+  "GLD": {
+   "median_price": 401.79,
+   "one_tick_bps": 0.249,
+   "corwin_schultz_median_bps": 1.694,
+   "shipped_overstatement_x": 16.1
+  },
+  "HYG": {
+   "median_price": 79.14,
+   "one_tick_bps": 1.264,
+   "corwin_schultz_median_bps": 0.626,
+   "shipped_overstatement_x": 3.2
+  },
+  "IWM": {
+   "median_price": 291.92,
+   "one_tick_bps": 0.343,
+   "corwin_schultz_median_bps": 1.281,
+   "shipped_overstatement_x": 11.7
+  },
+  "QQQ": {
+   "median_price": 715.35,
+   "one_tick_bps": 0.14,
+   "corwin_schultz_median_bps": 1.294,
+   "shipped_overstatement_x": 28.6
+  },
+  "SLV": {
+   "median_price": 59.7,
+   "one_tick_bps": 1.675,
+   "corwin_schultz_median_bps": 2.832,
+   "shipped_overstatement_x": 2.4
+  },
+  "SMH": {
+   "median_price": 556.74,
+   "one_tick_bps": 0.18,
+   "corwin_schultz_median_bps": 2.165,
+   "shipped_overstatement_x": 22.3
+  },
+  "SPY": {
+   "median_price": 765.15,
+   "one_tick_bps": 0.131,
+   "corwin_schultz_median_bps": 0.971,
+   "shipped_overstatement_x": 30.6
+  },
+  "TLT": {
+   "median_price": 81.86,
+   "one_tick_bps": 1.222,
+   "corwin_schultz_median_bps": 0.796,
+   "shipped_overstatement_x": 3.3
+  },
+  "VB": {
+   "median_price": 296.05,
+   "one_tick_bps": 0.338,
+   "corwin_schultz_median_bps": 0.54,
+   "shipped_overstatement_x": 11.8
+  },
+  "VO": {
+   "median_price": 81.45,
+   "one_tick_bps": 1.228,
+   "corwin_schultz_median_bps": 0.833,
+   "shipped_overstatement_x": 3.3
+  },
+  "VTI": {
+   "median_price": 377.02,
+   "one_tick_bps": 0.265,
+   "corwin_schultz_median_bps": 0.776,
+   "shipped_overstatement_x": 15.1
+  },
+  "XLB": {
+   "median_price": 52.14,
+   "one_tick_bps": 1.918,
+   "corwin_schultz_median_bps": 1.434,
+   "shipped_overstatement_x": 2.1
+  },
+  "XLE": {
+   "median_price": 64.43,
+   "one_tick_bps": 1.552,
+   "corwin_schultz_median_bps": 2.288,
+   "shipped_overstatement_x": 2.6
+  },
+  "XLF": {
+   "median_price": 57.4,
+   "one_tick_bps": 1.742,
+   "corwin_schultz_median_bps": 1.551,
+   "shipped_overstatement_x": 2.3
+  },
+  "XLI": {
+   "median_price": 172.67,
+   "one_tick_bps": 0.579,
+   "corwin_schultz_median_bps": 1.206,
+   "shipped_overstatement_x": 6.9
+  },
+  "XLK": {
+   "median_price": 185.94,
+   "one_tick_bps": 0.538,
+   "corwin_schultz_median_bps": 1.463,
+   "shipped_overstatement_x": 7.4
+  },
+  "XLP": {
+   "median_price": 84.53,
+   "one_tick_bps": 1.183,
+   "corwin_schultz_median_bps": 1.179,
+   "shipped_overstatement_x": 3.4
+  },
+  "XLRE": {
+   "median_price": 43.76,
+   "one_tick_bps": 2.285,
+   "corwin_schultz_median_bps": 1.121,
+   "shipped_overstatement_x": 1.8
+  },
+  "XLU": {
+   "median_price": 42.6,
+   "one_tick_bps": 2.348,
+   "corwin_schultz_median_bps": 1.773,
+   "shipped_overstatement_x": 1.7
+  },
+  "XLV": {
+   "median_price": 168.91,
+   "one_tick_bps": 0.592,
+   "corwin_schultz_median_bps": 1.274,
+   "shipped_overstatement_x": 6.8
+  },
+  "XLY": {
+   "median_price": 114.16,
+   "one_tick_bps": 0.876,
+   "corwin_schultz_median_bps": 1.276,
+   "shipped_overstatement_x": 4.6
+  }
+ }
+}

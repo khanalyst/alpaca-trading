@@ -1,6 +1,13 @@
 # Measured audit, 21 September 2026
 
-`FINDINGS.md` is the report. This directory holds the evidence.
+Three reports, in order:
+
+- `FINDINGS.md` — the audit: why the system had never produced a trade.
+- `REMEDIATION.md` — steps 1, 3 and 4 applied, plus the IBR contract merge.
+- `SIGNAL-VALUE.md` — steps 5, 6 and 2: exit geometry, signal quality, costs.
+  **This one overturns a conclusion in `FINDINGS.md`.** Read it last.
+
+This directory holds the evidence.
 
 ## Data
 
@@ -22,6 +29,16 @@ recorder evidence and cannot authorize anything.
 | `harness.py` | replays one rule spec over the universe using `agent.contracts.rule.evaluate_rule_signal` |
 | `runall.py` | runs all 36 rule + mechanism arms, writes `replay-results.json` |
 | `survivors.py` | per-session breakdown for the arms that survive a realistic cost |
+| `q1trades.py` | post-fix trade counts with the stressed-cost gate applied |
+| `q2.py` | 19-session forward returns for the regime question |
+| `step5b.py` | 81-point target/hold sweep with per-session values for a split test |
+| `step6b.py` | `research.signal_quality` run as the primary instrument |
+| `fetch60.py` | corpus fetch |
+
+Result artifacts: `replay-results.json`, `q1-post-fix-summary.json`,
+`q2-19session-summary.json`, `step5-geometry-grid.json`,
+`step6-signal-quality.json`, and `spread-reference.json` (diagnostic, not a
+cost source).
 
 Signals are evaluated on the completed bar; entry is the next bar's open;
 forward returns are signed by the signal's own direction. Outcome walks apply
