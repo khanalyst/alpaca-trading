@@ -303,6 +303,115 @@ def sign_flip_null_statistics(deltas, clusters, *, draws: int = DEFAULT_NULL_DRA
             "degenerate": bool(null_mean_abs <= 1e-15)}
 
 
+def _beta_continued_fraction(a: float, b: float, x: float) -> float:
+    """Lentz continued fraction for the regularized incomplete beta."""
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 400):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        step = d * c
+        h *= step
+        if abs(step - 1.0) < 3e-16:
+            break
+    return h
+
+
+def _regularized_incomplete_beta(a: float, b: float, x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_front = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) +
+                 a * math.log(x) + b * math.log1p(-x))
+    front = math.exp(log_front)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _beta_continued_fraction(a, b, x) / a
+    return 1.0 - front * _beta_continued_fraction(b, a, 1.0 - x) / b
+
+
+def student_t_sf(t: float, df: float) -> float:
+    """Upper tail ``P(T > t)`` of Student's t with ``df`` degrees of freedom.
+
+    Cluster-robust inference with G clusters is referred to t with G - 1
+    degrees of freedom.  At the cluster counts intraday research actually
+    has, a normal critical value would claim significance the data do not
+    support, so the exact tail is computed from the incomplete beta function
+    rather than approximated.
+    """
+    value, freedom = float(t), float(df)
+    if not math.isfinite(freedom) or freedom <= 0:
+        raise ValueError("df must be a positive finite number")
+    if math.isnan(value):
+        raise ValueError("t must be a number")
+    if math.isinf(value):
+        return 0.0 if value > 0 else 1.0
+    tail = 0.5 * _regularized_incomplete_beta(
+        freedom / 2.0, 0.5, freedom / (freedom + value * value))
+    return tail if value >= 0 else 1.0 - tail
+
+
+def cluster_robust_mean_inference(values, clusters, *,
+                                  shift: float = 0.0) -> dict:
+    """Mean with a cluster-robust (CR1) standard error over whole clusters.
+
+    Intraday observations inside one session share that session's shock, and
+    on a universe of correlated ETFs every symbol shares it too.  An ordinary
+    standard error treats each of them as independent and so overstates the
+    t-statistic by roughly the square root of the average cluster size.  This
+    keeps the ordinary event-weighted mean, so it is directly comparable with
+    an existing point estimate, and replaces only the error term:
+
+        var(mean) = G / (G - 1) * sum_g (sum_{i in g} (x_i - mean))^2 / N^2
+
+    which reduces exactly to ``stdev / sqrt(N)`` when every cluster holds one
+    observation.  The reference distribution for ``t_stat`` is Student-t with
+    ``G - 1`` degrees of freedom, so readers must use ``df`` rather than a
+    normal critical value.  Fewer than two clusters, or zero residual spread,
+    returns ``None`` error terms instead of a spurious number.
+    """
+    grouped: dict[str, list[float]] = {}
+    for value, cluster in zip(values, clusters):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            grouped.setdefault(str(cluster), []).append(number)
+    count = sum(len(items) for items in grouped.values())
+    clusters_total = len(grouped)
+    empty = {"mean": None, "stderr": None, "t_stat": None,
+             "clusters": clusters_total, "df": None, "observations": count,
+             "method": "cr1_cluster_robust"}
+    if not count:
+        return empty
+    centre = sum(sum(items) for items in grouped.values()) / count
+    result = dict(empty, mean=centre)
+    if clusters_total < 2:
+        return result
+    squares = sum((sum(items) - len(items) * centre) ** 2
+                  for items in grouped.values())
+    variance = (clusters_total / (clusters_total - 1)) * squares / count ** 2
+    error = math.sqrt(variance) if variance > 0 else None
+    if error is None or not math.isfinite(error):
+        return dict(result, df=clusters_total - 1)
+    return dict(result, stderr=error, df=clusters_total - 1,
+                t_stat=(centre - float(shift)) / error)
+
+
 def cluster_bootstrap_lower_bound(deltas, clusters, *, confidence: float = .95,
                                   draws: int = DEFAULT_BOOTSTRAP_DRAWS,
                                   seed: int | None = None,
@@ -1266,6 +1375,7 @@ __all__ = ["DEPENDENCE_POLICY_SCHEMA", "DEPENDENCE_MIN_COMPLETE_SESSIONS",
            "DEFAULT_CLUSTER_BLOCK_LENGTH",
            "benjamini_hochberg", "benjamini_yekutieli",
            "cluster_bootstrap_lower_bound", "cluster_contributions",
+           "cluster_robust_mean_inference", "student_t_sf",
            "clustered_mde_power_report", "clustered_mde_report",
            "clustered_mde_power", "mde_power_report",
            "effective_breadth_report",

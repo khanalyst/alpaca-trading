@@ -28,6 +28,8 @@ from .market_data import (historical_backfill_record, replay_available_at,
                            replay_bar_prefix,
                            replay_record_is_available)
 from .maturity import causal_maturity_bars
+from .stats import (DEFAULT_NULL_DRAWS, cluster_robust_mean_inference,
+                    sign_flip_null_statistics)
 
 
 SIGNAL_QUALITY_SCHEMA = "signal-quality.v2"
@@ -946,6 +948,11 @@ def measure_signal_quality(
         candidates: list[float] = []
         controls: list[float] = []
         paired_deltas: list[float] = []
+        # Session identity for each candidate and paired delta.  Intraday
+        # events inside one session, across correlated ETFs, share that
+        # session's shock; inference has to treat the session as the unit.
+        candidate_sessions: list[str] = []
+        delta_sessions: list[str] = []
         candidate_minutes: list[float] = []
         control_minutes: list[float] = []
         pool_sizes: list[int] = []
@@ -969,6 +976,7 @@ def measure_signal_quality(
                 unavailable[str(reason or "candidate_unavailable")] += 1
                 continue
             candidates.append(candidate)
+            candidate_sessions.append(str(session))
             sessions.add(session)
             symbols.add(symbol)
             cells.add(f"{session}:{symbol}")
@@ -988,6 +996,7 @@ def measure_signal_quality(
             else:
                 controls.append(control)
                 paired_deltas.append(candidate - control)
+                delta_sessions.append(str(session))
                 pool_sizes.append(int(control_meta["pool"]))
                 control_minutes.append(float(control_meta["mean_session_minute"]))
             event_vectors.append({
@@ -1004,6 +1013,18 @@ def measure_signal_quality(
                         if hurdle is not None else [])
         candidate_dispersion = _dispersion(candidates)
         delta_dispersion = _dispersion(paired_deltas)
+        delta_clustered = cluster_robust_mean_inference(
+            paired_deltas, delta_sessions)
+        after_hurdle_clustered = (cluster_robust_mean_inference(
+            candidates, candidate_sessions, shift=float(hurdle))
+            if hurdle is not None else None)
+        # One-sided cluster sign-flip over whole sessions, seeded from the
+        # data so the value is reproducible from its inputs alone.  It needs
+        # no distributional assumption, so it stays readable at the small
+        # cluster counts where a Student-t reference is least trustworthy.
+        delta_sign_flip = (sign_flip_null_statistics(
+            paired_deltas, delta_sessions, draws=DEFAULT_NULL_DRAWS)
+            if len(set(delta_sessions)) >= 2 else None)
         horizon_metrics[f"{horizon}m"] = {
             "horizon_minutes": horizon,
             "candidate_count": len(candidates),
@@ -1020,6 +1041,19 @@ def measure_signal_quality(
             "candidate_minus_control_stdev_bps": delta_dispersion["stdev_bps"],
             "candidate_minus_control_stderr_bps": delta_dispersion["stderr_bps"],
             "candidate_minus_control_t_stat": delta_dispersion["t_stat"],
+            # ``candidate_minus_control_t_stat`` above is event-level and
+            # treats every intraday event as independent.  These are the
+            # session-clustered counterparts and are the ones to read against
+            # a threshold: Student-t with ``..._cluster_df`` degrees of
+            # freedom, and a one-sided sign-flip p over whole sessions.
+            "inference_cluster_unit": "session",
+            "candidate_minus_control_cluster_stderr_bps":
+                delta_clustered["stderr"],
+            "candidate_minus_control_cluster_t_stat": delta_clustered["t_stat"],
+            "candidate_minus_control_cluster_df": delta_clustered["df"],
+            "candidate_minus_control_cluster_sign_flip_p_value": (
+                delta_sign_flip["p_value"]
+                if delta_sign_flip and delta_sign_flip.get("available") else None),
             "control_matching_counts": dict(sorted(matching_counts.items())),
             "control_pool_mean": mean(pool_sizes) if pool_sizes else None,
             "candidate_mean_session_minute": (
@@ -1032,6 +1066,9 @@ def measure_signal_quality(
             "after_hurdle_t_stat": (
                 _dispersion(candidates, shift=hurdle)["t_stat"]
                 if hurdle is not None else None),
+            "after_hurdle_cluster_t_stat": (
+                after_hurdle_clustered["t_stat"]
+                if after_hurdle_clustered is not None else None),
             "hurdle_exceedance_rate": (
                 sum(value > hurdle for value in candidates) / len(candidates)
                 if candidates and hurdle is not None else None),

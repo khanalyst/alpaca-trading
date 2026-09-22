@@ -563,10 +563,34 @@ def _fit_signal_quality_metrics(
             # A mean with no error term is what let a 47-trade replay read as a
             # finding.  Never render one of these numbers without its t.
             "control_delta_t": _number(item.get("candidate_minus_control_t_stat")),
+            # The event-level t above treats every intraday event as
+            # independent.  The session-clustered t is the one to read; it is
+            # absent on results computed before it existed.
+            "control_delta_cluster_t": _number(
+                item.get("candidate_minus_control_cluster_t_stat")),
+            "control_delta_cluster_df": _number(
+                item.get("candidate_minus_control_cluster_df")),
             "after_cost_bps": _number(item.get("mean_after_hurdle_bps")),
             "after_cost_t": _number(item.get("after_hurdle_t_stat")),
+            "after_cost_cluster_t": _number(
+                item.get("after_hurdle_cluster_t_stat")),
         })
     return result
+
+
+def _signal_t_label(item: Mapping[str, Any], clustered: str, event: str) -> str:
+    """Render a t-statistic, preferring the session-clustered value.
+
+    An event-level t on intraday events overstates evidence by roughly the
+    square root of the events per session, so it is shown only as a labelled
+    fallback when a result predates clustered inference.
+    """
+    value = item.get(clustered)
+    if value is not None:
+        df = item.get("control_delta_cluster_df")
+        suffix = f", df {int(df)}" if df is not None else ""
+        return f"clustered t {_fmt(value, 2)}{suffix}"
+    return f"event t {_fmt(item.get(event), 2)}"
 
 
 def _fit_path_telemetry_metrics(
@@ -1596,9 +1620,9 @@ def render_text(report: Mapping[str, Any]) -> str:
                             f"{item['horizon']} n={item['count']} mean "
                             f"{_fmt(item['mean_bps'], 2)}bps vs-null "
                             f"{_fmt(item['control_delta_bps'], 2)}bps "
-                            f"(t {_fmt(item['control_delta_t'], 2)}) after-cost "
+                            f"({_signal_t_label(item, 'control_delta_cluster_t', 'control_delta_t')}) after-cost "
                             f"{_fmt(item['after_cost_bps'], 2)}bps "
-                            f"(t {_fmt(item['after_cost_t'], 2)})"
+                            f"({_signal_t_label(item, 'after_cost_cluster_t', 'after_cost_t')})"
                             for item in signal_quality)
                         add(f"      fit conditional forward returns {rendered}")
                     path_metrics = _fit_path_telemetry_metrics(fit_diagnostics)
@@ -1800,9 +1824,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                             f"{item['horizon']} n={item['count']}, mean "
                             f"{_fmt(item['mean_bps'], 2)} bps, vs-null "
                             f"{_fmt(item['control_delta_bps'], 2)} bps "
-                            f"(t {_fmt(item['control_delta_t'], 2)}), after-cost "
+                            f"({_signal_t_label(item, 'control_delta_cluster_t', 'control_delta_t')}), after-cost "
                             f"{_fmt(item['after_cost_bps'], 2)} bps "
-                            f"(t {_fmt(item['after_cost_t'], 2)})"
+                            f"({_signal_t_label(item, 'after_cost_cluster_t', 'after_cost_t')})"
                             for item in signal_quality)
                         out.append(f"- Fit conditional forward returns: {rendered}")
                     path_metrics = _fit_path_telemetry_metrics(fit_diagnostics)

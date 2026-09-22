@@ -72,6 +72,26 @@ class ConditionalForwardReturnTests(unittest.TestCase):
             five["mean_forward_return_bps"] - 17.0)
         self.assertEqual(five["candidate_count"], five["matched_count"])
 
+    def test_session_clustered_inference_accompanies_every_control_delta(self):
+        result = measure_signal_quality(
+            self.bars, ROOT_SPEC, policy=self.policy, cost_hurdle_bps=17.0)
+        for label, horizon in result["horizon_metrics"].items():
+            with self.subTest(horizon=label):
+                self.assertEqual(horizon["inference_cluster_unit"], "session")
+                clusters = horizon["session_clusters"]
+                if horizon["matched_count"] and clusters >= 2:
+                    self.assertEqual(
+                        horizon["candidate_minus_control_cluster_df"],
+                        clusters - 1)
+                    p_value = horizon[
+                        "candidate_minus_control_cluster_sign_flip_p_value"]
+                    self.assertGreater(p_value, 0.0)
+                    self.assertLessEqual(p_value, 1.0)
+                    self.assertIn("after_hurdle_cluster_t_stat", horizon)
+                else:
+                    self.assertIsNone(
+                        horizon["candidate_minus_control_cluster_t_stat"])
+
     def test_direction_sign_is_applied_before_aggregation(self):
         rows = [row for row in self.bars
                 if row.symbol == self.bars[0].symbol and

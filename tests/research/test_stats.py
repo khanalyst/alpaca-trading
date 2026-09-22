@@ -1,6 +1,7 @@
 import unittest
 
 from research.stats import (
+    cluster_robust_mean_inference,
     deterministic_dependence_map,
     effective_breadth_report,
     moving_block_cluster_bootstrap_lower_bound,
@@ -153,3 +154,44 @@ class ResearchStatisticsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClusterRobustInferenceTests(unittest.TestCase):
+    def test_reduces_to_the_ordinary_error_for_singleton_clusters(self):
+        import math
+        from statistics import stdev
+        values = [1.0, 2.5, -0.3, 4.1, 0.7, 2.2]
+        result = cluster_robust_mean_inference(values, range(len(values)))
+        self.assertAlmostEqual(result["stderr"],
+                               stdev(values) / math.sqrt(len(values)))
+        self.assertEqual(result["df"], len(values) - 1)
+
+    def test_shared_cluster_shocks_shrink_the_t_statistic(self):
+        # Three sessions, ten identical events each: ten correlated looks at
+        # one shock are one observation, not ten.
+        import math
+        from statistics import mean, stdev
+        values = [1.0] * 10 + [3.0] * 10 + [-0.5] * 10
+        clusters = ["a"] * 10 + ["b"] * 10 + ["c"] * 10
+        result = cluster_robust_mean_inference(values, clusters)
+        event_t = mean(values) / (stdev(values) / math.sqrt(len(values)))
+        self.assertEqual(result["clusters"], 3)
+        self.assertEqual(result["df"], 2)
+        self.assertAlmostEqual(result["mean"], mean(values))
+        self.assertLess(result["t_stat"], event_t / 3.0)
+
+    def test_fewer_than_two_clusters_has_no_error_term(self):
+        result = cluster_robust_mean_inference([1.0, 2.0, 3.0], ["a"] * 3)
+        self.assertAlmostEqual(result["mean"], 2.0)
+        self.assertIsNone(result["stderr"])
+        self.assertIsNone(result["t_stat"])
+        self.assertIsNone(result["df"])
+
+    def test_shift_tests_against_a_hurdle_and_drops_non_finite_values(self):
+        result = cluster_robust_mean_inference(
+            [5.0, 7.0, float("nan"), 6.0, 8.0], ["a", "b", "b", "c", "d"],
+            shift=6.5)
+        self.assertEqual(result["observations"], 4)
+        self.assertAlmostEqual(result["t_stat"],
+                               (6.5 - 6.5) / result["stderr"])
+
