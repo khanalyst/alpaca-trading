@@ -34,18 +34,36 @@ def _runtime() -> dict:
     return config
 
 
-def _bar(index: int, *, close: float = 100.0,
+def _bar(index: int, *, close: float | None = None,
          volume: float = 1000.0) -> dict:
+    """One opening-range minute, or the breakout bar when ``close`` is given.
+
+    Each range minute spans a narrow slice and the slices walk across the
+    99.5-100.5 band, so the completed range is wider than any single bar.
+    Fifteen identical full-span bars would instead make ATR equal the range
+    width, which pins the width/ATR quotient at 1/sqrt(range_minutes) at every
+    price scale and leaves the fixture sitting on the band boundary rather
+    than testing what this module is about.
+    """
     stamp = OPEN + timedelta(minutes=index)
     ended = stamp + timedelta(minutes=1)
     observed = ended + (timedelta(seconds=5) if index == 15 else timedelta())
+    if close is None:
+        # Walk the range: 99.55 up to 100.45 across the fifteen minutes.
+        close = 99.55 + (index % 15) * (0.9 / 14.0)
+        high, low = close + 0.05, close - 0.05
+    else:
+        high, low = max(100.5, close + 0.2), min(99.5, close - 0.2)
     return {
         "event_key": f"bar:{index}", "event_type": "bar_1m",
         "symbol": "SPY", "timestamp": stamp.isoformat(),
         "as_of": ended.isoformat(), "observed_at": observed.isoformat(),
         "provider": "alpaca", "feed": "iex",
-        "source_mode": "forward_observed", "open": 100.0,
-        "high": max(100.5, close + 0.2), "low": min(99.5, close - 0.2),
+        "source_mode": "forward_observed",
+        # Open has to sit inside the bar's own high/low band, which the
+        # narrowed range minutes no longer contain at a fixed 100.0.
+        "open": min(max(100.0, low), high),
+        "high": high, "low": low,
         "close": close, "volume": volume,
     }
 

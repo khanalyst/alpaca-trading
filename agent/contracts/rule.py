@@ -1713,14 +1713,23 @@ def _confirmation(direction: str, rows: Sequence[Any], spec: Mapping[str, Any],
                  for row in evidence[:-1]]
         current = float(_supplied_value(evidence[-1], "volume"))
         return bool(current >= mean(prior) * spec["volume_multiplier"])
-    atr = _atr(rows, spec["atr_period"])
+    # ``compression_bps`` is an upper bound everywhere, and it is a *range
+    # width* bound: the volatility-breakout family compares it with the prior
+    # lookback window's high-low span.  Comparing it with a one-minute ATR
+    # instead put the field's two uses roughly an order of magnitude apart on
+    # the shipped universe (measured prior-window width median 11.5 bps
+    # against an ATR median of 3.2 bps), so the confirmation admitted every
+    # prefix it was asked about and could not reject anything.  Measure the
+    # same quantity the family gate measures so one field keeps one meaning.
+    if len(rows) <= spec["lookback"]:
+        return False
+    window = rows[-spec["lookback"] - 1:-1]
     close = closes[-1] if closes else 0.0
-    # ``compression_bps`` is an upper bound everywhere: volatility
-    # confirmation admits compressed (low-ATR) prefixes, matching the
-    # volatility-breakout family's range gate.  The previous lower-bound
-    # polarity made a single ``volatility`` confirmation contradict the
-    # breakout predicate and silently selected expanded regimes instead.
-    return bool(atr and close > 0 and atr / close * 10_000 <= spec["compression_bps"])
+    if close <= 0 or not window:
+        return False
+    width = (max(_number(row, "high") for row in window) -
+             min(_number(row, "low") for row in window))
+    return bool(width / close * 10_000 <= spec["compression_bps"])
 
 
 def _session_prefix(bars: Sequence[Any], current: Any) -> list[Any]:
@@ -1939,7 +1948,14 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
             return None, "slow_lookback_unavailable"
         fast = _sma(closes, spec["lookback"])
         slow = _sma(closes, spec["slow_lookback"])
-        near_fast = abs(close - fast) / fast <= max(threshold, .0005)
+        # The proximity band is the authored threshold.  A hard 5 bps floor
+        # used to override it, and since |close - fastSMA| / fastSMA has a
+        # measured median of 2.4 bps on this universe, every authored value
+        # at or below 5 bps collapsed onto the same band while every value
+        # above it admitted 97%+ of bars.  Guard only the degenerate zero,
+        # matching the ``max(threshold, 1e-9)`` idiom the reversion families
+        # already use.
+        near_fast = abs(close - fast) / fast <= max(threshold, 1e-9)
         if fast > slow and near_fast and close > opened:
             direction = "long"
         elif fast < slow and near_fast and close < opened:

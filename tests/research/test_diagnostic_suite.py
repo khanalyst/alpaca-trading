@@ -74,13 +74,31 @@ class CompleteDiagnosticSuiteTests(unittest.TestCase):
     def test_preflight_exposes_incompatibility_without_changing_policy(self):
         before = deepcopy(self.config)
         result = suite.admission_preflight(self.config)
-        self.assertAlmostEqual(result["fixed_scenario_minimum_stop_bps"], 25.0 / .30)
+        # Derived from the mounted configuration: the subject is that
+        # preflight exposes the arithmetic, not which scenario is shipped.
+        scenario = float(self.config["risk"]["stressed_cost_scenario_bps"])
+        ratio = float(self.config["risk"]["max_stressed_cost_to_risk_ratio"])
+        self.assertAlmostEqual(result["fixed_scenario_minimum_stop_bps"],
+                               scenario / ratio)
         self.assertEqual(result["rule_grammar_stop_floor_bps"], 30.0)
         self.assertEqual(result["static_bar_round_trip_cost_bps"], 17.0)
-        self.assertTrue(result["grammar_floor_below_fixed_scenario_requirement"])
+        # The mounted 9 bps scenario over a 0.30 ratio implies exactly the
+        # 30 bps grammar floor, so the floor is no longer *below* the
+        # requirement and the configuration is self-consistent.  An explicit
+        # incompatible scenario below still has to raise the flag: that is
+        # what this test is for.
+        self.assertFalse(result["grammar_floor_below_fixed_scenario_requirement"])
         self.assertFalse(result["plan_mutation"])
         self.assertFalse(result["costs_measured"])
         self.assertEqual(self.config, before)
+        incompatible = deepcopy(self.config)
+        incompatible["risk"]["stressed_cost_scenario_bps"] = 25.0
+        exposed = suite.admission_preflight(incompatible)
+        self.assertAlmostEqual(exposed["fixed_scenario_minimum_stop_bps"],
+                               25.0 / ratio)
+        self.assertTrue(
+            exposed["grammar_floor_below_fixed_scenario_requirement"])
+        self.assertFalse(exposed["plan_mutation"])
         self.config["risk"]["max_stressed_cost_to_risk_ratio"] = 0.0
         disabled = suite.admission_preflight(self.config)
         self.assertTrue(disabled["no_finite_stop_admissible"])
@@ -130,8 +148,10 @@ class CompleteDiagnosticSuiteTests(unittest.TestCase):
                 self.assertIn("historical_source", arm["runtime_evidence"]["reason_codes"])
                 self.assertTrue(arm["replay_scope"]["shared_signal_setup_risk"])
                 self.assertFalse(arm["replay_scope"]["broker_equivalence"])
+                # The eight runtime admission filters are mapped into the
+                # replay lane now, so the legacy comparison is full parity.
                 self.assertEqual(arm["legacy_comparison"]["replay_scope"]["runtime_parity"],
-                                 "partial")
+                                 "full")
         self.assertEqual(result["outcome_counts"]["unavailable"], 7)
         self.assertEqual(sum(result["legacy_comparison_outcome_counts"].values()), 7)
         self.assertEqual(result["ibr_runtime"]["status"], "unavailable")

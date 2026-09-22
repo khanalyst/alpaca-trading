@@ -57,7 +57,13 @@ def _runtime_config() -> dict:
             "execution_mode": "shares", "range_minutes": 15,
             "breakout_buffer_bps": 5.0, "min_relative_volume": 1.0,
             "target_r": 2.0, "max_entry_extension_r": 1.0,
-            "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0,
+            # The width band divides range width by ``atr * sqrt(range_minutes)``.
+            # This synthetic session carries a unit range against a unit
+            # one-minute ATR, so its normalised quotient is ~0.26 -- right on
+            # the mounted 0.25 lower bound.  The fixture is about filter
+            # plumbing, not width selection, so widen the floor rather than
+            # let an unrelated assertion sit on a boundary.
+            "min_ibr_width_atr": 0.1, "max_ibr_width_atr": 3.0,
             "atr_period": 14, "max_ibr_width_pct": 2.0,
             "stale_minutes": 0.5, "max_spread_bps": 25.0,
             "latest_entry_time": "15:00",
@@ -307,7 +313,8 @@ class IBRRuntimeParityTests(unittest.TestCase):
         cases = (
             ("min_relative_volume", {"min_relative_volume": 2.1}, {}),
             ("min_ibr_width_atr", {"min_ibr_width_atr": 1.5}, {}),
-            ("max_ibr_width_atr", {"max_ibr_width_atr": 0.5}, {}),
+            # 0.5 no longer rejects this fixture's ~0.26 normalised quotient.
+            ("max_ibr_width_atr", {"max_ibr_width_atr": 0.05}, {}),
             ("max_ibr_width_pct", {"max_ibr_width_pct": 0.5}, {}),
             ("atr_period", {"atr_period": 30}, {}),
             ("max_entry_extension_r", {"max_entry_extension_r": 0.5}, {}),

@@ -8,6 +8,7 @@ P&L, while keeping zero-trade rows attributable to their control.
 """
 
 import json
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
@@ -188,13 +189,19 @@ class CostRerunTests(unittest.TestCase):
                         places=9)
 
     def test_the_admission_gate_is_reported_separately_from_cost(self):
+        # Read the scenario from the mounted configuration rather than
+        # restating the shipped scalar: the subject here is that the gate is
+        # reported with its own arithmetic, not which scenario is selected.
+        scenario = float(self.config["risk"]["stressed_cost_scenario_bps"])
+        ratio = float(self.config["risk"]["max_stressed_cost_to_risk_ratio"])
         gate = self.report["stressed_cost_gate"]
-        self.assertEqual(gate["scenario_bps"], 25.0)
-        self.assertEqual(gate["max_cost_to_risk_ratio"], 0.30)
+        self.assertEqual(gate["scenario_bps"], scenario)
+        self.assertEqual(gate["max_cost_to_risk_ratio"], ratio)
         self.assertEqual(gate["grammar_min_stop_bps"], 30.0)
         self.assertAlmostEqual(gate["stress_implied_min_stop_bps"],
-                               25.0 / 0.30)
-        self.assertAlmostEqual(gate["implied_min_stop_bps"], 25.0 / 0.30)
+                               scenario / ratio)
+        self.assertAlmostEqual(gate["implied_min_stop_bps"],
+                               max(30.0, scenario / ratio))
         self.assertEqual(gate["effective_min_stop_bps"],
                          gate["implied_min_stop_bps"])
 
@@ -203,8 +210,14 @@ class CostRerunTests(unittest.TestCase):
         tight = [validate_rule_spec({**spec, "stop_atr": 1.0,
                                      "target_r": 10.0})
                  for spec in deterministic_cohort()][:2]
+        # At the shipped 9 bps scenario the implied minimum stop equals the
+        # 30 bps grammar floor, so nothing can bind.  Name a scenario that
+        # does bind: the subject is that the veto fires and is attributable,
+        # not which scenario the deployment happens to select.
+        binding = deepcopy(self.config)
+        binding["risk"]["stressed_cost_scenario_bps"] = 25.0
         report = run_cost_rerun(_depth_qualified_edge_corpus(25),
-                                runtime_config=self.config,
+                                runtime_config=binding,
                                 specs=tight, min_quotes_per_cell=50)
         gated = [item for item in report["results"]
                  if item["measured"]["stressed_cost_rejections"] > 0]

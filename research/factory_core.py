@@ -163,12 +163,27 @@ FAMILY_TEMPLATES: tuple[dict[str, Any], ...] = (
      "threshold_bps": 8.0, "target_r": 1.5, "confirmation": "none"},
     {"family": "momentum_continuation", "lookback": 12,
      "threshold_bps": 18.0, "confirmation": "volume"},
-    {"family": "mean_reversion", "lookback": 20,
+    # Carries ``confirmation: volatility``, so it needs an explicit
+    # ``compression_bps``; the 45 bps grammar default admits 96.8% of bars and
+    # left the arm effectively unconfirmed.  12 bps is near the measured
+    # median prior-window width.
+    {"family": "mean_reversion", "lookback": 20, "compression_bps": 12.0,
      "zscore": 1.5, "target_r": 1.5, "confirmation": "volatility"},
+    # ``threshold_bps`` is the pullback proximity band to the fast SMA.  At
+    # 15 bps it admitted 97.1% of bars against a measured median deviation of
+    # 2.4 bps, so it was not selecting a pullback.  3 bps sits between the
+    # measured p25 and p50.  The reclaim entry trigger reads the same field as
+    # an impulse magnitude; the frozen intraday-mechanisms.v1 cohort carries
+    # its own specifications and is unaffected by this root.
     {"family": "trend_pullback", "lookback": 10,
-     "slow_lookback": 35, "threshold_bps": 15.0, "confirmation": "trend"},
+     "slow_lookback": 35, "threshold_bps": 3.0, "confirmation": "trend"},
+    # ``compression_bps`` is a prior-window range-width bound in bps.  55 bps
+    # sat above the 98th percentile of that width on the shipped universe
+    # (measured p25 7.7, p50 11.5, p95 37.3), so the "compression" gate
+    # admitted 96.8% of bars and the family did not select compression at
+    # all.  8 bps is the measured lower quartile.
     {"family": "volatility_breakout", "lookback": 12,
-     "compression_bps": 55.0, "threshold_bps": 5.0, "confirmation": "volume"},
+     "compression_bps": 8.0, "threshold_bps": 5.0, "confirmation": "volume"},
     {"family": "volume_breakout", "lookback": 15,
      "volume_multiplier": 1.5, "threshold_bps": 5.0, "confirmation": "trend"},
     {"family": "vwap_reversion", "lookback": 20,

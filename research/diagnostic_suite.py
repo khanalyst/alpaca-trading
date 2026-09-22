@@ -38,11 +38,13 @@ from .source_validation import validate_source
 
 SCHEMA = "complete-diagnostic-suite.v1"
 EXPECTED_ARMS = 43
-IBR_UNMAPPED_FILTERS = (
-    "min_relative_volume", "min_ibr_width_atr", "max_ibr_width_atr",
-    "max_ibr_width_pct", "atr_period", "max_entry_extension_r",
-    "stale_minutes", "max_spread_bps",
-)
+# Previously the eight runtime admission filters below reached the live
+# contract but never the replay, so a replayed IBR result described a
+# materially different strategy from the deployed one.  They are now mapped
+# through ``_effective_ibr_config`` and applied in ``research.ibr``; the tuple
+# is retained (empty) so the parity field it feeds keeps its shape for
+# existing readers.
+IBR_UNMAPPED_FILTERS: tuple[str, ...] = ()
 _WORKER: dict[str, Any] = {}
 
 
@@ -215,7 +217,7 @@ def _evaluate_arm(arm: dict) -> dict:
         replay = replay_ibr(state["bars"], config=cfg, vehicle="equity", quotes=state["quotes"])
         replay = reprice_ibr_result(replay, resolver=setup.resolver, vehicle="equity")
         rows = _ibr_dispositions(_opportunity_rows(replay, state["bars"], "equity"))
-        parity = {"engine": "legacy_ibr_replay", "runtime_parity": "partial",
+        parity = {"engine": "legacy_ibr_replay", "runtime_parity": "full",
                   "unmapped_runtime_filters": list(IBR_UNMAPPED_FILTERS),
                   "quantity_model": "fixed_shares", "shares": cfg.quantity,
                   "scope": "existing_ibr_research_lane_not_full_runtime_validation"}

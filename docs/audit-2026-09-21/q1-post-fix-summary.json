@@ -1,0 +1,218 @@
+[
+ {
+  "vid": "rule.opening-range-breakout.0eb200d3136d80ee",
+  "family": "opening_range_breakout",
+  "role": "baseline",
+  "signals": 401,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 401
+ },
+ {
+  "vid": "rule.opening-range-breakout.4b10682772f81284",
+  "family": "opening_range_breakout",
+  "role": "variant",
+  "signals": 380,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 380
+ },
+ {
+  "vid": "rule.opening-range-fade.d5785d9e70b56def",
+  "family": "opening_range_fade",
+  "role": "baseline",
+  "signals": 65,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 65
+ },
+ {
+  "vid": "rule.opening-range-fade.be61630d346f0923",
+  "family": "opening_range_fade",
+  "role": "variant",
+  "signals": 31,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 31
+ },
+ {
+  "vid": "rule.momentum-continuation.fe74f73cfc7d082a",
+  "family": "momentum_continuation",
+  "role": "baseline",
+  "signals": 332,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 332
+ },
+ {
+  "vid": "rule.momentum-continuation.984cbcedd4a2846a",
+  "family": "momentum_continuation",
+  "role": "variant",
+  "signals": 232,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 232
+ },
+ {
+  "vid": "rule.mean-reversion.b4e231565af56f03",
+  "family": "mean_reversion",
+  "role": "baseline",
+  "signals": 426,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 426
+ },
+ {
+  "vid": "rule.mean-reversion.75a110f082d304d1",
+  "family": "mean_reversion",
+  "role": "variant",
+  "signals": 423,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 423
+ },
+ {
+  "vid": "rule.trend-pullback.eaf3e32977d88904",
+  "family": "trend_pullback",
+  "role": "baseline",
+  "signals": 456,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 456
+ },
+ {
+  "vid": "rule.trend-pullback.2ffd1a88404dd020",
+  "family": "trend_pullback",
+  "role": "variant",
+  "signals": 456,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 456
+ },
+ {
+  "vid": "rule.volatility-breakout.cc1b851a285825c5",
+  "family": "volatility_breakout",
+  "role": "baseline",
+  "signals": 76,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 76
+ },
+ {
+  "vid": "rule.volatility-breakout.ba43d3a496ff37d8",
+  "family": "volatility_breakout",
+  "role": "variant",
+  "signals": 168,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 168
+ },
+ {
+  "vid": "rule.volume-breakout.30fece6e3f9b9fd6",
+  "family": "volume_breakout",
+  "role": "baseline",
+  "signals": 254,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 254
+ },
+ {
+  "vid": "rule.volume-breakout.a68b65c3c8e96ff4",
+  "family": "volume_breakout",
+  "role": "variant",
+  "signals": 239,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 239
+ },
+ {
+  "vid": "rule.vwap-reversion.ab97bfe87ed566de",
+  "family": "vwap_reversion",
+  "role": "baseline",
+  "signals": 380,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 380
+ },
+ {
+  "vid": "rule.vwap-reversion.cf8b38b12c9bf952",
+  "family": "vwap_reversion",
+  "role": "variant",
+  "signals": 300,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 300
+ },
+ {
+  "vid": "rule.vwap-trend.349de232c3d7a18c",
+  "family": "vwap_trend",
+  "role": "baseline",
+  "signals": 90,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 90
+ },
+ {
+  "vid": "rule.vwap-trend.588bc47ed64d051e",
+  "family": "vwap_trend",
+  "role": "variant",
+  "signals": 40,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 40
+ },
+ {
+  "vid": "rule.range-expansion.a9871756f22463a5",
+  "family": "range_expansion",
+  "role": "baseline",
+  "signals": 429,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 429
+ },
+ {
+  "vid": "rule.range-expansion.f7fd1b25f2f95ba6",
+  "family": "range_expansion",
+  "role": "variant",
+  "signals": 403,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 403
+ },
+ {
+  "vid": "rule.opening-drive.393e7229056fc663",
+  "family": "opening_drive",
+  "role": "baseline",
+  "signals": 149,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 149
+ },
+ {
+  "vid": "rule.opening-drive.560520e6c8c85b1e",
+  "family": "opening_drive",
+  "role": "variant",
+  "signals": 103,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 103
+ },
+ {
+  "vid": "rule.cross-sectional-residual.374375e771a64864",
+  "family": "cross_sectional_residual",
+  "role": "baseline",
+  "signals": 0,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 0
+ },
+ {
+  "vid": "rule.cross-sectional-residual.2969f7f47855f157",
+  "family": "cross_sectional_residual",
+  "role": "variant",
+  "signals": 0,
+  "vetoed": 0,
+  "required_stop_bps": 30.0,
+  "trade_count": 0
+ }
+]

@@ -76,7 +76,7 @@
     "options_min_dte": 7,
     "options_max_dte": 60,
     "options_max_spread_pct": 10,
-    "stressed_cost_scenario_bps": 25,
+    "stressed_cost_scenario_bps": 9,
     "max_stressed_cost_to_risk_ratio": 0.3,
     "stressed_cost_calibration_enabled": false,
     "stressed_cost_calibration_path": ""

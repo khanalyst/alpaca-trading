@@ -93,8 +93,13 @@ class IBRContractTests(unittest.TestCase):
                  "high": 200, "low": 1, "close": 100.0},
             ],
         }
+        # The width band reads range width over a horizon-scaled ATR
+        # (``atr * sqrt(range_minutes)``), so this fixture's unit-width range
+        # against a unit ATR over a fifteen-minute window sits near 0.26.
+        # The band is deliberately permissive here: this test is about causal
+        # ``now`` handling and ATR-history bounding, not width selection.
         cfg = {"strategy": {"atr_period": 2,
-                             "min_ibr_width_atr": 0.5,
+                             "min_ibr_width_atr": 0.1,
                              "max_ibr_width_atr": 2.0,
                              "breakout_buffer_bps": 5,
                              "min_relative_volume": 1}}

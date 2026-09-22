@@ -618,13 +618,26 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
         breakout_buffer_bps=float(strategy.get("breakout_buffer_bps", 5.0)),
         costs=costs,
         close_confirmed=bool(close_confirmed),
+        # The runtime admission filters travel with the config so replay and
+        # the live contract admit the same candidate bars.  Omission keeps the
+        # contract's own permissive default rather than inventing a limit.
+        min_relative_volume=float(strategy.get("min_relative_volume", 0.0)),
+        min_ibr_width_atr=float(strategy.get("min_ibr_width_atr", 0.0)),
+        max_ibr_width_atr=float(strategy.get("max_ibr_width_atr", float("inf"))),
+        max_ibr_width_pct=float(strategy.get("max_ibr_width_pct", float("inf"))),
+        atr_period=int(strategy.get("atr_period", 14)),
+        max_entry_extension_r=float(
+            strategy.get("max_entry_extension_r", float("inf"))),
+        stale_minutes=float(strategy.get("stale_minutes", float("inf"))),
+        max_spread_bps=float(strategy.get("max_spread_bps", float("inf"))),
         timezone=str((source.get("session") or {}).get("timezone", "America/New_York")),
         policy=(ReplayPolicy.from_config(source) if policy is None else policy),
     )
     effective = dict(source)
     effective["strategy"] = strategy
     effective["replay"] = {"close_confirmed": cfg.close_confirmed,
-                            "range_stop": cfg.range_stop}
+                            "range_stop": cfg.range_stop,
+                            "runtime_admission_filters": "mapped"}
     # Persist the selected model at the top level (the effective replay
     # economics) while retaining the complete normalized schedule.  The
     # latter belongs to candidate identity: changing an option-only override

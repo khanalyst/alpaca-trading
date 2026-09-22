@@ -9,6 +9,7 @@ populations.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 import math
@@ -19,7 +20,7 @@ from agent.contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
     quantize_equity_bracket,
 )
-from agent.contracts.ibr import close_breaks_range
+from agent.contracts.ibr import atr_series, close_breaks_range
 from agent.contracts.rule import canonical_exit_reason
 from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS,
                                   MIN_STOP_DISTANCE_FRACTION)
@@ -63,6 +64,22 @@ class IBRConfig:
     # completed signal close explicitly.  The option is persisted in the
     # config hash so the two interpretations cannot be mixed in one run.
     close_confirmed: bool = False
+    # Runtime admission filters, mirrored field-for-field from
+    # ``agent.contracts.ibr.IBRConfig`` and carrying that contract's own
+    # permissive defaults.  Before these existed the replay applied none of
+    # them, so the two lanes shared only three substantive parameters and a
+    # replayed IBR result described a materially different strategy from the
+    # one the runtime would execute.  A caller that supplies the mounted
+    # runtime values now gets the same admission decision in both lanes; a
+    # caller that omits them keeps the historical permissive replay.
+    min_relative_volume: float = 0.0
+    min_ibr_width_atr: float = 0.0
+    max_ibr_width_atr: float = float("inf")
+    max_ibr_width_pct: float = float("inf")
+    atr_period: int = 14
+    max_entry_extension_r: float = float("inf")
+    stale_minutes: float = float("inf")
+    max_spread_bps: float = float("inf")
     # Replay always uses the checked runtime policy.  Diagnostics that need
     # legacy bar fallback must opt out explicitly with
     # ``ReplayPolicy(strict_market_data=False)``.
@@ -88,6 +105,23 @@ class IBRConfig:
             raise ReplayError("breakout_buffer_bps cannot be negative")
         if not isinstance(self.close_confirmed, bool):
             raise ReplayError("close_confirmed must be true or false")
+        # Mirror the runtime contract's own validation so a value it would
+        # refuse cannot reach replay and quietly widen admission here.
+        if (isinstance(self.atr_period, bool) or
+                not isinstance(self.atr_period, int) or self.atr_period <= 0):
+            raise ReplayError("atr_period must be a positive integer")
+        for name in ("min_relative_volume", "min_ibr_width_atr",
+                     "max_ibr_width_atr", "max_ibr_width_pct",
+                     "max_entry_extension_r", "stale_minutes",
+                     "max_spread_bps"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ReplayError(f"{name} must be a number")
+            if value < 0 or (value != value):
+                raise ReplayError(f"{name} cannot be negative")
+        if self.min_ibr_width_atr > self.max_ibr_width_atr:
+            raise ReplayError(
+                "min_ibr_width_atr cannot exceed max_ibr_width_atr")
         try:
             resolved = (ReplayPolicy() if self.policy is None else
                         ReplayPolicy.from_config(self.policy)
@@ -281,6 +315,41 @@ class IBRResult:
             "diagnostic_only": bool(self.diagnostic_only),
             "canonical_exit_reasons": dict(sorted(canonical.items())),
         }
+
+
+def _candidate_spread_bps(quotes, symbol: str, bar: UnderlyingBar) -> float | None:
+    """Quoted spread in bps at a candidate bar's close, or ``None``.
+
+    The runtime reads the spread off the candidate bar it is handed.  Replay
+    has to recover the same observation from the recorded quote corpus, so it
+    takes the last quote at or before the bar's close.  ``None`` means the
+    corpus carries no quote for that instant, which the caller treats the way
+    the contract does: silence, not a rejection.
+    """
+    if not isinstance(quotes, Mapping):
+        return None
+    rows = quotes.get(str(symbol).upper()) or quotes.get(str(symbol))
+    if not rows:
+        return None
+    latest = None
+    for quote in rows:
+        stamp = getattr(quote, "timestamp", None)
+        if stamp is None or stamp > bar.end:
+            continue
+        if latest is None or stamp >= getattr(latest, "timestamp", stamp):
+            latest = quote
+    if latest is None:
+        return None
+    bid = getattr(latest, "bid", None)
+    ask = getattr(latest, "ask", None)
+    try:
+        bid = float(bid); ask = float(ask)
+    except (TypeError, ValueError):
+        return None
+    mid = (bid + ask) / 2.0
+    if not math.isfinite(bid) or not math.isfinite(ask) or mid <= 0 or ask < bid:
+        return None
+    return (ask - bid) / mid * 10_000.0
 
 
 def _local(ts: datetime, zone: ZoneInfo) -> datetime:
@@ -697,8 +766,78 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     def breaks(bar: UnderlyingBar) -> bool:
         return ((buffer_long(bar) or buffer_short(bar)) if cfg.close_confirmed
                 else (bar.high > high or bar.low < low))
-    signal_idx = next((i for i, b in enumerate(post) if breaks(b)), None)
+
+    # Runtime admission.  ``evaluate_ibr_breakout`` refuses a candidate bar on
+    # these grounds and moves to the next one, so replay has to select the
+    # first bar that both breaks the range *and* clears them; stopping at the
+    # first raw break and refusing the session would discard a later
+    # admissible breakout the runtime would have taken.
+    width = high - low
+    width_pct = (width / low * 100.0) if low else None
+    range_volume_mean = (sum(b.volume for b in range_bars) / len(range_bars)
+                         if range_bars else 0.0)
+    admission_rejects: Counter = Counter()
+
+    def admitted(index: int, bar: UnderlyingBar) -> bool:
+        if width <= 0:
+            admission_rejects["nonpositive_range_width"] += 1
+            return False
+        if width_pct is not None and width_pct > cfg.max_ibr_width_pct:
+            admission_rejects["ibr_width_pct_above_limit"] += 1
+            return False
+        if cfg.min_ibr_width_atr > 0 or cfg.max_ibr_width_atr < float("inf"):
+            history = [{"timestamp": b.timestamp, "high": b.high,
+                        "low": b.low, "close": b.close}
+                       for b in [*range_bars, *post[:index + 1]]]
+            series = atr_series(history, period=cfg.atr_period)
+            atr = series[-1] if series else None
+            if not atr or atr <= 0:
+                admission_rejects["atr_unavailable"] += 1
+                return False
+            # Horizon-scaled exactly as the runtime contract scales it, so the
+            # authored band means the same thing in both lanes.
+            ratio = width / (atr * math.sqrt(max(1, int(cfg.range_minutes))))
+            if ratio < cfg.min_ibr_width_atr or ratio > cfg.max_ibr_width_atr:
+                admission_rejects["ibr_width_atr_outside_band"] += 1
+                return False
+        if cfg.min_relative_volume > 0:
+            if range_volume_mean <= 0:
+                admission_rejects["relative_volume_unavailable"] += 1
+                return False
+            if bar.volume / range_volume_mean < cfg.min_relative_volume:
+                admission_rejects["relative_volume_below_limit"] += 1
+                return False
+        if cfg.max_entry_extension_r < float("inf"):
+            long_side = buffer_long(bar) if cfg.close_confirmed else bar.high > high
+            extension = max(0.0, ((bar.close - high) / width) if long_side
+                            else ((low - bar.close) / width))
+            if extension > cfg.max_entry_extension_r:
+                admission_rejects["entry_extension_above_limit"] += 1
+                return False
+        # Staleness and spread mirror the contract's polarity exactly: it
+        # refuses a candidate whose age or spread is *known* to breach the
+        # limit and stays silent when the observation is simply absent.
+        # Rejecting on absence here would make replay stricter than the
+        # runtime and re-open the divergence from the other side.
+        if cfg.stale_minutes < float("inf"):
+            observed = _available(bar, cfg.policy)
+            if (observed is not None and
+                    (observed - bar.end).total_seconds() > cfg.stale_minutes * 60):
+                admission_rejects["stale_candidate_bar"] += 1
+                return False
+        if cfg.max_spread_bps < float("inf"):
+            spread = _candidate_spread_bps(quotes, symbol, bar)
+            if spread is not None and spread > cfg.max_spread_bps:
+                admission_rejects["spread_above_limit"] += 1
+                return False
+        return True
+
+    signal_idx = next((i for i, b in enumerate(post)
+                       if breaks(b) and admitted(i, b)), None)
     if signal_idx is None:
+        if admission_rejects:
+            reason, _count = admission_rejects.most_common(1)[0]
+            return refuse(reason, dict(admission_rejects))
         return refuse("no_breakout")
     if signal_idx + 1 >= len(post):
         return refuse("breakout_on_final_bar")

@@ -609,7 +609,18 @@ def evaluate_ibr_breakout(
     if atr is not None and "atr_pct" in bar:
         atr = close * atr / 100.0
     if atr and atr > 0:
-        ratio = width / atr
+        # ``atr`` is a one-minute ATR while ``width`` spans ``range_minutes``
+        # of those minutes, so a raw quotient grows with the opening window
+        # and carries a unit the authored band was never written in.  On the
+        # shipped 24-ETF universe the raw ratio runs 3.6-14 at 15 minutes and
+        # 6.6-23 at 45, so the authored [0.25, 3.0] band admitted nothing at
+        # any range length.  Scale the one-minute volatility to the range
+        # horizon the way a diffusion does.  The quotient is then
+        # horizon-invariant (measured p5 0.93-0.98 and median 1.57-1.86 at 15,
+        # 30, 45 and 60 minutes) and the authored band selects the intended
+        # tail: unusually wide or unusually narrow openings relative to the
+        # session's own volatility.
+        ratio = width / (atr * math.sqrt(max(1, int(cfg.range_minutes))))
         if ratio < cfg.min_ibr_width_atr or ratio > cfg.max_ibr_width_atr:
             return None
     elif cfg.min_ibr_width_atr > 0 or cfg.max_ibr_width_atr < float("inf"):

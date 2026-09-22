@@ -445,9 +445,13 @@ class V2EvaluationTests(unittest.TestCase):
         self.assertIsNone(evaluate_rule_signal(bars, too_wild))
 
     def test_volatility_confirmation_uses_compression_as_an_upper_bound(self):
+        # ``compression_bps`` bounds the prior lookback window's high-low
+        # span, the same quantity the volatility-breakout family gate reads,
+        # rather than a per-bar ATR.  The bound therefore carries the wider
+        # window unit: these fixtures span 119.6 and 464.0 bps respectively.
         low_atr = validate_rule_spec({
             **BASE, "schema": RULE_SCHEMA_V2, "confirmation": "volatility",
-            "compression_bps": 100.0,
+            "compression_bps": 200.0,
         })
         high_atr = rising_bars(40, 5, drift=.01)
         low_atr_rows = rising_bars(40, 5, drift=.001)
