@@ -39,9 +39,7 @@ raw-confirmatory-p, and stressed-cost boundaries and additionally seals paired
 synthetic root-control shadow decisions/replays, diagnostic-only historical-
 backfill provenance with exact calendar metadata, durable live-shadow FDR
 allocation binding, chronological paired inference, finite BY input
-validation, and conservative broker-tick equity rounding. Epoch-5 proofs remain
-readable for audit but are quarantined and cannot validate, champion, or
-authorize the paper trader until re-derived under epoch 6.
+validation, and conservative broker-tick equity rounding. Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. Epoch-5 and epoch-6 proofs remain readable for audit but are quarantined and cannot validate, champion, or authorize the paper trader until re-derived under epoch 7.
 
 The finite rule grammar contains twelve families. The twelfth,
 `cross_sectional_residual`, is shares-only, benchmarks SPY, and requires
@@ -156,8 +154,7 @@ cells fail closed. The checked-in block is disabled until a corpus-specific
 schedule is deliberately fitted and frozen.
 Stress bps are charged against entry notional, with listed-option round-trip
 fees added for both per-contract sides; they are not per-side bps. The shipped
-`max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade's 25-bps
-entry-notional stress is about `0.833` of risk and is vetoed before option fees.
+admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
 For equity geometry, a broker-normalized authored stop below
 `max(30 bps, scenario / max-cost-to-risk ratio)` is likewise refused as
 `stressed_cost_risk_limit` before sizing or fill. The stop is never widened and
@@ -590,7 +587,7 @@ confirmatory window, and only that gate's raw p is sent to LORD++. The source
 and provenance persist both session lists, their digests, the disjointness
 marker, and the confirmatory p-value source. Legacy same-tail v3 and v4 records
 (`lord_balanced_raw_p_v3`) and v2 records (`lord_balanced_v2`), as well as v5
-LORD++ rows, remain auditable but cannot authorize under epoch 6. The persisted
+LORD++ rows, remain auditable but cannot authorize under epoch 6 or later. The persisted
 live proof
 must match the durable FDR allocation for its vehicle scope and test id;
 caller-supplied p/alpha/allocation fields are not authority.
@@ -657,7 +654,7 @@ the raw held-out delta.
 
 Every run also records the replay generation it was measured under
 (`research/edge_ledger_store.py::REPLAY_ENGINE_EPOCH`), assigned by the ledger
-and never accepted from a caller. The current generation is **epoch 6**. Epoch
+and never accepted from a caller. The current generation is **epoch 7**; what it changed follows the epoch-6 description below. Epoch
 6 retains the epoch-5 point-in-time availability, executable-row-only
 statistics, vehicle-specific cost provenance, raw confirmatory p accounting,
 and stressed-cost abstention boundary. It additionally seals paired synthetic
@@ -669,15 +666,15 @@ chronologically, validates finite BY inputs (alpha in `(0,1]`, p-values in
 separately seeded, reproducible placebo-null calculation, and rounds
 broker-bound equity prices conservatively to valid ticks before sizing.
 
+Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. This is the case the next paragraph describes: a digest check cannot catch it, because an epoch-6 run still re-hashes and recomputes exactly what the epoch-6 evaluator produced.
+
 A run from a superseded generation cannot authorize `validated`, `champion`, or
 runtime eligibility, and `EdgeLedger.eligibility` names that quarantine rather
 than reporting a bare ineligibility. This is deliberately not a digest check:
 evidence measured under a replay engine that has since been corrected still
 re-hashes and still recomputes, because the recorded rows are exactly what that
 engine produced. Quarantine is not deletion — the rows stay readable and the
-lifecycle history stays intact — so epoch-5 proofs remain audit-readable but
-must be re-derived under epoch 6 to authorize. Authorization requires exact
-equality with current epoch 6; future as well as stale epochs remain audit-only.
+lifecycle history stays intact — so epoch-5 and epoch-6 proofs remain audit-readable but must be re-derived under epoch 7 to authorize. Authorization requires exact equality with current epoch 7; future as well as stale epochs remain audit-only.
 Each current-epoch run seals one immutable verified gate proof; re-derivation
 appends a new proof rather than rewriting history. The constant is raised
 whenever a replay or gate change invalidates evidence recorded before it.

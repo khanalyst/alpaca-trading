@@ -1,4 +1,4 @@
-# Steps 5, 6 and 2 — exit geometry, signal quality, and costs
+# Steps 5, 6 and 2: exit geometry, signal quality, and costs
 
 Completes the remediation list in `FINDINGS.md`. Same corpus throughout:
 177,504 one-minute bars, the configured 24-ETF universe, 19 sessions
@@ -11,7 +11,7 @@ sign of that signal is the opposite of what nine of the twelve families assume.
 
 ---
 
-## Step 5 — exit geometry: a real defect, worth about half a basis point
+## Step 5, exit geometry: a real defect worth about half a basis point
 
 65% of trades exit on time and the median excursion is a quarter of the target,
 so the bracket is plainly mis-sized. The question is what fixing it is worth.
@@ -54,7 +54,7 @@ not a strategy; it is the one-bar forward return.
 
 ---
 
-## Step 6 — signal quality: the decisive measurement
+## Step 6, signal quality: the decisive measurement
 
 `research/signal_quality.py` measures conditional forward return minus a
 **clock-matched control**: the same instrument, at the same session minute, on
@@ -118,11 +118,17 @@ continuation expression, is the single worst arm in the catalogue.
 ### What this does not establish
 
 - **The t-statistics are event-level, not session-clustered.** The module
-  reports `session_clusters` but does not use it in the standard error. On the
-  same arms, the session-clustered t computed in Q2 ran roughly one third of
-  the event-level value. Treat every t above as about 3x overstated:
+  reported `session_clusters` but did not use it in the standard error.
+  ~~On the same arms, the session-clustered t computed in Q2 ran roughly one
+  third of the event-level value. Treat every t above as about 3x overstated:
   `vwap_reversion` at +4.67 is nearer +1.6 clustered, which is **not**
-  significant on its own.
+  significant on its own.~~ **Corrected 22 September: this estimate was wrong.**
+  It was extrapolated from Q2's *raw* forward returns, which share each day's
+  market shock. The signed, control-adjusted delta largely does not, because
+  long and short signals in one session cancel that shock. Measured directly
+  (`RE-AUDIT.md`), clustered t is a median **0.86** of the event-level value,
+  and `vwap_reversion` holds at clustered **t = +4.34** (df 17). See the
+  correction section at the end of this document.
 - **The 24 arms share 19 sessions**, so their signs are correlated and the
   sign-test p is overstated for the same reason. One dominant regime would line
   every arm up regardless of predicate quality.
@@ -165,14 +171,15 @@ lead looks like before it is either confirmed or killed by more data.
    growing in horizon. They are not merely unprofitable; they are
    systematically backwards on this universe. Retiring them shrinks the
    false-discovery denominator for the hypotheses that are worth testing.
-4. **Fix the clustered standard error in `signal_quality.py`.** It already
-   computes `session_clusters`; it should use them. Until it does, its t-stats
-   overstate by roughly 3x and cannot be read against any threshold.
+4. **Fix the clustered standard error in `signal_quality.py`.** Done on
+   22 September: every horizon now reports a session-clustered t, its degrees
+   of freedom and a cluster sign-flip p. (The "roughly 3x" overstatement stated
+   here originally was wrong; the measured ratio is a median 0.86.)
 5. Exit geometry: leave it. Measured at +0.44 bps.
 
 ---
 
-## Step 2 — costs: still operator-blocked, with the evidence quantified
+## Step 2, costs: still operator-blocked, with the evidence quantified
 
 Unchanged from `REMEDIATION.md`: fitting `costs.measured_quote` needs a quote
 corpus with 500+ quotes per cell and exact feed provenance. This session has
@@ -208,3 +215,48 @@ tradeable, so Step 2 now matters more than it did before this measurement.
 No source change was made for Steps 5, 6 or 2. They are measurements and
 documentation. The full `deploy/test_suite.py` result is recorded in the commit
 message.
+
+---
+
+## Correction, 22 September 2026
+
+Re-measured with the session-clustered inference now built into
+`research/signal_quality.py`, on the 18 examined sessions still available
+from the source (26 August to 21 September), with the public data labelled
+honestly as `historical_backfill` on `delayed_sip`.
+
+| arm, 60 minutes | delta | event t | **clustered t** | df | sign-flip p |
+| --- | --- | --- | --- | --- | --- |
+| `vwap_reversion` baseline | +9.44 | 4.79 | **+4.34** | 17 | 0.0010 |
+| `vwap_reversion` variant | +9.07 | 3.97 | +3.23 | 17 | 0.0027 |
+| `opening_range_fade` baseline | +19.51 | 3.82 | +2.95 | 17 | 0.0036 |
+| `vwap_trend` baseline (mirror) | -13.12 | -4.96 | **-6.36** | 17 | 1.0000 |
+
+What changes:
+
+- **The in-sample evidence is materially stronger than stated above.**
+  Clustering costs a median 14% of the t-statistic here, not two thirds.
+- **Eleven continuation arms are individually and significantly negative**
+  once clustered (t from -2.45 to -6.36, df 17), so the reversion/continuation
+  split is not only a pattern across arms; it holds arm by arm.
+- **Against the multiplicity actually incurred** (24 arms by 5 horizons, 120
+  one-sided tests, Bonferroni 0.00042), `vwap_reversion` passes on the clustered
+  t (p = 0.00022) and fails on the sign-flip (p = 0.0010). The preregistration
+  requires both, so even in-sample it falls just short of its own bar.
+
+What does not change:
+
+- **All of this is the data that selected the hypothesis.** It strengthens the
+  case for the sealed forward test; it cannot substitute for it. That test,
+  `vwap-reversion-control-adjusted.v1`, was sealed in commit `c674f2f` before
+  this re-measurement was run, and its rules are hash-pinned.
+- **Cost.** +9.44 bps at 60 minutes against a realistic ~1.2 bps round trip is
+  tradeable; against the modelled 17 bps it is not. Step 2 still decides that.
+- **Recommendation 3 is withdrawn.** Retiring the continuation families would
+  select on in-sample evidence from one regime. Its stated benefit, a smaller
+  false-discovery denominator, no longer applies to the hypothesis that
+  matters: the preregistered test spends its own predeclared alpha, outside the
+  factory's multiplicity, and the diagnostic shadow cohort spends none
+  (`online_fdr: false`). Keeping them is free, and their forward data is the
+  regime evidence the preregistered mirror endpoint reads.
+

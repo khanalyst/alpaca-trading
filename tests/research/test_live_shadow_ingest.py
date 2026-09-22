@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from research import edge_discovery_core, gates
 from research.edge_ledger import EdgeLedger
-from research.edge_ledger_store import content_hash
+from research.edge_ledger_store import REPLAY_ENGINE_EPOCH, content_hash
 from research.live_shadow import (
     ShadowStore, _candidate_epoch_identity, _digest,
     _manifest_replay_identity, _safe_config,
@@ -488,7 +488,8 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(second["ingested"], 1, second)
         runs = self.ledger.runs(cid, lane="shadow")
         self.assertEqual(len(runs), 2)
-        self.assertEqual(runs[-1]["metrics"]["replay_engine_epoch"], 6)
+        self.assertEqual(runs[-1]["metrics"]["replay_engine_epoch"],
+                         REPLAY_ENGINE_EPOCH)
         self.assertNotEqual(runs[0]["run_id"], runs[1]["run_id"])
 
     def test_online_fdr_records_raw_p_not_selected_global_q(self):

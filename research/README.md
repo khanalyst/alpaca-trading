@@ -108,10 +108,7 @@ executable-row, vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries,
 and additionally seals paired synthetic root-control shadow decisions/replays,
 diagnostic-only historical-backfill provenance with exact calendar metadata,
 durable live-shadow FDR allocation binding, chronological paired inference,
-finite BY input validation, and conservative broker-tick equity rounding.
-Epoch-5 proofs remain readable for audit but are quarantined and cannot validate,
-champion, or authorize the paper trader until re-derived under epoch 6.
-Authorization requires exact epoch equality with current epoch 6; future epochs
+finite BY input validation, and conservative broker-tick equity rounding. Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. Epoch-5 and epoch-6 proofs remain readable for audit but are quarantined and cannot validate, champion, or authorize the paper trader until re-derived under epoch 7. Authorization requires exact epoch equality with current epoch 7; future epochs
 are audit-only as well. A verified current-epoch gate is sealed immutably per
 run, and re-derivation appends a new proof instead of rewriting prior evidence.
 
@@ -243,10 +240,7 @@ or not positive at 25 bps cannot authorize a candidate.
 
 Stress semantics are explicit: each scenario charges its bps against entry
 notional, then listed options add round-trip fees for both per-contract sides;
-the stress bps are not per-side bps. The shipped
-`max_stressed_cost_to_risk_ratio` is `0.30`; a 30-bps-floor trade has about
-`0.833` cost-to-risk at the 25-bps stress and is therefore vetoed before any
-option fees.
+the stress bps are not per-side bps. The shipped admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
 For equity geometry, a broker-normalized authored stop below
 `max(30 bps, scenario / max-cost-to-risk ratio)` is refused as
 `stressed_cost_risk_limit` before sizing or fill. The stop is never widened and
@@ -450,7 +444,7 @@ uses the selection p-values, and only the selected candidate's raw confirmatory
 p-value reaches LORD++. Same-tail v3 scopes remain audit-only and cannot
 authorize. Legacy v2/v3/v4 sequences (`lord_balanced_v2` and
 `lord_balanced_raw_p_v3`) and v5 LORD++ rows remain audit-readable and isolated
-from v6. Under epoch 6, the persisted live proof must match the durable FDR
+from v6. From epoch 6 onward, the persisted live proof must match the durable FDR
 allocation (scope/test id, method/version, p-value, alpha, allocation, and
 decision), not merely repeat those fields in a caller-supplied envelope.
 

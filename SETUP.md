@@ -319,8 +319,7 @@ abstains before submission when the configured stressed cost exceeds its
 cost-to-risk limit and records scenario/cost/ratio telemetry. Stress applies
 scenario bps to entry notional, then adds listed-option round-trip fees for
 both per-contract sides; it is not a per-side bps charge. The shipped
-`max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade is about
-`0.833` cost-to-risk at the 25-bps stress and is vetoed before option fees.
+admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
 `execution.strict_market_data` defaults to `true`; `python research.py calibrate`
 (see OPERATIONS.md) is an authorization check against
 real entry and exit fills, including terminal underfill/partial-cancel evidence.
@@ -669,8 +668,7 @@ only the selected candidate's raw confirmatory p reaches LORD++, and legacy
 v2/v3/v4 scopes remain audit-only. With `W0=alpha/2`, pre-discovery spending is
 `(alpha/2)*gamma_t`, the first-discovery reward is `alpha/2`, and later
 discoveries receive the standard `alpha` stream. Historical v5 rows retain
-`W0=alpha` and are audit-only, isolated from v6. Epoch-6
-verification binds the live proof to the durable FDR method/version and
+`W0=alpha` and are audit-only, isolated from v6. From epoch 6, verification binds the live proof to the durable FDR method/version and
 allocation rather than trusting caller-supplied fields.
 
 Authorizing fill quality is point-in-time and provenance-bound: required records
@@ -749,9 +747,7 @@ maximum. Replay epoch 6 retains epoch-5 boundaries and also
 seals paired synthetic root-control shadow replays, diagnostic historical-
 backfill provenance with exact calendar metadata, durable live-shadow FDR
 binding, chronological paired inference, finite BY input validation, and
-conservative broker-tick equity rounding. Epoch-5 evidence remains audit-readable
-but cannot authorize and must be re-derived under epoch 6. Exact equality with
-current epoch 6 is required; future epochs are audit-only too. Each current-epoch
+conservative broker-tick equity rounding. Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. Epoch-5 and epoch-6 evidence remains audit-readable but cannot authorize and must be re-derived under epoch 7. Exact equality with current epoch 7 is required; future epochs are audit-only too. Each current-epoch
 run seals one immutable verified gate proof, and re-derivation appends a new
 proof instead of rewriting history. These defaults make
 rejection and deployment decisions span market sessions rather than a handful

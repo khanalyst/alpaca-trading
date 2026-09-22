@@ -1,0 +1,83 @@
+{
+ "authorizing": false,
+ "decision": "diagnostic_only",
+ "decision_eligible": false,
+ "eligibility_reasons": [
+  "feed delayed_sip (public consolidated tape) is not the registered decision feed iex",
+  "source_mode historical_backfill is not forward_observed"
+ ],
+ "excluded_examined_bars": 168161,
+ "hypothesis_id": "vwap-reversion-control-adjusted.v1",
+ "interim": {
+  "decision": "none_before_first_look",
+  "mirror_60m": {
+   "candidate_count": 13,
+   "cluster_df": null,
+   "cluster_stderr_bps": null,
+   "cluster_t_stat": null,
+   "control_matching_counts": {
+    "same_session_minute_band": 13
+   },
+   "delta_bps": -3.1076995116909143,
+   "event_t_stat": -0.9280321344819279,
+   "matched_count": 13,
+   "session_clusters": 1,
+   "sign_flip_p_value": null
+  },
+  "primary_60m": {
+   "candidate_count": 19,
+   "cluster_df": null,
+   "cluster_stderr_bps": null,
+   "cluster_t_stat": null,
+   "control_matching_counts": {
+    "same_session_minute_band": 19
+   },
+   "delta_bps": 6.95024700274426,
+   "event_t_stat": 2.4512763747216164,
+   "matched_count": 19,
+   "session_clusters": 1,
+   "sign_flip_p_value": null
+  },
+  "sessions": 1,
+  "subject_120m": {
+   "candidate_count": 19,
+   "cluster_df": null,
+   "cluster_stderr_bps": null,
+   "cluster_t_stat": null,
+   "control_matching_counts": {
+    "same_session_minute_band": 19
+   },
+   "delta_bps": 3.369069597098285,
+   "event_t_stat": 1.4230214291831789,
+   "matched_count": 19,
+   "session_clusters": 1,
+   "sign_flip_p_value": null
+  }
+ },
+ "looks": [
+  {
+   "look": 1,
+   "sessions_required": 30,
+   "status": "not_reached"
+  },
+  {
+   "look": 2,
+   "sessions_required": 60,
+   "status": "not_reached"
+  }
+ ],
+ "manifest_hash": "d2e56d80bdb0e367bcceebbe4792bf4a00aee815eb442e62f043ee2e40b7c48e",
+ "provenance": {
+  "content_sha256": "a7b25d0c17c8d7ef77abac76e3e8b6ed4be1dbc697b040c035a751c76553b6cb",
+  "fetched_after_seal_commit": "c674f2f",
+  "note": "one sealed session, so the control falls back to a same-session tier; descriptive only",
+  "source": "public one-minute chart endpoint, 24 configured ETFs"
+ },
+ "rule_outcome_if_eligible": "accruing",
+ "schema": "preregistered-evaluation.v1",
+ "sealed_boundary": "2026-09-21",
+ "sealed_sessions": [
+  "2026-09-22"
+ ],
+ "trading_authorized": false
+}

@@ -1,4 +1,50 @@
-# Current findings — September 19, 2026
+# Current findings — September 22, 2026
+
+## Source state on `main`, 22 September 2026 (not deployed)
+
+**None of the following is running on the VM.** The VM remains pinned to image
+`alpaca-agent-trading:signal-fix-79c48c9` as recorded below. Deploying this
+source changes the diagnostic cohort identity (three arm ids moved), the
+config hash, and the replay epoch (6 to 7), so the frozen paused paper trial
+must first be retired or transitioned through the audited path in pending
+priority 5. The new code rejects the old trial identity; that is the intended
+fail-closed behaviour, not a fault.
+
+What changed, with measurements in `docs/audit-2026-09-21/`:
+
+- **Admission.** The shipped stressed-cost admission scenario is 9 bps (was
+  25). At 25 bps the implied 83.33 bps minimum stop exceeded every one-minute
+  ATR measured on this universe (maximum 44.8 bps), so every rule signal was
+  vetoed and the system could not trade in any lane. 9 bps implies exactly the
+  30 bps grammar floor. The proof-time 25 bps stress in `research/gates.py` is
+  unchanged. The built-in code default for a config that omits the key remains
+  25 bps.
+- **Dead filters repaired.** The `volatility` confirmation, the
+  `trend_pullback` proximity floor and the `volatility_breakout` compression
+  gate each admitted 97-100% of bars. `mean_reversion`, `trend_pullback` and
+  `volatility_breakout` therefore have new variant ids.
+- **IBR.** The width band divided a 15-45 minute range by a one-minute ATR and
+  admitted 0 of 348 measured sessions; it is now horizon-scaled. The replay
+  lane applies all eight runtime admission filters it previously skipped, so
+  replay and runtime admit the same bars (`IBR_UNMAPPED_FILTERS` is empty).
+- **Replay epoch 7.** The above changes what several variant ids emit without
+  changing the ids, so epoch-6 evidence is quarantined. The factory's
+  `code_hash` covers only `strategy_factory.py`, not the evaluator, so the
+  epoch is the only boundary that catches this.
+- **Inference.** `research/signal_quality.py` reported an event-level t that
+  treated intraday events as independent. It now also reports a
+  session-clustered (CR1) t with its degrees of freedom and a cluster
+  sign-flip p, and the factory report prints the clustered value.
+- **Preregistered forward test.** `vwap-reversion-control-adjusted.v1` was
+  sealed in commit `c674f2f` before any of its data existed. See
+  `docs/preregistered-hypotheses.md`. The subject is already in the deployed
+  shadow cohort, so the VM is already recording the data it needs.
+
+No gate threshold, evidence floor, FDR method, risk limit or cost constant was
+relaxed. No edge is proven.
+
+## Record as of September 19, 2026
+
 
 This is the single active pending list. The [strategy review](strategy-variant-review.md)
 covers all 43 registered arms and their research questions. The
@@ -217,10 +263,13 @@ not performed.
    code, configuration, calendar, source, and evidence identities; skipping
    validation or deleting negative sessions is not an acceptable optimization.
 2. Measure executable paper costs, fills, slippage, rejection, and protection
-   behavior; keep modeled shadow fills separate. The unchanged 25 bps stress /
-   0.30 cost-risk ceiling requires about 83.33 bps of stop distance before
-   tick geometry, so the 30 bps floor alone cannot pass. Zero entries can be a
-   correct refusal; do not relax gates or widen stops to create trades.
+   behavior; keep modeled shadow fills separate. (Superseded 22 September: the
+   former 25 bps admission scenario required 83.33 bps of stop distance and
+   admitted no rule signal at all; the shipped admission scenario is now 9 bps.)
+   The cost model is now the binding question: it charges 17 bps round trip
+   against a measured spread near 1 bps, and `costs.measured_quote` stays
+   disabled until it is fitted from the recorder's own quote corpus. Do not
+   relax gates or widen stops to create trades.
 3. Meet the evidence gates before judging an edge: the paper trial needs 20
    accepted sessions and 20 closed parent outcomes (60 accepted sessions is
    its review limit), while research readiness needs 30 accepted sessions and
@@ -236,6 +285,13 @@ not performed.
 6. Use bounded immutable snapshots and predeclared controls for frozen
    comparisons on untouched data. Re-running examined history or adding
    variants does not substitute for forward confirmation.
+
+7. Run the preregistered forward test on the VM's recorder corpus
+   (`python -m research.preregistered`, command in
+   `docs/preregistered-hypotheses.md`). With every session recorded and
+   accepted, look 1 falls at the close of 2 November 2026 (30th sealed session)
+   and look 2 at 15 December 2026 (60th). Missing or rejected sessions push
+   both later; do not look early for a decision, and do not change the manifest.
 
 ## Why negative results can still be visible
 

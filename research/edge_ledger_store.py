@@ -55,7 +55,16 @@ SCHEMA_VERSION = 3
 # placebo-null replication for integrity while retaining one preregistered
 # authorizing p-value.  These checks are part of the authorizing proof and are
 # re-derived rather than inferred from caller-supplied summaries.
-REPLAY_ENGINE_EPOCH = 6
+# Epoch 7 (September 2026) changes signal semantics under unchanged variant
+# ids: the ``volatility`` confirmation measures the prior-window range width
+# its ``compression_bps`` bound was written for, instead of a one-minute ATR;
+# the ``trend_pullback`` proximity band is the authored threshold rather than a
+# hidden 5 bps floor; the IBR width band divides by a horizon-scaled ATR; and
+# IBR replay applies all eight runtime admission filters.  The same variant id
+# can therefore emit different signals than it did under epoch 6.  The
+# factory's ``code_hash`` covers only ``strategy_factory.py``, not the
+# evaluator, so an epoch is the only boundary that quarantines such evidence.
+REPLAY_ENGINE_EPOCH = 7
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
 

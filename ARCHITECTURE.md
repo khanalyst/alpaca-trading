@@ -162,9 +162,11 @@ The executable exit grammar is versioned. v3 already provides the bounded
 equity `breakeven_r` transition; v4 adds frozen session VWAP/rolling-mean
 targets, a monotone trailing stop, and an `exit-before` deadline. The effective
 equity stop floor is `max(30 bps, active stressed-cost scenario /
-max-cost-to-risk ratio)`. If it binds, a fixed-R target is recomputed from the
-effective stop and the authored/effective geometry plus binding decision are
-persisted as telemetry. A non-gap stop/target observed on an exact-feed bar is
+max-cost-to-risk ratio)`. If it binds, the plan is vetoed as
+`stressed_cost_risk_limit` in every lane (runtime, factory, discovery, IBR): the
+authored stop is never widened and a fixed-R target is never recomputed. The
+authored/effective geometry and the binding decision are persisted as
+telemetry. A non-gap stop/target observed on an exact-feed bar is
 the conservative resting-bracket exception: it remains cost-charged even
 without a trigger-time quote. Gap, time, and deadline exits still require a
 fresh executable quote. The factory's fit-only diagnostics expose signal
@@ -379,8 +381,7 @@ vehicle schedule with recorded provenance; the shipped fallback is 4 bps
 spread, 6 bps slippage, and the configured per-side fees. Preregistered stress
 charges scenario bps against entry notional, plus listed-option round-trip fees
 for both per-contract sides; it is not a per-side bps charge. The shipped
-25-bps scenario and `max_stressed_cost_to_risk_ratio: 0.30` veto a 30-bps-floor
-trade at about `0.833` cost-to-risk before option fees.
+admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
 
 Quote entries in runtime, factory, explicit IBR replay, and randomized-null
 controls use one pure entry-slippage cap against their boundary reference.
@@ -646,13 +647,11 @@ selection uses only the former; the selected candidate is recomputed on the
 latter and only that raw confirmatory p-value is sent to LORD++. Legacy
 v2/v3/v4 evidence remains auditable but cannot authorize under v6. Historical
 v5 LORD++ rows retain their `W0=alpha` semantics and are audit-only, isolated
-from the active v6 sequence. The current
-`REPLAY_ENGINE_EPOCH` is 5: epoch 5 also seals paired synthetic root-control
+from the active v6 sequence. The current `REPLAY_ENGINE_EPOCH` is 7. Epoch 6 sealed paired synthetic root-control
 shadow decisions/replays, diagnostic historical-backfill provenance with exact
-calendar metadata, chronological paired inference, finite BH input validation,
+calendar metadata, chronological paired inference, finite BY input validation,
 conservative equity tick rounding, and a live-shadow proof binding to durable
-FDR state. Epoch-4 runs remain readable for audit but cannot validate or
-authorize runtime and must be re-derived under epoch 5; future epochs are
+FDR state. Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. Epoch-5 and epoch-6 runs remain readable for audit but cannot validate or authorize runtime and must be re-derived under epoch 7; future epochs are
 quarantined by the same exact-equality check. A current-epoch run seals one
 immutable verified gate proof; re-derivation appends a new proof instead of
 rewriting the old run.

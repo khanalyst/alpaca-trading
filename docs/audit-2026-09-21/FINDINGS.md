@@ -1,4 +1,4 @@
-# Full strategy, signal and variant audit — 21 September 2026
+# Full strategy, signal and variant audit: 21 September 2026
 
 Measured audit of all 43 registered arms against 44,993 real one-minute bars
 (24 configured ETFs, 5 regular sessions, 15–21 September 2026), replayed
@@ -14,7 +14,7 @@ geometric impossibility that is measurable to four decimal places.
 
 Every historical "negative result" in this repository is one of two things:
 
-1. `execution_blocked` — no trade occurred, so expectancy is undefined, not
+1. `execution_blocked`: no trade occurred, so expectancy is undefined, not
    negative; or
 2. output from a diagnostic replay lane that applies a different stop rule,
    a different cost model, and none of the runtime admission filters.
@@ -297,7 +297,7 @@ Immutable floors: 100 trades + 30 sessions + 30 clusters (backtest), the same
 again (sealed qualification), 150 trades + 30 sessions (live-shadow tail).
 `ARCHITECTURE.md` states 210 forward sessions total, about 0.83 years.
 
-The binding constraint is sessions, not trades — provided signals fire. They do
+The binding constraint is sessions, not trades, provided signals fire. They do
 fire (4,196 on one arm over 5 sessions), and 100% are vetoed, so the trade floor
 is unreachable no matter how long the system waits.
 
@@ -305,7 +305,7 @@ is unreachable no matter how long the system waits.
 
 ## Ordered remediation
 
-### Step 1 — unblock admission honestly (no code change)
+### Step 1: unblock admission honestly (no code change)
 
 Set `risk.stressed_cost_scenario_bps` from 25.0 to **9.0**, already in the
 preregistered set. Keep `max_stressed_cost_to_risk_ratio` at 0.30. Admission
@@ -317,14 +317,14 @@ Do **not** raise the ratio instead. It is the same cliff approached from the
 wrong direction, and it weakens the risk contract rather than correcting a
 measurement.
 
-### Step 2 — replace the cost assumption with the measurement
+### Step 2: replace the cost assumption with the measurement
 
 Enable `costs.measured_quote` and fit a per-symbol, per-half-hour schedule with
 `research.cost_rerun --calibration-only`. Every replayed result to date is
 dominated by two constants that are 30x wrong for SPY and 1.7x wrong for XLU.
 Until this is fitted, no P&L number in the repository means anything.
 
-### Step 3 — fix the IBR width band or retire the 7 arms
+### Step 3: fix the IBR width band or retire the 7 arms
 
 `max_ibr_width_atr: 3.0` compares a 15-minute range against a 1-minute ATR.
 Either compare like with like (range width against a range-period ATR, so the
@@ -332,7 +332,7 @@ band means what it says), or set the band from the measured distribution
 (median 7.2, p5 3.6, p95 14.0). As shipped, the 7 arms are dead weight in the
 FDR denominator.
 
-### Step 4 — repair or retire the three dead filters
+### Step 4: repair or retire the three dead filters
 
 * `volatility` confirmation: bound of 45 bps against a max observed ATR of
   44.8 bps. Set it from the measured distribution or remove it.
@@ -341,7 +341,7 @@ FDR denominator.
 * `trend_pullback` proximity: `max(threshold, 0.0005)` makes both variant values
   inert.
 
-### Step 5 — make the variant axes test what matters
+### Step 5: make the variant axes test what matters
 
 Every axis is entry selectivity. The measured failure is exit geometry:
 65.5% time exits, MFE a quarter of the target. Add axes on `max_hold_bars`,
@@ -350,7 +350,7 @@ Every axis is entry selectivity. The measured failure is exit geometry:
 have simply never been exercised because the factory has never completed a
 graded cycle.
 
-### Step 6 — run the signal-quality measurement as the primary instrument
+### Step 6: run the signal-quality measurement as the primary instrument
 
 `research/signal_quality.py` measures conditional forward returns against a
 clock-matched control at horizons 5/15/30/60/120/390. It needs bars only: no
@@ -362,7 +362,7 @@ Predeclared kill criterion: if no arm shows a control-adjusted mean above
 clusters, the 12-family grammar on 24 ETFs contains no edge, and universe
 change is the only remaining move.
 
-### Step 7 — fix the data foundation
+### Step 7: fix the data foundation
 
 IEX carries roughly 2% of consolidated volume. Every volume, RVOL and VWAP
 feature in the codebase consumes it, and IEX quotes are not the NBBO. Alpaca's
@@ -370,7 +370,7 @@ full SIP feed is about $99/month. Until then, `volume_breakout`, the `volume`
 confirmation on 7 of 12 families, both VWAP families and IBR relative volume
 are conditioning on noise.
 
-### Step 8 — change the working ratio
+### Step 8: change the working ratio
 
 157,119 lines of code, 2,173 tests, ~150 lines of signal logic, zero trades.
 Until one arm shows a positive control-adjusted forward return, cap work on

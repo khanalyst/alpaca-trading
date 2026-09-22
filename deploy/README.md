@@ -324,10 +324,7 @@ executable-row, vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries,
 and additionally seals paired synthetic root-control shadow decisions/replays,
 diagnostic historical-backfill provenance with exact calendar metadata, durable
 live-shadow FDR binding, chronological paired inference, finite BY input
-validation, and conservative broker-tick equity rounding. Epoch-5 proofs remain
-readable for audit but cannot validate, champion, or authorize the paper trader;
-they must be re-derived under epoch 6. Authorization requires exact equality
-with current epoch 6; future generations are audit-only too. A current-epoch run
+validation, and conservative broker-tick equity rounding. Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. Epoch-5 and epoch-6 proofs remain readable for audit but cannot validate, champion, or authorize the paper trader; they must be re-derived under epoch 7. Authorization requires exact equality with current epoch 7; future generations are audit-only too. A current-epoch run
 seals one immutable verified gate proof, and re-derivation appends a new proof
 instead of rewriting history.
 
@@ -442,9 +439,7 @@ diagnostics remain available while that boundary is closed. Fit diagnostics may
 count planned signal/exit geometry as quote-required, non-authorizing
 measurement. Stress applies scenario bps to entry notional and adds listed-option
 round-trip fees for both per-contract sides; it is not a per-side bps charge.
-The shipped `max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade
-is about `0.833` cost-to-risk at the 25-bps stress and is vetoed before option
-fees.
+The shipped admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
 The pure entry-slippage cap is shared by runtime, factory, explicit IBR replay,
 and randomized-null quote entries; malformed inputs use the stable reason
 `entry_slippage_invalid`, while over-cap quotes use

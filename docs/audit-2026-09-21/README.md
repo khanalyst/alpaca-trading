@@ -1,11 +1,14 @@
 # Measured audit, 21 September 2026
 
-Three reports, in order:
+Four reports, in order:
 
-- `FINDINGS.md` — the audit: why the system had never produced a trade.
-- `REMEDIATION.md` — steps 1, 3 and 4 applied, plus the IBR contract merge.
-- `SIGNAL-VALUE.md` — steps 5, 6 and 2: exit geometry, signal quality, costs.
-  **This one overturns a conclusion in `FINDINGS.md`.** Read it last.
+- `FINDINGS.md`: the audit, and why the system had never produced a trade.
+- `REMEDIATION.md`: steps 1, 3 and 4 applied, plus the IBR contract merge.
+- `SIGNAL-VALUE.md`: steps 5, 6 and 2, covering exit geometry, signal quality
+  and costs. **It overturns a conclusion in `FINDINGS.md`**, and carries a
+  correction of its own at the end.
+- `RE-AUDIT.md`: session-clustered inference, the preregistered forward test,
+  and a second pass over everything changed. Read it last.
 
 This directory holds the evidence.
 
@@ -32,13 +35,16 @@ recorder evidence and cannot authorize anything.
 | `q1trades.py` | post-fix trade counts with the stressed-cost gate applied |
 | `q2.py` | 19-session forward returns for the regime question |
 | `step5b.py` | 81-point target/hold sweep with per-session values for a split test |
-| `step6b.py` | `research.signal_quality` run as the primary instrument |
+| `step6b.py` | `research.signal_quality` run as the primary instrument (carries a provenance correction) |
+| `step6c.py` | the same, honestly labelled, with session-clustered inference, examined sessions only |
 | `fetch60.py` | corpus fetch |
 
 Result artifacts: `replay-results.json`, `q1-post-fix-summary.json`,
 `q2-19session-summary.json`, `step5-geometry-grid.json`,
-`step6-signal-quality.json`, and `spread-reference.json` (diagnostic, not a
-cost source).
+`step6-signal-quality.json`, `step6c-clustered-signal-quality.json`,
+`prereg-interim-2026-09-22.json` (the first sealed session, descriptive and
+`diagnostic_only`), and `spread-reference.json` (diagnostic, not a cost
+source).
 
 Signals are evaluated on the completed bar; entry is the next bar's open;
 forward returns are signed by the signal's own direction. Outcome walks apply
@@ -50,6 +56,11 @@ Five sessions is four degrees of freedom. Nothing here establishes or refutes
 an edge, and the report does not claim otherwise: the per-session table in
 section 9 exists specifically to show that the pooled t-statistics are
 artefacts of one trending day.
+
+The clustered re-run (`step6c.py`) uses 18 examined sessions, 2026-08-26 to
+2026-09-21, from the same public source. Sessions after 2026-09-21 are sealed
+for `vwap-reversion-control-adjusted.v1` and are excluded from every
+exploratory script.
 
 What five sessions *is* sufficient for, because these are mechanical rather
 than statistical facts, is everything in sections 1 through 8 and 10 through 12:

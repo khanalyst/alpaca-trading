@@ -1,4 +1,13 @@
-# Strategy and variant review — 19 September 2026
+# Strategy and variant review — 19 September 2026, amended 22 September 2026
+
+**Amendment.** The measured audit in `docs/audit-2026-09-21/` changed three
+rule roots, the shipped admission scenario, the IBR width band and the
+replay/runtime IBR contract. The rows and paragraphs affected are updated
+below; the historical evidence sections are unchanged and describe the
+configuration they were measured under. Read `SIGNAL-VALUE.md` in that
+directory for the current signal assessment, and
+`docs/preregistered-hypotheses.md` for the one hypothesis now under a sealed
+forward test.
 
 ## Scope and key gaps
 
@@ -90,10 +99,12 @@ historical backfill remains diagnostic-only. Fresh forward quotes/costs,
 market-open latency, after-cost validation, and the paper/research evidence
 gates remain open requirements. No positive edge is proven.
 
-The main evidence gap is executable forward quotes and cost measurement. The
-25 bps stress and 0.30 cost/risk ceiling imply an 83.33 bps minimum stop before
-ticks; a 30 bps floor alone cannot pass that geometry, although a 1 ATR stop
-can exceed 83.33 bps when volatility is sufficient, and quantity does not
+The main evidence gap is executable forward quotes and cost measurement. Under
+the former 25 bps admission scenario the 0.30 cost/risk ceiling implied an
+83.33 bps minimum stop, which no measured one-minute ATR on this universe
+reached (maximum 44.8 bps), so every rule arm was vetoed. The shipped admission
+scenario is now 9 bps, whose implied stop is exactly the 30 bps grammar floor;
+25 bps remains the proof-time stress in `research/gates.py`. Quantity does not
 change the ratio. The static bar round trip is 17 bps (4 bps spread + 12 bps
 slippage + 1 bps fees). Quote-based execution uses bid/ask prices, with spread
 already embedded, plus 13 bps of modeled slippage/fees. No risk-limit
@@ -144,9 +155,9 @@ semantic rewrite of the baseline.
 | `opening_range_breakout` — sound proxy, unvalidated | `rule.opening-range-breakout.0eb200d3136d80ee` → `rule.opening-range-breakout.4b10682772f81284` | Completed 15-minute opening-range close break; threshold 5 → 8 bps, with volume confirmation. This is a plausible causal proxy for continuation, not a measured auction or institutional-flow signal. Validate cost, time of day, and hold decay. |
 | `opening_range_fade` — sound but unvalidated | `rule.opening-range-fade.d5785d9e70b56def` → `rule.opening-range-fade.be61630d346f0923` | 20-minute range; threshold 8 → 12 bps; no confirmation; 1.5R target. The existing predicate already requires a wick outside and close back inside the range: it is not a blind fade. Eligibility is broader than an opening overshoot; lookback 15 is inactive here. Compare predeclared entry-window and value-exit hypotheses. |
 | `momentum_continuation` — sound proxy, unvalidated | `rule.momentum-continuation.fe74f73cfc7d082a` → `rule.momentum-continuation.984cbcedd4a2846a` | Lookback 12 bars; threshold 18 → 24 bps; volume confirmation (prior 12-bar volume × 1.25). The signal compares the current close with `closes[-lookback-1]` and checks direction against the previous close. Require cost-compatible decay and time-of-day evidence; institutional flow is unobserved. |
-| `mean_reversion` — causal entry, unvalidated exit thesis | `rule.mean-reversion.e8a26abe2aef631e` → `rule.mean-reversion.9fb941032e03c02b` | 20-bar close z-score 1.50 → 1.75 with volatility-compression confirmation; 1.5R fixed target. The current bar is included in the 20-close z-score causally. There is no reversal confirmation, and the exit is fixed-R rather than a mean/value exit. Predeclare reclaim, value-exit, or shorter-horizon hypotheses; do not search z-scores on old data. |
-| `trend_pullback` — active proximity axis; redundant legacy confirmation | `rule.trend-pullback.a2b51fa10dd145fd` → `rule.trend-pullback.946cfe961a9f767d` | Lookback 10, slow lookback 35; the active stored threshold/proximity coordinate is 15 → 20 bps, which loosens proximity. The legacy predicate is fast-SMA polarity + near-fast + green candle for long / red candle for short, not a sequenced retracement/reclaim. Legacy trend confirmation redundantly repeats the same fast/slow test. The v5 reclaim mechanism is a separate experiment; do not silently change v4 identity. |
-| `volatility_breakout` — active isolated variant, unvalidated | `rule.volatility-breakout.651520055477ae38` → `rule.volatility-breakout.30aa361de5e11ca7` | Lookback 12; prior total 12-bar range compression 55 → 65 bps; 5 bps break threshold with volume confirmation. The compression field is a range bound, not ATR. Increasing the bound loosens compression; measure the resulting selectivity and cost compatibility. |
+| `mean_reversion` — causal entry, unvalidated exit thesis | `rule.mean-reversion.b4e231565af56f03` → `rule.mean-reversion.75a110f082d304d1` (formerly `e8a26abe2aef631e` → `9fb941032e03c02b`) | 20-bar close z-score 1.50 → 1.75 with volatility-compression confirmation, now with an explicit 12 bps `compression_bps`: the confirmation measures the prior-window range width, and the former 45 bps default admitted every bar; 1.5R fixed target. The current bar is included in the 20-close z-score causally. There is no reversal confirmation, and the exit is fixed-R rather than a mean/value exit. Predeclare reclaim, value-exit, or shorter-horizon hypotheses; do not search z-scores on old data. |
+| `trend_pullback` — active proximity axis; redundant legacy confirmation | `rule.trend-pullback.eaf3e32977d88904` → `rule.trend-pullback.2ffd1a88404dd020` (formerly `a2b51fa10dd145fd` → `946cfe961a9f767d`) | Lookback 10, slow lookback 35; the proximity coordinate is now 3 → 5 bps (formerly 15 → 20, which admitted 97.1% and 98.6% of bars against a measured 2.4 bps median deviation, and a hard 5 bps floor overrode any smaller authored value). The legacy predicate is fast-SMA polarity + near-fast + green candle for long / red candle for short, not a sequenced retracement/reclaim. Legacy trend confirmation redundantly repeats the same fast/slow test. The v5 reclaim mechanism is a separate experiment; do not silently change v4 identity. |
+| `volatility_breakout` — active isolated variant, unvalidated | `rule.volatility-breakout.cc1b851a285825c5` → `rule.volatility-breakout.ba43d3a496ff37d8` (formerly `651520055477ae38` → `30aa361de5e11ca7`) | Lookback 12; prior total 12-bar range compression now 8 → 12 bps (formerly 55 → 65, which admitted 98.3% and 98.9% of bars, so the family did not select compression); 5 bps break threshold with volume confirmation. The compression field is a range bound, not ATR. Increasing the bound loosens compression; measure the resulting selectivity and cost compatibility. |
 | `volume_breakout` — feed-limited volume axis, unvalidated | `rule.volume-breakout.30fece6e3f9b9fd6` → `rule.volume-breakout.a68b65c3c8e96ff4` | Prior 15-bar mean-volume multiplier 1.50 → 1.75; 5 bps price break and trend confirmation. IEX volume is feed-limited and is not same-clock historical RVOL or consolidated participation. A feed/volume thesis needs its own evidence identity. |
 | `vwap_reversion` — causal signal, distinct value experiment | `rule.vwap-reversion.ab97bfe87ed566de` → `rule.vwap-reversion.cf8b38b12c9bf952` | Lookback 20; session-cumulative VWAP distance threshold 25 → 35 bps; no confirmation; 1.5R fixed target. Cumulative VWAP deviation is causal, but the target is fixed-R, not return-to-VWAP. The fair-value mechanism uses a frozen session-VWAP target and is a separate experiment. |
 | `vwap_trend` — unit/definition needs care, unvalidated | `rule.vwap-trend.349de232c3d7a18c` → `rule.vwap-trend.588bc47ed64d051e` | Lookback 15; threshold 8 → 12 bps with volume confirmation. The predicate combines current price side with cumulative-VWAP shift versus the prior session prefix (`session[:-lookback]`); it is not a price-return bps threshold or slope-per-minute. Time-of-day sensitivity is therefore a separate validation question. |
@@ -212,7 +223,10 @@ inherit the following IBR settings through the registry/runtime adapter for
 diagnostic comparison, not as an independent active IBR deployment. The
 registry is the [frozen IBR variant file](../research/variants.yaml). It
 contains minimum relative volume 1.0,
-opening-range width between 0.25 and 3.0 ATR, ATR period 14, maximum entry
+opening-range width between 0.25 and 3.0 horizon-scaled ATR (range width
+divided by one-minute ATR times the square root of `range_minutes`; the
+unscaled quotient admitted 0 of 348 measured symbol-sessions), ATR period 14,
+maximum entry
 extension 1R, stale limit 0.5 minutes (30 seconds) after candidate-bar
 completion,
 maximum spread 25 bps, latest entry 15:00, and force-flat 10 minutes before the

@@ -6,8 +6,8 @@
       "baseline_id": "rule.cross-sectional-residual.374375e771a64864",
       "changes": {
         "threshold_bps": {
-          "baseline": 12,
-          "variant": 16
+          "baseline": 12.0,
+          "variant": 16.0
         }
       },
       "family": "cross_sectional_residual",
@@ -15,7 +15,7 @@
       "variant_id": "rule.cross-sectional-residual.2969f7f47855f157"
     },
     {
-      "baseline_id": "rule.mean-reversion.e8a26abe2aef631e",
+      "baseline_id": "rule.mean-reversion.b4e231565af56f03",
       "changes": {
         "zscore": {
           "baseline": 1.5,
@@ -24,14 +24,14 @@
       },
       "family": "mean_reversion",
       "one_coordinate": true,
-      "variant_id": "rule.mean-reversion.9fb941032e03c02b"
+      "variant_id": "rule.mean-reversion.75a110f082d304d1"
     },
     {
       "baseline_id": "rule.momentum-continuation.fe74f73cfc7d082a",
       "changes": {
         "threshold_bps": {
-          "baseline": 18,
-          "variant": 24
+          "baseline": 18.0,
+          "variant": 24.0
         }
       },
       "family": "momentum_continuation",
@@ -42,8 +42,8 @@
       "baseline_id": "rule.opening-drive.393e7229056fc663",
       "changes": {
         "threshold_bps": {
-          "baseline": 30,
-          "variant": 40
+          "baseline": 30.0,
+          "variant": 40.0
         }
       },
       "family": "opening_drive",
@@ -54,8 +54,8 @@
       "baseline_id": "rule.opening-range-breakout.0eb200d3136d80ee",
       "changes": {
         "threshold_bps": {
-          "baseline": 5,
-          "variant": 8
+          "baseline": 5.0,
+          "variant": 8.0
         }
       },
       "family": "opening_range_breakout",
@@ -66,8 +66,8 @@
       "baseline_id": "rule.opening-range-fade.d5785d9e70b56def",
       "changes": {
         "threshold_bps": {
-          "baseline": 8,
-          "variant": 12
+          "baseline": 8.0,
+          "variant": 12.0
         }
       },
       "family": "opening_range_fade",
@@ -78,7 +78,7 @@
       "baseline_id": "rule.range-expansion.a9871756f22463a5",
       "changes": {
         "volume_multiplier": {
-          "baseline": 2,
+          "baseline": 2.0,
           "variant": 2.5
         }
       },
@@ -87,28 +87,28 @@
       "variant_id": "rule.range-expansion.f7fd1b25f2f95ba6"
     },
     {
-      "baseline_id": "rule.trend-pullback.a2b51fa10dd145fd",
+      "baseline_id": "rule.trend-pullback.eaf3e32977d88904",
       "changes": {
         "threshold_bps": {
-          "baseline": 15,
-          "variant": 20
+          "baseline": 3.0,
+          "variant": 5.0
         }
       },
       "family": "trend_pullback",
       "one_coordinate": true,
-      "variant_id": "rule.trend-pullback.946cfe961a9f767d"
+      "variant_id": "rule.trend-pullback.2ffd1a88404dd020"
     },
     {
-      "baseline_id": "rule.volatility-breakout.651520055477ae38",
+      "baseline_id": "rule.volatility-breakout.cc1b851a285825c5",
       "changes": {
         "compression_bps": {
-          "baseline": 55,
-          "variant": 65
+          "baseline": 8.0,
+          "variant": 12.0
         }
       },
       "family": "volatility_breakout",
       "one_coordinate": true,
-      "variant_id": "rule.volatility-breakout.30aa361de5e11ca7"
+      "variant_id": "rule.volatility-breakout.ba43d3a496ff37d8"
     },
     {
       "baseline_id": "rule.volume-breakout.30fece6e3f9b9fd6",
@@ -126,8 +126,8 @@
       "baseline_id": "rule.vwap-reversion.ab97bfe87ed566de",
       "changes": {
         "threshold_bps": {
-          "baseline": 25,
-          "variant": 35
+          "baseline": 25.0,
+          "variant": 35.0
         }
       },
       "family": "vwap_reversion",
@@ -138,8 +138,8 @@
       "baseline_id": "rule.vwap-trend.349de232c3d7a18c",
       "changes": {
         "threshold_bps": {
-          "baseline": 8,
-          "variant": 12
+          "baseline": 8.0,
+          "variant": 12.0
         }
       },
       "family": "vwap_trend",

@@ -356,15 +356,15 @@ Runtime, factory, explicit IBR, and randomized-null quote-entry replays share
 one pure entry-slippage cap; malformed inputs use `entry_slippage_invalid`,
 and over-cap quotes use `entry_slippage_exceeds_limit` as stable
 refusal/no-trade reasons. This cap is separate from expected costs.
-For a 30-bps-floor trade, 25 bps of entry-notional stress is about `0.833` of
-risk, so the trade is vetoed by that limit before any option fees.
+The shipped admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
 
 `research.py calibrate` reads the journal without mutation and checks entry and
 exit fills independently per vehicle; equity and option calibration is never
-pooled. Runtime risk applies the configured stressed-cost scenario (25 bps by
-default, with the scalar fallback retained when no valid artifact cell is
-available) and abstains when `stressed_cost_to_risk_ratio` exceeds
-`max_stressed_cost_to_risk_ratio`; intended,
+pooled. Runtime risk applies the configured stressed-cost scenario, retaining
+the scalar fallback when no valid artifact cell is available, and abstains when
+`stressed_cost_to_risk_ratio` exceeds `max_stressed_cost_to_risk_ratio`. The
+shipped `config.yaml` sets 9 bps; a config that omits the key falls back to the
+built-in 25 bps, which admits no floor-width trade. Intended,
 delivered, ratio, and shortfall telemetry are persisted with orders and fills.
 The scheduled calibration-only pass measures each symbol/session on the
 9/15/25/50-bps ladder. It is disabled by default and can affect runtime only
@@ -712,10 +712,7 @@ vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries, and additionally
 seals paired synthetic root-control shadow decisions/replays, diagnostic-only
 historical-backfill provenance with exact calendar metadata, durable live-shadow
 FDR allocation binding, chronological paired inference, finite BY input
-validation, and conservative broker-tick equity rounding. Epoch-5 proofs remain
-readable for audit but cannot validate, champion, or authorize the trader; they
-must be re-derived under epoch 6. Authorization requires exact equality with
-current epoch 6, while future epochs are audit-only. Each current-epoch run
+validation, and conservative broker-tick equity rounding. Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. Epoch-5 and epoch-6 proofs remain readable for audit but cannot validate, champion, or authorize the trader; they must be re-derived under epoch 7. Authorization requires exact equality with current epoch 7, while future epochs are audit-only. Each current-epoch run
 seals one immutable verified gate proof, and re-derivation appends a new proof
 rather than rewriting history.
 

@@ -41,7 +41,7 @@ def superseded_engine():
 class ReplayEngineEpochTests(unittest.TestCase):
     def test_epoch_five_evidence_is_legacy_readable_but_quarantined(self):
         # Legacy rows are intentionally interpreted, not rewritten.  The
-        # epoch-5 payload remains auditable while the current engine (epoch 6)
+        # epoch-5 payload remains auditable while the current engine
         # refuses to treat it as authorizing evidence.
         legacy = {"metrics": {"replay_engine_epoch": 5}}
         self.assertEqual(run_engine_epoch(legacy), 5)
@@ -91,11 +91,18 @@ class ReplayEngineEpochTests(unittest.TestCase):
                     ValueError, "current replay epoch requires"):
                 ledger.record_verified_gate(current_run["run_id"], current_v2)
 
-    def test_epoch_six_is_the_current_authorizing_generation(self):
-        current = {"metrics": {"replay_engine_epoch": 6}}
-        self.assertEqual(REPLAY_ENGINE_EPOCH, 6)
-        self.assertEqual(run_engine_epoch(current), 6)
+    def test_epoch_seven_is_the_current_authorizing_generation(self):
+        current = {"metrics": {"replay_engine_epoch": 7}}
+        self.assertEqual(REPLAY_ENGINE_EPOCH, 7)
+        self.assertEqual(run_engine_epoch(current), 7)
         self.assertTrue(run_engine_epoch_current(current))
+
+    def test_epoch_six_evidence_is_quarantined_by_the_signal_semantics_change(self):
+        # Epoch 7 changed what several variant ids emit without changing the
+        # ids, so a proof computed under epoch 6 describes different signals.
+        previous = {"metrics": {"replay_engine_epoch": 6}}
+        self.assertEqual(run_engine_epoch(previous), 6)
+        self.assertFalse(run_engine_epoch_current(previous))
 
     def test_future_epoch_is_quarantined_until_this_verifier_understands_it(self):
         future = {"metrics": {
@@ -135,7 +142,7 @@ class ReplayEngineEpochTests(unittest.TestCase):
                 ledger.transition(candidate_id, "validated",
                                   reason="epoch-5 evidence is quarantined")
 
-            # Re-deriving appends a new immutable proof stamped by epoch 6;
+            # Re-deriving appends a new immutable proof stamped by the current epoch;
             # that latest proof is the one lifecycle/live authorization consumes.
             fresh, _ = _persist_gate(ledger, candidate_id, "shadow")
             self.assertEqual(run_engine_epoch(fresh), REPLAY_ENGINE_EPOCH)

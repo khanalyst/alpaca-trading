@@ -72,6 +72,11 @@ ECONOMIC_HURDLE_BPS = 3.0
 LOOK_ALPHA_ONE_SIDED = 0.025
 MIN_MATCHED_CONTROLS = 30
 MIN_CONTROL_COVERAGE = 0.80
+# The sealed manifest registers the control as the same instrument at the same
+# session minute on *other* sessions.  signal_quality falls back to looser
+# tiers when a corpus is too small to supply that; a look may only decide on
+# the registered tier.
+REGISTERED_CONTROL_TIER = "cross_session_same_session_minute"
 
 
 class PreregistrationError(ValueError):
@@ -223,6 +228,8 @@ def _summary(metric: Mapping[str, Any]) -> dict[str, Any]:
         "sign_flip_p_value": metric.get(
             "candidate_minus_control_cluster_sign_flip_p_value"),
         "event_t_stat": metric.get("candidate_minus_control_t_stat"),
+        "control_matching_counts": dict(
+            metric.get("control_matching_counts") or {}),
     }
 
 
@@ -236,6 +243,13 @@ def look_outcome(metric: Mapping[str, Any], *, alpha: float,
             matched / candidates < MIN_CONTROL_COVERAGE):
         return {**summary, "outcome": "inconclusive",
                 "reason": "underpowered_control"}
+    tiers = {tier for tier, count in summary["control_matching_counts"].items()
+             if count}
+    if tiers and tiers != {REGISTERED_CONTROL_TIER}:
+        # Conformance with the sealed manifest, added after sealing: this can
+        # only turn a pass into inconclusive, never the reverse.
+        return {**summary, "outcome": "inconclusive",
+                "reason": "control_tier_not_registered"}
     mean, error = summary["delta_bps"], summary["cluster_stderr_bps"]
     df, flip_p = summary["cluster_df"], summary["sign_flip_p_value"]
     if mean is None or not error or not df or flip_p is None:

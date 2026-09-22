@@ -1,4 +1,4 @@
-# Remediation and re-measurement — 22 September 2026
+# Remediation and re-measurement: 22 September 2026
 
 Applies steps 1, 3 and 4 of `FINDINGS.md`, re-measures the result, extends the
 sample from 5 to 19 sessions, and collapses the two IBR admission paths into
@@ -9,7 +9,7 @@ Measurement corpus: 177,504 one-minute bars, 24 configured ETFs, 19 sessions
 
 ---
 
-## Step 1 — stressed-cost scenario 25.0 → 9.0 bps
+## Step 1: stressed-cost scenario 25.0 → 9.0 bps
 
 `config.yaml`, one value. `9.0` is already a member of the preregistered
 `COST_STRESS_SCENARIOS_BPS = (9.0, 15.0, 25.0, 50.0)`.
@@ -31,7 +31,7 @@ the 30 bps grammar floor. Raising the ratio to 0.60, which
 `research/cost_counterfactual.py` defaults to testing, admits 0.009% and would
 have reported no material change.
 
-## Step 3 — IBR width band made horizon-invariant
+## Step 3: IBR width band made horizon-invariant
 
 `agent/contracts/ibr.py`. The band compared a range spanning `range_minutes`
 against a **one-minute** ATR, so the quotient grew with the window and carried
@@ -51,7 +51,7 @@ authored band meaningful without changing it:
 The band now selects the intended tail: unusually wide or unusually narrow
 openings relative to the session's own volatility.
 
-## Step 4 — the dead filters
+## Step 4: the dead filters
 
 **4a. Volatility confirmation** (`agent/contracts/rule.py::_confirmation`).
 `compression_bps` is a *range width* bound, which is how the
@@ -216,7 +216,7 @@ is admissible; research owns what happens to it afterwards.
 
 ---
 
-## Step 2 — not done, and why
+## Step 2: not done, and why
 
 Step 2 was to replace the cost assumption with a measurement. It is blocked on
 data this session does not have, and the blocker is worth stating plainly
@@ -275,30 +275,30 @@ Ten tests encoded the previous behaviour and were updated, with their intent
 preserved and the unit change documented in each. Six of them only surfaced in
 the complete suite:
 
-- `tests/research/test_cost_rerun.py` — the gate assertion now derives the
+- `tests/research/test_cost_rerun.py`: the gate assertion now derives the
   scenario from the mounted config instead of restating the shipped scalar,
   and the tight-stop veto test names an explicitly binding scenario so it
   exercises the veto whatever the deployment selects.
-- `tests/research/test_diagnostic_suite.py` — preflight arithmetic derived
+- `tests/research/test_diagnostic_suite.py`: preflight arithmetic derived
   from config; the incompatibility flag is now asserted **False** at the
   shipped values and **True** under an explicit 25 bps scenario, which is the
   clearest statement of what this change did. The legacy-comparison parity
   field is asserted `full`.
-- `tests/research/test_offline_shadow_worker.py` — its opening range was
+- `tests/research/test_offline_shadow_worker.py`: its opening range was
   fifteen identical full-span bars, which makes ATR equal the range width and
   pins the normalised quotient at `1/sqrt(range_minutes)` at every price
   scale. The range minutes now walk across the band as real ones do.
-- `deploy/paper-orb.config.json` — the shipped paper profile is `config.yaml`
+- `deploy/paper-orb.config.json`: the shipped paper profile is `config.yaml`
   plus a `paper_trial` override, and a test enforces that. The scenario value
   is synced. This was a genuine find: the two files must not drift.
 
 And four from the targeted run:
 
-- `tests/test_strategy.py` — width band fixture, permissive floor for a test
+- `tests/test_strategy.py`: width band fixture, permissive floor for a test
   about causal `now` handling rather than width selection.
-- `tests/research/test_rule_grammar_v2.py` — compression bound restated in the
+- `tests/research/test_rule_grammar_v2.py`: compression bound restated in the
   window-width unit; the calm/wild polarity assertion still discriminates.
-- `tests/research/test_ibr_runtime_parity.py` — two band values retuned. These
+- `tests/research/test_ibr_runtime_parity.py`: two band values retuned. These
   fixtures carry a unit range against a unit one-minute ATR, implying a 100 bps
   one-minute ATR; real ETF one-minute ATR is ~3 bps. They were calibrated
   against the defect.

@@ -1,3 +1,12 @@
+# PROVENANCE CORRECTION (22 September 2026).  This is the script as it was
+# actually run for SIGNAL-VALUE.md, preserved unchanged below this note.  It
+# labels public consolidated-tape bars as provider "alpaca", feed "iex", and
+# leaves source_mode to its forward_observed default.  Those labels were
+# wrong: the data is third-party consolidated tape fetched after the fact.
+# Labels do not enter the arithmetic, so the published numbers stand, but the
+# strict policy only admitted these rows because of the false labels.
+# step6c.py is the corrected version: delayed_sip, historical_backfill, the
+# explicit diagnostic policy, and session-clustered inference.
 """Step 6: signal quality as the primary instrument, clock-matched control."""
 import sys,os,json
 SP=os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0,SP); sys.path.insert(0,'/home/user/alpaca-trading')

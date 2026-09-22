@@ -103,6 +103,18 @@ class DecisionRuleTests(unittest.TestCase):
         self.assertEqual(self.outcome(matched_count=300)["reason"],
                          "underpowered_control")
 
+    def test_a_fallback_control_tier_cannot_decide_a_look(self):
+        # With too few sessions the instrument falls back to a same-session
+        # control; the sealed manifest registered a cross-session one.
+        result = self.outcome(control_matching_counts={
+            "cross_session_same_session_minute": 370,
+            "same_session_minute_band": 10})
+        self.assertEqual(result["outcome"], "inconclusive")
+        self.assertEqual(result["reason"], "control_tier_not_registered")
+        registered = self.outcome(control_matching_counts={
+            "cross_session_same_session_minute": 380})
+        self.assertEqual(registered["outcome"], "pass")
+
     def test_missing_clustered_inference_is_inconclusive(self):
         result = self.outcome(candidate_minus_control_cluster_stderr_bps=None)
         self.assertEqual(result["reason"], "clustered_inference_unavailable")

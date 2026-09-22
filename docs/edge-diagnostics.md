@@ -51,8 +51,11 @@ diagnostics. Incomplete or unpriced opportunities remain missing-data rows;
 only closed modeled positions contribute realized P&L. Positive synthetic test
 fixtures verify arithmetic, not an economic edge.
 
-Each IBR result retains `legacy_comparison` from the existing fixed-share replay,
-including its partial-runtime-parity warning. Top-level `outcome_counts` describe
+Each IBR result retains `legacy_comparison` from the existing fixed-share replay.
+Since September 2026 the replay applies all eight runtime admission filters
+(`IBR_UNMAPPED_FILTERS` is empty) and the comparison reports full runtime
+parity; comparisons recorded before that carry a partial-parity warning and
+describe a materially more permissive strategy. Top-level `outcome_counts` describe
 the shared-runtime lane; `legacy_comparison_outcome_counts` are separate. An old
 positive legacy comparison is neither erased nor promoted into runtime evidence.
 
