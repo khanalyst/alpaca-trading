@@ -1,4 +1,23 @@
-# Current findings — September 22, 2026
+# Current findings — September 23, 2026
+
+## Additions on 23 September 2026 (not deployed)
+
+- **Paper incumbent ready to switch.** `deploy/paper-orf.config.json` runs
+  `rule.opening-range-fade.d5785d9e70b56def` on the Alpaca paper account as
+  trial `paper-orf-baseline-20260923-v1`, through the existing non-authorizing
+  paper trial lane. The exact VM sequence, including retiring the paused ORB
+  trial, is in [paper-shadow-trials.md](paper-shadow-trials.md). Nothing has
+  been run on the VM.
+- **Second preregistered test.** `opening-range-fade-control-adjusted.v1`,
+  sealed for sessions after 2026-09-23 (commit `a425097`).
+- **Code fingerprint.** A run's `code_hash` now covers the signal evaluator
+  (`agent/contracts/rule.py`, `agent/contracts/ibr.py`, `research/ibr.py`) as
+  well as the module that produced the run.
+- **Exits.** A walk-forward test of five alternative exits on the three
+  reversion families (`docs/audit-2026-09-21/exit-walkforward-2026-09-23.json`)
+  found none that reliably beat the registered bracket, so no exit variant was
+  added. `vwap_reversion`'s control-adjusted 60-minute delta does not become
+  raw P&L: held to 60 minutes it grosses about 2.7 bps per trade.
 
 ## Source state on `main`, 22 September 2026 (not deployed)
 

@@ -1,5 +1,5 @@
-"""All 24 rule arms, bracket replay under the shipped admission gate, net of three cost levels.
 # Record script: reads universe60.json (public consolidated tape, not committed) from its own directory.
+"""All 24 rule arms, bracket replay under the shipped admission gate, net of three cost levels.
 
 Examined window: 2026-08-26..2026-09-21 (18 sessions). Sealed window: sessions after 2026-09-21.
 One trade per symbol-session (first admitted signal), entry next bar open, stop-first ties.
