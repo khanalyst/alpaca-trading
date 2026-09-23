@@ -109,6 +109,56 @@ No tenure rule forces an entry or prevents a safety exit. Experimental parent
 outcomes are persisted atomically with closes in the existing paper state;
 they never enter the authorizing EdgeLedger/FDR outbox.
 
+## Replacing the ORB incumbent with opening-range fade
+
+`deploy/paper-orf.config.json` names a new incumbent,
+`rule.opening-range-fade.d5785d9e70b56def`, under trial
+`paper-orf-baseline-20260923-v1`. It is the subject of the preregistered
+`opening-range-fade-control-adjusted.v1` (see
+[preregistered-hypotheses.md](preregistered-hypotheses.md)); the paper trial
+adds real fills and trade-level outcomes, and neither decides the other.
+
+The old trial `paper-orb-baseline-20260914-v1` is paused with zero accepted
+sessions and zero outcomes. The
+[activation receipt](paper-activation-2026-09-15.json) records its incumbent
+identity as
+`2f02fc0ec886e893e12f65767186670138b63f093dd7a547a4469eaf8a3f9508`; confirm it
+against the persisted state before using it. On the VM, from the application
+directory:
+
+```bash
+# 1. Stop the trader, back up runtime state, and confirm the book is flat.
+docker compose stop trader
+docker compose run --rm --no-deps trader python main.py status
+
+# 2. Read the persisted trial identity (read-only).
+docker compose run --rm --no-deps trader python -c 'from agent import state; state.configure_runtime("paper"); t = state.load_state().get("paper_trial") or {}; print(t.get("trial_id"), t.get("incumbent_identity"), t.get("state"))'
+
+# 3. Retire it through the audited path, with the values printed above.
+docker compose run --rm --no-deps trader python deploy/cancel_paper_trial.py \
+  --config /app/config.yaml \
+  --confirm-trial-id "paper-orb-baseline-20260914-v1" \
+  --confirm-incumbent-identity "2f02fc0ec886e893e12f65767186670138b63f093dd7a547a4469eaf8a3f9508" \
+  --reason "Replace ORB incumbent with preregistered opening-range fade"
+
+# 4. Deploy current main with the new profile.
+git pull --ff-only
+export ALPACA_AGENT_CONFIG_FILE=./deploy/paper-orf.config.json
+deploy/update-compose.sh
+docker compose run --rm trader python main.py check
+
+# 5. Clear the operator pause (flat-only) and start trading on paper.
+docker compose run --rm trader python main.py resume
+docker compose start trader
+```
+
+Persist `ALPACA_AGENT_CONFIG_FILE` wherever the VM sets Compose's environment
+so a reboot keeps the same profile. After the first market session, confirm on
+the dashboard that the paper trial reports the new trial id and that
+`main.py status` shows no error. The operator pause, daily loss limit, position
+caps, spread and stale-data checks all still apply; the trial pauses itself as
+`review_required` at 60 accepted sessions.
+
 ## Parallel shadow books
 
 Each arm of the configured diagnostic cohort has its own persistent cash,

@@ -24,7 +24,7 @@ from typing import Any, Mapping, Sequence
 from .edge_discovery_core import _discover_gate, _finalize_gate
 from .edge_lab import _strengthen_gate
 from .edge_ledger import EdgeLedger, VEHICLES, provenance_hash
-from .edge_ledger_store import REPLAY_ENGINE_EPOCH, content_hash
+from .edge_ledger_store import REPLAY_ENGINE_EPOCH, content_hash, replay_code_identity
 from .costs import ReplayPolicy
 from .gates import (fdr_batch_evidence, sample_counts, verify_gate_envelope,
                     validate_protocol_floor)
@@ -1189,7 +1189,7 @@ class ShadowIngestor:
                        "null_candidate_id": null_id,
                        "run_provenance": run_provenance}
             hashes = provenance_hash(
-                dataset=source, config=_config(candidate), code=Path(__file__),
+                dataset=source, config=_config(candidate), code=replay_code_identity(Path(__file__)),
                 provenance=run_provenance)
             hashes.update({
                 "independent_confirmatory": True,
@@ -1240,7 +1240,7 @@ class ShadowIngestor:
                                        "replay_engine_epoch": int(REPLAY_ENGINE_EPOCH),
                                        "replay_digests": replay_digests})
         hashes = provenance_hash(
-            dataset=source, config=_config(candidate), code=Path(__file__),
+            dataset=source, config=_config(candidate), code=replay_code_identity(Path(__file__)),
             provenance=run_provenance)
         metrics = {"gate": gate, "shadow_source": source,
                    "replay_digests": list(replay_digests),
@@ -1259,7 +1259,7 @@ class ShadowIngestor:
                 # is still the newest session in the complete consumed tail.
                 existing = self.ledger.append_run(
                     candidate_id, lane="shadow", vehicle=vehicle,
-                    dataset=source, config=_config(candidate), code=Path(__file__),
+                    dataset=source, config=_config(candidate), code=replay_code_identity(Path(__file__)),
                     provenance=run_provenance, fit=[], heldout=confirmatory_rows,
                     metrics=metrics, run_id=run_id)
                 created = True

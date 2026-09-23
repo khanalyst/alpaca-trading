@@ -61,9 +61,10 @@ SCHEMA_VERSION = 3
 # the ``trend_pullback`` proximity band is the authored threshold rather than a
 # hidden 5 bps floor; the IBR width band divides by a horizon-scaled ATR; and
 # IBR replay applies all eight runtime admission filters.  The same variant id
-# can therefore emit different signals than it did under epoch 6.  The
-# factory's ``code_hash`` covers only ``strategy_factory.py``, not the
-# evaluator, so an epoch is the only boundary that quarantines such evidence.
+# can therefore emit different signals than it did under epoch 6.  At the
+# time the factory's ``code_hash`` covered only ``strategy_factory.py``; it now
+# also covers the evaluator modules (``replay_code_identity``), but the epoch
+# remains the boundary that quarantines evidence already recorded.
 REPLAY_ENGINE_EPOCH = 7
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
@@ -93,6 +94,33 @@ def hash_file(path: str | Path) -> str:
         return hashlib.sha256(source.read_bytes()).hexdigest()
     except OSError:
         return content_hash({"missing": str(source)})
+
+
+# Modules whose code decides what a registered variant id emits.  A run's
+# ``code_hash`` covers these as well as the module that produced the run, so an
+# evaluator change moves the fingerprint by itself instead of relying on
+# someone remembering to raise ``REPLAY_ENGINE_EPOCH``.
+REPLAY_EVALUATOR_MODULES = (
+    "agent/contracts/rule.py",
+    "agent/contracts/ibr.py",
+    "research/ibr.py",
+)
+REPLAY_CODE_IDENTITY_SCHEMA = "replay-code-identity.v1"
+
+
+def replay_code_identity(primary: str | Path) -> dict[str, Any]:
+    """Content identity of *primary* plus every signal-evaluating module."""
+    root = Path(__file__).resolve().parent.parent
+    source = Path(primary).resolve()
+    try:
+        name = source.relative_to(root).as_posix()
+    except ValueError:
+        name = source.name
+    files = {name: hash_file(source)}
+    for module in REPLAY_EVALUATOR_MODULES:
+        files.setdefault(module, hash_file(root / module))
+    return {"schema": REPLAY_CODE_IDENTITY_SCHEMA,
+            "files": dict(sorted(files.items()))}
 
 
 def provenance_hash(*, dataset: Any = None, config: Any = None,

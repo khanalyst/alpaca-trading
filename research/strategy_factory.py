@@ -38,7 +38,7 @@ from .quote_costs import cost_resolver_setup
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
-from .edge_ledger_store import provenance_hash
+from .edge_ledger_store import provenance_hash, replay_code_identity
 from .edge_identity import candidate_assumptions
 # One randomized-entry null control serves both research lanes; it lives in
 # the shared discovery helpers and is re-exported here for its callers.
@@ -4230,7 +4230,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     if risk_assumptions is not None:
         experiment_config["risk"] = risk_assumptions
     identity_hashes = provenance_hash(
-        dataset=raw_rows, config=experiment_config, code=Path(__file__),
+        dataset=raw_rows, config=experiment_config, code=replay_code_identity(Path(__file__)),
         provenance={"factory": FACTORY_SCHEMA, "experiment": experiment_config})
     experiment_cost = model.as_dict()
     if cost_setup.measured is not None:
@@ -5197,7 +5197,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             costs=model,
             measured_costs=cost_setup.measured,
             provenance=provenance_hash(
-                dataset=raw_rows, config=run_config, code=Path(__file__),
+                dataset=raw_rows, config=run_config, code=replay_code_identity(Path(__file__)),
                 provenance=run_provenance),
             candidate_id=variant["variant_id"],
             performance={"heldout_delta": gate["test"].get("mean_delta"),
@@ -5418,7 +5418,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                           "slot": hypothesis["slot"], "generation": hypothesis["generation"],
                           "diagnostic": variant["diagnostic"],
                           "simulated_account_id": variant["account"]["account_id"]},
-                    dataset=raw_rows, code=Path(__file__),
+                    dataset=raw_rows, code=replay_code_identity(Path(__file__)),
                     provenance=run_provenance)
             except (ValueError, sqlite3.Error):
                 # A legacy ledger may already contain this immutable variant
@@ -5452,7 +5452,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 fit, held = partitions[variant["account"]["account_id"]]
                 run = edge.append_run(
                     candidate["candidate_id"], lane=worker["mode"], vehicle=vehicle,
-                    dataset=raw_rows, config=run_config, code=Path(__file__),
+                    dataset=raw_rows, config=run_config, code=replay_code_identity(Path(__file__)),
                     provenance=run_provenance,
                     fit=fit, heldout=held,
                     metrics={"gate": gate, "account": {k: v for k, v in variant["account"].items()
