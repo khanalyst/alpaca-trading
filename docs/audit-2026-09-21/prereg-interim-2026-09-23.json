@@ -1,0 +1,119 @@
+{
+ "opening-range-fade-control-adjusted.v1": {
+  "authorizing": false,
+  "decision": "diagnostic_only",
+  "decision_eligible": false,
+  "eligibility_reasons": [
+   "public consolidated tape, not Alpaca IEX forward_observed"
+  ],
+  "excluded_examined_bars": 186847,
+  "hypothesis_id": "opening-range-fade-control-adjusted.v1",
+  "interim": {
+   "decision": "none_before_first_look",
+   "sessions": 0
+  },
+  "looks": [
+   {
+    "look": 1,
+    "sessions_required": 30,
+    "status": "not_reached"
+   },
+   {
+    "look": 2,
+    "sessions_required": 60,
+    "status": "not_reached"
+   }
+  ],
+  "manifest_hash": "a0ae21f5ffd765142f2f4b92c47e33f652e0fb3213f1fd8d5a6d82c3915c2b9e",
+  "provenance": {
+   "sessions": "2026-08-26..2026-09-23",
+   "source": "public_chart delayed_sip historical_backfill"
+  },
+  "rule_outcome_if_eligible": "accruing",
+  "schema": "preregistered-evaluation.v1",
+  "sealed_boundary": "2026-09-23",
+  "sealed_sessions": [],
+  "trading_authorized": false
+ },
+ "vwap-reversion-control-adjusted.v1": {
+  "authorizing": false,
+  "decision": "diagnostic_only",
+  "decision_eligible": false,
+  "eligibility_reasons": [
+   "public consolidated tape, not Alpaca IEX forward_observed"
+  ],
+  "excluded_examined_bars": 168161,
+  "hypothesis_id": "vwap-reversion-control-adjusted.v1",
+  "interim": {
+   "decision": "none_before_first_look",
+   "mirror_60m": {
+    "candidate_count": 31,
+    "cluster_df": 1,
+    "cluster_stderr_bps": 10.786117871195925,
+    "cluster_t_stat": 2.299907747388523,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 31
+    },
+    "delta_bps": 24.80707605620931,
+    "event_t_stat": 2.229345018904156,
+    "matched_count": 31,
+    "session_clusters": 2,
+    "sign_flip_p_value": 0.24037596240375964
+   },
+   "primary_60m": {
+    "candidate_count": 42,
+    "cluster_df": 1,
+    "cluster_stderr_bps": 6.564490535684931,
+    "cluster_t_stat": -1.9059241334413584,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 42
+    },
+    "delta_bps": -12.511420935709301,
+    "event_t_stat": -1.559010646415579,
+    "matched_count": 42,
+    "session_clusters": 2,
+    "sign_flip_p_value": 1.0
+   },
+   "sessions": 2,
+   "subject_120m": {
+    "candidate_count": 41,
+    "cluster_df": 1,
+    "cluster_stderr_bps": 5.121656869318792,
+    "cluster_t_stat": -2.931517513263965,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 41
+    },
+    "delta_bps": -15.014226809336726,
+    "event_t_stat": -1.6897827235513876,
+    "matched_count": 41,
+    "session_clusters": 2,
+    "sign_flip_p_value": 1.0
+   }
+  },
+  "looks": [
+   {
+    "look": 1,
+    "sessions_required": 30,
+    "status": "not_reached"
+   },
+   {
+    "look": 2,
+    "sessions_required": 60,
+    "status": "not_reached"
+   }
+  ],
+  "manifest_hash": "d2e56d80bdb0e367bcceebbe4792bf4a00aee815eb442e62f043ee2e40b7c48e",
+  "provenance": {
+   "sessions": "2026-08-26..2026-09-23",
+   "source": "public_chart delayed_sip historical_backfill"
+  },
+  "rule_outcome_if_eligible": "accruing",
+  "schema": "preregistered-evaluation.v1",
+  "sealed_boundary": "2026-09-21",
+  "sealed_sessions": [
+   "2026-09-22",
+   "2026-09-23"
+  ],
+  "trading_authorized": false
+ }
+}

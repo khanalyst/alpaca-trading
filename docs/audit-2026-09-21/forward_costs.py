@@ -31,12 +31,22 @@ def job(a):
     spec = validate_rule_spec(a["rule_spec"]); win = feature_window_bars(spec)
     need = max(causal_maturity_bars(spec), win or 0, int(spec["atr_period"]) + 1) + 2
     hold = int(spec["max_hold_bars"]); trades = []; vetoed = 0
+    xs = spec["family"] == "cross_sectional_residual"
+    spy = by_session(U["SPY"])
     for sym, rows in U.items():
+        if xs and sym == "SPY": continue
         c = cost(sym)
         for sess, sr in by_session(rows).items():
+            spy_s = spy.get(sess, [])
             for i in range(60, len(sr) - 1):
                 prefix = sr[:i + 1] if win is None else sr[max(0, i + 1 - need):i + 1]
-                try: s = evaluate_rule_signal(prefix, spec)
+                try:
+                    if xs:
+                        m = sr[i]["minute"]
+                        ctx = {"SPY": [r for r in spy_s if r["minute"] <= m]}
+                        s = evaluate_rule_signal(sr[:i + 1], spec, bars_by_symbol=ctx, symbol=sym)
+                    else:
+                        s = evaluate_rule_signal(prefix, spec)
                 except Exception: continue
                 if not s: continue
                 e = float(sr[i + 1]["open"]); d = 1 if s["direction"] == "long" else -1

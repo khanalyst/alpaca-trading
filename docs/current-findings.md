@@ -18,6 +18,12 @@
   found none that reliably beat the registered bracket, so no exit variant was
   added. `vwap_reversion`'s control-adjusted 60-minute delta does not become
   raw P&L: held to 60 minutes it grosses about 2.7 bps per trade.
+- **First forward sessions (22 and 23 September, public tape, diagnostic).**
+  All 24 rule arms pooled lose about 3 bps per trade at realistic cost both in
+  and out of sample, and about 17 at the modelled cost. The opening-range fade
+  lost on both days (8 trades); the VWAP hypothesis's first two sealed
+  sessions point against it. Two sessions decide nothing. Details:
+  `docs/audit-2026-09-21/FORWARD-2026-09-23.md`.
 
 ## Source state on `main`, 22 September 2026 (not deployed)
 

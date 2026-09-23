@@ -1,6 +1,6 @@
 # Measured audit, 21 September 2026
 
-Four reports, in order:
+Five reports, in order:
 
 - `FINDINGS.md`: the audit, and why the system had never produced a trade.
 - `REMEDIATION.md`: steps 1, 3 and 4 applied, plus the IBR contract merge.
@@ -8,7 +8,10 @@ Four reports, in order:
   and costs. **It overturns a conclusion in `FINDINGS.md`**, and carries a
   correction of its own at the end.
 - `RE-AUDIT.md`: session-clustered inference, the preregistered forward test,
-  and a second pass over everything changed. Read it last.
+  and a second pass over everything changed.
+- `FORWARD-2026-09-23.md`: all 24 rule arms net of fees, realistic and
+  modelled costs, historical and on the first two sealed sessions, plus the
+  walk-forward exit test. Read it last.
 
 This directory holds the evidence.
 
