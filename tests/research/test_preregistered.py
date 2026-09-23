@@ -18,6 +18,8 @@ from research.market_data import normalize_underlying_bar
 # Never update this literal to make the suite pass.
 FROZEN_MANIFEST_HASH = (
     "d2e56d80bdb0e367bcceebbe4792bf4a00aee815eb442e62f043ee2e40b7c48e")
+ORF_FROZEN_MANIFEST_HASH = (
+    "a0ae21f5ffd765142f2f4b92c47e33f652e0fb3213f1fd8d5a6d82c3915c2b9e")
 
 
 def _bars(day: date, *, count: int = 40, symbol: str = "SPY") -> list:
@@ -72,6 +74,48 @@ class FrozenManifestTests(unittest.TestCase):
     def test_unknown_hypothesis_is_refused(self):
         with self.assertRaises(prereg.PreregistrationError):
             prereg.preregistration("not-registered.v1")
+
+
+class OpeningRangeFadeManifestTests(unittest.TestCase):
+    hypothesis = prereg.OPENING_RANGE_FADE_HYPOTHESIS
+
+    def test_manifest_hash_is_pinned(self):
+        self.assertEqual(prereg.preregistration(self.hypothesis)["manifest_hash"],
+                         ORF_FROZEN_MANIFEST_HASH)
+
+    def test_registering_it_left_the_first_hypothesis_untouched(self):
+        self.assertEqual(prereg.preregistration()["manifest_hash"],
+                         FROZEN_MANIFEST_HASH)
+        self.assertEqual(set(prereg.PREREGISTERED_HYPOTHESES),
+                         {prereg.VWAP_REVERSION_HYPOTHESIS, self.hypothesis})
+
+    def test_subject_and_mirror_resolve_and_are_recorded_forward(self):
+        manifest = prereg.preregistration(self.hypothesis)
+        cohort = {arm["variant_id"] for arm in _logical_arms()}
+        subject = manifest["subject"]
+        mirror = manifest["secondary_descriptive"][0]
+        for item in (subject, mirror):
+            self.assertEqual(rule_variant_id(item["rule_spec"]), item["variant_id"])
+            self.assertIn(item["variant_id"], cohort)
+        self.assertEqual(subject["rule_spec"]["family"], "opening_range_fade")
+        self.assertEqual(mirror["rule_spec"]["family"], "opening_range_breakout")
+
+    def test_window_excludes_the_session_it_was_registered_during(self):
+        manifest = prereg.preregistration(self.hypothesis)
+        self.assertEqual(manifest["sealed_window"]["sessions_after"], "2026-09-23")
+        report = prereg.evaluate(
+            _bars(date(2026, 9, 23)) + _bars(date(2026, 9, 24)),
+            hypothesis_id=self.hypothesis, decision_eligible=True)
+        self.assertEqual(report["sealed_sessions"], ["2026-09-24"])
+        self.assertEqual(report["hypothesis_id"], self.hypothesis)
+        self.assertFalse(report["trading_authorized"])
+
+    def test_paper_profile_trades_exactly_the_registered_subject(self):
+        profile = json.loads((Path(prereg.__file__).resolve().parents[1] /
+                              "deploy" / "paper-orf.config.json").read_text())
+        manifest = prereg.preregistration(self.hypothesis)
+        self.assertEqual(profile["research"]["paper_trial"]["variant_id"],
+                         manifest["subject"]["variant_id"])
 
 
 class DecisionRuleTests(unittest.TestCase):

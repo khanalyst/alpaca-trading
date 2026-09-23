@@ -55,6 +55,37 @@ It never authorizes trading, sizing or a configuration change.
 diagnostic shadow cohort, and a test fails if it ever leaves it, so the
 recorder corpus on the VM is already accumulating the data this needs.
 
+## `opening-range-fade-control-adjusted.v1`
+
+Registered 2026-09-23, while that day's session was trading and before any of
+its bars were fetched. Manifest hash
+`a0ae21f5ffd765142f2f4b92c47e33f652e0fb3213f1fd8d5a6d82c3915c2b9e`, pinned by
+`tests/research/test_preregistered.py`.
+
+**Claim.** Bars on which the frozen opening-range fade rule fires are followed
+over the next 60 minutes by a return in the rule's own direction that beats a
+clock-matched control by at least 3.0 bps on average.
+
+**Why this one.** It was the only catalogue arm still positive after
+realistic costs in the audit's bracket replay (+10.2 bps per trade over 59
+trades, session-clustered t +2.57), with a +19.5 bps control-adjusted delta at
+60 minutes (clustered t +2.95). It also lost on 2026-09-22. All of that is
+in-sample, which is why it needs its own sealed test.
+
+| item | fixed value |
+| --- | --- |
+| subject | `rule.opening-range-fade.d5785d9e70b56def` (diagnostic-shadow baseline) |
+| mirror | `rule.opening-range-breakout.0eb200d3136d80ee`, expected negative |
+| sealed window | sessions strictly after **2026-09-23** |
+| everything else | identical to the VWAP hypothesis above: endpoint, data, looks, alpha, hurdle, decision rule |
+
+It is also the incumbent of the paper profile `deploy/paper-orf.config.json`
+(trial `paper-orf-baseline-20260923-v1`). The paper trial's real fills are
+trade-level evidence under the trial's own floors; they never enter this
+decision, and this decision never grants the trial anything.
+
+Each hypothesis spends its own alpha and is reported separately.
+
 ## Running it
 
 On the VM, against the recorder's forward corpus (a JSONL file or a directory
@@ -64,6 +95,10 @@ of session partitions):
 python -m research.preregistered \
   --data /app/runtime/research/recorded-forward-2026-09-16 \
   --out /app/runtime/research/preregistered/vwap-reversion-$(date -u +%F).json
+python -m research.preregistered \
+  --hypothesis opening-range-fade-control-adjusted.v1 \
+  --data /app/runtime/research/recorded-forward-2026-09-16 \
+  --out /app/runtime/research/preregistered/opening-range-fade-$(date -u +%F).json
 ```
 
 A report is never replaced; each run writes a new file. The run is

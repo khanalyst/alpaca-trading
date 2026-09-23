@@ -66,6 +66,32 @@ _MIRROR_SPEC: dict[str, Any] = {
     "volume_multiplier": 1.25, "zscore": 1.25,
 }
 
+OPENING_RANGE_FADE_HYPOTHESIS = "opening-range-fade-control-adjusted.v1"
+_ORF_SUBJECT_ID = "rule.opening-range-fade.d5785d9e70b56def"
+_ORF_SUBJECT_SPEC: dict[str, Any] = {
+    "atr_period": 14, "breakeven_r": None, "compression_bps": 45.0,
+    "confirmation": "none", "confirmations": [], "entry_after_minutes": 0,
+    "entry_before_minutes": 390, "exit_before_minutes": None,
+    "family": "opening_range_fade", "lookback": 15, "max_atr_bps": 5000.0,
+    "max_hold_bars": 90, "min_atr_bps": 0.0, "range_minutes": 20,
+    "schema": "rule-strategy.v4", "side": "both", "slow_lookback": 40,
+    "stop_atr": 1.0, "target_lookback": 20, "target_mode": "fixed_r",
+    "target_r": 1.5, "threshold_bps": 8.0, "trailing_stop_r": None,
+    "volume_multiplier": 1.25, "zscore": 1.25,
+}
+_ORF_MIRROR_ID = "rule.opening-range-breakout.0eb200d3136d80ee"
+_ORF_MIRROR_SPEC: dict[str, Any] = {
+    "atr_period": 14, "breakeven_r": None, "compression_bps": 45.0,
+    "confirmation": "volume", "confirmations": [], "entry_after_minutes": 0,
+    "entry_before_minutes": 390, "exit_before_minutes": None,
+    "family": "opening_range_breakout", "lookback": 15, "max_atr_bps": 5000.0,
+    "max_hold_bars": 90, "min_atr_bps": 0.0, "range_minutes": 15,
+    "schema": "rule-strategy.v4", "side": "both", "slow_lookback": 40,
+    "stop_atr": 1.0, "target_lookback": 20, "target_mode": "fixed_r",
+    "target_r": 2.0, "threshold_bps": 5.0, "trailing_stop_r": None,
+    "volume_multiplier": 1.25, "zscore": 1.25,
+}
+
 PRIMARY_HORIZON_MINUTES = 60
 SECONDARY_HORIZON_MINUTES = 120
 ECONOMIC_HURDLE_BPS = 3.0
@@ -192,7 +218,127 @@ def _vwap_reversion_manifest() -> dict[str, Any]:
     return {**body, "manifest_hash": content_hash(body)}
 
 
-_REGISTRY = {VWAP_REVERSION_HYPOTHESIS: _vwap_reversion_manifest}
+def _opening_range_fade_manifest() -> dict[str, Any]:
+    # Same instrument, endpoint, looks and decision rule as the VWAP
+    # hypothesis, so the two can be read side by side.  Everything that is
+    # specific to this claim is written out here rather than inherited.
+    first_look = int(PROTOCOL_QUALIFICATION_MIN_CLUSTERS)
+    body = {
+        "schema": PREREGISTRATION_SCHEMA,
+        "hypothesis_id": OPENING_RANGE_FADE_HYPOTHESIS,
+        "registered_on": "2026-09-23",
+        "claim": (
+            "On the configured 24-ETF universe, bars on which the frozen "
+            "opening-range fade rule fires are followed over the next 60 "
+            "minutes by a return, in the rule's own direction, that exceeds a "
+            "clock-matched control by at least 3.0 bps on average."),
+        "why_this_hypothesis": (
+            "opening_range_fade was the only catalogue arm whose bracket "
+            "replay stayed positive after realistic costs in the September "
+            "2026 audit (docs/audit-2026-09-21/forward-costs-2026-09-22.json: "
+            "+10.2 bps per trade over 59 trades, session-clustered t +2.57), "
+            "and its 60-minute control-adjusted delta was +19.5 bps "
+            "(clustered t +2.95, df 17).  It was chosen because of those "
+            "in-sample results and it lost on 2026-09-22, the one later "
+            "session seen, which is why it may only be confirmed on sessions "
+            "none of them used."),
+        "subject": {
+            "variant_id": _ORF_SUBJECT_ID,
+            "rule_spec": _frozen(_ORF_SUBJECT_SPEC, _ORF_SUBJECT_ID),
+            "provenance": (
+                "diagnostic-shadow opening_range_fade baseline, already "
+                "evaluated forward by the deployed shadow service, and the "
+                "incumbent of deploy/paper-orf.config.json"),
+            "selection_note": (
+                "the registered baseline, not the in-sample-best of its pair"),
+        },
+        "primary_endpoint": {
+            "instrument": "research.signal_quality.measure_signal_quality",
+            "metric": "candidate_minus_control_bps",
+            "horizon_minutes": PRIMARY_HORIZON_MINUTES,
+            "horizon_rationale": (
+                "inside the frozen arm's own 90-bar hold, so its bracket could "
+                "capture it"),
+            "control": (
+                "same instrument, same session minute, other sessions of the "
+                "same look window"),
+            "inference_unit": "session",
+            "statistics": [
+                "cr1 session-clustered t against Student-t with G-1 df",
+                "one-sided cluster sign-flip over whole sessions"],
+        },
+        "sealed_window": {
+            "sessions_after": "2026-09-23",
+            "rationale": (
+                "registered while the 2026-09-23 session was trading; no bar "
+                "of that session had been fetched, but it is excluded so the "
+                "window cannot contain a session that was under way when the "
+                "rules were written"),
+            "control_pool": "restricted to the sessions of the look window",
+        },
+        "data": {
+            "decision_provider": "alpaca",
+            "decision_feed": "iex",
+            "decision_source_mode": "forward_observed",
+            "feed_rationale": (
+                "the deployment trades on its own feed; a result on another "
+                "feed is a replication, not the decision"),
+            "other_feeds": "descriptive replication only, never decision-bearing",
+        },
+        "looks": [
+            {"look": 1, "sessions": first_look,
+             "alpha_one_sided": LOOK_ALPHA_ONE_SIDED},
+            {"look": 2, "sessions": 2 * first_look,
+             "alpha_one_sided": LOOK_ALPHA_ONE_SIDED},
+        ],
+        "look_rule": (
+            "each look uses exactly the first N sealed sessions in date order, "
+            "so a result cannot be improved by choosing when to look; alpha is "
+            "split 0.025 per look, 0.05 overall"),
+        "decision_rule": {
+            "economic_hurdle_bps": ECONOMIC_HURDLE_BPS,
+            "hurdle_origin": (
+                "the same kill threshold as vwap-reversion-control-adjusted.v1, "
+                "written at commit dc156ca"),
+            "pass": (
+                "cr1 one-sided p < alpha AND sign-flip one-sided p < alpha AND "
+                "mean control-adjusted delta >= economic_hurdle_bps"),
+            "futility": (
+                "one-sided test that the mean is below the hurdle has p < alpha: "
+                "retire the hypothesis"),
+            "inconclusive": (
+                "neither; at look 1 continue to look 2, at look 2 the claim is "
+                "not established and the hypothesis is retired"),
+            "underpowered_control": (
+                f"fewer than {MIN_MATCHED_CONTROLS} matched controls, coverage "
+                f"below {MIN_CONTROL_COVERAGE:.0%}, or any control outside the "
+                f"registered cross-session tier counts as inconclusive"),
+            "before_first_look": "descriptive only; no decision and no early stop",
+        },
+        "secondary_descriptive": [
+            {"name": "mirror", "variant_id": _ORF_MIRROR_ID,
+             "rule_spec": _frozen(_ORF_MIRROR_SPEC, _ORF_MIRROR_ID),
+             "expectation": "negative 60-minute control-adjusted delta"},
+            {"name": "subject_120m", "horizon_minutes": SECONDARY_HORIZON_MINUTES},
+            {"name": "paper_trial",
+             "profile": "deploy/paper-orf.config.json",
+             "trial_id": "paper-orf-baseline-20260923-v1",
+             "note": ("trade-level evidence on real paper fills under the "
+                      "paper trial's own floors; never part of this decision")},
+        ],
+        "multiplicity": (
+            "a second registered hypothesis with its own alpha; the two are "
+            "reported separately and neither is re-tested on the other's "
+            "behalf"),
+        "authorizes": (
+            "a pass earns entry to the existing proof pipeline; it never "
+            "authorizes trading, sizing, or a configuration change"),
+    }
+    return {**body, "manifest_hash": content_hash(body)}
+
+
+_REGISTRY = {VWAP_REVERSION_HYPOTHESIS: _vwap_reversion_manifest,
+             OPENING_RANGE_FADE_HYPOTHESIS: _opening_range_fade_manifest}
 PREREGISTERED_HYPOTHESES = tuple(_REGISTRY)
 
 
@@ -411,7 +557,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
-    "ECONOMIC_HURDLE_BPS", "EVALUATION_SCHEMA", "PREREGISTERED_HYPOTHESES",
+    "ECONOMIC_HURDLE_BPS", "EVALUATION_SCHEMA", "OPENING_RANGE_FADE_HYPOTHESIS",
+    "PREREGISTERED_HYPOTHESES",
     "PREREGISTRATION_SCHEMA", "PreregistrationError", "VWAP_REVERSION_HYPOTHESIS",
     "evaluate", "look_outcome", "main", "preregistration",
 ]
