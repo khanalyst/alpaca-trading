@@ -921,6 +921,24 @@ class LiveShadowTests(unittest.TestCase):
         self.assertEqual(len(runner.store.replay_accounts(
             candidate["candidate_id"])), 1)
 
+    def test_stored_event_evaluation_uses_payload_provenance_and_availability(self):
+        candidate = self._candidate()
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        event = self._replay_row(as_of="2026-01-02T16:00:00+00:00")
+        event.update(provider="alpaca", feed="iex",
+                     observed_at="2026-01-02T16:00:05+00:00")
+        runner.store.ingest_event(event, max_events=100)
+        stored = runner.store.events()[0]
+        self.assertNotIn("provider", stored)
+        with patch("research.live_shadow.generate_ibr_signal", return_value=None):
+            direct = runner._evaluate(candidate, event, {"SPY": [event]}, {}, {})
+            persisted = runner._evaluate(candidate, stored, {"SPY": [event]}, {}, {})
+        self.assertEqual(persisted, direct)
+        self.assertNotEqual(persisted[1], "equity provider mismatch")
+        invalid = dict(stored, event_json="{}")
+        self.assertEqual(runner._evaluate(candidate, invalid, {}, {}, {})[1],
+                         "invalid stored event payload")
+
     def test_open_books_enforce_candidate_local_portfolio_caps(self):
         cases = (
             ({"max_concurrent_positions": 1, "max_open_risk_pct": 100,

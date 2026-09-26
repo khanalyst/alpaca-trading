@@ -672,6 +672,60 @@ class DiagnosticLiveShadowTests(unittest.TestCase):
                     "shadow replay validation event bound 2 exceeded"):
             context_runner.run_once()
 
+    def test_large_cursor_backlog_pages_without_skipping_equal_timestamps(self):
+        store = ShadowStore(self.shadow)
+        with sqlite3.connect(self.shadow) as db:
+            db.executemany("""INSERT INTO events
+                (event_key,digest,event_json,event_type,symbol,timestamp,inserted_at)
+                VALUES (?,?,'{}','quote','SPY','2026-09-23T14:00:00+00:00',1)""",
+                [(f"{n:05d}", f"digest-{n}") for n in range(20_001)])
+        first = store.events_after_cursor(inserted_at=0, event_key="", max_events=20_000)
+        self.assertEqual(len(first), 20_000)
+        second = store.events_after_cursor(
+            inserted_at=first[-1]["inserted_at"],
+            event_key=first[-1]["event_key"], max_events=20_000)
+        self.assertEqual([row["event_key"] for row in second], ["20000"])
+        self.assertEqual(store.event_count(), 20_001)
+
+    def test_catchup_pages_commit_once_and_do_not_seal_partial_session(self):
+        runner = ShadowRunner(self._config())
+        activated = runner.run_once()["diagnostic_shadow"]
+        # Ingest three valid rows at once, then simulate a smaller consumer
+        # page budget without altering the cohort's frozen strategy identity.
+        source_start = self.corpus.stat().st_size
+        for minute in (30, 31, 32):
+            self._append_bar(minute, observed_at=(
+                datetime.now(timezone.utc) + timedelta(seconds=minute)))
+        with self.corpus.open(newline="") as handle:
+            for row in csv.DictReader(handle):
+                runner.store.ingest_event(
+                    row, max_events=200, source_path=str(self.corpus.resolve()),
+                    source_offset_start=source_start,
+                    source_offset_end=self.corpus.stat().st_size)
+        runner.store.save_source_offsets({
+            str(self.corpus.resolve()): self.corpus.stat().st_size})
+        cfg = ShadowConfig(
+            self.corpus, self.edge, self.shadow, diagnostic=True,
+            runtime_config=_runtime_config(), runtime_config_path="/mounted/config.yaml",
+            max_events=2, max_decisions=10_000, max_workers=4)
+        runner = ShadowRunner(cfg)
+        with patch.object(ShadowRunner, "_evaluate", return_value=(
+                "no_trade", "probe", {}, None)), \
+                patch.object(ShadowRunner, "_diagnostic_session_complete", return_value=True), \
+                patch.object(ShadowRunner, "_replay", return_value=True) as replay:
+            first = runner.run_once()
+            self.assertEqual(first["diagnostic_shadow"]["decision_counts"]["evaluated_total"], 48)
+            replay.assert_not_called()
+            second = runner.run_once()
+            self.assertEqual(second["diagnostic_shadow"]["decision_counts"]["evaluated_total"], 72)
+            self.assertEqual(replay.call_count, 24)
+            third = runner.run_once()
+            self.assertEqual(third["diagnostic_shadow"]["decision_counts"]["evaluated_total"], 72)
+        progress = runner.store.diagnostic_progress(
+            activated["cohort_identity"], activated["candidate_identities"],
+            runner.store.diagnostic_activation(activated["cohort_identity"]))
+        self.assertTrue(all(row["processed_events"] == 3 for row in progress.values()))
+
     def test_account_events_are_globally_causal_across_sessions_and_restarts(self):
         runner = ShadowRunner(self._config())
         activated = runner.run_once()["diagnostic_shadow"]

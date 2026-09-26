@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -26,6 +27,27 @@ if str(ROOT) not in sys.path:
 from agent import state
 from deploy.health import _read_json
 from deploy.watchdog import run_once, write_status
+
+
+def _open_journal_wal_anchor(path: Path) -> sqlite3.Connection:
+    """Keep journal sidecars available to the read-only dashboard while paused.
+
+    This query-only autocommit handle owns no transaction and cannot write
+    trades. It keeps normal WAL readers working even when no trader child
+    holds the journal open. Never use immutable=1 on a live journal.
+    """
+    connection = sqlite3.connect(
+        f"{path.resolve().as_uri()}?mode=rw", uri=True,
+        timeout=5, isolation_level=None)
+    try:
+        connection.execute("PRAGMA query_only=ON").close()
+        cursor = connection.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        cursor.fetchone()
+        cursor.close()
+    except BaseException:
+        connection.close()
+        raise
+    return connection
 
 
 def terminate_child(child, *, grace: float = 15.0) -> bool:
@@ -202,8 +224,17 @@ def main(argv=None) -> int:
     env_file = os.getenv("ALPACA_AGENT_SECRETS_FILE") or os.getenv("ALPACA_AGENT_SECRET_FILE")
     from dotenv import load_dotenv
     load_dotenv(env_file or ROOT / ".env", override=False)
-    return supervise(str(Path(args.config).resolve()), max_age=args.max_heartbeat_age,
-                     interval=args.interval, grace=args.terminate_grace)
+    from main import load_cfg
+    config_path = str(Path(args.config).resolve())
+    cfg = load_cfg(config_path)
+    state.configure_runtime(str(cfg.get("mode", "paper")))
+    state.initialize_journal()
+    anchor = _open_journal_wal_anchor(state.JOURNAL_FILE)
+    try:
+        return supervise(config_path, max_age=args.max_heartbeat_age,
+                         interval=args.interval, grace=args.terminate_grace)
+    finally:
+        anchor.close()
 
 
 if __name__ == "__main__":

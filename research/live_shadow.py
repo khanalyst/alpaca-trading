@@ -2967,16 +2967,13 @@ class ShadowStore:
 
     def events_after_cursor(self, *, inserted_at: float, event_key: str,
                             max_events: int) -> list[dict]:
-        """Read a bounded insertion-ordered diagnostic increment."""
+        """Read one bounded page; the committed cursor resumes the next page."""
         with self._connection() as db:
             rows = db.execute("""SELECT * FROM events
                 WHERE inserted_at>? OR (inserted_at=? AND event_key>?)
                 ORDER BY inserted_at,event_key LIMIT ?""",
                 (float(inserted_at), float(inserted_at), str(event_key),
-                 int(max_events) + 1)).fetchall()
-        if len(rows) > int(max_events):
-            raise ShadowError(
-                f"diagnostic shadow event batch bound {max_events} exceeded")
+                 int(max_events))).fetchall()
         return [dict(row) for row in rows]
 
     def events_for_sessions(self, sessions: Sequence[str], *,
@@ -3852,6 +3849,16 @@ class ShadowRunner:
             session: (tuple(values[0]), tuple(values[1]), tuple(values[2]))
             for session, values in session_input_lists.items()
         }
+        # Context includes the complete recorded session, while this poll may
+        # contain only one catch-up page. Do not seal a replay until the arm
+        # has consumed every insertion in that session, including rejected
+        # provenance rows and quotes.
+        session_last_cursor: dict[str, tuple[float, str]] = {}
+        for prepared in prepared_context:
+            if prepared.session is not None:
+                session_last_cursor[prepared.session] = max(
+                    session_last_cursor.get(prepared.session, (0.0, "")),
+                    prepared.cursor)
 
         work: dict[str, dict[str, Any]] = {}
         provenance_rejections = 0
@@ -3906,6 +3913,8 @@ class ShadowRunner:
             close_sessions = [
                 session for session in session_events
                 if session != "unknown" and session in session_inputs and
+                bool(arm_rows) and
+                arm_rows[-1].cursor >= session_last_cursor[session] and
                 self._diagnostic_session_complete(
                     arm, session, session_inputs[session][0],
                     calendar_snapshot=resolved_calendar)
@@ -4084,6 +4093,11 @@ class ShadowRunner:
             arm = arm_by_id[candidate_id]
             for session in refreshed[candidate_id].get("pending_sessions") or ():
                 inputs = session_inputs.get(str(session))
+                committed_cursor = (
+                    float(refreshed[candidate_id]["last_inserted_at"]),
+                    str(refreshed[candidate_id]["last_event_key"]))
+                if committed_cursor < session_last_cursor.get(str(session), (0.0, "")):
+                    continue
                 if inputs is None or not self._diagnostic_session_complete(
                         arm, str(session), inputs[0],
                         calendar_snapshot=resolved_calendar):
@@ -4810,6 +4824,19 @@ class ShadowRunner:
                   options: Mapping[str, list], *,
                   calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
                   ) -> tuple[str, str | None, dict, dict | None]:
+        # Legacy workers receive a WAL envelope; diagnostics receive its
+        # payload. Provider, feed and observed_at live in event_json, not in
+        # the envelope columns. Evaluate the same recorded payload in both.
+        if "event_json" in event:
+            try:
+                payload = json.loads(event["event_json"])
+                if not isinstance(payload, Mapping):
+                    raise ValueError("event payload must be an object")
+                if payload.get("event_key") != event.get("event_key"):
+                    raise ValueError("event payload key differs from WAL key")
+                event = payload
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return "no_data", "invalid stored event payload", {}, None
         symbol = str(event.get("symbol") or "")
         diagnostic_candidate = is_diagnostic_candidate(candidate)
         cfg = self._shadow_candidate_config(_safe_config(candidate))

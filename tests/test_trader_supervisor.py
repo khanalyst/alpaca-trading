@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,35 @@ from deploy import trader_supervisor as supervisor
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_paused_journal_anchor_preserves_wal_and_fresh_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.db"
+            writer = sqlite3.connect(path)
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("CREATE TABLE probe (value INTEGER)")
+            writer.commit()
+            writer.close()
+            anchor = supervisor._open_journal_wal_anchor(path)
+            try:
+                self.assertFalse(anchor.in_transaction)
+                with self.assertRaises(sqlite3.OperationalError):
+                    anchor.execute("INSERT INTO probe VALUES (0)")
+                for value in (1, 2):
+                    writer = sqlite3.connect(path)
+                    writer.execute("INSERT INTO probe VALUES (?)", (value,))
+                    writer.commit()
+                    writer.close()
+                    self.assertTrue(Path(str(path) + "-wal").exists())
+                    self.assertTrue(Path(str(path) + "-shm").exists())
+                    reader = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+                    try:
+                        self.assertEqual(reader.execute(
+                            "SELECT max(value) FROM probe").fetchone()[0], value)
+                    finally:
+                        reader.close()
+            finally:
+                anchor.close()
+
     def test_pause_waits_for_persisted_resume_without_broker_recovery(self):
         with patch.object(supervisor.state, "load_state", side_effect=[
                 {"operator_pause": True}, {"operator_pause": True}, {"operator_pause": False}]), \
