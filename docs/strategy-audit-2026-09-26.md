@@ -52,6 +52,15 @@ or positive expectancy.
    query-only autocommit connection for its lifetime, including while paused.
    The dashboard retains normal WAL consistency; it does not use immutable
    reads or a writable mount.
+4. Deployment verification exposed a second backlog failure after pagination
+   was repaired: the legacy candidate path duplicated the retained WAL and
+   decoded market rows into several independent JSON copies. With 386,176
+   retained events, initial loading used about 1.1 GB, then duplication hit
+   the shadow container's 2 GB limit. Tuple projections now share the already
+   detached, read-only rows, and the event watermark is hashed incrementally
+   with exactly the same canonical encoding. The change preserves full
+   history, session ordering and the event-floor rules. It does not truncate
+   sessions or raise the container's memory limit.
 
 ## Shared economics and constraints
 
@@ -147,6 +156,12 @@ passed 97 targeted shadow, provenance, backlog, supervisor, WAL and status
 tests, including a 20,001-event cursor case, partial-session replay deferral,
 restart/idempotency, and direct-versus-stored-event evaluation parity. Python
 compilation and `git diff --check` passed.
+
+The memory follow-up passed 100 targeted tests on September 28, including
+a 20,001-event memory-budget regression, canonical-hash equivalence, and
+checks that concurrent legacy evaluation and replay do not mutate the shared
+market rows. Legacy memory use still scales with retained pending history;
+the fix removes redundant copies, not the underlying full-history contract.
 
 Local audit receipts are in `outputs/strategy-audit-2026-09-24/`, including
 `status-before.json`, `shadow-before.json`, and

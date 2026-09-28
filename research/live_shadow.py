@@ -180,6 +180,17 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _sequence_digest(values: Iterable[Any]) -> str:
+    """Hash the same canonical JSON array without materializing its encoding."""
+    digest = hashlib.sha256(b"[")
+    for index, value in enumerate(values):
+        if index:
+            digest.update(b",")
+        digest.update(_json(value).encode("utf-8"))
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
 def _replay_code_hash() -> str:
     """Return a deterministic hash of the bounded replay source bundle."""
     root = Path(__file__).resolve().parents[1]
@@ -6653,40 +6664,39 @@ class ShadowRunner:
                          if row_session(row) == session],
                     )
 
-        # Convert all worker inputs to detached JSON values and tuples.  The
-        # tuples are never handed to a mutating path, making the poll snapshot
-        # explicit even if a provider returns mutable row objects.
-        frozen_events = tuple(json.loads(_json(dict(row))) for row in events)
+        # The WAL query and JSON decoder already detached every row from the
+        # recorder and database. Workers and replay treat these rows as read
+        # only, copying a row before adding derived fields. Share that one
+        # snapshot across its tuple projections: duplicating all envelopes,
+        # market maps and session maps exhausts memory during catch-up.
+        frozen_events = tuple(events)
         frozen_bars = {
-            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            str(symbol): tuple(values)
             for symbol, values in bars.items()}
         frozen_quotes = {
-            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            str(symbol): tuple(values)
             for symbol, values in quotes.items()}
         frozen_options = {
-            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            str(symbol): tuple(values)
             for symbol, values in options.items()}
         frozen_session_events: dict[str, tuple[dict, ...]] = {}
         for session, values in session_events.items():
-            frozen_session_events[session] = tuple(
-                json.loads(_json(dict(row))) for row in values)
+            frozen_session_events[session] = tuple(values)
         frozen_session_inputs: dict[str, tuple[tuple[dict, ...], tuple[dict, ...], tuple[dict, ...]]] = {}
         for session, (session_bars, session_quotes, session_options) in session_inputs.items():
             frozen_session_inputs[session] = (
-                tuple(json.loads(_json(dict(row))) for row in session_bars),
-                tuple(json.loads(_json(dict(row))) for row in session_quotes),
-                tuple(json.loads(_json(dict(row))) for row in session_options),
+                tuple(session_bars), tuple(session_quotes), tuple(session_options),
             )
         persisted_event_keys = self.store.decision_event_keys(
             sorted(arm_ids),
             sorted(set(frozen_session_events) - replay_only_sessions))
         event_watermark = {
             "count": len(frozen_events),
-            "events_digest": _digest([
+            "events_digest": _sequence_digest(
                 {key: row.get(key) for key in (
                     "event_key", "digest", "event_type", "symbol",
                     "timestamp", "as_of")}
-                for row in frozen_events]),
+                for row in frozen_events),
             "last_event_key": (str(frozen_events[-1].get("event_key") or "")
                                 if frozen_events else None),
             "last_timestamp": (str(frozen_events[-1].get("timestamp") or "")

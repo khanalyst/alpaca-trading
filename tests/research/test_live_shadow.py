@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import time
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest.mock import call, patch
@@ -21,7 +22,7 @@ from research.edge_ledger import EdgeLedger
 from research.factory_core import simulate_account as factory_simulate_account
 from research.live_shadow import (InputConflict, ShadowConfig, ShadowRunner,
                                    ShadowError, ShadowStore, _compact_shadow_rows,
-                                   _digest, _manifest_replay_identity,
+                                   _digest, _sequence_digest, _manifest_replay_identity,
                                    _replay_signature,
                                    _shadow_signature, _signature_diffs,
                                    _replay_code_hash,
@@ -279,6 +280,75 @@ class LiveShadowTests(unittest.TestCase):
         self.assertEqual(manifest["event_watermark"]["count"], 3)
         self.assertEqual(manifest["replay_code_hash"], _replay_code_hash())
         self.assertNotIn("replay_session_max_events", manifest)
+
+    def test_streamed_array_digest_preserves_manifest_identity(self):
+        for values in ([], [None, True, False, -0.0, 1.25],
+                       [{"z": "é\\\"", "a": [1, {"b": None}]}]):
+            with self.subTest(values=values):
+                self.assertEqual(_sequence_digest(iter(values)), _digest(values))
+
+    def test_legacy_snapshot_reuses_history_without_large_temporary_copies(self):
+        self._candidate()
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        stamp = "2026-01-02T14:30:00+00:00"
+        events, quotes = [], []
+        for index in range(20_001):
+            quote = {"event_key": f"quote-{index:06}", "event_type": "quote",
+                     "symbol": "SPY", "timestamp": stamp, "as_of": stamp,
+                     "observed_at": stamp, "provider": "alpaca", "feed": "iex",
+                     "bid": 99.9, "ask": 100.1}
+            quotes.append(quote)
+            events.append({"event_key": quote["event_key"], "event_type": "quote",
+                           "symbol": "SPY", "timestamp": stamp, "as_of": stamp,
+                           "event_json": json.dumps(quote),
+                           "digest": _digest(quote), "inserted_at": float(index)})
+        before = _digest([events, quotes])
+        expected_watermark = _digest([
+            {key: row.get(key) for key in (
+                "event_key", "digest", "event_type", "symbol", "timestamp", "as_of")}
+            for row in events])
+        tracemalloc.start()
+        try:
+            with patch.object(runner, "_load_events",
+                              return_value=(events, {}, {"SPY": quotes}, {})):
+                result = runner.run_once()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        # This budget excludes the input snapshot and allows allocator/platform
+        # variation, but rejects serializing and cloning the full history again.
+        self.assertLess(peak, 20 * 1024 * 1024)
+        self.assertEqual(result["events"], len(events))
+        self.assertEqual(result["forward_event_floor"], 0.0)
+        manifest = runner.store.manifest(result["manifest_digest"])
+        self.assertEqual(manifest["event_watermark"]["events_digest"], expected_watermark)
+        self.assertEqual(_digest([events, quotes]), before)
+
+    def test_legacy_workers_and_replay_preserve_shared_market_rows(self):
+        self._candidate()
+        self._candidate(variant="ibr.range.30")
+        self._write_session_closing_rows()
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, max_workers=2))
+        snapshots = []
+        original = runner._load_events
+
+        def capture():
+            result = original()
+            snapshots.append((result, _digest(result)))
+            return result
+
+        with patch.object(runner, "_load_events", side_effect=capture), \
+                patch.object(runner, "_evaluate_arm_snapshot",
+                             wraps=runner._evaluate_arm_snapshot) as evaluate, \
+                patch.object(runner, "_replay", wraps=runner._replay) as replay:
+            result = runner.run_once()
+        self.assertFalse(result["candidate_errors"])
+        self.assertTrue(evaluate.called)
+        self.assertTrue(replay.called)
+        self.assertTrue(snapshots)
+        for snapshot, before in snapshots:
+            self.assertEqual(_digest(snapshot), before)
 
     def test_no_candidate_poll_skips_historical_materialization(self):
         """An empty candidate set must not copy a large immutable WAL."""
