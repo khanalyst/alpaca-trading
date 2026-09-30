@@ -402,6 +402,13 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _quote_price(value: Any) -> float | None:
+    """Normalize serialized numeric prices without accepting non-price types."""
+    if isinstance(value, (bool, bytes, bytearray)):
+        return None
+    return _finite(value)
+
+
 def _timestamp(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
@@ -5239,7 +5246,7 @@ class ShadowRunner:
             snap["equity_provider"] = expected_equity_provider
         if quote is not None:
             quote_at = _timestamp(quote.get("timestamp"))
-            bid, ask = _finite(quote.get("bid")), _finite(quote.get("ask"))
+            bid, ask = _quote_price(quote.get("bid")), _quote_price(quote.get("ask"))
             age = None if quote_at is None else max(0.0, (event_at - quote_at).total_seconds())
             if bid and ask and bid > 0 and ask >= bid:
                 snap.update(price=(bid + ask) / 2,
@@ -5273,9 +5280,13 @@ class ShadowRunner:
             direction = str(signal.get("direction") or "").strip().lower()
             entry_side = ("buy" if direction == "long" else
                           "sell" if direction == "short" else direction)
+            # Recorder JSON retains valid bid/ask values as numeric strings.
+            # Consume the finite, positive, non-crossed values already
+            # validated into the diagnostic snapshot instead of passing the
+            # raw serialized fields through the strict slippage boundary.
             executable_entry_reference = (
-                quote.get("ask") if quote is not None and direction == "long"
-                else quote.get("bid") if quote is not None and direction == "short"
+                snap.get("ask") if direction == "long"
+                else snap.get("bid") if direction == "short"
                 else None)
             execution_cfg = cfg.get("execution")
             configured_slippage_cap = (

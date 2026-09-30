@@ -238,6 +238,31 @@ class ShadowEntrySlippageTests(unittest.TestCase):
         self.assertEqual(payload["snapshot"]["entry_slippage"][
             "max_slippage_bps"], 50.0)
 
+    def test_serialized_numeric_quote_matches_float_quote_outcome(self):
+        cases = (
+            ("favorable-short", "short", 59.825, 59.84, 59.85),
+            ("adverse-long", "long", 100.0, 100.99, 101.0),
+        )
+        for name, direction, reference, bid, ask in cases:
+            with self.subTest(name=name):
+                numeric, numeric_helper, numeric_setup, *_ = (
+                    self._evaluate_case(
+                        direction=direction, reference=reference,
+                        bid=bid, ask=ask))
+                serialized, serialized_helper, serialized_setup, *_ = (
+                    self._evaluate_case(
+                        direction=direction, reference=reference,
+                        bid=str(bid), ask=str(ask)))
+
+                self.assertEqual(serialized, numeric)
+                self.assertEqual(serialized_setup, numeric_setup)
+                side = "buy" if direction == "long" else "sell"
+                executable = ask if direction == "long" else bid
+                numeric_helper.assert_called_once_with(
+                    side, reference, executable, 50)
+                serialized_helper.assert_called_once_with(
+                    side, reference, executable, 50)
+
     def test_malformed_references_and_explicit_caps_fail_closed(self):
         cases = (
             ("missing-reference", None, 99.99, 100.1, 50),
@@ -268,7 +293,7 @@ class ShadowEntrySlippageTests(unittest.TestCase):
     def test_malformed_missing_and_stale_quotes_remain_unpriced(self):
         cases = (
             ("missing", None, None, 0.0),
-            ("numeric-string", 99.99, "100.1", 0.0),
+            ("malformed-string", 99.99, "not-a-number", 0.0),
             ("nan", 99.99, float("nan"), 0.0),
             ("infinite", 99.99, float("inf"), 0.0),
             ("stale", 100.99, 101.0, 31.0),
@@ -279,14 +304,33 @@ class ShadowEntrySlippageTests(unittest.TestCase):
                     direction="long", reference=100.0, bid=bid, ask=ask,
                     quote_age_seconds=age)
                 kind, reason, payload, plan = result
-                if name == "numeric-string":
-                    self.assertEqual(
-                        (kind, reason, plan),
-                        ("reject", ENTRY_SLIPPAGE_INVALID_REASON, None))
-                else:
-                    self.assertEqual(
-                        (kind, reason, plan),
-                        ("unpriced", "stale or unavailable quote", None))
+                self.assertEqual(
+                    (kind, reason, plan),
+                    ("unpriced", "stale or unavailable quote", None))
+                self.assertEqual(helper.call_count, 1)
+                self.assertFalse(payload["snapshot"][
+                    "entry_slippage"]["accepted"])
+
+    def test_boolean_and_binary_quotes_remain_unpriced(self):
+        cases = (
+            ("boolean-ask", "long", 1.0, 0.99, True),
+            ("boolean-bid", "short", 1.0, True, 1.01),
+            ("false-ask", "long", 1.0, 0.99, False),
+            ("false-bid", "short", 1.0, False, 1.01),
+            ("bytes", "long", 100.0, b"99.99", b"100.1"),
+            ("bytearray", "short", 100.0,
+             bytearray(b"99.99"), bytearray(b"100.1")),
+        )
+        for name, direction, reference, bid, ask in cases:
+            with self.subTest(name=name):
+                result, helper, setup_calls, *_ = self._evaluate_case(
+                    direction=direction, reference=reference,
+                    bid=bid, ask=ask)
+                kind, reason, payload, plan = result
+                self.assertEqual(
+                    (kind, reason, plan),
+                    ("unpriced", "stale or unavailable quote", None))
+                self.assertEqual(setup_calls, [])
                 self.assertEqual(helper.call_count, 1)
                 self.assertFalse(payload["snapshot"][
                     "entry_slippage"]["accepted"])
