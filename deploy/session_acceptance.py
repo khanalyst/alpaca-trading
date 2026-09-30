@@ -792,15 +792,19 @@ def _diagnostic_reasons(diag: Mapping[str, object], *, max_age: float,
         reasons.append("arm_cursors_missing")
     else:
         values: list[tuple[object, object, object]] = []
+        positions: list[tuple[float, str]] = []
         processed_total = 0
         for cursor in cursors.values():
             stamp = _finite(cursor.get("last_inserted_at"))
-            key = _text(cursor.get("last_event_key"))
+            raw_key = cursor.get("last_event_key")
+            key = raw_key if isinstance(raw_key, str) else None
             count = _nonnegative_int(cursor.get("processed_events"))
-            if stamp is None or stamp < 0 or not key or count is None:
+            if (stamp is None or stamp < 0 or key is None or
+                    (stamp > 0 and not key) or count is None):
                 reasons.append("arm_cursor_invalid")
                 continue
             values.append((stamp, key, count))
+            positions.append((stamp, key))
             processed_total += count
             if count <= 0 or (activation is not None and
                               (stamp, key) <= (
@@ -818,8 +822,21 @@ def _diagnostic_reasons(diag: Mapping[str, object], *, max_age: float,
         reported_processed = _nonnegative_int(diag.get("processed_events"))
         if reported_processed is None or reported_processed != processed_total:
             reasons.append("diagnostic_processed_events_invalid")
-    if diag.get("health_cursor_matches") is False:
-        reasons.append("arm_health_cursor_mismatch")
+        wal_head = health._shadow_wal_head_cursor(diag.get("wal_head_cursor"))
+        caught_up = diag.get("all_arms_caught_up")
+        health_match = diag.get("health_cursor_matches")
+        caught_up = (caught_up if isinstance(caught_up, bool) else
+                     health_match if isinstance(health_match, bool) else None)
+        claims_consistent = not (
+            isinstance(diag.get("all_arms_caught_up"), bool) and
+            isinstance(health_match, bool) and
+            diag.get("all_arms_caught_up") != health_match)
+        if (wal_head is None or caught_up is not True or
+                not claims_consistent or
+                any(position != (
+                    wal_head["last_inserted_at"], wal_head["last_event_key"])
+                    for position in positions)):
+            reasons.append("arm_cursor_behind_wal")
     if (diag.get("families_total") != contract["family_count"] or
             diag.get("baseline_count") != contract["baseline_count"] or
             diag.get("variant_count") != contract["variant_count"]):
@@ -1154,11 +1171,22 @@ def _storage_growth(samples: Sequence[Mapping[str, object]]) -> dict:
 
 def _latest_arm_progress(samples: Sequence[Mapping[str, object]]) -> dict:
     if not samples:
-        return {"arms": 0, "cursors": {}}
+        return {"arms": 0, "cursors": {}, "wal_head_cursor": None,
+                "all_arms_caught_up": None}
     shadow = samples[-1].get("shadow")
     diag = shadow.get("diagnostic_shadow") if isinstance(shadow, Mapping) else None
     cursors = _cursor_map(diag) if isinstance(diag, Mapping) else {}
-    return {"arms": len(cursors), "cursors": {key: dict(value) for key, value in sorted(cursors.items())}}
+    wal_head = (health._shadow_wal_head_cursor(diag.get("wal_head_cursor"))
+                if isinstance(diag, Mapping) else None)
+    caught_up = (diag.get("all_arms_caught_up")
+                 if isinstance(diag, Mapping) and
+                 isinstance(diag.get("all_arms_caught_up"), bool) else None)
+    return {
+        "arms": len(cursors),
+        "cursors": {key: dict(value) for key, value in sorted(cursors.items())},
+        "wal_head_cursor": wal_head,
+        "all_arms_caught_up": caught_up,
+    }
 
 
 def read_session_samples(output_dir: str | Path, session_date: str) -> list[dict]:

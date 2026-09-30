@@ -108,6 +108,11 @@ def _sample(ts: float, *, code: str = "code-1", warmup: str = WARMUP_DATE,
         "source_lag_seconds": 31.0 if source_stale else 1.0,
         "processed_events": processed * len(cursors),
         "processed_event_cursors": cursors,
+        "wal_head_cursor": {
+            "last_inserted_at": cursor_at,
+            "last_event_key": f"event-{processed}",
+        },
+        "all_arms_caught_up": True,
         "health_cursor_matches": True,
     }
     quote_age = 31.0 if stale else 1.0

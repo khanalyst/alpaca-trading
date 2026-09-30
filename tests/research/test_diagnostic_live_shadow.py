@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from deploy import health
 from deploy.recorder_market import _event_key
 from agent.registry import validate_contract_config
 from research.diagnostic_shadow import (
@@ -155,6 +156,13 @@ class DiagnosticLiveShadowTests(unittest.TestCase):
         self.assertEqual(coverage["rejection_counts"]["preactivation"], 24)
         self.assertEqual(coverage["observation_status"],
                          "no_post_activation_events")
+        self.assertEqual(coverage["wal_head_cursor"], {
+            "last_inserted_at": coverage["activation_event_watermark"][
+                "last_inserted_at"],
+            "last_event_key": coverage["activation_event_watermark"][
+                "last_event_key"],
+        })
+        self.assertTrue(coverage["all_arms_caught_up"])
 
         restarted = ShadowRunner(self._config()).run_once()["diagnostic_shadow"]
         self.assertEqual(coverage["cohort_identity"], restarted["cohort_identity"])
@@ -401,6 +409,8 @@ class DiagnosticLiveShadowTests(unittest.TestCase):
         self.assertEqual(repeated["rejection_counts"][
             "preactivation_this_poll"], 0)
         self.assertEqual(repeated["decision_counts"]["total"], 0)
+        self.assertTrue(rejected["all_arms_caught_up"])
+        self.assertTrue(repeated["all_arms_caught_up"])
 
     def test_partition_source_marker_rejects_postactivation_backfill(self):
         runner = ShadowRunner(self._config())
@@ -671,6 +681,137 @@ class DiagnosticLiveShadowTests(unittest.TestCase):
                     ShadowError,
                     "shadow replay validation event bound 2 exceeded"):
             context_runner.run_once()
+
+    def test_large_cursor_backlog_pages_without_skipping_equal_timestamps(self):
+        runner = ShadowRunner(ShadowConfig(
+            self.corpus, self.edge, self.shadow, diagnostic=True,
+            runtime_config=_runtime_config(),
+            runtime_config_path="/mounted/config.yaml",
+            max_events=20_000, max_decisions=10_000, max_workers=4,
+            diagnostic_include_ibr=True))
+        activated = runner.run_once()["diagnostic_shadow"]
+        self.assertEqual(activated["wal_head_cursor"], {
+            "last_inserted_at": 0.0,
+            "last_event_key": "",
+        })
+        self.assertTrue(activated["all_arms_caught_up"])
+        cohort = runner.store.diagnostic_cohort(activated["cohort_identity"])
+        self.assertIsNotNone(cohort)
+        activation = runner.store.diagnostic_activation(
+            activated["cohort_identity"])
+        self.assertIsNotNone(activation)
+        arms = list(cohort["arms"])
+        candidate_ids = list(cohort["candidate_identities"])
+        self.assertEqual(len(candidate_ids), 31)
+        inserted_at = datetime.now(timezone.utc).timestamp()
+        event_timestamp = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.shadow) as db:
+            db.executemany("""INSERT INTO events
+                (event_key,digest,event_json,event_type,symbol,timestamp,inserted_at)
+                VALUES (?,?,'{}','quote','SPY',?,?)""",
+                [(f"{n:05d}", f"digest-{n}", event_timestamp, inserted_at)
+                 for n in range(20_001)])
+
+        first_rows, _progress, first_watermark = runner._diagnostic_snapshot(
+            cohort, arms, activation)
+        self.assertEqual(len(first_rows), 20_000)
+        self.assertEqual(first_rows[-1]["event_key"], "19999")
+        self.assertEqual(first_watermark["wal_head_cursor"], {
+            "last_inserted_at": inserted_at,
+            "last_event_key": "20000",
+        })
+        for candidate_id in candidate_ids:
+            runner.store.record_diagnostic_batch(
+                cohort_identity=activated["cohort_identity"],
+                candidate_id=candidate_id,
+                cursor_inserted_at=inserted_at, cursor_event_key="19999",
+                processed_events=20_000, rollups={}, pending_sessions=[],
+                decisions=[], warmup_session=activation["warmup_session"],
+                max_decisions=10_000,
+                cohort_candidate_ids=candidate_ids)
+        first_coverage = runner._diagnostic_coverage(
+            cohort, activation,
+            wal_head_cursor=first_watermark["wal_head_cursor"])
+        self.assertFalse(first_coverage["all_arms_caught_up"])
+        self.assertFalse(first_coverage["health_cursor_matches"])
+        first_coverage["observation_status"] = (
+            "observed_no_quoteable_virtual_opens")
+        first_readiness = health._shadow_diagnostic_summary(
+            first_coverage, now=inserted_at + 1.0,
+            candidate_errors_present=True, candidate_errors_clear=True,
+            candidate_error_count=0)
+        self.assertEqual(first_readiness["readiness_status"],
+                         "arm_cursor_behind_wal")
+
+        second_rows, _progress, second_watermark = runner._diagnostic_snapshot(
+            cohort, arms, activation)
+        self.assertEqual([row["event_key"] for row in second_rows], ["20000"])
+        self.assertEqual(second_watermark["wal_head_cursor"],
+                         first_watermark["wal_head_cursor"])
+        for candidate_id in candidate_ids:
+            runner.store.record_diagnostic_batch(
+                cohort_identity=activated["cohort_identity"],
+                candidate_id=candidate_id,
+                cursor_inserted_at=inserted_at, cursor_event_key="20000",
+                processed_events=1, rollups={}, pending_sessions=[],
+                decisions=[], warmup_session=activation["warmup_session"],
+                max_decisions=10_000,
+                cohort_candidate_ids=candidate_ids)
+        caught_up = runner._diagnostic_coverage(
+            cohort, activation,
+            wal_head_cursor=second_watermark["wal_head_cursor"])
+        self.assertTrue(caught_up["all_arms_caught_up"])
+        self.assertTrue(caught_up["health_cursor_matches"])
+        caught_up["observation_status"] = "observed_no_quoteable_virtual_opens"
+        ready = health._shadow_diagnostic_summary(
+            caught_up, now=inserted_at + 1.0,
+            candidate_errors_present=True, candidate_errors_clear=True,
+            candidate_error_count=0)
+        self.assertEqual(ready["readiness_status"], "ready")
+
+    def test_catchup_pages_commit_once_and_do_not_seal_partial_session(self):
+        runner = ShadowRunner(self._config())
+        activated = runner.run_once()["diagnostic_shadow"]
+        # Ingest three valid rows at once, then simulate a smaller consumer
+        # page budget without altering the cohort's frozen strategy identity.
+        source_start = self.corpus.stat().st_size
+        for minute in (30, 31, 32):
+            self._append_bar(minute, observed_at=(
+                datetime.now(timezone.utc) + timedelta(seconds=minute)))
+        with self.corpus.open(newline="") as handle:
+            for row in csv.DictReader(handle):
+                runner.store.ingest_event(
+                    row, max_events=200, source_path=str(self.corpus.resolve()),
+                    source_offset_start=source_start,
+                    source_offset_end=self.corpus.stat().st_size)
+        runner.store.save_source_offsets({
+            str(self.corpus.resolve()): self.corpus.stat().st_size})
+        cfg = ShadowConfig(
+            self.corpus, self.edge, self.shadow, diagnostic=True,
+            runtime_config=_runtime_config(), runtime_config_path="/mounted/config.yaml",
+            max_events=2, max_decisions=10_000, max_workers=4)
+        runner = ShadowRunner(cfg)
+        with patch.object(ShadowRunner, "_evaluate", return_value=(
+                "no_trade", "probe", {}, None)), \
+                patch.object(ShadowRunner, "_diagnostic_session_complete", return_value=True), \
+                patch.object(ShadowRunner, "_replay", return_value=True) as replay:
+            first = runner.run_once()
+            self.assertEqual(first["diagnostic_shadow"]["decision_counts"]["evaluated_total"], 48)
+            self.assertFalse(first["diagnostic_shadow"]["all_arms_caught_up"])
+            self.assertFalse(first["diagnostic_shadow"]["health_cursor_matches"])
+            replay.assert_not_called()
+            second = runner.run_once()
+            self.assertEqual(second["diagnostic_shadow"]["decision_counts"]["evaluated_total"], 72)
+            self.assertTrue(second["diagnostic_shadow"]["all_arms_caught_up"])
+            self.assertTrue(second["diagnostic_shadow"]["health_cursor_matches"])
+            self.assertEqual(replay.call_count, 24)
+            third = runner.run_once()
+            self.assertEqual(third["diagnostic_shadow"]["decision_counts"]["evaluated_total"], 72)
+            self.assertTrue(third["diagnostic_shadow"]["all_arms_caught_up"])
+        progress = runner.store.diagnostic_progress(
+            activated["cohort_identity"], activated["candidate_identities"],
+            runner.store.diagnostic_activation(activated["cohort_identity"]))
+        self.assertTrue(all(row["processed_events"] == 3 for row in progress.values()))
 
     def test_account_events_are_globally_causal_across_sessions_and_restarts(self):
         runner = ShadowRunner(self._config())

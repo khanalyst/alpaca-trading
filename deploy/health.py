@@ -339,9 +339,22 @@ def _shadow_catalog_state(
     return arms, arm_ids, candidate_count, catalog_valid, identity_valid, contract
 
 
+def _shadow_wal_head_cursor(value: object) -> dict | None:
+    """Return the exact bounded WAL head, including the empty-WAL sentinel."""
+    if not isinstance(value, dict):
+        return None
+    stamp = _status_signed_float(value.get("last_inserted_at"))
+    key = _shadow_identity(value.get("last_event_key"), allow_empty=True)
+    if stamp is None or stamp < 0 or key is None or (stamp > 0 and not key):
+        return None
+    return {"last_inserted_at": stamp, "last_event_key": key}
+
+
 def _shadow_progress_projection(
         value: object, *, arm_ids: set[str], activation: dict | None,
-        current: float | None, reported_processed: object) -> tuple[dict, str]:
+        wal_head: dict | None, caught_up: object,
+        caught_up_claims_consistent: bool, current: float | None,
+        reported_processed: object) -> tuple[dict, str]:
     """Project and validate every supported arm's post-activation cursor."""
     expected_count = len(arm_ids)
     projected: dict[str, dict] = {}
@@ -363,8 +376,8 @@ def _shadow_progress_projection(
                 projected[candidate] = {
                     "last_inserted_at": _status_nonnegative_float(
                         raw_cursor.get("last_inserted_at")),
-                    "last_event_key": _status_text(
-                        raw_cursor.get("last_event_key")),
+                    "last_event_key": _shadow_identity(
+                        raw_cursor.get("last_event_key"), allow_empty=True),
                     "processed_events": _status_nonnegative_int(
                         raw_cursor.get("processed_events")),
                 }
@@ -375,9 +388,11 @@ def _shadow_progress_projection(
                 continue
             exact_cursor_ids.add(exact_candidate)
             stamp = _status_signed_float(raw_cursor.get("last_inserted_at"))
-            key = _shadow_identity(raw_cursor.get("last_event_key"))
+            key = _shadow_identity(
+                raw_cursor.get("last_event_key"), allow_empty=True)
             count = _shadow_nonnegative_int(raw_cursor.get("processed_events"))
-            if stamp is None or stamp < 0 or key is None or count is None:
+            if (stamp is None or stamp < 0 or key is None or
+                    (stamp > 0 and not key) or count is None):
                 invalid = True
                 continue
             cursor_values.append((stamp, key, count))
@@ -403,6 +418,12 @@ def _shadow_progress_projection(
         status = "arm_cursor_future"
     elif stale:
         status = "arm_cursor_stale"
+    elif (wal_head is None or caught_up is not True or
+          not caught_up_claims_consistent or
+          any((stamp, key) != (
+              wal_head["last_inserted_at"], wal_head["last_event_key"])
+              for stamp, key, _count in cursor_values)):
+        status = "arm_cursor_behind_wal"
     elif (len(cursor_values) != expected_count or
           len(set(cursor_values)) != 1):
         status = "arm_cursors_mismatch"
@@ -559,12 +580,25 @@ def _shadow_diagnostic_summary(
         raw_source_lag is not None and
         0 <= raw_source_lag <= SHADOW_COVERAGE_DATA_MAX_AGE_SECONDS)
 
+    wal_head_cursor = _shadow_wal_head_cursor(value.get("wal_head_cursor"))
+    all_arms_caught_up = (value.get("all_arms_caught_up")
+                          if isinstance(value.get("all_arms_caught_up"), bool)
+                          else None)
+    health_cursor_matches = (value.get("health_cursor_matches")
+                             if isinstance(value.get("health_cursor_matches"), bool)
+                             else None)
+    caught_up = (all_arms_caught_up if all_arms_caught_up is not None
+                 else health_cursor_matches)
+    caught_up_claims_consistent = not (
+        all_arms_caught_up is not None and health_cursor_matches is not None and
+        all_arms_caught_up != health_cursor_matches)
     cursors, cursor_status = _shadow_progress_projection(
         value.get("processed_event_cursors"), arm_ids=arm_ids,
-        activation=activation_marker, current=current,
+        activation=activation_marker, wal_head=wal_head_cursor,
+        caught_up=caught_up,
+        caught_up_claims_consistent=caught_up_claims_consistent,
+        current=current,
         reported_processed=value.get("processed_events"))
-    if cursor_status == "ready" and value.get("health_cursor_matches") is False:
-        cursor_status = "arm_health_cursor_mismatch"
 
     if not metadata_valid:
         readiness_status = "diagnostic_metadata_invalid"
@@ -628,6 +662,9 @@ def _shadow_diagnostic_summary(
         "processed_events": _status_nonnegative_int(
             value.get("processed_events")),
         "processed_event_cursors": cursors,
+        "wal_head_cursor": wal_head_cursor,
+        "all_arms_caught_up": all_arms_caught_up,
+        "health_cursor_matches": health_cursor_matches,
         "cursor_count": len(cursors),
         "cursor_status": cursor_status,
         "readiness_status": readiness_status,

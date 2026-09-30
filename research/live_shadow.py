@@ -180,6 +180,17 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _sequence_digest(values: Iterable[Any]) -> str:
+    """Hash the same canonical JSON array without materializing its encoding."""
+    digest = hashlib.sha256(b"[")
+    for index, value in enumerate(values):
+        if index:
+            digest.update(b",")
+        digest.update(_json(value).encode("utf-8"))
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
 def _replay_code_hash() -> str:
     """Return a deterministic hash of the bounded replay source bundle."""
     root = Path(__file__).resolve().parents[1]
@@ -2967,17 +2978,37 @@ class ShadowStore:
 
     def events_after_cursor(self, *, inserted_at: float, event_key: str,
                             max_events: int) -> list[dict]:
-        """Read a bounded insertion-ordered diagnostic increment."""
+        """Read one bounded page; the committed cursor resumes the next page."""
         with self._connection() as db:
             rows = db.execute("""SELECT * FROM events
                 WHERE inserted_at>? OR (inserted_at=? AND event_key>?)
                 ORDER BY inserted_at,event_key LIMIT ?""",
                 (float(inserted_at), float(inserted_at), str(event_key),
-                 int(max_events) + 1)).fetchall()
-        if len(rows) > int(max_events):
-            raise ShadowError(
-                f"diagnostic shadow event batch bound {max_events} exceeded")
+                 int(max_events))).fetchall()
         return [dict(row) for row in rows]
+
+    def diagnostic_events_page(
+            self, *, inserted_at: float, event_key: str,
+            max_events: int) -> tuple[list[dict], dict[str, Any]]:
+        """Read one bounded page and its immutable WAL head in one snapshot."""
+        with self._connection() as db:
+            # Explicitly pin both reads to one SQLite snapshot. A recorder row
+            # committed after this point belongs to the next poll and cannot
+            # make this page appear caught up to a moving head.
+            db.execute("BEGIN")
+            head = db.execute("""SELECT event_key,inserted_at FROM events
+                ORDER BY inserted_at DESC,event_key DESC LIMIT 1""").fetchone()
+            rows = db.execute("""SELECT * FROM events
+                WHERE inserted_at>? OR (inserted_at=? AND event_key>?)
+                ORDER BY inserted_at,event_key LIMIT ?""",
+                (float(inserted_at), float(inserted_at), str(event_key),
+                 int(max_events))).fetchall()
+        return [dict(row) for row in rows], {
+            "last_inserted_at": (float(head["inserted_at"])
+                                 if head is not None else 0.0),
+            "last_event_key": (str(head["event_key"])
+                               if head is not None else ""),
+        }
 
     def events_for_sessions(self, sessions: Sequence[str], *,
                             max_events: int) -> list[dict]:
@@ -3735,7 +3766,10 @@ class ShadowRunner:
             activation: Mapping[str, Any] | None
             ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
         if cohort is None or activation is None or not arms:
-            return [], {}, {"count": 0, "events_digest": _digest([])}
+            return [], {}, {
+                "count": 0, "events_digest": _digest([]),
+                "wal_head_cursor": None,
+            }
         candidate_ids = [str(arm.get("candidate_id") or "") for arm in arms]
         progress = self.store.diagnostic_progress(
             str(cohort.get("cohort_identity") or ""), candidate_ids, activation)
@@ -3744,7 +3778,7 @@ class ShadowRunner:
             for item in progress.values()
         ]
         minimum = min(cursors) if cursors else (0.0, "")
-        rows = self.store.events_after_cursor(
+        rows, wal_head_cursor = self.store.diagnostic_events_page(
             inserted_at=minimum[0], event_key=minimum[1],
             max_events=self.config.max_events)
         watermark = {
@@ -3763,6 +3797,7 @@ class ShadowRunner:
                 "inserted_at": self._stored_event_cursor(rows[-1])[0],
                 "event_key": self._stored_event_cursor(rows[-1])[1],
             } if rows else None),
+            "wal_head_cursor": dict(wal_head_cursor),
         }
         return rows, progress, watermark
 
@@ -3852,6 +3887,16 @@ class ShadowRunner:
             session: (tuple(values[0]), tuple(values[1]), tuple(values[2]))
             for session, values in session_input_lists.items()
         }
+        # Context includes the complete recorded session, while this poll may
+        # contain only one catch-up page. Do not seal a replay until the arm
+        # has consumed every insertion in that session, including rejected
+        # provenance rows and quotes.
+        session_last_cursor: dict[str, tuple[float, str]] = {}
+        for prepared in prepared_context:
+            if prepared.session is not None:
+                session_last_cursor[prepared.session] = max(
+                    session_last_cursor.get(prepared.session, (0.0, "")),
+                    prepared.cursor)
 
         work: dict[str, dict[str, Any]] = {}
         provenance_rejections = 0
@@ -3906,6 +3951,8 @@ class ShadowRunner:
             close_sessions = [
                 session for session in session_events
                 if session != "unknown" and session in session_inputs and
+                bool(arm_rows) and
+                arm_rows[-1].cursor >= session_last_cursor[session] and
                 self._diagnostic_session_complete(
                     arm, session, session_inputs[session][0],
                     calendar_snapshot=resolved_calendar)
@@ -4084,6 +4131,11 @@ class ShadowRunner:
             arm = arm_by_id[candidate_id]
             for session in refreshed[candidate_id].get("pending_sessions") or ():
                 inputs = session_inputs.get(str(session))
+                committed_cursor = (
+                    float(refreshed[candidate_id]["last_inserted_at"]),
+                    str(refreshed[candidate_id]["last_event_key"]))
+                if committed_cursor < session_last_cursor.get(str(session), (0.0, "")):
+                    continue
                 if inputs is None or not self._diagnostic_session_complete(
                         arm, str(session), inputs[0],
                         calendar_snapshot=resolved_calendar):
@@ -4122,6 +4174,7 @@ class ShadowRunner:
     def _diagnostic_coverage(
             self, cohort: Mapping[str, Any] | None,
             activation: Mapping[str, Any] | None, *,
+            wal_head_cursor: Mapping[str, Any] | None = None,
             this_poll_decisions: int = 0,
             preactivation_rejections: int = 0,
             poll_duration_seconds: float = 0.0,
@@ -4165,6 +4218,16 @@ class ShadowRunner:
         progress = (self.store.diagnostic_progress(
             str(cohort.get("cohort_identity") or ""), sorted(candidate_ids),
             activation) if isinstance(activation, Mapping) else {})
+        head_inserted_at = (_finite(wal_head_cursor.get("last_inserted_at"))
+                            if isinstance(wal_head_cursor, Mapping) else None)
+        raw_head_key = (wal_head_cursor.get("last_event_key")
+                        if isinstance(wal_head_cursor, Mapping) else None)
+        head_event_key = (raw_head_key if isinstance(raw_head_key, str) else None)
+        normalized_wal_head = ({
+            "last_inserted_at": float(head_inserted_at),
+            "last_event_key": head_event_key,
+        } if (head_inserted_at is not None and head_inserted_at >= 0 and
+              head_event_key is not None) else None)
         evaluated_by_kind: dict[str, int] = {}
         reason_counts: dict[str, dict[str, int]] = {
             "reject": {}, "unpriced": {}}
@@ -4206,6 +4269,14 @@ class ShadowRunner:
                 "last_event_key": item.get("last_event_key"),
                 "processed_events": item.get("processed_events"),
             }
+        all_arms_caught_up = bool(
+            normalized_wal_head is not None and candidate_ids and
+            set(progress) == candidate_ids and
+            all((float(item.get("last_inserted_at") or 0.0),
+                 str(item.get("last_event_key") or "")) == (
+                    normalized_wal_head["last_inserted_at"],
+                    normalized_wal_head["last_event_key"])
+                for item in progress.values()))
         family_by_candidate = {
             str(arm.get("candidate_id") or ""): str(arm.get("family") or "")
             for arm in arms}
@@ -4346,6 +4417,12 @@ class ShadowRunner:
             },
             "processed_events": int(processed_events),
             "processed_event_cursors": cursors,
+            "wal_head_cursor": normalized_wal_head,
+            "all_arms_caught_up": all_arms_caught_up,
+            # Retain the established consumer-facing name while publishing the
+            # explicit WAL head that makes the assertion independently
+            # verifiable. Missing head evidence therefore cannot authorize.
+            "health_cursor_matches": all_arms_caught_up,
             "pending_replay_sessions": sorted(pending_sessions),
             "completed_replay_sessions": sorted(completed_sessions),
             "quoteable_virtual_opens": quoteable,
@@ -4696,6 +4773,28 @@ class ShadowRunner:
         return event_rows, bars, quotes, options
 
     @staticmethod
+    def _group_rows_by_session(
+            rows: Iterable[dict], sessions: Iterable[str]
+            ) -> dict[str, list[dict]]:
+        """Project rows into requested NY sessions in one stable pass.
+
+        This is equivalent to filtering the same input once per session, but
+        preserves both source iteration order and the original row objects.
+        """
+        wanted = {str(session) for session in sessions}
+        if not wanted:
+            return {}
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            stamp = _timestamp(row.get("as_of") or row.get("timestamp"))
+            if stamp is None:
+                continue
+            session = stamp.astimezone(NEW_YORK).date().isoformat()
+            if session in wanted:
+                grouped.setdefault(session, []).append(row)
+        return grouped
+
+    @staticmethod
     def _quote_frontier_add(
             frontier: dict[tuple[str, str, str], list[dict]],
             rows: Sequence[Mapping[str, Any]]) -> None:
@@ -4810,6 +4909,19 @@ class ShadowRunner:
                   options: Mapping[str, list], *,
                   calendar_snapshot: _RecordedSessionCalendarSnapshot | None = None,
                   ) -> tuple[str, str | None, dict, dict | None]:
+        # Legacy workers receive a WAL envelope; diagnostics receive its
+        # payload. Provider, feed and observed_at live in event_json, not in
+        # the envelope columns. Evaluate the same recorded payload in both.
+        if "event_json" in event:
+            try:
+                payload = json.loads(event["event_json"])
+                if not isinstance(payload, Mapping):
+                    raise ValueError("event payload must be an object")
+                if payload.get("event_key") != event.get("event_key"):
+                    raise ValueError("event payload key differs from WAL key")
+                event = payload
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return "no_data", "invalid stored event payload", {}, None
         symbol = str(event.get("symbol") or "")
         diagnostic_candidate = is_diagnostic_candidate(candidate)
         cfg = self._shadow_candidate_config(_safe_config(candidate))
@@ -6418,6 +6530,8 @@ class ShadowRunner:
             coverage_started = time.monotonic()
             diagnostic_coverage = self._diagnostic_coverage(
                 diagnostic_cohort, diagnostic_activation,
+                wal_head_cursor=diagnostic_event_watermark.get(
+                    "wal_head_cursor"),
                 this_poll_decisions=int(diagnostic_result.get(
                     "this_poll_decisions") or 0),
                 preactivation_rejections=int(diagnostic_result.get(
@@ -6504,15 +6618,22 @@ class ShadowRunner:
                     (quarantine_through is None or session > quarantine_through)):
                 session_events.setdefault(session, []).append(event)
 
+        target_sessions = set(session_events)
+        bars_by_session = self._group_rows_by_session(
+            (row for values in bars.values() for row in values),
+            target_sessions)
+        quotes_by_session = self._group_rows_by_session(
+            (row for values in quotes.values() for row in values),
+            target_sessions)
+        options_by_session = self._group_rows_by_session(
+            (row for values in options.values() for row in values),
+            target_sessions)
         session_inputs: dict[str, tuple[list[dict], list[dict], list[dict]]] = {}
         for session in sorted(session_events):
             session_inputs[session] = (
-                [row for values in bars.values() for row in values
-                 if row_session(row) == session],
-                [row for values in quotes.values() for row in values
-                 if row_session(row) == session],
-                [row for values in options.values() for row in values
-                 if row_session(row) == session],
+                bars_by_session.get(session, []),
+                quotes_by_session.get(session, []),
+                options_by_session.get(session, []),
             )
 
         # Freeze both arm definitions and event inputs before dispatch.  A
@@ -6608,58 +6729,65 @@ class ShadowRunner:
                         f"{self.config.replay_session_max_events} exceeded")
                 old_events, old_bars, old_quotes, old_options = (
                     self._load_events_for_sessions(sorted(replay_only_sessions)))
+                old_events_by_session = self._group_rows_by_session(
+                    (row for row in old_events
+                     if row.get("event_type") in {"bar", "bar_1m"}),
+                    replay_only_sessions)
+                old_bars_by_session = self._group_rows_by_session(
+                    (row for values in old_bars.values() for row in values),
+                    replay_only_sessions)
+                old_quotes_by_session = self._group_rows_by_session(
+                    (row for values in old_quotes.values() for row in values),
+                    replay_only_sessions)
+                old_options_by_session = self._group_rows_by_session(
+                    (row for values in old_options.values() for row in values),
+                    replay_only_sessions)
                 for target, source in ((bars, old_bars), (quotes, old_quotes),
                                       (options, old_options)):
                     for symbol, values in source.items():
                         target.setdefault(symbol, []).extend(values)
                 for session in sorted(replay_only_sessions):
-                    session_events[session] = [
-                        row for row in old_events
-                        if row.get("event_type") in {"bar", "bar_1m"}
-                        and row_session(row) == session]
+                    session_events[session] = old_events_by_session.get(
+                        session, [])
                     session_inputs[session] = (
-                        [row for values in old_bars.values() for row in values
-                         if row_session(row) == session],
-                        [row for values in old_quotes.values() for row in values
-                         if row_session(row) == session],
-                        [row for values in old_options.values() for row in values
-                         if row_session(row) == session],
+                        old_bars_by_session.get(session, []),
+                        old_quotes_by_session.get(session, []),
+                        old_options_by_session.get(session, []),
                     )
 
-        # Convert all worker inputs to detached JSON values and tuples.  The
-        # tuples are never handed to a mutating path, making the poll snapshot
-        # explicit even if a provider returns mutable row objects.
-        frozen_events = tuple(json.loads(_json(dict(row))) for row in events)
+        # The WAL query and JSON decoder already detached every row from the
+        # recorder and database. Workers and replay treat these rows as read
+        # only, copying a row before adding derived fields. Share that one
+        # snapshot across its tuple projections: duplicating all envelopes,
+        # market maps and session maps exhausts memory during catch-up.
+        frozen_events = tuple(events)
         frozen_bars = {
-            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            str(symbol): tuple(values)
             for symbol, values in bars.items()}
         frozen_quotes = {
-            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            str(symbol): tuple(values)
             for symbol, values in quotes.items()}
         frozen_options = {
-            str(symbol): tuple(json.loads(_json(dict(row))) for row in values)
+            str(symbol): tuple(values)
             for symbol, values in options.items()}
         frozen_session_events: dict[str, tuple[dict, ...]] = {}
         for session, values in session_events.items():
-            frozen_session_events[session] = tuple(
-                json.loads(_json(dict(row))) for row in values)
+            frozen_session_events[session] = tuple(values)
         frozen_session_inputs: dict[str, tuple[tuple[dict, ...], tuple[dict, ...], tuple[dict, ...]]] = {}
         for session, (session_bars, session_quotes, session_options) in session_inputs.items():
             frozen_session_inputs[session] = (
-                tuple(json.loads(_json(dict(row))) for row in session_bars),
-                tuple(json.loads(_json(dict(row))) for row in session_quotes),
-                tuple(json.loads(_json(dict(row))) for row in session_options),
+                tuple(session_bars), tuple(session_quotes), tuple(session_options),
             )
         persisted_event_keys = self.store.decision_event_keys(
             sorted(arm_ids),
             sorted(set(frozen_session_events) - replay_only_sessions))
         event_watermark = {
             "count": len(frozen_events),
-            "events_digest": _digest([
+            "events_digest": _sequence_digest(
                 {key: row.get(key) for key in (
                     "event_key", "digest", "event_type", "symbol",
                     "timestamp", "as_of")}
-                for row in frozen_events]),
+                for row in frozen_events),
             "last_event_key": (str(frozen_events[-1].get("event_key") or "")
                                 if frozen_events else None),
             "last_timestamp": (str(frozen_events[-1].get("timestamp") or "")
@@ -6961,9 +7089,8 @@ class ShadowRunner:
                     session_success = False
                     continue
                 try:
-                    rows = self.store.decisions(candidate_id)
                     if is_replay_only and candidate_id in replay_decisions:
-                        current_rows = [{
+                        rows = [{
                             "candidate_id": candidate_id,
                             "event_key": str(item.get("event_key") or ""),
                             "session_date": str(item.get("session_date") or ""),
@@ -6972,9 +7099,9 @@ class ShadowRunner:
                             "reason": item.get("reason"),
                             "payload_json": _json(item.get("payload") or {}),
                         } for item in replay_decisions[candidate_id]]
-                        rows = [row for row in rows
-                                if row.get("session_date") != session]
-                        rows.extend(current_rows)
+                    else:
+                        rows = self.store.decisions_for_session(
+                            candidate_id, session)
                     complete = self._replay(
                         arm_by_id[candidate_id], session, session_bars,
                         session_quotes, rows, session_options,
@@ -7093,6 +7220,8 @@ class ShadowRunner:
         coverage_started = time.monotonic()
         diagnostic_coverage = self._diagnostic_coverage(
             diagnostic_cohort, diagnostic_activation,
+            wal_head_cursor=diagnostic_event_watermark.get(
+                "wal_head_cursor"),
             this_poll_decisions=int(diagnostic_result.get(
                 "this_poll_decisions") or 0),
             preactivation_rejections=int(diagnostic_result.get(

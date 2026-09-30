@@ -72,6 +72,11 @@ def _raw_diagnostic(cohort: dict, captured_ts: float) -> dict:
         "source_lag_seconds": 1.0,
         "processed_events": processed * arm_count,
         "processed_event_cursors": cursors,
+        "wal_head_cursor": {
+            "last_inserted_at": captured_ts - 1.0,
+            "last_event_key": f"forward-{processed}",
+        },
+        "all_arms_caught_up": True,
         "health_cursor_matches": True,
     }
 

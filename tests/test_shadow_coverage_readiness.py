@@ -69,6 +69,12 @@ class ShadowCoverageReadinessTests(unittest.TestCase):
         self.assertEqual(diagnostic["cursor_status"], "ready")
         self.assertEqual(diagnostic["cursor_count"], 24)
         self.assertEqual(len(diagnostic["processed_event_cursors"]), 24)
+        self.assertEqual(diagnostic["wal_head_cursor"], {
+            "last_inserted_at": NOW - 5.0,
+            "last_event_key": "forward-event",
+        })
+        self.assertTrue(diagnostic["all_arms_caught_up"])
+        self.assertTrue(diagnostic["health_cursor_matches"])
         self.assertFalse(diagnostic["authorizing"])
         self.assertFalse(diagnostic["proof_authority"])
         self.assertNotIn("accepted", result)
@@ -92,7 +98,7 @@ class ShadowCoverageReadinessTests(unittest.TestCase):
         mismatched["processed_event_cursors"][
             mismatched["candidate_identities"][0]
         ]["last_event_key"] = "different-forward-event"
-        cases.append(("mismatched", "arm_cursors_mismatch", mismatched))
+        cases.append(("mismatched", "arm_cursor_behind_wal", mismatched))
 
         future = _diagnostic_coverage(now=NOW)
         future["processed_event_cursors"][
@@ -126,6 +132,79 @@ class ShadowCoverageReadinessTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertFalse(result["coverage_ready"])
                 self.assertEqual(result["coverage_status"], expected_status)
+
+    def test_wal_head_and_caught_up_evidence_are_mandatory_and_exact(self):
+        cases = []
+
+        missing_head = _diagnostic_coverage(now=NOW)
+        missing_head.pop("wal_head_cursor")
+        cases.append(("missing-head", missing_head))
+
+        missing_caught_up = _diagnostic_coverage(now=NOW)
+        missing_caught_up.pop("all_arms_caught_up")
+        missing_caught_up.pop("health_cursor_matches")
+        cases.append(("missing-caught-up", missing_caught_up))
+
+        legacy_claim_only = _diagnostic_coverage(now=NOW)
+        legacy_claim_only.pop("wal_head_cursor")
+        legacy_claim_only.pop("all_arms_caught_up")
+        cases.append(("legacy-claim-only", legacy_claim_only))
+
+        false_claim = _diagnostic_coverage(now=NOW)
+        false_claim["all_arms_caught_up"] = False
+        false_claim["health_cursor_matches"] = False
+        cases.append(("false-claim", false_claim))
+
+        tie_key_behind = _diagnostic_coverage(now=NOW)
+        tie_key_behind["wal_head_cursor"]["last_event_key"] = (
+            "forward-event-after-page")
+        cases.append(("equal-timestamp-tie-key", tie_key_behind))
+
+        cursor_ahead = _diagnostic_coverage(now=NOW)
+        for cursor in cursor_ahead["processed_event_cursors"].values():
+            cursor["last_inserted_at"] = NOW - 4.0
+            cursor["last_event_key"] = "cursor-ahead-of-head"
+        cases.append(("cursor-ahead", cursor_ahead))
+
+        for case, diagnostic in cases:
+            with self.subTest(case=case):
+                result = self._project(diagnostic, candidate_errors={})
+                self.assertTrue(result["ok"])
+                self.assertFalse(result["coverage_ready"])
+                self.assertEqual(
+                    result["coverage_status"], "arm_cursor_behind_wal")
+
+    def test_empty_wal_epoch_is_caught_up_but_not_observed(self):
+        diagnostic = _diagnostic_coverage(now=NOW)
+        diagnostic["activation_event_watermark"].update({
+            "count": 0, "decision_event_count": 0,
+            "last_inserted_at": 0.0, "last_event_key": "",
+        })
+        for cursor in diagnostic["processed_event_cursors"].values():
+            cursor.update({
+                "last_inserted_at": 0.0,
+                "last_event_key": "",
+                "processed_events": 0,
+            })
+        diagnostic["processed_events"] = 0
+        diagnostic["wal_head_cursor"] = {
+            "last_inserted_at": 0.0, "last_event_key": "",
+        }
+        diagnostic["observation_status"] = "no_post_activation_events"
+
+        result = self._project(diagnostic, candidate_errors={})
+        projected = result["diagnostic_shadow"]
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["coverage_ready"])
+        self.assertEqual(projected["cursor_status"],
+                         "arm_post_activation_progress_missing")
+        self.assertEqual(projected["wal_head_cursor"], {
+            "last_inserted_at": 0.0, "last_event_key": "",
+        })
+        self.assertTrue(projected["all_arms_caught_up"])
+        self.assertTrue(all(
+            cursor["last_event_key"] == ""
+            for cursor in projected["processed_event_cursors"].values()))
 
     def test_catalog_code_and_cohort_must_match_exactly(self):
         mutations = []

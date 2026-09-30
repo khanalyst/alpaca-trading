@@ -23,6 +23,7 @@ from agent.alpaca_domain import OrderRequest
 from agent.alpaca_provider import AlpacaProvider
 from agent.engine import Engine
 from agent.instruments import validate_equity_symbol
+from agent.runtime_inspection import inspect_runtime
 from agent import state
 
 
@@ -176,27 +177,74 @@ def cmd_check(args, cfg) -> int:
             "edge_checked": False,
         }))
         return 0
-    engine = _engine(cfg, light=True)
+    guard = inspect_runtime(
+        cfg, authenticated=False, provider_factory=_provider)
+    if (guard.get("paper_trial_context") and
+            guard.get("status_ok") is not True):
+        result = dict(guard)
+        result["inspection"] = "check"
+        print(_dump_yaml(result))
+        return 1
+    state_present = guard.get("state_file_present") is True
+    journal_present = guard.get("journal_file_present") is True
+    blockers = set(guard.get("readiness_blockers", ()))
+    fresh_install = bool(
+        not state_present and not journal_present and
+        blockers.issubset({"runtime_state_missing", "runtime_journal_missing"}))
+    runtime_invalid = bool(
+        guard.get("runtime_state_ready") is not True or
+        guard.get("journal_ready") is not True)
+    if runtime_invalid and not fresh_install:
+        result = dict(guard)
+        result["inspection"] = "check"
+        print(_dump_yaml(result))
+        return 1
+    engine = None
     try:
+        engine = _engine(cfg, light=True)
         result = engine.check(authenticated=bool(args.authenticated))
     except Exception as exc:  # noqa: BLE001
         print(f"Authenticated check failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        engine.close()
+        if engine is not None:
+            engine.close()
     print(_dump_yaml(result))
     return 1 if result.get("edge_required") and not result.get("edge_ready") else 0
 
 
 def cmd_status(args, cfg) -> int:
-    engine = _engine(cfg, light=True)
+    local = inspect_runtime(
+        cfg, authenticated=False, provider_factory=_provider)
+    if (local.get("paper_trial_context") or
+            local.get("runtime_state_ready") is not True or
+            local.get("journal_ready") is not True):
+        result = inspect_runtime(
+            cfg, authenticated=True, provider_factory=_provider)
+        print(_dump_yaml(result))
+        return 0 if result.get("status_ok") is True else 1
+    engine = None
     try:
+        engine = _engine(cfg, light=True)
         result = engine.status()
+    except Exception as exc:  # noqa: BLE001
+        print(f"status failed: {exc}", file=sys.stderr)
+        return 1
     finally:
-        engine.close()
+        if engine is not None:
+            engine.close()
     print(_dump_yaml(result))
     return 1 if (result.get("auth_error") or
                  (result.get("edge_required") and not result.get("edge_ready"))) else 0
+
+
+def cmd_inspect_deployment(args, cfg) -> int:
+    """Prove an existing paper runtime is explicitly paused and flat."""
+    result = inspect_runtime(
+        cfg, authenticated=True, deployment=True,
+        provider_factory=_provider)
+    print(_dump_yaml(result))
+    return 0 if result.get("paused_flat_verified") is True else 1
 
 
 def cmd_run(args, cfg) -> int:
@@ -364,6 +412,16 @@ def parser() -> argparse.ArgumentParser:
     check.set_defaults(fn=cmd_check)
     status = sub.add_parser("status")
     status.set_defaults(fn=cmd_status)
+    inspect_deployment = sub.add_parser(
+        "inspect-deployment",
+        aliases=["deployment-inspect", "deployment-inspection"],
+        help="read-only authenticated proof that a paper deployment is paused and flat",
+        description=("Read existing state and journal without initializing or "
+                     "refreshing the runtime, then query only broker account, "
+                     "positions, open orders, and clock. This command never "
+                     "clears pause or authorizes entries."),
+    )
+    inspect_deployment.set_defaults(fn=cmd_inspect_deployment)
     run = sub.add_parser("run")
     run.add_argument("--cycles", type=int, default=None)
     run.set_defaults(fn=cmd_run)

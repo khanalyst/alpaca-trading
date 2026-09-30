@@ -78,6 +78,36 @@ class SessionAcceptanceReadinessParityTests(unittest.TestCase):
         self.assertFalse(report["accepted"])
         self.assertIn("candidate_errors_unknown", report["reasons"])
 
+    def test_wal_head_contract_has_health_and_session_parity(self):
+        def missing_head(diag):
+            diag.pop("wal_head_cursor")
+
+        def missing_caught_up(diag):
+            diag.pop("all_arms_caught_up")
+            diag.pop("health_cursor_matches")
+
+        def tie_key_behind(diag):
+            diag["wal_head_cursor"]["last_event_key"] += ":later"
+
+        def cursor_ahead(diag):
+            for cursor in diag["processed_event_cursors"].values():
+                cursor["last_inserted_at"] += 1.0
+                cursor["last_event_key"] = "ahead-of-poll-head"
+
+        for name, mutate in (
+                ("missing-head", missing_head),
+                ("missing-caught-up", missing_caught_up),
+                ("tie-key-behind", tie_key_behind),
+                ("cursor-ahead", cursor_ahead)):
+            with self.subTest(case=name):
+                samples = self._samples()
+                mutate(samples[10]["shadow"]["diagnostic_shadow"])
+                self.assertEqual(
+                    self._readiness(samples[10]), "arm_cursor_behind_wal")
+                report = self._report(samples)
+                self.assertFalse(report["accepted"])
+                self.assertIn("arm_cursor_behind_wal", report["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

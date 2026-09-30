@@ -16,16 +16,21 @@ from agent.alpaca_domain import Account, MarketClock, Order, Position
 
 class _Engine:
     def __init__(self, *, check=None, status=None, flatten=True,
-                 resume=None, resume_error=None):
+                 resume=None, resume_error=None, check_error=None):
         self._check = check or {}
         self._status = status or {}
         self._flatten = flatten
         self._resume = resume if resume is not None else {"resumed": True}
         self._resume_error = resume_error
+        self._check_error = check_error
         self.closed = 0
+        self.check_calls = []
         self.resume_calls = 0
 
     def check(self, authenticated=False):
+        self.check_calls.append(authenticated)
+        if self._check_error is not None:
+            raise self._check_error
         return {**self._check, "authenticated": authenticated}
 
     def status(self):
@@ -146,12 +151,129 @@ class CliSafetyTests(unittest.TestCase):
         engine = _Engine(
             check={"edge_required": True, "edge_ready": False},
             status={"edge_required": True, "edge_ready": False})
-        with patch.object(main, "_engine", return_value=engine), \
+        inspection = {
+            "paper_trial_context": False,
+            "runtime_state_ready": True,
+            "journal_ready": True,
+        }
+        with patch.object(main, "inspect_runtime", return_value=inspection), \
+                patch.object(main, "_engine", return_value=engine), \
                 redirect_stdout(StringIO()):
             self.assertEqual(main.cmd_check(
                 SimpleNamespace(authenticated=True), {}), 1)
             self.assertEqual(main.cmd_status(SimpleNamespace(), {}), 1)
         self.assertEqual(engine.closed, 2)
+
+    def test_frozen_identity_drift_status_and_check_never_construct_engine(self):
+        inspection = {
+            "schema": "runtime-readonly-inspection.v1",
+            "paper_trial_context": True,
+            "runtime_state_ready": True,
+            "journal_ready": True,
+            "frozen_trial_identity": {"incumbent_identity": "old"},
+            "expected_trial_identity": {"incumbent_identity": "new"},
+            "identity_match": False,
+            "status_ok": False,
+            "readiness_blockers": ["paper_trial_identity_mismatch"],
+        }
+        output = StringIO()
+        with patch.object(main, "inspect_runtime", return_value=inspection), \
+                patch.object(main, "_engine") as factory, \
+                redirect_stdout(output), redirect_stderr(StringIO()):
+            self.assertEqual(main.cmd_status(SimpleNamespace(), {}), 1)
+            self.assertEqual(main.cmd_check(
+                SimpleNamespace(authenticated=True), {}), 1)
+        factory.assert_not_called()
+        self.assertIn("paper_trial_identity_mismatch", output.getvalue())
+
+    def test_matching_trial_runs_authenticated_engine_preflight_and_closes(self):
+        inspection = {
+            "paper_trial_context": True,
+            "state_file_present": True,
+            "journal_file_present": True,
+            "runtime_state_ready": True,
+            "journal_ready": True,
+            "identity_match": True,
+            "status_ok": True,
+            "readiness_blockers": [],
+        }
+        engine = _Engine(
+            check_error=RuntimeError("calendar authorization unavailable"))
+        error = StringIO()
+        with patch.object(main, "inspect_runtime", return_value=inspection), \
+                patch.object(main, "_engine", return_value=engine) as factory, \
+                redirect_stdout(StringIO()), redirect_stderr(error):
+            code = main.cmd_check(SimpleNamespace(authenticated=True), {})
+
+        self.assertEqual(code, 1)
+        factory.assert_called_once_with({}, light=True)
+        self.assertEqual(engine.check_calls, [True])
+        self.assertEqual(engine.closed, 1)
+        self.assertIn("calendar authorization unavailable", error.getvalue())
+
+    def test_check_preserves_nontrial_fresh_install_engine_preflight(self):
+        inspection = {
+            "paper_trial_context": False,
+            "state_file_present": False,
+            "journal_file_present": False,
+            "runtime_state_ready": False,
+            "journal_ready": False,
+            "readiness_blockers": [
+                "runtime_state_missing", "runtime_journal_missing"],
+        }
+        engine = _Engine(check={"edge_required": False})
+        with patch.object(main, "inspect_runtime", return_value=inspection), \
+                patch.object(main, "_engine", return_value=engine) as factory, \
+                redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            code = main.cmd_check(SimpleNamespace(authenticated=True), {})
+
+        self.assertEqual(code, 0)
+        factory.assert_called_once_with({}, light=True)
+        self.assertEqual(engine.closed, 1)
+
+    def test_check_rejects_invalid_existing_nontrial_state_without_engine(self):
+        inspection = {
+            "paper_trial_context": False,
+            "state_file_present": True,
+            "journal_file_present": True,
+            "runtime_state_ready": False,
+            "journal_ready": True,
+            "status_ok": False,
+            "readiness_blockers": ["runtime_state_unreadable"],
+        }
+        output = StringIO()
+        with patch.object(main, "inspect_runtime", return_value=inspection), \
+                patch.object(main, "_engine") as factory, \
+                redirect_stdout(output), redirect_stderr(StringIO()):
+            code = main.cmd_check(SimpleNamespace(authenticated=True), {})
+
+        self.assertEqual(code, 1)
+        factory.assert_not_called()
+        self.assertIn("runtime_state_unreadable", output.getvalue())
+
+    def test_deployment_inspection_command_is_read_only_and_requires_proof(self):
+        inspection = {
+            "schema": "runtime-readonly-inspection.v1",
+            "paused_flat_verified": True,
+            "entry_eligible": False,
+        }
+        output = StringIO()
+        with patch.object(main, "inspect_runtime", return_value=inspection), \
+                patch.object(main, "_engine") as factory, \
+                redirect_stdout(output):
+            code = main.cmd_inspect_deployment(SimpleNamespace(), {})
+        self.assertEqual(code, 0)
+        factory.assert_not_called()
+        self.assertIn("entry_eligible", output.getvalue())
+        self.assertFalse(
+            main.parser().parse_args(["inspect-deployment"]).__dict__.get(
+                "authenticated", False))
+        self.assertEqual(
+            main.parser().parse_args(["deployment-inspect"]).fn,
+            main.cmd_inspect_deployment)
+        self.assertEqual(
+            main.parser().parse_args(["deployment-inspection"]).fn,
+            main.cmd_inspect_deployment)
 
     def test_flatten_never_reports_success_with_residual_positions(self):
         with patch.object(main, "_engine", return_value=_Engine(flatten=False)), \
