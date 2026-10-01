@@ -89,6 +89,20 @@ _JOURNAL_MINIMUM_COLUMNS = {
     "runs": {"run_id", "started_ts"},
 }
 
+_JOURNAL_OPTIONAL_REQUIRED_COLUMNS = {
+    "config_versions": {
+        "config_version_id",
+        "config_hash",
+        "previous_version_id",
+        "mode",
+        "source",
+        "actor",
+        "config_json",
+        "diff_json",
+        "created_at",
+    },
+}
+
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
@@ -207,13 +221,24 @@ def _readonly_journal_check(path: Path, mode: str) -> tuple[bool, str | None]:
                     table for table in tables
                     if not table.startswith("sqlite_")
                 }
-                if application_tables != set(_JOURNAL_TABLES):
+                core_tables = set(_JOURNAL_TABLES)
+                known_tables = (
+                    core_tables | set(_JOURNAL_OPTIONAL_REQUIRED_COLUMNS)
+                )
+                if (not core_tables.issubset(application_tables) or
+                        not application_tables.issubset(known_tables)):
                     return False, "runtime_journal_invalid"
-                if any(
-                        not set(columns).issubset(
-                            _journal_columns(db, table))
+                required_columns = {
+                    **_JOURNAL_MINIMUM_COLUMNS,
+                    **{
+                        table: columns
                         for table, columns in
-                        _JOURNAL_MINIMUM_COLUMNS.items()):
+                        _JOURNAL_OPTIONAL_REQUIRED_COLUMNS.items()
+                        if table in application_tables
+                    },
+                }
+                if any(not set(columns).issubset(_journal_columns(db, table))
+                       for table, columns in required_columns.items()):
                     return False, "runtime_journal_invalid"
     except sqlite3.DatabaseError:
         return False, "runtime_journal_invalid"

@@ -20,6 +20,7 @@ import main
 from agent import state
 from agent.alpaca_domain import Account, MarketClock
 from agent.config import DEFAULT_CONFIG, validate_config
+from agent.governance import record_config_version
 from agent.paper_trial import build_descriptor, new_state
 from agent.runtime_inspection import inspect_runtime
 from research.diagnostic_shadow import _logical_arms
@@ -267,6 +268,51 @@ class RuntimeInspectionTests(unittest.TestCase):
         self.assertEqual(before, _tree_snapshot(self.runtime_base))
         self.assertFalse(wal.exists())
         self.assertFalse(shm.exists())
+
+    def test_governance_config_versions_is_accepted_read_only(self):
+        record_config_version(
+            state.JOURNAL_FILE,
+            self.config,
+            source="test-runtime-inspection",
+            actor="test",
+        )
+        provider = _ReadOnlyProvider()
+        before = _tree_snapshot(self.runtime_base)
+
+        result = self._inspect(provider)
+
+        self.assertEqual(before, _tree_snapshot(self.runtime_base))
+        self.assertEqual(provider.calls, [
+            ("account", None),
+            ("positions", None),
+            ("orders", "open"),
+            ("clock", None),
+        ])
+        self.assertTrue(result["journal_ready"])
+        self.assertTrue(result["paused_flat_verified"])
+        self.assertFalse(result["entry_eligible"])
+
+    def test_partial_governance_config_versions_table_is_rejected(self):
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            db.execute("""CREATE TABLE config_versions (
+                config_version_id TEXT PRIMARY KEY,
+                config_hash TEXT NOT NULL UNIQUE,
+                previous_version_id TEXT,
+                mode TEXT NOT NULL,
+                source TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                diff_json TEXT NOT NULL
+            )""")
+            db.commit()
+        before = _tree_snapshot(self.runtime_base)
+
+        result = self._inspect(_ReadOnlyProvider())
+
+        self.assertEqual(before, _tree_snapshot(self.runtime_base))
+        self.assertFalse(result["journal_ready"])
+        self.assertIn("runtime_journal_invalid", result["readiness_blockers"])
+        self.assertFalse(result["paused_flat_verified"])
 
     def test_rogue_journal_table_is_rejected(self):
         with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
