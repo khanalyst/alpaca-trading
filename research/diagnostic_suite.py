@@ -270,7 +270,7 @@ def run_suite(data: str | Path, *, runtime_config: Mapping[str, Any],
               output: str | Path, workers: int = 2, starting_cash: float = 100_000.0,
               diagnostic_only: bool = False, full_fit_diagnostics: bool = False,
               ibr_max_events: int = 100_000,
-              progress=None) -> dict:
+              progress=None, runtime_progress=None) -> dict:
     if diagnostic_only is not True:
         raise ValueError("the complete inventory requires explicit diagnostic_only=True")
     if not isinstance(full_fit_diagnostics, bool):
@@ -282,11 +282,14 @@ def run_suite(data: str | Path, *, runtime_config: Mapping[str, Any],
     if (isinstance(ibr_max_events, bool) or not isinstance(ibr_max_events, int) or
             ibr_max_events <= 0):
         raise ValueError("ibr_max_events must be a positive integer")
+    if runtime_progress is not None and not callable(runtime_progress):
+        raise TypeError("runtime_progress must be callable when supplied")
     data = str(Path(data).resolve())
     destination = Path(output)
     manifest_path = destination.with_name(destination.name + ".manifest.json")
-    if destination.exists() or manifest_path.exists():
-        raise ValueError("diagnostic output or frozen manifest already exists; choose a new path")
+    component_root = destination.with_name(destination.name + ".components")
+    if destination.exists() or manifest_path.exists() or component_root.exists():
+        raise ValueError("diagnostic output, frozen manifest, or components already exists; choose a new path")
     runtime = _policy_config(runtime_config)
     source = validate_source(data, diagnostic_only=True)
     if not source.get("content_hash"):
@@ -328,8 +331,33 @@ def run_suite(data: str | Path, *, runtime_config: Mapping[str, Any],
                     "selection": "none", "proofs": [], "fdr": False}
         destination.parent.mkdir(parents=True, exist_ok=True)
         frozen = write_immutable_evidence(manifest_path, manifest)
+        component_root.mkdir()
         results = []
+        components = []
+
+        def persist_component(stage, variant_id, result):
+            component_path = component_root / (
+                stage + "-" + content_hash(str(variant_id)) + ".json")
+            component = write_immutable_evidence(component_path, {
+                "schema": "diagnostic-suite-component.v1",
+                "stage": stage, "variant_id": str(variant_id),
+                "manifest_hash": frozen["content_hash"],
+                "source_hash": source["content_hash"],
+                "runtime_config_hash": content_hash(runtime),
+                "code_hash": code_hash, "result": result,
+                "status": "unsealed_partial_diagnostic",
+                "final_source_and_code_validation": "pending",
+                "complete_suite": False, "authorizing": False,
+                "eligible": False, "proofs": [],
+            })
+            components.append({
+                "stage": stage, "variant_id": str(variant_id),
+                "path": component_path.relative_to(destination.parent).as_posix(),
+                "content_hash": component["content_hash"],
+            })
+
         def accept(arm, result):
+            persist_component("inventory", arm["variant_id"], result)
             results.append(result)
             if progress:
                 progress(len(results), len(inventory["arms"]), arm["variant_id"])
@@ -345,10 +373,35 @@ def run_suite(data: str | Path, *, runtime_config: Mapping[str, Any],
                 pending = {pool.submit(_evaluate_arm, arm): arm for arm in inventory["arms"]}
                 for future in as_completed(pending):
                     accept(pending[future], future.result())
+        expected_runtime_arms = {arm["variant_id"] for arm in ibr_arms}
+        completed_runtime_arms = {}
+
+        def accept_runtime(variant_id, result):
+            if variant_id in completed_runtime_arms:
+                raise ValueError("duplicate IBR runtime component")
+            if (variant_id not in expected_runtime_arms or
+                    result.get("variant_id") != variant_id):
+                raise ValueError("unexpected IBR runtime component identity")
+            persist_component("ibr_runtime", variant_id, result)
+            completed_runtime_arms[variant_id] = content_hash(result)
+            if runtime_progress is not None:
+                runtime_progress(len(completed_runtime_arms), len(ibr_arms), variant_id)
+
         forward = run_offline_forward_ibr(
             data, runtime_config=runtime, arms=ibr_arms,
             starting_cash=float(starting_cash), source_report=source,
-            max_events=ibr_max_events)
+            max_events=ibr_max_events, progress=accept_runtime)
+        runtime_results = forward.get("arms") or {}
+        if set(runtime_results) != expected_runtime_arms:
+            raise ValueError("incomplete IBR runtime result inventory")
+        for variant_id, result in runtime_results.items():
+            # Source-wide unavailability returns synthesized outcomes before
+            # per-arm evaluation. Persist those outcomes too; missing evidence
+            # must stay explicit rather than disappearing from checkpoints.
+            if variant_id not in completed_runtime_arms:
+                accept_runtime(variant_id, result)
+            elif completed_runtime_arms[variant_id] != content_hash(result):
+                raise ValueError("IBR runtime component differs from final result")
         _attach_ibr_runtime(results, forward)
         cost_status = _cost_status(data, runtime, quote_count)
         if _code_bundle_hash(_code_bundle_files()) != code_hash:
@@ -361,6 +414,9 @@ def run_suite(data: str | Path, *, runtime_config: Mapping[str, Any],
                   "manifest_hash": frozen["content_hash"], "inventory": inventory,
                   "source": source, "corpus": corpus, "code_hash": code_hash,
                   "runtime_config_hash": content_hash(runtime),
+                  "components": sorted(components, key=lambda item: (
+                      item["stage"], item["variant_id"])),
+                  "components_final_validation": "source_and_code_rechecked",
                   "full_fit_diagnostics": full_fit_diagnostics,
                   "ibr_runtime_contract": ibr_contract,
                   "ibr_runtime": {key: value for key, value in forward.items()
@@ -398,11 +454,14 @@ def main(argv: list[str] | None = None) -> int:
     def progress(done, total, variant):
         print(json.dumps({"phase": "diagnostic_inventory", "done": done,
                           "total": total, "variant_id": variant}), flush=True)
+    def runtime_progress(done, total, variant):
+        print(json.dumps({"phase": "ibr_runtime", "done": done,
+                          "total": total, "variant_id": variant}), flush=True)
     result = run_suite(args.data, runtime_config=load_config(args.agent_config),
                        output=args.out, workers=args.workers, diagnostic_only=True,
                        full_fit_diagnostics=args.full_fit_diagnostics,
                        ibr_max_events=args.ibr_max_events,
-                       progress=progress)
+                       progress=progress, runtime_progress=runtime_progress)
     print(json.dumps({"schema": SCHEMA, "status": result["status"],
                       "outcome_counts": result["outcome_counts"], "report": args.out,
                       "authorizing": False, "proofs": []}), flush=True)

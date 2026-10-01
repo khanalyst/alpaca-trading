@@ -63,7 +63,8 @@ from research.diagnostic_accounts import (
     POSITION_SCHEMA as DIAGNOSTIC_POSITION_SCHEMA,
     DiagnosticAccountBook, DiagnosticAccountError,
     content_digest as diagnostic_content_digest,
-    new_account_state, validate_account_state, validate_position_state,
+    new_account_state, prepare_diagnostic_quote_index,
+    validate_account_state, validate_position_state,
 )
 from research.quote_costs import cost_resolver_setup, reprice_ibr_result
 from research.stressed_cost_calibration import (
@@ -6035,10 +6036,11 @@ class ShadowRunner:
         if strategy_id not in {"rule", "ibr"}:
             return {"candidate_id": candidate_id, "decisions": [],
                     "error": "diagnostic strategy is unsupported"}
+        policy = self._shadow_policy(cfg)
         book = DiagnosticAccountBook(
             account=initial_state.get("account") or {},
             positions=initial_state.get("positions") or (), config=cfg,
-            policy=self._shadow_policy(cfg),
+            policy=policy,
             rule_spec=(rule_spec if strategy_id == "rule" else None))
         state = book.risk_state()
         decisions: list[dict[str, Any]] = []
@@ -6053,21 +6055,14 @@ class ShadowRunner:
             if strategy_id == "ibr":
                 self._worker_state.signal_sessions = book.signal_sessions
             warmup_session = str(warmup_session or "")
-            quote_cache: dict[tuple[str, ...], tuple[Mapping[str, Any], ...]] = {}
+            prepared_quotes = None
 
-            def relevant_quote_rows(symbol: str) -> tuple[Mapping[str, Any], ...]:
-                wanted = {str(symbol)}
-                wanted.update(
-                    str(position.get("symbol") or "")
-                    for position in book.positions.values()
-                    if position.get("status") == "open")
-                key = tuple(sorted(value for value in wanted if value))
-                cached = quote_cache.get(key)
-                if cached is None:
-                    cached = tuple(
-                        row for value in key for row in quotes.get(value, ()))
-                    quote_cache[key] = cached
-                return cached
+            def diagnostic_quote_rows():
+                nonlocal prepared_quotes
+                if prepared_quotes is None:
+                    prepared_quotes = prepare_diagnostic_quote_index(
+                        quotes, policy=policy)
+                return prepared_quotes
 
             def advance_empty_book(event: Mapping[str, Any], *,
                                    available_at: datetime) -> bool:
@@ -6140,7 +6135,7 @@ class ShadowRunner:
                                 event, available_at=available_at):
                             book.advance_quote_event(
                                 event,
-                                quote_rows=relevant_quote_rows(symbol))
+                                quote_rows=diagnostic_quote_rows())
                             state = book.risk_state()
                             self._worker_state.portfolios[candidate_id] = state
                             self._worker_state.equities[candidate_id] = book.equity
@@ -6158,7 +6153,7 @@ class ShadowRunner:
                             event, available_at=available_at):
                         book.advance_completed_bar(
                             event,
-                            quote_rows=relevant_quote_rows(symbol))
+                            quote_rows=diagnostic_quote_rows())
                         state = book.risk_state()
                         self._worker_state.portfolios[candidate_id] = state
                         self._worker_state.equities[candidate_id] = book.equity
@@ -6185,7 +6180,7 @@ class ShadowRunner:
                         (not warmup_session or session > warmup_session)):
                     book.open_requested_position(
                         event=event, plan=plan,
-                        quote_rows=relevant_quote_rows(symbol))
+                        quote_rows=diagnostic_quote_rows())
                     state = book.risk_state()
                     self._worker_state.portfolios[candidate_id] = state
                     self._worker_state.equities[candidate_id] = book.equity

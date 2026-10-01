@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from datetime import datetime
 import hashlib
 import json
@@ -882,7 +883,8 @@ def run_offline_forward_ibr(
         arms: Sequence[Mapping[str, Any]],
         starting_cash: float = 100_000.0,
         source_report: Mapping[str, Any] | None = None,
-        max_events: int = 100_000) -> dict[str, Any]:
+        max_events: int = 100_000,
+        progress=None) -> dict[str, Any]:
     """Replay one bounded forward-observed source through all seven IBR arms.
 
     Source defects are evidence unavailability, not zero-return measurements.
@@ -898,6 +900,8 @@ def run_offline_forward_ibr(
         raise ValueError("max_events must be a positive integer")
     if source_report is not None and not isinstance(source_report, Mapping):
         raise TypeError("source_report must be a mapping when supplied")
+    if progress is not None and not callable(progress):
+        raise TypeError("progress must be callable when supplied")
     arm_map = _arm_index(arms, runtime_config=runtime_config)
     try:
         rows = _load_rows(data, max_events=max_events)
@@ -956,6 +960,9 @@ def run_offline_forward_ibr(
             arm, evaluation, opportunities=opportunities,
             starting_cash=float(starting_cash),
             complete_opportunities=complete_opportunities)
+        if progress is not None:
+            # Observers may persist progress, but cannot mutate replay results.
+            progress(variant_id, deepcopy(results[variant_id]))
 
     failed = sorted(variant_id for variant_id, result in results.items()
                     if result.get("status") != "measured")

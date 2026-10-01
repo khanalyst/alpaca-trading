@@ -9,11 +9,14 @@ alongside the diagnostic decision cursor.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from copy import deepcopy
-from datetime import date, datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import math
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -104,6 +107,121 @@ def _state_digest(state: Mapping[str, Any]) -> str:
     body = dict(state)
     body.pop("state_digest", None)
     return content_digest(body)
+
+
+@dataclass(frozen=True)
+class _PreparedQuoteSeries:
+    quotes: tuple[Any, ...]
+    timestamps: tuple[datetime, ...]
+    available_quotes: tuple[tuple[datetime, datetime, int, Any], ...]
+    availabilities: tuple[datetime, ...]
+
+
+@dataclass(frozen=True)
+class PreparedDiagnosticQuoteIndex:
+    """Immutable normalized quotes for one diagnostic arm evaluation."""
+
+    by_symbol: Mapping[str, _PreparedQuoteSeries]
+    max_age_seconds: float
+    equity_feed: str
+    equity_provider: str
+
+    def validate_policy(self, policy: ReplayPolicy) -> None:
+        if (self.max_age_seconds !=
+                float(policy.max_market_data_age_seconds) or
+                self.equity_feed != _canonical_identity(policy.equity_feed) or
+                self.equity_provider !=
+                _canonical_identity(policy.equity_provider)):
+            raise DiagnosticAccountError(
+                "prepared diagnostic quote policy mismatch")
+
+    def fresh_quotes(self, symbol: str, at: datetime) -> tuple[Any, ...]:
+        series = self.by_symbol.get(str(symbol).upper())
+        if series is None:
+            return ()
+        lower = at - timedelta(seconds=self.max_age_seconds)
+        left = bisect_left(series.timestamps, lower)
+        right = bisect_right(series.timestamps, at)
+        return series.quotes[left:right]
+
+    def quote_fill(self, *, symbol: str, at: datetime, side: str,
+                   session_date: date) -> tuple[tuple[Any, ...], Any | None]:
+        normalized = self.fresh_quotes(symbol, at)
+        if not normalized:
+            return (), None
+        fill = quote_fill_record(
+            {str(symbol).upper(): normalized}, symbol=symbol, at=at, side=side,
+            max_age_seconds=self.max_age_seconds,
+            session_date=session_date,
+            allow_historical_backfill_diagnostics=False)
+        return normalized, fill
+
+    def candidates_after(
+            self, *, symbol: str, after: datetime,
+            visible_by: datetime) -> tuple[tuple[datetime, datetime, Any], ...]:
+        series = self.by_symbol.get(str(symbol).upper())
+        if series is None or visible_by < after:
+            return ()
+        left = bisect_left(series.availabilities, after)
+        right = bisect_right(series.availabilities, visible_by)
+        return tuple(
+            (available, timestamp, quote)
+            for available, timestamp, _sequence, quote in
+            series.available_quotes[left:right]
+            if timestamp >= after
+        )
+
+
+def prepare_diagnostic_quote_index(
+        quotes: Mapping[str, Sequence[Mapping[str, Any]]], *,
+        policy: ReplayPolicy) -> PreparedDiagnosticQuoteIndex:
+    """Normalize one immutable per-symbol quote snapshot exactly once."""
+    expected_feed = _canonical_identity(policy.equity_feed)
+    expected_provider = _canonical_identity(policy.equity_provider)
+    prepared: dict[str, _PreparedQuoteSeries] = {}
+    for raw_symbol, rows in quotes.items():
+        symbol = str(raw_symbol).upper()
+        entries: list[tuple[Any, datetime, int]] = []
+        for sequence, row in enumerate(rows):
+            if str(row.get("symbol") or "").upper() != symbol:
+                continue
+            if str(row.get("source_mode") or "forward_observed").strip().lower() \
+                    != "forward_observed":
+                continue
+            if (_canonical_identity(row.get("feed")) != expected_feed or
+                    _canonical_identity(row.get("provider")) !=
+                    expected_provider):
+                continue
+            try:
+                quote = normalize_quote(row)
+            except Exception:
+                continue
+            available = record_available_at(quote)
+            if available is None:
+                continue
+            entries.append((quote, available, sequence))
+        entries.sort(key=lambda item: (
+            item[0].timestamp, item[1], item[2]))
+        normalized = tuple(item[0] for item in entries)
+        available_quotes = tuple(sorted(
+            ((available, quote.timestamp, sequence, quote)
+             for quote, available, sequence in entries),
+            key=lambda item: (item[0], item[1], item[2])))
+        prepared[symbol] = _PreparedQuoteSeries(
+            quotes=normalized,
+            timestamps=tuple(quote.timestamp for quote in normalized),
+            available_quotes=available_quotes,
+            availabilities=tuple(item[0] for item in available_quotes),
+        )
+    return PreparedDiagnosticQuoteIndex(
+        by_symbol=MappingProxyType(prepared),
+        max_age_seconds=float(policy.max_market_data_age_seconds),
+        equity_feed=expected_feed,
+        equity_provider=expected_provider,
+    )
+
+
+_QuoteRows = Sequence[Mapping[str, Any]] | PreparedDiagnosticQuoteIndex
 
 
 def new_account_state(*, cohort_identity: str, candidate_id: str,
@@ -379,16 +497,22 @@ class DiagnosticAccountBook:
             math.isclose(float(price), float(fill.price), rel_tol=0.0,
                          abs_tol=1e-12))
 
-    def executable_quote(self, rows: Sequence[Mapping[str, Any]], *,
+    def executable_quote(self, rows: _QuoteRows, *,
                          symbol: str, at: datetime, side: str) -> dict[str, Any] | None:
-        normalized = self._normalized_quotes(rows, symbol=symbol)
-        if not normalized:
-            return None
-        fill = quote_fill_record(
-            index_quotes(normalized), symbol=symbol, at=at, side=side,
-            max_age_seconds=self.policy.max_market_data_age_seconds,
-            session_date=at.astimezone(NEW_YORK).date(),
-            allow_historical_backfill_diagnostics=False)
+        if isinstance(rows, PreparedDiagnosticQuoteIndex):
+            rows.validate_policy(self.policy)
+            normalized, fill = rows.quote_fill(
+                symbol=symbol, at=at, side=side,
+                session_date=at.astimezone(NEW_YORK).date())
+        else:
+            normalized = self._normalized_quotes(rows, symbol=symbol)
+            if not normalized:
+                return None
+            fill = quote_fill_record(
+                index_quotes(normalized), symbol=symbol, at=at, side=side,
+                max_age_seconds=self.policy.max_market_data_age_seconds,
+                session_date=at.astimezone(NEW_YORK).date(),
+                allow_historical_backfill_diagnostics=False)
         if fill is None:
             return None
         matching = [quote for quote in normalized
@@ -399,8 +523,21 @@ class DiagnosticAccountBook:
         return self._quote_evidence(matching[-1], fill, side=side, boundary=at)
 
     def first_executable_quote_after(
-            self, rows: Sequence[Mapping[str, Any]], *, symbol: str,
+            self, rows: _QuoteRows, *, symbol: str,
             after: datetime, visible_by: datetime, side: str) -> dict[str, Any] | None:
+        if isinstance(rows, PreparedDiagnosticQuoteIndex):
+            rows.validate_policy(self.policy)
+            candidates = rows.candidates_after(
+                symbol=symbol, after=after, visible_by=visible_by)
+            for available, _timestamp_value, quote in candidates:
+                _normalized, fill = rows.quote_fill(
+                    symbol=symbol, at=available, side=side,
+                    session_date=quote.session_date)
+                if (fill is not None and self._fill_matches_quote(
+                        quote, fill, at=available, side=side)):
+                    return self._quote_evidence(
+                        quote, fill, side=side, boundary=available)
+            return None
         normalized = self._normalized_quotes(rows, symbol=symbol)
         candidates = []
         for quote in normalized:
@@ -503,8 +640,7 @@ class DiagnosticAccountBook:
         position["state_digest"] = _state_digest(position)
         self._touched_positions.add(str(position["position_id"]))
 
-    def _revalue(self, *, at: datetime,
-                 quote_rows: Sequence[Mapping[str, Any]]) -> None:
+    def _revalue(self, *, at: datetime, quote_rows: _QuoteRows) -> None:
         total = 0.0
         unpriced = False
         for position in self.positions.values():
@@ -647,7 +783,7 @@ class DiagnosticAccountBook:
 
     def _complete_pending_exit(self, position: dict[str, Any], *,
                                event_key: str, visible_by: datetime,
-                               quote_rows: Sequence[Mapping[str, Any]]) -> bool:
+                               quote_rows: _QuoteRows) -> bool:
         pending = position.get("pending_exit")
         if not isinstance(pending, Mapping):
             return False
@@ -673,7 +809,7 @@ class DiagnosticAccountBook:
 
     def _apply_due_deadline(self, position: dict[str, Any], *, event_key: str,
                             visible_by: datetime,
-                            quote_rows: Sequence[Mapping[str, Any]]) -> bool:
+                            quote_rows: _QuoteRows) -> bool:
         deadline = position.get("deadline")
         deadline_at = (_timestamp(deadline.get("timestamp"))
                        if isinstance(deadline, Mapping) else None)
@@ -708,7 +844,7 @@ class DiagnosticAccountBook:
             quote_rows=quote_rows)
 
     def advance_completed_bar(self, event: Mapping[str, Any], *,
-                              quote_rows: Sequence[Mapping[str, Any]]) -> None:
+                              quote_rows: _QuoteRows) -> None:
         symbol = str(event.get("symbol") or "").upper()
         event_key = str(event.get("event_key") or "")
         if not symbol or not event_key:
@@ -822,7 +958,7 @@ class DiagnosticAccountBook:
         self.account["last_event_at"] = available_at.isoformat()
 
     def advance_quote_event(self, event: Mapping[str, Any], *,
-                            quote_rows: Sequence[Mapping[str, Any]]) -> None:
+                            quote_rows: _QuoteRows) -> None:
         """Apply a newly observed quote to pending exits and liquidation marks."""
         symbol = str(event.get("symbol") or "").upper()
         event_key = str(event.get("event_key") or "")
@@ -855,7 +991,7 @@ class DiagnosticAccountBook:
 
     def open_requested_position(self, *, event: Mapping[str, Any],
                                 plan: Mapping[str, Any],
-                                quote_rows: Sequence[Mapping[str, Any]]) -> bool:
+                                quote_rows: _QuoteRows) -> bool:
         symbol = str(event.get("symbol") or plan.get("symbol") or "").upper()
         event_key = str(event.get("event_key") or "")
         direction = str(plan.get("direction") or "").lower()
@@ -1026,7 +1162,8 @@ class DiagnosticAccountBook:
 
 __all__ = [
     "ACCOUNT_SCHEMA", "POSITION_SCHEMA", "ORDER_SCHEMA", "FILL_SCHEMA",
-    "DiagnosticAccountBook", "DiagnosticAccountError", "content_digest",
-    "event_available_at", "new_account_state", "validate_account_state",
-    "validate_position_state",
+    "DiagnosticAccountBook", "DiagnosticAccountError",
+    "PreparedDiagnosticQuoteIndex", "content_digest", "event_available_at",
+    "new_account_state", "prepare_diagnostic_quote_index",
+    "validate_account_state", "validate_position_state",
 ]

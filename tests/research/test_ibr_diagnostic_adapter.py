@@ -181,6 +181,7 @@ class OfflineIbrDiagnosticAdapterTests(unittest.TestCase):
         self.assertTrue(first["source"]["supplied_report_hash_verified"])
         self.assertFalse(first["broker_equivalence"])
         self.assertFalse(first["promotion_eligible"])
+
         baseline = first["arms"]["ibr.baseline"]
         self.assertEqual("measured", baseline["status"])
         self.assertEqual(1, len(baseline["rows"]))
@@ -197,6 +198,25 @@ class OfflineIbrDiagnosticAdapterTests(unittest.TestCase):
         self.assertEqual("missing_data", open_boundary["outcome"])
         self.assertTrue(open_boundary["rows"][0]["no_trade"])
         self.assertIsNone(open_boundary["rows"][0]["net_pnl"])
+
+    def test_progress_reports_completed_arms_without_changing_results(self):
+        rows = _source()
+        seen = {}
+        def progress(variant_id, result):
+            self.assertNotIn(variant_id, seen)
+            self.assertEqual(result["variant_id"], variant_id)
+            self.assertFalse(result["authorizing"])
+            seen[variant_id] = deepcopy(result)
+            result["observer_only_mutation"] = True
+        original = run_offline_forward_ibr(
+            rows, runtime_config=self.runtime, arms=self.arms)
+        observed = run_offline_forward_ibr(
+            rows, runtime_config=self.runtime, arms=self.arms, progress=progress)
+        self.assertEqual(observed, original)
+        self.assertEqual(seen, observed["arms"])
+        with self.assertRaisesRegex(TypeError, "progress"):
+            run_offline_forward_ibr(
+                rows, runtime_config=self.runtime, arms=self.arms, progress=True)
 
     def test_generated_signal_refusal_is_not_reported_as_no_signal(self):
         runtime = deepcopy(self.runtime)

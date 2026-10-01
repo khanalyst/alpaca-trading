@@ -153,6 +153,14 @@ class CompleteDiagnosticSuiteTests(unittest.TestCase):
                 self.assertEqual(arm["legacy_comparison"]["replay_scope"]["runtime_parity"],
                                  "full")
         self.assertEqual(result["outcome_counts"]["unavailable"], 7)
+        self.assertEqual(len(result["components"]), 50)
+        runtime_components = [item for item in result["components"]
+                              if item["stage"] == "ibr_runtime"]
+        self.assertEqual(len(runtime_components), 7)
+        for reference in runtime_components:
+            component = json.loads((self.root / reference["path"]).read_text())
+            self.assertEqual(component["result"]["status"], "unavailable")
+            self.assertFalse(component["authorizing"])
         self.assertEqual(sum(result["legacy_comparison_outcome_counts"].values()), 7)
         self.assertEqual(result["ibr_runtime"]["status"], "unavailable")
         self.assertIsNone(result["ibr_runtime"]["diagnostic"])
@@ -177,6 +185,51 @@ class CompleteDiagnosticSuiteTests(unittest.TestCase):
                 suite.run_suite(self.data, runtime_config=self.config, output=self.output,
                                 diagnostic_only=True, workers=workers)
         self.assertFalse(self.output.exists())
+
+    def test_components_are_durable_hash_bound_and_never_claim_completion(self):
+        from tests.research.test_ibr_diagnostic_adapter import _runtime, _source
+        self.data.write_text("".join(json.dumps(row) + "\n" for row in _source()),
+                             encoding="utf-8")
+        runtime_calls = []
+        def runtime_progress(done, total, variant):
+            component_root = self.output.with_name("results.json.components")
+            self.assertEqual(len(list(component_root.glob("ibr_runtime-*.json"))), done)
+            runtime_calls.append((done, total, variant))
+        with patch.object(suite, "_code_bundle_hash", return_value="a" * 64):
+            result = suite.run_suite(
+                self.data, runtime_config=_runtime(), output=self.output,
+                diagnostic_only=True, workers=1, runtime_progress=runtime_progress)
+        self.assertEqual(len(result["components"]), 50)
+        self.assertEqual(len(runtime_calls), 7)
+        self.assertEqual(runtime_calls[-1][:2], (7, 7))
+        self.assertEqual(result["components_final_validation"], "source_and_code_rechecked")
+        for reference in result["components"]:
+            component = json.loads((self.root / reference["path"]).read_text())
+            digest = component.pop("content_hash")
+            self.assertEqual(suite.content_hash(component), digest)
+            self.assertEqual(reference["content_hash"], digest)
+            self.assertEqual(component["manifest_hash"], result["manifest_hash"])
+            self.assertEqual(component["code_hash"], result["code_hash"])
+            self.assertEqual(component["source_hash"], result["source"]["content_hash"])
+            self.assertFalse(component["complete_suite"])
+            self.assertFalse(component["eligible"])
+            self.assertFalse(component["authorizing"])
+            self.assertEqual(component["final_source_and_code_validation"], "pending")
+
+    def test_interrupted_runtime_preserves_partial_components_not_final_result(self):
+        with patch.object(suite, "_code_bundle_hash", return_value="a" * 64), \
+                patch.object(suite, "run_offline_forward_ibr",
+                             side_effect=RuntimeError("interrupted runtime")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted runtime"):
+                suite.run_suite(self.data, runtime_config=self.config,
+                                output=self.output, diagnostic_only=True, workers=1)
+        self.assertFalse(self.output.exists())
+        component_root = self.output.with_name("results.json.components")
+        self.assertEqual(len(list(component_root.glob("inventory-*.json"))), 43)
+        self.assertEqual(len(list(component_root.glob("ibr_runtime-*.json"))), 0)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            suite.run_suite(self.data, runtime_config=self.config,
+                            output=self.output, diagnostic_only=True, workers=1)
 
     def test_runtime_ibr_uses_shared_forward_engine_and_preserves_legacy_comparison(self):
         # Synthetic prices verify plumbing and accounting, not market edge.
