@@ -129,7 +129,9 @@ CANDIDATE_REPLAY_EPOCH_SCHEMA = "shadow-candidate-replay-epoch.v1"
 MAX_DIAGNOSTIC_ROLLUP_SESSIONS = 64
 DIAGNOSTIC_REASON_ROLLUP_PREFIX = "reason:"
 _REPLAY_CODE_BUNDLE_ROOTS = ("agent", "research")
-_REPLAY_CODE_BUNDLE_EXTRAS = ("deploy/recorder.py", "requirements.lock.txt")
+_REPLAY_CODE_BUNDLE_EXTRAS = ("deploy/recorder.py", "deploy/recorder_market.py",
+                            "deploy/research_dataset.py", "requirements.lock.txt")
+_REPLAY_CODE_HASH_CACHE: str | None = None
 
 
 def _poll_interval(value: object) -> float:
@@ -194,6 +196,14 @@ def _sequence_digest(values: Iterable[Any]) -> str:
 
 def _replay_code_hash() -> str:
     """Return a deterministic hash of the bounded replay source bundle."""
+    # The replay process is an immutable code epoch: a running deployment has
+    # already imported the code it executes.  Hash the bundle once per process
+    # rather than rereading every source file on every poll.  This deliberately
+    # does not use mtimes or a corpus cache; a restart establishes a new epoch
+    # and recomputes the content hash in full.
+    global _REPLAY_CODE_HASH_CACHE
+    if _REPLAY_CODE_HASH_CACHE is not None:
+        return _REPLAY_CODE_HASH_CACHE
     root = Path(__file__).resolve().parents[1]
     files = {
         path.relative_to(root).as_posix()
@@ -211,7 +221,8 @@ def _replay_code_hash() -> str:
             digest.update(path.read_bytes())
         except OSError:
             digest.update(f"missing:{name}".encode("utf-8"))
-    return digest.hexdigest()
+    _REPLAY_CODE_HASH_CACHE = digest.hexdigest()
+    return _REPLAY_CODE_HASH_CACHE
 
 
 def _replay_epoch_identity(*, replay_code_hash: str,
@@ -517,6 +528,42 @@ def _diagnostic_phase_metrics() -> dict[str, Any]:
         "coverage_seconds": 0.0,
         "total_seconds": 0.0,
     }
+
+
+def _poll_phase_metrics() -> dict[str, float]:
+    """Return bounded whole-poll timing buckets.
+
+    These timings are operational telemetry only.  They intentionally use a
+    small fixed allowlist so a malformed or unexpectedly large internal
+    payload cannot become part of the health contract.
+    """
+    return {
+        "calendar_seconds": 0.0,
+        "candidate_preparation_seconds": 0.0,
+        "corpus_read_seconds": 0.0,
+        "ingest_seconds": 0.0,
+        "diagnostic_snapshot_seconds": 0.0,
+        "diagnostic_seconds": 0.0,
+        "authorizing_snapshot_seconds": 0.0,
+        "authorizing_evaluation_seconds": 0.0,
+        "coverage_seconds": 0.0,
+        "finalization_seconds": 0.0,
+        "total_seconds": 0.0,
+    }
+
+
+def _finish_poll_phase_metrics(metrics: Mapping[str, Any], started: float,
+                               *, now: float | None = None) -> dict[str, float]:
+    """Normalize whole-poll timings before publishing them."""
+    result = _poll_phase_metrics()
+    for key in result:
+        if key == "total_seconds":
+            continue
+        number = _finite(metrics.get(key))
+        result[key] = round(max(0.0, float(number or 0.0)), 6)
+    elapsed = (time.monotonic() if now is None else float(now)) - float(started)
+    result["total_seconds"] = round(max(0.0, elapsed), 6)
+    return result
 
 
 def _load_recorded_session_calendar(
@@ -1572,6 +1619,14 @@ class ShadowStore:
                   ON events(inserted_at,event_key);
                 CREATE INDEX IF NOT EXISTS decisions_candidate_session_idx
                   ON decisions(candidate_id,session_date);
+                CREATE INDEX IF NOT EXISTS replay_diffs_candidate_created_idx
+                  ON replay_diffs(candidate_id,created_at DESC,session_date DESC);
+                CREATE INDEX IF NOT EXISTS replay_diffs_candidate_session_idx
+                  ON replay_diffs(candidate_id,session_date DESC,replay_digest,status);
+                CREATE INDEX IF NOT EXISTS shadow_accounts_candidate_session_idx
+                  ON shadow_accounts(candidate_id,session_date,replay_digest);
+                CREATE INDEX IF NOT EXISTS shadow_trades_candidate_replay_idx
+                  ON shadow_trades(candidate_id,session_date,replay_digest,replay_status);
                 CREATE INDEX IF NOT EXISTS diagnostic_positions_open_idx
                   ON diagnostic_positions(cohort_identity,candidate_id,status,symbol);
                 CREATE INDEX IF NOT EXISTS diagnostic_orders_candidate_idx
@@ -1593,19 +1648,22 @@ class ShadowStore:
     def ingest_event(self, row: Mapping[str, Any], *, max_events: int,
                      source_path: str | None = None,
                      source_offset_start: int | None = None,
-                     source_offset_end: int | None = None) -> tuple[str, bool]:
+                     source_offset_end: int | None = None,
+                     update_cursor: bool = True) -> tuple[str, bool]:
         """Persist one recorder event in its own durable transaction."""
         with self._connection() as db:
             return self._ingest_event(
                 db, row, max_events=max_events, source_path=source_path,
                 source_offset_start=source_offset_start,
-                source_offset_end=source_offset_end)
+                source_offset_end=source_offset_end,
+                update_cursor=update_cursor)
 
     def _ingest_event(self, db: sqlite3.Connection,
                       row: Mapping[str, Any], *, max_events: int,
                       source_path: str | None = None,
                       source_offset_start: int | None = None,
-                      source_offset_end: int | None = None) -> tuple[str, bool]:
+                      source_offset_end: int | None = None,
+                      update_cursor: bool = True) -> tuple[str, bool]:
         """Persist one event through a caller-owned atomic poll transaction."""
         del max_events  # The bound applies to each compacted poll snapshot.
         event_key = str(row.get("event_key") or "").strip()
@@ -1640,17 +1698,27 @@ class ShadowStore:
               if source_offset_start is not None else None),
              (int(source_offset_end)
               if source_offset_end is not None else None)))
+        if update_cursor:
+            self._update_corpus_cursor(
+                db, timestamp=timestamp.isoformat(), event_key=event_key,
+                digest=digest)
+        return event_key, True
+
+    @staticmethod
+    def _update_corpus_cursor(db: sqlite3.Connection, *, timestamp: str,
+                               event_key: str, digest: str) -> None:
+        """Advance the corpus cursor once against a caller-owned transaction."""
         cursor = db.execute(
             "SELECT last_timestamp,last_event_key FROM cursor WHERE scope='corpus'"
         ).fetchone()
-        if cursor is None or (timestamp.isoformat(), event_key) >= (cursor[0], cursor[1]):
+        if cursor is None or (str(timestamp), str(event_key)) >= (
+                str(cursor[0]), str(cursor[1])):
             db.execute("""INSERT INTO cursor(scope,last_event_key,last_timestamp,last_digest,updated_at)
                 VALUES('corpus',?,?,?,?)
                 ON CONFLICT(scope) DO UPDATE SET last_event_key=excluded.last_event_key,
                     last_timestamp=excluded.last_timestamp,last_digest=excluded.last_digest,
                     updated_at=excluded.updated_at""",
-                (event_key, timestamp.isoformat(), digest, time.time()))
-        return event_key, True
+                (str(event_key), str(timestamp), str(digest), time.time()))
 
     def event_count(self) -> int:
         with self._connection() as db:
@@ -3155,18 +3223,37 @@ class ShadowStore:
         with self._connection() as db:
             return int(db.execute("SELECT count(*) FROM decisions").fetchone()[0])
 
-    def gate_sessions(self) -> list[tuple[str, str]]:
-        """Return candidate/session pairs whose replay evidence currently gates."""
+    def gate_sessions(self, candidate_ids: Sequence[str] | None = None
+                       ) -> list[tuple[str, str]]:
+        """Return replay-gated candidate/session pairs.
+
+        A candidate filter is used by the live poll so this continuity check
+        cannot turn into a historical scan when the shadow WAL contains
+        unrelated arms.  The no-argument form retains the complete projection
+        used by diagnostics and maintenance callers.
+        """
+        wanted = (sorted({str(value) for value in candidate_ids
+                          if str(value).strip()})
+                  if candidate_ids is not None else None)
+        if wanted == []:
+            return []
+        query = """SELECT DISTINCT t.candidate_id,t.session_date,
+                   c.config_json,c.proof_json
+            FROM shadow_trades t JOIN replay_diffs d
+              ON d.candidate_id=t.candidate_id
+             AND d.session_date=t.session_date
+             AND d.replay_digest=t.replay_digest
+            LEFT JOIN candidates c ON c.candidate_id=t.candidate_id
+            WHERE d.status='match' AND t.replay_status='match'"""
+        params: tuple[Any, ...] = ()
+        if wanted is not None:
+            marks = ",".join("?" for _ in wanted)
+            query += f" AND t.candidate_id IN ({marks})"
+            params = tuple(wanted)
         with self._connection() as db:
-            rows = db.execute("""SELECT DISTINCT t.candidate_id,t.session_date,
-                       c.config_json,c.proof_json
-                FROM shadow_trades t JOIN replay_diffs d
-                  ON d.candidate_id=t.candidate_id
-                 AND d.session_date=t.session_date
-                 AND d.replay_digest=t.replay_digest
-                LEFT JOIN candidates c ON c.candidate_id=t.candidate_id
-                WHERE d.status='match' AND t.replay_status='match'
-                ORDER BY t.session_date,t.candidate_id""").fetchall()
+            rows = db.execute(query +
+                              " ORDER BY t.session_date,t.candidate_id",
+                              params).fetchall()
         return [
             (str(row["candidate_id"]), str(row["session_date"]))
             for row in rows
@@ -3300,6 +3387,130 @@ class ShadowStore:
                 item["details"] = {}
             result.append(item)
         return result
+
+    def replay_diff_state_projection(self, candidate_ids: Sequence[str]) -> list[dict]:
+        """Return a bounded semantic replay-diff projection for candidates.
+
+        This intentionally excludes ``shadow_accounts``.  Account rows are
+        immutable evidence and the full replay metadata join is useful for
+        reports, but it is the wrong dependency for a per-poll cache key: a
+        large unrelated history must not be read just to determine whether
+        the current authorizing inputs changed.
+        """
+        wanted = sorted({str(value) for value in candidate_ids
+                         if str(value).strip()})
+        if not wanted:
+            return []
+        marks = ",".join("?" for _ in wanted)
+        query = f"""WITH counts AS (
+                SELECT candidate_id, count(*) AS row_count,
+                       max(created_at) AS latest_created_at
+                  FROM replay_diffs
+                 WHERE candidate_id IN ({marks})
+                 GROUP BY candidate_id
+            ), ranked AS (
+                SELECT candidate_id,session_date,source_digest,
+                       shadow_digest,replay_digest,status,details_json,
+                       created_at,
+                       row_number() OVER (
+                           PARTITION BY candidate_id
+                           ORDER BY created_at DESC,session_date DESC,diff_id DESC
+                       ) AS row_number
+                  FROM replay_diffs
+                 WHERE candidate_id IN ({marks})
+            )
+            SELECT counts.candidate_id,counts.row_count,
+                   counts.latest_created_at,
+                   ranked.session_date AS latest_session_date,
+                   ranked.source_digest AS latest_source_digest,
+                   ranked.shadow_digest AS latest_shadow_digest,
+                   ranked.replay_digest AS latest_replay_digest,
+                   ranked.status AS latest_status,
+                   ranked.details_json AS latest_details_json
+              FROM counts
+              LEFT JOIN ranked
+                ON ranked.candidate_id=counts.candidate_id
+               AND ranked.row_number=1
+             ORDER BY counts.candidate_id"""
+        params = (*wanted, *wanted)
+        with self._connection() as db:
+            rows = db.execute(query, params).fetchall()
+        result: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            details_json = item.pop("latest_details_json", None)
+            item["latest_details_digest"] = _digest(
+                str(details_json or ""))
+            result.append(item)
+        return result
+
+    def replay_metadata_tail(self, candidate_ids: Sequence[str], *,
+                             limit: int = 256) -> list[dict]:
+        """Return a bounded latest replay/account projection.
+
+        Capacity reporting only needs a recent tail for current authorizing
+        candidates.  Read the diff tail first, then probe each selected
+        account key with ``LIMIT 2``.  This keeps an old or malformed database
+        from expanding a historical diff/account join; more than one account
+        for an immutable key is ambiguous and fails closed.
+        """
+        wanted = sorted({str(value) for value in candidate_ids
+                         if str(value).strip()})
+        if not wanted:
+            return []
+        bounded_limit = max(1, min(int(limit), 256))
+        marks = ",".join("?" for _ in wanted)
+        query = f"""SELECT d.candidate_id,d.session_date,d.source_digest,
+                   d.shadow_digest,d.replay_digest,d.status,d.details_json
+              FROM replay_diffs d
+             WHERE d.candidate_id IN ({marks})
+             ORDER BY d.session_date DESC,d.candidate_id DESC
+             LIMIT ?"""
+        result: list[dict] = []
+        with self._connection() as db:
+            diff_rows = db.execute(query, (*wanted, bounded_limit)).fetchall()
+            for row in diff_rows:
+                account_rows = db.execute("""SELECT account_id,vehicle,
+                           starting_cash,ending_cash,realized_pnl,trade_count,
+                           replay_status,created_at AS account_created_at
+                      FROM shadow_accounts
+                     WHERE candidate_id=? AND session_date=?
+                       AND replay_digest=?
+                     ORDER BY account_id LIMIT 2""", (
+                         str(row["candidate_id"]), str(row["session_date"]),
+                         row["replay_digest"])).fetchall()
+                if len(account_rows) > 1:
+                    raise ShadowError(
+                        "ambiguous replay account rows for "
+                        f"{row['candidate_id']} {row['session_date']} "
+                        f"{row['replay_digest']}")
+                item = dict(row)
+                try:
+                    item["details"] = json.loads(item.pop("details_json"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item["details"] = {}
+                account = account_rows[0] if account_rows else None
+                for key in ("account_id", "vehicle", "starting_cash",
+                            "ending_cash", "realized_pnl", "trade_count",
+                            "replay_status", "account_created_at"):
+                    item[key] = account[key] if account is not None else None
+                result.append(item)
+        return result
+
+    def virtual_book_state(self, candidate_ids: Sequence[str]) -> list[dict]:
+        """Return the exact bounded authorizing virtual-book projection."""
+        wanted = sorted({str(value) for value in candidate_ids
+                         if str(value).strip()})
+        if not wanted:
+            return []
+        marks = ",".join("?" for _ in wanted)
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT book_id,candidate_id,decision_id,symbol,status,quantity,"
+                "entry_price,plan_json,created_at FROM virtual_books "
+                f"WHERE candidate_id IN ({marks}) ORDER BY book_id",
+                tuple(wanted)).fetchall()
+        return [dict(row) for row in rows]
 
     def gate_rows(self, candidate_id: str, session_date: str | None = None) -> list[dict]:
         """Return rows eligible for existing gates after replay parity only."""
@@ -3550,6 +3761,127 @@ class ShadowRunner:
         # (and test seams) while ensuring no worker mutates or observes a
         # sibling candidate's virtual book.
         self._worker_state = threading.local()
+        # The recorder/ShadowStore WAL is immutable between polls unless a
+        # new ingest commits.  Cache only the decoded authorizing event views;
+        # the fingerprint below binds every semantic input that can change
+        # how those views are interpreted.  This is process-local and is
+        # intentionally empty after restart.
+        self._authorizing_event_cache: tuple[str, tuple[dict, ...],
+                                             dict[str, tuple[dict, ...]],
+                                             dict[str, tuple[dict, ...]],
+                                             dict[str, tuple[dict, ...]]] | None = None
+
+    @staticmethod
+    def _calendar_snapshot_identity(
+            snapshot: _RecordedSessionCalendarSnapshot) -> list[dict[str, str]]:
+        return [{"session": str(session),
+                 "open": bounds[0].isoformat(),
+                 "close": bounds[1].isoformat()}
+                for session, bounds in snapshot.items()]
+
+    def _authorizing_event_fingerprint(
+            self, *, candidates: Sequence[Mapping[str, Any]],
+            diagnostic_arms: Sequence[Mapping[str, Any]],
+            calendar_snapshot: _RecordedSessionCalendarSnapshot,
+            source_offsets: Mapping[str, int], forward_event_floor: float,
+            event_watermark: Mapping[str, Any],
+            quarantine: Mapping[str, Any],
+            replay_quarantine: Mapping[str, Any],
+            replay_state: Mapping[str, Any],
+            virtual_book_state: Sequence[Mapping[str, Any]]) -> str:
+        """Bind cached event decoding to the complete current input epoch."""
+        candidate_rows: list[dict[str, Any]] = []
+        for candidate in candidates:
+            candidate_rows.append({
+                "candidate_id": str(candidate.get("candidate_id") or ""),
+                "variant_id": str(candidate.get("variant_id") or ""),
+                "strategy_id": str(candidate.get("strategy_id") or ""),
+                "vehicle": str(candidate.get("vehicle") or ""),
+                "status": str(candidate.get("status") or ""),
+                "config_digest": _digest(_safe_config(candidate)),
+                "proof_digest": _digest({key: candidate.get(key) for key in (
+                    "dataset_hash", "config_hash", "code_hash",
+                    "provenance_hash", "status")}),
+            })
+        diagnostic_rows = [{
+            "candidate_id": str(arm.get("candidate_id") or ""),
+            "cohort_identity": str(arm.get("cohort_identity") or ""),
+            "config_identity": str(arm.get("config_identity") or ""),
+            "code_identity": str(arm.get("code_identity") or ""),
+        } for arm in diagnostic_arms]
+        config_identity = {
+            "max_candidates": int(self.config.max_candidates),
+            "max_events": int(self.config.max_events),
+            "max_decisions": int(self.config.max_decisions),
+            "replay_session_max_events": int(self.config.replay_session_max_events),
+            "equity": float(self.config.equity),
+            "diagnostic": bool(self.config.diagnostic),
+            "diagnostic_include_ibr": bool(self.config.diagnostic_include_ibr),
+            "runtime_config": self.config.runtime_config,
+        }
+        return _digest({
+            "schema": "shadow-authorizing-event-cache.v1",
+            "replay_code_hash": _replay_code_hash(),
+            "config": config_identity,
+            "candidates": sorted(candidate_rows,
+                                  key=lambda row: row["candidate_id"]),
+            "diagnostic_candidates": sorted(
+                diagnostic_rows, key=lambda row: row["candidate_id"]),
+            "calendar": self._calendar_snapshot_identity(calendar_snapshot),
+            "source_offsets": {str(key): int(value)
+                               for key, value in sorted(source_offsets.items())},
+            "forward_event_floor": float(forward_event_floor),
+            "event_watermark": dict(event_watermark),
+            "quarantine": dict(quarantine),
+            "replay_quarantine": self._replay_quarantine_identity(
+                replay_quarantine),
+            "replay_state": dict(replay_state),
+            "virtual_book_state": [dict(row) for row in virtual_book_state],
+        })
+
+    @staticmethod
+    def _replay_quarantine_identity(
+            value: Mapping[str, Any]) -> dict[str, Any]:
+        """Project replay quarantine semantics without retry wall-clock churn."""
+        volatile = {"first_seen_ts", "last_seen_ts", "observed_ts",
+                    "repaired_ts", "updated_ts"}
+
+        def project(item: Any) -> Any:
+            if isinstance(item, Mapping):
+                return {str(key): project(raw) for key, raw in item.items()
+                        if str(key) not in volatile and str(key) != "history"}
+            if isinstance(item, (list, tuple)):
+                return [project(raw) for raw in item]
+            return item
+
+        return project(value)
+
+    def _cached_authorizing_event_views(
+            self, fingerprint: str) -> tuple[list[dict], dict[str, list[dict]],
+                                             dict[str, list[dict]],
+                                             dict[str, list[dict]]] | None:
+        cached = self._authorizing_event_cache
+        if cached is None or cached[0] != fingerprint:
+            return None
+        # Copy only the outer containers. Downstream code extends the grouped
+        # lists for legacy replay context, while the immutable event mappings
+        # themselves are never modified.
+        return (list(cached[1]),
+                {key: list(values) for key, values in cached[2].items()},
+                {key: list(values) for key, values in cached[3].items()},
+                {key: list(values) for key, values in cached[4].items()})
+
+    def _save_authorizing_event_views(
+            self, fingerprint: str, event_rows: Sequence[dict],
+            bars: Mapping[str, Sequence[dict]],
+            quotes: Mapping[str, Sequence[dict]],
+            options: Mapping[str, Sequence[dict]]) -> None:
+        self._authorizing_event_cache = (
+            str(fingerprint), tuple(event_rows),
+            {str(key): tuple(values) for key, values in bars.items()},
+            {str(key): tuple(values) for key, values in quotes.items()},
+            {str(key): tuple(values) for key, values in options.items()},
+        )
 
     @classmethod
     def for_offline_diagnostic(cls, config: ShadowConfig) -> "ShadowRunner":
@@ -6210,14 +6542,19 @@ class ShadowRunner:
             raise ShadowError(
                 "offline diagnostic worker cannot run the persistent poll")
         poll_started = time.monotonic()
+        poll_phases = _poll_phase_metrics()
         # The recorder rewrites its sidecar atomically.  Parse it once for this
         # poll and pass the immutable value through every worker/replay path so
         # a concurrent correction cannot split one poll across two calendars.
+        phase_started = time.monotonic()
         calendar_snapshot = _load_recorded_session_calendar(
             self.config.corpus_path)
+        poll_phases["calendar_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
         # Validate the mutable operational pointer before writing anything.
         # Older code identities are readable for rollover; malformed or
         # self-digest-mismatched manifests are never silently replaced.
+        phase_started = time.monotonic()
         prior_manifest = self.store.latest_manifest_for_rollover()
         # Cohort registration is intentionally the first durable action.  The
         # activation watermark is written only after this poll's existing
@@ -6230,9 +6567,12 @@ class ShadowRunner:
         candidates = _read_candidates(self.config.edge_db, max_candidates=self.config.max_candidates)
         for candidate in candidates:
             self.store.upsert_candidate(candidate)
+        poll_phases["candidate_preparation_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
         ingested = 0
         conflicts = 0
         invalid_events = 0
+        phase_started = time.monotonic()
         sources = _corpus_sources(self.config.corpus_path)
         offsets = self.store.source_offsets()
         forward_floor = self.store.forward_event_floor()
@@ -6292,6 +6632,8 @@ class ShadowRunner:
         if len(selected) > self.config.max_events:
             raise ShadowError(
                 f"shadow event batch bound {self.config.max_events} exceeded")
+        poll_phases["corpus_read_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
         quarantine = self.store.quarantine_events()
         invalid_sources: set[str] = set()
         resolved_quarantine: set[str] = set()
@@ -6308,6 +6650,8 @@ class ShadowRunner:
         # A crash before the first commit rolls the batch back. A crash between
         # commits retries already-durable events with the same deterministic
         # keys, without duplicating them or skipping uncommitted source bytes.
+        phase_started = time.monotonic()
+        cursor_candidate: tuple[str, str, str] | None = None
         with self.store._connection() as ingest_db:
             for raw in selected:
                 event_key = str(raw.get("event_key") or "")
@@ -6321,7 +6665,8 @@ class ShadowRunner:
                         source_offset_start=(source_provenance[1]
                                              if source_provenance else None),
                         source_offset_end=(source_provenance[2]
-                                           if source_provenance else None))
+                                           if source_provenance else None),
+                        update_cursor=False)
                 except InputConflict:
                     conflicts += 1
                     raise
@@ -6353,6 +6698,18 @@ class ShadowRunner:
                     resolved_quarantine.add(event_key)
                 if added:
                     ingested += 1
+                    timestamp = _timestamp(raw.get("timestamp"))
+                    if timestamp is not None:
+                        candidate = (timestamp.isoformat(), event_key,
+                                     _digest(_row_payload(raw)))
+                        if (cursor_candidate is None or
+                                (candidate[0], candidate[1]) >=
+                                (cursor_candidate[0], cursor_candidate[1])):
+                            cursor_candidate = candidate
+            if cursor_candidate is not None:
+                self.store._update_corpus_cursor(
+                    ingest_db, timestamp=cursor_candidate[0],
+                    event_key=cursor_candidate[1], digest=cursor_candidate[2])
         # Only commit offsets for sources whose complete forward batch was
         # normalized.  Other sources remain at their previous boundary and
         # are retried after correction; already-ingested rows are idempotent.
@@ -6366,6 +6723,8 @@ class ShadowRunner:
         # monotonic merge so unrelated quarantine evidence is preserved.
         self.store.save_quarantine_events(quarantine, replace=True)
         self.store.save_source_offsets(next_offsets)
+        poll_phases["ingest_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
         # Recompute the durable block after resolving corrected rows.  A
         # corrected replay can therefore become eligible in this same poll;
         # it does not require an operator to run an extra no-op cycle.
@@ -6390,9 +6749,12 @@ class ShadowRunner:
                 candidate_ids=[str(arm.get("candidate_id") or "")
                                for arm in diagnostic_arms],
                 starting_cash=float(self.config.equity))
+        phase_started = time.monotonic()
         diagnostic_rows, diagnostic_progress, diagnostic_event_watermark = (
             self._diagnostic_snapshot(
                 diagnostic_cohort, diagnostic_arms, diagnostic_activation))
+        poll_phases["diagnostic_snapshot_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
 
         # A poll without an eligible candidate still has to finish ingestion,
         # quarantine, and source-offset persistence above.  It must not then
@@ -6426,6 +6788,7 @@ class ShadowRunner:
                 # evidence; an empty candidate set is not permission to skip
                 # a quarantined session.
                 forward_floor = current_floor
+            phase_started = time.monotonic()
             prune = self.store.prune()
             stored_events = self.store.event_count()
             quarantine_through = self.store.quarantine_through_session()
@@ -6500,12 +6863,15 @@ class ShadowRunner:
             manifest_digest = self.store.save_manifest(manifest)
             replay_identity = _manifest_replay_identity(
                 manifest, manifest_digest)
+            phase_started = time.monotonic()
             diagnostic_result = self._run_diagnostic_poll(
                 diagnostic_cohort, diagnostic_arms, diagnostic_activation,
                 snapshot_rows=diagnostic_rows,
                 progress=diagnostic_progress,
                 replay_identity=replay_identity,
                 calendar_snapshot=calendar_snapshot)
+            poll_phases["diagnostic_seconds"] = max(
+                0.0, time.monotonic() - phase_started)
             diagnostic_errors = diagnostic_result.get("candidate_errors") or {}
             decision_count = self.store.decision_count()
             result = {
@@ -6531,8 +6897,11 @@ class ShadowRunner:
                 "stress_calibration": calibration_status,
                 "authorizing_candidates": 0,
                 "diagnostic_candidates": len(diagnostic_arms),
+                "authorizing_event_cache_hit": False,
                 **prune,
             }
+            poll_phases["finalization_seconds"] = max(
+                0.0, time.monotonic() - phase_started)
             coverage_started = time.monotonic()
             diagnostic_coverage = self._diagnostic_coverage(
                 diagnostic_cohort, diagnostic_activation,
@@ -6545,6 +6914,7 @@ class ShadowRunner:
                 poll_duration_seconds=0.0,
                 phase_metrics=diagnostic_result.get("phase_metrics"))
             coverage_seconds = max(0.0, time.monotonic() - coverage_started)
+            poll_phases["coverage_seconds"] = coverage_seconds
             poll_duration_seconds = round(
                 max(0.0, time.monotonic() - poll_started), 6)
             diagnostic_coverage["poll_duration_seconds"] = poll_duration_seconds
@@ -6559,8 +6929,51 @@ class ShadowRunner:
             result["poll_duration_seconds"] = poll_duration_seconds
             result["source_lag_seconds"] = result[
                 "diagnostic_shadow"]["source_lag_seconds"]
+            result["poll_phase_metrics"] = _finish_poll_phase_metrics(
+                poll_phases, poll_started)
             return result
-        events, bars, quotes, options = self._load_events()
+        # Build a complete cache fingerprint before decoding the authorizing
+        # event WAL. A changed head, floor, candidate/config/code epoch,
+        # calendar, quarantine, or replay/book projection forces a fresh
+        # decode. Diagnostic polling remains independent and still runs below.
+        cache_candidate_ids = [str(candidate.get("candidate_id") or "")
+                              for candidate in candidates]
+        for candidate in candidates:
+            root_control = self._rule_root_control(candidate)
+            if root_control is not None:
+                cache_candidate_ids.append(
+                    str(root_control.get("candidate_id") or ""))
+        cache_candidate_ids = sorted({candidate_id for candidate_id in
+                                      cache_candidate_ids if candidate_id})
+        cache_replay_state = {
+            "gate_sessions": self.store.gate_sessions(cache_candidate_ids),
+            "replay_diffs": self.store.replay_diff_state_projection(
+                cache_candidate_ids),
+        }
+        cache_event_watermark = self.store.event_watermark()
+        cache_fingerprint = self._authorizing_event_fingerprint(
+            candidates=candidates, diagnostic_arms=diagnostic_arms,
+            calendar_snapshot=calendar_snapshot,
+            source_offsets=next_offsets,
+            forward_event_floor=float(forward_floor or 0.0),
+            event_watermark=cache_event_watermark,
+            quarantine=quarantine,
+            replay_quarantine=self.store.replay_quarantine(),
+            replay_state=cache_replay_state,
+            virtual_book_state=self.store.virtual_book_state(
+                cache_candidate_ids))
+        cached_event_views = self._cached_authorizing_event_views(
+            cache_fingerprint)
+        authorizing_event_cache_hit = cached_event_views is not None
+        phase_started = time.monotonic()
+        if cached_event_views is not None:
+            events, bars, quotes, options = cached_event_views
+        else:
+            events, bars, quotes, options = self._load_events()
+            self._save_authorizing_event_views(
+                cache_fingerprint, events, bars, quotes, options)
+        poll_phases["authorizing_snapshot_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
         # Persist only exact recorder/Alpaca calendar sessions.  This catalog
         # is the continuity authority used by ingestion; event timestamps or
         # weekday heuristics are intentionally insufficient (holidays and
@@ -6663,9 +7076,7 @@ class ShadowRunner:
         # this catches corrected replay semantics without rescanning corpus
         # history or treating a no-op poll as fresh evidence.
         arm_ids = {str(arm.get("candidate_id") or "") for arm in arms}
-        gate_pairs = {(candidate_id, session)
-                      for candidate_id, session in self.store.gate_sessions()
-                      if candidate_id in arm_ids}
+        gate_pairs = set(self.store.gate_sessions(sorted(arm_ids)))
         replay_only_sessions = {
             session for _candidate_id, session in gate_pairs
             if session not in session_inputs}
@@ -6878,11 +7289,14 @@ class ShadowRunner:
         else:
             manifest_digest = self.store.save_manifest(manifest)
         replay_identity = _manifest_replay_identity(manifest, manifest_digest)
+        phase_started = time.monotonic()
         diagnostic_result = self._run_diagnostic_poll(
             diagnostic_cohort, diagnostic_arms, diagnostic_activation,
             snapshot_rows=diagnostic_rows, progress=diagnostic_progress,
             replay_identity=replay_identity,
             calendar_snapshot=calendar_snapshot)
+        poll_phases["diagnostic_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
 
         # Dispatch one immutable session at a time.  The parent commits
         # decisions and performs replay before the next session is submitted,
@@ -6900,6 +7314,7 @@ class ShadowRunner:
         # snapshots remain lossless and are bounded explicitly below.
         replay_quote_frontier: dict[tuple[str, str, str], list[dict]] = {}
         replay_option_context: dict[str, list[dict]] = {}
+        phase_started = time.monotonic()
         for session in sorted(set(frozen_session_events) | replay_only_sessions):
             is_replay_only = session in replay_only_sessions
             if is_replay_only and not legacy_replay_context:
@@ -7123,6 +7538,9 @@ class ShadowRunner:
                     session_success = False
             if not session_success:
                 replay_blocked = True
+        poll_phases["authorizing_evaluation_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
+        phase_started = time.monotonic()
         prune = self.store.prune()
         replay_quarantine = self.store.replay_quarantine()
         pending_repairs = [
@@ -7206,7 +7624,11 @@ class ShadowRunner:
         # bounded at write time; retain only a deterministic candidate/session
         # tail for the operational result.
         capacity: list[dict[str, Any]] = []
-        for metadata in self.store.replay_metadata():
+        authorizing_arm_ids = sorted(
+            candidate_id for candidate_id in arm_ids
+            if candidate_id not in diagnostic_candidate_ids and
+            not is_diagnostic_candidate(candidate_id))
+        for metadata in self.store.replay_metadata_tail(authorizing_arm_ids):
             if (str(metadata.get("candidate_id") or "") in diagnostic_candidate_ids or
                     is_diagnostic_candidate(str(metadata.get("candidate_id") or ""))):
                 continue
@@ -7223,6 +7645,8 @@ class ShadowRunner:
         capacity = sorted(capacity, key=lambda item: (
             item["candidate_id"], item["session_date"]))[-64:]
         decision_count = self.store.decision_count()
+        poll_phases["finalization_seconds"] = max(
+            0.0, time.monotonic() - phase_started)
         coverage_started = time.monotonic()
         diagnostic_coverage = self._diagnostic_coverage(
             diagnostic_cohort, diagnostic_activation,
@@ -7235,6 +7659,7 @@ class ShadowRunner:
             poll_duration_seconds=0.0,
             phase_metrics=diagnostic_result.get("phase_metrics"))
         coverage_seconds = max(0.0, time.monotonic() - coverage_started)
+        poll_phases["coverage_seconds"] = coverage_seconds
         poll_duration_seconds = round(
             max(0.0, time.monotonic() - poll_started), 6)
         diagnostic_coverage["poll_duration_seconds"] = poll_duration_seconds
@@ -7245,7 +7670,7 @@ class ShadowRunner:
         # diagnostic telemetry and must remain included in that total.
         phase_metrics["total_seconds"] = poll_duration_seconds
         diagnostic_coverage["phase_metrics"] = phase_metrics
-        return {"candidates": len(candidates),
+        result = {"candidates": len(candidates),
                 "authorizing_candidates": len(candidates),
                 "diagnostic_candidates": len(diagnostic_arms),
                 "ingested_events": ingested,
@@ -7262,10 +7687,14 @@ class ShadowRunner:
                 "signal_dispositions": signal_dispositions,
                 "stress_calibration": calibration_status,
                 "diagnostic_shadow": diagnostic_coverage,
+                "authorizing_event_cache_hit": bool(authorizing_event_cache_hit),
                 "poll_duration_seconds": poll_duration_seconds,
                 "source_lag_seconds": diagnostic_coverage[
                     "source_lag_seconds"],
                 **prune}
+        result["poll_phase_metrics"] = _finish_poll_phase_metrics(
+            poll_phases, poll_started)
+        return result
 
 
 def run_shadow_once(config: ShadowConfig) -> dict[str, Any]:

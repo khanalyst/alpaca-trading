@@ -462,6 +462,27 @@ def _shadow_phase_metrics(value: object, arm_ids: set[str]) -> dict:
     return result
 
 
+def _shadow_poll_phase_metrics(value: object) -> dict:
+    """Expose allowlisted whole-poll timing diagnostics.
+
+    This projection is deliberately independent from diagnostic readiness and
+    cannot influence the shadow coverage result.
+    """
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in (
+            "calendar_seconds", "candidate_preparation_seconds",
+            "corpus_read_seconds", "ingest_seconds",
+            "diagnostic_snapshot_seconds", "diagnostic_seconds",
+            "authorizing_snapshot_seconds", "authorizing_evaluation_seconds",
+            "coverage_seconds", "finalization_seconds", "total_seconds"):
+        number = _status_nonnegative_float(value.get(key))
+        if number is not None:
+            result[key] = number
+    return result
+
+
 def _shadow_diagnostic_summary(
         value: object, *, now: float | None = None,
         candidate_errors_present: bool = False,
@@ -1388,6 +1409,10 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "events": heartbeat.get("events"),
         "decisions": heartbeat.get("decisions"),
         "ingested_events": heartbeat.get("ingested_events"),
+        "authorizing_event_cache_hit": (
+            heartbeat.get("authorizing_event_cache_hit")
+            if isinstance(heartbeat.get("authorizing_event_cache_hit"), bool)
+            else None),
         "pruned_replay_diffs": heartbeat.get("pruned_replay_diffs"),
         "retention_days": heartbeat.get("retention_days"),
         "retention_floor_ts": heartbeat.get("retention_floor_ts"),
@@ -1395,6 +1420,8 @@ def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "stale_tail": heartbeat.get("stale_tail"),
         "signal_dispositions": signal_dispositions,
         "stress_calibration": stress_calibration,
+        "poll_phase_metrics": _shadow_poll_phase_metrics(
+            heartbeat.get("poll_phase_metrics")),
         "quarantine_through_session": heartbeat.get(
             "quarantine_through_session"),
         # Shadow capacity is diagnostic only.  Keep it bounded by forwarding

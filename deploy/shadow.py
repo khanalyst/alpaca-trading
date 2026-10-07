@@ -182,7 +182,9 @@ def _run_shadow_loop(args: argparse.Namespace, runner: ShadowRunner,
                 "retention_gap_watermark", "signal_dispositions",
                 "stress_calibration", "stale_tail", "diagnostic_shadow",
                 "authorizing_candidates", "diagnostic_candidates",
-                "poll_duration_seconds", "source_lag_seconds")
+                "authorizing_event_cache_hit",
+                "poll_duration_seconds", "source_lag_seconds",
+                "poll_phase_metrics")
                 if key in result}
             _write_health(health_file, "degraded" if candidate_errors else "running",
                           last_error=("candidate evaluation failures" if candidate_errors

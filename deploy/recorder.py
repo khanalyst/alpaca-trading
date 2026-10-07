@@ -2683,10 +2683,16 @@ def main(argv=None) -> int:
                                 telemetry=cycle_telemetry)
         except Exception as exc:
             failure_count += 1
-            delay = min(
-                MAX_ERROR_BACKOFF_SECONDS,
-                max(args.interval, 1.0) * (2 ** min(failure_count - 1, 4)),
-            )
+            # Failures consume the same fixed cadence as successful cycles.
+            # Exponential retry backoff made repeated failed reads drift to
+            # 60--90 seconds despite the configured 30-second interval.
+            completed_monotonic = time.monotonic()
+            next_tick = _next_cadence_deadline(
+                next_tick, completed_monotonic, args.interval)
+            # Millisecond precision is sufficient for a 30-second polling
+            # boundary and avoids turning clock-read jitter into a misleading
+            # retry interval in status and tests.
+            delay = round(max(0.0, next_tick - completed_monotonic), 3)
             failure_kind, retryable = _market_data_failure(
                 exc, data_feed=data_feed,
                 options_feed=options_feed or "opra")
@@ -2713,10 +2719,6 @@ def main(argv=None) -> int:
             if args.once:
                 return 1
             time.sleep(delay)
-            # A retry backoff is intentionally wall-clock based.  Resume the
-            # fixed cadence from the next successful cycle instead of firing
-            # an immediate request after the backoff expires.
-            next_tick = time.monotonic()
             continue
         failure_count = 0
         _save_status(output, {

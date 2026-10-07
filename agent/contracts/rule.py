@@ -25,7 +25,8 @@ RULE_SCHEMA_V2 = "rule-strategy.v2"
 RULE_SCHEMA_V3 = "rule-strategy.v3"
 RULE_SCHEMA_V4 = "rule-strategy.v4"
 RULE_SCHEMA_V5 = "rule-strategy.v5"
-RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5)
+RULE_SCHEMA_V6 = "rule-strategy.v6"
+RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6)
 # ``RULE_SCHEMA`` remains the v1 name so existing callers, stored specs, and
 # content hashes are untouched.  v2 is a strict superset reached only by
 # writing its schema string explicitly.
@@ -169,6 +170,33 @@ _V5_BOUNDS = {
     "regime_efficiency_threshold": (0.0, 1.0, float),
     "pullback_bars": (2, 10, int),
 }
+# v6 adds causal mechanism diagnostics.  These fields are deliberately
+# neutral at their defaults and are only meaningful on the family that owns
+# them (validation rejects an explicitly supplied field on another family).
+V6_DEFAULT_EXTENSIONS: dict[str, Any] = {
+    "compression_mode": "range_bps",
+    "compression_atr_multiple": None,
+    "opening_hold_bars": None,
+    "body_fraction_min": 0.0,
+    "close_location_min": 0.5,
+    # v6's neutral VWAP/volume modes retain the cumulative/current-feed
+    # predicates.  The opt-in modes below require the causal context helpers.
+    "vwap_slope_mode": "cumulative",
+    "vwap_slope_window": 5,
+    "relative_volume_mode": "current_feed",
+    "relative_volume_sessions": 5,
+}
+V6_COMPRESSION_MODES = ("range_bps", "atr")
+V6_VWAP_SLOPE_MODES = ("cumulative", "rolling")
+V6_RELATIVE_VOLUME_MODES = ("current_feed", "same_clock")
+_V6_BOUNDS = {
+    "compression_atr_multiple": (0.5, 10.0, float),
+    "opening_hold_bars": (1, 10, int),
+    "body_fraction_min": (0.0, 1.0, float),
+    "close_location_min": (0.5, 1.0, float),
+    "vwap_slope_window": (2, 60, int),
+    "relative_volume_sessions": (5, 20, int),
+}
 _EXTRA_CONFIRMATIONS = tuple(name for name in CONFIRMATIONS if name != "none")
 MAX_CONFIRMATIONS = len(_EXTRA_CONFIRMATIONS)
 
@@ -290,6 +318,19 @@ def _causal_maturity_bars(spec: Mapping[str, Any]) -> int:
     if spec.get("entry_trigger") == "reclaim":
         base = spec["slow_lookback"] if family == "trend_pullback" else spec["lookback"]
         needed = max(needed, base + spec["pullback_bars"] + 1)
+    if spec.get("schema") == RULE_SCHEMA_V6:
+        # v6 ATR compression and stop geometry are causal: the signal bar is
+        # never part of the ATR window.  One additional completed bar is
+        # therefore required beyond the legacy ATR dependency.
+        needed = max(needed, int(spec["atr_period"]) + 2)
+        hold = spec.get("opening_hold_bars")
+        if hold is not None and family in {"opening_range_breakout", "opening_drive"}:
+            needed = max(needed, int(spec["range_minutes"]) + int(hold))
+        if family == "vwap_trend" and spec.get("vwap_slope_mode") == "rolling":
+            # The equal-window slope consumes two complete windows ending at
+            # the signal bar.  Keep this dependency explicit so replay and
+            # direct evaluation agree on the first admissible prefix.
+            needed = max(needed, 2 * int(spec["vwap_slope_window"]))
     return max(1, int(needed))
 
 
@@ -307,7 +348,9 @@ def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     """Trailing completed bars :func:`evaluate_rule_signal` reads for a spec.
 
     ``None`` means the family or its active target retains a session-open
-    anchor and cannot be represented by one bounded trailing window.
+    anchor and cannot be represented by one bounded trailing window.  V6's
+    rolling VWAP slope is the bounded exception: it reads two trailing windows
+    and can therefore use the same continuity contract as other finite rules.
 
     Replay uses this to require adjacency over exactly the bars a signal is
     computed from.  A fixed lookback silently stretched across an outage is a
@@ -317,7 +360,16 @@ def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     """
     spec = validate_rule_spec(value)
     family = str(spec["family"])
-    if (family in SESSION_ACCUMULATING_FAMILIES | OPENING_ANCHORED_FAMILIES or
+    # Cumulative/session VWAP families retain a session-open anchor.  The V6
+    # rolling slope is different: its predicate reads only the final two
+    # equal windows, so replay can scope adjacency to that bounded horizon.
+    rolling_vwap = (
+        spec.get("schema") == RULE_SCHEMA_V6 and
+        family == "vwap_trend" and
+        spec.get("vwap_slope_mode") == "rolling" and
+        spec.get("target_mode") != "session_vwap")
+    if ((family in SESSION_ACCUMULATING_FAMILIES and not rolling_vwap) or
+            family in OPENING_ANCHORED_FAMILIES or
             spec.get("target_mode") == "session_vwap"):
         return None
     needed = _causal_maturity_bars(spec)
@@ -366,18 +418,23 @@ def rule_semantic_signature(value: Mapping[str, Any]) -> str:
     spec = validate_rule_spec(value)
     effective = {name: spec[name] for name in _semantic_fields(spec)
                  if name in spec}
-    if spec.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec.get("schema") in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         for name, default in V2_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
                 effective[name] = current
-    if spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         for name, default in V3_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
                 effective[name] = current
-    if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         for name, default in V4_DEFAULT_EXTENSIONS.items():
+            current = spec.get(name, default)
+            if current != default:
+                effective[name] = current
+    if spec.get("schema") == RULE_SCHEMA_V6:
+        for name, default in V6_DEFAULT_EXTENSIONS.items():
             current = spec.get(name, default)
             if current != default:
                 effective[name] = current
@@ -407,7 +464,8 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
     # local scale for floats, while retaining the audited span for discrete
     # integer coordinates such as lookback. Validation above remains the
     # source of truth for legal ranges.
-    bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS, **_V4_BOUNDS, **_V5_BOUNDS}
+    bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS, **_V4_BOUNDS, **_V5_BOUNDS,
+              **_V6_BOUNDS}
     fields = _semantic_fields(a) | _semantic_fields(b)
     for name, default in V2_DEFAULT_EXTENSIONS.items():
         if a.get(name, default) != default or b.get(name, default) != default:
@@ -416,6 +474,9 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
         if a.get(name, default) != default or b.get(name, default) != default:
             fields.add(name)
     for name, default in V4_DEFAULT_EXTENSIONS.items():
+        if a.get(name, default) != default or b.get(name, default) != default:
+            fields.add(name)
+    for name, default in V6_DEFAULT_EXTENSIONS.items():
         if a.get(name, default) != default or b.get(name, default) != default:
             fields.add(name)
     for name in sorted(fields):
@@ -459,7 +520,7 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             "confirmation": {"type": "string", "enum": list(CONFIRMATIONS)},
         }
         required = list(DEFAULT_RULE_SPEC)
-        if name in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+        if name in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
             common_properties.update({
                 "confirmations": {"type": "array", "maxItems": MAX_CONFIRMATIONS,
                                   "uniqueItems": True,
@@ -472,12 +533,12 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
                 "max_atr_bps": {"type": "number", "minimum": 1.0, "maximum": 5000.0},
             })
             required += list(V2_DEFAULT_EXTENSIONS)
-        if name in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+        if name in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
             common_properties["breakeven_r"] = {
                 "type": ["number", "null"], "minimum": 0.0, "maximum": 10.0,
             }
             required += list(V3_DEFAULT_EXTENSIONS)
-        if name in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+        if name in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
             common_properties.update({
                 # Strict structured-output providers require every property
                 # to be listed in ``required``.  These v4 fields remain
@@ -502,7 +563,7 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             # deadline are the neutral defaults.  The provider-facing schema
             # represents omission as null because strict providers do not
             # permit an optional property; validation fills these defaults.
-        if name == RULE_SCHEMA_V5:
+        if name in {RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
             common_properties.update({
                 "regime_mode": {"type": "string", "enum": ["none", "trend", "range"]},
                 "regime_timeframe_minutes": {"type": "integer", "enum": [5, 15]},
@@ -512,6 +573,28 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
                 "pullback_bars": {"type": "integer", "minimum": 2, "maximum": 10},
             })
             required += list(V5_DEFAULT_EXTENSIONS)
+        if name == RULE_SCHEMA_V6:
+            common_properties.update({
+                "compression_mode": {"type": "string",
+                                      "enum": list(V6_COMPRESSION_MODES)},
+                "compression_atr_multiple": {"type": ["number", "null"],
+                                               "minimum": 0.5, "maximum": 10.0},
+                "opening_hold_bars": {"type": ["integer", "null"],
+                                       "minimum": 1, "maximum": 10},
+                "body_fraction_min": {"type": "number", "minimum": 0.0,
+                                       "maximum": 1.0},
+                "close_location_min": {"type": "number", "minimum": 0.5,
+                                        "maximum": 1.0},
+                "vwap_slope_mode": {"type": "string",
+                                     "enum": list(V6_VWAP_SLOPE_MODES)},
+                "vwap_slope_window": {"type": "integer", "minimum": 2,
+                                        "maximum": 60},
+                "relative_volume_mode": {"type": "string",
+                                          "enum": list(V6_RELATIVE_VOLUME_MODES)},
+                "relative_volume_sessions": {"type": "integer", "minimum": 5,
+                                              "maximum": 20},
+            })
+            required += list(V6_DEFAULT_EXTENSIONS)
         def branch(family: dict[str, Any], *, eligible: bool) -> dict[str, Any]:
             properties = {**common_properties, "family": family}
             if eligible:
@@ -529,10 +612,66 @@ def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
             branch_required = list(required)
             if eligible:
                 branch_required.append("eligible_symbols")
-            if name in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+            if name in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
                 branch_required.extend(V4_DEFAULT_EXTENSIONS)
-            return {"type": "object", "additionalProperties": False,
-                    "required": branch_required, "properties": properties}
+            branch_schema = {"type": "object", "additionalProperties": False,
+                             "required": branch_required, "properties": properties}
+            if name == RULE_SCHEMA_V6:
+                # Keep the provider-facing grammar family-specific too.  A
+                # neutral default is valid everywhere because strict output
+                # providers must return every property, while non-neutral
+                # mechanism values are constrained to their owning family.
+                branch_schema["allOf"] = [
+                    {
+                        "if": {"properties": {"family": {
+                            "const": "volatility_breakout"}}},
+                        "then": {
+                            "if": {"properties": {"compression_mode": {
+                                "const": "atr"}}},
+                            "then": {
+                                "properties": {
+                                    "compression_atr_multiple": {
+                                        "type": "number"}},
+                                "required": ["compression_atr_multiple"],
+                            },
+                        },
+                        "else": {"properties": {
+                            "compression_mode": {"const": "range_bps"},
+                            "compression_atr_multiple": {"const": None},
+                        }},
+                    },
+                    {
+                        "if": {"properties": {"family": {"enum": [
+                            "opening_range_breakout", "opening_drive"]}}},
+                        "else": {"properties": {"opening_hold_bars": {
+                            "const": None}}},
+                    },
+                    {
+                        "if": {"properties": {"family": {
+                            "const": "range_expansion"}}},
+                        "else": {"properties": {
+                            "body_fraction_min": {"const": 0.0},
+                            "close_location_min": {"const": 0.5},
+                        }},
+                    },
+                    {
+                        "if": {"properties": {"family": {
+                            "const": "vwap_trend"}}},
+                        "else": {"properties": {
+                            "vwap_slope_mode": {"const": "cumulative"},
+                            "vwap_slope_window": {"const": 5},
+                        }},
+                    },
+                    {
+                        "if": {"properties": {"family": {
+                            "const": "volume_breakout"}}},
+                        "else": {"properties": {
+                            "relative_volume_mode": {"const": "current_feed"},
+                            "relative_volume_sessions": {"const": 5},
+                        }},
+                    },
+                ]
+            return branch_schema
 
         non_cross = [family for family in RULE_FAMILIES
                      if family != "cross_sectional_residual"]
@@ -606,18 +745,24 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         raise RuleSpecError(
             f"rule_spec.schema must be one of {', '.join(map(repr, RULE_SCHEMAS))}")
     permitted = set(DEFAULT_RULE_SPEC) | {"eligible_symbols"}
-    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         permitted |= set(V2_DEFAULT_EXTENSIONS)
-    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         permitted |= set(V3_DEFAULT_EXTENSIONS)
-    if schema in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if schema in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         permitted |= set(V4_DEFAULT_EXTENSIONS)
-    if schema == RULE_SCHEMA_V5:
+    if schema in {RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         permitted |= set(V5_DEFAULT_EXTENSIONS)
+    if schema == RULE_SCHEMA_V6:
+        permitted |= set(V6_DEFAULT_EXTENSIONS)
     unknown = sorted(set(value) - permitted)
     if unknown:
         if any(name in V5_DEFAULT_EXTENSIONS for name in unknown):
             raise RuleSpecError(f"context fields require schema {RULE_SCHEMA_V5!r}")
+        v6_extensions = [name for name in unknown if name in V6_DEFAULT_EXTENSIONS]
+        if v6_extensions:
+            raise RuleSpecError(
+                f"mechanism fields require schema {RULE_SCHEMA_V6!r}")
         # A v1 spec naming a v2 field is a version error, not a typo: say so.
         v3_extensions = [name for name in unknown if name in V3_DEFAULT_EXTENSIONS]
         if v3_extensions:
@@ -636,14 +781,16 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
                 f"schema {RULE_SCHEMA_V4!r}")
         raise RuleSpecError(f"rule_spec has unknown field(s): {', '.join(unknown)}")
     spec = dict(DEFAULT_RULE_SPEC)
-    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if schema in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         spec.update(V2_DEFAULT_EXTENSIONS)
-    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if schema in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         spec.update(V3_DEFAULT_EXTENSIONS)
-    if schema in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if schema in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         spec.update(V4_DEFAULT_EXTENSIONS)
-    if schema == RULE_SCHEMA_V5:
+    if schema in {RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         spec.update(V5_DEFAULT_EXTENSIONS)
+    if schema == RULE_SCHEMA_V6:
+        spec.update(V6_DEFAULT_EXTENSIONS)
     # Strict provider schemas encode legacy-optional properties as required
     # nullable values.  Treat null as omission for fields whose documented
     # defaults preserve the old caller contract.  ``breakeven_r`` and the two
@@ -760,7 +907,7 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
             raise RuleSpecError(
                 f"rule_spec.{name} must be between {lower:g} and {upper:g}, or null")
         spec[name] = number
-    if schema == RULE_SCHEMA_V5:
+    if schema in {RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         if spec["regime_mode"] not in {"none", "trend", "range"}:
             raise RuleSpecError("rule_spec.regime_mode must be none, trend, or range")
         if spec["entry_trigger"] not in {"legacy", "reclaim"}:
@@ -781,6 +928,120 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
             spec[name] = number
         if spec["regime_timeframe_minutes"] not in {5, 15}:
             raise RuleSpecError("regime_timeframe_minutes must be 5 or 15")
+    if schema != RULE_SCHEMA_V6:
+        return spec
+
+    # v6 mechanism extensions are strict by family.  Checking the raw input
+    # preserves a useful distinction between an omitted neutral field and an
+    # explicitly supplied field on an unrelated family.
+    # A normalized v6 mapping is routinely validated again by hashing and
+    # identity helpers.  Treat only non-neutral values as an explicit request
+    # so those canonical defaults do not fail family scoping on revalidation.
+    supplied_v6 = {
+        name for name, default in V6_DEFAULT_EXTENSIONS.items()
+        if name in value and value.get(name) != default
+    }
+    family = str(spec["family"])
+    compression_fields = {"compression_mode", "compression_atr_multiple"}
+    opening_fields = {"opening_hold_bars"}
+    expansion_fields = {"body_fraction_min", "close_location_min"}
+    vwap_fields = {"vwap_slope_mode", "vwap_slope_window"}
+    relative_volume_fields = {"relative_volume_mode", "relative_volume_sessions"}
+    if supplied_v6 & compression_fields and family != "volatility_breakout":
+        raise RuleSpecError(
+            "compression mechanism fields are only valid for volatility_breakout")
+    if supplied_v6 & opening_fields and family not in {
+            "opening_range_breakout", "opening_drive"}:
+        raise RuleSpecError(
+            "opening_hold_bars is only valid for opening_range_breakout or opening_drive")
+    if supplied_v6 & expansion_fields and family != "range_expansion":
+        raise RuleSpecError(
+            "body and close-location fields are only valid for range_expansion")
+    if supplied_v6 & vwap_fields and family != "vwap_trend":
+        raise RuleSpecError(
+            "VWAP slope fields are only valid for vwap_trend")
+    if supplied_v6 & relative_volume_fields and family != "volume_breakout":
+        raise RuleSpecError(
+            "relative-volume fields are only valid for volume_breakout")
+
+    mode = spec["compression_mode"]
+    if mode not in V6_COMPRESSION_MODES:
+        raise RuleSpecError(
+            "rule_spec.compression_mode must be range_bps or atr")
+    multiple = spec["compression_atr_multiple"]
+    if multiple is not None:
+        if isinstance(multiple, bool):
+            raise RuleSpecError("rule_spec.compression_atr_multiple has an invalid type")
+        low, high, cast = _V6_BOUNDS["compression_atr_multiple"]
+        try:
+            multiple = cast(multiple)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuleSpecError(
+                "rule_spec.compression_atr_multiple must be numeric or null") from exc
+        if not math.isfinite(multiple) or not low <= multiple <= high:
+            raise RuleSpecError(
+                f"rule_spec.compression_atr_multiple must be between {low:g} and {high:g}, or null")
+        spec["compression_atr_multiple"] = multiple
+    if family == "volatility_breakout":
+        if mode == "atr" and multiple is None:
+            raise RuleSpecError(
+                "compression_atr_multiple is required when compression_mode is atr")
+        if mode == "range_bps" and multiple is not None:
+            raise RuleSpecError(
+                "compression_atr_multiple must be null when compression_mode is range_bps")
+    elif mode != "range_bps" or multiple is not None:
+        raise RuleSpecError(
+            "compression mechanism fields are only active for volatility_breakout")
+
+    opening_hold = spec["opening_hold_bars"]
+    if opening_hold is not None:
+        if isinstance(opening_hold, bool) or not isinstance(opening_hold, int):
+            raise RuleSpecError("rule_spec.opening_hold_bars must be an integer or null")
+        low, high, _ = _V6_BOUNDS["opening_hold_bars"]
+        if not low <= opening_hold <= high:
+            raise RuleSpecError(
+                f"rule_spec.opening_hold_bars must be between {low:g} and {high:g}, or null")
+    elif family in {"opening_range_breakout", "opening_drive"}:
+        # null is the neutral legacy behavior for applicable families.
+        pass
+    elif supplied_v6 & opening_fields:
+        raise RuleSpecError(
+            "opening_hold_bars is only valid for opening_range_breakout or opening_drive")
+
+    for name in ("body_fraction_min", "close_location_min"):
+        raw = spec[name]
+        if isinstance(raw, bool):
+            raise RuleSpecError(f"rule_spec.{name} has an invalid type")
+        low, high, cast = _V6_BOUNDS[name]
+        try:
+            number = cast(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuleSpecError(f"rule_spec.{name} must be numeric") from exc
+        if not math.isfinite(number) or not low <= number <= high:
+            raise RuleSpecError(
+                f"rule_spec.{name} must be between {low:g} and {high:g}")
+        spec[name] = number
+    if spec["vwap_slope_mode"] not in V6_VWAP_SLOPE_MODES:
+        raise RuleSpecError(
+            "rule_spec.vwap_slope_mode must be cumulative or rolling")
+    for name in ("vwap_slope_window", "relative_volume_sessions"):
+        raw = spec[name]
+        low, high, cast = _V6_BOUNDS[name]
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise RuleSpecError(f"rule_spec.{name} must be an integer")
+        if not low <= raw <= high:
+            raise RuleSpecError(
+                f"rule_spec.{name} must be between {low:g} and {high:g}")
+        spec[name] = cast(raw)
+    if spec["relative_volume_mode"] not in V6_RELATIVE_VOLUME_MODES:
+        raise RuleSpecError(
+            "rule_spec.relative_volume_mode must be current_feed or same_clock")
+    if family == "vwap_trend" and spec["vwap_slope_mode"] == "rolling":
+        if spec["vwap_slope_window"] < 2:
+            raise RuleSpecError("rolling VWAP slope requires equal windows")
+    if family == "volume_breakout" and spec["relative_volume_mode"] == "same_clock":
+        if spec["relative_volume_sessions"] < 5:
+            raise RuleSpecError("same-clock relative volume requires five prior sessions")
     return spec
 
 
@@ -1177,6 +1438,11 @@ def completed_bar_exit_transition(state: Mapping[str, Any], bar: Any) -> dict[st
 def rule_vehicle_executable(spec: Mapping[str, Any], vehicle: str) -> bool:
     """Whether research/runtime possess a parity-safe execution path."""
     normalized = validate_rule_spec(spec)
+    # v6 is deliberately a diagnostic grammar.  It can be replayed through
+    # the research evaluator, but no engine cycle or live shadow may promote
+    # it until a separately audited execution contract exists.
+    if normalized["schema"] == RULE_SCHEMA_V6:
+        return False
     if normalized["family"] == "cross_sectional_residual":
         return str(vehicle or "").lower() in {"equity", "share", "shares"}
     return not (normalized["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5} and
@@ -1641,7 +1907,7 @@ def _session_minutes(stamp: datetime) -> float:
 
 
 def _within_entry_window(spec: Mapping[str, Any], stamp: datetime) -> bool:
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         return True
     elapsed = _session_minutes(stamp)
     return (float(spec["entry_after_minutes"]) <= elapsed <
@@ -1663,7 +1929,7 @@ def entry_window_bounds(value: Mapping[str, Any]) -> tuple[float, float]:
     predicate instead of a copy that can drift away from it.
     """
     spec = validate_rule_spec(value)
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         return 0.0, float(SESSION_MINUTES)
     return (float(spec["entry_after_minutes"]),
             float(spec["entry_before_minutes"]))
@@ -1671,7 +1937,7 @@ def entry_window_bounds(value: Mapping[str, Any]) -> tuple[float, float]:
 
 def _within_volatility_band(spec: Mapping[str, Any], atr: float,
                             close: float) -> bool:
-    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec.get("schema") not in {RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         return True
     if close <= 0:
         return False
@@ -1792,6 +2058,117 @@ def _vwap(bars: Sequence[Any]) -> float | None:
     return result if result > 0 and math.isfinite(result) else None
 
 
+def _context_feed(row: Any) -> str | None:
+    raw = _value(row, "feed")
+    if raw in (None, ""):
+        identity = _value(row, "identity")
+        raw = _value(identity, "feed")
+    if raw in (None, ""):
+        return None
+    return str(getattr(raw, "value", raw)).strip().lower() or None
+
+
+def _context_provider(row: Any) -> str | None:
+    raw = _value(row, "provider")
+    if raw in (None, ""):
+        identity = _value(row, "identity")
+        raw = _value(identity, "provider")
+    if raw in (None, ""):
+        return None
+    return str(getattr(raw, "value", raw)).strip().lower() or None
+
+
+def _context_available_by(row: Any, cutoff: datetime) -> bool:
+    """Honor optional point-in-time availability labels on context rows."""
+    cutoff_epoch = cutoff.timestamp()
+    identity = _value(row, "identity")
+    for field in ("as_of", "observed_at"):
+        supplied = _supplied_value(row, field)
+        if supplied is _MISSING:
+            supplied = _supplied_value(identity, field)
+        if supplied is _MISSING:
+            continue
+        stamp = _strict_datetime(supplied)
+        if stamp is None or stamp.timestamp() > cutoff_epoch:
+            return False
+    return True
+
+
+def _same_clock_relative_volume(current: Any, bars_by_symbol: Mapping[str, Sequence[Any]] | None,
+                                sessions: int) -> float | None:
+    """Return causal same-clock RVOL from the exact prior feed sessions.
+
+    The current bar's local session offset is matched against the most recent
+    prior session dates. Every selected session must contain exactly one bar at
+    that clock minute with the same feed (and, when supplied, provider). A
+    missing or unavailable sample fails closed instead of silently changing the
+    baseline population.
+    """
+    stamp = _timestamp(current)
+    feed = _context_feed(current)
+    provider = _context_provider(current)
+    if stamp is None or feed is None:
+        return None
+    context = _context_rows(bars_by_symbol, _row_symbol(current) or "")
+    if not context:
+        return None
+    zone = ZoneInfo("America/New_York")
+    local = stamp.astimezone(zone)
+    day = local.date()
+    opened = datetime.combine(day, time(9, 30), tzinfo=zone)
+    elapsed_seconds = (local - opened).total_seconds()
+    if (elapsed_seconds < 0 or elapsed_seconds % BAR_SECONDS != 0 or
+            local.second or local.microsecond):
+        return None
+    elapsed_minutes = int(elapsed_seconds / BAR_SECONDS)
+    grouped: dict[str, list[Any]] = {}
+    for row in context:
+        row_stamp = _timestamp(row)
+        if row_stamp is None or not _context_available_by(row, stamp):
+            continue
+        row_day = row_stamp.astimezone(zone).date()
+        if row_day >= day:
+            continue
+        if _context_feed(row) != feed:
+            continue
+        row_provider = _context_provider(row)
+        if provider is not None and row_provider != provider:
+            continue
+        grouped.setdefault(row_day.isoformat(), []).append(row)
+    prior_days = sorted(grouped)
+    if len(prior_days) < int(sessions):
+        return None
+    # Match by each session's own local open, not by a fixed UTC offset across
+    # daylight-saving transitions.
+    volumes: list[float] = []
+    for day_text in prior_days[-int(sessions):]:
+        prior_day = datetime.fromisoformat(day_text).date()
+        prior_open = datetime.combine(prior_day, time(9, 30), tzinfo=zone)
+        target = prior_open + timedelta(minutes=elapsed_minutes)
+        matches = [row for row in grouped[day_text]
+                   if _timestamp(row) == target]
+        if len(matches) != 1:
+            return None
+        raw_volume = _supplied_value(matches[0], "volume")
+        try:
+            volume = float(raw_volume)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(volume) or volume <= 0:
+            return None
+        volumes.append(volume)
+    raw_current = _supplied_value(current, "volume")
+    try:
+        current_volume = float(raw_current)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    baseline = mean(volumes) if volumes else 0.0
+    if (not math.isfinite(current_volume) or current_volume <= 0 or
+            not math.isfinite(baseline) or baseline <= 0):
+        return None
+    return current_volume / baseline
+
+
 def frozen_target_reference(rows: Sequence[Any],
                             value: Mapping[str, Any]) -> float | None:
     """Freeze a v4 non-R target from the completed prefix available now."""
@@ -1888,8 +2265,56 @@ def _reclaim_direction(bars: Sequence[Any], spec: Mapping[str, Any]) -> tuple[st
     return None, "reclaim_not_confirmed"
 
 
+def _opening_hold_passes(session: Sequence[Any], current: Any,
+                         spec: Mapping[str, Any], *, endpoint: float,
+                         direction: str) -> bool:
+    """Require consecutive completed closes after the opening window.
+
+    The rows are already completed prefixes.  Filtering by the calendar
+    opening-window boundary keeps a longer history from supplying pre-open or
+    prior-session closes, and taking the final N rows makes the predicate
+    depend only on evidence available at the current signal bar.
+    """
+    hold = spec.get("opening_hold_bars")
+    if hold is None:
+        return True
+    stamp = _timestamp(current)
+    if stamp is None:
+        return False
+    zone = ZoneInfo("America/New_York")
+    local_day = stamp.astimezone(zone).date()
+    start = datetime.combine(local_day, time(9, 30), tzinfo=zone)
+    end = start + timedelta(minutes=int(spec["range_minutes"]))
+    post = [row for row in session
+            if (timestamp := _timestamp(row)) is not None and timestamp >= end]
+    if len(post) < int(hold):
+        return False
+    closes = [_number(row, "close") for row in post[-int(hold):]]
+    if direction == "long":
+        return all(close > endpoint for close in closes)
+    return all(close < endpoint for close in closes)
+
+
+def _range_expansion_directional_shape(current: Any, direction: str,
+                                       spec: Mapping[str, Any]) -> bool:
+    """Check v6 directional body and close-location requirements."""
+    width = _number(current, "high") - _number(current, "low")
+    if width <= 0:
+        return False
+    opened = _number(current, "open")
+    close = _number(current, "close")
+    body_fraction = abs(close - opened) / width
+    location = ((close - _number(current, "low")) / width
+                if direction == "long" else
+                (_number(current, "high") - close) / width)
+    return (body_fraction >= float(spec["body_fraction_min"]) and
+            location >= float(spec["close_location_min"]))
+
+
 def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
-                      close: float, opened: float) -> tuple[str | None, str]:
+                      close: float, opened: float,
+                      bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+                      ) -> tuple[str | None, str]:
     """Evaluate only the family predicate shared by execution and diagnostics."""
     current = bars[-1]
     closes = [_number(row, "close") for row in bars]
@@ -1915,18 +2340,27 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
             bars, current, int(spec["range_minutes"]))
         if opening is None:
             return None, "opening_window_undercovered"
+        session = _session_prefix(bars, current)
         high = max(_number(row, "high") for row in opening)
         low = min(_number(row, "low") for row in opening)
         if family == "opening_range_breakout":
             if close > high * (1 + threshold):
-                direction = "long"
+                if _opening_hold_passes(session, current, spec,
+                                         endpoint=high, direction="long"):
+                    direction = "long"
             elif close < low * (1 - threshold):
-                direction = "short"
+                if _opening_hold_passes(session, current, spec,
+                                         endpoint=low, direction="short"):
+                    direction = "short"
         else:
             if _number(current, "high") > high * (1 + threshold) and close < high:
-                direction = "short"
+                if _opening_hold_passes(session, current, spec,
+                                         endpoint=high, direction="short"):
+                    direction = "short"
             elif _number(current, "low") < low * (1 - threshold) and close > low:
-                direction = "long"
+                if _opening_hold_passes(session, current, spec,
+                                         endpoint=low, direction="long"):
+                    direction = "long"
     elif family == "momentum_continuation":
         reference = closes[-spec["lookback"] - 1]
         move = close / reference - 1 if reference > 0 else 0.0
@@ -1965,7 +2399,13 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
         high = max(_number(row, "high") for row in previous)
         low = min(_number(row, "low") for row in previous)
         width_bps = (high - low) / close * 10_000
-        if width_bps <= spec["compression_bps"]:
+        compressed = width_bps <= spec["compression_bps"]
+        if spec.get("schema") == RULE_SCHEMA_V6 and spec.get("compression_mode") == "atr":
+            prior_atr = _atr(bars[:-1], spec["atr_period"])
+            compressed = (prior_atr is not None and
+                          (high - low) <= prior_atr *
+                          float(spec["compression_atr_multiple"]))
+        if compressed:
             if close > high * (1 + threshold):
                 direction = "long"
             elif close < low * (1 - threshold):
@@ -1984,6 +2424,17 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 float(_supplied_value(row, "volume")) for row in previous)
             current_volume = float(_supplied_value(current, "volume"))
             volume_ok = current_volume >= average_volume * spec["volume_multiplier"]
+        if (spec.get("schema") == RULE_SCHEMA_V6 and
+                spec.get("relative_volume_mode") == "same_clock"):
+            relative_volume = _same_clock_relative_volume(
+                current, bars_by_symbol,
+                int(spec["relative_volume_sessions"]))
+            volume_ok = (relative_volume is not None and
+                         relative_volume >= float(spec["volume_multiplier"]))
+            if relative_volume is None:
+                reason = "same_clock_relative_volume_unavailable"
+            elif not volume_ok:
+                reason = "same_clock_relative_volume_below_limit"
         if volume_ok and close > high * (1 + threshold):
             direction = "long"
         elif volume_ok and close < low * (1 - threshold):
@@ -1994,16 +2445,32 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
         session = _session_prefix(bars, current)
         if len(session) < spec["lookback"] + 1:
             return None, "session_lookback_unavailable"
-        vwap = _vwap(session)
-        if vwap is None:
-            return None, "vwap_unavailable"
-        deviation = close / vwap - 1
         if family == "vwap_reversion":
+            vwap = _vwap(session)
+            if vwap is None:
+                return None, "vwap_unavailable"
+            deviation = close / vwap - 1
             if deviation <= -max(threshold, 1e-9):
                 direction = "long"
             elif deviation >= max(threshold, 1e-9):
                 direction = "short"
+        elif (spec.get("schema") == RULE_SCHEMA_V6 and
+              spec.get("vwap_slope_mode") == "rolling"):
+            window = int(spec["vwap_slope_window"])
+            if len(session) < 2 * window:
+                return None, "rolling_vwap_slope_history_unavailable"
+            earlier = _vwap(session[-2 * window:-window])
+            vwap = _vwap(session[-window:])
+            if earlier is None or vwap is None:
+                return None, "rolling_vwap_slope_unavailable"
+            if close > vwap and vwap > earlier * (1 + threshold):
+                direction = "long"
+            elif close < vwap and vwap < earlier * (1 - threshold):
+                direction = "short"
         else:
+            vwap = _vwap(session)
+            if vwap is None:
+                return None, "vwap_unavailable"
             earlier = _vwap(session[:-spec["lookback"]])
             if earlier is None:
                 return None, "earlier_vwap_unavailable"
@@ -2019,9 +2486,13 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
         if (average_range > 0 and
                 current_range >= average_range * spec["volume_multiplier"]):
             if close > opened * (1 + threshold):
-                direction = "long"
+                if (spec.get("schema") != RULE_SCHEMA_V6 or
+                        _range_expansion_directional_shape(current, "long", spec)):
+                    direction = "long"
             elif close < opened * (1 - threshold):
-                direction = "short"
+                if (spec.get("schema") != RULE_SCHEMA_V6 or
+                        _range_expansion_directional_shape(current, "short", spec)):
+                    direction = "short"
         else:
             reason = "range_expansion_filter_failed"
     elif family == "opening_drive":
@@ -2043,9 +2514,13 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
         last = _number(opening[-1], "close")
         drive = last / first - 1 if first > 0 else 0.0
         if drive > threshold and close > opened:
-            direction = "long"
+            if _opening_hold_passes(session, current, spec,
+                                     endpoint=last, direction="long"):
+                direction = "long"
         elif drive < -threshold and close < opened:
-            direction = "short"
+            if _opening_hold_passes(session, current, spec,
+                                     endpoint=last, direction="short"):
+                direction = "short"
     return direction, "passed" if direction is not None else reason
 
 
@@ -2111,7 +2586,8 @@ def _evaluate_rule_signal_staged(
             bars, spec, bars_by_symbol=bars_by_symbol, symbol=symbol)
     else:
         direction, family_reason = _family_direction(
-            bars, spec, close=close, opened=opened)
+            bars, spec, close=close, opened=opened,
+            bars_by_symbol=bars_by_symbol)
     if not stage("family_predicate", direction is not None, family_reason):
         return None, stages, family_metadata
     assert direction is not None
@@ -2149,7 +2625,11 @@ def _evaluate_rule_signal_staged(
         if not stage(f"confirmation:{kind}", passed,
                      "passed" if passed else "confirmation_failed"):
             return None, stages, family_metadata
-    atr = _atr(bars, spec["atr_period"])
+    # v6 records ATR only from the completed bars before the signal bar.  This
+    # prevents the signal bar's own range from changing its stop geometry or
+    # ATR compression decision; legacy schemas retain their exact behavior.
+    atr_rows = bars[:-1] if spec["schema"] == RULE_SCHEMA_V6 else bars
+    atr = _atr(atr_rows, spec["atr_period"])
     if not stage("atr", atr is not None,
                  "passed" if atr is not None else "atr_unavailable"):
         return None, stages, family_metadata
@@ -2202,16 +2682,36 @@ def _evaluate_rule_signal_staged(
         "rule_spec_hash": rule_spec_hash(spec),
         "confidence": 1.0,
     }
-    if spec["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec["schema"] in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         result.update({"rule_schema": RULE_SCHEMA_V3,
                        "breakeven_r": spec.get("breakeven_r")})
-    if spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         result.update({"rule_schema": spec["schema"],
                        "target_mode": target_mode,
                        "target_reference": target_reference,
                        "target_lookback": spec.get("target_lookback"),
                        "trailing_stop_r": spec.get("trailing_stop_r"),
                        "exit_before_minutes": spec.get("exit_before_minutes")})
+    if spec["schema"] == RULE_SCHEMA_V6:
+        result.update({
+            "compression_mode": spec.get("compression_mode"),
+            "compression_atr_multiple": spec.get("compression_atr_multiple"),
+            "opening_hold_bars": spec.get("opening_hold_bars"),
+            "body_fraction_min": spec.get("body_fraction_min"),
+            "close_location_min": spec.get("close_location_min"),
+            "vwap_slope_mode": spec.get("vwap_slope_mode"),
+            "vwap_slope_window": spec.get("vwap_slope_window"),
+            "relative_volume_mode": spec.get("relative_volume_mode"),
+            "relative_volume_sessions": spec.get("relative_volume_sessions"),
+        })
+        if (spec["family"] == "volume_breakout" and
+                spec.get("relative_volume_mode") == "same_clock"):
+            result["relative_volume"] = _same_clock_relative_volume(
+                current, bars_by_symbol,
+                int(spec["relative_volume_sessions"]))
+        if (spec["family"] == "vwap_trend" and
+                spec.get("vwap_slope_mode") == "rolling"):
+            result["vwap_slope_mode"] = "rolling"
     if spec["family"] == "cross_sectional_residual":
         result.update(family_metadata)
     if "intraday_context" in family_metadata:
@@ -2269,7 +2769,8 @@ def evaluate_rule_signal_metadata(rows: Sequence[Any],
     spec = validate_rule_spec(value)
     bars = list(rows)
     close = float(signal.get("entry_price") or 0.0)
-    atr = _atr(bars, spec["atr_period"])
+    atr = _atr(bars[:-1] if spec["schema"] == RULE_SCHEMA_V6 else bars,
+               spec["atr_period"])
     atr_bps = (float(atr) / close * 10_000.0
                if atr is not None and close > 0 else None)
     authored_distance = (float(atr) * float(spec["stop_atr"])
@@ -2348,7 +2849,7 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
         "stop_price": snapshot.get("stop_price"),
         "target_price": snapshot.get("target_price"),
     }
-    if spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         evidence.update({
             "target_mode": snapshot.get("target_mode", spec.get("target_mode")),
             "target_reference": snapshot.get("target_reference"),
@@ -2359,6 +2860,28 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
             "exit_before_minutes": snapshot.get("exit_before_minutes",
                                                 spec.get("exit_before_minutes")),
             "exit_before_ts": snapshot.get("exit_before_ts"),
+        })
+    if spec["schema"] == RULE_SCHEMA_V6:
+        evidence.update({
+            "compression_mode": snapshot.get(
+                "compression_mode", spec.get("compression_mode")),
+            "compression_atr_multiple": snapshot.get(
+                "compression_atr_multiple", spec.get("compression_atr_multiple")),
+            "opening_hold_bars": snapshot.get(
+                "opening_hold_bars", spec.get("opening_hold_bars")),
+            "body_fraction_min": snapshot.get(
+                "body_fraction_min", spec.get("body_fraction_min")),
+            "close_location_min": snapshot.get(
+                "close_location_min", spec.get("close_location_min")),
+            "vwap_slope_mode": snapshot.get(
+                "vwap_slope_mode", spec.get("vwap_slope_mode")),
+            "vwap_slope_window": snapshot.get(
+                "vwap_slope_window", spec.get("vwap_slope_window")),
+            "relative_volume_mode": snapshot.get(
+                "relative_volume_mode", spec.get("relative_volume_mode")),
+            "relative_volume_sessions": snapshot.get(
+                "relative_volume_sessions", spec.get("relative_volume_sessions")),
+            "relative_volume": snapshot.get("relative_volume"),
         })
     if snapshot.get("intraday_context") is not None:
         evidence["intraday_context"] = snapshot["intraday_context"]
@@ -2385,8 +2908,8 @@ __all__ = [
     "EXIT_REASON_UNKNOWN",
     "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
-           "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "RULE_SCHEMA_V4", "RULE_SCHEMA_V5", "SESSION_MINUTES",
-           "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS", "V4_DEFAULT_EXTENSIONS", "V5_DEFAULT_EXTENSIONS",
+           "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "RULE_SCHEMA_V4", "RULE_SCHEMA_V5", "RULE_SCHEMA_V6", "SESSION_MINUTES",
+           "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS", "V4_DEFAULT_EXTENSIONS", "V5_DEFAULT_EXTENSIONS", "V6_DEFAULT_EXTENSIONS", "V6_COMPRESSION_MODES", "V6_VWAP_SLOPE_MODES", "V6_RELATIVE_VOLUME_MODES",
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "OPENING_ANCHORED_FAMILIES",
            "entry_window_bounds", "session_minutes",

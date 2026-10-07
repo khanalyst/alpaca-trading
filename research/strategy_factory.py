@@ -3628,11 +3628,20 @@ def _run_diagnostic_factory(
     """
     manifest = None
     if cohort is not None:
-        from .mechanism_cohort import mechanism_cohort
         if vehicle != "equity":
             raise FactoryError("intraday mechanism cohort is equity-only")
+        if cohort == "intraday-mechanisms.v2":
+            from .mechanism_cohort_v2 import mechanism_cohort
+        else:
+            from .mechanism_cohort import mechanism_cohort
         manifest = mechanism_cohort(cohort)
-        strategies, variants_per_strategy = 3, 4
+        # Cohort dimensions come from the immutable manifest.  The caller's
+        # minimum of two variants remains for ordinary runs; a one-arm frozen
+        # manifest is the only safe exception and is replayed exactly once.
+        strategies = len(manifest["families"])
+        arm_counts = [len(item.get("arms") or ())
+                      for item in manifest["families"]]
+        variants_per_strategy = max(2, max(arm_counts, default=0))
     def progress(phase, done, total):
         if progress_callback is not None:
             progress_callback(phase, done, total)
@@ -3747,7 +3756,10 @@ def _run_diagnostic_factory(
     risk_config = ((runtime_config or {}).get("risk")
                    if isinstance(runtime_config, Mapping) else None)
     completed_accounts = 0
-    progress("evaluating", 0, len(templates) * int(variants_per_strategy))
+    evaluation_total = (
+        sum(len(item.get("arms") or ()) for item in manifest["families"])
+        if manifest is not None else len(templates) * int(variants_per_strategy))
+    progress("evaluating", 0, evaluation_total)
     for hypothesis, source, discovery, discovery_context in selected_hypotheses:
         cached = root_cache.get(rule_variant_id(hypothesis.rule_spec))
         if cached is not None:
@@ -3825,7 +3837,7 @@ def _run_diagnostic_factory(
                     costs=model, vehicle=vehicle, risk_config=risk_config,
                     policy=policy)
             completed_accounts += 1
-            progress("evaluating", completed_accounts, len(templates) * int(variants_per_strategy))
+            progress("evaluating", completed_accounts, evaluation_total)
             variants.append({
                 "variant_id": variant_id,
                 "rule_spec": selected.rule_spec,

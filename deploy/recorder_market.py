@@ -440,10 +440,17 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     # available or a quote arriving during the request can incorrectly have
     # as_of > observed_at.
     quotes_received = datetime.now(timezone.utc)
-    observation = max(observed_at or now, quotes_received)
+    # Keep each source's causal receipt boundary. Bars can finish well before
+    # a paginated quote response; assigning every row the later quote receipt
+    # makes the bar's first observation appear artificially late. The caller's
+    # explicit boundary still wins when it is later than the receipt.
+    base_observation = observed_at or now
+    bars_observation = max(base_observation, bars_received)
+    quotes_observation = max(base_observation, quotes_received)
     if telemetry is not None:
         telemetry["quotes_received_at"] = quotes_received.isoformat()
-    observed = observation.isoformat()
+    observed_bar = bars_observation.isoformat()
+    observed_quote = quotes_observation.isoformat()
     projection_started = time.perf_counter()
     latest_bar = latest_quote = None
     for raw_symbol, values in bars.items():
@@ -466,7 +473,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             latest_bar = max(latest_bar or bar_start, bar_start)
             yield {
                 "event_key": _event_key("bar_1m", symbol, timestamp),
-                "observed_at": observed, "provider": "alpaca",
+                "observed_at": observed_bar, "provider": "alpaca",
                 "feed": bar_feed,
                 "event_type": "bar_1m", "symbol": symbol, "contract": "",
                 "timestamp": timestamp, "as_of": bar_complete.isoformat(),
@@ -490,7 +497,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             latest_quote = max(latest_quote or quote_timestamp, quote_timestamp)
             yield {
                 "event_key": _event_key("quote", symbol, timestamp),
-                "observed_at": observed, "provider": "alpaca",
+                "observed_at": observed_quote, "provider": "alpaca",
                 "feed": quote_feed,
                 "event_type": "quote", "symbol": symbol, "contract": "",
                 "timestamp": timestamp, "as_of": timestamp, "open": "", "high": "",
@@ -511,5 +518,5 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
                 provider, symbols, quotes, now, feed=feed, config=config,
                 limit=max(1, min(MAX_OPTION_LIMIT, int(option_limit))),
                 minimum_timestamp=start,
-                observed_at=observation,
+                observed_at=quotes_observation,
                 pinned=frozenset(str(item).upper() for item in option_pins))

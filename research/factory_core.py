@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
-    RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, SESSION_MINUTES,
+    RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, SESSION_MINUTES,
     V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS, V4_DEFAULT_EXTENSIONS,
     canonical_exit_reason, completed_bar_exit_transition, evaluate_rule_signal,
     evaluate_rule_signal_trace, frozen_target_reference,
@@ -507,7 +507,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "unknown", "invalid_session_bars", stage="data_validation",
             signal_opportunity=False)
     spec = validate_rule_spec(spec)
-    if not rule_vehicle_executable(spec, vehicle):
+    # v6 is intentionally replayable for diagnostic research while remaining
+    # unavailable to engine/live execution through rule_vehicle_executable.
+    if (not rule_vehicle_executable(spec, vehicle) and
+            spec.get("schema") != RULE_SCHEMA_V6):
         reason = ("cross_sectional_residual is executable only for equity shares"
                   if spec["family"] == "cross_sectional_residual" else
                   f"{spec['schema']} is not executable for options")
@@ -593,7 +596,9 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 else:
                     cross_context_valid_prefixes += 1
         else:
-            signal = evaluate_rule_signal(session_bars[:index + 1], spec)
+            signal = evaluate_rule_signal(
+                session_bars[:index + 1], spec,
+                bars_by_symbol=market_context, symbol=signal_bar.symbol)
         if signal is None:
             continue
         if spec["family"] == "cross_sectional_residual":
@@ -1278,7 +1283,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
             })
-        if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+        if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
             trade_row.update({
                 "initial_stop_price": exit_state["initial_stop_price"],
                 "active_stop_price": exit_state["active_stop_price"],
@@ -1286,6 +1291,22 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 "target_mode": exit_state.get("target_mode", "fixed_r"),
                 "target_lookback": exit_state.get("target_lookback"),
                 "exit_before_ts": exit_state.get("exit_before_ts"),
+            })
+        if spec.get("schema") == RULE_SCHEMA_V6:
+            trade_row.update({
+                "diagnostic_only": True,
+                "authorizing": False,
+                "rule_vehicle_executable": False,
+                "compression_mode": spec.get("compression_mode"),
+                "compression_atr_multiple": spec.get("compression_atr_multiple"),
+                "opening_hold_bars": spec.get("opening_hold_bars"),
+                "body_fraction_min": spec.get("body_fraction_min"),
+                "close_location_min": spec.get("close_location_min"),
+                "vwap_slope_mode": spec.get("vwap_slope_mode"),
+                "vwap_slope_window": spec.get("vwap_slope_window"),
+                "relative_volume_mode": spec.get("relative_volume_mode"),
+                "relative_volume_sessions": spec.get("relative_volume_sessions"),
+                "relative_volume": signal.get("relative_volume"),
             })
         trade_row["path_telemetry"] = compute_path_telemetry(
             trade_row, session_bars)
@@ -1431,6 +1452,10 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 "reject_reason": "simulation_missing_disposition",
             })
             continue
+        if spec.get("schema") == RULE_SCHEMA_V6 and isinstance(raw, dict):
+            raw.update({"diagnostic_only": True, "authorizing": False,
+                        "directional_authorizing": False,
+                        "rule_vehicle_executable": False})
         if raw.get("execution_disposition") == "no_signal":
             row = {"vehicle": vehicle, "symbol": symbol,
                    "session_date": day.isoformat(), "opportunity_id": opportunity,
@@ -2165,7 +2190,7 @@ def _family_exit_hypothesis(root: Mapping[str, Any]) -> dict | None:
     remaining first-batch members retain fixed-R behavior, so an unavailable
     fair-value reference cannot suppress the entire batch.
     """
-    if root.get("schema") not in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+    if root.get("schema") not in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
         return None
     family = str(root.get("family") or "")
     if family == "mean_reversion":
