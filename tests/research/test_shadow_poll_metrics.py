@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -118,6 +119,27 @@ class ShadowPollMetricsTests(unittest.TestCase):
                 "WHERE scope='corpus'").fetchone()
         self.assertEqual(cursor[1], rows[-1]["event_key"])
 
+    def test_causal_event_prefix_normalizes_timezone_and_sees_late_rows(self):
+        store = ShadowStore(self.shadow)
+        row = self._bar(
+            datetime(2026, 1, 2, 20, 59, tzinfo=timezone.utc), 0)
+        store.ingest_event(row, max_events=100)
+        utc_identity = store.event_prefix_identity(
+            datetime(2026, 1, 2, 21, 0, tzinfo=timezone.utc))
+        offset_identity = store.event_prefix_identity(
+            datetime.fromisoformat("2026-01-03T01:00:00+04:00"))
+        self.assertEqual(utc_identity, offset_identity)
+
+        late = self._bar(
+            datetime(2026, 1, 2, 20, 58, tzinfo=timezone.utc), 1)
+        store.ingest_event(late, max_events=100)
+        late_identity = store.event_prefix_identity(
+            datetime(2026, 1, 2, 21, 0, tzinfo=timezone.utc))
+        self.assertEqual(late_identity["row_count"],
+                         utc_identity["row_count"] + 1)
+        self.assertNotEqual(late_identity["last_event_key"],
+                            utc_identity["last_event_key"])
+
     def test_repeated_unchanged_authorizing_input_avoids_event_reload(self):
         self._candidate()
         start = datetime(2026, 9, 8, 13, 30, tzinfo=timezone.utc)
@@ -198,6 +220,135 @@ class ShadowPollMetricsTests(unittest.TestCase):
                 for row in runner.store.replay_metadata_tail(
                     [candidate["candidate_id"]])
             ))
+
+    def test_closed_replay_memo_skips_historical_evaluation_and_retry_churn(self):
+        candidate = self._candidate()
+        closing = self._bar(
+            datetime(2026, 1, 2, 20, 59, tzinfo=timezone.utc), 0)
+        self._write([closing])
+        runner = self._runner()
+        store = runner.store
+        store.upsert_candidate(candidate)
+        store.ingest_event(closing, max_events=100)
+        store.save_source_offsets({str(self.corpus.resolve()):
+                                   self.corpus.stat().st_size})
+        store.save_forward_event_floor(time.time() + 3600)
+        store.decision(
+            candidate_id=candidate["candidate_id"],
+            event_key=closing["event_key"], session_date="2026-01-02",
+            symbol="SPY", kind="no_trade", reason="seed",
+            payload={"session_date": "2026-01-02"}, max_decisions=100)
+        replay_digest = "stable-replay"
+        store.replay_diff(
+            candidate_id=candidate["candidate_id"], session_date="2026-01-02",
+            source_digest="stable-source", shadow_digest="stable-shadow",
+            replay_digest=replay_digest, status="match",
+            details={"complete": True, "signature_match": True})
+        store.record_replay_evidence(
+            candidate_id=candidate["candidate_id"], session_date="2026-01-02",
+            replay_digest=replay_digest, vehicle="equity",
+            starting_cash=100_000, ending_cash=100_000, realized_pnl=0,
+            trades=[{"symbol": "SPY", "session_date": "2026-01-02"}],
+            replay_status="match")
+
+        def no_trade(candidate, event, bars, quotes, options):
+            del bars, quotes, options
+            return ("no_trade", "memo test", {
+                "session_date": str(event["timestamp"])[:10],
+            }, None)
+
+        with patch.object(runner, "_evaluate", side_effect=no_trade) as evaluate, \
+                patch.object(runner, "_replay", return_value=True) as replay:
+            first = runner.run_once()
+        self.assertEqual(evaluate.call_count, 1)
+        replay.assert_called_once()
+
+        # The replay row's retry timestamp changes, but its semantic content
+        # stays the same and must not invalidate the memo.
+        store.replay_diff(
+            candidate_id=candidate["candidate_id"], session_date="2026-01-02",
+            source_digest="stable-source", shadow_digest="stable-shadow",
+            replay_digest=replay_digest, status="match",
+            details={"complete": True, "signature_match": True})
+        with patch.object(runner, "_evaluate",
+                          side_effect=AssertionError("historical eval repeated")) as evaluate, \
+                patch.object(runner, "_replay",
+                             side_effect=AssertionError("historical replay repeated")) as replay:
+            second = runner.run_once()
+        evaluate.assert_not_called()
+        replay.assert_not_called()
+        self.assertTrue(runner._authorizing_replay_memo)
+        self.assertEqual(first["candidate_errors"], second["candidate_errors"])
+
+    def test_replay_memo_is_causal_for_new_day_and_late_prior_observation(self):
+        candidate = self._candidate()
+        closing = self._bar(
+            datetime(2026, 1, 2, 20, 59, tzinfo=timezone.utc), 0)
+        self._write([closing])
+        runner = self._runner()
+        store = runner.store
+        store.upsert_candidate(candidate)
+        store.ingest_event(closing, max_events=100)
+        store.save_source_offsets({str(self.corpus.resolve()):
+                                   self.corpus.stat().st_size})
+        store.save_forward_event_floor(time.time() + 3600)
+        store.decision(
+            candidate_id=candidate["candidate_id"],
+            event_key=closing["event_key"], session_date="2026-01-02",
+            symbol="SPY", kind="no_trade", reason="seed",
+            payload={"session_date": "2026-01-02"}, max_decisions=100)
+        replay_digest = "causal-replay"
+        store.replay_diff(
+            candidate_id=candidate["candidate_id"], session_date="2026-01-02",
+            source_digest="causal-source", shadow_digest="causal-shadow",
+            replay_digest=replay_digest, status="match",
+            details={"complete": True, "signature_match": True})
+        store.record_replay_evidence(
+            candidate_id=candidate["candidate_id"], session_date="2026-01-02",
+            replay_digest=replay_digest, vehicle="equity",
+            starting_cash=100_000, ending_cash=100_000, realized_pnl=0,
+            trades=[{"symbol": "SPY", "session_date": "2026-01-02"}],
+            replay_status="match")
+
+        def no_trade(candidate, event, bars, quotes, options):
+            del bars, quotes, options
+            return ("no_trade", "causal memo test", {
+                "session_date": str(event["timestamp"])[:10],
+            }, None)
+
+        with patch.object(runner, "_evaluate", side_effect=no_trade), \
+                patch.object(runner, "_replay", return_value=True):
+            runner.run_once()
+
+        new_day = self._bar(
+            datetime(2026, 1, 3, 15, 0, tzinfo=timezone.utc), 1)
+        with self.corpus.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=FIELDS).writerow(new_day)
+
+        def only_new_day(candidate, event, bars, quotes, options):
+            if str(event["event_key"]) == str(closing["event_key"]):
+                raise AssertionError("closed prior day was reevaluated")
+            return no_trade(candidate, event, bars, quotes, options)
+
+        with patch.object(runner, "_evaluate", side_effect=only_new_day) as evaluate, \
+                patch.object(runner, "_replay",
+                             side_effect=AssertionError("old replay repeated")):
+            runner.run_once()
+        self.assertTrue(all(
+            str(call.args[1]["event_key"]) == str(new_day["event_key"])
+            for call in evaluate.call_args_list
+        ))
+
+        late_prior = self._bar(
+            datetime(2026, 1, 2, 20, 58, tzinfo=timezone.utc), 2)
+        with self.corpus.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=FIELDS).writerow(late_prior)
+        with patch.object(runner, "_evaluate", side_effect=no_trade) as evaluate, \
+                patch.object(runner, "_replay", return_value=True) as replay:
+            runner.run_once()
+        self.assertIn(late_prior["event_key"], {
+            str(call.args[1]["event_key"]) for call in evaluate.call_args_list})
+        replay.assert_called()
 
     def test_health_allowlists_whole_poll_metrics_without_readiness_effect(self):
         path = Path(self.tmp.name) / "shadow-health.json"

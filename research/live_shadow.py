@@ -118,6 +118,7 @@ REPLAY_QUARANTINE_META_KEY = "replay_quarantine"
 SESSION_CATALOG_META_KEY = "session_catalog"
 MAX_REPLAY_REPAIR_HISTORY = 32
 MAX_ACTIVE_REPLAY_QUARANTINE = 1024
+MAX_AUTHORIZING_REPLAY_MEMO_ENTRIES = 4096
 REPLAY_QUARANTINE_OVERFLOW_KEY = "__replay_quarantine_overflow__"
 SHADOW_MANIFEST_META_PREFIX = "shadow-manifest.v1:"
 SHADOW_MANIFEST_LATEST_KEY = "shadow-manifest.v1:latest"
@@ -181,6 +182,21 @@ def _json(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _replay_details_digest(encoded: Any) -> str:
+    """Hash replay details after removing per-poll identity churn."""
+    try:
+        decoded = json.loads(encoded) if isinstance(encoded, str) else encoded
+    except (TypeError, ValueError, json.JSONDecodeError):
+        decoded = None
+    if isinstance(decoded, Mapping):
+        semantic = dict(decoded)
+        for key in ("manifest_digest", "candidate_set_digest",
+                    "replay_epoch_identity", "candidate_epoch_identity"):
+            semantic.pop(key, None)
+        return _digest(semantic)
+    return _digest(str(encoded or ""))
 
 
 def _sequence_digest(values: Iterable[Any]) -> str:
@@ -1615,10 +1631,14 @@ class ShadowStore:
                   BEFORE DELETE ON diagnostic_fills
                   BEGIN SELECT RAISE(ABORT, 'diagnostic fills are immutable'); END;
                 CREATE INDEX IF NOT EXISTS events_timestamp_idx ON events(timestamp);
+                CREATE INDEX IF NOT EXISTS events_timestamp_inserted_idx
+                  ON events(timestamp,inserted_at,event_key);
                 CREATE INDEX IF NOT EXISTS events_inserted_at_idx
                   ON events(inserted_at,event_key);
                 CREATE INDEX IF NOT EXISTS decisions_candidate_session_idx
                   ON decisions(candidate_id,session_date);
+                CREATE INDEX IF NOT EXISTS virtual_books_candidate_status_idx
+                  ON virtual_books(candidate_id,status,created_at,book_id);
                 CREATE INDEX IF NOT EXISTS replay_diffs_candidate_created_idx
                   ON replay_diffs(candidate_id,created_at DESC,session_date DESC);
                 CREATE INDEX IF NOT EXISTS replay_diffs_candidate_session_idx
@@ -2617,6 +2637,37 @@ class ShadowStore:
                                  if row is not None else 0.0),
         }
 
+    def event_prefix_identity(self, through: datetime) -> dict[str, Any]:
+        """Return the append-only event prefix visible through a session close.
+
+        The prefix includes every event type whose recorder timestamp is at or
+        before ``through``.  A later append outside that prefix therefore does
+        not invalidate a completed historical replay, while a late correction
+        inside it changes the count or insertion head and forces validation.
+        """
+        normalized_through = (through.astimezone(UTC)
+                              if through.tzinfo is not None else
+                              through.replace(tzinfo=UTC))
+        bound = normalized_through.isoformat()
+        with self._connection() as db:
+            summary = db.execute(
+                """SELECT count(*) AS row_count,
+                          coalesce(max(inserted_at),0.0) AS max_inserted_at
+                     FROM events WHERE timestamp<=?""", (bound,)).fetchone()
+            head = db.execute(
+                """SELECT event_key,digest,inserted_at
+                     FROM events WHERE timestamp<=?
+                     ORDER BY inserted_at DESC,event_key DESC LIMIT 1""",
+                (bound,)).fetchone()
+        return {
+            "through": bound,
+            "row_count": int(summary["row_count"] if summary else 0),
+            "max_inserted_at": (float(summary["max_inserted_at"])
+                                 if summary else 0.0),
+            "last_event_key": (str(head["event_key"]) if head else None),
+            "last_digest": (str(head["digest"]) if head else None),
+        }
+
     def forward_event_floor(self) -> float | None:
         with self._connection() as db:
             row = db.execute("SELECT value FROM meta WHERE key='forward_event_floor'").fetchone()
@@ -3012,6 +3063,125 @@ class ShadowStore:
                                (candidate_id, candidate_id, session_date))
             return int(cursor.rowcount)
 
+    def virtual_book_state_through(self, candidate_id: str,
+                                   session_date: str) -> list[dict]:
+        """Return one candidate's book state causally visible by a session."""
+        with self._connection() as db:
+            rows = db.execute("""SELECT b.book_id,b.candidate_id,b.decision_id,
+                       b.symbol,b.status,b.quantity,b.entry_price,b.plan_json,
+                       b.created_at
+                  FROM virtual_books b JOIN decisions d
+                    ON d.decision_id=b.decision_id
+                 WHERE b.candidate_id=? AND d.session_date<=?
+                 ORDER BY b.book_id""", (str(candidate_id),
+                                          str(session_date))).fetchall()
+        return [dict(row) for row in rows]
+
+    def replay_session_identities(
+            self, pairs: Sequence[tuple[str, str]]) -> dict[
+                tuple[str, str], dict[str, Any]]:
+        """Read semantic replay/account state for explicit candidate sessions.
+
+        This projection deliberately omits timestamps that are rewritten by a
+        retry.  Account multiplicity is retained as an explicit ambiguity so
+        callers can fail closed instead of selecting one historical profit
+        row from a malformed WAL.
+        """
+        wanted = sorted({(str(candidate_id), str(session))
+                         for candidate_id, session in pairs
+                         if str(candidate_id).strip() and str(session).strip()})
+        if not wanted:
+            return {}
+        result: dict[tuple[str, str], dict[str, Any]] = {}
+        with self._connection() as db:
+            # Account lookups bind three values per pair. Stay within the
+            # historical SQLite limit of 999 variables as well as newer builds.
+            for offset in range(0, len(wanted), 333):
+                chunk = wanted[offset:offset + 333]
+                marks = ",".join("(?,?)" for _ in chunk)
+                params = tuple(value for pair in chunk for value in pair)
+                rows = db.execute(
+                    """SELECT d.candidate_id,d.session_date,d.source_digest,
+                              d.shadow_digest,d.replay_digest,d.status,
+                              d.details_json
+                         FROM replay_diffs d
+                        WHERE (d.candidate_id,d.session_date) IN (""" +
+                    marks + ")", params).fetchall()
+                for row in rows:
+                    key = (str(row["candidate_id"]), str(row["session_date"]))
+                    result[key] = {
+                        "replay": {
+                            "source_digest": row["source_digest"],
+                            "shadow_digest": row["shadow_digest"],
+                            "replay_digest": row["replay_digest"],
+                            "status": row["status"],
+                            "details_digest": _replay_details_digest(
+                                row["details_json"]),
+                        },
+                        "account": None,
+                        "ambiguous_account": False,
+                    }
+                replay_pairs = [
+                    (*key, detail["replay"].get("replay_digest"))
+                    for key, detail in result.items()
+                    if key in chunk and detail["replay"].get("replay_digest")
+                ]
+                account_rows: list[sqlite3.Row] = []
+                if replay_pairs:
+                    account_marks = ",".join("(?,?,?)"
+                                               for _ in replay_pairs)
+                    account_params = tuple(value for pair in replay_pairs
+                                           for value in pair)
+                    account_rows = db.execute(
+                        """WITH wanted(candidate_id,session_date,replay_digest)
+                                   AS (VALUES """ + account_marks + """),
+                              ranked AS (
+                                  SELECT a.candidate_id,a.session_date,
+                                         a.replay_digest,a.account_id,a.vehicle,
+                                         a.starting_cash,a.ending_cash,
+                                         a.realized_pnl,a.trade_count,
+                                         a.replay_status,
+                                         row_number() OVER (
+                                           PARTITION BY a.candidate_id,
+                                                        a.session_date,
+                                                        a.replay_digest
+                                           ORDER BY a.account_id
+                                         ) AS row_number
+                                    FROM shadow_accounts a JOIN wanted w
+                                      ON w.candidate_id=a.candidate_id
+                                     AND w.session_date=a.session_date
+                                     AND w.replay_digest=a.replay_digest
+                              )
+                              SELECT candidate_id,session_date,replay_digest,
+                                     account_id,vehicle,starting_cash,
+                                     ending_cash,realized_pnl,trade_count,
+                                     replay_status
+                                FROM ranked WHERE row_number<=2""",
+                        account_params).fetchall()
+                accounts_by_key: dict[tuple[str, str, str], list[dict]] = {}
+                for row in account_rows:
+                    key = (str(row["candidate_id"]),
+                           str(row["session_date"]),
+                           str(row["replay_digest"]))
+                    accounts_by_key.setdefault(key, []).append({
+                        "account_id": row["account_id"],
+                        "vehicle": row["vehicle"],
+                        "starting_cash": row["starting_cash"],
+                        "ending_cash": row["ending_cash"],
+                        "realized_pnl": row["realized_pnl"],
+                        "trade_count": row["trade_count"],
+                        "replay_status": row["replay_status"],
+                    })
+                for key, detail in result.items():
+                    replay_digest = detail["replay"].get("replay_digest")
+                    account_key = (key[0], key[1], str(replay_digest))
+                    accounts = accounts_by_key.get(account_key, [])
+                    if len(accounts) > 1:
+                        detail["ambiguous_account"] = True
+                    elif accounts:
+                        detail["account"] = accounts[0]
+        return result
+
     def candidates(self) -> list[dict]:
         with self._connection() as db:
             return [dict(row) for row in db.execute("SELECT * FROM candidates ORDER BY candidate_id")]
@@ -3403,8 +3573,7 @@ class ShadowStore:
             return []
         marks = ",".join("?" for _ in wanted)
         query = f"""WITH counts AS (
-                SELECT candidate_id, count(*) AS row_count,
-                       max(created_at) AS latest_created_at
+            SELECT candidate_id, count(*) AS row_count
                   FROM replay_diffs
                  WHERE candidate_id IN ({marks})
                  GROUP BY candidate_id
@@ -3420,7 +3589,6 @@ class ShadowStore:
                  WHERE candidate_id IN ({marks})
             )
             SELECT counts.candidate_id,counts.row_count,
-                   counts.latest_created_at,
                    ranked.session_date AS latest_session_date,
                    ranked.source_digest AS latest_source_digest,
                    ranked.shadow_digest AS latest_shadow_digest,
@@ -3770,6 +3938,11 @@ class ShadowRunner:
                                              dict[str, tuple[dict, ...]],
                                              dict[str, tuple[dict, ...]],
                                              dict[str, tuple[dict, ...]]] | None = None
+        # Completed authorizing replay sessions are memoized only for this
+        # process epoch.  Each entry is keyed by a causal event prefix and
+        # semantic replay/account state, so a new day does not force every
+        # already-closed session through the expensive legacy evaluator.
+        self._authorizing_replay_memo: dict[tuple[str, str], dict[str, Any]] = {}
 
     @staticmethod
     def _calendar_snapshot_identity(
@@ -3855,6 +4028,96 @@ class ShadowRunner:
             return item
 
         return project(value)
+
+    def _authorizing_replay_memo_key(
+            self, candidate: Mapping[str, Any], session: str,
+            replay_window: Mapping[str, Any],
+            causal_prefix: Mapping[str, Any],
+            quarantine: Mapping[str, Any],
+            replay_quarantine: Mapping[str, Any],
+            replay_identity: Mapping[str, Any],
+            replay_state: Mapping[str, Any] | None,
+            book_state: Sequence[Mapping[str, Any]]) -> str:
+        """Build a per-session key for a completed authorizing replay.
+
+        Poll/manifest timestamps and candidate-set identities are excluded;
+        the candidate/config/proof, code, policy/cost, causal event prefix,
+        quarantine, book, and semantic replay/account state remain bound.
+        """
+        cfg = self._shadow_candidate_config(_safe_config(candidate))
+        policy = self._shadow_policy(cfg)
+        cost_setup = cost_resolver_setup(
+            cfg, vehicle=str(candidate.get("vehicle") or "equity"))
+        close = replay_window.get("calendar_close")
+        calendar_bounds = replay_window.get("calendar_bounds")
+        relevant_quarantine: dict[str, Any] = {}
+        candidate_id = str(candidate.get("candidate_id") or "")
+        for key, detail in replay_quarantine.items():
+            if key == "__replay_quarantine_overflow__":
+                relevant_quarantine[key] = detail
+                continue
+            if not isinstance(detail, Mapping):
+                continue
+            if str(detail.get("candidate_id") or "") != candidate_id:
+                continue
+            detail_session = str(detail.get("session_date") or "")
+            if detail_session and detail_session <= str(session):
+                relevant_quarantine[str(key)] = detail
+        relevant_source_quarantine: dict[str, Any] = {}
+        for key, detail in quarantine.items():
+            if key in {QUARANTINE_OVERFLOW_KEY, "__quarantine_overflow__"}:
+                relevant_source_quarantine[str(key)] = detail
+                continue
+            detail_session = (detail.get("session_date")
+                              if isinstance(detail, Mapping) else None)
+            if not detail_session or str(detail_session) <= str(session):
+                relevant_source_quarantine[str(key)] = detail
+        return _digest({
+            "schema": "shadow-authorizing-replay-memo.v1",
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "session_date": str(session),
+            "candidate": {
+                "variant_id": str(candidate.get("variant_id") or ""),
+                "strategy_id": str(candidate.get("strategy_id") or ""),
+                "vehicle": str(candidate.get("vehicle") or ""),
+                "status": str(candidate.get("status") or ""),
+                "config": cfg,
+                "proof": {key: candidate.get(key) for key in (
+                    "dataset_hash", "config_hash", "code_hash",
+                    "provenance_hash", "status", "cohort_identity")},
+            },
+            "replay_code_hash": str(
+                replay_identity.get("replay_code_hash") or _replay_code_hash()),
+            "runtime": {
+                "equity": float(self.config.equity),
+                "runtime_config": self.config.runtime_config,
+                "stress_calibration_enabled": bool(
+                    self.config.stress_calibration_enabled),
+                "stress_calibration_path": self.config.stress_calibration_path,
+                "stress_calibration_artifact": self.config.stress_calibration_artifact,
+            },
+            "policy": dataclasses.asdict(policy),
+            "cost_model": dataclasses.asdict(cost_setup.model),
+            "measured_cost": cost_setup.measured,
+            "calendar": {
+                "close": close.isoformat() if isinstance(close, datetime) else close,
+                "source": replay_window.get("calendar_source"),
+                "bounds": ([value.isoformat() for value in calendar_bounds]
+                           if isinstance(calendar_bounds, tuple) else calendar_bounds),
+            },
+            "causal_prefix": dict(causal_prefix),
+            "source_quarantine": self._replay_quarantine_identity(
+                relevant_source_quarantine),
+            "quarantine": self._replay_quarantine_identity(relevant_quarantine),
+            "replay_state": dict(replay_state or {}),
+            "book_state": [dict(row) for row in book_state],
+            # The legacy evaluator restores every current open book before
+            # processing a session.  Bind that exact projection as well as
+            # the causal through-session state so a later open position cannot
+            # silently reuse an old no-trade replay.
+            "current_open_books": self.store.open_books(
+                str(candidate.get("candidate_id") or "")),
+        })
 
     def _cached_authorizing_event_views(
             self, fingerprint: str) -> tuple[list[dict], dict[str, list[dict]],
@@ -7077,6 +7340,13 @@ class ShadowRunner:
         # history or treating a no-op poll as fresh evidence.
         arm_ids = {str(arm.get("candidate_id") or "") for arm in arms}
         gate_pairs = set(self.store.gate_sessions(sorted(arm_ids)))
+        active_memo_pairs = {(candidate_id, session)
+                             for candidate_id, session in gate_pairs
+                             if candidate_id in arm_ids}
+        self._authorizing_replay_memo = {
+            pair: detail for pair, detail in self._authorizing_replay_memo.items()
+            if pair in active_memo_pairs
+        }
         replay_only_sessions = {
             session for _candidate_id, session in gate_pairs
             if session not in session_inputs}
@@ -7314,6 +7584,7 @@ class ShadowRunner:
         # snapshots remain lossless and are bounded explicitly below.
         replay_quote_frontier: dict[tuple[str, str, str], list[dict]] = {}
         replay_option_context: dict[str, list[dict]] = {}
+        replay_quarantine_for_memo = self.store.replay_quarantine()
         phase_started = time.monotonic()
         for session in sorted(set(frozen_session_events) | replay_only_sessions):
             is_replay_only = session in replay_only_sessions
@@ -7399,18 +7670,66 @@ class ShadowRunner:
                     options_for_eval.setdefault(str(symbol), tuple())
                     options_for_eval[str(symbol)] = (
                         *options_for_eval[str(symbol)], *values)
+            session_replay_windows: dict[str, dict[str, Any]] = {}
+            session_replay_context: dict[str, tuple[dict[str, Any],
+                                                      dict[str, Any],
+                                                      list[dict]]] = {}
+            replay_cache_state: dict[str, str] = {}
+            causal_prefix_cache: dict[str, dict[str, Any]] = {}
+            if is_replay_only:
+                replay_pairs = [(candidate_id, session)
+                                for candidate_id, value in gate_pairs
+                                if value == session]
+                replay_identities = self.store.replay_session_identities(
+                    replay_pairs)
+                for candidate_id, _session in replay_pairs:
+                    replay_window = self._replay_session_window(
+                        arm_by_id[candidate_id], session, session_inputs_one[
+                            session][0], session_inputs_one[session][1],
+                        session_inputs_one[session][2],
+                        calendar_snapshot=calendar_snapshot)
+                    session_replay_windows[candidate_id] = replay_window
+                    close = replay_window.get("calendar_close")
+                    identity = replay_identities.get((candidate_id, session))
+                    if (not replay_window.get("complete") or
+                            not isinstance(close, datetime) or
+                            identity is None):
+                        continue
+                    close_key = close.isoformat()
+                    causal_prefix = causal_prefix_cache.get(close_key)
+                    if causal_prefix is None:
+                        causal_prefix = self.store.event_prefix_identity(close)
+                        causal_prefix_cache[close_key] = causal_prefix
+                    book_state = self.store.virtual_book_state_through(
+                        candidate_id, session)
+                    memo_key = self._authorizing_replay_memo_key(
+                        arm_by_id[candidate_id], session, replay_window,
+                        causal_prefix, quarantine, replay_quarantine_for_memo,
+                        replay_identity, identity, book_state)
+                    session_replay_context[candidate_id] = (
+                        replay_window, causal_prefix, book_state)
+                    prior = self._authorizing_replay_memo.get(
+                        (candidate_id, session))
+                    if isinstance(prior, Mapping) and prior.get("key") == memo_key:
+                        replay_cache_state[candidate_id] = (
+                            "hit" if prior.get("ok") is True else "blocked")
             session_candidates = ({candidate_id for candidate_id, value in gate_pairs
                                    if value == session}
                                   if is_replay_only else arm_ids)
             eligible_events_by_arm: dict[str, tuple[dict, ...]] = {}
             active_arms: list[dict[str, Any]] = []
             session_success = bool(session_candidates)
+            if any(state == "blocked" for state in replay_cache_state.values()):
+                session_success = False
             if any(candidate_id in failed_arms or candidate_id not in arm_by_id
                    for candidate_id in session_candidates):
                 session_success = False
             for arm in arms:
                 candidate_id = str(arm["candidate_id"])
                 if candidate_id not in session_candidates or candidate_id in failed_arms:
+                    continue
+                if (is_replay_only and replay_cache_state.get(candidate_id)
+                        in {"hit", "blocked"}):
                     continue
                 if is_replay_only:
                     eligible_rows = session_rows
@@ -7498,14 +7817,21 @@ class ShadowRunner:
             for candidate_id in sorted(session_candidates):
                 if candidate_id in failed_arms or candidate_id not in arm_by_id:
                     continue
+                if is_replay_only and replay_cache_state.get(candidate_id) == "hit":
+                    continue
+                if is_replay_only and replay_cache_state.get(candidate_id) == "blocked":
+                    session_success = False
+                    continue
                 if (candidate_id in active_candidate_ids and
                         candidate_id not in successful_evaluations):
                     session_success = False
                     continue
-                replay_window = self._replay_session_window(
-                    arm_by_id[candidate_id], session, session_bars,
-                    session_quotes, session_options,
-                    calendar_snapshot=calendar_snapshot)
+                replay_window = session_replay_windows.get(candidate_id)
+                if replay_window is None:
+                    replay_window = self._replay_session_window(
+                        arm_by_id[candidate_id], session, session_bars,
+                        session_quotes, session_options,
+                        calendar_snapshot=calendar_snapshot)
                 if not is_replay_only and not replay_window["complete"]:
                     session_success = False
                     continue
@@ -7530,6 +7856,41 @@ class ShadowRunner:
                         replay_window=replay_window)
                     if complete is not True:
                         session_success = False
+                    elif is_replay_only:
+                        post_identity = self.store.replay_session_identities(
+                            [(candidate_id, session)]).get(
+                                (candidate_id, session))
+                        close = replay_window.get("calendar_close")
+                        if post_identity is None or not isinstance(close, datetime):
+                            session_success = False
+                            continue
+                        close_key = close.isoformat()
+                        post_prefix = causal_prefix_cache.get(close_key)
+                        if post_prefix is None:
+                            post_prefix = self.store.event_prefix_identity(close)
+                            causal_prefix_cache[close_key] = post_prefix
+                        post_books = self.store.virtual_book_state_through(
+                            candidate_id, session)
+                        post_key = self._authorizing_replay_memo_key(
+                            arm_by_id[candidate_id], session, replay_window,
+                            post_prefix, quarantine,
+                            self.store.replay_quarantine(),
+                            replay_identity, post_identity, post_books)
+                        account = post_identity.get("account")
+                        parity = bool(
+                            not post_identity.get("ambiguous_account") and
+                            post_identity.get("replay", {}).get("status") == "match" and
+                            isinstance(account, Mapping) and
+                            account.get("replay_status") == "match")
+                        self._authorizing_replay_memo[
+                            (candidate_id, session)] = {
+                                "key": post_key, "ok": parity}
+                        while (len(self._authorizing_replay_memo) >
+                               MAX_AUTHORIZING_REPLAY_MEMO_ENTRIES):
+                            self._authorizing_replay_memo.pop(
+                                next(iter(self._authorizing_replay_memo)))
+                        if not parity:
+                            session_success = False
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {str(exc)[:240]}"
                     candidate_errors[candidate_id] = message
