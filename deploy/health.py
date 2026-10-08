@@ -30,6 +30,8 @@ from deploy.scheduler_output import (derive_research_readiness,
 from research.diagnostic_cohort_contract import validate_cohort_layout
 
 MAX_RECORDER_INDEX_BYTES = 16 * 1024 * 1024
+PENDING_QUOTE_WINDOW_NAME = ".recorder-pending-quote-window.json"
+PENDING_QUOTE_WINDOW_SCHEMA = "recorder-pending-quote-window.v1"
 AUTHORIZING_MARKET_DATA_MAX_AGE_SECONDS = 30.0
 SHADOW_COVERAGE_ARM_COUNT = 24
 SHADOW_COVERAGE_FAMILY_COUNT = 12
@@ -62,6 +64,34 @@ def _read_json(path: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _validated_quote_window(root: Path) -> dict | None:
+    """Expose only the bounded, point-in-time retry/deferred marker."""
+    value = _read_json(root / PENDING_QUOTE_WINDOW_NAME)
+    if value.get("schema") != PENDING_QUOTE_WINDOW_SCHEMA:
+        return None
+    policy = value.get("capture_policy")
+    if policy not in {"catch_up", "forward_only"}:
+        return None
+    start = _timestamp_epoch(value.get("start"))
+    end = _timestamp_epoch(value.get("end"))
+    if start is None or end is None or end <= start:
+        return None
+    result = {
+        "schema": PENDING_QUOTE_WINDOW_SCHEMA,
+        "start": str(value["start"]),
+        "end": str(value["end"]),
+        "capture_policy": policy,
+        "recorded": bool(value.get("recorded", False)),
+    }
+    observed_at = value.get("observed_at")
+    if observed_at not in (None, "") and _timestamp_epoch(observed_at) is not None:
+        result["observed_at"] = str(observed_at)
+    reason = value.get("reason")
+    if isinstance(reason, str) and len(reason) <= 120:
+        result["reason"] = reason
+    return result
 
 
 def _status_text(value: object, *, limit: int = 160) -> str | None:
@@ -1013,12 +1043,15 @@ def _recorder_cycle_telemetry(attempt: dict) -> dict:
             "recent_key_incoming_count", "recent_key_expired_count",
             "recent_key_current_count",
             "index_json_save_seconds", "windows_completed", "projected_rows",
-            "session_rows", "unique_rows"):
+            "session_rows", "unique_rows", "bars_durable_rows",
+            "bars_durable_unique_rows", "storage_free_bytes",
+            "storage_reserve_bytes"):
         value = _status_nonnegative_float(raw.get(key))
         if value is not None:
             result[key] = value
     for key in ("bar_request_end_at", "quote_request_end_at", "bars_received_at",
-                "quotes_received_at", "last_bar_market_ts", "last_quote_market_ts"):
+                "quotes_received_at", "bars_durable_at", "last_bar_market_ts",
+                "last_quote_market_ts"):
         value = raw.get(key)
         if isinstance(value, str) and len(value) <= 40:
             try:
@@ -1182,6 +1215,10 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
         "capture_policy": attempt.get("capture_policy") or index.get("capture_policy"),
         "deferred_catchup": (index.get("deferred_catchup")
                              if isinstance(index.get("deferred_catchup"), dict) else None),
+        "pending_quote_window": _validated_quote_window(path),
+        "deferred_quote_window": (index.get("deferred_quote_window")
+                                   if isinstance(index.get("deferred_quote_window"), dict)
+                                   else None),
         "configured_data_feed": (attempt.get("data_feed") or
                                   configured_data_feed),
         "configured_options_feed": (attempt.get("options_feed") or

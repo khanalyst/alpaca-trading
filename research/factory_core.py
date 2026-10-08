@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
-    RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, SESSION_MINUTES,
+    RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, RULE_SCHEMA_V7, SESSION_MINUTES,
     V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS, V4_DEFAULT_EXTENSIONS,
     canonical_exit_reason, completed_bar_exit_transition, evaluate_rule_signal,
     evaluate_rule_signal_trace, frozen_target_reference,
@@ -510,7 +510,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     # v6 is intentionally replayable for diagnostic research while remaining
     # unavailable to engine/live execution through rule_vehicle_executable.
     if (not rule_vehicle_executable(spec, vehicle) and
-            spec.get("schema") != RULE_SCHEMA_V6):
+            spec.get("schema") not in {RULE_SCHEMA_V6, RULE_SCHEMA_V7}):
         reason = ("cross_sectional_residual is executable only for equity shares"
                   if spec["family"] == "cross_sectional_residual" else
                   f"{spec['schema']} is not executable for options")
@@ -778,12 +778,19 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             try:
                 stop, target, distance = quantize_equity_bracket(
                     entry_ref, stop, target, direction)
-            except RiskGeometryError:
+            except RiskGeometryError as exc:
                 return _unpriced(
                     signal_bar, entry_bar, signal_bar.session_date, direction,
                     "broker_tick_geometry_invalid", stage="risk_geometry",
                     decision_timestamp=signal_ready,
-                    entry_timestamp=entry_at)
+                    entry_timestamp=entry_at, telemetry={
+                        "bracket_refusal_detail": str(exc),
+                        "authored_stop_price": authored_stop,
+                        "authored_target_price": authored_target,
+                        "executable_entry_reference": entry_ref,
+                        "authored_stop_floor_bps": spec.get(
+                            "min_stop_distance_bps", MIN_STOP_DISTANCE_BPS),
+                        "target_mutated": False})
         # Resolve the bounded clock once from the same point-in-time entry and
         # policy used by admitted trades.  Rejected-plan metadata below reuses
         # this value; it never scans a future bar or runs the exit transition.
@@ -1283,7 +1290,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
             })
-        if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
+        if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, RULE_SCHEMA_V7}:
             trade_row.update({
                 "initial_stop_price": exit_state["initial_stop_price"],
                 "active_stop_price": exit_state["active_stop_price"],
@@ -1292,7 +1299,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 "target_lookback": exit_state.get("target_lookback"),
                 "exit_before_ts": exit_state.get("exit_before_ts"),
             })
-        if spec.get("schema") == RULE_SCHEMA_V6:
+        if spec.get("schema") in {RULE_SCHEMA_V6, RULE_SCHEMA_V7}:
             trade_row.update({
                 "diagnostic_only": True,
                 "authorizing": False,
@@ -1452,10 +1459,12 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 "reject_reason": "simulation_missing_disposition",
             })
             continue
-        if spec.get("schema") == RULE_SCHEMA_V6 and isinstance(raw, dict):
+        if spec.get("schema") in {RULE_SCHEMA_V6, RULE_SCHEMA_V7} and isinstance(raw, dict):
             raw.update({"diagnostic_only": True, "authorizing": False,
                         "directional_authorizing": False,
                         "rule_vehicle_executable": False})
+            if spec.get("schema") == RULE_SCHEMA_V7:
+                raw["authored_stop_floor_bps"] = spec["min_stop_distance_bps"]
         if raw.get("execution_disposition") == "no_signal":
             row = {"vehicle": vehicle, "symbol": symbol,
                    "session_date": day.isoformat(), "opportunity_id": opportunity,
@@ -2190,7 +2199,7 @@ def _family_exit_hypothesis(root: Mapping[str, Any]) -> dict | None:
     remaining first-batch members retain fixed-R behavior, so an unavailable
     fair-value reference cannot suppress the entire batch.
     """
-    if root.get("schema") not in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
+    if root.get("schema") not in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, RULE_SCHEMA_V7}:
         return None
     family = str(root.get("family") or "")
     if family == "mean_reversion":

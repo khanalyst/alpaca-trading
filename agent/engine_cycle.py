@@ -263,8 +263,7 @@ class EngineCycleMixin:
                     execution_cfg.get("max_market_data_age_seconds", 30) or 30)
                 execution_mode = str(
                     strategy_cfg.get("execution_mode") or "").lower()
-                if (rule_spec["family"] == "cross_sectional_residual" and
-                        not rule_vehicle_executable(rule_spec, execution_mode)):
+                if not rule_vehicle_executable(rule_spec, execution_mode):
                     return False
             except (TypeError, ValueError, OverflowError):
                 return None
@@ -701,12 +700,10 @@ class EngineCycleMixin:
                         configured_bar_age = 30.0
                     execution_mode = str(
                         strategy_cfg.get("execution_mode") or "").lower()
-                    if (rule_spec["family"] == "cross_sectional_residual" and
-                            not rule_vehicle_executable(
-                                rule_spec, execution_mode)):
+                    if not rule_vehicle_executable(rule_spec, execution_mode):
                         self._event("rule_signal_reject", {
                             "symbol": symbol,
-                            "reason": "cross_sectional_requires_equity_shares",
+                            "reason": "rule_vehicle_not_executable",
                             "variant_id": (edge_record or {}).get("variant_id")})
                         continue
                     prepared = _rule_runtime_bars(

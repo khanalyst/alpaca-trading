@@ -635,7 +635,7 @@ class EntryBarVisibilityTests(unittest.TestCase):
         self.assertIsNotNone(trade)
         self.assertEqual(trade["entry_fill_source"], "quote")
 
-    def test_fit_rejects_entry_row_observed_after_entry_boundary(self):
+    def test_fit_measures_delayed_signals_without_claiming_bar_entry_fills(self):
         _raw, bars, _snapshots, _quotes = _read_discovery_rows(edge_corpus(1))
         delayed = [replace(
             bar,
@@ -643,11 +643,19 @@ class EntryBarVisibilityTests(unittest.TestCase):
                              observed_at=bar.end + timedelta(seconds=5)),
         ) for bar in bars]
         diagnostic = measure_fit_diagnostics(delayed, ROOT_SPEC)
-        self.assertEqual(diagnostic["first_signal"]["signals"], 0)
+        self.assertGreater(diagnostic["first_signal"]["signals"], 0)
         prefixes = _fit_prefixes(delayed, ROOT_SPEC)
-        self.assertFalse(prefixes["first_signals"])
-        self.assertEqual(prefixes["eligibility_provenance"]["status"],
-                         "data_incomplete")
+        self.assertTrue(prefixes["first_signals"])
+        self.assertTrue(all(item["entry_pricing"] == "quote_required"
+                            and item["entry_bar_available"] is False
+                            for item in prefixes["first_signals"]))
+        self.assertFalse(diagnostic["authorizing"])
+        # A measured conditional signal still cannot invent an executable
+        # opening print from a delayed completed OHLC row.
+        subject = [bar for bar in delayed if bar.symbol == delayed[0].symbol]
+        refused = _simulate_trade(subject, ROOT_SPEC, [], "equity",
+                                  policy=ReplayPolicy())
+        self.assertEqual(refused["unpriced_reason"], "no fresh equity quote at entry")
 
     def test_randomized_null_and_reference_use_availability_time(self):
         start = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)

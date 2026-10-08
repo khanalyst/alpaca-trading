@@ -45,7 +45,10 @@ class RecorderMeasurementTests(unittest.TestCase):
             "recent_key_incoming_count": 4,
             "recent_key_expired_count": 2,
             "recent_key_current_count": 8,
-            "bars_received_at": stamp, "quotes_received_at": "invalid",
+            "bars_received_at": stamp, "bars_durable_at": stamp,
+            "bars_durable_rows": 3, "bars_durable_unique_rows": 2,
+            "storage_free_bytes": 9_000, "storage_reserve_bytes": 5_000,
+            "quotes_received_at": "invalid",
             "last_bar_market_ts": "2026-09-09T14:30:00",
             "api_key": "must-not-be-exposed", "arbitrary": {"payload": "secret"},
         }}
@@ -60,7 +63,11 @@ class RecorderMeasurementTests(unittest.TestCase):
                     "recent_key_incoming_count": 4.0,
                     "recent_key_expired_count": 2.0,
                     "recent_key_current_count": 8.0,
-                    "bars_received_at": stamp}
+                    "bars_received_at": stamp, "bars_durable_at": stamp,
+                    "bars_durable_rows": 3.0,
+                    "bars_durable_unique_rows": 2.0,
+                    "storage_free_bytes": 9000.0,
+                    "storage_reserve_bytes": 5000.0}
         self.assertEqual(health._recorder_cycle_telemetry(attempt), expected)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -284,6 +291,196 @@ class RecorderQuoteBoundaryTests(unittest.TestCase):
                         list(recorder_market._rows(
                             provider, ["SPY"], started,
                             start=started - timedelta(minutes=1)))
+
+    def test_bar_callback_runs_before_quote_request(self):
+        events = []
+        started = self.started
+
+        class Provider:
+            data_feed = "iex"
+
+            def bars(self, symbols, **kwargs):
+                events.append("bars")
+                return {"SPY": [SimpleNamespace(
+                    timestamp=started.replace(second=0) - timedelta(minutes=1),
+                    open=100, high=101, low=99, close=100, volume=10)]}
+
+            def quotes(self, symbols, **kwargs):
+                events.append("quotes")
+                self.assert_callback()
+                return {"SPY": []}
+
+        provider = Provider()
+        provider.assert_callback = lambda: self.assertEqual(
+            events, ["bars", "callback", "quotes"])
+        with patch.object(recorder_market, "datetime", self.clock):
+            rows = list(recorder_market._rows(
+                provider, ["SPY"], started,
+                start=started - timedelta(minutes=1),
+                on_bars=lambda rows: events.append("callback")))
+        self.assertEqual([row["event_type"] for row in rows], ["bar_1m"])
+        self.assertEqual(events, ["bars", "callback", "quotes"])
+
+    def test_quote_failure_leaves_validated_bars_durable(self):
+        fixed_now = datetime(2026, 9, 9, 14, 31, 10, tzinfo=timezone.utc)
+        bar_stamp = fixed_now - timedelta(minutes=3)
+        quote_stamp = bar_stamp + timedelta(seconds=1)
+        events = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            testcase = self
+
+            class Provider:
+                data_feed = "iex"
+
+                def __init__(self):
+                    self.quote_attempts = 0
+                    self.quote_starts = []
+
+                def bars(self, symbols, **kwargs):
+                    events.append("bars")
+                    return {"SPY": [SimpleNamespace(
+                        timestamp=bar_stamp, open=100, high=101, low=99,
+                        close=100, volume=10)]}
+
+                def quotes(self, symbols, **kwargs):
+                    events.append("quotes")
+                    self.quote_starts.append(kwargs["start"])
+                    self.quote_attempts += 1
+                    durable = list(recorder.iter_corpus_rows(path))
+                    if self.quote_attempts <= 2:
+                        testcase.assertEqual(
+                            [row["event_type"] for row in durable], ["bar_1m"])
+                    if self.quote_attempts == 1:
+                        raise RuntimeError("delayed quote page failed")
+                    return {"SPY": [SimpleNamespace(
+                        timestamp=quote_stamp, bid=100, ask=101, last=100.5)]}
+
+            telemetry = {}
+            provider = Provider()
+            with self.assertRaisesRegex(RuntimeError, "delayed quote page"):
+                recorder.record_once(
+                    provider, ["SPY"], path, now=fixed_now,
+                    telemetry=telemetry)
+            durable = list(recorder.iter_corpus_rows(path))
+            self.assertEqual([row["event_type"] for row in durable], ["bar_1m"])
+            failed_index = recorder._prepare_index(path)
+            self.assertIsNone(failed_index["watermark"])
+            pending = recorder._load_pending_quote_window(path)
+            self.assertEqual(pending["start"],
+                             (fixed_now - timedelta(minutes=3)).isoformat())
+            self.assertEqual(pending["end"],
+                             (fixed_now - timedelta(minutes=2)).isoformat())
+            self.assertEqual(telemetry["bars_durable_rows"], 1)
+            self.assertEqual(telemetry["bars_durable_unique_rows"], 1)
+            self.assertIsNotNone(telemetry["bars_durable_at"])
+            self.assertIsNone(telemetry.get("quotes_received_at"))
+            self.assertLessEqual(
+                datetime.fromisoformat(durable[0]["observed_at"]),
+                datetime.fromisoformat(telemetry["bars_durable_at"]))
+
+            resumed = {}
+            self.assertEqual(
+                recorder.record_once(
+                    provider, ["SPY"], path,
+                    now=fixed_now + timedelta(minutes=5),
+                    telemetry=resumed), 1)
+            self.assertEqual(provider.quote_starts[:2], [
+                fixed_now - timedelta(minutes=3),
+                fixed_now - timedelta(minutes=3),
+            ])
+            durable = list(recorder.iter_corpus_rows(path))
+            self.assertEqual([row["event_type"] for row in durable],
+                             ["bar_1m", "quote"])
+            resumed_index = recorder._prepare_index(path)
+            self.assertEqual(resumed_index["watermark"], quote_stamp.isoformat())
+            self.assertIsNone(recorder._load_pending_quote_window(path))
+
+    def test_storage_reserve_stops_before_fetch_or_append(self):
+        fixed_now = datetime(2026, 9, 9, 14, 31, 10, tzinfo=timezone.utc)
+        calls = []
+
+        class Provider:
+            data_feed = "iex"
+
+            def bars(self, symbols, **kwargs):
+                calls.append("bars")
+                return {}
+
+            def quotes(self, symbols, **kwargs):
+                calls.append("quotes")
+                return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            telemetry = {}
+            with patch.dict("os.environ", {
+                    "ALPACA_RECORDER_MIN_FREE_BYTES": "500"}), \
+                    patch.object(recorder.shutil, "disk_usage",
+                                 return_value=SimpleNamespace(free=499)):
+                with self.assertRaisesRegex(
+                        recorder.RecorderStorageCapacityError,
+                        "storage reserve"):
+                    recorder.record_once(
+                        Provider(), ["SPY"], path, now=fixed_now,
+                        telemetry=telemetry)
+            self.assertEqual(calls, [])
+            self.assertEqual(list(recorder.iter_corpus_rows(path)), [])
+            self.assertFalse((path.parent / recorder.INDEX_NAME).exists())
+            self.assertEqual(recorder._market_data_failure(
+                recorder.RecorderStorageCapacityError("full"),
+                data_feed="iex", options_feed="opra"),
+                ("storage_capacity", False))
+            self.assertEqual(telemetry["storage_free_bytes"], 499)
+            self.assertEqual(telemetry["storage_reserve_bytes"], 500)
+
+    def test_forward_quote_failure_is_retained_as_deferred_window(self):
+        first_now = datetime(2026, 9, 9, 14, 31, 10, tzinfo=timezone.utc)
+        calls = []
+
+        class Provider:
+            data_feed = "iex"
+
+            def bars(self, symbols, **kwargs):
+                stamp = kwargs["end"] - timedelta(minutes=1)
+                return {"SPY": [SimpleNamespace(
+                    timestamp=stamp, open=100, high=101, low=99,
+                    close=100, volume=10)]}
+
+            def quotes(self, symbols, **kwargs):
+                calls.append(kwargs["start"])
+                if len(calls) == 1:
+                    raise RuntimeError("forward quote page failed")
+                stamp = kwargs["end"] - timedelta(seconds=1)
+                return {"SPY": [SimpleNamespace(
+                    timestamp=stamp, bid=100, ask=101, last=100.5)]}
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict("os.environ", {
+                    "ALPACA_RECORDER_CAPTURE_POLICY": "forward_only",
+                    "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "1"}):
+            path = Path(directory) / "market.csv"
+            provider = Provider()
+            with self.assertRaisesRegex(RuntimeError, "forward quote page"):
+                recorder.record_once(provider, ["SPY"], path, now=first_now)
+            self.assertEqual(
+                recorder._load_pending_quote_window(path)["start"],
+                (first_now - timedelta(minutes=1)).isoformat())
+
+            second_now = first_now + timedelta(minutes=5)
+            recorder.record_once(provider, ["SPY"], path, now=second_now)
+            index = recorder._prepare_index(path)
+            self.assertIsNone(recorder._load_pending_quote_window(path))
+            deferred = index["deferred_quote_window"]
+            self.assertEqual(deferred["capture_policy"], "forward_only")
+            self.assertEqual(deferred["reason"], "forward_capture_priority")
+            self.assertEqual(deferred["start"],
+                             (first_now - timedelta(minutes=1)).isoformat())
+            self.assertEqual(calls[:2], [
+                first_now - timedelta(minutes=1),
+                second_now - timedelta(minutes=1),
+            ])
 
 
 if __name__ == "__main__":

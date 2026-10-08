@@ -26,6 +26,7 @@ import math
 import mmap
 import os
 import sqlite3
+import shutil
 import sys
 import tempfile
 import time
@@ -117,6 +118,8 @@ CORPUS_LOCK_NAME = ".recorder.lock"
 STATUS_NAME = ".recorder-status.json"
 STATUS_SCHEMA = "recorder-status.v1"
 CYCLE_TELEMETRY_SCHEMA = "recorder-cycle-telemetry.v1"
+PENDING_QUOTE_WINDOW_SCHEMA = "recorder-pending-quote-window.v1"
+PENDING_QUOTE_WINDOW_NAME = ".recorder-pending-quote-window.json"
 PARTITION_DIR = "sessions"
 PARTITION_SOURCE_SCHEMA = "recorder-partition-source.v1"
 PARTITION_CALENDAR_SCHEMA = "recorder-partition-calendar.v1"
@@ -136,10 +139,15 @@ DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
 MAX_AUTHORIZING_INTERVAL_SECONDS = 30.0
 MAX_DEFERRED_CATCHUP_INTERVALS = 64
+DEFAULT_RECORDER_MIN_FREE_BYTES = 5 * 1024 ** 3
 # Calendar metadata is an audit boundary, not a deduplication cache.  Keep the
 # name for callers that imported the old constant, but do not prune calendar
 # entries by age.
 SESSION_CALENDAR_RETENTION_DAYS = 90
+
+
+class RecorderStorageCapacityError(RuntimeError):
+    """The recorder must stop before consuming the configured disk reserve."""
 
 
 def _initialize_cycle_telemetry(target: dict) -> dict:
@@ -171,6 +179,14 @@ def _initialize_cycle_telemetry(target: dict) -> dict:
         "projected_rows": 0,
         "session_rows": 0,
         "unique_rows": 0,
+        # Source-specific publication evidence.  Receipt timestamps describe
+        # provider availability; these fields describe when validated bars
+        # reached the durable corpus before quote acquisition completed.
+        "bars_durable_at": None,
+        "bars_durable_rows": 0,
+        "bars_durable_unique_rows": 0,
+        "storage_free_bytes": None,
+        "storage_reserve_bytes": None,
         "recent_key_incoming_count": 0,
         "recent_key_expired_count": 0,
         "recent_key_current_count": 0,
@@ -245,6 +261,8 @@ def _save_status(output: Path, payload: dict) -> dict:
 def _market_data_failure(exc: Exception, *, data_feed: str,
                          options_feed: str) -> tuple[str, bool]:
     """Classify permanent entitlement failures separately from outages."""
+    if isinstance(exc, RecorderStorageCapacityError):
+        return "storage_capacity", False
     message = str(exc).strip().lower()
     entitlement_markers = (
         "subscription does not permit",
@@ -274,6 +292,10 @@ def _session_date(value: datetime) -> date:
 
 def _corpus_root(output: Path) -> Path:
     return output.parent
+
+
+def _pending_quote_window_path(output: Path) -> Path:
+    return _corpus_root(output) / PENDING_QUOTE_WINDOW_NAME
 
 
 def _partition_path(output: Path, day: date) -> Path:
@@ -1029,6 +1051,78 @@ def _prune_index(index: dict) -> dict:
     return index
 
 
+def _normalize_quote_window(value: object) -> dict | None:
+    """Validate one bounded quote retry/deferred window sidecar."""
+    if not isinstance(value, dict):
+        return None
+    if value.get("schema") != PENDING_QUOTE_WINDOW_SCHEMA:
+        return None
+    policy = str(value.get("capture_policy") or "").strip()
+    if policy not in {"catch_up", "forward_only"}:
+        return None
+    start = _timestamp(value.get("start"))
+    end = _timestamp(value.get("end"))
+    if start is None or end is None or end <= start:
+        return None
+    normalized = {
+        "schema": PENDING_QUOTE_WINDOW_SCHEMA,
+        "start": start.astimezone(timezone.utc).isoformat(),
+        "end": end.astimezone(timezone.utc).isoformat(),
+        "capture_policy": policy,
+    }
+    observed_at = value.get("observed_at")
+    if observed_at not in (None, ""):
+        parsed_observed = _timestamp(observed_at)
+        if parsed_observed is None:
+            return None
+        normalized["observed_at"] = parsed_observed.astimezone(
+            timezone.utc).isoformat()
+    reason = value.get("reason")
+    if reason not in (None, ""):
+        if not isinstance(reason, str) or len(reason) > 120:
+            return None
+        normalized["reason"] = reason
+    normalized["recorded"] = bool(value.get("recorded", False))
+    return normalized
+
+
+def _load_pending_quote_window(output: Path) -> dict | None:
+    """Read the crash-safe quote retry checkpoint, if it validates."""
+    path = _pending_quote_window_path(output)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return _normalize_quote_window(value)
+
+
+def _save_pending_quote_window(output: Path, value: dict) -> dict:
+    """Atomically publish one bounded quote retry checkpoint."""
+    normalized = _normalize_quote_window(value)
+    if normalized is None:
+        raise RuntimeError("recorder pending quote window is invalid")
+    root = _corpus_root(output)
+    root.mkdir(parents=True, exist_ok=True)
+    path = _pending_quote_window_path(output)
+    temporary = root / (PENDING_QUOTE_WINDOW_NAME + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(normalized, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    _fsync_directory(root)
+    return normalized
+
+
+def _clear_pending_quote_window(output: Path) -> None:
+    path = _pending_quote_window_path(output)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
+
+
 def _update_observation_watermarks(index: dict,
                                    rows: Sequence[Mapping[str, object]]) -> None:
     """Record latest quote/bar availability even when every row is a duplicate."""
@@ -1170,6 +1264,13 @@ def _validate_index(index: object, output: Path, *, require_recent: bool,
     raw_watermark = index.get("watermark")
     if raw_watermark is not None and _timestamp(raw_watermark) is None:
         return None
+    for name in ("pending_quote_window", "deferred_quote_window"):
+        raw_window = index.get(name)
+        if raw_window is not None:
+            normalized_window = _normalize_quote_window(raw_window)
+            if normalized_window is None:
+                return None
+            index[name] = normalized_window
     inline_keys = index.get("recent_keys")
     recent_metadata = index.get("recent_key_index")
     if inline_keys is not None:
@@ -2110,6 +2211,40 @@ def _fetch_window_minutes() -> int:
     return value
 
 
+def _recorder_min_free_bytes() -> int:
+    raw = os.getenv("ALPACA_RECORDER_MIN_FREE_BYTES",
+                    str(DEFAULT_RECORDER_MIN_FREE_BYTES))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "ALPACA_RECORDER_MIN_FREE_BYTES must be a nonnegative integer"
+        ) from exc
+    if value < 0:
+        raise RuntimeError(
+            "ALPACA_RECORDER_MIN_FREE_BYTES must be a nonnegative integer")
+    return value
+
+
+def _storage_preflight(output: Path, telemetry: dict | None = None) -> int:
+    """Fail closed before any provider fetch or durable corpus mutation."""
+    root = _corpus_root(output)
+    reserve = _recorder_min_free_bytes()
+    try:
+        free = int(shutil.disk_usage(root).free)
+    except OSError as exc:
+        raise RecorderStorageCapacityError(
+            f"cannot inspect recorder storage capacity at {root}: {exc}") from exc
+    if telemetry is not None:
+        telemetry["storage_free_bytes"] = free
+        telemetry["storage_reserve_bytes"] = reserve
+    if free < reserve:
+        raise RecorderStorageCapacityError(
+            f"recorder storage reserve is unavailable: {free} free bytes "
+            f"below required {reserve} bytes at {root}")
+    return free
+
+
 def _capture_policy() -> str:
     value = os.getenv("ALPACA_RECORDER_CAPTURE_POLICY", "catch_up")
     if value not in {"catch_up", "forward_only"}:
@@ -2231,8 +2366,13 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
                   bar_gap_policy: str,
                   bar_gap_maximum: timedelta,
                   forward_observation_max_lag: timedelta,
-                  telemetry: dict | None = None):
+                  telemetry: dict | None = None,
+                  advance_watermark: bool = True):
     """Validate and durably append one bounded provider response."""
+    if rows:
+        # Capacity can change while a provider request is in flight. Recheck
+        # immediately before the response's first durable sidecar/CSV write.
+        _storage_preflight(output, telemetry)
     with _timed_cycle_phase(telemetry, "validation_ingest_seconds"):
         coverage = _verify_bar_continuity(
             rows, latest_bars, window_end, symbols, calendar, feed=feed,
@@ -2273,7 +2413,7 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
             unique_keys.add(key)
             unique_rows.append(row)
             recent_entries.append((key, parsed.isoformat()))
-            if watermark is None or parsed > watermark:
+            if advance_watermark and (watermark is None or parsed > watermark):
                 watermark = parsed
             if row.get("event_type") in {"bar", "bar_1m"}:
                 symbol = str(row.get("symbol") or "")
@@ -2284,7 +2424,8 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
                     latest_bars[symbol] = parsed
 
         index["option_pins"] = pins
-        index["watermark"] = watermark.isoformat() if watermark else None
+        if advance_watermark:
+            index["watermark"] = watermark.isoformat() if watermark else None
         index = _prune_index(index)
     if rows:
         if unique_rows:
@@ -2361,6 +2502,9 @@ def _record_once_locked(provider: AlpacaProvider, symbols: list[str], output: Pa
         include_options = any(str(value).lower() in {"us_option", "option"}
                               for value in classes)
     _corpus_root(output).mkdir(parents=True, exist_ok=True)
+    # Check capacity before migration, index rebuild, provider access, or any
+    # sidecar write.  A recorder outage must never become an ENOSPC append.
+    _storage_preflight(output, telemetry)
     with _timed_cycle_phase(telemetry, "corpus_migration_seconds"):
         migrate_corpus(output)
     with _timed_cycle_phase(telemetry, "index_preparation_seconds"):
@@ -2425,6 +2569,34 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
         raise RuntimeError("recorder dataset watermark is in the future")
     index["capture_policy"] = capture_policy
     window = timedelta(minutes=_fetch_window_minutes())
+    pending_window = _load_pending_quote_window(output)
+    # Catch-up retries must replay the exact bounded request that was
+    # checkpointed before bar publication. Forward-only capture deliberately
+    # does not backfill a failed historical/current window; retain a bounded
+    # diagnostic marker instead.
+    deferred_transitioned = False
+    if (pending_window is not None and
+            pending_window["capture_policy"] != capture_policy):
+        index["deferred_quote_window"] = {
+            **pending_window,
+            "reason": "capture_policy_changed",
+            "recorded": False,
+        }
+        pending_window = None
+        deferred_transitioned = True
+    elif pending_window is not None and capture_policy == "forward_only":
+        index["deferred_quote_window"] = {
+            **pending_window,
+            "reason": "forward_capture_priority",
+            "recorded": False,
+        }
+        pending_window = None
+        deferred_transitioned = True
+    if deferred_transitioned:
+        with _timed_cycle_phase(telemetry, "durable_save_seconds"):
+            _save_index(output, index, recent_store=recent_store,
+                        telemetry=telemetry)
+        _clear_pending_quote_window(output)
     if capture_policy == "forward_only":
         # Always observe exactly the newest configured window. Repeated cycles
         # overlap naturally; recorder_market additionally rounds only the bar
@@ -2433,8 +2605,13 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
     else:
         # Catch-up resumes from durable data. The one-minute overlap makes
         # retries safe while event-key deduplication removes duplicates.
-        start = (watermark - timedelta(minutes=1)
-                 if watermark is not None else now - timedelta(minutes=3))
+        start = (
+            _timestamp(pending_window["start"])
+            if pending_window is not None else
+            (watermark - timedelta(minutes=1)
+             if watermark is not None else now - timedelta(minutes=3)))
+        if start is None:
+            raise RuntimeError("recorder pending quote window has no start")
     with _timed_cycle_phase(telemetry, "calendar_preparation_seconds"):
         _record_session_calendar(index, calendar, start, now, output)
     forward_open_window = None
@@ -2465,8 +2642,22 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
     completed_windows = 0
     maximum_windows = _max_windows_per_cycle()
     while True:
+        retry_window_end = None
+        if (pending_window is not None and capture_policy == "catch_up" and
+                cursor == start):
+            retry_window_end = _timestamp(pending_window["end"])
+            if (retry_window_end is None or retry_window_end <= cursor or
+                    retry_window_end > now + timedelta(seconds=5) or
+                    retry_window_end - cursor > window):
+                # A malformed/stale checkpoint must not widen a fetch. The
+                # normal bounded catch-up calculation remains authoritative.
+                pending_window = None
+                _clear_pending_quote_window(output)
+                retry_window_end = None
         if require_exact_calendar:
             request_window = (
+                (cursor, retry_window_end)
+                if retry_window_end is not None else
                 forward_open_window
                 if capture_policy == "forward_only" else
                 _next_exact_session_window(cursor, now, window, calendar))
@@ -2474,7 +2665,21 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                 break
             cursor, window_end = request_window
         else:
-            window_end = min(cursor + window, now)
+            window_end = min(retry_window_end or cursor + window, now)
+        if window_end <= cursor:
+            break
+        # Persist the quote request boundary before bars can be committed.
+        # If either network call or strict row validation fails, the next
+        # catch-up cycle can replay this exact bounded interval.
+        with _timed_cycle_phase(telemetry, "durable_save_seconds"):
+            _save_pending_quote_window(output, {
+                "schema": PENDING_QUOTE_WINDOW_SCHEMA,
+                "start": cursor.astimezone(timezone.utc).isoformat(),
+                "end": window_end.astimezone(timezone.utc).isoformat(),
+                "capture_policy": capture_policy,
+                "observed_at": now.astimezone(timezone.utc).isoformat(),
+                "recorded": False,
+            })
         quote_end_limit = None
         refresh_current_quotes = bool(refresh_quote_end and window_end >= now)
         if refresh_quote_end and calendar is not None:
@@ -2483,6 +2688,37 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                 quote_end_limit = session.close.astimezone(timezone.utc)
             else:
                 refresh_current_quotes = False
+        published_bar_keys: set[str] = set()
+
+        def publish_bars(projected: list[dict]) -> None:
+            """Commit one complete bar response before requesting quotes."""
+            nonlocal index, watermark, latest_bars, pins, total_unique
+            if not projected:
+                return
+            bar_rows = _recorded_session_rows(
+                index, projected,
+                require_exact_calendar=require_exact_calendar)
+            if not bar_rows:
+                return
+            index, watermark, latest_bars, pins, unique = _ingest_chunk(
+                output, index, recent_store, watermark, latest_bars, pins,
+                bar_rows, symbols, window_end, now, option_hold, horizon,
+                calendar, feed=resolved_feed, bar_gap_policy=bar_gap_policy,
+                bar_gap_maximum=bar_gap_maximum,
+                forward_observation_max_lag=forward_observation_max_lag,
+                telemetry=telemetry, advance_watermark=False)
+            published_bar_keys.update(
+                str(row.get("event_key") or "") for row in bar_rows)
+            total_unique += unique
+            _increment_cycle_telemetry(telemetry, "unique_rows", unique)
+            if telemetry is not None:
+                telemetry["bars_durable_at"] = datetime.now(
+                    timezone.utc).isoformat()
+                telemetry["bars_durable_rows"] = int(
+                    telemetry.get("bars_durable_rows", 0) or 0) + len(bar_rows)
+                telemetry["bars_durable_unique_rows"] = int(
+                    telemetry.get("bars_durable_unique_rows", 0) or 0) + unique
+
         with _timed_cycle_phase(telemetry, "fetch_projection_seconds"):
             fetched_rows = list(_rows(
                 provider, symbols, window_end, feed=resolved_feed, config=config,
@@ -2496,7 +2732,8 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                 option_limit=option_limit,
                 start=cursor, option_pins=frozenset(pins), observed_at=now,
                 refresh_quote_end=refresh_current_quotes,
-                quote_end_limit=quote_end_limit, telemetry=telemetry))
+                quote_end_limit=quote_end_limit, telemetry=telemetry,
+                on_bars=publish_bars))
         total_rows += len(fetched_rows)
         _increment_cycle_telemetry(
             telemetry, "projected_rows", len(fetched_rows))
@@ -2505,6 +2742,11 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                 index, fetched_rows,
                 require_exact_calendar=require_exact_calendar)
         _increment_cycle_telemetry(telemetry, "session_rows", len(rows))
+        # The callback above already committed the complete bar response.  The
+        # final ingest therefore contains only quotes/options, preserving the
+        # existing source-specific atomic boundary without writing bars twice.
+        rows = [row for row in rows
+                if str(row.get("event_key") or "") not in published_bar_keys]
         index, watermark, latest_bars, pins, unique = _ingest_chunk(
             output, index, recent_store, watermark, latest_bars, pins, rows, symbols,
             window_end, now, option_hold, horizon, calendar,
@@ -2512,6 +2754,10 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             bar_gap_maximum=bar_gap_maximum,
             forward_observation_max_lag=forward_observation_max_lag,
             telemetry=telemetry)
+        # The complete quote response (including strict validation and durable
+        # ingest) has succeeded. It is now safe to retire the retry checkpoint.
+        if _load_pending_quote_window(output) is not None:
+            _clear_pending_quote_window(output)
         total_unique += unique
         completed_windows += 1
         _increment_cycle_telemetry(telemetry, "unique_rows", unique)

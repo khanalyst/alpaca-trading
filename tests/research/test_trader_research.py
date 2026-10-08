@@ -128,11 +128,30 @@ class TraderResearchRunnerTests(unittest.TestCase):
             return_value={"schema": "trader-diagnostics.v1",
                           "diagnostic_only": True,
                           "authorizing": False}))
+        signal_ids = [arm["variant_id"] for arm in inventory["arms"]
+                      if arm["role"] in {
+                          "new_mechanism", "cost_compatible_mechanism"}]
+        signal_calls = []
+        def signal_quality(*args, **kwargs):
+            index = len(signal_calls)
+            signal_calls.append((args, kwargs))
+            return {
+                "schema": "signal-quality.v1",
+                "variant_id": signal_ids[index],
+                "measurement_scope": (
+                    "previously_examined_retrospective_diagnostic"),
+                "horizons": [5, 15, 30, 60],
+                "diagnostic_only": True,
+                "authorizing": False,
+            }
         stack.enter_context(patch.object(
             research, "measure_signal_quality",
-            return_value={"schema": "signal-quality.v1",
-                          "diagnostic_only": True,
-                          "authorizing": False}))
+            side_effect=signal_quality))
+        stack.enter_context(patch.object(
+            research, "_fit_prefixes", return_value={
+                "first_signals": [{"symbol": "SPY", "session": "2026-01-05"}],
+                "eligibility_provenance": {"total_prefixes": 37,
+                                            "mature_prefixes": 30}}))
         stack.enter_context(patch.object(
             research, "_WORKER", {"bars": [], "policy": {}}))
 
@@ -176,6 +195,15 @@ class TraderResearchRunnerTests(unittest.TestCase):
             self.assertEqual(len(receipt["results"]), 55)
             self.assertEqual(len(receipt["components"]), 55)
             self.assertEqual(len(receipt["signal_quality"]), 12)
+            self.assertEqual(receipt["signal_quality_count"], 12)
+            self.assertEqual(receipt["signal_quality_variant_ids"], [
+                arm["variant_id"] for arm in inventory["arms"]
+                if arm["role"] == "new_mechanism"])
+            handed = research.measure_signal_quality.call_args.kwargs
+            self.assertEqual(handed["eligibility_provenance"]["total_prefixes"], 37)
+            self.assertEqual(handed["precomputed_first_signals"][0]["symbol"], "SPY")
+            self.assertEqual(handed["measurement_scope"],
+                             "previously_examined_retrospective_diagnostic")
 
             result_path = output / "result.json"
             result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -193,6 +221,103 @@ class TraderResearchRunnerTests(unittest.TestCase):
                                  "unsealed_partial_diagnostic")
                 self.assertFalse(component["authorizing"])
                 self.assertTrue(component["diagnostic_only"])
+
+    def test_rule_worker_is_released_before_strict_ibr_allocates(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            self._common_patches(stack, _inventory())
+            stack.enter_context(patch.object(
+                research, "_evaluate_arm", side_effect=lambda arm: {
+                    **arm, "outcome": "no_signal", "rows": []}))
+            events = []
+            research._close_worker.side_effect = lambda: events.append("closed")
+            def ibr(*args, **kwargs):
+                self.assertEqual(events, ["closed"])
+                events.append("ibr")
+                return {"status": "unavailable"}
+            research.run_offline_forward_ibr.side_effect = ibr
+            data = Path(directory) / "market.jsonl"
+            data.write_text("synthetic\n")
+            research.run(data, Path(directory) / "run", runtime_config={},
+                         signal_quality=True)
+            self.assertEqual(events, ["closed", "ibr", "closed"])
+
+    def test_additive_cost_inventory_preserves_all_55_frozen_comparisons(self):
+        config = load_config(Path("config.yaml"))
+        original = research.frozen_inventory(config, "a" * 64)
+        expanded = research.frozen_inventory(config, "a" * 64,
+                                             include_cost_compatible=True)
+        self.assertEqual(expanded["arms"][:55], original["arms"])
+        self.assertEqual(expanded["registered_arms"], 67)
+        self.assertEqual(len({arm["variant_id"] for arm in expanded["arms"]}), 67)
+        self.assertTrue(all(arm["role"] == "cost_compatible_mechanism"
+                            for arm in expanded["arms"][55:]))
+
+    def test_additive_scope_requires_signal_quality(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            self._common_patches(stack, _inventory())
+            data = Path(directory) / "market.jsonl"
+            data.write_text("synthetic\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "signal_quality=True"):
+                research.run(
+                    data, Path(directory) / "run", runtime_config={},
+                    signal_quality=False, include_cost_compatible=True,
+                    evaluation_scope="additive_geometry")
+
+    def test_additive_run_binds_baseline_and_measures_only_new_geometry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, projection_dir, manifest = _small_projection(root)
+            with patch.object(
+                    research, "_code_bundle_hash",
+                    side_effect=["a" * 64, "a" * 64,
+                                 "b" * 64, "b" * 64]):
+                baseline = research.run(
+                    manifest["compact_jsonl"], root / "baseline",
+                    runtime_config=config, signal_quality=False,
+                    ibr_max_events=10,
+                    projection_manifest=projection_dir / "manifest.json")
+                current = research.run(
+                    manifest["compact_jsonl"], root / "additive",
+                    runtime_config=config, signal_quality=True,
+                    include_cost_compatible=True,
+                    evaluation_scope="additive_geometry",
+                    baseline_result=root / "baseline/result.json",
+                    projection_manifest=projection_dir / "manifest.json")
+            self.assertEqual(current["registered_arms"], 67)
+            self.assertEqual(current["evaluated_arms"], 12)
+            self.assertEqual(len(current["components"]), 12)
+            self.assertEqual(len(current["not_recomputed_variant_ids"]), 55)
+            self.assertEqual(len(current["not_recomputed_execution_variant_ids"]), 55)
+            self.assertEqual(current["not_recomputed_execution_count"], 55)
+            self.assertEqual(len(current["signal_quality"]), 24)
+            self.assertEqual(current["signal_quality_count"], 24)
+            self.assertEqual(
+                current["signal_quality_variant_ids"],
+                [arm["variant_id"] for arm in research.frozen_inventory(
+                    config, "b" * 64, include_cost_compatible=True)["arms"]
+                 if arm["role"] in {
+                     "new_mechanism", "cost_compatible_mechanism"}],
+            )
+            self.assertEqual(current["baseline_comparison"]["content_hash"],
+                             baseline["content_hash"])
+            self.assertNotEqual(current["code_hash"],
+                                current["baseline_comparison"]["code_hash"])
+            self.assertEqual(current["ibr_runtime"]["status"], "not_recomputed")
+            self.assertFalse(current["authorizing"])
+            self.assertEqual(current["proofs"], [])
+            for ref in current["signal_quality"]:
+                quality = json.loads((root / "additive" / ref["path"]).read_text())
+                self.assertEqual(quality["scope"],
+                                 "previously_examined_retrospective_diagnostic")
+            path = root / "baseline/result.json"
+            tampered = json.loads(path.read_text())
+            tampered["selection"] = "winner"
+            path.write_text(json.dumps(tampered))
+            with self.assertRaisesRegex(ValueError, "sealed non-authorizing"):
+                research.run(manifest["compact_jsonl"], root / "rejected",
+                    runtime_config=config, include_cost_compatible=True,
+                    evaluation_scope="additive_geometry", baseline_result=path)
+            self.assertFalse((root / "rejected").exists())
 
     def test_mid_run_failure_keeps_partial_components_and_blocks_final_result(self):
         inventory = _inventory()

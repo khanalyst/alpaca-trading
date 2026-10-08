@@ -400,7 +400,8 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
           observed_at: datetime | None = None,
           refresh_quote_end: bool = False,
           quote_end_limit: datetime | None = None,
-          telemetry: dict | None = None):
+          telemetry: dict | None = None,
+          on_bars=None):
     start = start or now - timedelta(minutes=3)
     if start.tzinfo is None or start.utcoffset() is None or start > now:
         raise ValueError("recorder start must be an aware timestamp at or before now")
@@ -432,27 +433,16 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     if telemetry is not None:
         telemetry["bars_received_at"] = bars_received.isoformat()
         telemetry["quote_request_end_at"] = quote_end.isoformat()
-    with _market_phase(telemetry, "quotes_fetch_seconds"):
-        quotes = _call_quotes(provider.quotes, symbols, start=start, end=quote_end,
-                              feed=feed)
-    # ``now`` is the requested window end captured before network I/O. The
-    # observation timestamp must reflect when the responses were actually
-    # available or a quote arriving during the request can incorrectly have
-    # as_of > observed_at.
-    quotes_received = datetime.now(timezone.utc)
     # Keep each source's causal receipt boundary. Bars can finish well before
     # a paginated quote response; assigning every row the later quote receipt
     # makes the bar's first observation appear artificially late. The caller's
     # explicit boundary still wins when it is later than the receipt.
     base_observation = observed_at or now
     bars_observation = max(base_observation, bars_received)
-    quotes_observation = max(base_observation, quotes_received)
-    if telemetry is not None:
-        telemetry["quotes_received_at"] = quotes_received.isoformat()
     observed_bar = bars_observation.isoformat()
-    observed_quote = quotes_observation.isoformat()
     projection_started = time.perf_counter()
     latest_bar = latest_quote = None
+    bar_rows = []
     for raw_symbol, values in bars.items():
         symbol = validate_equity_symbol(raw_symbol)
         for bar in values:
@@ -471,7 +461,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             if bar_complete > now:
                 continue
             latest_bar = max(latest_bar or bar_start, bar_start)
-            yield {
+            bar_rows.append({
                 "event_key": _event_key("bar_1m", symbol, timestamp),
                 "observed_at": observed_bar, "provider": "alpaca",
                 "feed": bar_feed,
@@ -481,7 +471,26 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
                 "high": _value(bar.high), "low": _value(bar.low),
                 "close": _value(bar.close), "volume": _value(bar.volume),
                 "bid": "", "ask": "", "last": "",
-            }
+            })
+    # A complete, validated bar response is a durable publication boundary.
+    # The callback lets the recorder commit this bounded source before the
+    # potentially paginated quote request starts.  Existing callers still see
+    # the same rows below, so this is an additive latency seam.
+    if callable(on_bars):
+        on_bars(list(bar_rows))
+    yield from bar_rows
+    with _market_phase(telemetry, "quotes_fetch_seconds"):
+        quotes = _call_quotes(provider.quotes, symbols, start=start, end=quote_end,
+                              feed=feed)
+    # ``now`` is the requested window end captured before network I/O. The
+    # observation timestamp must reflect when the responses were actually
+    # available or a quote arriving during the request can incorrectly have
+    # as_of > observed_at.
+    quotes_received = datetime.now(timezone.utc)
+    quotes_observation = max(base_observation, quotes_received)
+    if telemetry is not None:
+        telemetry["quotes_received_at"] = quotes_received.isoformat()
+    observed_quote = quotes_observation.isoformat()
     for raw_symbol, values in quotes.items():
         symbol = validate_equity_symbol(raw_symbol)
         for quote in values:

@@ -72,6 +72,18 @@ class ConditionalForwardReturnTests(unittest.TestCase):
             five["mean_forward_return_bps"] - 17.0)
         self.assertEqual(five["candidate_count"], five["matched_count"])
 
+    def test_measurement_scope_is_explicit_and_validated(self):
+        result = measure_signal_quality(
+            self.bars, ROOT_SPEC, horizons=(5,),
+            measurement_scope="previously_examined_retrospective_diagnostic")
+        self.assertEqual(result["scope"],
+                         "previously_examined_retrospective_diagnostic")
+        self.assertEqual(result["timing_policy"]["measurement_scope"],
+                         result["scope"])
+        with self.assertRaises(ValueError):
+            measure_signal_quality(self.bars, ROOT_SPEC,
+                                   measurement_scope="validation")
+
     def test_session_clustered_inference_accompanies_every_control_delta(self):
         result = measure_signal_quality(
             self.bars, ROOT_SPEC, policy=self.policy, cost_hurdle_bps=17.0)
@@ -216,6 +228,89 @@ class ConditionalForwardReturnTests(unittest.TestCase):
                          "data_ineligible")
         self.assertNotEqual(
             quality["event_rejection_counts"], {"no_actionable_signal": 16})
+
+    def test_normal_one_second_recorder_delay_keeps_causal_signal_outcome_and_control(self):
+        delayed = [replace(
+            row,
+            identity=replace(row.identity,
+                             observed_at=row.end + timedelta(seconds=1)),
+        ) for row in self.bars]
+        result = measure_signal_quality(
+            delayed, ROOT_SPEC, policy=self.policy, horizons=(5,))
+        metrics = result["horizon_metrics"]["5m"]
+        self.assertGreater(result["event_count"], 0)
+        self.assertGreater(metrics["candidate_count"], 0)
+        self.assertGreater(metrics["matched_count"], 0)
+        self.assertEqual(
+            metrics["candidate_decision_delay_seconds"]["mean_seconds"], 1.0)
+        self.assertEqual(
+            metrics["candidate_outcome_observation_delay_seconds"]["mean_seconds"],
+            1.0)
+        self.assertEqual(
+            metrics["control_decision_delay_seconds"]["mean_seconds"], 1.0)
+        self.assertEqual(
+            metrics["control_outcome_observation_delay_seconds"]["mean_seconds"],
+            1.0)
+        self.assertEqual(result["timing_policy"]["entry_semantics"],
+                         "conditional_signal_close_anchor")
+
+    def test_delayed_entry_selection_does_not_shift_wall_clock_horizon(self):
+        rows = [row for row in self.bars
+                if row.symbol == self.bars[0].symbol and
+                row.session_date == self.bars[0].session_date]
+        delayed = [replace(
+            row,
+            identity=replace(row.identity,
+                             observed_at=row.end + timedelta(seconds=1)),
+        ) for row in rows]
+        baseline = measure_signal_quality(rows, ROOT_SPEC, horizons=(5,))
+        result = measure_signal_quality(delayed, ROOT_SPEC, horizons=(5,))
+        self.assertEqual(
+            baseline["horizon_metrics"]["5m"]["mean_forward_return_bps"],
+            result["horizon_metrics"]["5m"]["mean_forward_return_bps"])
+        event, reason = _first_event(
+            delayed, ROOT_SPEC, allow_backfill=False)
+        self.assertIsNone(reason)
+        self.assertGreater(event["entry_index"], event["signal_index"] + 1)
+
+    def test_late_signal_cannot_reuse_outcome_that_closed_before_decision(self):
+        rows = [row for row in self.bars
+                if row.symbol == self.bars[0].symbol and
+                row.session_date == self.bars[0].session_date]
+        delayed = list(rows)
+        signal_index = 15
+        delayed[signal_index] = replace(
+            delayed[signal_index],
+            identity=replace(
+                delayed[signal_index].identity,
+                observed_at=delayed[signal_index].end + timedelta(minutes=10),
+            ),
+        )
+        result = measure_signal_quality(delayed, ROOT_SPEC, horizons=(5,))
+        metrics = result["horizon_metrics"]["5m"]
+        self.assertEqual(result["event_count"], 1)
+        self.assertEqual(metrics["candidate_count"], 0)
+        self.assertEqual(
+            metrics["unavailable_reason_counts"],
+            {"future_bar_unavailable": 1})
+
+    def test_unresolved_revision_marker_is_refused_closed(self):
+        class VersionedRow:
+            def __init__(self, base):
+                self._base = base
+                self.version = "v2"
+
+            def __getattr__(self, name):
+                return getattr(self._base, name)
+
+        revised = [VersionedRow(row) for row in self.bars]
+        result = measure_signal_quality(revised, ROOT_SPEC, horizons=(5,))
+        self.assertEqual(result["event_count"], 0)
+        self.assertEqual(
+            result["event_rejection_counts"], {"revision_unresolved": 16})
+        self.assertEqual(
+            result["eligibility_provenance"]["reason_counts"].get(
+                "revision_unresolved"), 16)
 
 
 class ControlPrefixTests(unittest.TestCase):

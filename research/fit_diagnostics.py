@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS,
+    RULE_SCHEMA_V7,
     cross_sectional_symbol_eligibility,
     evaluate_rule_signal_metadata,
     evaluate_rule_signal_trace, feature_window_bars, rule_variant_id,
@@ -34,6 +35,7 @@ from .market_data import (historical_backfill_record, record_available_at,
 from .maturity import causal_maturity_bars
 from .stats import clustered_mde_power_report
 from .signal_quality import (SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
+                              _row_has_revision_marker,
                               measure_signal_quality)
 from .path_telemetry import (
     aggregate_path_telemetry, aggregate_pre_admission_path_telemetry,
@@ -567,6 +569,7 @@ _PREFIX_DATA_INELIGIBLE_REASONS = frozenset({
 _PREFIX_DATA_INCOMPLETE_REASONS = frozenset({
     "insufficient_history", "signal_end_unavailable", "feature_gap",
     "entry_not_adjacent", "entry_bar_unavailable", "invalid_session",
+    "revision_unresolved",
 })
 
 
@@ -776,6 +779,10 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 prefix_status["historical_backfill_excluded"] += 1
                 cell_status["historical_backfill_excluded"] += 1
                 continue
+            if any(_row_has_revision_marker(item) for item in feature_rows):
+                prefix_status["revision_unresolved"] += 1
+                cell_status["revision_unresolved"] += 1
+                continue
             available = [replay_available_at(
                             item,
                             allow_historical_backfill_diagnostics=allow_backfill)
@@ -809,17 +816,10 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 cell_status["entry_bar_unavailable"] += 1
                 continue
             entry = rows[entry_index]
-            entry_cutoff = _bar_end(entry) or _timestamp(entry)
-            if not replay_record_is_available(
-                    entry, entry_cutoff,
-                    allow_historical_backfill_diagnostics=allow_backfill):
-                # The selected immediate entry row is part of the causal
-                # hand-off.  Do not mark a signal prefix eligible when that
-                # row cannot be observed under the same policy used by the
-                # direct signal-quality path.
-                prefix_status["entry_bar_unavailable"] += 1
-                cell_status["entry_bar_unavailable"] += 1
-                continue
+            # Keep the selected row as decision/entry provenance, but do not
+            # require its completed OHLC to have arrived by its own market end.
+            # Signal quality anchors returns to the observable signal close;
+            # delayed entry-bar OHLC remains quote-required metadata below.
             eligible_prefixes += 1
             cell_eligible += 1
             prefix_status["eligible"] += 1
@@ -834,7 +834,9 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                     rows[:index + 1], spec, bars_by_symbol=context,
                     symbol=symbol)
             else:
-                trace = evaluate_rule_signal_trace(rows[:index + 1], spec)
+                trace = evaluate_rule_signal_trace(
+                    rows[:index + 1], spec, bars_by_symbol=market_context,
+                    symbol=symbol)
             stages = trace.get("stages") or []
             for item in stages:
                 name = str(item.get("stage") or "unknown")
@@ -857,7 +859,9 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                     rows[:index + 1], spec, bars_by_symbol=context,
                     symbol=symbol)
                     if spec["family"] == "cross_sectional_residual" else
-                    evaluate_rule_signal_metadata(rows[:index + 1], spec))
+                    evaluate_rule_signal_metadata(
+                        rows[:index + 1], spec, bars_by_symbol=market_context,
+                        symbol=symbol))
             else:
                 metadata = None
             if metadata is not None:
@@ -903,7 +907,7 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                        next((reason for reason in (
                            "historical_backfill_excluded", "feature_unavailable",
                            "entry_bar_unavailable", "entry_not_adjacent",
-                           "feature_gap", "invalid_session",
+                           "feature_gap", "revision_unresolved", "invalid_session",
                            "signal_end_unavailable", "insufficient_history")
                             if cell_status.get(reason)),
                             "data_incomplete")),
@@ -1441,6 +1445,12 @@ def measure_fit_diagnostics(
     eligible = int(prefix["eligible_prefixes"])
     total = int(prefix["total_prefixes"])
     floor_count = sum(bool(item.get("floor_binding")) for item in signals)
+    authored_floor_bps = (
+        float(normalized["min_stop_distance_bps"])
+        if normalized.get("schema") == RULE_SCHEMA_V7 else None)
+    effective_floor_bps = (
+        authored_floor_bps
+        if authored_floor_bps is not None else float(MIN_STOP_DISTANCE_BPS))
     atr_values = [item.get("atr_bps") for item in signals]
     planned = {
         "stop_distance": _quantiles([item.get("planned_stop_distance") for item in signals]),
@@ -1578,11 +1588,25 @@ def measure_fit_diagnostics(
         "signal_quality": signal_quality,
         "expected_cost": expected_cost,
         "atr_bps": _quantiles(atr_values),
-        "floor_30bps": {
-            "bps": float(MIN_STOP_DISTANCE_BPS),
-            "binding": floor_count, "signals": len(signals),
-            "rate": floor_count / len(signals) if signals else 0.0,
-        },
+        **({
+            # Keep the legacy spelling for pre-V7 diagnostics.  V7 carries
+            # its authored geometry under the versioned section below so a
+            # 30 bps label cannot misdescribe a wider diagnostic floor.
+            "floor_30bps": {
+                "bps": float(MIN_STOP_DISTANCE_BPS),
+                "binding": floor_count, "signals": len(signals),
+                "rate": floor_count / len(signals) if signals else 0.0,
+            },
+        } if authored_floor_bps is None else {
+            "authored_stop_floor_bps": {
+                "bps": authored_floor_bps,
+                "binding": floor_count, "signals": len(signals),
+                "rate": floor_count / len(signals) if signals else 0.0,
+                "schema": RULE_SCHEMA_V7,
+                "authorizing": False,
+                "diagnostic_only": True,
+            },
+        }),
         "planned": planned,
         "vehicle": resolved_vehicle,
         "provenance": provenance,
@@ -1597,10 +1621,10 @@ def measure_fit_diagnostics(
             "scenario_bps": stress_scenario,
             "limit": stress_limit,
             "required_static_stop_distance_bps": required_stop_bps,
-            "grammar_stop_floor_bps": float(MIN_STOP_DISTANCE_BPS),
+            "grammar_stop_floor_bps": effective_floor_bps,
             "grammar_stop_floor_admissible": (
                 None if required_stop_bps is None else
-                float(MIN_STOP_DISTANCE_BPS) >= required_stop_bps),
+                effective_floor_bps >= required_stop_bps),
             "configured_stress": {
                 "scenario_bps": stress_scenario,
                 "max_cost_to_risk_ratio": stress_limit,
@@ -1694,7 +1718,9 @@ def measure_fit_diagnostics(
     }
     # Stable descriptive aliases keep downstream reports readable while the
     # canonical sections above remain versioned and compact.
-    fit_diagnostics["30bps_floor_binding"] = dict(fit_diagnostics["floor_30bps"])
+    if authored_floor_bps is None:
+        fit_diagnostics["30bps_floor_binding"] = dict(
+            fit_diagnostics["floor_30bps"])
     fit_diagnostics["planned_effective"] = dict(planned)
     fit_diagnostics["cost_to_risk_stressed"] = dict(stressed)
     return fit_diagnostics
@@ -1888,6 +1914,11 @@ def audit_exit_grammar(spec: Mapping[str, Any] | None = None) -> dict[str, Any]:
         normalized = None
     breakeven = (normalized.get("breakeven_r")
                  if isinstance(normalized, Mapping) else None)
+    floor_bps = (
+        float(normalized["min_stop_distance_bps"])
+        if isinstance(normalized, Mapping) and
+        normalized.get("schema") == RULE_SCHEMA_V7 else
+        float(MIN_STOP_DISTANCE_BPS))
     unsupported = sorted(
         str(key) for key in candidate
         if any(marker in str(key).lower() for marker in (
@@ -1899,7 +1930,8 @@ def audit_exit_grammar(spec: Mapping[str, Any] | None = None) -> dict[str, Any]:
                    else "fixed-atr-floor-bracket-r-target-bar-cap.v1"),
         "supported_exit_modes": [
             "atr_floor_bracket", "r_target", "bar_cap"],
-        "bracket": "ATR stop with 30 bps floor",
+        "bracket": f"ATR stop with {floor_bps:g} bps floor",
+        "stop_floor_bps": floor_bps,
         "target": "configured R multiple",
         "hold_cap": "configured max_hold_bars",
         "executable_exit_templates_added": breakeven is not None,

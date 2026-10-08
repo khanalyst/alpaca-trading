@@ -42,6 +42,10 @@ _DATA_INELIGIBLE_REASONS = frozenset({
 _DATA_INCOMPLETE_REASONS = frozenset({
     "insufficient_history", "signal_end_unavailable", "feature_gap",
     "entry_not_adjacent", "entry_bar_unavailable", "invalid_session",
+    "revision_unresolved",
+})
+_MEASUREMENT_SCOPES = frozenset({
+    "fit_only", "previously_examined_retrospective_diagnostic",
 })
 # Intraday returns carry strong time-of-day structure, and every family in the
 # catalog fires on a concentrated part of the session: opening-anchored rules
@@ -152,6 +156,98 @@ def _contiguous(rows: Sequence[Any], start: int, stop: int) -> bool:
                for left, right in zip(stamps, stamps[1:]))
 
 
+def _row_has_revision_marker(row: Any) -> bool:
+    """Refuse unresolved revision/version metadata in a causal prefix.
+
+    The normalized market records do not carry a revision field.  Raw mapping
+    callers sometimes do, however, and treating a versioned row as the final
+    observation would make the result depend on an unresolved correction.  A
+    resolved stream should project one clean row per market timestamp before
+    it reaches this diagnostic.
+    """
+    for name in ("revision", "revision_id", "version", "version_id",
+                 "supersedes", "superseded_by", "correction", "is_revision"):
+        value = _value(row, name)
+        if value is not None and value != "" and not (
+                isinstance(value, bool) and value is False):
+            return True
+    return False
+
+
+def _completed_record_is_available(
+        row: Any, *, allow_backfill: bool,
+        decision_at: datetime | None = None,
+        ) -> tuple[bool, str | None, datetime | None]:
+    """Resolve completed-bar visibility on the observation clock.
+
+    ``replay_record_is_available(row, row.end)`` asks whether a record arrived
+    by its market end.  Ordinary recorder rows may arrive a second after the
+    end, while normalized historical fixtures can retain an ``as_of`` or
+    ``observed_at`` timestamp at the bar timestamp.  Treat market end as the
+    earliest defensible completion for a complete OHLC row, and move that
+    completion time later when the forward observation arrives later.  The
+    decision cutoff prevents a late signal from borrowing an outcome whose
+    market interval had already closed.  The explicit backfill lane preserves
+    its historical ``as_of`` semantics.
+    """
+    has_revision = _row_has_revision_marker(row)
+    cutoff = _bar_end(row)
+    if cutoff is None or has_revision:
+        return False, "revision_unresolved" if has_revision else "future_bar_unavailable", None
+    available = replay_available_at(
+        row, allow_historical_backfill_diagnostics=allow_backfill)
+    if available is None:
+        return False, "future_bar_unavailable", None
+    # A normalized row contains complete OHLC values.  Historical fixtures can
+    # carry an observation timestamp earlier than the bar end, so use market
+    # end as the earliest defensible completion; ordinary forward observations
+    # arriving after the end extend that completion time.  Causality is then
+    # enforced by the decision cutoff and contiguous market-time checks.
+    completed_at = max(cutoff, available)
+    if decision_at is not None:
+        # A late record cannot make an already-finished market interval
+        # actionable.  The strict end boundary also handles a revision that
+        # was only observed after the original outcome had closed.
+        if cutoff <= decision_at or completed_at < decision_at:
+            return False, "future_bar_unavailable", available
+    return True, None, available
+
+
+def _feature_decision(
+        rows: Sequence[Any], feature_start: int, signal_index: int, *,
+        signal_end: datetime, allow_backfill: bool,
+        ) -> tuple[datetime | None, str | None]:
+    """Return the causal decision time for a feature prefix."""
+    feature_rows = rows[feature_start:signal_index + 1]
+    if any(_row_has_revision_marker(row) for row in feature_rows):
+        return None, "revision_unresolved"
+    available = [replay_available_at(
+        row, allow_historical_backfill_diagnostics=allow_backfill)
+                 for row in feature_rows]
+    if any(item is None for item in available):
+        if (not allow_backfill and any(
+                historical_backfill_record(row) for row in feature_rows)):
+            return None, "historical_backfill_excluded"
+        return None, "feature_unavailable"
+    return max([signal_end, *(item for item in available if item is not None)]), None
+
+
+def _decision_at(
+        rows: Sequence[Any], signal_index: int, policy: "_ControlPolicy",
+        *, allow_backfill: bool,
+        ) -> datetime | None:
+    """Resolve a control's feature observation clock, if its prefix is usable."""
+    signal_end = _bar_end(rows[signal_index])
+    if signal_end is None:
+        return None
+    feature_start = (0 if policy.window is None else
+                     max(0, signal_index + 1 - int(policy.window)))
+    decision, reason = _feature_decision(
+        rows, feature_start, signal_index, signal_end=signal_end,
+        allow_backfill=allow_backfill)
+    return decision if reason is None else None
+
+
 def _mature_prefix(spec: Mapping[str, Any], window: int | None) -> int:
     """Backward-compatible wrapper around the shared maturity contract."""
     del window
@@ -204,6 +300,7 @@ def _cell_key(symbol: Any, session: Any) -> str:
 def _provenance_summary(
         provenance: Any, *, total_cells: int,
         fallback_cells: Mapping[str, str] | None = None,
+        measurement_scope: str = "fit_only",
         ) -> dict[str, Any]:
     """Return a bounded, JSON-safe eligibility summary.
 
@@ -317,7 +414,7 @@ def _provenance_summary(
             return 0
     return {
         "schema": SIGNAL_QUALITY_ELIGIBILITY_SCHEMA,
-        "scope": "fit_only",
+        "scope": measurement_scope,
         "authorizing": False,
         "diagnostic_only": True,
         "status": status,
@@ -431,17 +528,12 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
             # turn into the less informative ``entry_bar_unavailable``.
             status_counts["historical_backfill_excluded"] += 1
             continue
-        available = [replay_available_at(
-            row, allow_historical_backfill_diagnostics=allow_backfill)
-            for row in feature_rows]
-        if any(item is None for item in available):
-            if (not allow_backfill and any(historical_backfill_record(row)
-                                           for row in feature_rows)):
-                status_counts["historical_backfill_excluded"] += 1
-            else:
-                status_counts["feature_unavailable"] += 1
+        decision, decision_reason = _feature_decision(
+            rows, feature_start, index, signal_end=signal_end,
+            allow_backfill=allow_backfill)
+        if decision is None:
+            status_counts[str(decision_reason or "feature_unavailable")] += 1
             continue
-        decision = max([signal_end, *(item for item in available if item is not None)])
         next_row = rows[index + 1]
         if _timestamp(next_row) != signal_end and decision <= signal_end:
             status_counts["entry_not_adjacent"] += 1
@@ -453,13 +545,10 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
         if entry_index is None:
             status_counts["entry_bar_unavailable"] += 1
             continue
-        selected_entry = rows[entry_index]
-        entry_cutoff = _bar_end(selected_entry) or _timestamp(selected_entry)
-        if not replay_record_is_available(
-                selected_entry, entry_cutoff,
-                allow_historical_backfill_diagnostics=allow_backfill):
-            status_counts["entry_bar_unavailable"] += 1
-            continue
+        # The selected row records the first full bar at/after the causal
+        # decision and remains in the internal hand-off for compatibility.
+        # Signal quality is anchored to the completed signal close, so it must
+        # not require that row's OHLC to have arrived by its own market end.
         eligible_prefix = True
         if spec["family"] == "cross_sectional_residual":
             context = {CROSS_SECTIONAL_BENCHMARK: replay_bar_prefix(
@@ -479,7 +568,9 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
                                       "subject_ineligible:")):
                     context_reason = reason
         else:
-            signal = evaluate_rule_signal(rows[:index + 1], spec)
+            signal = evaluate_rule_signal(
+                rows[:index + 1], spec, bars_by_symbol=bars_by_symbol,
+                symbol=symbol)
         if signal is None:
             continue
         # This is a pre-execution signal-quality measurement, not a fabricated
@@ -503,29 +594,41 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
         # provenance hand-off when available.
         priority = (
             "historical_backfill_excluded", "feature_unavailable",
-            "entry_bar_unavailable", "entry_not_adjacent", "feature_gap",
-            "invalid_session", "signal_end_unavailable", "insufficient_history",
+            "revision_unresolved", "entry_bar_unavailable",
+            "entry_not_adjacent", "feature_gap", "invalid_session",
+            "signal_end_unavailable", "insufficient_history",
         )
         reason = next((item for item in priority if status_counts.get(item)),
                       "insufficient_history")
+        if reason == "revision_unresolved":
+            return None, reason
         return None, _eligibility_classification(reason)
     return None, "data_incomplete"
 
 
 def _forward_return(rows: Sequence[Any], *, entry_index: int, horizon: int,
                     entry_price: float, direction: str,
-                    allow_backfill: bool) -> tuple[float | None, str | None]:
+                    allow_backfill: bool,
+                    decision_at: datetime | None = None,
+                    ) -> tuple[float | None, str | None]:
+    """Return a completed close-to-close outcome on a contiguous wall clock.
+
+    ``entry_index`` is the first post-signal bar in the historical API.  The
+    target therefore remains ``entry_index + horizon - 1`` even when a delayed
+    decision selected a later executable entry row.  This keeps every horizon
+    anchored to the signal close instead of silently shifting it with recorder
+    latency.
+    """
     future_index = entry_index + int(horizon) - 1
     if future_index >= len(rows):
         return None, "insufficient_future_bars"
     if not _contiguous(rows, entry_index, future_index + 1):
         return None, "future_gap"
     future = rows[future_index]
-    cutoff = _bar_end(future)
-    if cutoff is None or not replay_record_is_available(
-            future, cutoff,
-            allow_historical_backfill_diagnostics=allow_backfill):
-        return None, "future_bar_unavailable"
+    complete, reason, _available = _completed_record_is_available(
+        future, allow_backfill=allow_backfill, decision_at=decision_at)
+    if not complete:
+        return None, str(reason or "future_bar_unavailable")
     future_close = _number(_value(future, "close"))
     if future_close is None or future_close <= 0 or entry_price <= 0:
         return None, "future_price_invalid"
@@ -582,19 +685,22 @@ def _control_indices(rows: Sequence[Any], policy: _ControlPolicy, *,
         minutes = policy.admissible(rows, signal_index)
         if minutes is None:
             continue
+        decision_at = _decision_at(
+            rows, signal_index, policy, allow_backfill=allow_backfill)
+        if decision_at is None:
+            continue
         future_index = signal_index + int(horizon)
         if future_index >= len(rows) or not _contiguous(
                 rows, signal_index, future_index + 1):
             continue
-        signal_at = _bar_end(rows[signal_index])
-        future_at = _bar_end(rows[future_index])
-        if (signal_at is None or future_at is None or
-                not replay_record_is_available(
-                    rows[signal_index], signal_at,
-                    allow_historical_backfill_diagnostics=allow_backfill) or
-                not replay_record_is_available(
-                    rows[future_index], future_at,
-                    allow_historical_backfill_diagnostics=allow_backfill)):
+        signal_ok, _signal_reason, _signal_available = (
+            _completed_record_is_available(
+                rows[signal_index], allow_backfill=allow_backfill))
+        future_ok, _future_reason, _future_available = (
+            _completed_record_is_available(
+                rows[future_index], allow_backfill=allow_backfill,
+                decision_at=decision_at))
+        if not signal_ok or not future_ok:
             continue
         entry_price = _number(_value(rows[signal_index], "close"))
         future_price = _number(_value(rows[future_index], "close"))
@@ -618,7 +724,8 @@ def _control_return(candidate_cell: tuple[str, str], candidate_minutes: float, *
                     eligible: Mapping[tuple[str, str], dict[int, tuple[int, float]]],
                     session_rows: Mapping[tuple[str, str], Sequence[Any]],
                     candidate_index: int, direction: str, horizon: int,
-                    allow_backfill: bool
+                    allow_backfill: bool,
+                    policy: _ControlPolicy | None = None,
                     ) -> tuple[float | None, str | None, dict[str, Any]]:
     """Average every admissible null draw whose clock matches the candidate.
 
@@ -663,19 +770,42 @@ def _control_return(candidate_cell: tuple[str, str], candidate_minutes: float, *
         return None, "no_matched_control", {"matching": "none", "pool": 0}
     values: list[float] = []
     minutes_used: list[float] = []
+    decision_delays: list[float] = []
+    outcome_delays: list[float] = []
     for cell, index, item_minutes in choices:
         rows = session_rows[cell]
+        decision_at = (_decision_at(
+            rows, index, policy, allow_backfill=allow_backfill)
+                       if policy is not None else None)
         value, _reason = _forward_return(
             rows, entry_index=index + 1, horizon=horizon,
             entry_price=float(_value(rows[index], "close")),
-            direction=direction, allow_backfill=allow_backfill)
+            direction=direction, allow_backfill=allow_backfill,
+            decision_at=decision_at)
         if value is not None:
             values.append(value)
             minutes_used.append(item_minutes)
+            if decision_at is not None:
+                signal_end = _bar_end(rows[index])
+                if signal_end is not None:
+                    decision_delays.append(max(
+                        0.0, (decision_at - signal_end).total_seconds()))
+            future = rows[index + horizon]
+            available = replay_available_at(
+                future, allow_historical_backfill_diagnostics=allow_backfill)
+            future_end = _bar_end(future)
+            if available is not None and future_end is not None:
+                outcome_delays.append(max(
+                    0.0, (available - future_end).total_seconds()))
     if not values:
         return None, "no_matched_control", {"matching": matching, "pool": 0}
-    return mean(values), None, {"matching": matching, "pool": len(values),
-                                "mean_session_minute": mean(minutes_used)}
+    metadata = {"matching": matching, "pool": len(values),
+                "mean_session_minute": mean(minutes_used)}
+    if decision_delays:
+        metadata["mean_decision_delay_seconds"] = mean(decision_delays)
+    if outcome_delays:
+        metadata["mean_outcome_observation_delay_seconds"] = mean(outcome_delays)
+    return mean(values), None, metadata
 
 
 def _summary(values: Sequence[float]) -> tuple[float | None, float | None, float | None]:
@@ -703,6 +833,18 @@ def _dispersion(values: Sequence[float], *, shift: float = 0.0) -> dict[str, Any
     centre = mean(clean) - float(shift)
     return {"stdev_bps": deviation, "stderr_bps": error,
             "t_stat": (centre / error) if error else None}
+
+
+def _latency_summary(values: Sequence[float]) -> dict[str, Any]:
+    clean = sorted(float(value) for value in values
+                   if isinstance(value, (int, float)) and
+                   not isinstance(value, bool) and math.isfinite(float(value)))
+    if not clean:
+        return {"count": 0, "mean_seconds": None, "median_seconds": None,
+                "min_seconds": None, "max_seconds": None}
+    return {"count": len(clean), "mean_seconds": mean(clean),
+            "median_seconds": median(clean), "min_seconds": clean[0],
+            "max_seconds": clean[-1]}
 
 
 def _event_index(value: Any) -> int | None:
@@ -781,6 +923,42 @@ def _precomputed_event(
              "entry_price": entry_price}, None)
 
 
+def _validate_precomputed_timing(
+        rows: Sequence[Any], event: Mapping[str, Any],
+        spec: Mapping[str, Any], *, allow_backfill: bool,
+        ) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate the observation clock of a fit-prefix hand-off.
+
+    The optional metadata avoids rescanning the predicate, but it cannot be
+    allowed to bypass current source visibility.  Recheck the feature prefix,
+    decision boundary, and selected post-signal row against the supplied bars;
+    a stale or revised hand-off therefore fails closed while the evaluator is
+    still invoked exactly once by the fit worker.
+    """
+    signal_index = int(event["signal_index"])
+    entry_index = int(event["entry_index"])
+    signal_end = _bar_end(rows[signal_index])
+    if signal_end is None:
+        return None, "precomputed_event_invalid"
+    window = feature_window_bars(spec)
+    feature_start = (0 if window is None else
+                     max(0, signal_index + 1 - int(window)))
+    decision, reason = _feature_decision(
+        rows, feature_start, signal_index, signal_end=signal_end,
+        allow_backfill=allow_backfill)
+    if decision is None:
+        return None, str(reason or "data_incomplete")
+    entry_at = event.get("entry_at")
+    if not isinstance(entry_at, datetime) or entry_at < decision:
+        return None, "precomputed_event_invalid"
+    expected_entry = next((probe for probe in range(signal_index + 1, len(rows))
+                           if (_timestamp(rows[probe]) is not None and
+                               _timestamp(rows[probe]) >= decision)), None)
+    if expected_entry is None or expected_entry != entry_index:
+        return None, "precomputed_event_invalid"
+    return dict(event), None
+
+
 def measure_signal_quality(
         bars: Sequence[Any], spec: Mapping[str, Any], *, policy: Any | None = None,
         horizons: Sequence[int] = DEFAULT_HORIZONS,
@@ -788,6 +966,7 @@ def measure_signal_quality(
         precomputed_first_signals: Sequence[Mapping[str, Any]] | None = None,
         eligibility_provenance: Mapping[str, Any] | None = None,
         bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
+        measurement_scope: str = "fit_only",
         ) -> dict[str, Any]:
     """Measure conditional forward returns and a matched random-entry control.
 
@@ -801,6 +980,11 @@ def measure_signal_quality(
     unavailable/incomplete data from a genuinely tested predicate with no
     actionable signal.
     """
+    if not isinstance(measurement_scope, str) or \
+            measurement_scope not in _MEASUREMENT_SCOPES:
+        raise ValueError(
+            "measurement_scope must be fit_only or "
+            "previously_examined_retrospective_diagnostic")
     normalized = validate_rule_spec(spec)
     market_context = _immutable_market_context(bars, bars_by_symbol)
     requested = tuple(int(value) for value in horizons)
@@ -895,6 +1079,9 @@ def measure_signal_quality(
                 continue
             event, reason = _precomputed_event(
                 rows, item, symbol=cell[0], session=cell[1])
+            if event is not None:
+                event, reason = _validate_precomputed_timing(
+                    rows, event, normalized, allow_backfill=allow_backfill)
             if event is None or cell in precomputed_by_cell:
                 precomputed_invalid_cells.add(cell)
                 if cell in precomputed_by_cell:
@@ -955,6 +1142,10 @@ def measure_signal_quality(
         delta_sessions: list[str] = []
         candidate_minutes: list[float] = []
         control_minutes: list[float] = []
+        candidate_decision_delays: list[float] = []
+        candidate_outcome_delays: list[float] = []
+        control_decision_delays: list[float] = []
+        control_outcome_delays: list[float] = []
         pool_sizes: list[int] = []
         matching_counts: Counter[str] = Counter()
         unavailable: Counter[str] = Counter()
@@ -968,10 +1159,18 @@ def measure_signal_quality(
             for cell, rows in grouped.items()}
         for symbol, session, rows, event in events:
             direction = str(event["signal"]["direction"])
+            signal_index = int(event["signal_index"])
+            signal_end = _bar_end(rows[signal_index])
+            decision_at = event.get("entry_at")
+            if not isinstance(decision_at, datetime):
+                decision_at = signal_end
             candidate, reason = _forward_return(
-                rows, entry_index=int(event["entry_index"]), horizon=horizon,
+                # Keep the outcome clock anchored to the signal close.  The
+                # selected entry row remains provenance for delayed decisions
+                # but must not shift the conditional-return horizon.
+                rows, entry_index=signal_index + 1, horizon=horizon,
                 entry_price=float(event["entry_price"]), direction=direction,
-                allow_backfill=allow_backfill)
+                allow_backfill=allow_backfill, decision_at=decision_at)
             if candidate is None:
                 unavailable[str(reason or "candidate_unavailable")] += 1
                 continue
@@ -980,7 +1179,19 @@ def measure_signal_quality(
             sessions.add(session)
             symbols.add(symbol)
             cells.add(f"{session}:{symbol}")
-            signal_stamp = _timestamp(rows[int(event["signal_index"])])
+            if signal_end is not None and decision_at is not None:
+                candidate_decision_delays.append(max(
+                    0.0, (decision_at - signal_end).total_seconds()))
+            outcome_index = signal_index + horizon
+            if outcome_index < len(rows):
+                outcome_available = replay_available_at(
+                    rows[outcome_index],
+                    allow_historical_backfill_diagnostics=allow_backfill)
+                outcome_end = _bar_end(rows[outcome_index])
+                if outcome_available is not None and outcome_end is not None:
+                    candidate_outcome_delays.append(max(
+                        0.0, (outcome_available - outcome_end).total_seconds()))
+            signal_stamp = _timestamp(rows[signal_index])
             minutes = (session_minutes(signal_stamp)
                        if signal_stamp is not None else 0.0)
             candidate_minutes.append(minutes)
@@ -989,7 +1200,7 @@ def measure_signal_quality(
                 session_rows=grouped,
                 candidate_index=int(event["signal_index"]),
                 direction=direction, horizon=horizon,
-                allow_backfill=allow_backfill)
+                allow_backfill=allow_backfill, policy=control_policy)
             matching_counts[str(control_meta["matching"])] += 1
             if control is None:
                 unavailable[str(control_reason or "control_unavailable")] += 1
@@ -999,6 +1210,12 @@ def measure_signal_quality(
                 delta_sessions.append(str(session))
                 pool_sizes.append(int(control_meta["pool"]))
                 control_minutes.append(float(control_meta["mean_session_minute"]))
+                if control_meta.get("mean_decision_delay_seconds") is not None:
+                    control_decision_delays.append(float(
+                        control_meta["mean_decision_delay_seconds"]))
+                if control_meta.get("mean_outcome_observation_delay_seconds") is not None:
+                    control_outcome_delays.append(float(
+                        control_meta["mean_outcome_observation_delay_seconds"]))
             event_vectors.append({
                 "symbol": symbol, "session": session, "horizon": horizon,
                 "direction": direction, "signal_index": event["signal_index"],
@@ -1060,6 +1277,14 @@ def measure_signal_quality(
                 mean(candidate_minutes) if candidate_minutes else None),
             "control_mean_session_minute": (
                 mean(control_minutes) if control_minutes else None),
+            "candidate_decision_delay_seconds": _latency_summary(
+                candidate_decision_delays),
+            "candidate_outcome_observation_delay_seconds": _latency_summary(
+                candidate_outcome_delays),
+            "control_decision_delay_seconds": _latency_summary(
+                control_decision_delays),
+            "control_outcome_observation_delay_seconds": _latency_summary(
+                control_outcome_delays),
             "cost_hurdle_bps": hurdle,
             "mean_after_hurdle_bps": (
                 mean(after_hurdle) if after_hurdle else None),
@@ -1085,6 +1310,7 @@ def measure_signal_quality(
     quality_provenance = _provenance_summary(
         provenance if provenance else None,
         total_cells=len(grouped),
+        measurement_scope=measurement_scope,
         fallback_cells=(
             {**observed_cell_reasons,
              **{_cell_key(symbol, session): str(reason)
@@ -1092,13 +1318,23 @@ def measure_signal_quality(
             if (observed_cell_reasons or provenance_by_cell) else None))
     result = {
         "schema": SIGNAL_QUALITY_SCHEMA,
-        "scope": "fit_only",
+        "scope": measurement_scope,
+        "measurement_scope": measurement_scope,
         "authorizing": False,
         "diagnostic_only": True,
         "metric": "conditional_forward_return",
         "canonical_cross_sectional_ic": False,
         "event_policy": "first_actionable_signal_per_symbol_session",
-        "return_basis": "signal_bar_close_to_horizon_close_with_next_bar_lag",
+        "return_basis": "signal_bar_close_to_contiguous_horizon_close",
+        "timing_policy": {
+            "measurement_scope": measurement_scope,
+            "feature_prefix": "available_by_decision_timestamp",
+            "decision_timestamp": "max(signal_bar_end, feature_observation_times)",
+            "outcome": "completed_bar_observed_after_decision_timestamp",
+            "entry_semantics": "conditional_signal_close_anchor",
+            "historical_backfill": "excluded_by_default",
+            "revision_policy": "unresolved_revision_or_version_refused",
+        },
         "control_policy": (
             "same_symbol_admissible_entry_bars_at_the_same_session_minute"
             "_across_other_sessions_averaged_over_pool"),

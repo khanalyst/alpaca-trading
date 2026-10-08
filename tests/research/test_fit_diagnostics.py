@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 import unittest
 from zoneinfo import ZoneInfo
 
-from agent.contracts.rule import evaluate_rule_signal_metadata
+from agent.contracts.rule import (
+    RULE_SCHEMA_V6, RULE_SCHEMA_V7, evaluate_rule_signal_metadata,
+    validate_rule_spec,
+)
 from research.edge_lab import _read_discovery_rows
 from research.costs import CostModel, diagnostic_backfill_policy
 from research.fit_diagnostics import (
@@ -14,6 +17,8 @@ from research.fit_diagnostics import (
     collapse_behavior_aliases,
     measure_fit_diagnostics,
 )
+from research.market_data import normalize_underlying_bar
+from research.signal_quality import measure_signal_quality
 from research.strategy_factory import initial_hypotheses
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 
@@ -51,6 +56,30 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertTrue(metadata["floor_binding"])
         self.assertAlmostEqual(metadata["planned_stop_distance"],
                                metadata["floor_distance"])
+
+    def test_v7_authored_floor_is_reported_and_drives_risk_controls(self):
+        bars, _snapshots, _quotes = self._fit()
+        spec = validate_rule_spec({
+            **ROOT_SPEC, "schema": RULE_SCHEMA_V7,
+            "min_stop_distance_bps": 100.0,
+        })
+        diagnostic = measure_fit_diagnostics(
+            bars, spec, costs=CostModel(), vehicle="equity",
+            risk_config={"risk": {
+                "stressed_cost_scenario_bps": 25.0,
+                "max_stressed_cost_to_risk_ratio": 0.30,
+            }})
+        floor = diagnostic["authored_stop_floor_bps"]
+        self.assertEqual(floor["bps"], 100.0)
+        self.assertEqual(floor["binding"], diagnostic["first_signal"]["signals"])
+        self.assertNotIn("floor_30bps", diagnostic)
+        self.assertNotIn("30bps_floor_binding", diagnostic)
+        controls = diagnostic["risk_controls"]
+        self.assertEqual(controls["grammar_stop_floor_bps"], 100.0)
+        self.assertTrue(controls["grammar_stop_floor_admissible"])
+        self.assertEqual(diagnostic["exit_grammar"]["stop_floor_bps"], 100.0)
+        self.assertEqual(diagnostic["exit_grammar"]["bracket"],
+                         "ATR stop with 100 bps floor")
 
     def test_heldout_changes_do_not_enter_a_fit_measurement(self):
         bars, snapshots, quotes = self._fit()
@@ -162,6 +191,70 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertEqual(
             diagnostic["signal_quality"]["eligibility_provenance"]["status"],
             "data_incomplete")
+
+    def test_one_second_recorder_delay_keeps_prefix_and_quality_causal(self):
+        bars, _snapshots, _quotes = self._fit()
+        delayed = [replace(
+            row,
+            identity=replace(row.identity,
+                             observed_at=row.end + timedelta(seconds=1)),
+        ) for row in bars]
+        prefix = _fit_prefixes(delayed, ROOT_SPEC)
+        self.assertGreater(len(prefix["first_signals"]), 0)
+        first = prefix["first_signals"][0]
+        self.assertGreater(first["entry_index"], first["signal_index"] + 1)
+        diagnostic = measure_fit_diagnostics(delayed, ROOT_SPEC)
+        quality = diagnostic["signal_quality"]
+        self.assertGreater(quality["event_count"], 0)
+        metrics = quality["horizon_metrics"]["5m"]
+        self.assertGreater(metrics["candidate_count"], 0)
+        self.assertGreater(metrics["matched_count"], 0)
+        self.assertEqual(
+            metrics["candidate_decision_delay_seconds"]["mean_seconds"], 1.0)
+        self.assertEqual(
+            metrics["candidate_outcome_observation_delay_seconds"]["mean_seconds"],
+            1.0)
+
+    def test_same_clock_rvol_prefix_handoff_uses_prior_feed_context(self):
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V6, "family": "volume_breakout",
+            "lookback": 3, "slow_lookback": 5, "atr_period": 3,
+            "threshold_bps": 0.0, "volume_multiplier": 1.25,
+            "relative_volume_mode": "same_clock",
+            "relative_volume_sessions": 5,
+        })
+        current_open = datetime(2026, 8, 10, 13, 30, tzinfo=ZoneInfo("UTC"))
+
+        def bar(stamp, close, volume):
+            opened = close - .01
+            return normalize_underlying_bar({
+                "symbol": "SPY", "provider": "test", "feed": "iex",
+                "timestamp": stamp.isoformat(),
+                "as_of": (stamp + timedelta(minutes=1)).isoformat(),
+                "observed_at": (stamp + timedelta(minutes=1)).isoformat(),
+                "open": opened, "high": close + .02,
+                "low": opened - .02, "close": close, "volume": volume,
+            })
+
+        prior = [bar(current_open - timedelta(days=offset) + timedelta(minutes=30),
+                     100.0, 100.0) for offset in range(1, 7)]
+        current = [bar(current_open + timedelta(minutes=index),
+                       100.0 + index * .01, 100.0)
+                   for index in range(32)]
+        current[30] = bar(current_open + timedelta(minutes=30),
+                          101.5, 200.0)
+        context = {"SPY": [*prior, *current]}
+        prefix = _fit_prefixes(
+            current, spec, bars_by_symbol=context)
+        self.assertTrue(prefix["first_signals"])
+        self.assertEqual(
+            prefix["first_signals"][0]["signal_index"], 30)
+        quality = measure_signal_quality(
+            current, spec,
+            precomputed_first_signals=prefix["first_signals"],
+            eligibility_provenance=prefix["eligibility_provenance"],
+            bars_by_symbol=context, horizons=(1,))
+        self.assertEqual(quality["event_count"], 1)
 
     def test_alias_canonicalization_is_review_only_and_zero_signal_is_kept(self):
         bars, _snapshots, _quotes = self._fit()

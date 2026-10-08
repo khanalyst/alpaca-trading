@@ -11,6 +11,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 import json
 import hashlib
+import gc
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -25,11 +26,67 @@ from .edge_ledger_store import content_hash
 from .ibr_diagnostic import run_offline_forward_ibr
 from .mechanism_cohort_v2 import mechanism_cohort
 from .signal_quality import measure_signal_quality
+from .fit_diagnostics import _fit_prefixes
 from .source_validation import validate_source
 from .trader_diagnostics import build_trader_diagnostics
 
 
-def frozen_inventory(config: Mapping[str, Any], code_hash: str) -> dict:
+_SIGNAL_QUALITY_HORIZONS = (5, 15, 30, 60)
+
+
+def _valid_sha256(value: Any) -> bool:
+    """Return whether a value is a canonical hexadecimal SHA-256 digest."""
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _additive_execution_arms(inventory: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Validate the ordered cost-compatible suffix used by additive runs."""
+    arms = inventory.get("arms")
+    if not isinstance(arms, list) or len(arms) != 67:
+        raise ValueError("additive geometry requires a 67-arm inventory")
+    suffix = arms[55:]
+    cohort = inventory.get("cost_compatible_mechanisms")
+    families = cohort.get("families") if isinstance(cohort, Mapping) else None
+    expected = [
+        arm for family in (families or ())
+        if isinstance(family, Mapping)
+        for arm in (family.get("arms") or ())
+        if isinstance(arm, Mapping)
+    ]
+    expected_ids = [str(arm.get("variant_id")) for arm in expected]
+    actual_ids = [str(arm.get("variant_id")) for arm in suffix]
+    if (len(suffix) != 12 or len(expected_ids) != 12 or
+            actual_ids != expected_ids or
+            any(arm.get("role") != "cost_compatible_mechanism"
+                for arm in suffix)):
+        raise ValueError(
+            "additive geometry requires exactly 12 ordered cost-compatible "
+            "execution arms matching inventory suffix 55")
+    return suffix
+
+
+def _validate_signal_quality_result(
+        result: Mapping[str, Any], expected_variant_id: str) -> None:
+    """Validate the compact signal artifact before it becomes immutable."""
+    if (result.get("variant_id") != expected_variant_id or
+            result.get("measurement_scope") !=
+            "previously_examined_retrospective_diagnostic" or
+            result.get("authorizing") is not False or
+            result.get("diagnostic_only") is not True or
+            result.get("horizons") != list(_SIGNAL_QUALITY_HORIZONS)):
+        raise ValueError(
+            "signal-quality artifact failed variant, scope, horizon, or "
+            "non-authorizing validation: " + str(expected_variant_id))
+
+
+def frozen_inventory(config: Mapping[str, Any], code_hash: str, *,
+                     include_cost_compatible: bool = False) -> dict:
     controls = build_inventory(config, code_hash=code_hash)
     mechanisms = mechanism_cohort()
     arms = list(controls["arms"])
@@ -39,13 +96,29 @@ def frozen_inventory(config: Mapping[str, Any], code_hash: str) -> dict:
                 for family in mechanisms["families"] for arm in family["arms"])
     if len(arms) != 55 or len({a["variant_id"] for a in arms}) != 55:
         raise ValueError("expected 43 unchanged controls and 12 distinct new arms")
-    return {"arms": arms, "controls": controls, "mechanisms": mechanisms,
+    extra = {}
+    if include_cost_compatible:
+        from .mechanism_cost_cohort import mechanism_cost_cohort
+        compatible = mechanism_cost_cohort()
+        arms.extend({"variant_id": arm["variant_id"], "strategy_id": "rule",
+                     "family": family["name"], "role": "cost_compatible_mechanism",
+                     "cohort": compatible["cohort_id"], "rule_spec": arm["rule_spec"],
+                     "parent_variant_id": arm["parent_variant_id"],
+                     "geometry_delta": arm["geometry_delta"]}
+                    for family in compatible["families"] for arm in family["arms"])
+        if len(arms) != 67 or len({a["variant_id"] for a in arms}) != 67:
+            raise ValueError("expected 55 frozen comparisons and 12 distinct cost-compatible arms")
+        extra["cost_compatible_mechanisms"] = compatible
+    return {"arms": arms, "controls": controls, "mechanisms": mechanisms, **extra,
             "inventory_hash": content_hash(arms), "registered_arms": len(arms),
             "diagnostic_only": True, "authorizing": False, "selection": "none"}
 
 
 def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, Any],
         ibr_max_events: int = 1_000_000, signal_quality: bool = True,
+        include_cost_compatible: bool = False,
+        evaluation_scope: str = "full_frozen_inventory",
+        baseline_result: str | Path | None = None,
         projection_manifest: str | Path | None = None, progress=None) -> dict:
     data = str(Path(data).resolve())
     destination = Path(output)
@@ -59,7 +132,67 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
         raise ValueError("source has no validated content identity")
     files = _code_bundle_files()
     code_hash = _code_bundle_hash(files)
-    inventory = frozen_inventory(runtime, code_hash)
+    inventory = (frozen_inventory(runtime, code_hash, include_cost_compatible=True)
+                 if include_cost_compatible else frozen_inventory(runtime, code_hash))
+    if evaluation_scope not in {"full_frozen_inventory", "additive_geometry"}:
+        raise ValueError("unknown evaluation scope")
+    if evaluation_scope == "additive_geometry" and not include_cost_compatible:
+        raise ValueError("additive geometry requires the cost-compatible cohort")
+    if evaluation_scope == "additive_geometry" and not signal_quality:
+        raise ValueError("additive geometry requires signal_quality=True")
+    execution_arms = (
+        _additive_execution_arms(inventory)
+        if include_cost_compatible else [])
+    evaluated_arms = (inventory["arms"] if evaluation_scope == "full_frozen_inventory"
+                      else [a for a in inventory["arms"]
+                            if a["role"] == "cost_compatible_mechanism"])
+    baseline = None
+    if baseline_result is not None:
+        path = Path(baseline_result)
+        previous = json.loads(path.read_text())
+        body = dict(previous)
+        digest = body.pop("content_hash", None)
+        if (content_hash(body) != digest or
+                previous.get("status") != "diagnostic_complete" or
+                previous.get("authorizing") is not False or
+                previous.get("diagnostic_only") is not True or
+                previous.get("eligible") != [] or previous.get("proofs") != [] or
+                previous.get("selection") != "none"):
+            raise ValueError("baseline result is not sealed non-authorizing evidence")
+        previous_source = previous.get("source")
+        if (not isinstance(previous_source, Mapping) or
+                previous_source.get("content_hash") != source["content_hash"] or
+                previous.get("runtime_config_hash") != content_hash(runtime)):
+            raise ValueError("baseline source or runtime policy differs")
+        identity_fields = ("variant_id", "strategy_id", "family", "role", "cohort", "rule_spec", "overrides")
+        old_arms = previous.get("results") or []
+        if (not isinstance(old_arms, list) or len(old_arms) != 55 or
+                any(not isinstance(arm, Mapping) for arm in old_arms) or
+                [{k: arm.get(k) for k in identity_fields} for arm in old_arms] !=
+                [{k: arm.get(k) for k in identity_fields} for arm in inventory["arms"][:55]]):
+            raise ValueError("baseline differs from the 55 frozen comparisons")
+        if any(not isinstance(arm, Mapping) or
+               arm.get("authorizing") is not False or
+               arm.get("diagnostic_only") is not True or
+               arm.get("eligible") is not False
+               for arm in old_arms):
+            raise ValueError(
+                "baseline inner results are not sealed non-authorizing "
+                "diagnostic non-eligible evidence")
+        baseline_code_hash = previous.get("code_hash")
+        if (not _valid_sha256(baseline_code_hash) or
+                baseline_code_hash == code_hash):
+            raise ValueError(
+                "baseline code_hash must be a valid SHA-256 digest from "
+                "previous code")
+        with path.open("rb") as handle:
+            baseline = {"path": str(path.resolve()), "content_hash": digest,
+                "sha256": hashlib.file_digest(handle, "sha256").hexdigest(),
+                "code_hash": baseline_code_hash, "arms": 55,
+                "scope": "sealed_previous_code_comparison_not_recomputed",
+                "diagnostic_only": True, "authorizing": False}
+    if evaluation_scope == "additive_geometry" and baseline is None:
+        raise ValueError("additive geometry requires a verified frozen baseline result")
     projection = None
     raw_costs = None
     if projection_manifest is not None:
@@ -95,6 +228,12 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
         "confirmation_policy": "All comparisons stay frozen. Only unseen, accepted complete sessions may support confirmation under the unchanged holdout, power, FDR and broker-equivalence gates.",
         "automatic_winner_selection": False, "ibr_max_events": ibr_max_events,
         "signal_quality_requested": bool(signal_quality), "proofs": []}
+    registration["resource_policy"] = "rule_and_signal_worker_closed_before_strict_ibr"
+    registration["signal_measurement_scope"] = "previously_examined_retrospective_diagnostic"
+    registration["evaluation_scope"] = evaluation_scope
+    registration["evaluated_variant_ids"] = [a["variant_id"] for a in evaluated_arms]
+    registration["execution_variant_ids"] = [a["variant_id"] for a in evaluated_arms]
+    registration["baseline_comparison"] = baseline
     if projection is not None:
         registration["projection"] = projection
     destination.mkdir(parents=True)
@@ -132,8 +271,11 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     components = []
     results = []
     decay_refs = []
+    signal_quality_arms = [arm for arm in inventory["arms"]
+                           if arm["role"] in {
+                               "new_mechanism", "cost_compatible_mechanism"}]
     try:
-        for index, arm in enumerate(inventory["arms"], 1):
+        for index, arm in enumerate(evaluated_arms, 1):
             result = _evaluate_arm(arm)
             # Retain the separate legacy IBR comparison before the runtime
             # adapter attaches its stricter forward-observation measurement.
@@ -148,28 +290,55 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
             components.append({"variant_id": arm["variant_id"],
                                "path": component_name,
                                "content_hash": receipt["content_hash"]})
-            emit("arm_complete", done=index, total=len(inventory["arms"]), variant_id=arm["variant_id"])
-        cohort = build_diagnostic_cohort(runtime, code_identity=code_hash, include_ibr=True)
-        ibr = run_offline_forward_ibr(data, runtime_config=runtime,
-            arms=[a for a in cohort["arms"] if a["strategy_id"] == "ibr"],
-            source_report=source, starting_cash=100_000.0, max_events=ibr_max_events)
-        write_immutable_evidence(destination / "ibr-runtime.json", ibr)
-        _attach_ibr_runtime(results, ibr)
-        rows = {r["variant_id"]: r["rows"] for r in results}
-        meta = {r["variant_id"]: {"family": r["family"], "cohort": r["cohort"]} for r in results}
-        trader = build_trader_diagnostics(rows, meta)
-        trader_receipt = write_immutable_evidence(destination / "trader-diagnostics.json", trader)
+            emit("arm_complete", done=index, total=len(evaluated_arms), variant_id=arm["variant_id"])
         if signal_quality:
-            for arm in inventory["arms"]:
-                if arm["role"] != "new_mechanism":
-                    continue
+            for arm in signal_quality_arms:
                 emit("signal_quality", variant_id=arm["variant_id"])
+                prefix = _fit_prefixes(_WORKER["bars"], arm["rule_spec"],
+                                       policy=_WORKER["policy"])
                 decay = measure_signal_quality(_WORKER["bars"], arm["rule_spec"],
-                    policy=_WORKER["policy"], horizons=(5, 15, 30, 60))
+                    policy=_WORKER["policy"], horizons=(5, 15, 30, 60),
+                    precomputed_first_signals=prefix["first_signals"],
+                    eligibility_provenance=prefix["eligibility_provenance"],
+                    measurement_scope="previously_examined_retrospective_diagnostic")
+                if not isinstance(decay, Mapping):
+                    raise ValueError(
+                        "signal-quality artifact is not a mapping: " +
+                        str(arm["variant_id"]))
+                _validate_signal_quality_result(decay, arm["variant_id"])
                 component_name = "signal-" + content_hash(arm["variant_id"]) + ".json"
                 receipt = write_immutable_evidence(destination / component_name, decay)
                 decay_refs.append({"variant_id": arm["variant_id"],
                     "path": component_name, "content_hash": receipt["content_hash"]})
+                del prefix, decay
+        # The strict IBR worker builds its own replay corpus. Retaining the
+        # rule quote index here doubled memory and killed the previous run.
+        _close_worker()
+        gc.collect()
+        emit("rule_worker_released")
+        if evaluation_scope == "full_frozen_inventory":
+            cohort = build_diagnostic_cohort(runtime, code_identity=code_hash, include_ibr=True)
+            ibr = run_offline_forward_ibr(data, runtime_config=runtime,
+                arms=[a for a in cohort["arms"] if a["strategy_id"] == "ibr"],
+                source_report=source, starting_cash=100_000.0, max_events=ibr_max_events)
+            _attach_ibr_runtime(results, ibr)
+        else:
+            ibr = {"status": "not_recomputed", "arms": {},
+                   "reason": "additive_geometry_scope_uses_sealed_previous_comparison",
+                   "baseline_comparison": baseline, "authorizing": False,
+                   "diagnostic_only": True}
+        if evaluation_scope == "additive_geometry":
+            evaluated_ids = [str(result.get("variant_id")) for result in results]
+            expected_ids = [str(arm["variant_id"]) for arm in execution_arms]
+            if evaluated_ids != expected_ids:
+                raise ValueError(
+                    "additive execution results do not match the ordered "
+                    "12-arm inventory suffix")
+        write_immutable_evidence(destination / "ibr-runtime.json", ibr)
+        rows = {r["variant_id"]: r["rows"] for r in results}
+        meta = {r["variant_id"]: {"family": r["family"], "cohort": r["cohort"]} for r in results}
+        trader = build_trader_diagnostics(rows, meta)
+        trader_receipt = write_immutable_evidence(destination / "trader-diagnostics.json", trader)
         # A partial run can never be read as a sealed completed result.
         if _code_bundle_hash(_code_bundle_files()) != code_hash:
             raise ValueError("code changed during research")
@@ -180,7 +349,20 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
             "proofs": [], "selection": "none", "portfolio_pnl": None,
             "registration_hash": frozen["content_hash"], "source": source,
             "code_hash": code_hash, "runtime_config_hash": content_hash(runtime),
+            "evaluation_scope": evaluation_scope,
+            "registered_arms": len(inventory["arms"]), "evaluated_arms": len(results),
+            "baseline_comparison": baseline,
+            "not_recomputed_variant_ids": [a["variant_id"] for a in inventory["arms"]
+                if a["variant_id"] not in {r["variant_id"] for r in results}],
+            "not_recomputed_execution_variant_ids": [
+                a["variant_id"] for a in inventory["arms"][:55]
+                if a["variant_id"] not in {r["variant_id"] for r in results}],
+            "not_recomputed_execution_count": sum(
+                a["variant_id"] not in {r["variant_id"] for r in results}
+                for a in inventory["arms"][:55]),
             "components": components, "signal_quality": decay_refs,
+            "signal_quality_variant_ids": [ref["variant_id"] for ref in decay_refs],
+            "signal_quality_count": len(decay_refs),
             "cost_calibration_hash": cost_receipt["content_hash"],
             "trader_diagnostics_hash": trader_receipt["content_hash"],
             "ibr_runtime": {k: v for k, v in ibr.items() if k != "arms"},
@@ -206,10 +388,16 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--ibr-max-events", type=int, default=1_000_000)
     parser.add_argument("--skip-signal-quality", action="store_true")
+    parser.add_argument("--include-cost-compatible", action="store_true")
+    parser.add_argument("--evaluation-scope", choices=("full_frozen_inventory", "additive_geometry"),
+                        default="full_frozen_inventory")
+    parser.add_argument("--baseline-result", type=Path)
     parser.add_argument("--projection-manifest", type=Path)
     args = parser.parse_args(argv)
     run(args.data, args.output, runtime_config=load_config(args.config),
         ibr_max_events=args.ibr_max_events, signal_quality=not args.skip_signal_quality,
+        include_cost_compatible=args.include_cost_compatible,
+        evaluation_scope=args.evaluation_scope, baseline_result=args.baseline_result,
         projection_manifest=args.projection_manifest,
         progress=lambda value: print(json.dumps(value, allow_nan=False), flush=True))
     return 0

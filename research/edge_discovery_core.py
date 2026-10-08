@@ -22,7 +22,7 @@ from agent.contracts.risk_geometry import (
     quantize_equity_bracket,
 )
 from agent.contracts.rule import (
-    MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, canonical_exit_reason,
+    MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, RULE_SCHEMA_V7, canonical_exit_reason,
     completed_bar_exit_transition, exit_deadline,
     frozen_target_reference, initialize_exit_state,
     rule_vehicle_executable, thesis_exit_deadline, validate_rule_spec,
@@ -905,7 +905,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
     # v6 is a diagnostic replay grammar; runtime eligibility remains false,
     # but null controls can still be evaluated for research comparison.
     unsupported_vehicle = (not rule_vehicle_executable(spec, vehicle) and
-                           spec.get("schema") != RULE_SCHEMA_V6)
+                           spec.get("schema") not in {RULE_SCHEMA_V6, RULE_SCHEMA_V7})
     base_model = costs or CostModel()
 
     def resolve_cost_model(context: Mapping[str, Any]) -> CostModel:
@@ -1504,7 +1504,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 "breakeven_armed_at": exit_state.get("breakeven_armed_at"),
                 "breakeven_armed_epoch": exit_state.get("breakeven_armed_epoch"),
             })
-        if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6}:
+        if spec.get("schema") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, RULE_SCHEMA_V7}:
             row.update({
                 "initial_stop_price": exit_state["initial_stop_price"],
                 "active_stop_price": exit_state["active_stop_price"],
@@ -1513,7 +1513,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 "target_lookback": exit_state.get("target_lookback"),
                 "exit_before_ts": exit_state.get("exit_before_ts"),
             })
-        if spec.get("schema") == RULE_SCHEMA_V6:
+        if spec.get("schema") in {RULE_SCHEMA_V6, RULE_SCHEMA_V7}:
             row.update({
                 "diagnostic_only": True,
                 "authorizing": False,
@@ -1529,6 +1529,8 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 "relative_volume_sessions": spec.get("relative_volume_sessions"),
                 "relative_volume": signal.get("relative_volume"),
             })
+            if spec.get("schema") == RULE_SCHEMA_V7:
+                row["authored_stop_floor_bps"] = spec["min_stop_distance_bps"]
         economics = row_cost_economics_claim(row, vehicle=vehicle)
         if economics is not None:
             row["cost_economics"] = economics

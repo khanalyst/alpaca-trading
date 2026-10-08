@@ -22,7 +22,8 @@ from .contracts.risk_geometry import (
     quantize_equity_bracket as _shared_quantize_equity_bracket,
     quantize_equity_price as _shared_quantize_equity_price,
 )
-from .contracts.rule import RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5
+from .contracts.rule import (RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5,
+                             RULE_SCHEMA_V6, RULE_SCHEMA_V7)
 from .execution_lifecycle import _plain, _value
 from .instruments import validate_equity_symbol
 from research.costs import (ENTRY_SLIPPAGE_INVALID_REASON,
@@ -566,6 +567,12 @@ class MarketEntryRiskMixin:
             return None
         edge_cfg = cfg or self.cfg
         strategy = edge_cfg.get("strategy", {})
+        if (str(decision.get("rule_schema") or "") in {RULE_SCHEMA_V6, RULE_SCHEMA_V7}
+                or str((strategy.get("rule_spec") or {}).get("schema") or "")
+                in {RULE_SCHEMA_V6, RULE_SCHEMA_V7}):
+            self._event("risk_reject", {
+                "symbol": symbol, "reason": "diagnostic_rule_not_executable"})
+            return None
         profile = str(decision.get("execution_profile") or
                       strategy.get("execution_profile",
                                    strategy.get("execution_mode", "shares"))).lower()
