@@ -662,6 +662,53 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 decision_timestamp=signal_ready,
                 entry_timestamp=entry_at)
             continue
+        # Resolve the bounded clock before any executable quote, bracket, cost,
+        # or risk admission.  An entry is only admissible when its first full
+        # post-entry bar can complete by the same deadline used by the exit
+        # transition below.  This mirrors null-control discovery and prevents
+        # a thesis that already expired (or cannot produce one full mark) from
+        # becoming a scored trade at the entry bar.
+        force_flat_ts = None
+        if resolved_policy.force_flat_time is not None:
+            local_entry = entry_at.astimezone(ZoneInfo("America/New_York"))
+            force_flat_ts = local_entry.replace(
+                hour=resolved_policy.force_flat_time.hour,
+                minute=resolved_policy.force_flat_time.minute,
+                second=resolved_policy.force_flat_time.second,
+                microsecond=resolved_policy.force_flat_time.microsecond,
+            ).timestamp()
+        deadline_contract = exit_deadline(
+            entry_at, spec, force_flat_ts=force_flat_ts)
+        deadline = (None if deadline_contract is None else
+                    float(deadline_contract["timestamp"]))
+        deadline_reason = (None if deadline_contract is None else
+                           str(deadline_contract["reason"]))
+        thesis_deadline = thesis_exit_deadline(entry_at, spec)
+        if deadline is not None:
+            deadline_detail = {
+                "entry_timestamp": entry_at.isoformat(),
+                "entry_bar_timestamp": entry_bar.timestamp.isoformat(),
+                "entry_bar_end_timestamp": entry_bar.end.isoformat(),
+                "exit_deadline_timestamp": (
+                    datetime.fromtimestamp(deadline, timezone.utc).isoformat()),
+                "exit_deadline_reason": deadline_reason,
+            }
+            if deadline <= entry_at.timestamp():
+                last_refusal = _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date,
+                    str(signal.get("direction") or "unknown"),
+                    "entry_after_exit_deadline", stage="entry_policy",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at, detail=deadline_detail)
+                continue
+            if entry_bar.end.timestamp() > deadline:
+                last_refusal = _unpriced(
+                    signal_bar, entry_bar, signal_bar.session_date,
+                    str(signal.get("direction") or "unknown"),
+                    "entry_bar_after_exit_deadline", stage="entry_policy",
+                    decision_timestamp=signal_ready,
+                    entry_timestamp=entry_at, detail=deadline_detail)
+                continue
         direction = signal["direction"]
         # A completed recorder bar is normally observed at its end, so it
         # cannot authorize the opening print at the entry boundary.  A fresh
@@ -791,25 +838,6 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                         "authored_stop_floor_bps": spec.get(
                             "min_stop_distance_bps", MIN_STOP_DISTANCE_BPS),
                         "target_mutated": False})
-        # Resolve the bounded clock once from the same point-in-time entry and
-        # policy used by admitted trades.  Rejected-plan metadata below reuses
-        # this value; it never scans a future bar or runs the exit transition.
-        force_flat_ts = None
-        if resolved_policy.force_flat_time is not None:
-            local_entry = entry_at.astimezone(ZoneInfo("America/New_York"))
-            force_flat_ts = local_entry.replace(
-                hour=resolved_policy.force_flat_time.hour,
-                minute=resolved_policy.force_flat_time.minute,
-                second=resolved_policy.force_flat_time.second,
-                microsecond=resolved_policy.force_flat_time.microsecond,
-            ).timestamp()
-        deadline_contract = exit_deadline(
-            entry_at, spec, force_flat_ts=force_flat_ts)
-        deadline = (None if deadline_contract is None else
-                    float(deadline_contract["timestamp"]))
-        deadline_reason = (None if deadline_contract is None else
-                           str(deadline_contract["reason"]))
-        thesis_deadline = thesis_exit_deadline(entry_at, spec)
         stress_geometry_requested = (
             resolved_policy.stressed_cost_scenario_bps is not None or
             resolved_policy.max_stressed_cost_to_risk_ratio is not None or

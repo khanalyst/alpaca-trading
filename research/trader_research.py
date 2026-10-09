@@ -45,29 +45,68 @@ def _valid_sha256(value: Any) -> bool:
     return True
 
 
-def _additive_execution_arms(inventory: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    """Validate the ordered cost-compatible suffix used by additive runs."""
+def _additive_execution_arms(
+        inventory: Mapping[str, Any], *,
+        include_deadline_compatible: bool = False,
+) -> list[Mapping[str, Any]]:
+    """Validate the ordered additive suffix used by geometry runs.
+
+    The first 55 arms are the sealed comparison inventory.  Additive arms
+    must remain in manifest order and retain their manifest cohort identity;
+    this prevents a reordered or cross-cohort arm from being measured under
+    the wrong diagnostic label.
+    """
     arms = inventory.get("arms")
-    if not isinstance(arms, list) or len(arms) != 67:
-        raise ValueError("additive geometry requires a 67-arm inventory")
-    suffix = arms[55:]
-    cohort = inventory.get("cost_compatible_mechanisms")
-    families = cohort.get("families") if isinstance(cohort, Mapping) else None
-    expected = [
-        arm for family in (families or ())
-        if isinstance(family, Mapping)
-        for arm in (family.get("arms") or ())
-        if isinstance(arm, Mapping)
-    ]
-    expected_ids = [str(arm.get("variant_id")) for arm in expected]
-    actual_ids = [str(arm.get("variant_id")) for arm in suffix]
-    if (len(suffix) != 12 or len(expected_ids) != 12 or
-            actual_ids != expected_ids or
-            any(arm.get("role") != "cost_compatible_mechanism"
-                for arm in suffix)):
+    expected_total = 70 if include_deadline_compatible else 67
+    if not isinstance(arms, list) or len(arms) != expected_total:
         raise ValueError(
-            "additive geometry requires exactly 12 ordered cost-compatible "
-            "execution arms matching inventory suffix 55")
+            "additive geometry requires a " + str(expected_total) +
+            "-arm inventory")
+
+    def manifest_arms(key: str, role: str, start: int, count: int) -> list[Mapping[str, Any]]:
+        cohort = inventory.get(key)
+        families = cohort.get("families") if isinstance(cohort, Mapping) else None
+        if not isinstance(families, list) or not isinstance(cohort, Mapping):
+            raise ValueError("additive geometry is missing the " + key + " manifest")
+        expected = [
+            arm for family in families
+            if isinstance(family, Mapping)
+            for arm in (family.get("arms") or ())
+            if isinstance(arm, Mapping)
+        ]
+        actual = arms[start:start + count]
+        if len(expected) != count or len(actual) != count:
+            raise ValueError(
+                "additive geometry requires exactly " + str(count) +
+                " ordered " + role + " execution arms")
+        cohort_id = cohort.get("cohort_id")
+        for expected_arm, actual_arm in zip(expected, actual):
+            if (actual_arm.get("variant_id") != expected_arm.get("variant_id") or
+                    actual_arm.get("role") != role or
+                    actual_arm.get("cohort") != cohort_id or
+                    actual_arm.get("rule_spec") != expected_arm.get("rule_spec") or
+                    actual_arm.get("parent_variant_id") != expected_arm.get("parent_variant_id")):
+                raise ValueError(
+                    "additive geometry has an ordered " + role +
+                    " arm or cohort binding mismatch")
+            for metadata_key in ("geometry_delta", "timing_delta"):
+                if metadata_key in expected_arm and actual_arm.get(metadata_key) != expected_arm[metadata_key]:
+                    raise ValueError(
+                        "additive geometry has a " + role + " " + metadata_key +
+                        " mismatch")
+        return actual
+
+    cost_arms = manifest_arms(
+        "cost_compatible_mechanisms", "cost_compatible_mechanism", 55, 12)
+    deadline_arms = []
+    if include_deadline_compatible:
+        deadline_arms = manifest_arms(
+            "deadline_compatible_mechanisms",
+            "deadline_compatible_mechanism", 67, 3)
+    suffix = [*cost_arms, *deadline_arms]
+    suffix_ids = [str(arm.get("variant_id")) for arm in suffix]
+    if len(set(suffix_ids)) != len(suffix_ids):
+        raise ValueError("additive geometry execution arms must have unique variant IDs")
     return suffix
 
 
@@ -86,7 +125,11 @@ def _validate_signal_quality_result(
 
 
 def frozen_inventory(config: Mapping[str, Any], code_hash: str, *,
-                     include_cost_compatible: bool = False) -> dict:
+                     include_cost_compatible: bool = False,
+                     include_deadline_compatible: bool = False) -> dict:
+    if include_deadline_compatible and not include_cost_compatible:
+        raise ValueError(
+            "deadline-compatible cohort requires the cost-compatible cohort")
     controls = build_inventory(config, code_hash=code_hash)
     mechanisms = mechanism_cohort()
     arms = list(controls["arms"])
@@ -109,6 +152,26 @@ def frozen_inventory(config: Mapping[str, Any], code_hash: str, *,
         if len(arms) != 67 or len({a["variant_id"] for a in arms}) != 67:
             raise ValueError("expected 55 frozen comparisons and 12 distinct cost-compatible arms")
         extra["cost_compatible_mechanisms"] = compatible
+        if include_deadline_compatible:
+            from .mechanism_deadline_cohort import mechanism_deadline_cohort
+            deadline = mechanism_deadline_cohort()
+            arms.extend({"variant_id": arm["variant_id"], "strategy_id": "rule",
+                         "family": family["name"],
+                         "role": "deadline_compatible_mechanism",
+                         "cohort": deadline["cohort_id"],
+                         "rule_spec": arm["rule_spec"],
+                         "parent_variant_id": arm["parent_variant_id"],
+                         "timing_delta": arm["timing_delta"]}
+                        for family in deadline["families"] for arm in family["arms"])
+            if len(arms) != 70 or len({a["variant_id"] for a in arms}) != 70:
+                raise ValueError(
+                    "expected 67 frozen comparisons and 3 distinct deadline-compatible arms")
+            extra["deadline_compatible_mechanisms"] = deadline
+        # Validate the complete suffix at the construction boundary as well
+        # as when additive execution is selected.
+        _additive_execution_arms(
+            {"arms": arms, **extra},
+            include_deadline_compatible=include_deadline_compatible)
     return {"arms": arms, "controls": controls, "mechanisms": mechanisms, **extra,
             "inventory_hash": content_hash(arms), "registered_arms": len(arms),
             "diagnostic_only": True, "authorizing": False, "selection": "none"}
@@ -117,6 +180,7 @@ def frozen_inventory(config: Mapping[str, Any], code_hash: str, *,
 def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, Any],
         ibr_max_events: int = 1_000_000, signal_quality: bool = True,
         include_cost_compatible: bool = False,
+        include_deadline_compatible: bool = False,
         evaluation_scope: str = "full_frozen_inventory",
         baseline_result: str | Path | None = None,
         projection_manifest: str | Path | None = None, progress=None) -> dict:
@@ -124,6 +188,9 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     destination = Path(output)
     if destination.exists():
         raise ValueError("choose a new immutable research output directory")
+    if include_deadline_compatible and not include_cost_compatible:
+        raise ValueError(
+            "deadline-compatible cohort requires include_cost_compatible=True")
     if isinstance(ibr_max_events, bool) or not isinstance(ibr_max_events, int) or ibr_max_events < 1:
         raise ValueError("IBR event budget must be positive")
     runtime = _policy_config(runtime_config)
@@ -132,8 +199,10 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
         raise ValueError("source has no validated content identity")
     files = _code_bundle_files()
     code_hash = _code_bundle_hash(files)
-    inventory = (frozen_inventory(runtime, code_hash, include_cost_compatible=True)
-                 if include_cost_compatible else frozen_inventory(runtime, code_hash))
+    inventory = frozen_inventory(
+        runtime, code_hash,
+        include_cost_compatible=include_cost_compatible,
+        include_deadline_compatible=include_deadline_compatible)
     if evaluation_scope not in {"full_frozen_inventory", "additive_geometry"}:
         raise ValueError("unknown evaluation scope")
     if evaluation_scope == "additive_geometry" and not include_cost_compatible:
@@ -141,11 +210,12 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     if evaluation_scope == "additive_geometry" and not signal_quality:
         raise ValueError("additive geometry requires signal_quality=True")
     execution_arms = (
-        _additive_execution_arms(inventory)
+        _additive_execution_arms(
+            inventory,
+            include_deadline_compatible=include_deadline_compatible)
         if include_cost_compatible else [])
     evaluated_arms = (inventory["arms"] if evaluation_scope == "full_frozen_inventory"
-                      else [a for a in inventory["arms"]
-                            if a["role"] == "cost_compatible_mechanism"])
+                      else execution_arms)
     baseline = None
     if baseline_result is not None:
         path = Path(baseline_result)
@@ -273,7 +343,8 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     decay_refs = []
     signal_quality_arms = [arm for arm in inventory["arms"]
                            if arm["role"] in {
-                               "new_mechanism", "cost_compatible_mechanism"}]
+                               "new_mechanism", "cost_compatible_mechanism",
+                               "deadline_compatible_mechanism"}]
     try:
         for index, arm in enumerate(evaluated_arms, 1):
             result = _evaluate_arm(arm)
@@ -333,7 +404,7 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
             if evaluated_ids != expected_ids:
                 raise ValueError(
                     "additive execution results do not match the ordered "
-                    "12-arm inventory suffix")
+                    + str(len(execution_arms)) + "-arm inventory suffix")
         write_immutable_evidence(destination / "ibr-runtime.json", ibr)
         rows = {r["variant_id"]: r["rows"] for r in results}
         meta = {r["variant_id"]: {"family": r["family"], "cohort": r["cohort"]} for r in results}
@@ -389,6 +460,7 @@ def main(argv=None):
     parser.add_argument("--ibr-max-events", type=int, default=1_000_000)
     parser.add_argument("--skip-signal-quality", action="store_true")
     parser.add_argument("--include-cost-compatible", action="store_true")
+    parser.add_argument("--include-deadline-compatible", action="store_true")
     parser.add_argument("--evaluation-scope", choices=("full_frozen_inventory", "additive_geometry"),
                         default="full_frozen_inventory")
     parser.add_argument("--baseline-result", type=Path)
@@ -397,6 +469,7 @@ def main(argv=None):
     run(args.data, args.output, runtime_config=load_config(args.config),
         ibr_max_events=args.ibr_max_events, signal_quality=not args.skip_signal_quality,
         include_cost_compatible=args.include_cost_compatible,
+        include_deadline_compatible=args.include_deadline_compatible,
         evaluation_scope=args.evaluation_scope, baseline_result=args.baseline_result,
         projection_manifest=args.projection_manifest,
         progress=lambda value: print(json.dumps(value, allow_nan=False), flush=True))

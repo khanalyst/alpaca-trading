@@ -130,7 +130,8 @@ class TraderResearchRunnerTests(unittest.TestCase):
                           "authorizing": False}))
         signal_ids = [arm["variant_id"] for arm in inventory["arms"]
                       if arm["role"] in {
-                          "new_mechanism", "cost_compatible_mechanism"}]
+                          "new_mechanism", "cost_compatible_mechanism",
+                          "deadline_compatible_mechanism"}]
         signal_calls = []
         def signal_quality(*args, **kwargs):
             index = len(signal_calls)
@@ -252,6 +253,51 @@ class TraderResearchRunnerTests(unittest.TestCase):
         self.assertTrue(all(arm["role"] == "cost_compatible_mechanism"
                             for arm in expanded["arms"][55:]))
 
+    def test_deadline_inventory_appends_ordered_children_with_timing_metadata(self):
+        config = load_config(Path("config.yaml"))
+        cost = research.frozen_inventory(
+            config, "a" * 64, include_cost_compatible=True)
+        expanded = research.frozen_inventory(
+            config, "a" * 64, include_cost_compatible=True,
+            include_deadline_compatible=True)
+
+        self.assertEqual(expanded["arms"][:67], cost["arms"])
+        self.assertEqual(expanded["registered_arms"], 70)
+        self.assertEqual(len({arm["variant_id"] for arm in expanded["arms"]}), 70)
+        manifest = expanded["deadline_compatible_mechanisms"]
+        expected = [arm for family in manifest["families"] for arm in family["arms"]]
+        actual = expanded["arms"][67:]
+        self.assertEqual(
+            [arm["variant_id"] for arm in actual],
+            [arm["variant_id"] for arm in expected])
+        self.assertEqual(
+            [arm["family"] for arm in actual],
+            [family["name"] for family in manifest["families"]])
+        self.assertTrue(all(arm["role"] == "deadline_compatible_mechanism"
+                            for arm in actual))
+        self.assertTrue(all(arm["cohort"] == manifest["cohort_id"]
+                            for arm in actual))
+        for inventory_arm, manifest_arm in zip(actual, expected):
+            self.assertEqual(inventory_arm["parent_variant_id"],
+                             manifest_arm["parent_variant_id"])
+            self.assertEqual(inventory_arm["timing_delta"],
+                             manifest_arm["timing_delta"])
+
+    def test_deadline_inventory_requires_cost_opt_in(self):
+        with self.assertRaisesRegex(ValueError, "cost-compatible"):
+            research.frozen_inventory(
+                load_config(Path("config.yaml")), "a" * 64,
+                include_deadline_compatible=True)
+
+    def test_deadline_run_requires_cost_opt_in_before_source_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "market.jsonl"
+            data.write_text("synthetic\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "include_cost_compatible"):
+                research.run(
+                    data, Path(directory) / "run", runtime_config={},
+                    include_deadline_compatible=True)
+
     def test_additive_scope_requires_signal_quality(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             self._common_patches(stack, _inventory())
@@ -318,6 +364,52 @@ class TraderResearchRunnerTests(unittest.TestCase):
                     runtime_config=config, include_cost_compatible=True,
                     evaluation_scope="additive_geometry", baseline_result=path)
             self.assertFalse((root / "rejected").exists())
+
+    def test_deadline_additive_run_evaluates_15_arms_and_27_signal_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, projection_dir, manifest = _small_projection(root)
+            with patch.object(
+                    research, "_code_bundle_hash",
+                    side_effect=["a" * 64, "a" * 64,
+                                 "b" * 64, "b" * 64]):
+                baseline = research.run(
+                    manifest["compact_jsonl"], root / "baseline",
+                    runtime_config=config, signal_quality=False,
+                    ibr_max_events=10,
+                    projection_manifest=projection_dir / "manifest.json")
+                current = research.run(
+                    manifest["compact_jsonl"], root / "additive",
+                    runtime_config=config, signal_quality=True,
+                    include_cost_compatible=True,
+                    include_deadline_compatible=True,
+                    evaluation_scope="additive_geometry",
+                    baseline_result=root / "baseline/result.json",
+                    projection_manifest=projection_dir / "manifest.json")
+
+            self.assertEqual(current["registered_arms"], 70)
+            self.assertEqual(current["evaluated_arms"], 15)
+            self.assertEqual(len(current["components"]), 15)
+            self.assertEqual(len(current["not_recomputed_variant_ids"]), 55)
+            self.assertEqual(len(current["not_recomputed_execution_variant_ids"]), 55)
+            self.assertEqual(current["not_recomputed_execution_count"], 55)
+            self.assertEqual(len(current["signal_quality"]), 27)
+            self.assertEqual(current["signal_quality_count"], 27)
+            expanded = research.frozen_inventory(
+                config, "b" * 64, include_cost_compatible=True,
+                include_deadline_compatible=True)
+            self.assertEqual(
+                current["signal_quality_variant_ids"],
+                [arm["variant_id"] for arm in expanded["arms"]
+                 if arm["role"] in {
+                     "new_mechanism", "cost_compatible_mechanism",
+                     "deadline_compatible_mechanism"}],
+            )
+            self.assertEqual(current["baseline_comparison"]["content_hash"],
+                             baseline["content_hash"])
+            self.assertEqual(current["ibr_runtime"]["status"], "not_recomputed")
+            self.assertFalse(current["authorizing"])
+            self.assertEqual(current["proofs"], [])
 
     def test_mid_run_failure_keeps_partial_components_and_blocks_final_result(self):
         inventory = _inventory()
