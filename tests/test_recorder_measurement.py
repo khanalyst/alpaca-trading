@@ -120,6 +120,26 @@ class RecorderMeasurementTests(unittest.TestCase):
             self.assertEqual(telemetry["recent_key_expired_count"], 1)
             self.assertEqual(telemetry["recent_key_current_count"], 1)
 
+    def test_recent_key_contains_many_batches_and_preserves_exact_membership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / recorder.RECENT_KEY_INDEX_NAME
+            existing = [
+                (f"key-{index}", "2026-08-08T13:00:00+00:00")
+                for index in range(1001)
+            ]
+            with recorder.RecentKeyIndex(database, create=True) as recent:
+                recent.add_many(existing)
+                statements = []
+                recent.db.set_trace_callback(statements.append)
+                probe = [f"key-{index}" for index in range(1001)]
+                probe.extend(("key-10", "missing"))
+                found = recent.contains_many(probe)
+
+            selects = [statement for statement in statements
+                       if statement.startswith("SELECT event_key FROM recent_keys")]
+            self.assertEqual(len(selects), 3)
+            self.assertEqual(found, {f"key-{index}" for index in range(1001)})
+
     def test_recent_key_commit_failure_rolls_back_without_success_count(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / recorder.RECENT_KEY_INDEX_NAME

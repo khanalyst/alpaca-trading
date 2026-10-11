@@ -13,6 +13,7 @@ from unittest.mock import patch
 from agent.config import load_config
 from deploy.trader_projection import ProjectionLimits, project_corpus
 from research import trader_research as research
+from research.mechanism_refresh_cohort import IBR_COMPARISON_VARIANT_IDS
 
 
 _PROJECTION_FIELDS = [
@@ -288,6 +289,154 @@ class TraderResearchRunnerTests(unittest.TestCase):
             research.frozen_inventory(
                 load_config(Path("config.yaml")), "a" * 64,
                 include_deadline_compatible=True)
+
+    def test_refresh_inventory_requires_cost_and_deadline_opt_ins(self):
+        config = load_config(Path("config.yaml"))
+        with self.assertRaisesRegex(ValueError, "cost-compatible"):
+            research.frozen_inventory(
+                config, "a" * 64, include_mechanism_refresh=True)
+        with self.assertRaisesRegex(ValueError, "deadline-compatible"):
+            research.frozen_inventory(
+                config, "a" * 64, include_cost_compatible=True,
+                include_mechanism_refresh=True)
+
+    def test_refresh_inventory_appends_twelve_parent_bound_children_to_70(self):
+        config = load_config(Path("config.yaml"))
+        inventory = research.frozen_inventory(
+            config, "a" * 64, include_cost_compatible=True,
+            include_deadline_compatible=True, include_mechanism_refresh=True)
+        self.assertEqual(inventory["registered_arms"], 82)
+        self.assertEqual(len(inventory["arms"]), 82)
+        self.assertEqual(inventory["arms"][:70], research.frozen_inventory(
+            config, "a" * 64, include_cost_compatible=True,
+            include_deadline_compatible=True)["arms"])
+        self.assertEqual(
+            [arm["variant_id"] for arm in inventory["arms"][70:]],
+            [arm["variant_id"] for family in inventory["mechanism_refresh"]["families"]
+             for arm in family["arms"]],
+        )
+        self.assertTrue(all(arm["role"] == "mechanism_refresh"
+                            for arm in inventory["arms"][70:]))
+        self.assertTrue(all(arm["parent_variant_id"]
+                            for arm in inventory["arms"][70:]))
+
+    def _refresh_inventory_for_runner(self) -> dict:
+        return research.frozen_inventory(
+            load_config(Path("config.yaml")), "a" * 64,
+            include_cost_compatible=True, include_deadline_compatible=True,
+            include_mechanism_refresh=True)
+
+    def test_refresh_scope_freshly_evaluates_ordered_children_parents_and_ibr(self):
+        inventory = self._refresh_inventory_for_runner()
+        child_ids = [arm["variant_id"] for arm in inventory["arms"][70:]]
+        parent_ids = [arm["parent_variant_id"] for arm in inventory["arms"][70:]]
+        refresh_signal_ids = [*child_ids, *parent_ids]
+        ibr_arms = [{
+            "strategy_id": "ibr", "family": "ibr", "role": "baseline",
+            "variant_id": variant_id, "overrides": {}, "cohort": "ibr_registry",
+        } for variant_id in IBR_COMPARISON_VARIANT_IDS]
+        signal_calls = []
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            self._common_patches(stack, inventory)
+            stack.enter_context(patch.object(
+                research, "build_inventory", return_value={"arms": ibr_arms}))
+            research.build_diagnostic_cohort.return_value = {"arms": ibr_arms}
+            research.run_offline_forward_ibr.return_value = {
+                "status": "measured",
+                "arms": {arm["variant_id"]: {"outcome": "no_signal"}
+                         for arm in ibr_arms},
+            }
+
+            def signal_quality(*args, **kwargs):
+                index = len(signal_calls)
+                signal_calls.append((args, kwargs))
+                return {
+                    "schema": "signal-quality.v1",
+                    "variant_id": refresh_signal_ids[index],
+                    "measurement_scope": "previously_examined_retrospective_diagnostic",
+                    "horizons": [5, 15, 30, 60], "diagnostic_only": True,
+                    "authorizing": False,
+                }
+            research.measure_signal_quality.side_effect = signal_quality
+            stack.enter_context(patch.object(
+                research, "_evaluate_arm", side_effect=lambda arm: {
+                    **arm, "outcome": "no_signal", "rows": [],
+                    "diagnostic_only": True, "authorizing": False,
+                    "eligible": False,
+                }))
+            data = Path(directory) / "market.jsonl"
+            data.write_text("synthetic\n", encoding="utf-8")
+            output = Path(directory) / "run"
+            receipt = research.run(
+                data, output, runtime_config={}, signal_quality=True,
+                include_cost_compatible=True,
+                include_deadline_compatible=True,
+                include_mechanism_refresh=True,
+                evaluation_scope="mechanism_refresh")
+
+            expected_ids = [*child_ids, *parent_ids, *IBR_COMPARISON_VARIANT_IDS]
+            self.assertEqual(receipt["evaluation_scope"], "mechanism_refresh")
+            self.assertEqual(receipt["registered_arms"], 82)
+            self.assertEqual(receipt["evaluated_arms"], 31)
+            self.assertEqual(receipt["evaluated_variant_ids"], expected_ids)
+            self.assertEqual(receipt["execution_variant_ids"], expected_ids)
+            self.assertEqual(len(receipt["components"]), 31)
+            self.assertEqual(receipt["signal_quality_count"], 24)
+            self.assertEqual(receipt["signal_quality_variant_ids"], refresh_signal_ids)
+            self.assertEqual(len(receipt["not_recomputed_variant_ids"]), 51)
+            self.assertEqual(receipt["not_recomputed_execution_count"], 51)
+            self.assertIsNone(receipt["baseline_comparison"])
+            self.assertEqual(receipt["mechanism_refresh"]["execution_report_count"], 31)
+            self.assertEqual(receipt["mechanism_refresh"]["signal_quality_report_count"], 24)
+            self.assertEqual(
+                [arm["variant_id"] for arm in research.run_offline_forward_ibr.call_args.kwargs["arms"]],
+                list(IBR_COMPARISON_VARIANT_IDS),
+            )
+            registration = json.loads((output / "registration.json").read_text())
+            self.assertEqual(registration["expected_execution_reports"], 31)
+            self.assertEqual(registration["expected_signal_quality_reports"], 24)
+            self.assertEqual(
+                len(registration["mechanism_refresh"]["parent_bindings"]), 12)
+            result = json.loads((output / "result.json").read_text())
+            self.assertEqual(result["content_hash"], receipt["content_hash"])
+            self.assertFalse(result["authorizing"])
+            self.assertEqual(len(list(output.glob("arm-*.json"))), 31)
+            self.assertEqual(len(list(output.glob("signal-*.json"))), 24)
+
+    def test_refresh_scope_rejects_sealed_baseline_reuse(self):
+        inventory = self._refresh_inventory_for_runner()
+        ibr_arms = [{
+            "strategy_id": "ibr", "family": "ibr", "role": "baseline",
+            "variant_id": variant_id, "overrides": {}, "cohort": "ibr_registry",
+        } for variant_id in IBR_COMPARISON_VARIANT_IDS]
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            self._common_patches(stack, inventory)
+            stack.enter_context(patch.object(
+                research, "build_inventory", return_value={"arms": ibr_arms}))
+            research.build_diagnostic_cohort.return_value = {"arms": ibr_arms}
+            data = Path(directory) / "market.jsonl"
+            data.write_text("synthetic\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not accept baseline_result"):
+                research.run(
+                    data, Path(directory) / "run", runtime_config={},
+                    include_cost_compatible=True,
+                    include_deadline_compatible=True,
+                    include_mechanism_refresh=True,
+                    evaluation_scope="mechanism_refresh",
+                    baseline_result=Path(directory) / "sealed-result.json")
+            self.assertFalse((Path(directory) / "run").exists())
+
+    def test_refresh_opt_in_cannot_fall_through_to_whole_inventory_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "market.jsonl"
+            data.write_text("synthetic\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "evaluation_scope='mechanism_refresh'"):
+                research.run(
+                    data, Path(directory) / "run", runtime_config={},
+                    include_cost_compatible=True,
+                    include_deadline_compatible=True,
+                    include_mechanism_refresh=True)
+            self.assertFalse((Path(directory) / "run").exists())
 
     def test_deadline_run_requires_cost_opt_in_before_source_work(self):
         with tempfile.TemporaryDirectory() as directory:

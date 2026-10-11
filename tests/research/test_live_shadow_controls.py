@@ -186,6 +186,10 @@ class LiveShadowControlTests(unittest.TestCase):
                     result["rows"][0]["target_price"] += 0.25
                 return result
 
+            # This fault injection replaces the replay implementation in
+            # memory. Discard the process-local memo so the parity check runs
+            # against that replacement, as it would after a code restart.
+            runner._authorizing_replay_memo.clear()
             with patch.object(runner, "_evaluate", side_effect=evaluate), \
                     patch("research.live_shadow.simulate_account",
                           side_effect=mismatching_account):

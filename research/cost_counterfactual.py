@@ -52,7 +52,8 @@ DEFAULT_COUNTERFACTUAL_BLOCK_LENGTH = 5
 _CODE_BUNDLE_ROOTS = ("agent", "research")
 _CODE_BUNDLE_EXTRAS = ("requirements.lock.txt", "deploy/recorder.py",
                      "deploy/recorder_market.py", "deploy/research_dataset.py",
-                     "deploy/trader_projection.py")
+                     "deploy/trader_projection.py",
+                     "research/mechanism_refresh_cohort.py")
 
 
 def _finite(value: object) -> float | None:

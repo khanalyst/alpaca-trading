@@ -25,6 +25,10 @@ from .diagnostic_shadow import _policy_config, build_diagnostic_cohort
 from .edge_ledger_store import content_hash
 from .ibr_diagnostic import run_offline_forward_ibr
 from .mechanism_cohort_v2 import mechanism_cohort
+from .mechanism_refresh_cohort import (
+    IBR_COMPARISON_VARIANT_IDS,
+    mechanism_refresh_cohort,
+)
 from .signal_quality import measure_signal_quality
 from .fit_diagnostics import _fit_prefixes
 from .source_validation import validate_source
@@ -110,6 +114,121 @@ def _additive_execution_arms(
     return suffix
 
 
+def _mechanism_refresh_plan(
+        inventory: Mapping[str, Any], runtime: Mapping[str, Any],
+        *, code_hash: str) -> dict[str, Any]:
+    """Resolve the fresh refresh execution plan from the frozen inventory.
+
+    The refresh scope intentionally evaluates only the twelve new children,
+    their twelve direct parents, and the existing seven IBR comparisons.  The
+    IBR arms are resolved through the same runtime cohort adapter used by the
+    full frozen run; they are not added to the 82-arm registration inventory.
+    """
+    manifest = inventory.get("mechanism_refresh")
+    if (not isinstance(manifest, Mapping) or
+            manifest.get("cohort_id") != mechanism_refresh_cohort().get("cohort_id")):
+        raise ValueError("mechanism refresh inventory is missing its cohort manifest")
+    refresh_families = manifest.get("families")
+    if not isinstance(refresh_families, list) or len(refresh_families) != 12:
+        raise ValueError("mechanism refresh inventory must contain 12 families")
+
+    inventory_arms = inventory.get("arms")
+    if not isinstance(inventory_arms, list) or len(inventory_arms) != 82:
+        raise ValueError("mechanism refresh requires an 82-arm inventory")
+    by_id = {str(arm.get("variant_id")): arm for arm in inventory_arms
+             if isinstance(arm, Mapping) and arm.get("variant_id") is not None}
+    children = inventory_arms[70:]
+    if len(children) != 12:
+        raise ValueError("mechanism refresh children are not the ordered inventory suffix")
+
+    child_ids: list[str] = []
+    parent_ids: list[str] = []
+    child_bindings: list[dict[str, Any]] = []
+    for family, child in zip(refresh_families, children):
+        if not isinstance(family, Mapping) or not isinstance(child, Mapping):
+            raise ValueError("mechanism refresh family or arm is invalid")
+        family_arms = family.get("arms")
+        if (not isinstance(family_arms, list) or len(family_arms) != 1 or
+                not isinstance(family_arms[0], Mapping)):
+            raise ValueError("mechanism refresh family must contain one arm")
+        declared = family_arms[0]
+        if (child.get("variant_id") != declared.get("variant_id") or
+                child.get("cohort") != manifest.get("cohort_id") or
+                child.get("role") != "mechanism_refresh" or
+                child.get("parent_variant_id") != declared.get("parent_variant_id") or
+                child.get("rule_spec") != declared.get("rule_spec")):
+            raise ValueError("mechanism refresh child manifest binding changed")
+        parent_id = str(child.get("parent_variant_id") or "")
+        parent = by_id.get(parent_id)
+        if (parent is None or parent.get("strategy_id") != "rule" or
+                parent.get("variant_id") != parent_id):
+            raise ValueError("mechanism refresh direct parent is not registered")
+        if parent_id in parent_ids or str(child.get("variant_id")) in child_ids:
+            raise ValueError("mechanism refresh child or parent IDs are not unique")
+        expected_parent_cohort = declared.get("parent_cohort_id")
+        if (parent.get("cohort") != expected_parent_cohort or
+                child.get("parent_cohort_id") != expected_parent_cohort or
+                child.get("parent_manifest_hash") != declared.get("parent_manifest_hash")):
+            raise ValueError("mechanism refresh direct parent cohort binding changed")
+        child_ids.append(str(child["variant_id"]))
+        parent_ids.append(parent_id)
+        child_bindings.append({
+            "child_variant_id": str(child["variant_id"]),
+            "parent_variant_id": parent_id,
+            "parent_cohort_id": expected_parent_cohort,
+            "parent_manifest_hash": declared.get("parent_manifest_hash"),
+            "declared_mechanism_delta": declared.get("declared_mechanism_delta"),
+        })
+
+    # Preserve the refresh manifest order: children first, then their direct
+    # parents in the same family order.  This makes component/result ordering
+    # deterministic and leaves the existing inventory order untouched.
+    child_arms = [dict(by_id[variant_id]) for variant_id in child_ids]
+    parent_arms = [dict(by_id[variant_id]) for variant_id in parent_ids]
+    runtime_cohort = build_diagnostic_cohort(
+        runtime, code_identity=code_hash, include_ibr=True)
+    runtime_ibr = [arm for arm in runtime_cohort.get("arms", ())
+                   if isinstance(arm, Mapping) and arm.get("strategy_id") == "ibr"]
+    runtime_ibr_by_id = {str(arm.get("variant_id")): arm for arm in runtime_ibr}
+    if (len(runtime_ibr) != len(IBR_COMPARISON_VARIANT_IDS) or
+            set(runtime_ibr_by_id) != set(IBR_COMPARISON_VARIANT_IDS)):
+        raise ValueError("mechanism refresh requires the seven registered IBR comparisons")
+    runtime_ibr_arms = [dict(runtime_ibr_by_id[variant_id])
+                        for variant_id in IBR_COMPARISON_VARIANT_IDS]
+    # The runtime cohort carries the strict adapter configuration, while the
+    # legacy evaluator also needs the registry's dotted override map.  Resolve
+    # that map from the existing inventory without changing the registration.
+    legacy_ibr = [arm for arm in build_inventory(runtime, code_hash=code_hash)["arms"]
+                  if arm.get("strategy_id") == "ibr"]
+    legacy_overrides = {
+        str(arm.get("variant_id")): arm.get("overrides", {})
+        for arm in legacy_ibr}
+    if set(legacy_overrides) != set(IBR_COMPARISON_VARIANT_IDS):
+        raise ValueError("mechanism refresh IBR registry does not contain seven overrides")
+    ibr_arms = [dict(arm) for arm in runtime_ibr_arms]
+    for arm in ibr_arms:
+        arm["overrides"] = dict(legacy_overrides[arm["variant_id"]])
+        arm["cohort"] = "ibr_registry"
+    for arm in child_arms:
+        arm["refresh_comparison_role"] = "child"
+    for arm in parent_arms:
+        arm["refresh_comparison_role"] = "direct_parent"
+    for arm in ibr_arms:
+        arm["refresh_comparison_role"] = "ibr_comparison"
+    rules = [*child_arms, *parent_arms]
+    return {
+        "manifest": manifest,
+        "children": child_arms,
+        "parents": parent_arms,
+        "rules": rules,
+        "ibr": ibr_arms,
+        "runtime_ibr": runtime_ibr_arms,
+        "execution": [*rules, *ibr_arms],
+        "child_bindings": child_bindings,
+        "runtime_cohort": runtime_cohort,
+    }
+
+
 def _validate_signal_quality_result(
         result: Mapping[str, Any], expected_variant_id: str) -> None:
     """Validate the compact signal artifact before it becomes immutable."""
@@ -126,10 +245,17 @@ def _validate_signal_quality_result(
 
 def frozen_inventory(config: Mapping[str, Any], code_hash: str, *,
                      include_cost_compatible: bool = False,
-                     include_deadline_compatible: bool = False) -> dict:
+                     include_deadline_compatible: bool = False,
+                     include_mechanism_refresh: bool = False) -> dict:
     if include_deadline_compatible and not include_cost_compatible:
         raise ValueError(
             "deadline-compatible cohort requires the cost-compatible cohort")
+    if include_mechanism_refresh and not include_cost_compatible:
+        raise ValueError(
+            "mechanism refresh cohort requires the cost-compatible cohort")
+    if include_mechanism_refresh and not include_deadline_compatible:
+        raise ValueError(
+            "mechanism refresh cohort requires the deadline-compatible cohort")
     controls = build_inventory(config, code_hash=code_hash)
     mechanisms = mechanism_cohort()
     arms = list(controls["arms"])
@@ -172,6 +298,34 @@ def frozen_inventory(config: Mapping[str, Any], code_hash: str, *,
         _additive_execution_arms(
             {"arms": arms, **extra},
             include_deadline_compatible=include_deadline_compatible)
+    if include_mechanism_refresh:
+        refresh = mechanism_refresh_cohort()
+        refresh_arms = []
+        for family in refresh["families"]:
+            for arm in family["arms"]:
+                refresh_arms.append({
+                    "variant_id": arm["variant_id"],
+                    "strategy_id": "rule",
+                    "family": family["name"],
+                    "role": "mechanism_refresh",
+                    "cohort": refresh["cohort_id"],
+                    "rule_spec": arm["rule_spec"],
+                    "parent_variant_id": arm["parent_variant_id"],
+                    "parent_cohort_id": arm["parent_cohort_id"],
+                    "parent_manifest_hash": arm["parent_manifest_hash"],
+                    "parent_rule_spec": arm["parent_rule_spec"],
+                    "parent_spec": arm["parent_spec"],
+                    "declared_mechanism_delta": arm["declared_mechanism_delta"],
+                    "mechanism_delta": arm["mechanism_delta"],
+                    "economic_thesis": arm["economic_thesis"],
+                })
+        if (len(refresh_arms) != 12 or
+                len({arm["variant_id"] for arm in refresh_arms}) != 12):
+            raise ValueError("expected 12 distinct mechanism refresh arms")
+        arms.extend(refresh_arms)
+        if len(arms) != 82 or len({a["variant_id"] for a in arms}) != 82:
+            raise ValueError("expected 82 registered mechanism refresh arms")
+        extra["mechanism_refresh"] = refresh
     return {"arms": arms, "controls": controls, "mechanisms": mechanisms, **extra,
             "inventory_hash": content_hash(arms), "registered_arms": len(arms),
             "diagnostic_only": True, "authorizing": False, "selection": "none"}
@@ -181,6 +335,7 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
         ibr_max_events: int = 1_000_000, signal_quality: bool = True,
         include_cost_compatible: bool = False,
         include_deadline_compatible: bool = False,
+        include_mechanism_refresh: bool = False,
         evaluation_scope: str = "full_frozen_inventory",
         baseline_result: str | Path | None = None,
         projection_manifest: str | Path | None = None, progress=None) -> dict:
@@ -191,6 +346,21 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     if include_deadline_compatible and not include_cost_compatible:
         raise ValueError(
             "deadline-compatible cohort requires include_cost_compatible=True")
+    if include_mechanism_refresh and not include_cost_compatible:
+        raise ValueError(
+            "mechanism refresh cohort requires include_cost_compatible=True")
+    if include_mechanism_refresh and not include_deadline_compatible:
+        raise ValueError(
+            "mechanism refresh cohort requires include_deadline_compatible=True")
+    if evaluation_scope not in {
+            "full_frozen_inventory", "additive_geometry", "mechanism_refresh"}:
+        raise ValueError("unknown evaluation scope")
+    if include_mechanism_refresh and evaluation_scope != "mechanism_refresh":
+        raise ValueError(
+            "include_mechanism_refresh requires evaluation_scope='mechanism_refresh'")
+    if evaluation_scope == "mechanism_refresh" and not include_mechanism_refresh:
+        raise ValueError(
+            "mechanism_refresh scope requires include_mechanism_refresh=True")
     if isinstance(ibr_max_events, bool) or not isinstance(ibr_max_events, int) or ibr_max_events < 1:
         raise ValueError("IBR event budget must be positive")
     runtime = _policy_config(runtime_config)
@@ -202,20 +372,30 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     inventory = frozen_inventory(
         runtime, code_hash,
         include_cost_compatible=include_cost_compatible,
-        include_deadline_compatible=include_deadline_compatible)
-    if evaluation_scope not in {"full_frozen_inventory", "additive_geometry"}:
-        raise ValueError("unknown evaluation scope")
+        include_deadline_compatible=include_deadline_compatible,
+        include_mechanism_refresh=include_mechanism_refresh)
     if evaluation_scope == "additive_geometry" and not include_cost_compatible:
         raise ValueError("additive geometry requires the cost-compatible cohort")
     if evaluation_scope == "additive_geometry" and not signal_quality:
         raise ValueError("additive geometry requires signal_quality=True")
+    if evaluation_scope == "mechanism_refresh" and not signal_quality:
+        raise ValueError("mechanism_refresh requires signal_quality=True")
+    if evaluation_scope == "mechanism_refresh" and baseline_result is not None:
+        raise ValueError(
+            "mechanism_refresh uses fresh evaluation and does not accept baseline_result")
+    refresh_plan = None
+    if evaluation_scope == "mechanism_refresh":
+        refresh_plan = _mechanism_refresh_plan(
+            inventory, runtime, code_hash=code_hash)
     execution_arms = (
         _additive_execution_arms(
             inventory,
             include_deadline_compatible=include_deadline_compatible)
-        if include_cost_compatible else [])
-    evaluated_arms = (inventory["arms"] if evaluation_scope == "full_frozen_inventory"
-                      else execution_arms)
+        if evaluation_scope == "additive_geometry" else
+        refresh_plan["execution"] if refresh_plan is not None else [])
+    evaluated_arms = (
+        inventory["arms"] if evaluation_scope == "full_frozen_inventory" else
+        execution_arms)
     baseline = None
     if baseline_result is not None:
         path = Path(baseline_result)
@@ -303,6 +483,31 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     registration["evaluation_scope"] = evaluation_scope
     registration["evaluated_variant_ids"] = [a["variant_id"] for a in evaluated_arms]
     registration["execution_variant_ids"] = [a["variant_id"] for a in evaluated_arms]
+    if refresh_plan is not None:
+        registration["mechanism_refresh"] = {
+            "cohort_id": refresh_plan["manifest"]["cohort_id"],
+            "children_variant_ids": [
+                arm["variant_id"] for arm in refresh_plan["children"]],
+            "direct_parent_variant_ids": [
+                arm["variant_id"] for arm in refresh_plan["parents"]],
+            "ibr_variant_ids": [arm["variant_id"] for arm in refresh_plan["ibr"]],
+            "parent_bindings": refresh_plan["child_bindings"],
+            "execution_report_count": len(refresh_plan["execution"]),
+            "rule_execution_report_count": len(refresh_plan["rules"]),
+            "ibr_execution_report_count": len(refresh_plan["ibr"]),
+            "signal_quality_report_count": len(refresh_plan["rules"]),
+            "fresh_evaluation": True,
+            "baseline_reused": False,
+            "baseline_required": False,
+            "retrospective_only": True,
+            "fresh_holdout_claim": False,
+            "scope_label": "fresh_mechanism_children_direct_parents_and_existing_ibr",
+        }
+        registration["expected_execution_reports"] = len(refresh_plan["execution"])
+        registration["expected_signal_quality_reports"] = len(refresh_plan["rules"])
+        registration["evaluated_count"] = len(refresh_plan["execution"])
+        registration["execution_report_count"] = len(refresh_plan["execution"])
+        registration["signal_quality_report_count"] = len(refresh_plan["rules"])
     registration["baseline_comparison"] = baseline
     if projection is not None:
         registration["projection"] = projection
@@ -311,7 +516,14 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     def emit(phase, **values):
         if progress:
             progress({"phase": phase, **values})
-    emit("registered", arms=len(inventory["arms"]))
+    emit("registered", arms=len(inventory["arms"]),
+         evaluated=(len(refresh_plan["execution"]) if refresh_plan is not None else
+                    len(evaluated_arms)),
+         signal_quality=(len(refresh_plan["rules"]) if refresh_plan is not None else
+                         sum(arm["role"] in {
+                             "new_mechanism", "cost_compatible_mechanism",
+                             "deadline_compatible_mechanism"}
+                             for arm in inventory["arms"])))
     # Calibration is measured independently; it does not lower the admission
     # gate or rewrite the protected runtime config.
     try:
@@ -341,10 +553,12 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
     components = []
     results = []
     decay_refs = []
-    signal_quality_arms = [arm for arm in inventory["arms"]
-                           if arm["role"] in {
-                               "new_mechanism", "cost_compatible_mechanism",
-                               "deadline_compatible_mechanism"}]
+    signal_quality_arms = (
+        list(refresh_plan["rules"]) if refresh_plan is not None else
+        [arm for arm in inventory["arms"]
+         if arm["role"] in {
+             "new_mechanism", "cost_compatible_mechanism",
+             "deadline_compatible_mechanism"}])
     try:
         for index, arm in enumerate(evaluated_arms, 1):
             result = _evaluate_arm(arm)
@@ -364,7 +578,8 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
             emit("arm_complete", done=index, total=len(evaluated_arms), variant_id=arm["variant_id"])
         if signal_quality:
             for arm in signal_quality_arms:
-                emit("signal_quality", variant_id=arm["variant_id"])
+                emit("signal_quality", done=len(decay_refs) + 1,
+                     total=len(signal_quality_arms), variant_id=arm["variant_id"])
                 prefix = _fit_prefixes(_WORKER["bars"], arm["rule_spec"],
                                        policy=_WORKER["policy"])
                 decay = measure_signal_quality(_WORKER["bars"], arm["rule_spec"],
@@ -387,10 +602,15 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
         _close_worker()
         gc.collect()
         emit("rule_worker_released")
-        if evaluation_scope == "full_frozen_inventory":
-            cohort = build_diagnostic_cohort(runtime, code_identity=code_hash, include_ibr=True)
+        if evaluation_scope in {"full_frozen_inventory", "mechanism_refresh"}:
+            cohort = (refresh_plan["runtime_cohort"] if refresh_plan is not None else
+                      build_diagnostic_cohort(runtime, code_identity=code_hash,
+                                              include_ibr=True))
+            runtime_arms = [a for a in cohort["arms"] if a["strategy_id"] == "ibr"]
+            if refresh_plan is not None:
+                runtime_arms = refresh_plan["runtime_ibr"]
             ibr = run_offline_forward_ibr(data, runtime_config=runtime,
-                arms=[a for a in cohort["arms"] if a["strategy_id"] == "ibr"],
+                arms=runtime_arms,
                 source_report=source, starting_cash=100_000.0, max_events=ibr_max_events)
             _attach_ibr_runtime(results, ibr)
         else:
@@ -405,6 +625,19 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
                 raise ValueError(
                     "additive execution results do not match the ordered "
                     + str(len(execution_arms)) + "-arm inventory suffix")
+        if refresh_plan is not None:
+            evaluated_ids = [str(result.get("variant_id")) for result in results]
+            expected_ids = [str(arm["variant_id"])
+                            for arm in refresh_plan["execution"]]
+            if evaluated_ids != expected_ids:
+                raise ValueError(
+                    "mechanism refresh results do not match the ordered "
+                    "12-child, 12-parent, 7-IBR execution plan")
+            if (len(results) != 31 or
+                    sum(result.get("strategy_id") == "rule" for result in results) != 24 or
+                    sum(result.get("strategy_id") == "ibr" for result in results) != 7):
+                raise ValueError(
+                    "mechanism refresh requires exactly 24 rule and 7 IBR reports")
         write_immutable_evidence(destination / "ibr-runtime.json", ibr)
         rows = {r["variant_id"]: r["rows"] for r in results}
         meta = {r["variant_id"]: {"family": r["family"], "cohort": r["cohort"]} for r in results}
@@ -415,22 +648,35 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
             raise ValueError("code changed during research")
         if validate_source(data, diagnostic_only=True).get("content_hash") != source["content_hash"]:
             raise ValueError("source changed during research")
+        selected_inventory_ids = {
+            str(result["variant_id"]) for result in results
+            if str(result.get("variant_id")) in {
+                str(arm.get("variant_id")) for arm in inventory["arms"]}}
+        not_recomputed_ids = [
+            arm["variant_id"] for arm in inventory["arms"]
+            if arm["variant_id"] not in selected_inventory_ids]
         report = {"schema": "trader-research.v1", "status": "diagnostic_complete",
             "diagnostic_only": True, "authorizing": False, "eligible": [],
             "proofs": [], "selection": "none", "portfolio_pnl": None,
             "registration_hash": frozen["content_hash"], "source": source,
             "code_hash": code_hash, "runtime_config_hash": content_hash(runtime),
             "evaluation_scope": evaluation_scope,
+            "fresh_holdout_claim": False,
             "registered_arms": len(inventory["arms"]), "evaluated_arms": len(results),
+            "evaluated_count": len(results),
+            "execution_report_count": len(results),
+            "evaluated_variant_ids": [result["variant_id"] for result in results],
+            "execution_variant_ids": [result["variant_id"] for result in results],
             "baseline_comparison": baseline,
-            "not_recomputed_variant_ids": [a["variant_id"] for a in inventory["arms"]
-                if a["variant_id"] not in {r["variant_id"] for r in results}],
-            "not_recomputed_execution_variant_ids": [
-                a["variant_id"] for a in inventory["arms"][:55]
-                if a["variant_id"] not in {r["variant_id"] for r in results}],
-            "not_recomputed_execution_count": sum(
-                a["variant_id"] not in {r["variant_id"] for r in results}
-                for a in inventory["arms"][:55]),
+            "not_recomputed_variant_ids": not_recomputed_ids,
+            "not_recomputed_execution_variant_ids": (
+                not_recomputed_ids if refresh_plan is not None else [
+                    a["variant_id"] for a in inventory["arms"][:55]
+                    if a["variant_id"] not in {r["variant_id"] for r in results}]),
+            "not_recomputed_execution_count": (
+                len(not_recomputed_ids) if refresh_plan is not None else sum(
+                    a["variant_id"] not in {r["variant_id"] for r in results}
+                    for a in inventory["arms"][:55])),
             "components": components, "signal_quality": decay_refs,
             "signal_quality_variant_ids": [ref["variant_id"] for ref in decay_refs],
             "signal_quality_count": len(decay_refs),
@@ -445,6 +691,33 @@ def run(data: str | Path, output: str | Path, *, runtime_config: Mapping[str, An
                 "quote_costs_do_not_measure_actual_fills_or_broker_equivalence",
                 "overlapping_variants_are_not_independent_or_a_portfolio",
                 "live_cadence_requires_a_fresh_market_session"]}
+        if refresh_plan is not None:
+            report["mechanism_refresh"] = {
+                "cohort_id": refresh_plan["manifest"]["cohort_id"],
+                "children_variant_ids": [
+                    arm["variant_id"] for arm in refresh_plan["children"]],
+                "direct_parent_variant_ids": [
+                    arm["variant_id"] for arm in refresh_plan["parents"]],
+                "ibr_variant_ids": [arm["variant_id"] for arm in refresh_plan["ibr"]],
+                "parent_bindings": refresh_plan["child_bindings"],
+                "execution_report_count": len(results),
+                "rule_execution_report_count": sum(
+                    result.get("strategy_id") == "rule" for result in results),
+                "ibr_execution_report_count": sum(
+                    result.get("strategy_id") == "ibr" for result in results),
+                "signal_quality_report_count": len(decay_refs),
+                "fresh_evaluation": True,
+                "baseline_reused": False,
+                "retrospective_only": True,
+                "fresh_holdout_claim": False,
+                "historical_comparison_label": (
+                    "retrospective_diagnostic_fresh_replay_without_sealed_baseline_reuse"),
+            }
+            report["limitations"].extend([
+                "mechanism refresh is a fresh retrospective replay, not an untouched holdout",
+                "refresh children are compared directly with their registered parent arms",
+                "the seven IBR reports use the strict forward runtime adapter and remain diagnostic",
+            ])
         receipt = write_immutable_evidence(destination / "result.json", report)
         emit("completed", output=str(destination), arms=len(results), authorizing=False)
         return receipt
@@ -461,7 +734,9 @@ def main(argv=None):
     parser.add_argument("--skip-signal-quality", action="store_true")
     parser.add_argument("--include-cost-compatible", action="store_true")
     parser.add_argument("--include-deadline-compatible", action="store_true")
-    parser.add_argument("--evaluation-scope", choices=("full_frozen_inventory", "additive_geometry"),
+    parser.add_argument("--include-mechanism-refresh", action="store_true")
+    parser.add_argument("--evaluation-scope", choices=(
+        "full_frozen_inventory", "additive_geometry", "mechanism_refresh"),
                         default="full_frozen_inventory")
     parser.add_argument("--baseline-result", type=Path)
     parser.add_argument("--projection-manifest", type=Path)
@@ -470,6 +745,7 @@ def main(argv=None):
         ibr_max_events=args.ibr_max_events, signal_quality=not args.skip_signal_quality,
         include_cost_compatible=args.include_cost_compatible,
         include_deadline_compatible=args.include_deadline_compatible,
+        include_mechanism_refresh=args.include_mechanism_refresh,
         evaluation_scope=args.evaluation_scope, baseline_result=args.baseline_result,
         projection_manifest=args.projection_manifest,
         progress=lambda value: print(json.dumps(value, allow_nan=False), flush=True))

@@ -132,6 +132,9 @@ PARTITION_CALENDAR_SCHEMA = "recorder-partition-calendar.v1"
 DEDUP_HORIZON = timedelta(minutes=15)
 MAX_INLINE_INDEX_BYTES = 16 * 1024 * 1024
 RECENT_KEY_BATCH_SIZE = 10_000
+# Keep membership probes below SQLite's portable host-parameter limit while
+# still amortizing the query overhead for high-rate quote responses.
+RECENT_KEY_LOOKUP_BATCH_SIZE = 500
 RECENT_KEY_CACHE_KIB = 64 * 1024
 DEFAULT_FETCH_WINDOW_MINUTES = 1
 DEFAULT_FORWARD_OBSERVATION_MAX_LAG_MINUTES = 15
@@ -810,6 +813,25 @@ class RecentKeyIndex:
         return self.db.execute(
             "SELECT 1 FROM recent_keys WHERE event_key=? LIMIT 1",
             (event_key,)).fetchone() is not None
+
+    def contains_many(self, event_keys) -> set[str]:
+        """Return the exact subset of ``event_keys`` present on disk.
+
+        SQLite accepts a bounded number of host parameters per statement.
+        Chunking the ``IN`` probes keeps this method portable across the
+        recorder's supported SQLite builds while reducing one query per
+        projected row to a bounded number of queries per response.
+        """
+        keys = list(dict.fromkeys(str(key) for key in event_keys))
+        found: set[str] = set()
+        for offset in range(0, len(keys), RECENT_KEY_LOOKUP_BATCH_SIZE):
+            batch = keys[offset:offset + RECENT_KEY_LOOKUP_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.db.execute(
+                f"SELECT event_key FROM recent_keys WHERE event_key IN "
+                f"({placeholders})", batch)
+            found.update(str(row[0]) for row in rows)
+        return found
 
     def add_many(self, entries) -> None:
         values = [(str(key), _recent_key_timestamp(stamp))
@@ -2391,6 +2413,9 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
     unique_keys: set[str] = set()
     recent_entries: list[tuple[str, str]] = []
     with _timed_cycle_phase(telemetry, "validation_ingest_seconds"):
+        validated_rows: list[tuple[dict, datetime, str]] = []
+        lookup_keys: list[str] = []
+        lookup_key_set: set[str] = set()
         for row in rows:
             parsed = _timestamp(row.get("timestamp"))
             if parsed is None:
@@ -2403,12 +2428,19 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
             key = str(row.get("event_key") or "").strip()
             if not key:
                 raise RuntimeError("recorder row has no event_key")
+            validated_rows.append((row, parsed, key))
+            if key not in lookup_key_set:
+                lookup_key_set.add(key)
+                lookup_keys.append(key)
             if row.get("event_type") == "option_snapshot":
                 # Refresh the hold even when the snapshot itself is a duplicate;
                 # the option contract remains pinned while the recorder observes it.
                 pins[str(row.get("contract") or row.get("symbol"))] = (
                     observed_at + option_hold).isoformat()
-            if key in unique_keys or recent_store.contains(key):
+
+        existing_keys = recent_store.contains_many(lookup_keys)
+        for row, parsed, key in validated_rows:
+            if key in unique_keys or key in existing_keys:
                 continue
             unique_keys.add(key)
             unique_rows.append(row)

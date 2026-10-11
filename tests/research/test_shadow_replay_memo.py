@@ -258,6 +258,46 @@ class ShadowReplayMemoRegressionTests(unittest.TestCase):
         memo = runner._authorizing_replay_memo[(candidate["candidate_id"], session)]
         self.assertFalse(memo["ok"])
 
+        # The exact blocked identity is still safe to memoize: it must keep
+        # this poll blocked without loading the historical session again.
+        with patch.object(runner.store, "replay_session_identities",
+                          return_value=ambiguous), \
+                patch.object(runner, "_evaluate",
+                             side_effect=AssertionError(
+                                 "blocked memo should skip evaluation")) as evaluate, \
+                patch.object(runner, "_replay",
+                             side_effect=AssertionError(
+                                 "blocked memo should skip replay")) as replay, \
+                patch.object(runner, "_load_events_for_sessions",
+                             side_effect=AssertionError(
+                                 "blocked memo should skip historical load")) as load_events:
+            blocked = runner.run_once()
+        evaluate.assert_not_called()
+        replay.assert_not_called()
+        load_events.assert_not_called()
+        self.assertEqual(blocked["forward_event_floor"], prior_floor)
+
+        # A semantic identity change invalidates the blocked memo and returns
+        # to the full repair path.
+        repaired_identity = dict(ambiguous)
+        repaired_identity[(candidate["candidate_id"], session)] = {
+            **ambiguous[(candidate["candidate_id"], session)],
+            "ambiguous_account": False,
+            "account": {
+                "account_id": "memo-account", "replay_status": "match",
+            },
+        }
+        with patch.object(runner.store, "replay_session_identities",
+                          return_value=repaired_identity), \
+                patch.object(runner, "_evaluate",
+                             side_effect=self._no_trade), \
+                patch.object(runner, "_replay", return_value=True) as replay, \
+                patch.object(runner, "_load_events_for_sessions",
+                             wraps=runner._load_events_for_sessions) as load_events:
+            runner.run_once()
+        replay.assert_called_once()
+        load_events.assert_called()
+
     def test_future_same_symbol_open_book_invalidates_historical_memo(self):
         runner = self._runner()
         candidate = self._candidate()

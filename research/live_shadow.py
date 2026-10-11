@@ -4119,6 +4119,113 @@ class ShadowRunner:
                 str(candidate.get("candidate_id") or "")),
         })
 
+    @staticmethod
+    def _memo_replay_window(value: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Decode the bounded calendar portion retained with a replay memo.
+
+        A memo is process-local evidence, rather than authorization state.  It
+        is useful only when the exact calendar window used by the completed
+        replay can be reconstructed without reading its historical rows.  An
+        older/partial entry therefore deliberately returns ``None`` and takes
+        the normal replay path.
+        """
+        encoded = value.get("replay_window")
+        if not isinstance(encoded, Mapping):
+            return None
+        close = _timestamp(encoded.get("calendar_close"))
+        if close is None:
+            return None
+        raw_bounds = encoded.get("calendar_bounds")
+        bounds: tuple[datetime, datetime] | None = None
+        if raw_bounds is not None:
+            if (not isinstance(raw_bounds, (list, tuple)) or
+                    len(raw_bounds) != 2):
+                return None
+            opened, closed = (_timestamp(item) for item in raw_bounds)
+            if opened is None or closed is None:
+                return None
+            bounds = (opened, closed)
+        source = str(encoded.get("calendar_source") or "")
+        if not source:
+            return None
+        return {
+            "require_exact_calendar": bool(
+                encoded.get("require_exact_calendar", False)),
+            "calendar_bounds": bounds,
+            "calendar_close": close,
+            "calendar_source": source,
+            # The replay key uses only the calendar/policy/cost fields.  Keep
+            # the row collections empty so this validation can never be
+            # mistaken for a replay input snapshot.
+            "bars": (), "quotes": (), "options": (), "complete": True,
+        }
+
+    def _validate_authorizing_replay_memo(
+            self, candidate: Mapping[str, Any], session: str,
+            memo: Mapping[str, Any], identity: Mapping[str, Any],
+            *, calendar_snapshot: _RecordedSessionCalendarSnapshot,
+            quarantine: Mapping[str, Any],
+            replay_quarantine: Mapping[str, Any],
+            replay_identity: Mapping[str, Any]) -> str | None:
+        """Validate one closed replay memo without loading historical rows.
+
+        Every input used by ``_authorizing_replay_memo_key`` is re-read from
+        the current WAL/configuration.  The source prefix and calendar are
+        checked separately because they are the two pieces that cannot be
+        reconstructed from replay/account metadata alone.  Return ``hit``
+        for a successful memo, ``blocked`` for an exact cached fail-closed
+        result, and ``None`` when the old slow path must repair/recompute it.
+        """
+        if (not isinstance(memo.get("ok"), bool) or
+                not memo.get("key")):
+            return None
+        stored_prefix = memo.get("causal_prefix")
+        if not isinstance(stored_prefix, Mapping):
+            return None
+        stored_code = str(memo.get("replay_code_hash") or "")
+        current_code = str(replay_identity.get("replay_code_hash") or "")
+        if not stored_code or stored_code != current_code:
+            return None
+        window = self._memo_replay_window(memo)
+        if window is None:
+            return None
+        try:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            cfg = self._shadow_candidate_config(_safe_config(candidate))
+            session_cfg = (cfg.get("session")
+                           if isinstance(cfg.get("session"), Mapping) else {})
+            require_exact = bool(session_cfg.get("require_exact_calendar", False))
+            if require_exact != bool(window["require_exact_calendar"]):
+                return None
+            bounds = _recorded_session_bounds(
+                self.config.corpus_path, session,
+                calendar_snapshot=calendar_snapshot)
+            close, source = _session_close(
+                self.config.corpus_path, session,
+                require_exact_calendar=require_exact,
+                calendar_snapshot=calendar_snapshot)
+            if close is None or close != window["calendar_close"]:
+                return None
+            if str(source) != str(window["calendar_source"]):
+                return None
+            if bounds != window.get("calendar_bounds"):
+                return None
+            current_prefix = self.store.event_prefix_identity(close)
+            if dict(current_prefix) != dict(stored_prefix):
+                return None
+            current_key = self._authorizing_replay_memo_key(
+                candidate, session, window, current_prefix, quarantine,
+                replay_quarantine, replay_identity, identity,
+                self.store.virtual_book_state_through(candidate_id, session))
+            if current_key != str(memo.get("key")):
+                return None
+            return "hit" if memo["ok"] is True else "blocked"
+        except Exception:
+            # Missing calendar/cost/policy metadata is a replay miss.  The
+            # historical path below retains its established fail-closed
+            # behavior and records the detailed diagnostic if it fails too.
+            return None
+
     def _cached_authorizing_event_views(
             self, fingerprint: str) -> tuple[list[dict], dict[str, list[dict]],
                                              dict[str, list[dict]],
@@ -7338,6 +7445,7 @@ class ShadowRunner:
         # matched gate evidence, using a timestamp-indexed bounded WAL query;
         # this catches corrected replay semantics without rescanning corpus
         # history or treating a no-op poll as fresh evidence.
+        authorizing_preparation_started = time.monotonic()
         arm_ids = {str(arm.get("candidate_id") or "") for arm in arms}
         gate_pairs = set(self.store.gate_sessions(sorted(arm_ids)))
         active_memo_pairs = {(candidate_id, session)
@@ -7347,9 +7455,64 @@ class ShadowRunner:
             pair: detail for pair, detail in self._authorizing_replay_memo.items()
             if pair in active_memo_pairs
         }
+        # A gate session that reappears in the forward batch is a late or
+        # corrected observation, even when it is also present in
+        # ``session_inputs``.  Force the complete historical replay so a new
+        # row cannot be evaluated as an isolated current-session event.
+        def row_session_for_memo(row: Mapping[str, Any]) -> str | None:
+            stamp = _timestamp(row.get("as_of") or row.get("timestamp"))
+            return (stamp.astimezone(NEW_YORK).date().isoformat()
+                    if stamp is not None else None)
         replay_only_sessions = {
             session for _candidate_id, session in gate_pairs
             if session not in session_inputs}
+        replay_only_sessions.update(
+            session for _candidate_id, session in gate_pairs
+            if session in session_inputs and any(
+                row_session_for_memo(row) == session for row in events))
+        replay_pairs = sorted({(candidate_id, session)
+                               for candidate_id, session in gate_pairs
+                               if session in replay_only_sessions})
+        # This is intentionally one bounded projection for the whole poll.
+        # It supplies both the warm validation state and the slow-path state;
+        # per-session SQL probes here would dominate an otherwise idle poll.
+        replay_identities_for_poll = (
+            self.store.replay_session_identities(replay_pairs)
+            if replay_pairs else {})
+        replay_memo_states: dict[tuple[str, str], str] = {}
+        replay_identity_for_memo = {"replay_code_hash": _replay_code_hash()}
+        replay_quarantine_for_memo = self.store.replay_quarantine()
+        for candidate_id, session in replay_pairs:
+            candidate = next((item for item in arms
+                              if str(item.get("candidate_id") or "") ==
+                              candidate_id), None)
+            identity = replay_identities_for_poll.get((candidate_id, session))
+            memo = self._authorizing_replay_memo.get((candidate_id, session))
+            if (candidate is not None and isinstance(identity, Mapping) and
+                    isinstance(memo, Mapping)):
+                state = self._validate_authorizing_replay_memo(
+                    candidate, session, memo, identity,
+                    calendar_snapshot=calendar_snapshot,
+                    quarantine=quarantine,
+                    replay_quarantine=replay_quarantine_for_memo,
+                    replay_identity=replay_identity_for_memo)
+                if state is not None:
+                    replay_memo_states[(candidate_id, session)] = state
+        # A session is removed from the slow path only after every gated arm
+        # has independently validated its memo.  Mixed hit/miss sessions must
+        # still load one complete historical snapshot for the misses, while a
+        # validated blocked arm is safe to skip and keeps the poll blocked.
+        replay_only_sessions = {
+            session for session in replay_only_sessions
+            if not all((candidate_id, session) in replay_memo_states
+                       for candidate_id, gated_session in gate_pairs
+                       if gated_session == session)
+        }
+        replay_memo_blocked = {
+            pair for pair, state in replay_memo_states.items()
+            if state == "blocked"}
+        authorizing_preparation_seconds = max(
+            0.0, time.monotonic() - authorizing_preparation_started)
         legacy_replay_context = False
         if replay_only_sessions:
             # Full-session correction is intentionally preflighted before the
@@ -7577,7 +7740,7 @@ class ShadowRunner:
         candidate_errors: dict[str, str] = dict(diagnostic_errors)
         authorizing_errors: dict[str, str] = {}
         failed_arms: set[str] = set()
-        replay_blocked = False
+        replay_blocked = bool(replay_memo_blocked)
         # Historical quote context is reduced to a point-in-time skyline as
         # replay sessions advance.  This preserves the old cross-session
         # quote lookup without retaining every prior session row.  Option
@@ -7585,7 +7748,10 @@ class ShadowRunner:
         replay_quote_frontier: dict[tuple[str, str, str], list[dict]] = {}
         replay_option_context: dict[str, list[dict]] = {}
         replay_quarantine_for_memo = self.store.replay_quarantine()
-        phase_started = time.monotonic()
+        memo_replay_contexts: dict[
+            tuple[str, str], tuple[dict[str, Any], dict[str, Any], list[dict]]
+        ] = {}
+        authorizing_evaluation_started = time.monotonic()
         for session in sorted(set(frozen_session_events) | replay_only_sessions):
             is_replay_only = session in replay_only_sessions
             if is_replay_only and not legacy_replay_context:
@@ -7680,9 +7846,15 @@ class ShadowRunner:
                 replay_pairs = [(candidate_id, session)
                                 for candidate_id, value in gate_pairs
                                 if value == session]
-                replay_identities = self.store.replay_session_identities(
-                    replay_pairs)
+                replay_identities = {
+                    pair: detail for pair, detail in
+                    replay_identities_for_poll.items()
+                    if pair in replay_pairs}
                 for candidate_id, _session in replay_pairs:
+                    memo_state = replay_memo_states.get((candidate_id, session))
+                    if memo_state is not None:
+                        replay_cache_state[candidate_id] = memo_state
+                        continue
                     replay_window = self._replay_session_window(
                         arm_by_id[candidate_id], session, session_inputs_one[
                             session][0], session_inputs_one[session][1],
@@ -7710,9 +7882,10 @@ class ShadowRunner:
                         replay_window, causal_prefix, book_state)
                     prior = self._authorizing_replay_memo.get(
                         (candidate_id, session))
-                    if isinstance(prior, Mapping) and prior.get("key") == memo_key:
-                        replay_cache_state[candidate_id] = (
-                            "hit" if prior.get("ok") is True else "blocked")
+                    if (isinstance(prior, Mapping) and
+                            prior.get("key") == memo_key and
+                            prior.get("ok") is True):
+                        replay_cache_state[candidate_id] = "hit"
             session_candidates = ({candidate_id for candidate_id, value in gate_pairs
                                    if value == session}
                                   if is_replay_only else arm_ids)
@@ -7819,7 +7992,8 @@ class ShadowRunner:
                     continue
                 if is_replay_only and replay_cache_state.get(candidate_id) == "hit":
                     continue
-                if is_replay_only and replay_cache_state.get(candidate_id) == "blocked":
+                if (is_replay_only and
+                        replay_cache_state.get(candidate_id) == "blocked"):
                     session_success = False
                     continue
                 if (candidate_id in active_candidate_ids and
@@ -7856,12 +8030,9 @@ class ShadowRunner:
                         replay_window=replay_window)
                     if complete is not True:
                         session_success = False
-                    elif is_replay_only:
-                        post_identity = self.store.replay_session_identities(
-                            [(candidate_id, session)]).get(
-                                (candidate_id, session))
+                    elif complete is True:
                         close = replay_window.get("calendar_close")
-                        if post_identity is None or not isinstance(close, datetime):
+                        if not isinstance(close, datetime):
                             session_success = False
                             continue
                         close_key = close.isoformat()
@@ -7871,26 +8042,8 @@ class ShadowRunner:
                             causal_prefix_cache[close_key] = post_prefix
                         post_books = self.store.virtual_book_state_through(
                             candidate_id, session)
-                        post_key = self._authorizing_replay_memo_key(
-                            arm_by_id[candidate_id], session, replay_window,
-                            post_prefix, quarantine,
-                            self.store.replay_quarantine(),
-                            replay_identity, post_identity, post_books)
-                        account = post_identity.get("account")
-                        parity = bool(
-                            not post_identity.get("ambiguous_account") and
-                            post_identity.get("replay", {}).get("status") == "match" and
-                            isinstance(account, Mapping) and
-                            account.get("replay_status") == "match")
-                        self._authorizing_replay_memo[
-                            (candidate_id, session)] = {
-                                "key": post_key, "ok": parity}
-                        while (len(self._authorizing_replay_memo) >
-                               MAX_AUTHORIZING_REPLAY_MEMO_ENTRIES):
-                            self._authorizing_replay_memo.pop(
-                                next(iter(self._authorizing_replay_memo)))
-                        if not parity:
-                            session_success = False
+                        memo_replay_contexts[(candidate_id, session)] = (
+                            replay_window, post_prefix, post_books)
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {str(exc)[:240]}"
                     candidate_errors[candidate_id] = message
@@ -7899,8 +8052,66 @@ class ShadowRunner:
                     session_success = False
             if not session_success:
                 replay_blocked = True
+        # Refresh all replay identities in one bounded query after slow-path
+        # replays have committed their immutable diff/account rows.  Warm
+        # memo hits never enter this projection a second time.
+        if memo_replay_contexts:
+            post_identities = self.store.replay_session_identities(
+                sorted(memo_replay_contexts))
+            for (candidate_id, session), (replay_window, post_prefix,
+                                           post_books) in memo_replay_contexts.items():
+                post_identity = post_identities.get((candidate_id, session))
+                if post_identity is None:
+                    # A test seam or a legacy caller may provide a replay
+                    # implementation that reports completion without
+                    # persisting authorizing evidence.  Preserve the normal
+                    # current-session floor behavior; a historical gated
+                    # session remains fail-closed as before.
+                    if (candidate_id, session) in gate_pairs:
+                        replay_blocked = True
+                    continue
+                post_key = self._authorizing_replay_memo_key(
+                    arm_by_id[candidate_id], session, replay_window,
+                    post_prefix, quarantine, self.store.replay_quarantine(),
+                    replay_identity, post_identity, post_books)
+                account = post_identity.get("account")
+                parity = bool(
+                    not post_identity.get("ambiguous_account") and
+                    post_identity.get("replay", {}).get("status") == "match" and
+                    isinstance(account, Mapping) and
+                    account.get("replay_status") == "match")
+                close = replay_window.get("calendar_close")
+                self._authorizing_replay_memo[(candidate_id, session)] = {
+                    "key": post_key, "ok": parity,
+                    "replay_code_hash": str(
+                        replay_identity.get("replay_code_hash") or
+                        _replay_code_hash()),
+                    "causal_prefix": dict(post_prefix),
+                    "replay_window": {
+                        "require_exact_calendar": bool(
+                            replay_window.get("require_exact_calendar", False)),
+                        "calendar_close": (close.isoformat()
+                                            if isinstance(close, datetime)
+                                            else None),
+                        "calendar_source": replay_window.get("calendar_source"),
+                        "calendar_bounds": ([value.isoformat()
+                                             for value in replay_window.get(
+                                                 "calendar_bounds", ())]
+                                            if isinstance(replay_window.get(
+                                                "calendar_bounds"), tuple)
+                                            else replay_window.get(
+                                                "calendar_bounds")),
+                    },
+                }
+                while (len(self._authorizing_replay_memo) >
+                       MAX_AUTHORIZING_REPLAY_MEMO_ENTRIES):
+                    self._authorizing_replay_memo.pop(
+                        next(iter(self._authorizing_replay_memo)))
+                if not parity:
+                    replay_blocked = True
         poll_phases["authorizing_evaluation_seconds"] = max(
-            0.0, time.monotonic() - phase_started)
+            0.0, authorizing_preparation_seconds +
+            time.monotonic() - authorizing_evaluation_started)
         phase_started = time.monotonic()
         prune = self.store.prune()
         replay_quarantine = self.store.replay_quarantine()

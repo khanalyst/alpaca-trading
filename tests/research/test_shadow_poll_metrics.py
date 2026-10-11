@@ -273,10 +273,19 @@ class ShadowPollMetricsTests(unittest.TestCase):
         with patch.object(runner, "_evaluate",
                           side_effect=AssertionError("historical eval repeated")) as evaluate, \
                 patch.object(runner, "_replay",
-                             side_effect=AssertionError("historical replay repeated")) as replay:
+                             side_effect=AssertionError("historical replay repeated")) as replay, \
+                patch.object(runner, "_load_events_for_sessions",
+                             side_effect=AssertionError(
+                                 "historical rows should stay unloaded")) as load_events, \
+                patch.object(runner.store, "replay_session_identities",
+                             wraps=runner.store.replay_session_identities) as identities:
             second = runner.run_once()
         evaluate.assert_not_called()
         replay.assert_not_called()
+        load_events.assert_not_called()
+        identities.assert_called_once()
+        self.assertEqual(set(identities.call_args.args[0]), {
+            (candidate["candidate_id"], "2026-01-02")})
         self.assertTrue(runner._authorizing_replay_memo)
         self.assertEqual(first["candidate_errors"], second["candidate_errors"])
 
@@ -344,11 +353,14 @@ class ShadowPollMetricsTests(unittest.TestCase):
         with self.corpus.open("a", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=FIELDS).writerow(late_prior)
         with patch.object(runner, "_evaluate", side_effect=no_trade) as evaluate, \
-                patch.object(runner, "_replay", return_value=True) as replay:
+                patch.object(runner, "_replay", return_value=True) as replay, \
+                patch.object(runner, "_load_events_for_sessions",
+                             wraps=runner._load_events_for_sessions) as load_events:
             runner.run_once()
         self.assertIn(late_prior["event_key"], {
             str(call.args[1]["event_key"]) for call in evaluate.call_args_list})
         replay.assert_called()
+        load_events.assert_called()
 
     def test_health_allowlists_whole_poll_metrics_without_readiness_effect(self):
         path = Path(self.tmp.name) / "shadow-health.json"
