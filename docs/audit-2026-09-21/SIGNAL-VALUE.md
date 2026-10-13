@@ -1,6 +1,7 @@
 # Steps 5, 6 and 2: exit geometry, signal quality, and costs
 
-Completes the remediation list in `FINDINGS.md`. Same corpus throughout:
+Completes the remediation list in the historical
+[FINDINGS.md](https://github.com/khanalyst/alpaca-trading/blob/2f25d5fb17d5bfb568274b435cce51c76549c6d3/docs/audit-2026-09-21/FINDINGS.md). Same corpus throughout:
 177,504 one-minute bars, the configured 24-ETF universe, 19 sessions
 (2026-08-25 to 2026-09-21).
 
@@ -84,7 +85,8 @@ Control-adjusted delta, basis points:
 | opening_drive | +0.45 | -4.79 | -7.06 | **-10.49** | -9.10 |
 | **vwap_trend** | -2.45 | -5.85 | -9.89 | **-13.34** | **-14.45** |
 
-The predeclared kill criterion from `FINDINGS.md` was: no arm above +3 bps with
+The predeclared kill criterion from the historical
+[FINDINGS.md](https://github.com/khanalyst/alpaca-trading/blob/2f25d5fb17d5bfb568274b435cce51c76549c6d3/docs/audit-2026-09-21/FINDINGS.md) was: no arm above +3 bps with
 |t| > 2 at any horizon means the grammar is dead. It returns **11 hits**. The
 criterion is not met. The grammar is not dead.
 
@@ -126,7 +128,7 @@ continuation expression, is the single worst arm in the catalogue.
   It was extrapolated from Q2's *raw* forward returns, which share each day's
   market shock. The signed, control-adjusted delta largely does not, because
   long and short signals in one session cancel that shock. Measured directly
-  (`RE-AUDIT.md`), clustered t is a median **0.86** of the event-level value,
+  ([historical re-audit](https://github.com/khanalyst/alpaca-trading/blob/2f25d5fb17d5bfb568274b435cce51c76549c6d3/docs/audit-2026-09-21/RE-AUDIT.md)), clustered t is a median **0.86** of the event-level value,
   and `vwap_reversion` holds at clustered **t = +4.34** (df 17). See the
   correction section at the end of this document.
 - **The 24 arms share 19 sessions**, so their signs are correlated and the
@@ -181,7 +183,8 @@ lead looks like before it is either confirmed or killed by more data.
 
 ## Step 2, costs: still operator-blocked, with the evidence quantified
 
-Unchanged from `REMEDIATION.md`: fitting `costs.measured_quote` needs a quote
+Unchanged from the historical
+[remediation report](https://github.com/khanalyst/alpaca-trading/blob/2f25d5fb17d5bfb568274b435cce51c76549c6d3/docs/audit-2026-09-21/REMEDIATION.md): fitting `costs.measured_quote` needs a quote
 corpus with 500+ quotes per cell and exact feed provenance. This session has
 bars, not quotes, and fabricating a schedule would put an unmeasured number in
 the place the repository is most careful about.

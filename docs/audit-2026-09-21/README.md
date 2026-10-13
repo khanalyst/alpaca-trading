@@ -1,19 +1,18 @@
 # Measured audit, 21 September 2026
 
-Five reports, in order:
+This directory retains historical research data, reproduction scripts, and
+forward-test evidence. These observations describe the September experiment.
 
-- `FINDINGS.md`: the audit, and why the system had never produced a trade.
-- `REMEDIATION.md`: steps 1, 3 and 4 applied, plus the IBR contract merge.
-- `SIGNAL-VALUE.md`: steps 5, 6 and 2, covering exit geometry, signal quality
-  and costs. **It overturns a conclusion in `FINDINGS.md`**, and carries a
-  correction of its own at the end.
-- `RE-AUDIT.md`: session-clustered inference, the preregistered forward test,
-  and a second pass over everything changed.
-- `FORWARD-2026-09-23.md`: all 24 rule arms net of fees, realistic and
-  modelled costs, historical and on the first two sealed sessions, plus the
-  walk-forward exit test. Read it last.
+- [SIGNAL-VALUE.md](SIGNAL-VALUE.md) records exit geometry, signal quality,
+  costs, and the later correction to the inference method.
+- [FORWARD-2026-09-23.md](FORWARD-2026-09-23.md) records the historical and first
+  sealed-session results for 24 arms and the walk-forward exit test.
 
-This directory holds the evidence.
+Superseded narrative reports were removed from the current tree. Their exact
+versions remain in Git history:
+[FINDINGS.md](https://github.com/khanalyst/alpaca-trading/blob/2f25d5fb17d5bfb568274b435cce51c76549c6d3/docs/audit-2026-09-21/FINDINGS.md),
+[REMEDIATION.md](https://github.com/khanalyst/alpaca-trading/blob/2f25d5fb17d5bfb568274b435cce51c76549c6d3/docs/audit-2026-09-21/REMEDIATION.md), and
+[RE-AUDIT.md](https://github.com/khanalyst/alpaca-trading/blob/2f25d5fb17d5bfb568274b435cce51c76549c6d3/docs/audit-2026-09-21/RE-AUDIT.md).
 
 ## Data
 

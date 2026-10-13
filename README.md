@@ -9,10 +9,11 @@ Options are single-leg long calls or puts
 (buy-to-open, sell-to-close); multi-leg and naked/short option structures are
 unsupported. No performance claim is made.
 
-The current pending work, deployment status and evidence boundary are recorded in
-[docs/current-findings.md](docs/current-findings.md).
-The [strategy and variant review](docs/strategy-variant-review.md) maps all 43
-registered equity arms to their actual signals, parameters and evidence gaps.
+The dated [deployment snapshot](docs/current-findings.md) records the last
+verified deployment observations and evidence boundary.
+The [diagnostic suite](research/diagnostic_suite.py) constructs the registered
+arms, and the [refresh cohort](research/mechanism_refresh_cohort.py) defines the
+new mechanism comparisons.
 
 ## What this repository does
 
@@ -575,8 +576,8 @@ winners are based on completed parent trades across the full journal, with
 unknown costs left unknown. Charts show observed account equity, drawdown, net
 payoffs, uncertainty, and recorded entry context. Account equity is explicitly
 not adjusted for cash transfers. Direct research progress is separate from the
-scheduler heartbeat. See the [current findings](docs/current-findings.md)
-for verified pending work, deployment status and evidence limitations.
+scheduler heartbeat. See the dated [deployment snapshot](docs/current-findings.md)
+for the last verified observations and evidence limitations.
 The [archived frozen strategy and feed comparison](https://github.com/khanalyst/alpaca-trading/blob/8068c73deb157d14fb84e49514c8f8eb8d0e9de5/docs/trading-edge-comparison-2026-09-08.md)
 retains all twelve arms and their execution refusals as historical evidence;
 it is not current performance and establishes no deployable positive edge.
