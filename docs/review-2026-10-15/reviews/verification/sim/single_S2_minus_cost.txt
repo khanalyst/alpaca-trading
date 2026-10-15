@@ -1,0 +1,1 @@
+S2_minus_cost single n=20 sims=5000: P(total_r>0 & mean_r>0)=0.3456  P(verdict=passed)=0.0462  P(verdict=failed)=0.1928  [325s]

@@ -1,0 +1,1 @@
+S3_coin sequential looks n=20..60 sims=1000: P(ever passed)=0.2140  P(failed, absorbing)=0.2100  [2062s]

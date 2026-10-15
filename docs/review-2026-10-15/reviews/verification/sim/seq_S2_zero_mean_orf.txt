@@ -1,0 +1,1 @@
+S2_zero_mean_orf sequential looks n=20..60 sims=1000: P(ever passed)=0.2170  P(failed, absorbing)=0.2310  [2040s]

@@ -1,0 +1,1 @@
+S2_minus_cost sequential looks n=20..60 sims=1000: P(ever passed)=0.1070  P(failed, absorbing)=0.4100  [1838s]

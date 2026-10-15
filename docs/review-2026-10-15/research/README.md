@@ -51,6 +51,14 @@ python -I scripts/pro_variants.py data results/pro_variants.json        # profes
 python -I scripts/variance_ratio.py data > results/variance_ratio.txt   # intraday variance ratios with session bootstrap
 ```
 
+## Monitoring simulation (edge-ledger drift test, finding F3b)
+
+```sh
+python -I scripts/sprt_sim.py   # SPRT retirement speed, no-reset delay, rolling-R warning rate
+```
+
+The script reproduces the formulas in `research/edge_ledger.py:605-722` with bracket-like R outcomes and prints the figures quoted in `../reviews/handoff-F3b_coordinator.md`.
+
 ## Files in `results/`
 
 | file | content |
