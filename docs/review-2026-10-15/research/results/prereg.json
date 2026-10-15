@@ -1,0 +1,192 @@
+{
+ "vwap-reversion-control-adjusted.v1": {
+  "schema": "preregistered-evaluation.v1",
+  "hypothesis_id": "vwap-reversion-control-adjusted.v1",
+  "manifest_hash": "d2e56d80bdb0e367bcceebbe4792bf4a00aee815eb442e62f043ee2e40b7c48e",
+  "authorizing": false,
+  "trading_authorized": false,
+  "decision_eligible": false,
+  "eligibility_reasons": [
+   "public consolidated-tape bars, not Alpaca IEX forward_observed"
+  ],
+  "sealed_boundary": "2026-09-21",
+  "sealed_sessions": [
+   "2026-09-22",
+   "2026-09-23",
+   "2026-09-24",
+   "2026-09-25",
+   "2026-09-28",
+   "2026-09-29",
+   "2026-09-30",
+   "2026-10-01",
+   "2026-10-02",
+   "2026-10-05",
+   "2026-10-06",
+   "2026-10-07",
+   "2026-10-08",
+   "2026-10-09",
+   "2026-10-12",
+   "2026-10-13"
+  ],
+  "excluded_examined_bars": 56091,
+  "interim": {
+   "sessions": 16,
+   "decision": "none_before_first_look",
+   "primary_60m": {
+    "candidate_count": 337,
+    "matched_count": 337,
+    "session_clusters": 16,
+    "delta_bps": 3.499522738044767,
+    "cluster_stderr_bps": 3.806108045876637,
+    "cluster_t_stat": 0.9194491317281414,
+    "cluster_df": 15,
+    "sign_flip_p_value": 0.19218078192180782,
+    "event_t_stat": 1.7766302341172109,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 337
+    }
+   },
+   "subject_120m": {
+    "candidate_count": 325,
+    "matched_count": 325,
+    "session_clusters": 16,
+    "delta_bps": 9.14423677414566,
+    "cluster_stderr_bps": 5.373305925346052,
+    "cluster_t_stat": 1.7017897177623948,
+    "cluster_df": 15,
+    "sign_flip_p_value": 0.05269473052694731,
+    "event_t_stat": 3.464603666308692,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 325
+    }
+   },
+   "mirror_60m": {
+    "candidate_count": 276,
+    "matched_count": 276,
+    "session_clusters": 16,
+    "delta_bps": -4.430704438940456,
+    "cluster_stderr_bps": 3.6028293683817942,
+    "cluster_t_stat": -1.2297847013860943,
+    "cluster_df": 15,
+    "sign_flip_p_value": 0.8725127487251275,
+    "event_t_stat": -1.9037063779628516,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 276
+    }
+   }
+  },
+  "looks": [
+   {
+    "look": 1,
+    "sessions_required": 30,
+    "status": "not_reached"
+   },
+   {
+    "look": 2,
+    "sessions_required": 60,
+    "status": "not_reached"
+   }
+  ],
+  "decision": "diagnostic_only",
+  "rule_outcome_if_eligible": "accruing",
+  "provenance": {
+   "source": "public chart endpoint",
+   "feed": "delayed_sip",
+   "fetched": "2026-10-14"
+  }
+ },
+ "opening-range-fade-control-adjusted.v1": {
+  "schema": "preregistered-evaluation.v1",
+  "hypothesis_id": "opening-range-fade-control-adjusted.v1",
+  "manifest_hash": "a0ae21f5ffd765142f2f4b92c47e33f652e0fb3213f1fd8d5a6d82c3915c2b9e",
+  "authorizing": false,
+  "trading_authorized": false,
+  "decision_eligible": false,
+  "eligibility_reasons": [
+   "public consolidated-tape bars, not Alpaca IEX forward_observed"
+  ],
+  "sealed_boundary": "2026-09-23",
+  "sealed_sessions": [
+   "2026-09-24",
+   "2026-09-25",
+   "2026-09-28",
+   "2026-09-29",
+   "2026-09-30",
+   "2026-10-01",
+   "2026-10-02",
+   "2026-10-05",
+   "2026-10-06",
+   "2026-10-07",
+   "2026-10-08",
+   "2026-10-09",
+   "2026-10-12",
+   "2026-10-13"
+  ],
+  "excluded_examined_bars": 74777,
+  "interim": {
+   "sessions": 14,
+   "decision": "none_before_first_look",
+   "primary_60m": {
+    "candidate_count": 79,
+    "matched_count": 79,
+    "session_clusters": 13,
+    "delta_bps": 2.0419000440486834,
+    "cluster_stderr_bps": 5.606623363686029,
+    "cluster_t_stat": 0.36419425946711936,
+    "cluster_df": 12,
+    "sign_flip_p_value": 0.37516248375162486,
+    "event_t_stat": 0.5147332332575277,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 79
+    }
+   },
+   "subject_120m": {
+    "candidate_count": 73,
+    "matched_count": 73,
+    "session_clusters": 13,
+    "delta_bps": 0.8446973119602019,
+    "cluster_stderr_bps": 6.923889000564756,
+    "cluster_t_stat": 0.12199752363033303,
+    "cluster_df": 12,
+    "sign_flip_p_value": 0.44925507449255075,
+    "event_t_stat": 0.17141113339389874,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 73
+    }
+   },
+   "mirror_60m": {
+    "candidate_count": 305,
+    "matched_count": 305,
+    "session_clusters": 14,
+    "delta_bps": -4.157411521889066,
+    "cluster_stderr_bps": 2.6460078638347957,
+    "cluster_t_stat": -1.5712014989493754,
+    "cluster_df": 13,
+    "sign_flip_p_value": 0.934906509349065,
+    "event_t_stat": -2.2621299125918246,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 305
+    }
+   }
+  },
+  "looks": [
+   {
+    "look": 1,
+    "sessions_required": 30,
+    "status": "not_reached"
+   },
+   {
+    "look": 2,
+    "sessions_required": 60,
+    "status": "not_reached"
+   }
+  ],
+  "decision": "diagnostic_only",
+  "rule_outcome_if_eligible": "accruing",
+  "provenance": {
+   "source": "public chart endpoint",
+   "feed": "delayed_sip",
+   "fetched": "2026-10-14"
+  }
+ }
+}

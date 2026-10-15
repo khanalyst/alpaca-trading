@@ -1,0 +1,33 @@
+arms 82 | with trades 80 | zero-trade arms [('cost_v1', 'vwap_reversion'), ('mech_v2', 'vwap_reversion')]
+positive mean net(real) 4 [('refresh_v1', 'opening_range_fade', 'opening_range_fade#0', 0.8, 0.16, 24), ('deadline_v1', 'opening_range_fade', 'opening_range_fade#0', 0.26, 0.1, 89), ('diag24', 'opening_range_fade', 'variant', 6.48, 1.23, 70), ('diag24', 'opening_range_fade', 'baseline', 3.49, 1.02, 161)]
+positive mean gross 27
+net clustered t < -2: 60 | net clustered t > +2: 0
+mean of arm means gross: -1.12 bps (median -0.75)
+mean of arm means real: -4.03 bps (median -3.51)
+mean of arm means model: -18.12 bps (median -17.75)
+stop floor ibr arms 7 {'force_flat': 0.659, 'stop': 0.309, 'target': 0.031}
+stop floor None arms 47 {'deadline': 0.034, 'force_flat': 0.038, 'stop': 0.265, 'target': 0.1, 'time': 0.563}
+stop floor 100.0 arms 26 {'deadline': 0.062, 'stop': 0.004, 'target': 0.119, 'time': 0.815}
+first-trade net: entry at next open minus entry one bar later, mean over arms 0.22 bps (median 0.05)
+refusals mech_v2 mean_reversion {'exit:ValueError': 5459}
+refusals cost_v1 mean_reversion {'exit:ValueError': 5458}
+refusals cost_v1 opening_range_fade {'exit:ValueError': 86}
+refusals mech_v2 opening_range_fade {'exit:ValueError': 86}
+refusals cost_v1 vwap_reversion {'exit:ValueError': 3657}
+refusals mech_v2 vwap_reversion {'exit:ValueError': 3657}
+portfolio total return over 22 sessions, real costs: best [(0.43536854579137446, 'ibr7', 'ibr', 'ibr.buffer.0bps'), (0.9521012707545434, 'diag24', 'opening_range_fade', 'baseline'), (0.9823856653684047, 'diag24', 'opening_range_fade', 'variant')] worst [(-4.764299159191085, 'mech_v1', 'opening_range_breakout', 'opening_continuation#3'), (-3.927014385600055, 'deadline_v1', 'mean_reversion', 'mean_reversion#0'), (-3.7643366950211097, 'diag24', 'vwap_trend', 'variant')]
+mean risk used per trade (% equity): 0.1403
+
+FAMILY (diag24 baseline | variant): net mean bps (t) all-22 ; unseen-14 ; signal quality 60m delta (t)
+cross_sectional_residual  base n1556 -3.73 (-3.52) ; -4.01 ; sq60 -3.40 (-0.84) | vari n1311 -3.36 (-2.68) ; -3.55 ; sq60 -1.98 (-0.49)
+mean_reversion            base n994 -3.50 (-5.05) ; -3.66 ; sq60 0.14 (0.12) | vari n962 -3.25 (-5.04) ; -3.67 ; sq60 0.58 (0.51)
+momentum_continuation     base n1254 -4.12 (-4.08) ; -4.48 ; sq60 -3.10 (-1.27) | vari n897 -3.88 (-3.90) ; -4.34 ; sq60 -3.65 (-1.27)
+opening_drive             base n808 -2.73 (-1.97) ; -2.94 ; sq60 -3.62 (-1.20) | vari n522 -4.77 (-3.40) ; -6.09 ; sq60 -5.84 (-1.91)
+opening_range_breakout    base n1647 -5.36 (-4.70) ; -6.77 ; sq60 -3.48 (-1.86) | vari n1506 -5.59 (-5.07) ; -6.93 ; sq60 -3.70 (-2.06)
+opening_range_fade        base n161 3.49 (1.02) ; 2.44 ; sq60 9.84 (1.42) | vari n70 6.48 (1.23) ; 3.10 ; sq60 16.38 (1.33)
+range_expansion           base n1376 -5.33 (-7.55) ; -5.03 ; sq60 -4.24 (-2.24) | vari n925 -3.80 (-2.95) ; -4.04 ; sq60 -0.07 (-0.03)
+trend_pullback            base n2166 -3.40 (-4.33) ; -4.18 ; sq60 -2.67 (-1.52) | vari n2288 -3.22 (-4.01) ; -3.80 ; sq60 -2.96 (-1.75)
+volatility_breakout       base n95 -3.52 (-1.25) ; -2.62 ; sq60 -0.35 (-0.11) | vari n248 -0.37 (-0.17) ; -1.41 ; sq60 1.72 (0.68)
+volume_breakout           base n515 -3.37 (-1.75) ; -4.20 ; sq60 -2.26 (-0.82) | vari n471 -3.23 (-1.65) ; -4.27 ; sq60 -2.15 (-0.72)
+vwap_reversion            base n1822 -0.80 (-0.69) ; 0.18 ; sq60 3.24 (1.12) | vari n1224 -0.74 (-0.50) ; 0.54 ; sq60 0.40 (0.17)
+vwap_trend                base n580 -7.52 (-4.21) ; -8.77 ; sq60 -5.62 (-1.90) | vari n382 -9.60 (-4.45) ; -12.28 ; sq60 -6.26 (-1.93)

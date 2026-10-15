@@ -1,0 +1,84 @@
+arms 82 todo 82
+diag24 opening_range_breakout baseline trades 1647 vetoed 0 errors {} secs 193.4
+diag24 opening_range_breakout variant trades 1506 vetoed 0 errors {} secs 218.7
+diag24 opening_range_fade baseline trades 161 vetoed 0 errors {} secs 526.8
+diag24 momentum_continuation baseline trades 1254 vetoed 0 errors {} secs 29.8
+diag24 opening_range_fade variant trades 70 vetoed 0 errors {} secs 537.2
+diag24 momentum_continuation variant trades 897 vetoed 0 errors {} secs 33.4
+diag24 mean_reversion baseline trades 994 vetoed 0 errors {} secs 49.3
+diag24 trend_pullback baseline trades 2166 vetoed 0 errors {} secs 16.6
+diag24 mean_reversion variant trades 962 vetoed 0 errors {} secs 47.0
+diag24 trend_pullback variant trades 2288 vetoed 0 errors {} secs 14.4
+diag24 volatility_breakout baseline trades 95 vetoed 0 errors {} secs 47.6
+diag24 volatility_breakout variant trades 248 vetoed 0 errors {} secs 44.9
+diag24 volume_breakout baseline trades 515 vetoed 0 errors {} secs 75.3
+diag24 volume_breakout variant trades 471 vetoed 0 errors {} secs 78.4
+diag24 vwap_reversion baseline trades 1822 vetoed 0 errors {} secs 256.2
+diag24 vwap_reversion variant trades 1224 vetoed 0 errors {} secs 370.5
+diag24 vwap_trend baseline trades 580 vetoed 0 errors {} secs 468.3
+diag24 range_expansion baseline trades 1376 vetoed 0 errors {} secs 30.7
+diag24 range_expansion variant trades 925 vetoed 0 errors {} secs 39.6
+diag24 vwap_trend variant trades 382 vetoed 0 errors {} secs 497.3
+diag24 opening_drive baseline trades 808 vetoed 0 errors {} secs 326.9
+diag24 opening_drive variant trades 522 vetoed 0 errors {} secs 339.1
+diag24 cross_sectional_residual baseline trades 1556 vetoed 0 errors {} secs 164.2
+mech_v1 opening_range_breakout opening_continuation#0 trades 2154 vetoed 0 errors {} secs 111.1
+diag24 cross_sectional_residual variant trades 1311 vetoed 0 errors {} secs 202.9
+mech_v1 opening_range_breakout opening_continuation#1 trades 1781 vetoed 0 errors {} secs 158.6
+mech_v1 opening_range_breakout opening_continuation#2 trades 1295 vetoed 0 errors {} secs 197.5
+mech_v1 trend_pullback trend_pullback#0 trades 2869 vetoed 0 errors {} secs 6.4
+mech_v1 trend_pullback trend_pullback#1 trades 873 vetoed 0 errors {} secs 47.7
+mech_v1 trend_pullback trend_pullback#2 trades 504 vetoed 0 errors {} secs 58.9
+mech_v1 opening_range_breakout opening_continuation#3 trades 2453 vetoed 0 errors {} secs 212.0
+mech_v1 trend_pullback trend_pullback#3 trades 506 vetoed 0 errors {} secs 64.6
+mech_v1 vwap_reversion fair_value_reversion#0 trades 3233 vetoed 0 errors {} secs 168.3
+mech_v1 vwap_reversion fair_value_reversion#1 trades 2738 vetoed 0 errors {} secs 194.4
+mech_v1 vwap_reversion fair_value_reversion#2 trades 1554 vetoed 0 errors {} secs 207.9
+mech_v2 opening_range_breakout opening_range_breakout#0 trades 1900 vetoed 0 errors {} secs 36.7
+mech_v1 vwap_reversion fair_value_reversion#3 trades 1967 vetoed 0 errors {} secs 216.7
+mech_v2 momentum_continuation momentum_continuation#0 trades 1142 vetoed 0 errors {} secs 10.3
+mech_v2 mean_reversion mean_reversion#0 trades 161 vetoed 0 errors {'exit:ValueError': 5459} secs 25.4
+mech_v2 trend_pullback trend_pullback#0 trades 1052 vetoed 0 errors {} secs 23.6
+mech_v2 volatility_breakout volatility_breakout#0 trades 432 vetoed 0 errors {} secs 15.3
+mech_v2 opening_range_fade opening_range_fade#0 trades 11 vetoed 0 errors {'exit:ValueError': 86} secs 107.0
+mech_v2 vwap_reversion vwap_reversion#0 trades 0 vetoed 0 errors {'exit:ValueError': 3657} secs 265.4
+mech_v2 vwap_trend vwap_trend#0 trades 2075 vetoed 0 errors {} secs 10.0
+mech_v2 range_expansion range_expansion#0 trades 927 vetoed 0 errors {} secs 11.7
+mech_v2 opening_drive opening_drive#0 trades 584 vetoed 0 errors {} secs 68.0
+mech_v2 cross_sectional_residual cross_sectional_residual#0 trades 1754 vetoed 0 errors {} secs 46.1
+cost_v1 opening_range_breakout opening_range_breakout#0 trades 1800 vetoed 0 errors {} secs 34.3
+cost_v1 opening_range_fade opening_range_fade#0 trades 11 vetoed 0 errors {'exit:ValueError': 86} secs 98.6
+cost_v1 momentum_continuation momentum_continuation#0 trades 1038 vetoed 0 errors {} secs 8.9
+cost_v1 mean_reversion mean_reversion#0 trades 161 vetoed 0 errors {'exit:ValueError': 5458} secs 26.0
+cost_v1 trend_pullback trend_pullback#0 trades 976 vetoed 0 errors {} secs 23.3
+cost_v1 volatility_breakout volatility_breakout#0 trades 414 vetoed 0 errors {} secs 14.3
+mech_v2 volume_breakout volume_breakout#0 trades 332 vetoed 0 errors {} secs 1143.4
+cost_v1 vwap_reversion vwap_reversion#0 trades 0 vetoed 0 errors {'exit:ValueError': 3657} secs 263.2
+cost_v1 vwap_trend vwap_trend#0 trades 1809 vetoed 0 errors {} secs 9.0
+cost_v1 range_expansion range_expansion#0 trades 889 vetoed 0 errors {} secs 11.3
+cost_v1 opening_drive opening_drive#0 trades 558 vetoed 0 errors {} secs 67.8
+cost_v1 cross_sectional_residual cross_sectional_residual#0 trades 1562 vetoed 0 errors {} secs 43.1
+deadline_v1 opening_range_fade opening_range_fade#0 trades 89 vetoed 0 errors {} secs 94.6
+deadline_v1 mean_reversion mean_reversion#0 trades 3039 vetoed 0 errors {} secs 14.0
+cost_v1 volume_breakout volume_breakout#0 trades 320 vetoed 0 errors {} secs 1103.3
+refresh_v1 opening_range_breakout opening_range_breakout#0 trades 1745 vetoed 0 errors {} secs 32.3
+refresh_v1 opening_range_fade opening_range_fade#0 trades 24 vetoed 0 errors {} secs 96.6
+deadline_v1 vwap_reversion vwap_reversion#0 trades 1457 vetoed 0 errors {} secs 203.3
+refresh_v1 momentum_continuation momentum_continuation#0 trades 1105 vetoed 0 errors {} secs 9.9
+refresh_v1 mean_reversion mean_reversion#0 trades 2105 vetoed 0 errors {} secs 16.2
+refresh_v1 volatility_breakout volatility_breakout#0 trades 26 vetoed 0 errors {} secs 14.9
+refresh_v1 trend_pullback trend_pullback#0 trades 817 vetoed 0 errors {} secs 24.7
+refresh_v1 vwap_reversion vwap_reversion#0 trades 785 vetoed 0 errors {} secs 225.7
+refresh_v1 vwap_trend vwap_trend#0 trades 1913 vetoed 0 errors {} secs 9.7
+refresh_v1 range_expansion range_expansion#0 trades 854 vetoed 0 errors {} secs 12.4
+refresh_v1 opening_drive opening_drive#0 trades 537 vetoed 0 errors {} secs 64.3
+refresh_v1 cross_sectional_residual cross_sectional_residual#0 trades 1573 vetoed 0 errors {} secs 36.8
+ibr7 ibr ibr.baseline trades 369 vetoed 0 errors {} secs 9.0
+ibr7 ibr ibr.range.30 trades 382 vetoed 0 errors {} secs 8.5
+ibr7 ibr ibr.range.45 trades 328 vetoed 0 errors {} secs 9.9
+ibr7 ibr ibr.target.1_5r trades 369 vetoed 0 errors {} secs 9.6
+ibr7 ibr ibr.target.3r trades 369 vetoed 0 errors {} secs 9.7
+ibr7 ibr ibr.buffer.0bps trades 403 vetoed 0 errors {} secs 8.3
+ibr7 ibr ibr.buffer.10bps trades 321 vetoed 0 errors {} secs 9.8
+refresh_v1 volume_breakout volume_breakout#0 trades 239 vetoed 0 errors {} secs 1108.3
+DONE
