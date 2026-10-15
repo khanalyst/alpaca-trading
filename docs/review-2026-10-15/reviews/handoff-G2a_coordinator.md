@@ -58,7 +58,7 @@ Validation requires:
 - exactly 55 sealed comparison arms, followed by 12 cost-compatible and 3 deadline-compatible arms, for totals of 67 or 70 (`research/trader_research.py:64-110`);
 - a refresh of exactly 31 reports, split into 24 rule and 7 IBR (`:629-636`).
 
-Any change to a cohort needs code edits in several places, and the module cannot run a new question without becoming another cohort generation. This is part of the pattern found elsewhere: cohorts v1 to v7, `mechanism_cohort_v2`, `mechanism_refresh_cohort`, `mechanism_cost_cohort`. Experiment history has been encoded as code paths rather than data.
+Any change to a cohort needs code edits in several places, and the module cannot run a new question without becoming another cohort generation. This is part of the pattern found elsewhere: rule schemas v1 to v7, and six cohort modules (`mechanism_cohort`, `mechanism_cohort_v2`, `mechanism_cost_cohort`, `mechanism_deadline_cohort`, `mechanism_refresh_cohort`, `diagnostic_cohort_contract`). Experiment history has been encoded as code paths rather than data.
 
 ## Summary
 

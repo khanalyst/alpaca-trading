@@ -74,7 +74,7 @@ Every tracked file was assigned to exactly one review group (`live_shadow.py` wa
 | area | files | lines | how it was reviewed |
 | --- | --- | --- | --- |
 | Trading-critical code: runtime, signals, execution, state, statistics, gates, costs, factory core, live shadow | 73 | about 53,700 | every line, by review agents working to a shared evidence brief |
-| Research tooling, deployment, infrastructure | 75 | about 55,000 | by the coordinator, with targeted reading: full function inventories, every decision path that affects correctness, pattern searches across the tree, and code execution where useful |
+| Research tooling, deployment, infrastructure | 65 | about 50,700 | by the coordinator, with targeted reading: full function inventories, every decision path that affects correctness, pattern searches across the tree, and code execution where useful |
 | Documentation and audit evidence | 41 | about 35,700 | every concrete parameter checked against the code; key documents read in full; audit JSON reloaded and checked number by number |
 | Tests | 164 | about 62,200 | complete AST inventory of every test; full suite run (2,359 tests: 2,358 pass, 1 fails); targeted reading of the trading-critical modules |
 
@@ -148,8 +148,8 @@ MEDIUM and LOW findings carry the reviewer's own confidence label. Several were 
 ## 3. First principles used as the yardstick
 
 1. **Net expectancy per trade, set against round-trip cost, is the whole game.** A strategy earns `win% x average win - loss% x average loss - costs`. A 60 to 70% win rate means nothing on its own: mean-reversion systems win often and small, and breakout systems win rarely and large. What matters is net basis points per trade, and whether that holds up across independent days.
-2. **Know your real costs to a tenth of a basis point.** On these 24 ETFs, a marketable round trip costs about one quoted spread (one cent is 0.13 bps on SPY and about 2.3 bps on XLU or XLRE), plus slippage. There is also the SEC Section 31 fee, charged on sells only: $20.60 per million from 4 April 2026, about 0.2 bps. Alpaca charges no commission on API equity trades. A realistic all-in round trip is therefore about 1.5 to 4 bps, not 17.
-3. **The edge must exceed noise by enough to be found with the data you have.** A 60-minute return on SPY has a standard deviation of roughly 15 to 25 bps. Detecting a 3 bps edge at t = 2 needs about `(2 x 20 / 3)^2`, or 180, *independent* trades. Twenty-four ETFs on one day are not 24 independent observations: the day is the unit.
+2. **Know your real costs to a tenth of a basis point.** On these 24 ETFs, a marketable round trip costs about one quoted spread (one cent is 0.13 bps on SPY at $778, and 2.4 bps on XLU or XLRE at about $42), plus slippage. There is also the SEC Section 31 fee, charged on sells only: $20.60 per million from 4 April 2026, about 0.2 bps. Alpaca charges no commission on API equity trades. A realistic all-in round trip is therefore about 1.5 to 4 bps, not 17.
+3. **The edge must exceed noise by enough to be found with the data you have.** In this period a 60-minute return had a standard deviation of about 16 bps on SPY, 8.5 bps on HYG and 43 bps on SLV. At a typical 20 bps, detecting a 3 bps edge at t = 2 needs about `(2 x 20 / 3)^2`, or 180, *independent* trades. Twenty-four ETFs on one day are not 24 independent observations: the day is the unit.
 4. **Scale stops and targets to each instrument's volatility over the holding period.** A fixed 30 bps stop is a coin flip on SLV and a near-certain time exit on HYG.
 5. **Execution quality is part of the edge.**
    - Act on a completed bar within seconds.
@@ -599,7 +599,7 @@ A fair review also records what should survive any rewrite:
 
 | assumption in the code or documentation | reality | consequence | ref |
 | --- | --- | --- | --- |
-| A round trip costs 17 bps | about 0.35 bps (SPY) to 2.5 bps (XLRE) before slippage; about 1.5 to 4 bps all-in | research verdicts and stop floors are driven by the cost constants | E1-01, E1-07 |
+| A round trip costs 17 bps | about 0.35 bps (SPY) to 2.6 bps (XLRE) for one spread plus the SEC fee, before slippage; about 1.5 to 4 bps all-in | research verdicts and stop floors are driven by the cost constants | E1-01, E1-07 |
 | Risk per trade is 0.5% of equity | 0.075% at a 30 bps stop; 0.25% at a 100 bps stop | the configured risk budget is fiction; the P&L scale is 7 times smaller than intended | B-06 |
 | Stops are scaled by ATR | the 30 bps floor binds on essentially every trade | a stop means a different thing on every ETF | A-02 |
 | `exit_before_minutes: 360` means six hours of thesis | it means 10:00 | two cohorts cannot trade | A-01 |
@@ -677,7 +677,7 @@ A fair review also records what should survive any rewrite:
 | Live shadow runner and ingestion | 8,349 + 1,473 lines to approximate runtime parity | G1, G1c |
 | `deploy/research-cycle.sh` | 1,940 lines of bash, 24 Python heredocs, 21 `set +e` toggles | H2a-02 |
 | Options execution stack | about 1,450 runtime lines that cannot run under the shipped configuration | B handoff |
-| Rule grammar | seven schema versions (v1 to v7) and at least seven cohort modules | A, G2a-05 |
+| Rule grammar | seven schema versions (v1 to v7) and six cohort modules (`research/mechanism_*cohort*.py`, `diagnostic_cohort_contract.py`) | A, G2a-05 |
 | Validation functions | `_gate_envelope_error` 519 lines; `null_control_account` 664; `_discover_gate` 333 | F3b-05, F3a-03 |
 | Recorder | 3,028 + 531 lines, mostly to make overlapping REST polls idempotent | H1a-04 |
 | Research cache and snapshot | 934 + 550 lines | H1b |
