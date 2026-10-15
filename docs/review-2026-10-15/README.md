@@ -43,9 +43,12 @@ This document is the hand-over. Every finding links to a handoff file in [`revie
    - A proof needs about 25 bps of gross edge per trade (D2-01).
    - The fit and held-out split needs at least 100 self-recorded IEX sessions, so the first possible proof is around mid-January 2027 (F1a-03). Session acceptance has so far accepted no sessions at all (C2-02).
    - The online false-discovery budget starves after a few tests (D1-08).
-   - The live-shadow lane is the only route to authorisation, and it fails twice over:
+   - The live-shadow lane is the only route to authorisation, and it fails in several independent ways:
      - Its virtual book holds capital for the whole session, while the replay it is checked against releases capital as trades exit. Any arm with three or more entries in a session is therefore quarantined, and 94% of arms average that many (the median is 18 entries per session) (G1a-03).
-     - It stops for good after 100,000 stored decisions, about 11 sessions for a single arm (G1a-02).
+     - It does not apply the runtime's first-signal-per-symbol-session rule, so it can open trades the runtime would never take (G1b-02).
+     - It re-checks historical sessions against fresh re-evaluations that start from today's open positions, which is look-ahead inside the parity check (G1b-01).
+     - It stops for good after 100,000 stored decisions, about 11 sessions for a single arm (G1a-02). An outage of more than about 4.6 market hours also wedges ingestion for about two weeks (G1b-03).
+     - One unresolved session freezes progress for every candidate (G1b-04).
    - The factory's own power diagnostic implies about 3,500 trades for the effect size it targets (F2b-02).
 4. **The system is heavily over-engineered.** About 202,000 lines support a system that has not yet traded a single validated edge: 63,000 lines of research code, 62,000 of tests and 30,000 of documentation and audit evidence. Examples:
    - one 1,983-line function;
@@ -90,7 +93,7 @@ Every tracked file was assigned to exactly one review group (`live_shadow.py` wa
 | D2 | proof gates | agent | [D2](reviews/handoff-D2_gates.md) |
 | E1 | cost model | agent | [E1](reviews/handoff-E1_costs.md) |
 | F1b | factory simulator core | agent | [F1b](reviews/handoff-F1b_factory_core.md) |
-| G1a, G1b | live shadow runner | agent | [G1a](reviews/handoff-G1a_live_shadow_part1.md); G1b in progress |
+| G1a, G1b | live shadow runner | agent | [G1a](reviews/handoff-G1a_live_shadow_part1.md), [G1b](reviews/handoff-G1b_live_shadow_part2.md) |
 | E2 | market-data normalisation, cost tools | coordinator | [E2](reviews/handoff-E2_coordinator.md) |
 | F1a | strategy factory | coordinator | [F1a](reviews/handoff-F1a_coordinator.md) |
 | F2a | factory ledger and report | coordinator | [F2a](reviews/handoff-F2a_coordinator.md) |
@@ -135,7 +138,9 @@ Corrections made along the way are part of the record:
 - **Rolling-R demotion rule.** Before writing up the "last 20 trades lose 2R" rule, I checked the code: it is advisory only (`research/edge_ledger.py:705-722`). The finding was reframed accordingly (F3b-03).
 - **Repeated hypotheses.** Twice I suspected a broken CLI branch or a P&L sign error. Each time I read the full function and found the code correct, and no finding was written.
 
-For the live-shadow findings, the coordinator re-read the replay key, the gate join and the restart path (G1a-01). It also re-read the global decision bound and the shipped default (G1a-02), and the session-long virtual book against the replay's release of capital (G1a-03). The frequency of G1a-03 was then measured from the fresh replay.
+The second half of `research/live_shadow.py` was re-run as a single review agent after the workflow hit the usage limit. Its four HIGH findings were re-verified the same way: the decisions passed to historical replays and the seeding from current books (G1b-01), the missing signal-session state against `agent/engine_cycle.py:738-800` (G1b-02), the unpaged ingest and its bounds (G1b-03), and the floor-advance condition (G1b-04).
+
+For the first-half live-shadow findings, the coordinator re-read the replay key, the gate join and the restart path (G1a-01). It also re-read the global decision bound and the shipped default (G1a-02), and the session-long virtual book against the replay's release of capital (G1a-03). The frequency of G1a-03 was then measured from the fresh replay.
 
 MEDIUM and LOW findings carry the reviewer's own confidence label. Several were spot-checked: F1b-01, F1b-02, E1-02 and E1-11.
 
@@ -485,6 +490,10 @@ Each ID links to its evidence in the handoff named by its prefix:
 | I2-02 | evidence | The in-sample effects that motivated the preregistrations decayed by 60 to 90% on fresh data | the paper incumbent was chosen on selection noise |
 | G1a-02 | shadow | Every bar event for every authorising arm is stored as a decision, including "no signal" (`research/live_shadow.py:6660-6690`, `:7965-7975`). A global, never-pruned bound of 100,000 decisions applies (`:92`, `:2993-3026`), and the deployment never overrides it (`deploy/shadow.py:72`) | one arm hits the bound after about 11 sessions (24 symbols x 390 bars); after that, every poll raises and forward evidence stops |
 | G1a-03 | shadow | The live virtual book keeps every open position, and its notional, for the whole session (`research/live_shadow.py:6665-6693`), while the replay releases capital at each exit (`research/factory_core.py:1523-1536`) | with a 25% notional cap and a 50% gross cap, the shadow refuses the third entry of a session but the replay admits it. The result is an "extra" signature difference and a quarantined session (`research/live_shadow.py:1102-1121`, `:6566-6577`). 94% of arms average three or more entries per session (median 18), so most sessions would be quarantined |
+| G1b-01 | shadow | Historical gate sessions are checked against fresh re-evaluations, not the decisions made live, and those re-evaluations start from the candidate's current open books (`research/live_shadow.py:7915-7923`, `:8008-8032`, `:4110-4120`; pinned by `tests/research/test_shadow_replay_memo.py:301-336`) | look-ahead inside the parity check: a later book vetoes an earlier session's signal, so the session flips to "mismatch" and is quarantined. Every open or close re-runs the candidate's whole history (about 36 s per arm-session at 0.5 CPU, estimated) |
+| G1b-02 | shadow | The authorising lane keeps no signal-session state for rule or IBR arms (`research/live_shadow.py:5848-5889`), while the runtime consumes the symbol-session on the first signal, before any quote or risk check (`agent/engine_cycle.py:743-797`) | after a refused first signal, the shadow can open a later trade the runtime would never take; where the replay consumed the session, the result is a quarantine that cannot be repaired |
+| G1b-03 | shadow | Catch-up ingestion is unpaged, and the 20,000-row bound raises before offsets are saved (`research/live_shadow.py:6970-7006`, `:7086-7096`) | an outage of more than about 4.6 market hours makes every poll fail until the backlog passes 64 MB (about 11.5 trading days), and the backlog is then discarded |
+| G1b-04 | shadow | Any unresolved session pins one global forward floor for every candidate (`research/live_shadow.py:8125-8160`) | per-poll decoding, replays and memory then grow with history; under the shipped limits, out of memory is estimated after about 25 pinned sessions |
 
 ### 7.3 Medium
 
@@ -546,6 +555,9 @@ Each ID links to its evidence in the handoff named by its prefix:
 | G1a-04 | Shadow "parity" certifies signal geometry only. All gate P&L comes from the backtest simulator's fill model, so the shadow lane cannot detect B-02 or B-08 effects |
 | G1a-05 | The replay diff, the evidence and the book closure are committed separately, with the "match" diff written first. A crash between them leaves a matched session with no evidence, which is never replayed again and blocks the candidate's tail |
 | G1a-06 | Candidate intake silently keeps only the 32 oldest eligible candidates, including demoted ones. Newer candidates can never be shadowed, and nothing reports the truncation |
+| G1b-05 | Simultaneous signals are admitted in SHA-256 key order live, symbol order in the replay and universe order in the runtime. When caps bind, the lanes choose different symbols and the session mismatches |
+| G1b-06 | A failed null control is stored as a completed "match" with no rows. Ingestion then blocks with `null_incomplete` while the health check reports a clear tail |
+| G1b-07 | Diagnostic pending sessions are uncapped and share one 200,000-row bound, and its error escapes `run_once`, so a non-authorising arm can stop the authorising lane |
 
 ### 7.4 Low
 
@@ -557,7 +569,7 @@ These are recorded in the handoffs and not repeated in full here:
 - **Statistics and gates:** D1-09 to D1-13 and D2-07 to D2-09.
 - **Costs:** E1-06 to E1-11.
 - **Factory core:** F1b-06 to F1b-10.
-- **Live shadow:** G1a-07 to G1a-09. G1a-08 independently confirms E2-01: availability falls back to the bar's start when stamps are missing.
+- **Live shadow:** G1a-07 to G1a-09 and G1b-08 (the runtime admits the cutoff minute, but the shadow and both replays refuse it). G1a-08 independently confirms E2-01: availability falls back to the bar's start when stamps are missing.
 - **Coordinator handoffs:** E2-01 (a latent 60-second look-ahead default for bars without timestamps), E2-05, F2a-02, F3a-03 to F3a-05, F3b-03 (the rolling warning fires for 95% of healthy edges), F3b-05, G1c-03, G2a-04, H1a-03, H2b-02, I1-02, I1-04, I1-05, I2-03 and I2-04.
 
 ### 7.5 What is done well
@@ -655,7 +667,10 @@ A fair review also records what should survive any rewrite:
 - replay evidence keyed by a digest of its full content (G1a-01);
 - one atomic commit for the replay diff, the evidence and the book closure (G1a-05);
 - a virtual book that releases capital at simulated exits, exactly as the replay does (G1a-03);
-- persistence of signal-bearing decisions only, with a bound scoped to each session (G1a-02).
+- persistence of signal-bearing decisions only, with a bound scoped to each session (G1a-02);
+- comparison of every replay with the decisions persisted live, never with a re-evaluation seeded from later books (G1b-01);
+- the runtime's first-signal-per-symbol-session rule in the shadow worker, and one tie-break for simultaneous signals in every lane (G1b-02, G1b-05);
+- paged catch-up ingestion, and a floor that advances per settled session (G1b-03, G1b-04).
 
 **Research design:**
 
@@ -674,7 +689,7 @@ A fair review also records what should survive any rewrite:
 | Research, deployment and tests compared with the runtime | 144,600 lines against 20,500 | section 5.1 |
 | `_run_factory` | one function of 1,983 lines | F1a-01 |
 | Paper-epoch subsystem | 2,527 lines, plus tests; nothing calls it | G2b-01 |
-| Live shadow runner and ingestion | 8,349 + 1,473 lines to approximate runtime parity | G1, G1c |
+| Live shadow runner and ingestion | 8,349 + 1,473 lines to approximate runtime parity. Inside the runner: `run_once` is one 1,360-line method; about 1,460 lines serve a non-authorising diagnostic lane; about 313 lines of memo machinery exist to make the design's own history re-replays affordable; and a thread pool runs CPU-bound Python under the GIL at a 0.5 CPU limit | G1a, G1b, G1c |
 | `deploy/research-cycle.sh` | 1,940 lines of bash, 24 Python heredocs, 21 `set +e` toggles | H2a-02 |
 | Options execution stack | about 1,450 runtime lines that cannot run under the shipped configuration | B handoff |
 | Rule grammar | seven schema versions (v1 to v7) and six cohort modules (`research/mechanism_*cohort*.py`, `diagnostic_cohort_contract.py`) | A, G2a-05 |
@@ -761,7 +776,7 @@ The research found exactly one consistent structure: mild 30 to 60 minute mean r
 2. Retire the continuation families: they are consistently and significantly negative in sample, in the unseen window and in two years of related evidence.
 3. Freeze the factory and the LLM proposer until the cost model and the data are fixed. Searching a grammar in which every member loses after costs only spends the multiple-testing budget.
 4. Let the two preregistered tests run, but add a tradeable endpoint (net bracket P&L with per-symbol costs) next to the control-adjusted drift.
-5. Repair the gate defects that make passing impossible (D2-01 to D2-04, D1-08, G1c-01).
+5. Repair the gate and shadow-lane defects that make passing impossible (D2-01 to D2-04, D1-08, G1c-01, G1a-02, G1a-03, G1b-01 to G1b-04).
 
 ### Path C: change the arena
 
