@@ -32,6 +32,9 @@ from research.costs import (ENTRY_SLIPPAGE_INVALID_REASON,
 log = logging.getLogger("engine")
 
 
+CLOCK_SKEW_TOLERANCE_SECONDS = 2.0
+
+
 def _quantize_equity_price(value: Any, *, rounding: str) -> Decimal:
     try:
         return _shared_quantize_equity_price(value, rounding=rounding)
@@ -388,7 +391,9 @@ class MarketEntryRiskMixin:
         age = (current - timestamp.astimezone(timezone.utc)).total_seconds()
         maximum = float(self._edge_base_cfg.get("execution", {}).get(
             "max_market_data_age_seconds", 30) or 30)
-        if age < 0:
+        # The local clock is read after the response arrives, so a broker
+        # timestamp slightly ahead of it is NTP skew, not a bad clock.
+        if age < -CLOCK_SKEW_TOLERANCE_SECONDS:
             raise AlpacaError("broker clock timestamp is in the future")
         if age > maximum:
             raise AlpacaError("broker clock timestamp is stale")

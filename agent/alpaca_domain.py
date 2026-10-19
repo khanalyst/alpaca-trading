@@ -417,7 +417,7 @@ class OrderRequest:
             raise ValueError("order side must be buy or sell")
         object.__setattr__(self, "side", side)
         order_type = _text(self.type).lower()
-        if order_type not in {"market", "limit"}:
+        if order_type not in {"market", "limit", "stop"}:
             raise ValueError(f"unsupported order type {self.type!r}")
         object.__setattr__(self, "type", order_type)
         try:
@@ -447,8 +447,27 @@ class OrderRequest:
             object.__setattr__(self, "limit_price", limit_price)
         if order_type == "limit" and self.limit_price is None:
             raise ValueError("limit orders require a finite positive limit_price")
-        if self.stop_price is not None:
-            raise ValueError("stop orders are not supported")
+        if order_type == "stop":
+            # A standalone stop exists only to re-protect an open equity
+            # position whose bracket legs were cancelled for a close that
+            # then failed.  It is never an entry and never a bracket.
+            if self.stop_price is None:
+                raise ValueError("stop orders require a finite positive stop_price")
+            try:
+                stop_price = Decimal(str(self.stop_price))
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError("stop_price must be numeric") from exc
+            if not stop_price.is_finite() or stop_price <= 0:
+                raise ValueError("stop_price must be finite and positive")
+            object.__setattr__(self, "stop_price", stop_price)
+            if self.limit_price is not None:
+                raise ValueError("stop orders cannot carry a limit_price")
+            if is_option:
+                raise ValueError("stop orders are not supported for option symbols")
+            if self.order_class not in {None, "simple"}:
+                raise ValueError("stop orders must be simple orders")
+        elif self.stop_price is not None:
+            raise ValueError("stop orders are not supported unless type is stop")
         order_class = self.order_class
         if order_class is not None:
             order_class = _text(order_class).lower()

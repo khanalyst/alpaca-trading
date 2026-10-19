@@ -68,6 +68,30 @@ This document is the hand-over. Every finding links to a handoff file in [`revie
 - Research one hypothesis at a time, with a power calculation up front.
 - Do not resume paper or live trading on the current runtime.
 
+## Follow-up implemented on 19 October 2026
+
+The runtime safety fixes of Path A, Step 1, are implemented with tests. The core design is written up. A standalone study harness for the one consistent structure found by the research was built separately; see `studies/liquid_reversion/`.
+
+| finding | what changed | where |
+| --- | --- | --- |
+| B-01 | Close, flatten and re-arm client order ids carry an exposure token: the entry order id, or for a broker-only position its New York session and broker economics. They are stable across retries of one exposure and unique across exposures. The token is placed last, so prefix truncation never removes it | `agent/execution_lifecycle.py` (`_exposure_token`, `_exit_client_id`) |
+| C1-01 | A flatten close is bound to its entry order and marks the trade as closing. Reconciliation then books it: a journal close, an outcome, and an empty local book. A newer trade on the same symbol no longer inherits the previous trade's legs or close evidence | `agent/runtime_control.py`, `agent/execution_lifecycle.py` (`close_entries`, leg carry-over) |
+| C1-02 | When a close fails or expires unfilled after its bracket legs were cancelled, a standalone DAY stop at the trade's active stop is re-armed. This happens only after a fresh broker snapshot shows the same position with nothing working for it, so the stop can never open a reversal. This applies to both the flatten and the monitor close paths | `_rearm_protective_stop`; plain equity stop orders added to `OrderRequest` and the provider |
+| C2-01 | A paused or not-ready trader still flattens in the force-flat window. A killed runtime is left to the operator | `agent/engine_cycle.py` (`_not_ready_force_flat`) |
+| B-03 | A failed calendar, clock, reconciliation or account read holds the cycle with entries blocked and the broker brackets left in place. The fail-closed flatten runs after three consecutive failures, or at once inside the force-flat window. A broker clock up to 2 seconds ahead of local time is accepted | `_transient_or_fail_closed`, `CLOCK_SKEW_TOLERANCE_SECONDS` |
+| B-04 | A failed entry submission is classified. A definite rejection refuses only that entry. An ambiguous outcome (timeout, 429, 5xx) is resolved by client order id; if it is still unresolved, entries halt for the cycle and reconciliation is forced. No other position is touched | `submit_failure_kind`, `_resolve_failed_entry` |
+
+**Tests:**
+
+- 21 new tests: `tests/test_exit_safety.py` has 11 and `tests/test_cycle_resilience.py` has 10.
+- On the unmodified code, 17 of the 21 fail: 16 behavioural and API tests, plus the classifier test, which cannot import the new function. The 4 that pass there are guard tests that the old code also satisfied.
+- One existing test was changed on purpose: an account read failure now escalates to fail-closed on the third consecutive failure instead of the first.
+- The full runtime test set passes: 1,015 tests, of which 994 existed before and 21 are new. The research tests that drive the engine also pass.
+
+**Deploying these fixes changes the paper-trial code identity (C1-03),** because every file under `agent/` is hashed into it. Restart or re-register the trial as the operations runbook describes before relying on it.
+
+The file-by-file core design and its staged migration plan are in [`core-design.md`](core-design.md).
+
 ## 2. Scope, method, and how hallucination was controlled
 
 ### 2.1 What was reviewed
@@ -741,10 +765,12 @@ The evidence points one way: the problem is not a missing gate, a missing varian
 2. If a strategy depends on volume, VWAP or quotes, trade it on SIP in real time (the paid Algo Trader Plus plan) over the WebSocket stream.
 3. Define one session-quality rule and use it everywhere (H1a-02).
 
-**Step 4. Cut the system to its decision-making core.** The target is 10,000 to 15,000 lines:
+**Step 4. Cut the system to its decision-making core.** The target is 10,000 to 15,000 lines, built around:
 
 - one event-driven engine shared by backtest, paper and live, so that parity holds by construction rather than through a shadow runner;
 - one strategy interface and one risk module.
+
+The file-by-file design, the parts kept unchanged and the staged migration plan are in [`core-design.md`](core-design.md).
 
 Archive the following (Git keeps the history):
 

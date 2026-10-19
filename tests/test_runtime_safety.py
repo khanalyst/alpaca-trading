@@ -1074,15 +1074,26 @@ class RuntimeSafetyTests(unittest.TestCase):
             def account(self):
                 raise RuntimeError("account unavailable")
 
+        from agent.engine_cycle import TRANSIENT_FAILURE_LIMIT
         provider = BrokenAccountProvider()
         engine = Engine(_cfg(), light=True, provider=provider)
         self.addCleanup(engine.close)
         engine._ensure_order_ready = lambda: True
         engine._wall_clock = lambda: provider.now
+        load_state = __import__("agent.state", fromlist=["load_state"]).load_state
+        # A failed read blocks entries but keeps the broker-protected book.
+        for attempt in range(1, TRANSIENT_FAILURE_LIMIT):
+            result = engine.run_once({})
+            self.assertEqual(result["action"], "hold")
+            self.assertEqual(result["reason"], "account_unavailable")
+            self.assertEqual(result["consecutive_failures"], attempt)
+            self.assertEqual(provider.cancel_calls, 0)
+            self.assertFalse(load_state().get("operator_pause"))
+        # A persistent failure still fails closed: cancel, flatten and pause.
         result = engine.run_once({})
         self.assertEqual(result["reason"], "account_unavailable")
         self.assertGreaterEqual(provider.cancel_calls, 1)
-        self.assertTrue(__import__("agent.state", fromlist=["load_state"]).load_state()["operator_pause"])
+        self.assertTrue(load_state()["operator_pause"])
 
     def test_post_risk_positions_failure_cancels_and_pauses_via_fail_closed(self):
         class BrokenPostRiskPositionsProvider(FakeProvider):

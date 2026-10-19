@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from . import state
 from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
+from .contracts.rule import canonical_exit_reason
 from .execution_lifecycle import (
     _TERMINAL_ORDER_STATUSES,
     _leg_live,
@@ -130,6 +131,10 @@ class RuntimeControlMixin:
         submitted: dict[str, dict[str, Any]] = {}
         retryable = {"canceled", "cancelled", "expired", "rejected",
                      "failed", "not_found"}
+        # Symbols whose broker legs this flatten cancelled.  A close that then
+        # fails or never fills must not leave them without protection.
+        unprotected: dict[str, tuple[Mapping[str, Any] | None, Any]] = {}
+        failed_symbols: set[str] = set()
         for poll in range(6):
             try:
                 positions = self.provider.positions()
@@ -168,11 +173,22 @@ class RuntimeControlMixin:
                     return False
                 self._event("flatten_confirmed", {"reason": reason, "poll": poll})
                 return True
+            runtime_now = state.load_state()
+            active_now = runtime_now.get("active_trades", {})
+            active_now = active_now if isinstance(active_now, Mapping) else {}
+            working_ids = {str(_value(order, "id", "") or "")
+                           for order in working_orders}
             for position in positions:
                 qty = abs(Decimal(str(_value(position, "qty", 0))))
                 if qty <= 0:
                     continue
                 symbol = str(_value(position, "symbol", "")).upper()
+                if symbol in failed_symbols:
+                    # Its close submission failed in this call.  The next
+                    # cycle retries; this one restores protection at the end.
+                    continue
+                trade = active_now.get(symbol)
+                trade = trade if isinstance(trade, Mapping) else None
                 prior = submitted.get(symbol)
                 if prior is not None:
                     saved = state.load_state().get("orders", {}).get(
@@ -185,57 +201,97 @@ class RuntimeControlMixin:
                         continue
                     close_attempt = int(prior.get("attempt", 0)) + 1
                 else:
+                    working_close = str((trade or {}).get("closing_order_id") or "")
+                    if working_close and working_close in working_ids:
+                        # An exit for this exposure is already working at the
+                        # broker.  A second close would either be refused for
+                        # reserved quantity or overfill into a reversal.
+                        continue
                     close_attempt = 0
                 legs = protected.get(symbol) or []
                 if legs and not self._cancel_protective_legs(symbol, legs):
                     # A resting leg reserves the quantity; never submit a close
                     # that the broker would bounce.
                     return False
+                if legs:
+                    unprotected[symbol] = (trade, position)
                 protected.pop(symbol, None)
                 close = getattr(self.provider, "close_position", None)
-                if callable(close):
-                    client_order_id = self._client_id(
-                        "flatten", {"symbol": symbol, "setup_id": reason},
-                        attempt=close_attempt)
-                    try:
-                        order = close(symbol, qty=qty, client_order_id=client_order_id,
-                                      order_type="market", time_in_force="day")
-                    except TypeError:
+                client_order_id = self._exit_client_id(
+                    "flatten", symbol, reason, trade=trade, position=position,
+                    attempt=close_attempt)
+                request = None
+                try:
+                    if callable(close):
                         try:
-                            order = close(symbol, qty=qty)
+                            order = close(symbol, qty=qty,
+                                          client_order_id=client_order_id,
+                                          order_type="market", time_in_force="day")
                         except TypeError:
-                            order = close(symbol)
-                else:
-                    side = "sell" if str(_value(position, "side", "long")).lower() in {"long", "buy"} else "buy"
-                    request = OrderRequest(symbol, qty, side, type="market", time_in_force="day",
-                                           client_order_id=self._client_id(
-                                               "flatten", {"symbol": symbol,
-                                                           "setup_id": reason},
-                                               close_attempt))
-                    order = self.provider.submit_order(request)
-                order_id = str(getattr(order, "id", None) or client_order_id
-                               if callable(close) else
-                               getattr(order, "id", None) or request.client_order_id)
+                            try:
+                                order = close(symbol, qty=qty)
+                            except TypeError:
+                                order = close(symbol)
+                    else:
+                        side = ("sell" if str(_value(position, "side", "long")).lower()
+                                in {"long", "buy"} else "buy")
+                        request = OrderRequest(symbol, qty, side, type="market",
+                                               time_in_force="day",
+                                               client_order_id=client_order_id)
+                        order = self.provider.submit_order(request)
+                except Exception as exc:  # noqa: BLE001
+                    # An ambiguous failure may still have created the close at
+                    # the broker.  Protection is restored below only from a
+                    # fresh snapshot proving the position remains and nothing
+                    # is working for it.
+                    self._event("flatten_close_failed", {
+                        "symbol": symbol, "reason": reason,
+                        "attempt": close_attempt, "error": str(exc)})
+                    failed_symbols.add(symbol)
+                    continue
+                order_id = str(getattr(order, "id", None) or client_order_id)
                 status = str(getattr(order, "status", "submitted") or "submitted").lower()
+                entry_order_id = (str(trade.get("order_id") or "")
+                                  if trade is not None else "")
                 order_state = {
                     "order_id": order_id, "symbol": symbol,
                     "status": status,
-                    "client_order_id": (client_order_id if callable(close)
-                                        else request.client_order_id),
+                    "client_order_id": client_order_id,
                     "qty": str(qty), "action": "flatten", "reason": reason,
-                    "attempt": close_attempt, "updated_ts": time.time(),
+                    "attempt": close_attempt, "closing_attempt": close_attempt,
+                    "updated_ts": time.time(),
                 }
+                if entry_order_id:
+                    # Bind the close to its exposure so reconciliation books it
+                    # against this trade and never against a later one.
+                    order_state["entry_order_id"] = entry_order_id
+
+                def book_close(current: dict, *, symbol=symbol, order_id=order_id,
+                               order_state=order_state, entry_order_id=entry_order_id,
+                               close_attempt=close_attempt) -> dict:
+                    current = {**current,
+                               "orders": {**current.get("orders", {}),
+                                          order_id: order_state}}
+                    active = current.get("active_trades", {})
+                    row = active.get(symbol) if isinstance(active, Mapping) else None
+                    if (isinstance(row, dict) and entry_order_id and
+                            str(row.get("order_id") or "") == entry_order_id):
+                        exit_reason = canonical_exit_reason(reason)
+                        row.update({"status": "closing", "closing_reason": reason,
+                                    "closing_exit_reason": exit_reason,
+                                    "canonical_exit_reason": exit_reason,
+                                    "closing_order_id": order_id,
+                                    "closing_attempt": close_attempt,
+                                    "updated_ts": time.time()})
+                    return current
+
                 try:
                     state.log_order(
-                        order, None if callable(close) else request,
+                        order, request,
                         action="flatten", reason=reason, symbol=symbol,
                         qty=float(qty), runtime_mode=self.mode,
                         run_id=self.run_id)
-                    state.update_state(lambda current: {
-                        **current,
-                        "orders": {**current.get("orders", {}),
-                                   order_id: order_state},
-                    })
+                    state.update_state(book_close)
                 except Exception as exc:  # noqa: BLE001
                     self._reconciled = False
                     self._preflight_error = (
@@ -274,6 +330,18 @@ class RuntimeControlMixin:
             order for order in (residual_orders or [])
             if order_status(order) not in _TERMINAL_ORDER_STATUSES
         ]
+        if unprotected and positions_error is None and orders_error is None:
+            # This call cancelled these exposures' bracket legs, but their
+            # closes did not complete and nothing is working for them now.
+            # Restore a broker stop rather than leave them unprotected.
+            working_symbols = {str(_value(order, "symbol", "")).upper()
+                               for order in residual_working_orders}
+            for position in residual_positions or []:
+                symbol = str(_value(position, "symbol", "")).upper()
+                if symbol in unprotected and symbol not in working_symbols:
+                    trade, _ = unprotected.pop(symbol)
+                    self._rearm_protective_stop(symbol, trade, position,
+                                                reason=reason)
         evidence = {
             "reason": reason,
             "residual": _plain(residual_positions),

@@ -15,7 +15,7 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from . import state
-from .alpaca_provider import AlpacaError
+from .alpaca_provider import SUBMIT_REJECTED, AlpacaError, submit_failure_kind
 from .execution_lifecycle import (
     _TERMINAL_ORDER_STATUSES,
     _plain,
@@ -24,6 +24,10 @@ from .execution_lifecycle import (
 
 
 _NEW_YORK = ZoneInfo("America/New_York")
+# Consecutive cycles of failed broker reads tolerated before liquidation.  At
+# the 60 s cadence this is about three minutes, during which positions keep
+# their broker-resident bracket legs and no new entry is taken.
+TRANSIENT_FAILURE_LIMIT = 3
 
 
 def _rule_bar_timestamp(row: Any) -> datetime | None:
@@ -387,14 +391,129 @@ class EngineCycleMixin:
             retained.append(item)
         return retained
 
+    def _not_ready_force_flat(self, reason: str) -> dict[str, Any] | None:
+        """Keep flat-by-the-close when the cycle cannot trade.
+
+        A paused or not-ready runtime blocks entries, but it must never carry
+        exposure past the session close: that is a larger risk than any entry
+        it prevents, and its degraded heartbeat would not wake a supervisor.
+        A KILLED runtime is left to the operator who killed it.
+        """
+        try:
+            if state.load_state().get("state") == state.KILLED:
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.market.refresh_calendar()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            now = self._timestamp(_value(self.market.clock(), "timestamp", None))
+        except Exception:  # noqa: BLE001
+            now = None
+        if now is None:
+            now = self._wall_clock()
+        try:
+            due = self.market.should_force_flat(now)
+        except Exception:  # noqa: BLE001
+            due = False
+        if not due:
+            return None
+        try:
+            positions = self.provider.positions()
+        except Exception as exc:  # noqa: BLE001
+            self._event("not_ready_force_flat_failed", {
+                "reason": reason, "error": f"positions unavailable: {exc}"})
+            return None
+        if not positions:
+            return None
+        self._event("not_ready_force_flat", {"reason": reason,
+                                              "positions": len(positions)})
+        try:
+            closed = self.flatten_all("before_close")
+        except Exception as exc:  # noqa: BLE001
+            self._event("not_ready_force_flat_failed", {
+                "reason": reason, "error": str(exc)})
+            closed = False
+        try:
+            residual = _plain(self.provider.positions())
+        except Exception:  # noqa: BLE001
+            residual = None
+        return {"action": "force_flat", "reason": reason, "closed": closed,
+                "residual": residual, "not_ready": True}
+
+    def _resolve_failed_entry(self, request: Any,
+                              error: Exception) -> tuple[Any | None, bool]:
+        """Settle one failed entry without touching any other exposure.
+
+        Returns the broker order when an ambiguous submit is found to have
+        been accepted, and whether new entries must stop for this cycle.  A
+        definite rejection refuses only this entry (its signal session is
+        already consumed).  An ambiguous outcome that cannot be resolved by
+        client order id halts entries and forces a fresh reconciliation, which
+        adopts the order if it does exist.  Nothing here flattens the book.
+        """
+        client_order_id = str(getattr(request, "client_order_id", "") or "")
+        detail = {"symbol": getattr(request, "symbol", None),
+                  "client_order_id": client_order_id, "error": str(error)}
+        if submit_failure_kind(error) == SUBMIT_REJECTED:
+            self._event("entry_rejected", detail)
+            return None, False
+        try:
+            found = [order for order in (self.provider.orders(
+                client_order_id=client_order_id) or [])
+                if str(_value(order, "client_order_id", "") or "") == client_order_id]
+        except Exception as lookup_error:  # noqa: BLE001
+            found = []
+            detail["lookup_error"] = str(lookup_error)
+        if found:
+            self._event("entry_submit_recovered", {
+                **detail, "order_id": str(_value(found[0], "id", "") or "")})
+            return found[0], False
+        self._reconciled = False
+        self._event("entry_submit_ambiguous", detail)
+        return None, True
+
+    def _transient_or_fail_closed(self, reason: str, error: Exception) -> dict[str, Any]:
+        """Block entries on a failed broker read; liquidate only if it persists.
+
+        Open positions keep their broker-resident brackets while a read fails,
+        so one failed read must not close them at market.  The fail-closed
+        path runs after TRANSIENT_FAILURE_LIMIT consecutive failures, or at
+        once inside the force-flat window, when exposure must go regardless.
+        """
+        count = int(getattr(self, "_transient_failures", 0) or 0) + 1
+        self._transient_failures = count
+        try:
+            near_close = bool(self.market.should_force_flat(self._wall_clock()))
+        except Exception:  # noqa: BLE001
+            near_close = False
+        if count >= TRANSIENT_FAILURE_LIMIT or near_close:
+            self._transient_failures = 0
+            return self._fail_closed(reason, error)
+        self._event("cycle_degraded", {
+            "reason": reason, "error": str(error),
+            "consecutive_failures": count, "limit": TRANSIENT_FAILURE_LIMIT})
+        try:
+            state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
+                run_id=self.run_id, reason=reason))
+        except Exception:  # noqa: BLE001
+            pass
+        return {"action": "hold", "reason": reason, "error": str(error),
+                "transient": True, "consecutive_failures": count}
+
     def _run_once_impl(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:
         if not self._ensure_order_ready():
             reason = self._preflight_error or "startup_reconciliation_required"
+            flattened = self._not_ready_force_flat(reason)
             try:
                 state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
                     run_id=self.run_id, reason=reason))
             except Exception:
                 pass
+            if flattened is not None:
+                return flattened
             return {"action": "hold", "reason": reason}
         try:
             calendar = self.market.refresh_calendar()
@@ -404,17 +523,17 @@ class EngineCycleMixin:
                 state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
                     reason="calendar_or_clock_unavailable"))
             except Exception: pass
-            return self._fail_closed("calendar_or_clock_unavailable", exc)
+            return self._transient_or_fail_closed("calendar_or_clock_unavailable", exc)
         try:
             now = self._validated_clock_timestamp(clock)
         except Exception as exc:  # noqa: BLE001
-            return self._fail_closed("broker_clock_invalid", exc)
+            return self._transient_or_fail_closed("broker_clock_invalid", exc)
         try:
             reconciliation = self.reconcile()
             positions = reconciliation.get("positions", []) if isinstance(reconciliation, Mapping) else []
         except Exception as exc:  # noqa: BLE001
             self._reconciled = False
-            return self._fail_closed("cycle_reconciliation_failed", exc)
+            return self._transient_or_fail_closed("cycle_reconciliation_failed", exc)
         try:
             for position in positions:
                 self._required_number(
@@ -441,9 +560,11 @@ class EngineCycleMixin:
                     orders=0))
             except Exception:
                 pass
+            self._transient_failures = 0
             return {"action": "force_flat", "reason": "outside_regular_session",
                     "closed": True, "residual": _plain(self.provider.positions())}
         if self.market.should_force_flat(now):
+            self._transient_failures = 0
             closed = self.flatten_all("before_close")
             return {"action": "force_flat", "closed": closed,
                     "residual": _plain(self.provider.positions())}
@@ -473,7 +594,9 @@ class EngineCycleMixin:
         try:
             account = self.provider.account()
         except Exception as exc:  # noqa: BLE001
-            return self._fail_closed("account_unavailable", exc)
+            return self._transient_or_fail_closed("account_unavailable", exc)
+        # Every broker read this cycle depends on has now succeeded.
+        self._transient_failures = 0
         try:
             daily_pnl, daily_stop = self._update_daily_risk(account, now)
         except Exception as exc:  # noqa: BLE001
@@ -653,7 +776,10 @@ class EngineCycleMixin:
         edge_configs = self._allocate_edges(
             edge_configs,
             free_slots=free_slots)
+        entries_halted = False
         for edge_record, edge_cfg in edge_configs:
+            if entries_halted:
+                break
             if not self._latest_entry_allowed(now, edge_cfg):
                 continue
             edge_minutes = int(edge_cfg.get("strategy", {}).get(
@@ -662,6 +788,8 @@ class EngineCycleMixin:
             edge_force_flat_at = (session_close - timedelta(minutes=max(0, edge_minutes))
                                   if session_close is not None else force_flat_at)
             for symbol in symbols:
+                if entries_halted:
+                    break
                 row = rows.get(symbol)
                 if not row:
                     continue
@@ -949,7 +1077,13 @@ class EngineCycleMixin:
                     risk_plan["decision_ts"] = decision_ts
                     risk_plan["request_sent_ts"] = time.time()
                     submit_clock = time.monotonic()
-                    order = self.provider.submit_order(request)
+                    try:
+                        order = self.provider.submit_order(request)
+                    except Exception as submit_error:  # noqa: BLE001
+                        order, entries_halted = self._resolve_failed_entry(
+                            request, submit_error)
+                        if order is None:
+                            continue
                     risk_plan["response_received_ts"] = time.time()
                     risk_plan["submit_roundtrip_ms"] = (time.monotonic() - submit_clock) * 1000
                     placed.append(order); placed_keys.add(key)

@@ -114,6 +114,51 @@ def _order_status_matches(value: Any, requested: str | None) -> bool:
     return status == requested
 
 
+SUBMIT_REJECTED = "rejected"
+SUBMIT_AMBIGUOUS = "ambiguous"
+
+
+def _http_status(exc: BaseException) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None) if response is not None else None
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def submit_failure_kind(exc: BaseException) -> str:
+    """Classify an order submission failure as definite or ambiguous.
+
+    ``rejected`` means the broker refused the request (a 4xx answer other
+    than timeout or rate limiting), or the request never left this process.
+    ``ambiguous`` means the order may exist at the broker (a timeout, a
+    dropped connection, rate limiting or a 5xx answer) and must be resolved by
+    looking up its client order id before anything else is decided.
+    """
+    if isinstance(exc, IdempotencyConflict):
+        return SUBMIT_REJECTED
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain and len(chain) < 8:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    for item in chain:
+        status = _http_status(item)
+        if status is None:
+            continue
+        if status in {408, 429} or status >= 500:
+            return SUBMIT_AMBIGUOUS
+        if 400 <= status < 500:
+            return SUBMIT_REJECTED
+    if len(chain) == 1 and isinstance(exc, (AlpacaError, ValueError)):
+        # Local validation raised before any request was sent.
+        return SUBMIT_REJECTED
+    return SUBMIT_AMBIGUOUS
+
+
 def _order_lookup_not_found(exc: Exception) -> bool:
     """Recognize Alpaca's exact missing-order response without hiding 404s."""
     code = getattr(exc, "code", None)
@@ -520,6 +565,17 @@ class AlpacaProvider(AlpacaMarketDataMixin):
                     raise IdempotencyConflict("client_order_id belongs to a different limit price")
             except ValueError as exc:
                 raise IdempotencyConflict("client_order_id belongs to a malformed limit price") from exc
+        if request.type == "stop":
+            existing_stop = _value(raw, "stop_price")
+            try:
+                if (existing_stop is None or
+                        _finite_decimal(existing_stop, "broker order stop_price")
+                        != request.stop_price):
+                    raise IdempotencyConflict(
+                        "client_order_id belongs to a different stop price")
+            except ValueError as exc:
+                raise IdempotencyConflict(
+                    "client_order_id belongs to a malformed stop price") from exc
         existing_class = _text(_value(raw, "order_class", None)).lower() or "simple"
         if (request.order_class or "simple") != existing_class:
             raise IdempotencyConflict("client_order_id belongs to a different order class")
@@ -553,12 +609,19 @@ class AlpacaProvider(AlpacaMarketDataMixin):
             from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
             side = OrderSide.BUY if request.side == "buy" else OrderSide.SELL
             tif = getattr(TimeInForce, request.time_in_force.upper())
-            cls = MarketOrderRequest if request.type == "market" else LimitOrderRequest
+            if request.type == "stop":
+                # Imported only when used: protective re-arm is the sole caller.
+                from alpaca.trading.requests import StopOrderRequest
+                cls = StopOrderRequest
+            else:
+                cls = MarketOrderRequest if request.type == "market" else LimitOrderRequest
             qty = int(request.qty) if request.qty == request.qty.to_integral_value() else float(request.qty)
             kwargs = {"symbol": request.symbol, "qty": qty, "side": side, "time_in_force": tif, "client_order_id": cid,
                       "extended_hours": request.extended_hours}
             if request.limit_price is not None:
                 kwargs["limit_price"] = float(request.limit_price)
+            if request.type == "stop":
+                kwargs["stop_price"] = float(request.stop_price)
             if request.order_class == "bracket":
                 from alpaca.trading.enums import OrderClass
                 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
