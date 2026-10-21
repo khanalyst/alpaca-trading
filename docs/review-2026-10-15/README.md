@@ -112,6 +112,8 @@ F5, EC-04 and EC-05 were proved by tests that fail on the first-round code. The 
 - 15 new tests: 10 in `tests/test_exit_safety.py` and 5 in `tests/test_cycle_resilience.py`. All 15 fail on the first-round code.
 - One existing test changed on purpose: one failed pre-entry positions read now holds, and a persistent failure still fails closed on the third cycle.
 - The classifier test gained the duplicate-id case.
+- The full runtime shard passes on the final code: 1,029 tests in one run, plus the F1 booking test, which was added afterwards and passes in its module's run.
+- In the research shard, one stale test had kept CI red on this branch since before this work: it listed the equity rule grammar without v6 and v7. It now expects the full grammar.
 
 ### The liquid-ETF reversion study
 
