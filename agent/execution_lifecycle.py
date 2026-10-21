@@ -172,6 +172,21 @@ def _leg_live(leg: Mapping) -> bool:
     return str(leg.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES
 
 
+def _bracket_stripped(trade: Any) -> bool:
+    """Whether an equity exposure lost its bracket without any leg filling.
+
+    An earlier close cancelled the legs and its stop re-arm did not happen.
+    The next failed close must restore a broker stop even though nothing
+    live remains to cancel.
+    """
+    legs = _leg_rows(trade)
+    return bool(legs) and not _option_trade(trade) and all(
+        not _leg_live(leg) and
+        str(leg.get("status", "")).lower() not in _FILLED_ORDER_STATUSES and
+        not (float(leg.get("filled_qty") or 0) > 0)
+        for leg in legs)
+
+
 def _broker_protected(legs: list[dict]) -> bool:
     """Only a complete live pair is protection; a half-bracket is not."""
     return {"stop", "target"} <= {str(leg.get("role")) for leg in legs if _leg_live(leg)}
@@ -425,8 +440,49 @@ class ExecutionLifecycleMixin:
                    str(item.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES
                    for item in orders.values())
 
-    def _record_open_order(self, request: OrderRequest, order: Any, risk_plan: Mapping) -> None:
-        """Persist submission metadata; only a reported fill becomes a trade."""
+    def _adopt_unresolved_entry(self, order_state: dict, key: str, saved: dict,
+                                broker_order: Any) -> Any:
+        """Bind an ambiguously submitted entry to the broker order it created.
+
+        The listing that found it may not nest bracket legs, so the exact
+        client order id lookup supplies them.  The row is re-keyed by the
+        broker id before any fill activates a trade from it, so the trade
+        carries its real legs and attribution instead of becoming unknown.
+        """
+        client_order_id = str(saved.get("client_order_id") or "")
+        exact = broker_order
+        if not getattr(broker_order, "legs", None) and client_order_id:
+            try:
+                exact = next((order for order in (self.provider.orders(
+                    client_order_id=client_order_id) or [])
+                    if str(_value(order, "client_order_id", "") or "") ==
+                    client_order_id), broker_order)
+            except Exception:  # noqa: BLE001
+                exact = broker_order
+        broker_id = str(_value(exact, "id", "") or "")
+        if not broker_id:
+            return broker_order
+        legs = _protective_legs(getattr(exact, "legs", ()))
+        saved["order_id"] = broker_id
+        if legs:
+            saved["protective_legs"] = legs
+        saved.pop("submit_unresolved", None)
+        if key != broker_id:
+            order_state.pop(key, None)
+            order_state[broker_id] = saved
+        self._event("entry_submit_adopted", {
+            "symbol": saved.get("symbol"), "client_order_id": client_order_id,
+            "order_id": broker_id, "legs": len(legs)})
+        return exact
+
+    def _record_open_order(self, request: OrderRequest, order: Any, risk_plan: Mapping,
+                           *, unresolved: bool = False) -> None:
+        """Persist submission metadata; only a reported fill becomes a trade.
+
+        ``unresolved`` records an entry whose submit failed ambiguously and
+        whose client order id lookup found nothing yet.  The row is keyed by
+        its client order id until reconciliation finds the broker order.
+        """
         symbol = request.symbol.upper()
         order_id = str(getattr(order, "id", None) or request.client_order_id)
         status = str(getattr(order, "status", "submitted") or "submitted").lower()
@@ -515,6 +571,8 @@ class ExecutionLifecycleMixin:
             "updated_ts": time.time(),
         }
         order_state.update(provenance_fields)
+        if unresolved:
+            order_state["submit_unresolved"] = True
         def update(current: dict) -> dict:
             current.setdefault("orders", {})[order_id] = order_state
             if filled_qty > 0 and status in _FILLED_ORDER_STATUSES:
@@ -1449,8 +1507,36 @@ class ExecutionLifecycleMixin:
                 return [bar for _stamp, bar in prepared[:index]], True
         return [bar for _stamp, bar in prepared], False
 
+    @staticmethod
+    def _attach_rearmed_stop(current: dict, symbol: str, trade: Mapping | None,
+                             leg: Mapping) -> dict:
+        """Record a re-armed stop on the exposure it protects, in place."""
+        for bucket in ("active_trades", "protection"):
+            row = current.get(bucket, {}).get(symbol)
+            if not isinstance(row, dict):
+                continue
+            if (bucket == "active_trades" and isinstance(trade, Mapping) and
+                    trade.get("order_id") and
+                    str(row.get("order_id") or "") != str(trade.get("order_id"))):
+                continue
+            legs = [dict(item) for item in _leg_rows(row)
+                    if str(item.get("order_id")) != str(leg["order_id"])]
+            legs.append(dict(leg))
+            row["protective_legs"] = legs
+            row["protection_rearm_count"] = int(leg.get("rearm_attempt", 0)) + 1
+            if bucket == "active_trades":
+                # No exit is working any more.  Clear the failed close so a
+                # fill of this stop, or the next close, books the exit.
+                for key in ("closing_order_id", "closing_reason",
+                            "closing_exit_reason", "closing_price",
+                            "closing_trigger_price"):
+                    row.pop(key, None)
+                row["status"] = "open"
+        return current
+
     def _rearm_protective_stop(self, symbol: str, trade: Mapping | None,
-                               position: Any, *, reason: str) -> bool:
+                               position: Any, *, reason: str,
+                               close_client_id: str | None = None) -> dict | None:
         """Restore a broker stop after a close failed with its legs cancelled.
 
         A resting leg reserves the position quantity, so every close cancels
@@ -1460,10 +1546,18 @@ class ExecutionLifecycleMixin:
         until the next close attempt cancels it again.  It is submitted only
         when a fresh broker snapshot proves the same position remains and no
         order is working for the symbol, so it can never become a reversal.
+        A close whose submit failed may still have reached the broker, so
+        ``close_client_id`` is looked up first and any trace of it that is
+        working or filled blocks the stop; orders are read before positions,
+        so a close that fills between the two reads shows as a changed
+        position rather than as no working order.
+        Returns the recorded leg, or None when nothing was placed.  A caller
+        holding its own copy of the book must apply the leg to that copy with
+        ``_attach_rearmed_stop`` before writing it back.
         """
         symbol = str(symbol).upper()
         if _option_trade(trade):
-            return False
+            return None
         stop = None
         if isinstance(trade, Mapping):
             for key in ("active_stop_price", "stop_price",
@@ -1480,20 +1574,35 @@ class ExecutionLifecycleMixin:
             self._event("protection_rearm_failed", {
                 "symbol": symbol, "reason": reason,
                 "error": "no stop price or quantity to protect"})
-            return False
+            return None
+        def status_of(item: Any) -> str:
+            value = _value(item, "status", "")
+            return str(getattr(value, "value", value)).split(".")[-1].lower()
+
         try:
-            fresh = [item for item in (self.provider.positions() or [])
-                     if str(_value(item, "symbol", "")).upper() == symbol]
+            if close_client_id:
+                traces = [item for item in (self.provider.orders(
+                    client_order_id=close_client_id) or [])
+                    if str(_value(item, "client_order_id", "") or "") ==
+                    close_client_id and
+                    (status_of(item) not in _PROTECTIVE_TERMINAL_STATUSES or
+                     (self._number(_value(item, "filled_qty", 0)) or 0.0) > 0)]
+                if traces:
+                    self._event("protection_rearm_skipped", {
+                        "symbol": symbol, "reason": reason,
+                        "close_client_order_id": close_client_id,
+                        "close_status": status_of(traces[0])})
+                    return None
             working = [item for item in (self.provider.orders() or [])
                        if str(_value(item, "symbol", "")).upper() == symbol and
-                       str(getattr(_value(item, "status", ""), "value",
-                                   _value(item, "status", ""))).split(".")[-1]
-                       .lower() not in _PROTECTIVE_TERMINAL_STATUSES]
+                       status_of(item) not in _PROTECTIVE_TERMINAL_STATUSES]
+            fresh = [item for item in (self.provider.positions() or [])
+                     if str(_value(item, "symbol", "")).upper() == symbol]
         except Exception as exc:  # noqa: BLE001
             self._event("protection_rearm_skipped", {
                 "symbol": symbol, "reason": reason,
                 "error": f"broker snapshot unavailable: {exc}"})
-            return False
+            return None
         held = (abs(Decimal(str(_value(fresh[0], "qty", 0) or 0)))
                 if len(fresh) == 1 else Decimal("0"))
         if held != expected_qty or working:
@@ -1501,7 +1610,7 @@ class ExecutionLifecycleMixin:
                 "symbol": symbol, "reason": reason,
                 "held_qty": str(held), "expected_qty": str(expected_qty),
                 "working_orders": len(working)})
-            return False
+            return None
         long_side = str(_value(fresh[0], "side",
                                (trade or {}).get("direction", "long"))
                         ).lower() in {"long", "buy"}
@@ -1512,7 +1621,7 @@ class ExecutionLifecycleMixin:
         except RiskGeometryError as exc:
             self._event("protection_rearm_failed", {
                 "symbol": symbol, "reason": reason, "error": str(exc)})
-            return False
+            return None
         base = int(self._number((trade or {}).get("protection_rearm_count")) or 0)
         order = None
         request = None
@@ -1528,7 +1637,7 @@ class ExecutionLifecycleMixin:
             except Exception as exc:  # noqa: BLE001
                 self._event("protection_rearm_failed", {
                     "symbol": symbol, "reason": reason, "error": str(exc)})
-                return False
+                return None
             status = str(_value(order, "status", "accepted") or "accepted").lower()
             if status not in _PROTECTIVE_TERMINAL_STATUSES:
                 break
@@ -1538,39 +1647,16 @@ class ExecutionLifecycleMixin:
             self._event("protection_rearm_failed", {
                 "symbol": symbol, "reason": reason,
                 "error": "every re-arm attempt returned a terminal order"})
-            return False
+            return None
         leg = {"order_id": str(_value(order, "id", "") or request.client_order_id),
                "role": "stop",
                "status": str(_value(order, "status", "accepted") or "accepted").lower(),
                "price": float(price), "qty": float(held), "rearmed": True,
-               "rearm_reason": str(reason)}
-
-        def attach(current: dict) -> dict:
-            for bucket in ("active_trades", "protection"):
-                row = current.get(bucket, {}).get(symbol)
-                if not isinstance(row, dict):
-                    continue
-                if (bucket == "active_trades" and isinstance(trade, Mapping) and
-                        trade.get("order_id") and
-                        str(row.get("order_id") or "") != str(trade.get("order_id"))):
-                    continue
-                legs = [dict(item) for item in _leg_rows(row)
-                        if str(item.get("order_id")) != leg["order_id"]]
-                legs.append(dict(leg))
-                row["protective_legs"] = legs
-                row["protection_rearm_count"] = attempt + 1
-                if bucket == "active_trades":
-                    # No exit is working any more.  Clear the failed close so
-                    # a fill of this stop, or the next close, books the exit.
-                    for key in ("closing_order_id", "closing_reason",
-                                "closing_exit_reason", "closing_price",
-                                "closing_trigger_price"):
-                        row.pop(key, None)
-                    row["status"] = "open"
-            return current
+               "rearm_reason": str(reason), "rearm_attempt": attempt}
 
         try:
-            state.update_state(attach)
+            state.update_state(
+                lambda current: self._attach_rearmed_stop(current, symbol, trade, leg))
             state.log_order(order, request, action="protect", run_id=self.run_id,
                             runtime_mode=self.mode,
                             setup_id=(trade or {}).get("setup_id"))
@@ -1582,7 +1668,7 @@ class ExecutionLifecycleMixin:
         self._event("protection_rearmed", {
             "symbol": symbol, "reason": reason, "order_id": leg["order_id"],
             "stop_price": float(price), "qty": float(held)})
-        return True
+        return leg
 
     @staticmethod
     def _replacement_leg(order: Any, stop_price: float) -> dict[str, Any]:
@@ -1953,12 +2039,13 @@ class ExecutionLifecycleMixin:
                 # Measured before cancelling: the cancel marks legs terminal.
                 had_live_legs = any(_leg_live(leg) for leg in legs)
                 legs_cancelled = False
+                close_client_id = None
                 try:
                     if not self._cancel_protective_legs(symbol, legs):
                         failed.append({"symbol": symbol, "reason": reason,
                                        "error": "protective legs could not be cancelled"})
                         continue
-                    legs_cancelled = had_live_legs
+                    legs_cancelled = had_live_legs or _bracket_stripped(trade)
                     prior_attempt = self._number(trade.get("closing_attempt")) \
                         if isinstance(trade, Mapping) else None
                     attempt = int(prior_attempt) + 1 if prior_attempt is not None else 0
@@ -2010,9 +2097,17 @@ class ExecutionLifecycleMixin:
                     if legs_cancelled:
                         # The bracket is gone and the close did not go
                         # through: restore a broker stop until the retry.
-                        self._rearm_protective_stop(
+                        rearmed = self._rearm_protective_stop(
                             symbol, trade if isinstance(trade, Mapping) else None,
-                            position, reason=reason)
+                            position, reason=reason, close_client_id=close_client_id)
+                        if rearmed:
+                            # This pass ends by writing its own copy of the
+                            # book; carry the live stop into that copy so the
+                            # write cannot erase it.
+                            self._attach_rearmed_stop(
+                                runtime, symbol,
+                                trade if isinstance(trade, Mapping) else None,
+                                rearmed)
         if changed:
             try:
                 protection = dict(runtime.get("protection", {}))
@@ -2270,6 +2365,9 @@ class ExecutionLifecycleMixin:
                 continue
             broker_order = by_id.get(str(saved.get("order_id") or key)) or \
                 by_client.get(str(saved.get("client_order_id") or ""))
+            if broker_order is not None and saved.get("submit_unresolved") is True:
+                broker_order = self._adopt_unresolved_entry(
+                    order_state, str(key), saved, broker_order)
             if broker_order is None:
                 if str(saved.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES:
                     misses = int(saved.get("not_found_count", 0) or 0) + 1

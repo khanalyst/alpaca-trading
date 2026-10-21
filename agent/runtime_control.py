@@ -15,6 +15,7 @@ from .alpaca_provider import AlpacaError
 from .contracts.rule import canonical_exit_reason
 from .execution_lifecycle import (
     _TERMINAL_ORDER_STATUSES,
+    _bracket_stripped,
     _leg_live,
     _leg_rows,
     _plain,
@@ -134,13 +135,30 @@ class RuntimeControlMixin:
         # Symbols whose broker legs this flatten cancelled.  A close that then
         # fails or never fills must not leave them without protection.
         unprotected: dict[str, tuple[Mapping[str, Any] | None, Any]] = {}
+        try:
+            for symbol, trade in (state.load_state().get("active_trades") or {}).items():
+                if _bracket_stripped(trade):
+                    # An earlier call stripped this bracket and could not
+                    # restore a stop; a failed close here must restore it.
+                    unprotected[str(symbol).upper()] = (trade, None)
+        except Exception:  # noqa: BLE001
+            pass
         failed_symbols: set[str] = set()
+        # Client ids of closes whose submit failed; the re-arm looks each up
+        # in case it reached the broker anyway.
+        failed_close_ids: dict[str, str] = {}
+        # Every failure below leaves the poll loop through the residual check,
+        # never through an early return, so exposures stripped of their legs
+        # earlier in this call still get their broker stop restored.  A loop
+        # that stopped early never reports a confirmed flatten.
+        loop_error = None
         for poll in range(6):
             try:
                 positions = self.provider.positions()
             except Exception as exc:  # noqa: BLE001
                 self._event("flatten_positions_error", {"reason": str(exc)})
-                return False
+                loop_error = f"positions unavailable: {exc}"
+                break
             try:
                 broker_orders = self.provider.orders()
             except Exception as exc:  # noqa: BLE001
@@ -148,7 +166,8 @@ class RuntimeControlMixin:
                 # report a successful flatten while the broker boundary is
                 # unavailable.
                 self._event("flatten_orders_error", {"reason": str(exc)})
-                return False
+                loop_error = f"orders unavailable: {exc}"
+                break
             working_orders = [
                 order for order in (broker_orders or [])
                 if order_status(order) not in _TERMINAL_ORDER_STATUSES
@@ -202,19 +221,25 @@ class RuntimeControlMixin:
                     close_attempt = int(prior.get("attempt", 0)) + 1
                 else:
                     working_close = str((trade or {}).get("closing_order_id") or "")
-                    if working_close and working_close in working_ids:
+                    own_legs = {str(leg.get("order_id")) for leg in _leg_rows(trade)}
+                    if (working_close and working_close in working_ids and
+                            working_close not in own_legs):
                         # An exit for this exposure is already working at the
                         # broker.  A second close would either be refused for
-                        # reserved quantity or overfill into a reversal.
+                        # reserved quantity or overfill into a reversal.  A
+                        # partly filled bracket leg is not such an exit: it is
+                        # cancelled below and the residual is closed.
                         continue
                     close_attempt = 0
                 legs = protected.get(symbol) or []
-                if legs and not self._cancel_protective_legs(symbol, legs):
-                    # A resting leg reserves the quantity; never submit a close
-                    # that the broker would bounce.
-                    return False
                 if legs:
                     unprotected[symbol] = (trade, position)
+                if legs and not self._cancel_protective_legs(symbol, legs):
+                    # A resting leg reserves the quantity; never submit a close
+                    # that the broker would bounce.  A leg that filled in the
+                    # cancel race leaves a residual, which the next poll
+                    # closes from a fresh snapshot.  Other symbols go on.
+                    continue
                 protected.pop(symbol, None)
                 close = getattr(self.provider, "close_position", None)
                 client_order_id = self._exit_client_id(
@@ -248,6 +273,7 @@ class RuntimeControlMixin:
                         "symbol": symbol, "reason": reason,
                         "attempt": close_attempt, "error": str(exc)})
                     failed_symbols.add(symbol)
+                    failed_close_ids[symbol] = client_order_id
                     continue
                 order_id = str(getattr(order, "id", None) or client_order_id)
                 status = str(getattr(order, "status", "submitted") or "submitted").lower()
@@ -274,7 +300,10 @@ class RuntimeControlMixin:
                                           order_id: order_state}}
                     active = current.get("active_trades", {})
                     row = active.get(symbol) if isinstance(active, Mapping) else None
-                    if (isinstance(row, dict) and entry_order_id and
+                    # A position known only to the broker has no entry order;
+                    # the close binds through closing_order_id, as the
+                    # monitor's own closes of such rows do.
+                    if (isinstance(row, dict) and
                             str(row.get("order_id") or "") == entry_order_id):
                         exit_reason = canonical_exit_reason(reason)
                         row.update({"status": "closing", "closing_reason": reason,
@@ -308,7 +337,8 @@ class RuntimeControlMixin:
                 self.reconcile()
             except Exception as exc:  # noqa: BLE001
                 self._event("flatten_reconcile_error", {"reason": str(exc)})
-                return False
+                loop_error = f"reconciliation failed: {exc}"
+                break
             if poll < 5:
                 time.sleep(0.25)
         positions_error = None
@@ -340,8 +370,9 @@ class RuntimeControlMixin:
                 symbol = str(_value(position, "symbol", "")).upper()
                 if symbol in unprotected and symbol not in working_symbols:
                     trade, _ = unprotected.pop(symbol)
-                    self._rearm_protective_stop(symbol, trade, position,
-                                                reason=reason)
+                    self._rearm_protective_stop(
+                        symbol, trade, position, reason=reason,
+                        close_client_id=failed_close_ids.get(symbol))
         evidence = {
             "reason": reason,
             "residual": _plain(residual_positions),
@@ -353,9 +384,12 @@ class RuntimeControlMixin:
             evidence["positions_error"] = positions_error
         if orders_error is not None:
             evidence["orders_error"] = orders_error
+        if loop_error is not None:
+            evidence["loop_error"] = loop_error
         self._event("flatten_incomplete", evidence)
         return (not residual_positions and not residual_working_orders and
-                positions_error is None and orders_error is None)
+                positions_error is None and orders_error is None and
+                loop_error is None)
 
     def _resume_pause_invariants(self, runtime: Mapping[str, Any], *,
                                  check_orders: bool = True) -> None:

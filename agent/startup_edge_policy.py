@@ -427,6 +427,9 @@ class StartupEdgePolicyMixin:
         return self._preflight
 
     def _ensure_order_ready(self) -> bool:
+        # Set only when readiness failed on a broker read, so the cycle can
+        # count it towards the transient-failure limit.
+        self._readiness_read_error = None
         if not self._state_ready:
             return False
         try:
@@ -458,6 +461,7 @@ class StartupEdgePolicyMixin:
                 self.reconcile()
             except Exception as exc:  # noqa: BLE001
                 self._preflight_error = f"startup reconciliation failed: {exc}"
+                self._readiness_read_error = exc
                 self._event("cycle_blocked", {"reason": "reconciliation_failed", "error": str(exc)})
                 return False
         if (trial_runtime is not None and

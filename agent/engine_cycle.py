@@ -15,7 +15,8 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from . import state
-from .alpaca_provider import SUBMIT_REJECTED, AlpacaError, submit_failure_kind
+from .alpaca_provider import (SUBMIT_REJECTED, AlpacaError, IdempotencyConflict,
+                              submit_failure_kind)
 from .execution_lifecycle import (
     _TERMINAL_ORDER_STATUSES,
     _plain,
@@ -447,17 +448,23 @@ class EngineCycleMixin:
                               error: Exception) -> tuple[Any | None, bool]:
         """Settle one failed entry without touching any other exposure.
 
-        Returns the broker order when an ambiguous submit is found to have
-        been accepted, and whether new entries must stop for this cycle.  A
-        definite rejection refuses only this entry (its signal session is
-        already consumed).  An ambiguous outcome that cannot be resolved by
-        client order id halts entries and forces a fresh reconciliation, which
-        adopts the order if it does exist.  Nothing here flattens the book.
+        Returns the broker order when a failed submit is found to have been
+        accepted, and whether new entries must stop for this cycle.  Every
+        failure is first looked up by client order id: alpaca-py retries a
+        POST after a gateway timeout, so a 4xx can answer a retry whose first
+        attempt created the order.  A definite rejection that is not found
+        refuses only this entry (its signal session is already consumed).  An
+        ambiguous outcome that cannot be resolved halts entries and forces a
+        fresh reconciliation, which adopts the order from its durable
+        unresolved row if it does exist.  Nothing here flattens the book.
         """
         client_order_id = str(getattr(request, "client_order_id", "") or "")
         detail = {"symbol": getattr(request, "symbol", None),
                   "client_order_id": client_order_id, "error": str(error)}
-        if submit_failure_kind(error) == SUBMIT_REJECTED:
+        kind = submit_failure_kind(error)
+        if isinstance(error, IdempotencyConflict):
+            # The id belongs to an earlier request, already recorded on its
+            # own; this request must not adopt that order.
             self._event("entry_rejected", detail)
             return None, False
         try:
@@ -471,6 +478,9 @@ class EngineCycleMixin:
             self._event("entry_submit_recovered", {
                 **detail, "order_id": str(_value(found[0], "id", "") or "")})
             return found[0], False
+        if kind == SUBMIT_REJECTED and "lookup_error" not in detail:
+            self._event("entry_rejected", detail)
+            return None, False
         self._reconciled = False
         self._event("entry_submit_ambiguous", detail)
         return None, True
@@ -506,6 +516,13 @@ class EngineCycleMixin:
     def _run_once_impl(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:
         if not self._ensure_order_ready():
             reason = self._preflight_error or "startup_reconciliation_required"
+            read_error = getattr(self, "_readiness_read_error", None)
+            if read_error is not None:
+                # A reconciliation that keeps failing counts like any other
+                # failed broker read, so a persistent outage still fails
+                # closed instead of holding the book unmonitored all day.
+                return self._transient_or_fail_closed(
+                    "cycle_reconciliation_failed", read_error)
             flattened = self._not_ready_force_flat(reason)
             try:
                 state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
@@ -674,11 +691,20 @@ class EngineCycleMixin:
             ))
             force_flat_at = session_close - timedelta(minutes=max(0, minutes))
         if rows is None:
-            rows = self._collect(symbols, now, snapshot)
+            try:
+                rows = self._collect(symbols, now, snapshot)
+            except Exception as exc:  # noqa: BLE001
+                # The book is flat here (positions collect their rows above),
+                # so a failed data read only blocks this cycle's entries.
+                self._event("entry_market_data_unavailable", {"error": str(exc)})
+                return {"action": "hold", "reason": "market_data_unavailable",
+                        "error": str(exc)}
         try:
             positions = self.provider.positions()
         except Exception as exc:  # noqa: BLE001
-            return self._fail_closed("post_risk_positions_unavailable", exc)
+            # Open positions keep their brackets; one failed read only blocks
+            # entries, as for the account read above.
+            return self._transient_or_fail_closed("post_risk_positions_unavailable", exc)
         portfolio_data = portfolio or {"account": _plain(account), "positions": _plain(positions)}
         placed = []; signals = []; placed_keys: set[tuple[str, str]] = set()
         planned_risk = 0.0; planned_notional = 0.0
@@ -1082,17 +1108,23 @@ class EngineCycleMixin:
                     except Exception as submit_error:  # noqa: BLE001
                         order, entries_halted = self._resolve_failed_entry(
                             request, submit_error)
-                        if order is None:
+                        if order is None and not entries_halted:
                             continue
-                    risk_plan["response_received_ts"] = time.time()
-                    risk_plan["submit_roundtrip_ms"] = (time.monotonic() - submit_clock) * 1000
-                    placed.append(order); placed_keys.add(key)
+                    if order is not None:
+                        risk_plan["response_received_ts"] = time.time()
+                        risk_plan["submit_roundtrip_ms"] = (
+                            time.monotonic() - submit_clock) * 1000
+                        placed.append(order); placed_keys.add(key)
                     pending_keys.add((symbol, str(risk_plan.get("direction") or "")))
                     pending_underlyings.add(symbol)
                     planned_risk += candidate_risk
                     planned_notional += candidate_notional
                     try:
-                        self._record_open_order(request, order, risk_plan)
+                        # An unresolved submit may exist at the broker.  Its
+                        # durable row counts its risk, blocks its symbol and
+                        # lets reconciliation adopt it with its legs.
+                        self._record_open_order(request, order, risk_plan,
+                                                unresolved=order is None)
                     except Exception as exc:  # noqa: BLE001
                         self._reconciled = False
                         self._preflight_error = (

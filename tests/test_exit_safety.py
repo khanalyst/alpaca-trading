@@ -136,6 +136,23 @@ class FlattenBookingTests(ProtectionHarness):
             {**runtime, "state": state.PAUSED, "operator_pause": True},
             check_orders=True)
 
+    def test_flatten_of_a_broker_only_position_is_booked(self):
+        self._bind_engine(runtime_name="rt-flatten-broker-only")
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("10"), "long", avg_entry_price=Decimal("101.5"),
+            current_price=Decimal("101"))]
+        self.engine.reconcile()
+        self.assertEqual(state.load_state()["active_trades"]["SPY"]["status"],
+                         "unprotected")
+        self._filling_close()
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.assertTrue(self.engine.flatten_all("before_close"))
+        self.engine.reconcile()
+        self.assertEqual(state.load_state()["active_trades"], {})
+        closes = [row for row in self._journal_trades() if row[1] == "close"]
+        self.assertEqual([(row[0], row[5]) for row in closes],
+                         [("SPY", "before_close")])
+
     def test_next_trade_on_the_symbol_keeps_its_own_legs(self):
         self._bind_engine(runtime_name="rt-flatten-next-trade")
         self._open_bracketed_position()
@@ -218,6 +235,200 @@ class ProtectionRearmTests(ProtectionHarness):
         self.assertFalse(self.engine._rearm_protective_stop(
             "SPY", trade, stale, reason="before_close"))
         self.assertEqual(self._stop_requests(), [])
+
+
+class RealCancelProvider(ProtectionProvider):
+    """Keeps a cancelled order's partial fill, as Alpaca does."""
+
+    def cancel_order(self, order_id):
+        if self.cancel_error is not None:
+            raise RuntimeError(self.cancel_error)
+        self.cancelled.append(str(order_id))
+        order = self.orders_by_id[str(order_id)]
+        self.set_order(str(order_id), status="canceled",
+                       filled_qty=order.filled_qty or 0,
+                       filled_avg_price=order.filled_avg_price)
+
+
+class PartlyFilledLegFlattenTests(ProtectionHarness):
+    def setUp(self):
+        super().setUp()
+        self.provider = RealCancelProvider()
+
+    def test_partly_filled_target_does_not_block_the_flatten(self):
+        self._bind_engine(runtime_name="rt-partial-target")
+        order = self._open_bracketed_position(quantity=Decimal("300"))
+        target = f"{order.id}-target"
+        self.provider.set_order(target, status="partially_filled",
+                                filled_qty=100, filled_avg_price=105)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("200"), "long", avg_entry_price=Decimal("101.5"))]
+        self.engine.reconcile()
+        self.assertEqual(state.load_state()["active_trades"]["SPY"]["closing_order_id"],
+                         target)
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.engine.flatten_all("before_close")
+        self.assertIn(target, self.provider.cancelled)
+        self.assertEqual([request.qty for request in self.provider.close_requests],
+                         [Decimal("200")])
+
+    def test_partly_filled_target_and_flattened_residual_are_both_booked(self):
+        self._bind_engine(runtime_name="rt-partial-target-booked")
+        order = self._open_bracketed_position(quantity=Decimal("300"))
+        self.provider.set_order(f"{order.id}-target", status="partially_filled",
+                                filled_qty=100, filled_avg_price=105)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("200"), "long", avg_entry_price=Decimal("101.5"))]
+        self.engine.reconcile()
+        provider = self.provider
+
+        def filling_close(symbol, qty=None, **kwargs):
+            close = ProtectionProvider.close_position(provider, symbol, qty, **kwargs)
+            provider.set_order(close.id, status="filled", filled_qty=close.qty,
+                               filled_avg_price=100.0)
+            provider.positions_live = []
+            return provider.orders_by_id[close.id]
+
+        provider.close_position = filling_close
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.assertTrue(self.engine.flatten_all("before_close"))
+        self.engine.reconcile()
+        self.assertEqual(state.load_state()["active_trades"], {})
+        closes = [(row[2], row[3], row[5]) for row in self._journal_trades()
+                  if row[1] == "close"]
+        self.assertEqual(closes, [(100.0, 105.0, "target"), (200.0, 100.0, "before_close")])
+
+    def test_partly_filled_option_take_profit_does_not_block_the_flatten(self):
+        self._bind_engine(profile="options", runtime_name="rt-partial-option")
+        self._open_option_position(quantity=Decimal("6"))
+        self.engine._sync_option_take_profit()
+        take_profit = self._resting_legs()[0]["order_id"]
+        self.provider.set_order(take_profit, status="partially_filled",
+                                filled_qty=2, filled_avg_price=2.5)
+        self.provider.positions_live = [Position(
+            self.OPTION, Decimal("4"), "long", avg_entry_price=Decimal("2"))]
+        self.engine.reconcile()
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.engine.flatten_all("before_close")
+        self.assertIn(take_profit, self.provider.cancelled)
+        self.assertEqual([request.qty for request in self.provider.close_requests],
+                         [Decimal("4")])
+
+
+class RearmDurabilityTests(ProtectionHarness):
+    def _stops(self):
+        return [request for request in self.provider.submitted
+                if request.type == "stop"]
+
+    def test_rearmed_stop_survives_the_monitor_end_of_pass_write(self):
+        self._bind_engine(runtime_name="rt-rearm-durable")
+        self._open_bracketed_position(plan_updates={
+            "hold_deadline_ts": (self.NOW - timedelta(minutes=1)).timestamp()})
+        # A second position whose close succeeds makes the pass write its book.
+        self.provider.positions_live.append(Position(
+            "QQQ", Decimal("5"), "long", avg_entry_price=Decimal("400"),
+            current_price=Decimal("401")))
+        self.engine.reconcile()
+        provider = self.provider
+
+        def close(symbol, qty=None, **kwargs):
+            if symbol == "SPY":
+                raise RuntimeError("503 Service Unavailable")
+            return ProtectionProvider.close_position(provider, symbol, qty, **kwargs)
+
+        provider.close_position = close
+        monitored = self.engine._monitor_positions(
+            self.NOW, list(provider.positions_live), market_rows={})
+        self.assertEqual([item["symbol"] for item in monitored["closed"]], ["QQQ"])
+        self.assertEqual(len(self._stops()), 1)
+        runtime = state.load_state()
+        for bucket in ("active_trades", "protection"):
+            rearmed = [leg for leg in _leg_rows(runtime[bucket]["SPY"])
+                       if leg.get("rearmed") and _leg_live(leg)]
+            self.assertEqual(len(rearmed), 1, bucket)
+        self.assertEqual(runtime["active_trades"]["SPY"]["protection_rearm_count"], 1)
+        self.assertEqual(runtime["active_trades"]["QQQ"]["status"], "closing")
+
+    def _close_that_fills_but_times_out(self):
+        provider = self.provider
+
+        def close(symbol, qty=None, **kwargs):
+            order = ProtectionProvider.close_position(provider, symbol, qty, **kwargs)
+            provider.set_order(order.id, status="filled", filled_qty=order.qty,
+                               filled_avg_price=100.0)
+            # The position endpoint has not caught up with the fill yet.
+            raise TimeoutError("read timed out")
+
+        provider.close_position = close
+
+    def test_monitor_never_rearms_over_a_close_that_reached_the_broker(self):
+        self._bind_engine(runtime_name="rt-rearm-ambiguous-monitor")
+        self._open_bracketed_position(plan_updates={
+            "hold_deadline_ts": (self.NOW - timedelta(minutes=1)).timestamp()})
+        self._close_that_fills_but_times_out()
+        self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live), market_rows={})
+        self.assertEqual(len(self.provider.close_requests), 1)
+        self.assertEqual(self._stops(), [])
+
+    def test_flatten_never_rearms_over_a_close_that_reached_the_broker(self):
+        self._bind_engine(runtime_name="rt-rearm-ambiguous-flatten")
+        self._open_bracketed_position()
+        self._close_that_fills_but_times_out()
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.engine.flatten_all("before_close")
+        self.assertEqual(self._stops(), [])
+
+    def _stripped_bracket(self):
+        order = self._open_bracketed_position()
+        # An earlier call cancelled the bracket and could not restore a stop.
+        for leg in ("stop", "target"):
+            self.provider.set_order(f"{order.id}-{leg}", status="canceled")
+        self.engine.reconcile()
+
+        def refusing_close(symbol, qty=None, **kwargs):
+            raise RuntimeError("503 Service Unavailable")
+
+        self.provider.close_position = refusing_close
+
+    def test_monitor_rearms_a_bracket_stripped_by_an_earlier_call(self):
+        self._bind_engine(runtime_name="rt-rearm-stripped-monitor")
+        self._stripped_bracket()
+        self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live), market_rows={})
+        self.assertEqual(len(self._stops()), 1)
+
+    def test_flatten_rearms_a_bracket_stripped_by_an_earlier_call(self):
+        self._bind_engine(runtime_name="rt-rearm-stripped-flatten")
+        self._stripped_bracket()
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.assertFalse(self.engine.flatten_all("before_close"))
+        self.assertEqual(len(self._stops()), 1)
+
+    def test_a_read_failure_after_a_failed_close_still_rearms(self):
+        self._bind_engine(runtime_name="rt-rearm-after-read-error")
+        self._open_bracketed_position()
+        provider = self.provider
+
+        def refusing_close(symbol, qty=None, **kwargs):
+            raise RuntimeError("503 Service Unavailable")
+
+        calls = {"positions": 0}
+
+        def flaky_positions():
+            calls["positions"] += 1
+            if calls["positions"] == 2:
+                raise RuntimeError("502 Bad Gateway")
+            return ProtectionProvider.positions(provider)
+
+        provider.close_position = refusing_close
+        provider.positions = flaky_positions
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.assertFalse(self.engine.flatten_all("before_close"))
+        self.assertEqual(len(self._stops()), 1)
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertTrue(any(leg.get("rearmed") and _leg_live(leg)
+                            for leg in _leg_rows(trade)))
 
 
 class StopOrderRequestTests(unittest.TestCase):

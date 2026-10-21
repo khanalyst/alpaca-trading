@@ -6,6 +6,7 @@ entries without closing the broker-protected book; persistent failures still
 fail closed.
 """
 
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,8 @@ from agent.alpaca_domain import Order, Position
 from agent.alpaca_provider import (SUBMIT_AMBIGUOUS, SUBMIT_REJECTED, AlpacaError,
                                    IdempotencyConflict, submit_failure_kind)
 from agent.engine import Engine
+from agent.engine_cycle import TRANSIENT_FAILURE_LIMIT
+from tests.test_broker_protection import _leg
 from tests.test_runtime_safety import BrainFake, FakeProvider, _cfg
 
 
@@ -69,6 +72,27 @@ class NotReadyForceFlatTests(_RuntimeCase):
         self.assertEqual(result["action"], "hold")
         self.assertEqual(provider.orders_sent, [])
 
+    def test_calendar_outage_does_not_disable_the_force_flat(self):
+        class FailingCalendar(FakeProvider):
+            calendar_down = False
+
+            def calendar(self, **kwargs):
+                if self.calendar_down:
+                    raise RuntimeError("calendar unavailable")
+                return super().calendar(**kwargs)
+
+        provider = FailingCalendar()
+        provider.now = provider.day.close - timedelta(minutes=5)
+        self._open_book(provider)
+        engine = self._engine(provider)
+        engine.market.refresh_calendar()
+        provider.calendar_down = True
+        state.update_state(lambda current: {**current, "operator_pause": True})
+        result = engine.run_once({})
+        self.assertEqual(result["action"], "force_flat")
+        self.assertEqual([(order.symbol, order.side) for order in provider.orders_sent],
+                         [("SPY", "sell")])
+
     def test_killed_runtime_is_left_to_the_operator(self):
         provider = FakeProvider()
         provider.now = provider.day.close - timedelta(minutes=5)
@@ -107,6 +131,25 @@ class TransientReadTests(_RuntimeCase):
         self.assertEqual(provider.orders_sent, [])
         self.assertFalse(state.load_state().get("operator_pause"))
 
+    def test_calendar_outage_inside_the_force_flat_window_fails_closed_at_once(self):
+        class FailingCalendar(FakeProvider):
+            calendar_down = False
+
+            def calendar(self, **kwargs):
+                if self.calendar_down:
+                    raise RuntimeError("calendar unavailable")
+                return super().calendar(**kwargs)
+
+        provider = FailingCalendar()
+        provider.now = provider.day.close - timedelta(minutes=5)
+        engine = self._engine(provider)
+        engine._ensure_order_ready = lambda: True
+        engine.market.refresh_calendar()
+        provider.calendar_down = True
+        result = engine.run_once({})
+        self.assertNotIn("transient", result)
+        self.assertGreaterEqual(provider.cancel_calls, 1)
+
     def test_failed_clock_read_inside_the_force_flat_window_fails_closed_at_once(self):
         class BrokenClock(FakeProvider):
             def clock(self):
@@ -119,6 +162,29 @@ class TransientReadTests(_RuntimeCase):
         result = engine.run_once({})
         self.assertNotIn("transient", result)
         self.assertGreaterEqual(provider.cancel_calls, 1)
+
+
+class PersistentReconcileFailureTests(_RuntimeCase):
+    def test_reconciliation_failing_every_cycle_still_fails_closed(self):
+        class BrokenOrders(FakeProvider):
+            broken = False
+
+            def orders(self, **kwargs):
+                if self.broken:
+                    raise RuntimeError("orders endpoint unavailable")
+                return super().orders(**kwargs)
+
+        provider = BrokenOrders()
+        engine = self._engine(provider)
+        self.assertNotIn(engine.run_once({})["action"], {"fail_closed"})
+        provider.broken = True
+        results = [engine.run_once({}) for _ in range(TRANSIENT_FAILURE_LIMIT)]
+        for result in results[:-1]:
+            self.assertEqual(result["action"], "hold")
+            self.assertTrue(result["transient"])
+        self.assertEqual(results[-1]["reason"], "cycle_reconciliation_failed")
+        self.assertNotIn("transient", results[-1])
+        self.assertTrue(state.load_state().get("operator_pause"))
 
 
 class _Forbidden(Exception):
@@ -145,6 +211,16 @@ class SubmitFailureClassificationTests(unittest.TestCase):
             self.assertEqual(submit_failure_kind(exc), SUBMIT_AMBIGUOUS)
         self.assertEqual(submit_failure_kind(AlpacaError("order time_in_force must be day")),
                          SUBMIT_REJECTED)
+
+        class _Unprocessable(Exception):
+            status_code = 422
+
+        try:
+            raise AlpacaError("submit order failed") from _Unprocessable(
+                '{"code": 40010001, "message": "client_order_id must be unique"}')
+        except AlpacaError as exc:
+            # The duplicate proves the order exists: never a plain rejection.
+            self.assertEqual(submit_failure_kind(exc), SUBMIT_AMBIGUOUS)
         self.assertEqual(submit_failure_kind(IdempotencyConflict("reused id")),
                          SUBMIT_REJECTED)
 
@@ -185,6 +261,37 @@ class EntryFailureTests(_RuntimeCase):
         self.assertTrue(engine._reconciled)
         self.assertFalse(state.load_state().get("operator_pause"))
 
+    def test_refusal_of_a_retried_post_that_created_the_order_is_recovered(self):
+        class _Duplicate(Exception):
+            status_code = 422
+
+        class RetriedProvider(FakeProvider):
+            created = None
+
+            def submit_order(self, request):
+                # The first POST created the order and timed out at the
+                # gateway; the SDK's automatic retry was refused as a
+                # duplicate client order id.
+                self.orders_sent.append(request)
+                self.created = Order("order-first-post", request.symbol, request.qty,
+                                     request.side, "accepted", request.type,
+                                     request.time_in_force,
+                                     client_order_id=request.client_order_id)
+                raise AlpacaError("submit order failed: client_order_id must be "
+                                  "unique") from _Duplicate("duplicate")
+
+            def orders(self, *, client_order_id=None, **_):
+                if (client_order_id and self.created is not None and
+                        self.created.client_order_id == client_order_id):
+                    return [self.created]
+                return []
+
+        provider = RetriedProvider()
+        engine, snapshot = self._entry_cycle(provider)
+        result = engine.run_once(snapshot)
+        self.assertEqual([order.id for order in result["orders"]], ["order-first-post"])
+        self.assertTrue(engine._reconciled)
+
     def test_ambiguous_entry_is_recovered_by_its_client_order_id(self):
         class TimeoutProvider(FakeProvider):
             accepted = None
@@ -223,6 +330,58 @@ class EntryFailureTests(_RuntimeCase):
         self.assertEqual(result["orders"], [])
         self.assertFalse(engine._reconciled)
         self.assertFalse(state.load_state().get("operator_pause"))
+
+    def test_unresolved_entry_is_adopted_with_its_legs_once_the_broker_shows_it(self):
+        class LaggingProvider(FakeProvider):
+            created = None
+            visible = False
+
+            def submit_order(self, request):
+                self.orders_sent.append(request)
+                self.created = Order(
+                    "order-late", request.symbol, request.qty, request.side,
+                    "accepted", request.type, request.time_in_force,
+                    client_order_id=request.client_order_id,
+                    legs=(_leg("order-late-stop", "stop"),
+                          _leg("order-late-target", "target")))
+                raise TimeoutError("read timed out")
+
+            def orders(self, *, client_order_id=None, **_):
+                if not self.visible or self.created is None:
+                    return []
+                if client_order_id is not None:
+                    return ([self.created]
+                            if client_order_id == self.created.client_order_id else [])
+                # The listing does not nest bracket legs.
+                return [replace(self.created, legs=())]
+
+        provider = LaggingProvider()
+        engine, snapshot = self._entry_cycle(provider)
+        engine.run_once(snapshot)
+        client_order_id = provider.orders_sent[0].client_order_id
+        rows = [row for row in state.load_state()["orders"].values()
+                if row.get("client_order_id") == client_order_id]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["submit_unresolved"])
+        self.assertTrue(engine._client_order_pending(client_order_id))
+
+        filled = provider.created.qty
+        provider.created = replace(provider.created, status="filled",
+                                   filled_qty=filled,
+                                   filled_avg_price=Decimal("101.5"))
+        provider.visible = True
+        provider.positions_live = [Position("SPY", filled, "long",
+                                            avg_entry_price=Decimal("101.5"),
+                                            market_value=filled * Decimal("101.5"))]
+        engine.reconcile()
+        runtime = state.load_state()
+        self.assertIn("order-late", runtime["orders"])
+        self.assertNotIn("submit_unresolved", runtime["orders"]["order-late"])
+        trade = runtime["active_trades"]["SPY"]
+        self.assertEqual(trade["order_id"], "order-late")
+        self.assertEqual(sorted(leg["order_id"] for leg in trade["protective_legs"]),
+                         ["order-late-stop", "order-late-target"])
+        self.assertNotEqual(trade.get("execution_profile"), "unknown")
 
 
 if __name__ == "__main__":

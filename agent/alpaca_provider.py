@@ -145,6 +145,10 @@ def submit_failure_kind(exc: BaseException) -> str:
     while current is not None and current not in chain and len(chain) < 8:
         chain.append(current)
         current = current.__cause__ or current.__context__
+    if any("client_order_id must be unique" in str(item).lower() for item in chain):
+        # A duplicate refusal proves an order with this id exists, typically
+        # created by the first attempt of a POST the SDK retried after a 504.
+        return SUBMIT_AMBIGUOUS
     for item in chain:
         status = _http_status(item)
         if status is None:

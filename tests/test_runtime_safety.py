@@ -1095,7 +1095,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertGreaterEqual(provider.cancel_calls, 1)
         self.assertTrue(load_state()["operator_pause"])
 
-    def test_post_risk_positions_failure_cancels_and_pauses_via_fail_closed(self):
+    def test_post_risk_positions_failure_holds_then_fails_closed_if_it_persists(self):
         class BrokenPostRiskPositionsProvider(FakeProvider):
             def __init__(self):
                 super().__init__()
@@ -1107,13 +1107,27 @@ class RuntimeSafetyTests(unittest.TestCase):
                     raise RuntimeError("positions unavailable")
                 return []
 
+        from agent.engine_cycle import TRANSIENT_FAILURE_LIMIT
         provider = BrokenPostRiskPositionsProvider()
         engine = Engine(_cfg(), light=True, provider=provider)
         self.addCleanup(engine.close)
         engine._ensure_order_ready = lambda: True
         engine._wall_clock = lambda: provider.now
+        load_state = __import__("agent.state", fromlist=["load_state"]).load_state
         result = engine.run_once({})
+        # One failed read blocks entries; the book keeps its brackets.
         self.assertEqual(result["reason"], "post_risk_positions_unavailable")
+        self.assertTrue(result["transient"])
+        self.assertEqual(provider.cancel_calls, 0)
+        self.assertFalse(load_state().get("operator_pause"))
+        # The same endpoint keeps failing, now inside reconciliation.
+        for _ in range(TRANSIENT_FAILURE_LIMIT - 2):
+            result = engine.run_once({})
+            self.assertTrue(result["transient"])
+            self.assertEqual(provider.cancel_calls, 0)
+        result = engine.run_once({})
+        self.assertEqual(result["reason"], "cycle_reconciliation_failed")
+        self.assertNotIn("transient", result)
         self.assertGreaterEqual(provider.cancel_calls, 1)
 
     def test_malformed_risk_day_date_does_not_reset_baseline(self):

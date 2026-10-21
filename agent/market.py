@@ -136,7 +136,11 @@ class MarketData:
                     self.policy.exit_allowed(now or datetime.now(tz=NEW_YORK), self.session(now)))
 
     def should_force_flat(self, now: datetime | None = None) -> bool:
-        return bool(self._calendar_loaded and self.policy.should_force_flat(now or datetime.now(tz=NEW_YORK), self.session(now)))
+        # Entries need a fresh calendar; the exit to flat must not.  A failed
+        # refresh leaves the last broker calendar in place, and today's close
+        # in it does not change, so the force flat still comes due on time.
+        return bool(self._calendar and self.policy.should_force_flat(
+            now or datetime.now(tz=NEW_YORK), self.session(now)))
 
     def assets(self, *, include_options: bool = False) -> list[Asset | OptionContract]:
         rows: list[Asset | OptionContract] = list(self.provider.assets())
