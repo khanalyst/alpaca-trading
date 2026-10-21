@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V2,
+from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMAS, RULE_SCHEMA_V2,
                                   RULE_SCHEMA_V3, RULE_SCHEMA_V4,
                                   rule_spec_hash, rule_variant_id,
                                   validate_rule_spec)
@@ -153,8 +153,8 @@ class LLMRuleStrategyTests(unittest.TestCase):
             branch["properties"]["schema"]["enum"][0]
             for branch in option["properties"]["rule_spec"]["anyOf"]
         }
-        self.assertEqual(equity_schemas, {"rule-strategy.v1", "rule-strategy.v2",
-                                          RULE_SCHEMA_V3, RULE_SCHEMA_V4, "rule-strategy.v5"})
+        # Equity keeps the full audited grammar, which grew v6 and v7.
+        self.assertEqual(equity_schemas, set(RULE_SCHEMAS))
         self.assertEqual(option_schemas, {"rule-strategy.v1", "rule-strategy.v2"})
 
     def test_evidence_hashes_the_vehicle_specific_rule_grammar(self):
