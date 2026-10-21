@@ -48,6 +48,41 @@ def minimum_detectable_effect(n: int, sd_bps: float, alpha: float = 0.05, power:
     return _critical(alpha, power, one_sided) * sd_bps / math.sqrt(n)
 
 
+def rule_required_sessions(effect_bps: float, cost_bps: float, sd_bps: float, trades_per_session: float,
+                           alpha: float = 0.05, power: float = 0.80) -> int | None:
+    """Traded sessions for the whole preregistered rule to pass with ``power``.
+
+    Besides a one-sided test of the net session mean, the rule needs the
+    session mean to stay above zero at twice the cost.  That is the same as a
+    net mean per trade above the mean cost per trade, so passing needs the
+    net session mean above ``max(z_alpha x se, cost x m)``.  With ``m`` trades
+    per traded session this takes both ``n >= ((z_a + z_b) x sd / (e x m))**2``
+    and ``n >= (z_b x sd / ((e - cost) x m))**2``.  A true net effect at or
+    below the cost never passes, at any sample size: None.
+    """
+    if sd_bps <= 0 or trades_per_session <= 0 or cost_bps < 0:
+        raise ValueError("sd and trades per session must be positive and cost non-negative")
+    if effect_bps <= cost_bps:
+        return None
+    z_power = _NORMAL.inv_cdf(power)
+    test = (_critical(alpha, power, True) * sd_bps / (effect_bps * trades_per_session)) ** 2
+    margin = (max(z_power, 0.0) * sd_bps / ((effect_bps - cost_bps) * trades_per_session)) ** 2
+    return math.ceil(max(test, margin))
+
+
+def rule_minimum_detectable_effect(n: int, sd_bps: float, trades_per_session: float, cost_bps: float,
+                                   alpha: float = 0.05, power: float = 0.80) -> float:
+    """Smallest true net effect per trade the whole rule detects with ``n`` traded sessions.
+
+    ``max(z_alpha x se, cost) + z_power x se``, with ``se = sd / sqrt(n) / m`` per trade.
+    """
+    if n <= 0 or sd_bps <= 0 or trades_per_session <= 0 or cost_bps < 0:
+        raise ValueError("n, sd and trades per session must be positive and cost non-negative")
+    _critical(alpha, power, True)
+    se = sd_bps / math.sqrt(n) / trades_per_session
+    return max(_NORMAL.inv_cdf(1.0 - alpha) * se, cost_bps) + _NORMAL.inv_cdf(power) * se
+
+
 def design_effect(cluster_size: float, icc: float) -> float:
     """Variance inflation of a mean over clusters of correlated trades: ``1 + (m - 1) x icc``."""
     if cluster_size < 1 or not -1 <= icc <= 1:
@@ -88,26 +123,41 @@ def summarise_sessions(trades: Iterable[TradeLike], *, stress: float = 1.0) -> S
 
 def power_table(*, sd_bps: float, trades_per_session: float, traded_share: float,
                 effects_bps: Iterable[float] = (0.5, 1.0, 2.0, 3.0), sessions_for_mde: int = 2500,
-                alpha: float = 0.05, power: float = 0.80, one_sided: bool = True) -> dict[str, object]:
+                alpha: float = 0.05, power: float = 0.80, one_sided: bool = True,
+                cost_bps_per_trade: float | None = None) -> dict[str, object]:
     """Sessions needed per true per-trade effect, and the MDE for a given number of sessions.
 
     A per-trade effect ``e`` is a session effect of ``e x trades_per_session``.
     Required traded sessions are converted to calendar sessions by dividing by
-    the share of sessions that trade.
+    the share of sessions that trade.  The ``traded_sessions`` and MDE columns
+    are for the significance test alone.  With ``cost_bps_per_trade`` the
+    ``rule_*`` columns add the 2x-cost check of the preregistered rule, which
+    is what a decision run must pass.
     """
     if not 0 < traded_share <= 1 or trades_per_session <= 0:
         raise ValueError("traded share must lie in (0, 1] and trades per session be positive")
-    rows: list[dict[str, float | int]] = []
+    rows: list[dict[str, float | int | None]] = []
     for effect in effects_bps:
         traded = required_sessions(effect * trades_per_session, sd_bps, alpha, power, one_sided)
-        rows.append({"effect_bps_per_trade": effect, "traded_sessions": traded,
-                     "calendar_sessions": math.ceil(traded / traded_share)})
+        row: dict[str, float | int | None] = {
+            "effect_bps_per_trade": effect, "traded_sessions": traded,
+            "calendar_sessions": math.ceil(traded / traded_share)}
+        if cost_bps_per_trade is not None:
+            rule = rule_required_sessions(effect, cost_bps_per_trade, sd_bps, trades_per_session,
+                                          alpha, power)
+            row["rule_traded_sessions"] = rule
+            row["rule_calendar_sessions"] = None if rule is None else math.ceil(rule / traded_share)
+        rows.append(row)
     traded_available = max(1, math.floor(sessions_for_mde * traded_share))
     mde_session = minimum_detectable_effect(traded_available, sd_bps, alpha, power, one_sided)
+    mde: dict[str, float | int] = {"calendar_sessions": sessions_for_mde, "traded_sessions": traded_available,
+                                   "session_bps": mde_session, "per_trade_bps": mde_session / trades_per_session}
+    if cost_bps_per_trade is not None:
+        mde["rule_per_trade_bps"] = rule_minimum_detectable_effect(
+            traded_available, sd_bps, trades_per_session, cost_bps_per_trade, alpha, power)
     return {"alpha": alpha, "power": power, "one_sided": one_sided, "sd_bps": sd_bps,
-            "trades_per_session": trades_per_session, "traded_share": traded_share, "rows": rows,
-            "mde": {"calendar_sessions": sessions_for_mde, "traded_sessions": traded_available,
-                    "session_bps": mde_session, "per_trade_bps": mde_session / trades_per_session}}
+            "trades_per_session": trades_per_session, "traded_share": traded_share,
+            "cost_bps_per_trade": cost_bps_per_trade, "rows": rows, "mde": mde}
 
 
 def observed_power(summary: SessionSummary, *, sessions_available: int, mean_trade_bps: float | None,

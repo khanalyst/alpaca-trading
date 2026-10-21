@@ -47,6 +47,12 @@ SMOKE_BANNER = ("SMOKE RUN: NOT EVIDENCE. There are fewer sessions than one trai
                 "test block, so no parameters were selected and nothing here was tested out of sample. "
                 "It checks that the pipeline runs end to end on real bars; the numbers are far too few "
                 "to support or reject the hypothesis.")
+# The decision run the rule was registered for.  Any other run still reports
+# the checks, but its verdict is never "deploy to paper".
+PREREGISTERED_DESIGN = {"mode": "walk_forward", "format": "alpaca", "timeframe": "1Min",
+                        "symbols": list(SYMBOLS), "train": TRAIN_SESSIONS, "test": TEST_SESSIONS,
+                        "min_trades": MIN_TRAIN_TRADES, "permutations": PERMUTATION_DRAWS,
+                        "seed": PERMUTATION_SEED, "partial_files": 0, "calendar_covers_data": True}
 MAX_TRADES_IN_JSON = 250
 MAX_OUTPUT_BYTES = 200_000  # report.md and results.json each stay below this
 
@@ -361,13 +367,21 @@ def render_report(results: Mapping[str, object]) -> str:
         if table:
             lines += ["", "Sessions needed for a given true effect per trade, at the sd and trade rate measured "
                       "here:", ""]
-            lines += _table(["effect (bps per trade)", "traded sessions", "calendar sessions"],
-                            [[row["effect_bps_per_trade"], row["traded_sessions"], row["calendar_sessions"]]
+            lines += _table(["effect (bps per trade)", "test only: traded sessions", "test only: calendar",
+                             "whole rule: traded sessions", "whole rule: calendar"],
+                            [[row["effect_bps_per_trade"], row["traded_sessions"], row["calendar_sessions"],
+                              _fmt(row.get("rule_traded_sessions"), 0) if row.get("rule_traded_sessions")
+                              else "never", _fmt(row.get("rule_calendar_sessions"), 0)
+                              if row.get("rule_calendar_sessions") else "never"]
                              for row in table["rows"]])
             mde = table["mde"]
             lines += ["", f"MDE with {mde['calendar_sessions']:,} calendar sessions (about ten years): "
-                      f"{_fmt(mde['per_trade_bps'])} bps per trade ({_fmt(mde['session_bps'])} bps per traded "
-                      "session)."]
+                      f"{_fmt(mde['per_trade_bps'])} bps per trade for the significance test alone "
+                      f"({_fmt(mde['session_bps'])} bps per traded session); "
+                      f"{_fmt(mde.get('rule_per_trade_bps'))} bps per trade for the whole rule. The rule's "
+                      "2x-cost check needs the net effect per trade to exceed the mean cost per trade "
+                      f"({_fmt(table.get('cost_bps_per_trade'))} bps), so a smaller true effect never "
+                      "passes, at any sample size."]
     else:
         lines += [power.get("note", "not available")]
     lines += ["", "### Selection bias", ""]
@@ -381,9 +395,12 @@ def render_report(results: Mapping[str, object]) -> str:
     lines += ["", "## Preregistered decision rule", "",
               "Deploy to paper only if the out-of-sample session-level mean net bps is above zero with "
               "sign-flip p < 0.05 AND the 2x cost stress stays above zero.", ""]
-    if smoke:
-        lines += ["Not applicable: a smoke run is not an out-of-sample test. For reference only, the checks "
-                  "on this sample would read: " + _checks(rule["checks"]) + "."]
+    if not rule.get("applicable", not smoke):
+        why = ("a smoke run is not an out-of-sample test" if smoke else
+               "this run departs from the preregistered design in: " +
+               ", ".join(rule.get("design_deviations", [])))
+        lines += [f"Not applicable: {why}. For reference only, the checks on this sample would read: "
+                  + _checks(rule["checks"]) + ". **Decision: none (do not deploy).**"]
     else:
         lines += _table(["check", "passed"], [[CHECK_LABELS.get(name, name), passed]
                                               for name, passed in rule["checks"].items()])
@@ -491,7 +508,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--symbols must be a comma-separated list of tickers")
     if args.train <= 0 or args.test <= 0 or args.min_trades < 1 or args.permutations < 1:
         raise SystemExit("--train, --test, --min-trades and --permutations must be positive")
-    early_closes = bar_io.load_early_closes(args.calendar) if args.calendar else {}
+    if args.format == "alpaca" and args.calendar is None:
+        # Fetcher files hold all hours.  Without the calendar an early close
+        # keeps its post-close bars and they would be traded as regular hours.
+        raise SystemExit("--format alpaca needs --calendar (the fetcher's calendar.json)")
+    calendar_days: frozenset[date] | None = None
+    early_closes: dict[date, time] = {}
+    if args.calendar:
+        early_closes, calendar_days = bar_io.load_calendar(args.calendar)
     spreads = _read_spreads(args.spreads)
     if args.format == "public":
         streams, stats, info = load_public(args.data, symbols, args.timeframe, early_closes)
@@ -499,10 +523,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         streams, stats, info = load_alpaca(args.data, symbols, args.timeframe or "1Min", early_closes)
     result = simulate_grid(streams, GRID, rules=RULES, spreads=spreads,
                            skip_sessions=frozenset(early_closes))
+    sessions = result.sessions()
+    uncovered = ([day for day in sessions if day not in calendar_days]
+                 if calendar_days is not None else None)
+    if uncovered:
+        raise SystemExit(f"the calendar misses {len(uncovered)} data sessions (first {uncovered[0]}); "
+                         "fetch it for the whole data range")
     study = run_study(result, train=args.train, test=args.test, min_trades=args.min_trades,
                       draws=args.permutations, seed=args.seed)
     coverage = stats.summary()
-    sessions = result.sessions()
     info.update({"symbols": [symbol for symbol in symbols if symbol in coverage],
                  "sessions": len(sessions),
                  "first_session": sessions[0].isoformat() if sessions else None,
@@ -511,6 +540,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     prices = {symbol: row["median_close"] for symbol, row in coverage.items() if row["median_close"]}
     trades: list[Trade] = study.pop("trades_record")
     evaluation = study["evaluation"]
+    design = {"mode": study["mode"], "format": args.format,
+              "timeframe": args.timeframe or ("1Min" if args.format == "alpaca" else info.get("timeframe")),
+              "symbols": list(symbols), "train": args.train, "test": args.test,
+              "min_trades": args.min_trades, "permutations": args.permutations, "seed": args.seed,
+              "partial_files": info.get("partial_files"),
+              "calendar_covers_data": calendar_days is not None and not uncovered}
+    rule = dict(evaluation["decision"])
+    rule["design"] = design
+    rule["design_deviations"] = [key for key, value in PREREGISTERED_DESIGN.items()
+                                 if design.get(key) != value]
+    rule["applicable"] = not rule["design_deviations"]
+    rule["deploy_to_paper"] = bool(rule["applicable"] and all(rule["checks"].values()))
+    evaluation["decision"] = rule
     # Built in ``evaluate`` from the unrounded session sd, trade rate and traded share.
     table = evaluation.pop("power_table", None)
     results: dict[str, object] = {

@@ -103,14 +103,14 @@ Measured here: session-level sd 19.18 bps, 1.72 trades per traded session, 0.58 
 
 Sessions needed for a given true effect per trade, at the sd and trade rate measured here:
 
-| effect (bps per trade) | traded sessions | calendar sessions |
-| --- | --- | --- |
-| 0.50 | 3067 | 5283 |
-| 1.00 | 767 | 1321 |
-| 2.00 | 192 | 331 |
-| 3.00 | 86 | 149 |
+| effect (bps per trade) | test only: traded sessions | test only: calendar | whole rule: traded sessions | whole rule: calendar |
+| --- | --- | --- | --- | --- |
+| 0.50 | 3067 | 5283 | never | never |
+| 1.00 | 767 | 1321 | never | never |
+| 2.00 | 192 | 331 | 270 | 465 |
+| 3.00 | 86 | 149 | 86 | 149 |
 
-MDE with 2,500 calendar sessions (about ten years): 0.73 bps per trade (1.25 bps per traded session).
+MDE with 2,500 calendar sessions (about ten years): 0.73 bps per trade for the significance test alone (1.25 bps per traded session); 1.68 bps per trade for the whole rule. The rule's 2x-cost check needs the net effect per trade to exceed the mean cost per trade (1.43 bps), so a smaller true effect never passes, at any sample size.
 
 ### Selection bias
 
@@ -120,4 +120,4 @@ Not computed: no selection took place in a smoke run.
 
 Deploy to paper only if the out-of-sample session-level mean net bps is above zero with sign-flip p < 0.05 AND the 2x cost stress stays above zero.
 
-Not applicable: a smoke run is not an out-of-sample test. For reference only, the checks on this sample would read: session-level mean net bps above zero: yes; sign-flip p below 0.05: no; session-level mean above zero at 2x cost: no.
+Not applicable: a smoke run is not an out-of-sample test. For reference only, the checks on this sample would read: session-level mean net bps above zero: yes; sign-flip p below 0.05: no; session-level mean above zero at 2x cost: no. **Decision: none (do not deploy).**

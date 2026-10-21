@@ -328,7 +328,39 @@
     "sign_flip_p_below_0_05": false,
     "session_mean_at_2x_cost_above_zero": false
    },
-   "deploy_to_paper": false
+   "deploy_to_paper": false,
+   "inputs": {
+    "session_mean": -19.645707537976893,
+    "sign_flip_p_one_sided": 0.8227177282271773,
+    "session_mean_at_2x_cost": -22.71109495157962
+   },
+   "design": {
+    "mode": "smoke",
+    "format": "public",
+    "timeframe": null,
+    "symbols": [
+     "SPY",
+     "QQQ",
+     "IWM",
+     "DIA",
+     "VTI"
+    ],
+    "train": 504,
+    "test": 126,
+    "min_trades": 60,
+    "permutations": 10000,
+    "seed": 20261019,
+    "partial_files": null,
+    "calendar_covers_data": false
+   },
+   "design_deviations": [
+    "mode",
+    "format",
+    "timeframe",
+    "partial_files",
+    "calendar_covers_data"
+   ],
+   "applicable": false
   }
  },
  "power_table": {
@@ -338,33 +370,43 @@
   "sd_bps": 42.9407,
   "trades_per_session": 2.1429,
   "traded_share": 0.6364,
+  "cost_bps_per_trade": 1.4305,
   "rows": [
    {
     "effect_bps_per_trade": 0.5,
     "traded_sessions": 9931,
-    "calendar_sessions": 15606
+    "calendar_sessions": 15606,
+    "rule_traded_sessions": null,
+    "rule_calendar_sessions": null
    },
    {
     "effect_bps_per_trade": 1.0,
     "traded_sessions": 2483,
-    "calendar_sessions": 3902
+    "calendar_sessions": 3902,
+    "rule_traded_sessions": null,
+    "rule_calendar_sessions": null
    },
    {
     "effect_bps_per_trade": 2.0,
     "traded_sessions": 621,
-    "calendar_sessions": 976
+    "calendar_sessions": 976,
+    "rule_traded_sessions": 878,
+    "rule_calendar_sessions": 1380
    },
    {
     "effect_bps_per_trade": 3.0,
     "traded_sessions": 276,
-    "calendar_sessions": 434
+    "calendar_sessions": 434,
+    "rule_traded_sessions": 276,
+    "rule_calendar_sessions": 434
    }
   ],
   "mde": {
    "calendar_sessions": 2500,
    "traded_sessions": 1590,
    "session_bps": 2.6777,
-   "per_trade_bps": 1.2496
+   "per_trade_bps": 1.2496,
+   "rule_per_trade_bps": 1.8535
   }
  },
  "deflated_sharpe": {
@@ -376,7 +418,39 @@
    "sign_flip_p_below_0_05": false,
    "session_mean_at_2x_cost_above_zero": false
   },
-  "deploy_to_paper": false
+  "deploy_to_paper": false,
+  "inputs": {
+   "session_mean": -19.645707537976893,
+   "sign_flip_p_one_sided": 0.8227177282271773,
+   "session_mean_at_2x_cost": -22.71109495157962
+  },
+  "design": {
+   "mode": "smoke",
+   "format": "public",
+   "timeframe": null,
+   "symbols": [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA",
+    "VTI"
+   ],
+   "train": 504,
+   "test": 126,
+   "min_trades": 60,
+   "permutations": 10000,
+   "seed": 20261019,
+   "partial_files": null,
+   "calendar_covers_data": false
+  },
+  "design_deviations": [
+   "mode",
+   "format",
+   "timeframe",
+   "partial_files",
+   "calendar_covers_data"
+  ],
+  "applicable": false
  },
  "trades": [
   {

@@ -261,11 +261,18 @@ def _group(trades: Sequence[Trade], key: Callable[[Trade], str]) -> dict[str, di
 
 def decision(session_mean: float | None, sign_flip: float | None,
              session_mean_2x: float | None) -> dict[str, object]:
-    """The preregistered rule: session mean above zero, sign-flip p < 0.05, and above zero at 2x cost."""
+    """The preregistered rule: session mean above zero, sign-flip p < 0.05, and above zero at 2x cost.
+
+    ``inputs`` keeps the unrounded numbers the checks used, so the published
+    verdict can be re-derived exactly.  The runner adds whether the rule
+    applies at all (an out-of-sample run of the preregistered design).
+    """
     checks = {"session_mean_above_zero": session_mean is not None and session_mean > 0,
               "sign_flip_p_below_0_05": sign_flip is not None and sign_flip < 0.05,
               "session_mean_at_2x_cost_above_zero": session_mean_2x is not None and session_mean_2x > 0}
-    return {"checks": checks, "deploy_to_paper": all(checks.values())}
+    return {"checks": checks, "deploy_to_paper": all(checks.values()),
+            "inputs": {"session_mean": session_mean, "sign_flip_p_one_sided": sign_flip,
+                       "session_mean_at_2x_cost": session_mean_2x}}
 
 
 def evaluate(trades: Sequence[Trade], *, sessions: Sequence[date], refusals: Sequence[Refusal] = (),
@@ -317,7 +324,8 @@ def evaluate(trades: Sequence[Trade], *, sessions: Sequence[date], refusals: Seq
     share = power.get("traded_share")
     if "sd_bps" in power and isinstance(share, float) and 0 < share <= 1:
         table = power_table(sd_bps=power["sd_bps"], trades_per_session=power["trades_per_session"],
-                            traded_share=share)
+                            traded_share=share,
+                            cost_bps_per_trade=fmean(t.cost_bps for t in trades) if trades else None)
     out["power_table"] = _round_floats(table, 4)
     out["decision"] = decision(summary.mean, p_value, stressed[2.0][0].mean)
     return out

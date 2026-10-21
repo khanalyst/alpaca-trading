@@ -26,7 +26,7 @@ optional fetcher also uses `requests` (already pinned in `requirements.lock.txt`
 | `run.py` | command line: simulate, select or smoke-test, write `report.md` and `results.json` |
 | `fetch_sip.py` | command line: download Alpaca SIP bars into one gzip CSV per symbol and month |
 | `results/smoke-1m/`, `results/smoke-5m/` | the two smoke runs (not evidence) |
-| `tests/research/test_liquid_reversion_study.py` | 44 offline unit tests (in the repository's test tree) |
+| `tests/research/test_liquid_reversion_study.py` | 51 offline unit tests (in the repository's test tree) |
 
 ## Causal rules
 
@@ -147,12 +147,18 @@ call to Alpaca was made while building this study.
     python -I studies/liquid_reversion/run.py --data /data/sip-1min --format alpaca --timeframe 1Min \
         --calendar /data/sip-1min/calendar.json --out studies/liquid_reversion/results/walkforward-1m
 
+`--calendar` is required for fetcher data. The fetcher keeps all hours, so without the calendar the
+bars after an early close (13:00 on the day after Thanksgiving, for example) would be read as regular
+hours and traded. The run also stops if the calendar misses any session in the data, so fetch the
+calendar for the whole data range.
+
 Optional arguments:
 
 * `--spreads spreads.json`: measured quoted spreads in bps per symbol, for example
   `{"SPY": 0.15, "QQQ": 0.16}`.
 * `--train`, `--test`, `--min-trades`, `--permutations`, `--seed`: these change the preregistered
-  design, so leave them at their defaults for the decision run.
+  design. Any departure is listed under `decision.design_deviations` in `results.json`, and the
+  verdict is then never "deploy to paper".
 
 Use the script path as shown. Under `-I`, `python -I -m studies.liquid_reversion.run` cannot find
 the package from the working directory. The script inserts the repository root itself
@@ -184,16 +190,35 @@ been measured on the full data.
 **Deploy to paper only if the out-of-sample session-level mean net bps > 0 with sign-flip
 p < 0.05 AND the 2x cost stress stays > 0.**
 
-`walkforward.py:262` to `walkforward.py:268` implements it, and the report prints each check and the
-verdict. The rule, the fixed rules above, the grid, the window lengths, the selection criterion and
-the cost model are fixed before any full-data run. Changing any of them after seeing the
-out-of-sample record would void the test.
+`walkforward.decision` implements the three checks and publishes the unrounded numbers they used
+under `decision.inputs`. `run.py` then applies the rule only to the preregistered design: a
+walk-forward run on Alpaca one-minute data for the five symbols, with the default windows, minimum
+training trades, permutation draws and seed, no partial month files, and a calendar covering every
+session (`run.PREREGISTERED_DESIGN`). Otherwise `decision.applicable` is false, the departures are
+listed in `decision.design_deviations`, and `deploy_to_paper` is false whatever the checks read. A
+smoke run is never applicable.
+
+The rule, the fixed rules above, the grid, the window lengths, the selection criterion and the cost
+model are fixed before any full-data run. Changing any of them after seeing the out-of-sample record
+would void the test.
+
+What the third check means: the session mean at twice the cost is the net session mean minus one
+more cost per trade. It is above zero only when the net effect per trade exceeds the mean round-trip
+cost (about 1.43 bps here). The rule therefore tests "net expectancy above the cost", that is gross
+expectancy above twice the cost, not merely "net expectancy above zero". That is deliberate: it is
+the margin that protects against costs being underestimated. The power section below is computed
+for the whole rule.
 
 ## Power
 
 The table below comes from the session-level sd of net P&L measured in the two smoke runs.
 Session P&L is the sum of that day's net bps across the five ETFs, one position's notional per
-trade.
+trade. It gives two sets of figures:
+
+* **test only**: the one-sided significance test of the net session mean on its own;
+* **whole rule**: all three checks together. Passing needs the net session mean above both the test's
+  critical value and one cost per trade, so a true net effect at or below the mean cost (about
+  1.43 bps per trade) never passes, at any sample size (`power.rule_required_sessions`).
 
 * **Measured** on the smoke samples, at the middle grid point: session-level sd, trades per traded
   session and the share of sessions that trade.
@@ -211,23 +236,26 @@ Calendar sessions = traded sessions / traded share.
 | 90% interval for that sd (chi-square) | 29.64 to 82.25 | 15.06 to 26.85 |
 | trades per traded session (measured) | 2.14 | 1.72 |
 | share of sessions that trade (measured) | 0.636 | 0.581 |
-| 0.5 bps per trade: traded / calendar sessions | 9,931 / 15,606 (about 62 years) | 3,067 / 5,283 (about 21 years) |
-| 1 bp per trade: traded / calendar sessions | 2,483 / 3,902 (about 15.5 years) | 767 / 1,321 (about 5.2 years) |
-| 2 bps per trade: traded / calendar sessions | 621 / 976 (about 3.9 years) | 192 / 331 (about 1.3 years) |
-| 3 bps per trade: traded / calendar sessions | 276 / 434 (about 1.7 years) | 86 / 149 (about 0.6 years) |
-| minimum detectable effect, 2,500 calendar sessions (about ten years) | 1.25 bps per trade (2.68 per traded session) | 0.73 bps per trade (1.25 per traded session) |
-| same, across the 90% sd interval | 0.86 to 2.39 bps per trade | 0.57 to 1.02 bps per trade |
-| minimum detectable effect, 1,996 out-of-sample sessions | 1.40 bps per trade | 0.81 bps per trade |
+| mean cost per trade, bps (measured) | 1.43 | 1.43 |
+| 0.5 bps net per trade, calendar sessions: test only / whole rule | 15,606 (about 62 years) / never | 5,283 (about 21 years) / never |
+| 1 bp net per trade: test only / whole rule | 3,902 (about 15.5 years) / never | 1,321 (about 5.2 years) / never |
+| 2 bps net per trade: test only / whole rule | 976 (about 3.9 years) / 1,380 (about 5.5 years) | 331 (about 1.3 years) / 465 (about 1.8 years) |
+| 3 bps net per trade: test only / whole rule | 434 (about 1.7 years) / 434 (about 1.7 years) | 149 (about 0.6 years) / 149 (about 0.6 years) |
+| minimum detectable effect, 2,500 calendar sessions: test only / whole rule | 1.25 / 1.85 bps per trade | 0.73 / 1.68 bps per trade |
+| whole rule at 2,500 calendar sessions, across the 90% sd interval | 1.72 to 2.39 bps per trade | 1.62 to 1.77 bps per trade |
+| minimum detectable effect, 1,996 out-of-sample sessions: test only / whole rule | 1.40 / 1.90 bps per trade | 0.81 / 1.70 bps per trade |
 
 How to read it:
 
-* Ten years can detect an effect of roughly 0.7 to 1.3 bps net per trade on these point estimates.
-  At the upper end of the one-minute sd interval, that rises to about 2.4 bps. An effect of 0.5 bps
-  per trade is out of reach.
-* The mean round-trip cost is about 1.43 bps per trade, so the detectable effect is about the size
-  of the cost.
-* Only about 1,996 of the ten years' sessions are out of sample, because the first 504 only train
-  (last row).
+* Ten years of data give about 1,996 out-of-sample sessions, because the first 504 only train. On
+  them the whole rule detects a true net effect of about 1.7 to 1.9 bps per trade with 80% power, and
+  up to about 2.7 bps at the top of the one-minute sd interval.
+* The significance test alone could see smaller effects (0.8 to 1.4 bps), but the 2x-cost check
+  binds first: any true net effect below the mean cost of about 1.43 bps per trade fails it, however
+  much data there is. An earlier version of this table showed the test-only figures as if they were
+  the rule's; a review corrected that.
+* In gross terms the rule needs about 3.1 to 3.3 bps per trade (net effect plus cost) to pass
+  reliably.
 * The sd rests on 7 and 18 traded sessions, so required sample sizes are uncertain by a factor of two
   to four (they scale with the square of the sd). The two samples also overlap in time.
 * The full study uses one-minute bars, so the one-minute column is the more relevant design, but it
@@ -252,8 +280,9 @@ Alpaca SIP. The two samples overlap in time.
 | session mean at 2x cost | -22.71 | -1.77 |
 | exits | time 13, stop 2 | time 28, target 3 |
 
-The decision rule does not apply to a smoke run. For reference only, neither sample would pass it:
-both fail the sign-flip check and the 2x cost check.
+The decision rule does not apply to a smoke run: `results.json` records `decision.applicable:
+false` and `deploy_to_paper: false`. For reference only, neither sample would pass it: both fail the
+sign-flip check and the 2x cost check.
 
 Regenerate them with:
 
@@ -266,9 +295,14 @@ Regenerate them with:
 
     python -I -m unittest discover -s tests/research -t . -p test_liquid_reversion_study.py -v
 
-The 44 tests are offline and take about a second. They cover:
+The 51 tests are offline and take about a second. They cover:
 
-* the power arithmetic: 2 bps against an sd of 20 bps needs 619 sessions;
+* the power arithmetic: 2 bps against an sd of 20 bps needs 619 sessions for the test alone, and
+  873 for the whole rule at a cost of 1.43 bps; an effect at or below the cost never passes;
+* the decision rule: unrounded inputs are published, and a smoke run or any departure from the
+  preregistered design never yields "deploy to paper";
+* early closes: fetcher data needs a calendar that covers every session, and post-close bars are not
+  regular hours;
 * tick and fee arithmetic, including the sell-only SEC fee;
 * VWAP on a tiny session;
 * the 10:00 day type, proved by corrupting later bars;
@@ -288,6 +322,13 @@ module form works from the repository root.
   no per-bar VWAP. The fetcher saves Alpaca's per-bar `vwap` column, but the loader does not use it.
 * If a minute bar is missing after a signal, the entry is taken at the next available bar's open,
   which is later than the signal. This is rare on these ETFs.
-* Without `--calendar`, early-close sessions are traded and close at the last bar (`data_end`).
+* Public chart files hold regular hours only and carry no calendar; on them, early-close sessions are
+  traded and close at their last bar (`data_end`). Fetcher data cannot be run without a covering
+  calendar.
 * Slippage is assumed, not measured, and spreads default to one tick unless measured spreads are
   supplied.
+* The SEC Section 31 fee is applied at today's $20.60 per million to every year. The real rate
+  changes each fiscal year: it was $0.00 per million until 3 April 2026
+  ([SEC Fee Rate Advisory 2026-2](https://www.sec.gov/rules-regulations/fee-rate-advisories/2026-2)),
+  and it differed again in earlier years. On these ETFs the fee is about 0.2 bps on the sell leg, so
+  the error is a small part of the round trip.

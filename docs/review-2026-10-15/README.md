@@ -88,6 +88,55 @@ The runtime safety fixes of Path A, Step 1, are implemented with tests. The core
 - One existing test was changed on purpose: an account read failure now escalates to fail-closed on the third consecutive failure instead of the first.
 - The full runtime test set passes: 1,015 tests, of which 994 existed before and 21 are new. The research tests that drive the engine also pass.
 
+### Second review round (20 and 21 October 2026)
+
+The first-round commit was then reviewed adversarially. Three reviewers each read it through one lens: order lifecycle, cycle policy, and regressions. Each finding went to two checkers told to refute it by default. Each surviving finding was then reproduced against the code before it was fixed. Ten defects survived. Five were introduced by the first round, and five were older paths that the first round's claims did not yet cover. All ten are fixed.
+
+| id | defect (severity after checking) | fix |
+| --- | --- | --- |
+| F1 | Flatten skipped a symbol whose recorded closing order was its own partly filled take-profit leg. The residual was carried past the close (high; introduced) | A working leg of the trade's own bracket is no longer treated as a separate close. Flatten cancels it and closes the residual. A fill in the cancel race no longer aborts the whole flatten |
+| F2 | The monitor's end-of-pass write erased the stop it had just re-armed, leaving it live at the broker but unknown locally (high; introduced) | The re-arm returns its leg, and the monitor applies it to its own copy of the book (`_attach_rearmed_stop`) |
+| F3 | Any read failure later in a flatten returned before the re-arm, leaving a stripped position with no broker stop (medium; older) | Every failure leaves the poll loop through the residual check. A bracket stripped by an earlier call is re-armed by the next failed close in the flatten or the monitor (`_bracket_stripped`). A loop that stopped early never reports a confirmed flatten |
+| F4 | After a close failed ambiguously, the re-arm could place a stop on a book the close had already flattened, which is a short-opening order (low; introduced) | The re-arm first looks the failed close up by client id, and refuses on any working or filled trace. It reads orders before positions |
+| F5 | A flatten of a position known only to the broker was never booked, so the phantom trade later paused the runtime (medium; older) | The flatten binds to such a row through its closing order id, as the monitor already did |
+| EC-01 | A 4xx answering alpaca-py's automatic retry of a POST that had already created the entry was booked as a rejection (medium; introduced) | Every failed entry is looked up by client id before it is classified. A duplicate-id refusal counts as ambiguous |
+| EC-02 | An unresolved ambiguous entry was never adopted. It became an unknown position whose closes the hidden bracket legs refused (medium; introduced) | A durable unresolved order row counts the entry's risk and blocks its symbol. Reconciliation adopts the broker order with its bracket legs when it appears |
+| EC-03 | The pre-entry positions read still flattened the whole book and paused the runtime on one failed GET. A failed market-data read with a flat book stopped the process (medium; older) | The read goes through the transient policy, and a data failure only holds the cycle |
+| EC-04 | A failed calendar refresh discarded the loaded calendar and disabled both force-flat checks (high as reported; older) | The force-flat check uses the last good calendar. Entries still need a fresh one |
+| EC-05 | A reconciliation that kept failing never reached the three-failure limit, because later cycles failed in the readiness path, which did not count (medium; older) | Reconciliation failures in the readiness path count towards the same limit |
+
+F5, EC-04 and EC-05 were proved by tests that fail on the first-round code. The second checker for each was cut off by a usage limit. For F1, a test also checks the booking. The partly filled take-profit and the flatten of the residual are journalled as two closes with their own prices: 100 shares at 105 and 200 at 100.
+
+**Tests, second round:**
+
+- 15 new tests: 10 in `tests/test_exit_safety.py` and 5 in `tests/test_cycle_resilience.py`. All 15 fail on the first-round code.
+- One existing test changed on purpose: one failed pre-entry positions read now holds, and a persistent failure still fails closed on the third cycle.
+- The classifier test gained the duplicate-id case.
+
+### The liquid-ETF reversion study
+
+[`studies/liquid_reversion/`](../../studies/liquid_reversion/README.md) is a standalone harness for the one consistent structure the research found. It sits outside `agent/` and `research/`, so building it does not change the paper-trial identity. It includes:
+
+- a SIP one-minute fetcher;
+- a causal simulator of the preregistered rules;
+- per-symbol costs;
+- a rolling walk-forward;
+- session-level inference (a clustered t and a sign-flip test);
+- a power calculation;
+- 51 offline tests.
+
+The adversarial review of the study found five defects, all fixed:
+
+- **STAT-01 (high).** The power table modelled only the significance test. The decision rule's 2x-cost check requires the net effect per trade to exceed the mean cost of about 1.43 bps. A smaller true edge can never pass, at any sample size.
+- **STAT-02.** A smoke run could publish `deploy_to_paper: true`.
+- **STAT-03.** The verdict was not tied to the preregistered design, so a different seed or window could change it. It now is.
+- **STAT-04.** The published p-value and means were rounded and could contradict the checks. The unrounded inputs are now published.
+- **LA-01.** Fetcher data run without a calendar would have traded the post-close bars of early-close days. A calendar that covers every session is now required.
+
+**What ten years can show.** On about 1,996 out-of-sample sessions, the whole rule detects a true net edge of about 1.7 to 1.9 bps per trade with 80% power, which is about 3.1 to 3.3 bps gross. A net edge at or below the cost never passes. These figures rest on the session sd measured in two small public samples, so they are uncertain by a factor of about two.
+
+**Smoke runs, which are not evidence.** On 22 and 42 sessions of public bars, the fixed middle grid point netted -9.17 and +0.40 bps per trade, with sign-flip p of 0.82 and 0.45. Both would fail the rule. The ten-year SIP walk-forward has not been run: it needs Alpaca keys on the VM. The study README gives the commands.
+
 **Deploying these fixes changes the paper-trial code identity (C1-03),** because every file under `agent/` is hashed into it. Restart or re-register the trial as the operations runbook describes before relying on it.
 
 The file-by-file core design and its staged migration plan are in [`core-design.md`](core-design.md).

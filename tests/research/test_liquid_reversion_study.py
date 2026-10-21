@@ -175,6 +175,34 @@ class PowerTests(unittest.TestCase):
         self.assertAlmostEqual(table["mde"]["per_trade_bps"], expected["mde"]["per_trade_bps"], places=4)
 
 
+    def test_whole_rule_needs_the_net_effect_to_exceed_the_cost(self):
+        # The 2x-cost check is "net per trade above the mean cost per trade".
+        self.assertIsNone(power.rule_required_sessions(1.0, 1.43, 20.0, 1.0))
+        self.assertIsNone(power.rule_required_sessions(1.43, 1.43, 20.0, 1.0))
+        # 2 bps against a 1.43 bps cost: the cost margin, not the test, binds.
+        # (z_0.80 x 20 / 0.57) ** 2 = 29.5306 ** 2 = 872.06 -> 873 > 619.
+        self.assertEqual(power.rule_required_sessions(2.0, 1.43, 20.0, 1.0), 873)
+        # With no cost the rule is the significance test alone.
+        self.assertEqual(power.rule_required_sessions(2.0, 0.0, 20.0, 1.0), 619)
+
+    def test_whole_rule_mde_never_falls_below_the_cost(self):
+        for n in (100, 1000, 10_000, 1_000_000):
+            mde = power.rule_minimum_detectable_effect(n, 20.0, 2.0, 1.43)
+            self.assertGreater(mde, 1.43)
+            self.assertGreaterEqual(mde, power.minimum_detectable_effect(n, 20.0) / 2.0)
+        self.assertAlmostEqual(power.rule_minimum_detectable_effect(10**12, 20.0, 2.0, 1.43), 1.43, places=4)
+
+    def test_power_table_reports_the_whole_rule_beside_the_test(self):
+        table = power.power_table(sd_bps=20.0, trades_per_session=1.0, traded_share=0.5,
+                                  effects_bps=(1.0, 2.0), cost_bps_per_trade=1.43)
+        below, above = table["rows"]
+        self.assertIsNone(below["rule_traded_sessions"])
+        self.assertIsNone(below["rule_calendar_sessions"])
+        self.assertEqual((above["traded_sessions"], above["rule_traded_sessions"]), (619, 873))
+        self.assertEqual(above["rule_calendar_sessions"], 1746)
+        self.assertGreater(table["mde"]["rule_per_trade_bps"], table["mde"]["per_trade_bps"])
+
+
 # --------------------------------------------------------------------------- costs
 
 
@@ -519,6 +547,12 @@ class WalkForwardTests(unittest.TestCase):
         for trade in wf.trades:
             self.assertIs(trade, chosen[trade.session])
 
+    def test_decision_publishes_the_unrounded_inputs_it_used(self):
+        rule = walkforward.decision(0.0004, 500 / 10001, 0.0001)
+        self.assertTrue(rule["checks"]["sign_flip_p_below_0_05"])
+        self.assertEqual(rule["inputs"]["sign_flip_p_one_sided"], 500 / 10001)
+        self.assertEqual(rule["inputs"]["session_mean"], 0.0004)
+
     def test_decision_rule_needs_all_three_checks(self):
         self.assertTrue(walkforward.decision(1.0, 0.01, 0.5)["deploy_to_paper"])
         self.assertFalse(walkforward.decision(1.0, 0.05, 0.5)["deploy_to_paper"])
@@ -559,6 +593,46 @@ class SmokeReportTests(unittest.TestCase):
         self.assertFalse(results["out_of_sample"])
         self.assertIn("NOT EVIDENCE", report.splitlines()[0] + report.splitlines()[2])
         self.assertEqual(results["hypothesis"], run.HYPOTHESIS)
+        # A smoke run never carries a deploy verdict, whatever its checks read.
+        self.assertFalse(results["decision"]["applicable"])
+        self.assertFalse(results["decision"]["deploy_to_paper"])
+        self.assertIn("mode", results["decision"]["design_deviations"])
+
+    def test_alpaca_data_needs_a_calendar(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(SystemExit, "needs --calendar"):
+                run.main(["--data", folder, "--format", "alpaca", "--out", str(Path(folder) / "out")])
+
+    def test_a_calendar_that_misses_data_sessions_stops_the_run(self):
+        days = weekdays(date(2026, 9, 14), 2)
+        with tempfile.TemporaryDirectory() as folder:
+            data = Path(folder)
+            with gzip.open(data / "SPY_1Min_2026-09.csv.gz", "wt", encoding="utf-8", newline="") as handle:
+                handle.write(",".join(bar_io.ALPACA_CSV_COLUMNS) + "\n")
+                for day in days:
+                    for index in range(390):
+                        stamp = start_of(day, index).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        handle.write(f"SPY,{stamp},100,100.1,99.9,100,1000,10,100\n")
+            (data / "calendar.json").write_text(json.dumps(
+                [{"date": days[0].isoformat(), "open": "09:30", "close": "16:00"}]), encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "misses 1 data sessions"):
+                run.main(["--data", str(data), "--format", "alpaca", "--symbols", "SPY",
+                          "--calendar", str(data / "calendar.json"), "--out", str(data / "out")])
+
+    def test_post_close_bars_of_an_early_close_are_not_regular_hours(self):
+        day = date(2026, 11, 27)  # the day after Thanksgiving closes at 13:00
+        bars = [make_bar(day, index, 100, 100.1, 99.9, 100) for index in range(390)]
+        kept = bar_io.session_bars(bars, early_closes={day: time(13, 0)})[SYMBOL][day]
+        self.assertEqual(len(kept), 210)
+        self.assertLess(kept[-1].ts.astimezone(bar_io.NEW_YORK).time(), time(13, 0))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "calendar.json"
+            path.write_text(json.dumps([{"date": "2026-11-27", "open": "09:30", "close": "13:00"},
+                                        {"date": "2026-11-30", "open": "09:30", "close": "16:00"}]),
+                            encoding="utf-8")
+            early, days = bar_io.load_calendar(path)
+        self.assertEqual(early, {day: time(13, 0)})
+        self.assertEqual(days, frozenset({day, date(2026, 11, 30)}))
 
     def test_results_json_stays_under_200_kb(self):
         trade = fake_trade(DAY, 1.0).as_dict()

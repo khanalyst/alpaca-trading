@@ -246,17 +246,28 @@ def iter_alpaca_sessions(paths: Sequence[Path], *, interval_seconds: int,
                 yield day, rows
 
 
-def load_early_closes(path: str | Path) -> dict[date, time]:
-    """Regular closes before 16:00, read from a ``calendar.json`` written by the fetcher."""
+def load_calendar(path: str | Path) -> tuple[dict[date, time], frozenset[date]]:
+    """Early closes (before 16:00) and every trading day, from the fetcher's ``calendar.json``.
+
+    The trading days let the runner prove the calendar covers the data: a
+    session missing from it could be an unrecognised early close.
+    """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError("calendar file: expected a list of trading days")
-    out: dict[date, time] = {}
+    early: dict[date, time] = {}
+    days: set[date] = set()
     for entry in data:
         if not isinstance(entry, dict):
             raise ValueError("calendar file: every entry must be an object")
         day = date.fromisoformat(str(entry.get("date")))
         close = time.fromisoformat(str(entry.get("close")))
+        days.add(day)
         if close < REGULAR_CLOSE:
-            out[day] = close
-    return out
+            early[day] = close
+    return early, frozenset(days)
+
+
+def load_early_closes(path: str | Path) -> dict[date, time]:
+    """Regular closes before 16:00, read from a ``calendar.json`` written by the fetcher."""
+    return load_calendar(path)[0]
