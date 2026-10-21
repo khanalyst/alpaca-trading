@@ -39,7 +39,7 @@ import json  # noqa: E402
 import math  # noqa: E402
 import os  # noqa: E402
 import time  # noqa: E402
-from collections.abc import Callable, Mapping, Sequence  # noqa: E402
+from collections.abc import Callable, Iterable, Mapping, Sequence  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from typing import Any, Protocol  # noqa: E402
@@ -138,7 +138,9 @@ class AlpacaClient:
                 headers = getattr(response, "headers", None) or {}
                 self._sleep(backoff_seconds(attempt, headers.get("Retry-After")))
                 continue
-            raise FetchError(f"HTTP {status} from {url}: {_brief(response)}")
+            # An error body can echo request headers (some proxies do), so the
+            # credentials are scrubbed before any of it reaches a message or log.
+            raise FetchError(f"HTTP {status} from {url}: {_brief(response, self._headers.values())}")
         raise FetchError("retry loop ended without a response")  # pragma: no cover
 
 
@@ -153,9 +155,13 @@ def backoff_seconds(attempt: int, retry_after: object = None) -> float:
     return min(BACKOFF_BASE_SECONDS * 2 ** attempt, BACKOFF_CAP_SECONDS)
 
 
-def _brief(response: Any) -> str:
-    text = str(getattr(response, "text", ""))[:200]
-    return " ".join(text.split()) or "no body"
+def _brief(response: Any, secrets: Iterable[str] = ()) -> str:
+    """The first 200 characters of a response body, with every secret replaced first."""
+    text = str(getattr(response, "text", ""))
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return " ".join(text[:200].split()) or "no body"
 
 
 def rfc3339(instant: datetime) -> str:

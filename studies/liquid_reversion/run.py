@@ -31,7 +31,6 @@ from statistics import median  # noqa: E402
 from studies.liquid_reversion import bars as bar_io  # noqa: E402
 from studies.liquid_reversion.costs import (FINRA_TAF_CAP, FINRA_TAF_PER_SHARE,  # noqa: E402
                                             SEC_FEE_PER_MILLION, cost_breakdown)
-from studies.liquid_reversion.power import power_table  # noqa: E402
 from studies.liquid_reversion.strategy import (GRID, RULES, SMOKE_PARAMS, GridResult, Params,  # noqa: E402
                                                Trade, simulate_grid)
 from studies.liquid_reversion.walkforward import (MIN_TRAIN_TRADES, PERMUTATION_DRAWS,  # noqa: E402
@@ -48,7 +47,8 @@ SMOKE_BANNER = ("SMOKE RUN: NOT EVIDENCE. There are fewer sessions than one trai
                 "test block, so no parameters were selected and nothing here was tested out of sample. "
                 "It checks that the pipeline runs end to end on real bars; the numbers are far too few "
                 "to support or reject the hypothesis.")
-MAX_TRADES_IN_JSON = 1000
+MAX_TRADES_IN_JSON = 250
+MAX_OUTPUT_BYTES = 200_000  # report.md and results.json each stay below this
 
 
 class DataStats:
@@ -250,7 +250,8 @@ def render_report(results: Mapping[str, object]) -> str:
     evaluation = results["evaluation"]
     selection = results["selection"]
     smoke = results["mode"] == "smoke"
-    lines = ["# Liquid-ETF VWAP reversion study: " + ("smoke run" if smoke else "walk-forward result"), ""]
+    lines = ["# Liquid-ETF VWAP reversion study: "
+             + ("smoke run (NOT EVIDENCE)" if smoke else "walk-forward result"), ""]
     if smoke:
         lines += [f"> **{results['banner']}**", ""]
     lines += ["## Hypothesis", "", f"> {results['hypothesis']}", ""]
@@ -258,7 +259,8 @@ def render_report(results: Mapping[str, object]) -> str:
               f"- Source: {data['source']}.",
               f"- Input: `{data['path_name']}` ({data['files']} file{'' if data['files'] == 1 else 's'}), "
               f"{data['interval_seconds'] // 60}-minute bars, "
-              f"SHA-256 `{data['sha256'][:16]}...`.",
+              f"fingerprint `{data['sha256'][:16]}...` (SHA-256 of each file's name and content, "
+              "so it differs from a plain checksum of the file).",
               f"- Sessions: {data['sessions']} in total, "
               f"{data['first_session']} to {data['last_session']}; regular hours only (09:30 to 16:00 New York).",
               f"- Early closes supplied: {data['early_closes']} (sessions with an early close feed the history "
@@ -304,7 +306,7 @@ def render_report(results: Mapping[str, object]) -> str:
                           _fmt(row["deflated_sharpe"], 3)]
                          for row in selection["per_window"]])
         lines += [""]
-    title = "Results (smoke sample, in sample)" if smoke else "Results (out of sample)"
+    title = "Results (smoke sample, in sample, not evidence)" if smoke else "Results (out of sample)"
     net = evaluation["net_bps_per_trade"]
     session = evaluation["session_level"]
     lines += [f"## {title}", ""]
@@ -472,6 +474,16 @@ def _json_ready(value: object) -> object:
     return value
 
 
+def serialise_results(results: Mapping[str, object], *, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
+    """The results.json text; the per-trade list is dropped if it would take the file past ``max_bytes``."""
+    text = json.dumps(_json_ready(results), indent=1) + "\n"
+    trades = results.get("trades")
+    if len(text.encode("utf-8")) > max_bytes and isinstance(trades, list):
+        note = f"omitted: {len(trades)} trades would take results.json past {max_bytes:,} bytes"
+        text = json.dumps(_json_ready({**results, "trades": note}), indent=1) + "\n"
+    return text
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     symbols = tuple(item.strip().upper() for item in args.symbols.split(",") if item.strip())
@@ -499,11 +511,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     prices = {symbol: row["median_close"] for symbol, row in coverage.items() if row["median_close"]}
     trades: list[Trade] = study.pop("trades_record")
     evaluation = study["evaluation"]
-    power = evaluation["power"]
-    table = None
-    if power.get("sd_bps") and power.get("trades_per_session") and power.get("traded_share"):
-        table = power_table(sd_bps=power["sd_bps"], trades_per_session=power["trades_per_session"],
-                            traded_share=power["traded_share"])
+    # Built in ``evaluate`` from the unrounded session sd, trade rate and traded share.
+    table = evaluation.pop("power_table", None)
     results: dict[str, object] = {
         "schema": SCHEMA, **{key: study[key] for key in ("mode", "out_of_sample", "banner")},
         "hypothesis": HYPOTHESIS, "data": info,
@@ -523,7 +532,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                    else f"omitted: {len(trades)} trades exceed the {MAX_TRADES_IN_JSON}-trade limit"),
     }
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "results.json").write_text(json.dumps(_json_ready(results), indent=1) + "\n", encoding="utf-8")
+    (args.out / "results.json").write_text(serialise_results(results), encoding="utf-8")
     (args.out / "report.md").write_text(render_report(results), encoding="utf-8")
     mode = "SMOKE (not evidence)" if study["mode"] == "smoke" else "walk-forward"
     print(f"{mode}: {evaluation['trades']} trades, net {_fmt(evaluation['net_bps_per_trade']['mean'])} bps per "

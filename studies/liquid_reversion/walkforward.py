@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import date
 from statistics import NormalDist, fmean, median, stdev
 
-from studies.liquid_reversion.power import (SessionSummary, observed_power, session_totals,
+from studies.liquid_reversion.power import (SessionSummary, observed_power, power_table, session_totals,
                                             summarise_sessions)
 from studies.liquid_reversion.strategy import GRID, Params, Refusal, Trade
 
@@ -310,5 +310,24 @@ def evaluate(trades: Sequence[Trade], *, sessions: Sequence[date], refusals: Seq
                            mean_trade_bps=fmean(nets) if nets else None)
     out["power"] = {key: (_rounded(value) if isinstance(value, float) else value)
                     for key, value in power.items()}
+    # The table is built from the unrounded measurements; only its outputs are
+    # rounded. Rounding the sd, trade rate and traded share first moved the
+    # published session counts (15,614 instead of 15,606 on the 1-minute smoke run).
+    table = None
+    share = power.get("traded_share")
+    if "sd_bps" in power and isinstance(share, float) and 0 < share <= 1:
+        table = power_table(sd_bps=power["sd_bps"], trades_per_session=power["trades_per_session"],
+                            traded_share=share)
+    out["power_table"] = _round_floats(table, 4)
     out["decision"] = decision(summary.mean, p_value, stressed[2.0][0].mean)
     return out
+
+
+def _round_floats(value: object, places: int) -> object:
+    if isinstance(value, float):
+        return value if math.isinf(value) else round(value, places)
+    if isinstance(value, Mapping):
+        return {key: _round_floats(item, places) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_round_floats(item, places) for item in value]
+    return value
