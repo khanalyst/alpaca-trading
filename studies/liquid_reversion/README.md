@@ -26,7 +26,7 @@ optional fetcher also uses `requests` (already pinned in `requirements.lock.txt`
 | `run.py` | command line: simulate, select or smoke-test, write `report.md` and `results.json` |
 | `fetch_sip.py` | command line: download Alpaca SIP bars into one gzip CSV per symbol and month |
 | `results/smoke-1m/`, `results/smoke-5m/` | the two smoke runs (not evidence) |
-| `tests/research/test_liquid_reversion_study.py` | 51 offline unit tests (in the repository's test tree) |
+| `tests/research/test_liquid_reversion_study.py` | 52 offline unit tests (in the repository's test tree) |
 
 ## Causal rules
 
@@ -87,15 +87,18 @@ entry of a short. One tick is 1e4 x $0.01 / price bps; for SPY at $778 that is 0
 
 | component | value used | source and status |
 | --- | --- | --- |
-| spread | max($0.01 tick, measured quoted spread), one full spread per round trip (`costs.py:87`) | Measured spreads are optional (`--spreads`). Without them, one tick is used. If a smaller minimum increment applies to these ETFs, the one-cent floor overstates the cost, which works against the hypothesis. This was not checked here. |
+| spread | max($0.01 tick, measured quoted spread), one full spread per round trip (`costs.py:87`) | Measured spreads are optional (`--spreads`). Without them, one tick is used. The SEC's half-penny increment for tightly quoted stocks (amended Rule 612) is not yet in force: Release 34-105656 of 11 June 2026 moved its compliance date to the first business day of November 2027 ([Federal Register](https://public-inspection.federalregister.gov/2026-11997.pdf)). So $0.01 is the right floor for the whole data window. After that date it would overstate the cost by half a tick, about 0.06 to 0.18 bps per round trip on these ETFs, which works against the hypothesis. |
 | slippage | 0.5 bps per side, so 1 bp per round trip (`costs.py:28`) | assumption, not measured |
 | SEC Section 31 fee | $20.60 per million of sell notional, sell leg only (`costs.py:24`) | [SEC Fee Rate Advisory 2026-2](https://www.sec.gov/rules-regulations/fee-rate-advisories/2026-2). Read on 20 October 2026: "will be set at $20.60 per million dollars", "starting on April 4, 2026". The same page gives $0.00 per million before that date. |
-| FINRA Trading Activity Fee | $0.000195 per share sold, capped at $9.79 per trade (`costs.py:25` and `costs.py:26`) | Not re-verified in this work. Its size is 0.0025 to 0.0069 bps per round trip at the smoke-run prices, so it is immaterial. |
+| FINRA Trading Activity Fee | $0.000195 per share sold, capped at $9.79 per trade (`costs.py:25` and `costs.py:26`) | The 2026 rate. FINRA paused the fee for transactions from 1 October to 31 December 2026 ([SR-FINRA-2026-021](https://www.finra.org/sites/default/files/2026-09/SR-FINRA-2026-021.pdf)). It is 0.0025 to 0.0069 bps per round trip at the smoke-run prices, so it is immaterial either way. |
 | commission | none | Alpaca API equity trading is commission-free (from the study brief, not re-verified here) |
 | market data | SIP consolidated tape, raw (unadjusted) bars | [Alpaca Market Data API](https://docs.alpaca.markets/docs/about-market-data-api). On the free plan, only the latest 15 minutes of SIP data are restricted. |
 
 Today's fee schedule is applied to every year of history on purpose: the question is whether the
-edge survives the costs a trade would pay now. The cost stress multiplies the whole round trip by 2.
+edge survives the costs a trade would pay now. The SEC fee in fact moved between $0.00 and
+$27.80 per million over the decade, so any one trade's fee is misstated by at most about 0.2 bps,
+and the decade's average by a few hundredths of a bp. The cost stress multiplies the whole round
+trip by 2.
 
 Round trip at the median closes of the one-minute smoke sample, with no measured spreads:
 
@@ -128,6 +131,9 @@ What the fetcher does:
   latest 15 minutes of SIP data, so older history is available on the free plan.
 * It paces requests to at most 200 per minute. HTTP 429, 5xx and network errors are retried with
   bounded exponential back-off, honouring `Retry-After`.
+* The keys are sent only over HTTPS to `data.alpaca.markets`, `paper-api.alpaca.markets` or
+  `api.alpaca.markets`, and a redirect is refused rather than followed, because `requests` would
+  forward the `APCA-*` headers to the new host.
 * The keys travel only in the `APCA-API-KEY-ID` and `APCA-API-SECRET-KEY` request headers
   (`fetch_sip.py:121`). They are never put in the query, printed, logged or written to disk. Error
   bodies are scrubbed of both keys before they reach a message (`fetch_sip.py:163`).
@@ -295,7 +301,7 @@ Regenerate them with:
 
     python -I -m unittest discover -s tests/research -t . -p test_liquid_reversion_study.py -v
 
-The 51 tests are offline and take about a second. They cover:
+The 52 tests are offline and take about a second. They cover:
 
 * the power arithmetic: 2 bps against an sd of 20 bps needs 619 sessions for the test alone, and
   873 for the whole rule at a cost of 1.43 bps; an effect at or below the cost never passes;
@@ -310,7 +316,8 @@ The 51 tests are offline and take about a second. They cover:
 * one trade per symbol-session, including a refused first signal;
 * stop-first ties, gap fills at the open, the 60-minute time stop and the 15:50 flat;
 * walk-forward windows, and a selection that ignores poisoned test data;
-* the fetcher's pagination, 429 retry and key handling, against a fake session.
+* the fetcher's pagination, 429 retry and key handling, against a fake session, including refusing
+  plain HTTP, non-Alpaca hosts and redirects.
 
 `python -I -m unittest tests.research.test_liquid_reversion_study` does not work, because `-I`
 removes the working directory from `sys.path`. `discover -t .` puts it back. Without `-I`, the
@@ -327,8 +334,10 @@ module form works from the repository root.
   calendar.
 * Slippage is assumed, not measured, and spreads default to one tick unless measured spreads are
   supplied.
-* The SEC Section 31 fee is applied at today's $20.60 per million to every year. The real rate
-  changes each fiscal year: it was $0.00 per million until 3 April 2026
-  ([SEC Fee Rate Advisory 2026-2](https://www.sec.gov/rules-regulations/fee-rate-advisories/2026-2)),
-  and it differed again in earlier years. On these ETFs the fee is about 0.2 bps on the sell leg, so
-  the error is a small part of the round trip.
+* The bars are unadjusted (`adjustment=raw`), which is right for intraday P&L, VWAP and the tick
+  floor. But the overnight gap on an ex-dividend morning includes the dividend, so a quiet
+  ex-dividend day can be classified as a gap day and skipped. That is about 2% of symbol-sessions
+  (about 5% for DIA, which pays monthly). It removes sessions; it does not bias the trades taken.
+* Partial month files (the current month) are read if present, but a run that uses any is not the
+  preregistered design, so its verdict is never "deploy to paper". End the fetch on the last day of
+  a completed month.

@@ -12,6 +12,7 @@
 - Input: `bars_5m.json` (1 file), 5-minute bars, fingerprint `5294ea75745f0897...` (SHA-256 of each file's name and content, so it differs from a plain checksum of the file).
 - Sessions: 42 in total, 2026-08-17 to 2026-10-14; regular hours only (09:30 to 16:00 New York).
 - Early closes supplied: 0 (sessions with an early close feed the history but are not traded).
+- Partial (provisional) month files used: not applicable.
 
 | symbol | sessions | bars | min bars | max bars | short sessions | zero-volume bars | median close |
 | --- | --- | --- | --- | --- | --- | --- | --- |

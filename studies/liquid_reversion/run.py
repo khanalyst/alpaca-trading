@@ -270,7 +270,8 @@ def render_report(results: Mapping[str, object]) -> str:
               f"- Sessions: {data['sessions']} in total, "
               f"{data['first_session']} to {data['last_session']}; regular hours only (09:30 to 16:00 New York).",
               f"- Early closes supplied: {data['early_closes']} (sessions with an early close feed the history "
-              "but are not traded).", ""]
+              "but are not traded).",
+              f"- Partial (provisional) month files used: {data.get('partial_files', 'not applicable')}.", ""]
     coverage = data["coverage"]
     lines += _table(["symbol", "sessions", "bars", "min bars", "max bars", "short sessions", "zero-volume bars",
                      "median close"],

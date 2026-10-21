@@ -667,8 +667,9 @@ class FakeSession:
         self.responses = list(responses)
         self.calls: list[dict] = []
 
-    def get(self, url, *, params, headers, timeout):
-        self.calls.append({"url": url, "params": dict(params), "headers": dict(headers), "timeout": timeout})
+    def get(self, url, *, params, headers, timeout, allow_redirects=True):
+        self.calls.append({"url": url, "params": dict(params), "headers": dict(headers), "timeout": timeout,
+                           "allow_redirects": allow_redirects})
         return self.responses.pop(0)
 
 
@@ -745,6 +746,20 @@ class FetcherTests(unittest.TestCase):
             client_for(session, clock).get_json(fetch_sip.BARS_URL, {"symbols": "SPY"})
         self.assertIn("403", str(caught.exception))
         self.assert_keys_absent(str(caught.exception))
+
+    def test_keys_go_only_to_https_alpaca_hosts_and_never_follow_a_redirect(self):
+        for url in ("http://data.alpaca.markets/v2/stocks/bars", "https://example.com/v2/calendar",
+                    "https://data.alpaca.markets.evil.example/v2/stocks/bars"):
+            session = FakeSession([])
+            with self.assertRaisesRegex(fetch_sip.FetchError, "only HTTPS Alpaca hosts"):
+                client_for(session, FakeClock()).get_json(url, {})
+            self.assertEqual(session.calls, [])
+        session = FakeSession([FakeResponse(302, headers={"Location": "https://example.com/"})])
+        with self.assertRaisesRegex(fetch_sip.FetchError, "redirect .* refused") as caught:
+            client_for(session, FakeClock()).get_json(fetch_sip.CALENDAR_URL, {})
+        self.assertFalse(session.calls[0]["allow_redirects"])
+        self.assertNotIn(API_KEY, str(caught.exception))
+        self.assertNotIn(API_SECRET, str(caught.exception))
 
     def test_repeated_page_token_is_an_error(self):
         page = {"bars": {"SPY": []}, "next_page_token": "same"}

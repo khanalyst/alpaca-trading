@@ -3,8 +3,11 @@
 Usage, from the repository root, with ``ALPACA_API_KEY`` and ``ALPACA_SECRET_KEY``
 set in the environment::
 
-    python -I studies/liquid_reversion/fetch_sip.py --out DIR --start 2016-01-01 \\
-        --end 2026-10-16 --symbols SPY,QQQ,IWM,DIA,VTI
+    python -I studies/liquid_reversion/fetch_sip.py --out DIR --start 2016-10-01 \\
+        --end 2026-09-30 --symbols SPY,QQQ,IWM,DIA,VTI --calendar
+
+End on the last day of a completed month so that every file is final; a
+decision run on partial months is not the preregistered design.
 
 ``python -m studies.liquid_reversion.fetch_sip`` takes the same arguments.
 
@@ -43,12 +46,17 @@ from collections.abc import Callable, Iterable, Mapping, Sequence  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from typing import Any, Protocol  # noqa: E402
+from urllib.parse import urlsplit  # noqa: E402
 
 from studies.liquid_reversion.bars import (ALPACA_CSV_COLUMNS, NEW_YORK, SYMBOL_PATTERN,  # noqa: E402
                                            TIMEFRAME_SECONDS, month_file_name, parse_utc)
 
 BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
 CALENDAR_URL = "https://paper-api.alpaca.markets/v2/calendar"
+# The keys are sent only to these hosts, only over HTTPS, and never through a
+# redirect: ``requests`` strips Authorization on a cross-host redirect, but not
+# the APCA-* headers.
+ALPACA_HOSTS = frozenset({"data.alpaca.markets", "paper-api.alpaca.markets", "api.alpaca.markets"})
 KEY_ENV = "ALPACA_API_KEY"
 SECRET_ENV = "ALPACA_SECRET_KEY"
 DEFAULT_SYMBOLS = ("SPY", "QQQ", "IWM", "DIA", "VTI")
@@ -113,13 +121,17 @@ class AlpacaClient:
 
     def get_json(self, url: str, params: Mapping[str, Any]) -> Any:
         """GET ``url`` and decode JSON, retrying 429, 5xx and network errors with back-off."""
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.hostname not in ALPACA_HOSTS:
+            raise FetchError(f"refusing to send the keys to {parts.scheme}://{parts.hostname}: "
+                             "only HTTPS Alpaca hosts are allowed")
         for attempt in range(self._max_retries + 1):
             self._pacer.wait()
             self.requests += 1
             last_attempt = attempt == self._max_retries
             try:
                 response = self._session.get(url, params=dict(params), headers=self._headers,
-                                             timeout=self._timeout)
+                                             timeout=self._timeout, allow_redirects=False)
             except OSError as error:  # requests' exceptions derive from OSError
                 if last_attempt:
                     raise FetchError(f"network error from {url} after {attempt + 1} attempts: "
@@ -132,6 +144,9 @@ class AlpacaClient:
                     return response.json()
                 except ValueError:
                     raise FetchError(f"{url} returned a body that is not JSON") from None
+            if 300 <= status < 400:
+                raise FetchError(f"HTTP {status} redirect from {url} refused; the keys are never "
+                                 "forwarded")
             if status == 429 or 500 <= status < 600:
                 if last_attempt:
                     raise FetchError(f"HTTP {status} from {url} after {attempt + 1} attempts")

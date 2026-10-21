@@ -125,7 +125,7 @@ F5, EC-04 and EC-05 were proved by tests that fail on the first-round code. The 
 - a rolling walk-forward;
 - session-level inference (a clustered t and a sign-flip test);
 - a power calculation;
-- 51 offline tests.
+- 52 offline tests.
 
 The adversarial review of the study found five defects, all fixed:
 
@@ -134,6 +134,13 @@ The adversarial review of the study found five defects, all fixed:
 - **STAT-03.** The verdict was not tied to the preregistered design, so a different seed or window could change it. It now is.
 - **STAT-04.** The published p-value and means were rounded and could contradict the checks. The unrounded inputs are now published.
 - **LA-01.** Fetcher data run without a calendar would have traded the post-close bars of early-close days. A calendar that covers every session is now required.
+
+Lower-severity data and cost points from the same review:
+
+- The fetcher sends the keys only to HTTPS Alpaca hosts and never follows a redirect, because `requests` would forward the `APCA-*` headers.
+- Partial month files are now shown in the report and block a deploy verdict.
+- The ex-dividend gap effect on the day type is documented: it skips about 2% of sessions.
+- The one-cent tick floor is right for the whole data window. The SEC's half-penny increment is delayed to November 2027 ([Release 34-105656](https://public-inspection.federalregister.gov/2026-11997.pdf)).
 
 **What ten years can show.** On about 1,996 out-of-sample sessions, the whole rule detects a true net edge of about 1.7 to 1.9 bps per trade with 80% power, which is about 3.1 to 3.3 bps gross. A net edge at or below the cost never passes. These figures rest on the session sd measured in two small public samples, so they are uncertain by a factor of about two.
 
