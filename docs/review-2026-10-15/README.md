@@ -115,6 +115,22 @@ F5, EC-04 and EC-05 were proved by tests that fail on the first-round code. The 
 - The full runtime shard passes on the final code: 1,029 tests in one run, plus the F1 booking test, which was added afterwards and passes in its module's run.
 - In the research shard, one stale test had kept CI red on this branch since before this work: it listed the equity rule grammar without v6 and v7. It now expects the full grammar.
 
+### Third review round (21 to 24 October 2026)
+
+Two more reviewers read the second-round diff on a frozen copy, one for exits and one for cycle policy. Their checkers were cut off by a usage limit, so I reproduced each finding against the code myself before fixing it. All five reproduced, and all five are fixed. Three were introduced by the second round.
+
+| id | defect | fix |
+| --- | --- | --- |
+| R3-F1-01 | After a fill race, the flatten trusted a positions snapshot that lagged the stop's fill. It could sell an exposure the stop had already closed, opening a reversal. It also treated a partly filled leg whose cancel was still pending as gone, and closed under it (high; introduced) | Every flatten close is sized from the exposure's entry fill less the broker's fills of its own exits. The close waits while the two disagree. An own leg the broker still works is re-cancelled whatever its local label says |
+| R3-F3-01 | The end-of-call re-arm could place a full-size stop over a flatten close that had already filled, and reopen the trade (medium; introduced) | Every close the call submitted is looked up by client id before the re-arm. The re-arm is sized from the same fill accounting, so it never places a stop on a flat book |
+| R3-F3-02 | A leg with a partial fill stopped a stripped bracket from ever being re-armed after one failed re-arm (medium; introduced) | An equity bracket with no live leg counts as stripped. The re-arm sizes the stop to the residual |
+| EC02-R3-01 | The reconcile write merged an adopted entry's old client-id row back, so it was re-adopted, and journalled as a new open, on every reconcile. It also blocked resume (high) | The re-keyed-away keys are removed in the same write. A stale duplicate is dropped |
+| EC02-R3-02 | An entry adopted while the exact lookup failed lost its bracket legs for good (medium) | A bracket adopted without legs is marked `legs_pending`, and every reconcile retries the lookup and attaches the legs |
+
+One liveness risk in my own fix was caught in self-review before commit. The exposure size comes only from the recorded entry fill, not from `qty`. Reconcile rewrites `qty` from each position snapshot, so subtracting exit fills from it would count them twice. That could stall the flatten of a position known only to the broker.
+
+**Tests, third round:** 6 new tests. Four are in `tests/test_exit_safety.py`: a full fill in the cancel race, a cancel still pending, a filled close followed by a reconcile error, and a re-arm retried after a partial fill. Two are in `tests/test_cycle_resilience.py`: a single adoption with a single journal row, and recovery of pending legs followed by the stop-out booking. All 6 fail on the second-round code. The reviewer's own reproductions also pass now.
+
 ### The liquid-ETF reversion study
 
 [`studies/liquid_reversion/`](../../studies/liquid_reversion/README.md) is a standalone harness for the one consistent structure the research found. It sits outside `agent/` and `research/`, so building it does not change the paper-trial identity. It includes:

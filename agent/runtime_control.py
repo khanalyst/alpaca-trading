@@ -144,9 +144,10 @@ class RuntimeControlMixin:
         except Exception:  # noqa: BLE001
             pass
         failed_symbols: set[str] = set()
-        # Client ids of closes whose submit failed; the re-arm looks each up
-        # in case it reached the broker anyway.
-        failed_close_ids: dict[str, str] = {}
+        # Client ids of every close this call submitted, per symbol.  The
+        # end-of-call re-arm looks each up, so it never places a stop over a
+        # close that reached the broker or has already filled.
+        close_ids: dict[str, list[str]] = {}
         # Every failure below leaves the poll loop through the residual check,
         # never through an early return, so exposures stripped of their legs
         # earlier in this call still get their broker stop restored.  A loop
@@ -197,6 +198,20 @@ class RuntimeControlMixin:
             active_now = active_now if isinstance(active_now, Mapping) else {}
             working_ids = {str(_value(order, "id", "") or "")
                            for order in working_orders}
+            # Exit fill evidence, terminal orders included.  The position
+            # endpoint can lag the order endpoint, so every close below is
+            # sized from the exposure's entry fill less its exits' fills.
+            every_orders = None
+            if any(isinstance(active_now.get(str(_value(item, "symbol", "")).upper()), Mapping)
+                   for item in positions):
+                try:
+                    every_orders = self._all_orders()
+                except Exception as exc:  # noqa: BLE001
+                    self._event("flatten_orders_error", {"reason": str(exc)})
+                    loop_error = f"order history unavailable: {exc}"
+                    break
+            every_by_id = {str(_value(order, "id", "") or ""): order
+                           for order in (every_orders or [])}
             for position in positions:
                 qty = abs(Decimal(str(_value(position, "qty", 0))))
                 if qty <= 0:
@@ -231,20 +246,51 @@ class RuntimeControlMixin:
                         # cancelled below and the residual is closed.
                         continue
                     close_attempt = 0
-                legs = protected.get(symbol) or []
+                legs = list(protected.get(symbol) or [])
+                if trade is not None:
+                    # An own leg the broker still works is cancelled whatever
+                    # its local status says: a cancel that met a fill marks it
+                    # filled locally while the broker may still be working it.
+                    listed = {str(leg.get("order_id")) for leg in legs}
+                    legs += [leg for leg in _leg_rows(trade)
+                             if str(leg.get("order_id")) not in listed]
+                    for index, leg in enumerate(legs):
+                        broker_leg = every_by_id.get(str(leg.get("order_id")))
+                        if (broker_leg is not None and
+                                order_status(broker_leg) not in _TERMINAL_ORDER_STATUSES):
+                            if leg.get("status") != order_status(broker_leg):
+                                legs[index] = {**leg, "status": order_status(broker_leg)}
+                if trade is not None and every_orders is not None:
+                    exits_filled, _ = self._exposure_exit_fills(
+                        trade, every_orders, orders_state=runtime_now.get("orders"),
+                        close_client_ids=close_ids.get(symbol, ()))
+                    size = self._exposure_qty(trade)
+                    if size is not None and exits_filled > 1e-9:
+                        remaining = size - exits_filled
+                        if remaining <= 1e-9 or abs(float(qty) - remaining) > 1e-6:
+                            # The exposure's own exits have taken part or all
+                            # of it and the position snapshot has not caught
+                            # up.  Closing now could reverse the position, so
+                            # wait for a snapshot that agrees.
+                            self._event("flatten_waiting_for_position", {
+                                "symbol": symbol, "snapshot_qty": str(qty),
+                                "remaining_qty": max(0.0, remaining)})
+                            continue
                 if legs:
                     unprotected[symbol] = (trade, position)
                 if legs and not self._cancel_protective_legs(symbol, legs):
                     # A resting leg reserves the quantity; never submit a close
                     # that the broker would bounce.  A leg that filled in the
-                    # cancel race leaves a residual, which the next poll
-                    # closes from a fresh snapshot.  Other symbols go on.
+                    # cancel race leaves a residual, which a later poll closes
+                    # once the broker's fills and the snapshot agree.  Other
+                    # symbols go on.
                     continue
                 protected.pop(symbol, None)
                 close = getattr(self.provider, "close_position", None)
                 client_order_id = self._exit_client_id(
                     "flatten", symbol, reason, trade=trade, position=position,
                     attempt=close_attempt)
+                close_ids.setdefault(symbol, []).append(client_order_id)
                 request = None
                 try:
                     if callable(close):
@@ -273,7 +319,6 @@ class RuntimeControlMixin:
                         "symbol": symbol, "reason": reason,
                         "attempt": close_attempt, "error": str(exc)})
                     failed_symbols.add(symbol)
-                    failed_close_ids[symbol] = client_order_id
                     continue
                 order_id = str(getattr(order, "id", None) or client_order_id)
                 status = str(getattr(order, "status", "submitted") or "submitted").lower()
@@ -372,7 +417,7 @@ class RuntimeControlMixin:
                     trade, _ = unprotected.pop(symbol)
                     self._rearm_protective_stop(
                         symbol, trade, position, reason=reason,
-                        close_client_id=failed_close_ids.get(symbol))
+                        close_client_ids=close_ids.get(symbol, ()))
         evidence = {
             "reason": reason,
             "residual": _plain(residual_positions),

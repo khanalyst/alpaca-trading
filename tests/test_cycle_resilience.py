@@ -6,10 +6,12 @@ entries without closing the broker-protected book; persistent failures still
 fail closed.
 """
 
+from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -382,6 +384,104 @@ class EntryFailureTests(_RuntimeCase):
         self.assertEqual(sorted(leg["order_id"] for leg in trade["protective_legs"]),
                          ["order-late-stop", "order-late-target"])
         self.assertNotEqual(trade.get("execution_profile"), "unknown")
+
+
+class _LateBracketProvider(FakeProvider):
+    """An entry created at the broker although its submit timed out."""
+
+    created = None
+    visible = False
+    exact_down = False
+
+    def submit_order(self, request):
+        self.orders_sent.append(request)
+        self.created = Order(
+            "order-late", request.symbol, request.qty, request.side,
+            "accepted", request.type, request.time_in_force,
+            client_order_id=request.client_order_id,
+            legs=(_leg("order-late-stop", "stop", qty=str(request.qty)),
+                  _leg("order-late-target", "target", qty=str(request.qty))))
+        raise TimeoutError("read timed out")
+
+    def orders(self, *, client_order_id=None, **_):
+        if not self.visible or self.created is None:
+            return []
+        if client_order_id is not None:
+            if self.exact_down:
+                raise RuntimeError("502 Bad Gateway")
+            return [self.created] if client_order_id == self.created.client_order_id else []
+        # The listing is not nested: the parent comes without legs, and each
+        # leg is its own row.
+        legs = [Order(leg["id"], "SPY", Decimal(str(leg["qty"])), leg["side"],
+                      leg["status"], leg["type"], "day",
+                      filled_qty=Decimal(str(leg.get("filled_qty") or 0)),
+                      filled_avg_price=leg.get("filled_avg_price"))
+                for leg in self.created.legs]
+        return [replace(self.created, legs=()), *legs]
+
+    def fill(self):
+        filled = self.created.qty
+        self.created = replace(self.created, status="filled", filled_qty=filled,
+                               filled_avg_price=Decimal("101.5"))
+        self.visible = True
+        self.positions_live = [Position("SPY", filled, "long",
+                                        avg_entry_price=Decimal("101.5"),
+                                        market_value=filled * Decimal("101.5"))]
+
+
+def _journal_actions():
+    with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+        return [row[0] for row in db.execute("SELECT action FROM trades ORDER BY id")]
+
+
+class EntryAdoptionTests(_RuntimeCase):
+    _entry_cycle = EntryFailureTests._entry_cycle
+
+    def test_an_adopted_entry_is_rekeyed_and_journalled_once(self):
+        provider = _LateBracketProvider()
+        engine, snapshot = self._entry_cycle(provider)
+        engine.run_once(snapshot)
+        client_order_id = provider.orders_sent[0].client_order_id
+        provider.fill()
+        for _ in range(3):
+            engine.reconcile()
+        orders = state.load_state()["orders"]
+        self.assertNotIn(client_order_id, orders)
+        self.assertEqual([key for key, row in orders.items()
+                          if row.get("client_order_id") == client_order_id], ["order-late"])
+        self.assertEqual(_journal_actions(), ["open"])
+        self.assertFalse(engine._client_order_pending(client_order_id))
+
+    def test_legs_unreadable_at_adoption_are_attached_by_a_later_reconcile(self):
+        provider = _LateBracketProvider()
+        engine, snapshot = self._entry_cycle(provider)
+        engine.run_once(snapshot)
+        provider.fill()
+        provider.exact_down = True
+        engine.reconcile()
+        runtime = state.load_state()
+        self.assertTrue(runtime["orders"]["order-late"]["legs_pending"])
+        self.assertFalse(runtime["active_trades"]["SPY"].get("protective_legs"))
+        provider.exact_down = False
+        engine.reconcile()
+        runtime = state.load_state()
+        trade = runtime["active_trades"]["SPY"]
+        self.assertEqual(sorted(leg["order_id"] for leg in trade["protective_legs"]),
+                         ["order-late-stop", "order-late-target"])
+        self.assertNotIn("legs_pending", runtime["orders"]["order-late"])
+        # The bracket's own stop then closes the position (one cancels the
+        # other, so the target is cancelled) and the exit is booked.
+        stop, target = (next(leg for leg in provider.created.legs if leg["role"] == role)
+                        for role in ("stop", "target"))
+        provider.created = replace(provider.created, legs=(
+            {**stop, "status": "filled", "filled_qty": provider.created.qty,
+             "filled_avg_price": Decimal("99")},
+            {**target, "status": "canceled"}))
+        provider.positions_live = []
+        for _ in range(3):
+            engine.reconcile()
+        self.assertEqual(state.load_state()["active_trades"], {})
+        self.assertEqual(_journal_actions(), ["open", "close"])
 
 
 if __name__ == "__main__":

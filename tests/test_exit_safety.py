@@ -431,6 +431,188 @@ class RearmDurabilityTests(ProtectionHarness):
                             for leg in _leg_rows(trade)))
 
 
+class LaggingPositionsProvider(ProtectionProvider):
+    """The positions endpoint lags the order endpoint by ``lag`` reads."""
+
+    def __init__(self):
+        super().__init__()
+        self.lag = None
+        self.flat_after_lag = False
+
+    def _settle(self):
+        if self.lag is not None:
+            if self.lag > 0:
+                self.lag -= 1
+            elif self.flat_after_lag:
+                self.positions_live = []
+
+    def positions(self):
+        self._settle()
+        return list(self.positions_live)
+
+    def reconcile(self):
+        self._settle()
+        return {"positions": list(self.positions_live),
+                "orders": list(self.orders_by_id.values())}
+
+
+class ExitFillAccountingTests(ProtectionHarness):
+    """Exits are sized from the broker's order fills, never from a lagging position."""
+
+    def _stops(self):
+        return [request for request in self.provider.submitted if request.type == "stop"]
+
+    def _working_stops(self):
+        return [order.id for order in self.provider.orders_by_id.values()
+                if order.type == "stop" and order.status not in
+                {"filled", "canceled", "cancelled", "expired", "rejected", "replaced"}]
+
+    def test_a_stop_filled_in_the_cancel_race_is_never_sold_again(self):
+        provider = LaggingPositionsProvider()
+        self.provider = provider
+        self._bind_engine(runtime_name="rt-race-full-fill")
+        order = self._open_bracketed_position(quantity=Decimal("300"))
+        stop = f"{order.id}-stop"
+
+        def cancel(order_id):
+            provider.cancelled.append(str(order_id))
+            if str(order_id) == stop:
+                # The stop triggers and fills in full as its cancel arrives.
+                provider.set_order(stop, status="filled", filled_qty=300,
+                                   filled_avg_price=98.9)
+                provider.lag, provider.flat_after_lag = 50, True
+                return
+            provider.set_order(str(order_id), status="canceled")
+
+        provider.cancel_order = cancel
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.assertFalse(self.engine.flatten_all("before_close"))
+        self.assertEqual(provider.close_requests, [])
+        self.assertEqual(self._stops(), [])
+        provider.lag = 0
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.assertTrue(self.engine.flatten_all("before_close"))
+        self.assertEqual(provider.close_requests, [])
+        self.assertEqual(state.load_state()["active_trades"], {})
+
+    def test_no_close_while_a_partly_filled_leg_is_still_cancelling(self):
+        self._bind_engine(runtime_name="rt-pending-cancel")
+        provider = self.provider
+        order = self._open_bracketed_position(quantity=Decimal("300"))
+        stop = f"{order.id}-stop"
+        provider.set_order(stop, status="partially_filled", filled_qty=100,
+                           filled_avg_price=99)
+        provider.positions_live = [Position(
+            "SPY", Decimal("200"), "long", avg_entry_price=Decimal("101.5"))]
+        self.engine.reconcile()
+        overlaps = []
+
+        def cancel(order_id):
+            provider.cancelled.append(str(order_id))
+            if provider.orders_by_id[str(order_id)].status == "canceled":
+                raise RuntimeError("422 order is not cancelable")
+            if str(order_id) == stop:
+                # The venue has not confirmed the cancel of a triggered stop.
+                provider.set_order(stop, status="pending_cancel", filled_qty=100,
+                                   filled_avg_price=99)
+                return
+            provider.set_order(str(order_id), status="canceled")
+
+        def close(symbol, qty=None, **kwargs):
+            overlaps.append((str(qty), provider.orders_by_id[stop].status))
+            closed = ProtectionProvider.close_position(provider, symbol, qty, **kwargs)
+            provider.set_order(closed.id, status="filled", filled_qty=closed.qty,
+                               filled_avg_price=99.5)
+            provider.positions_live = []
+            return provider.orders_by_id[closed.id]
+
+        provider.cancel_order = cancel
+        provider.close_position = close
+        with mock.patch("agent.runtime_control.time.sleep"), \
+                mock.patch("agent.execution_lifecycle.time.sleep"):
+            self.engine.flatten_all("before_close")
+        self.assertEqual(overlaps, [])
+        # Once the venue confirms the cancel, the residual is closed.
+        provider.set_order(stop, status="canceled", filled_qty=100, filled_avg_price=99)
+        with mock.patch("agent.runtime_control.time.sleep"), \
+                mock.patch("agent.execution_lifecycle.time.sleep"):
+            self.assertTrue(self.engine.flatten_all("before_close"))
+        self.assertEqual(overlaps, [("200", "canceled")])
+
+    def test_no_stop_is_rearmed_over_a_flatten_close_that_filled(self):
+        provider = LaggingPositionsProvider()
+        self.provider = provider
+        self._bind_engine(runtime_name="rt-filled-close-no-rearm")
+        self._open_bracketed_position(quantity=Decimal("300"))
+        calls = {"reconcile": 0}
+        real_reconcile = provider.reconcile
+
+        def close(symbol, qty=None, **kwargs):
+            closed = ProtectionProvider.close_position(provider, symbol, qty, **kwargs)
+            provider.set_order(closed.id, status="filled", filled_qty=closed.qty,
+                               filled_avg_price=98.5)
+            provider.lag, provider.flat_after_lag = 2, True
+            calls["reconcile"] = 1
+            return provider.orders_by_id[closed.id]
+
+        def reconcile():
+            if calls["reconcile"] == 1:
+                calls["reconcile"] = 2
+                raise RuntimeError("502 Bad Gateway")
+            return real_reconcile()
+
+        provider.close_position = close
+        provider.reconcile = reconcile
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.assertFalse(self.engine.flatten_all("before_close"))
+        self.assertEqual(self._stops(), [])
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["status"], "closing")
+        for _ in range(3):  # until the position endpoint catches up
+            self.engine.reconcile()
+        self.assertEqual(state.load_state()["active_trades"], {})
+        self.assertEqual(self._working_stops(), [])
+        closes = [row for row in self._journal_trades() if row[1] == "close"]
+        self.assertEqual([(row[2], row[5]) for row in closes], [(300.0, "before_close")])
+
+    def test_a_partly_filled_bracket_is_rearmed_after_a_failed_rearm(self):
+        self.provider = RealCancelProvider()
+        provider = self.provider
+        self._bind_engine(runtime_name="rt-partial-rearm-retry")
+        order = self._open_bracketed_position(quantity=Decimal("300"))
+        provider.set_order(f"{order.id}-target", status="partially_filled",
+                           filled_qty=100, filled_avg_price=105)
+        provider.positions_live = [Position(
+            "SPY", Decimal("200"), "long", avg_entry_price=Decimal("101.5"),
+            current_price=Decimal("101"))]
+        self.engine.reconcile()
+        stop_errors = {"left": 1}
+        real_submit = provider.submit_order
+
+        def submit(request):
+            if request.type == "stop" and stop_errors["left"] > 0:
+                stop_errors["left"] -= 1
+                raise RuntimeError("503 Service Unavailable")
+            return real_submit(request)
+
+        def refusing_close(symbol, qty=None, **kwargs):
+            raise RuntimeError("503 Service Unavailable")
+
+        provider.submit_order = submit
+        provider.close_position = refusing_close
+        with mock.patch("agent.runtime_control.time.sleep"):
+            self.engine.flatten_all("before_close")
+            self.assertEqual(self._stops(), [])
+            self.engine.flatten_all("before_close")
+        self.assertEqual([(request.side, request.qty) for request in self._stops()],
+                         [("sell", Decimal("200"))])
+        self.engine._monitor_positions(self.NOW, list(provider.positions_live),
+                                       market_rows={})
+        # A later failed close cancels and re-arms; never two stops at once.
+        self.assertLessEqual(len(self._working_stops()), 1)
+        self.assertTrue(all(request.qty == Decimal("200") for request in self._stops()))
+
+
 class StopOrderRequestTests(unittest.TestCase):
     def test_standalone_stop_is_valid_only_as_a_simple_equity_stop(self):
         request = OrderRequest("SPY", Decimal("10"), "sell", type="stop",

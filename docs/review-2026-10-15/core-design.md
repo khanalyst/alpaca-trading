@@ -99,7 +99,8 @@ Target CI time: under five minutes.
    - feeds are never mixed.
 4. **Statistics**: session-clustered inference, sign-flip tests and BY from `research/stats.py`. LORD++ (`research/factory_ledger.py:301-382`) is correct but unnecessary when hypotheses are tested one at a time with sealed forward windows.
 5. **Container hardening**: a non-root user, a read-only filesystem, dropped capabilities, and a dashboard bound to localhost with confined report paths.
-6. **The order-lifecycle policies fixed in this change set** (two review rounds):
+6. **The order-lifecycle policies fixed in this change set** (three review rounds):
+   - every exit is sized from the exposure's entry fill less the broker's fills of its own exits, never from a position snapshot alone, because the position endpoint can lag the order endpoint;
    - exit client ids unique per exposure;
    - flatten closes bound to their entry, or to a position known only to the broker, and booked;
    - a partly filled bracket leg cancelled and the residual closed, never mistaken for a working close;
@@ -130,7 +131,7 @@ Each stage is one reviewed change, and the system stays runnable after every one
 
 | stage | change | done when |
 | --- | --- | --- |
-| 0 | Runtime safety fixes (this change set): B-01, C1-01, C1-02, C2-01, B-03, B-04, and the second-round findings F1 to F5 and EC-01 to EC-05 | the new tests pass, the runtime suite is green, and the tests fail on the old code |
+| 0 | Runtime safety fixes (this change set): B-01, C1-01, C1-02, C2-01, B-03, B-04, the second-round findings F1 to F5 and EC-01 to EC-05, and the five third-round findings | the new tests pass, the runtime suite is green, and the tests fail on the old code |
 | 1 | Stop the factory, LLM and shadow services in Compose. Keep the trader paused and the recorder running. Bind the paper-trial identity to the strategy code it runs (C1-03) | no research job runs during market hours, and a deploy no longer breaks the safety paths |
 | 2 | Build `core/` next to `agent/`, with the simulated broker and the kept exit contract. Add the parity test | identical intents and orders from backtest and paper-with-simulated-broker on recorded data |
 | 3 | Run `studies/liquid_reversion` on ten years of SIP bars on the VM. Apply its preregistered decision rule | a written decision, either deploy to paper or archive the hypothesis |

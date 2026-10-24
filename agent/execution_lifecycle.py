@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from . import state
@@ -173,18 +173,22 @@ def _leg_live(leg: Mapping) -> bool:
 
 
 def _bracket_stripped(trade: Any) -> bool:
-    """Whether an equity exposure lost its bracket without any leg filling.
+    """Whether an equity exposure has recorded legs and none of them is live.
 
-    An earlier close cancelled the legs and its stop re-arm did not happen.
-    The next failed close must restore a broker stop even though nothing
-    live remains to cancel.
+    An earlier close cancelled the legs and its stop re-arm did not happen,
+    or a leg filled in part before it was cancelled.  The next failed close
+    must try to restore a broker stop even though nothing live remains to
+    cancel.  The re-arm itself sizes the stop from the broker's exit fills
+    and refuses when those fills leave nothing to protect.
     """
     legs = _leg_rows(trade)
-    return bool(legs) and not _option_trade(trade) and all(
-        not _leg_live(leg) and
-        str(leg.get("status", "")).lower() not in _FILLED_ORDER_STATUSES and
-        not (float(leg.get("filled_qty") or 0) > 0)
-        for leg in legs)
+    return bool(legs) and not _option_trade(trade) and not any(
+        _leg_live(leg) for leg in legs)
+
+
+def _status_text(order: Any) -> str:
+    value = _value(order, "status", "")
+    return str(getattr(value, "value", value)).split(".")[-1].strip().lower()
 
 
 def _broker_protected(legs: list[dict]) -> bool:
@@ -440,40 +444,74 @@ class ExecutionLifecycleMixin:
                    str(item.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES
                    for item in orders.values())
 
+    def _exact_legs(self, client_order_id: str) -> list[dict] | None:
+        """Bracket legs from the exact client id lookup; None when it fails."""
+        try:
+            found = next((order for order in (self.provider.orders(
+                client_order_id=client_order_id) or [])
+                if str(_value(order, "client_order_id", "") or "") ==
+                client_order_id), None)
+        except Exception:  # noqa: BLE001
+            return None
+        return None if found is None else _protective_legs(getattr(found, "legs", ()))
+
     def _adopt_unresolved_entry(self, order_state: dict, key: str, saved: dict,
-                                broker_order: Any) -> Any:
+                                broker_order: Any, retired: set[str]) -> Any:
         """Bind an ambiguously submitted entry to the broker order it created.
 
         The listing that found it may not nest bracket legs, so the exact
         client order id lookup supplies them.  The row is re-keyed by the
         broker id before any fill activates a trade from it, so the trade
         carries its real legs and attribution instead of becoming unknown.
+        The old key goes into ``retired``, which the reconciliation write
+        removes from the durable map, so the row is adopted exactly once.  A
+        bracket whose legs could not be read yet is marked ``legs_pending``
+        and every later reconciliation retries the lookup.
         """
         client_order_id = str(saved.get("client_order_id") or "")
-        exact = broker_order
-        if not getattr(broker_order, "legs", None) and client_order_id:
-            try:
-                exact = next((order for order in (self.provider.orders(
-                    client_order_id=client_order_id) or [])
-                    if str(_value(order, "client_order_id", "") or "") ==
-                    client_order_id), broker_order)
-            except Exception:  # noqa: BLE001
-                exact = broker_order
-        broker_id = str(_value(exact, "id", "") or "")
+        broker_id = str(_value(broker_order, "id", "") or "")
         if not broker_id:
             return broker_order
-        legs = _protective_legs(getattr(exact, "legs", ()))
+        if key != broker_id and isinstance(order_state.get(broker_id), dict):
+            # Already adopted under the broker id; this row is a stale copy.
+            order_state.pop(key, None)
+            retired.add(key)
+            return None
+        legs = _protective_legs(getattr(broker_order, "legs", ()))
+        if not legs and client_order_id:
+            legs = self._exact_legs(client_order_id) or []
         saved["order_id"] = broker_id
         if legs:
             saved["protective_legs"] = legs
+            saved.pop("legs_pending", None)
+        elif str(saved.get("order_class") or "").lower() == "bracket":
+            saved["legs_pending"] = True
         saved.pop("submit_unresolved", None)
         if key != broker_id:
             order_state.pop(key, None)
             order_state[broker_id] = saved
+            retired.add(key)
         self._event("entry_submit_adopted", {
             "symbol": saved.get("symbol"), "client_order_id": client_order_id,
-            "order_id": broker_id, "legs": len(legs)})
-        return exact
+            "order_id": broker_id, "legs": len(legs),
+            "legs_pending": bool(saved.get("legs_pending"))})
+        return broker_order
+
+    def _recover_pending_legs(self, symbol: str, trade: dict, order_state: dict) -> list[dict]:
+        """Attach bracket legs that could not be read when the entry was adopted."""
+        entry = order_state.get(str(trade.get("order_id") or ""))
+        if not (isinstance(entry, dict) and entry.get("legs_pending") is True):
+            return []
+        legs = self._exact_legs(str(entry.get("client_order_id") or ""))
+        if not legs:
+            return []
+        entry["protective_legs"] = [dict(leg) for leg in legs]
+        entry.pop("legs_pending", None)
+        trade["protective_legs"] = [dict(leg) for leg in legs]
+        self._event("entry_legs_recovered", {"symbol": symbol,
+                                             "order_id": trade.get("order_id"),
+                                             "legs": len(legs)})
+        return _leg_rows(trade)
 
     def _record_open_order(self, request: OrderRequest, order: Any, risk_plan: Mapping,
                            *, unresolved: bool = False) -> None:
@@ -1534,9 +1572,70 @@ class ExecutionLifecycleMixin:
                 row["status"] = "open"
         return current
 
+    def _exposure_qty(self, trade: Mapping | None) -> float | None:
+        """The exposure's recorded entry fill, or None when there is none.
+
+        ``qty`` is not a fallback: reconciliation rewrites it from each
+        position snapshot, so subtracting exit fills from it would count them
+        twice.  A position known only to the broker has no entry fill, and its
+        exits are then sized from the snapshot as before.
+        """
+        if not isinstance(trade, Mapping):
+            return None
+        size = self._number(trade.get("cumulative_filled_qty")) or 0.0
+        return size if size > 0 else None
+
+    def _exposure_exit_fills(self, trade: Mapping | None, broker_orders: Any, *,
+                             orders_state: Mapping | None = None,
+                             close_client_ids: Iterable[str] = ()) -> tuple[float, list[str]]:
+        """Broker fills of every exit bound to one exposure, and the exits still working.
+
+        The order endpoint can settle before the position endpoint, so an exit
+        sized from a position snapshot alone can close or protect quantity a
+        leg or an earlier close has already taken.  The exits are the trade's
+        own legs, its recorded closing order, every durable close or flatten
+        row bound to its entry order, and any client ids passed in.
+        """
+        if not isinstance(trade, Mapping):
+            return 0.0, []
+        ids = {str(leg.get("order_id")) for leg in _leg_rows(trade)}
+        if trade.get("closing_order_id"):
+            ids.add(str(trade.get("closing_order_id")))
+        entry = str(trade.get("order_id") or "")
+        if entry and isinstance(orders_state, Mapping):
+            for key, row in orders_state.items():
+                if (isinstance(row, Mapping) and
+                        str(row.get("action", "")).lower() in {"close", "flatten"} and
+                        str(row.get("entry_order_id") or "") == entry):
+                    ids.add(str(row.get("order_id") or key))
+        ids.discard(entry)
+        clients = {str(item) for item in close_client_ids if item}
+        filled = 0.0
+        working: list[str] = []
+        seen: set[str] = set()
+        for order in broker_orders or ():
+            order_id = str(_value(order, "id", "") or "")
+            if not order_id or order_id in seen:
+                continue
+            if (order_id not in ids and
+                    str(_value(order, "client_order_id", "") or "") not in clients):
+                continue
+            seen.add(order_id)
+            filled += self._number(_value(order, "filled_qty", 0)) or 0.0
+            if _status_text(order) not in _PROTECTIVE_TERMINAL_STATUSES:
+                working.append(order_id)
+        return filled, working
+
+    def _all_orders(self) -> list[Any]:
+        """Every recent broker order, terminal ones included, for fill evidence."""
+        try:
+            return list(self.provider.orders(status="all") or [])
+        except TypeError:
+            return list(self.provider.orders() or [])
+
     def _rearm_protective_stop(self, symbol: str, trade: Mapping | None,
                                position: Any, *, reason: str,
-                               close_client_id: str | None = None) -> dict | None:
+                               close_client_ids: Iterable[str] = ()) -> dict | None:
         """Restore a broker stop after a close failed with its legs cancelled.
 
         A resting leg reserves the position quantity, so every close cancels
@@ -1547,10 +1646,11 @@ class ExecutionLifecycleMixin:
         when a fresh broker snapshot proves the same position remains and no
         order is working for the symbol, so it can never become a reversal.
         A close whose submit failed may still have reached the broker, so
-        ``close_client_id`` is looked up first and any trace of it that is
-        working or filled blocks the stop; orders are read before positions,
-        so a close that fills between the two reads shows as a changed
-        position rather than as no working order.
+        each of ``close_client_ids`` is looked up first and any trace of it
+        that is working or filled blocks the stop.  Orders are read before
+        positions, and the stop is sized from the exposure's entry fill less
+        every exit fill the broker reports, so a position snapshot that lags a
+        fill can neither size the stop nor place one on a flat book.
         Returns the recorded leg, or None when nothing was placed.  A caller
         holding its own copy of the book must apply the leg to that copy with
         ``_attach_rearmed_stop`` before writing it back.
@@ -1575,27 +1675,26 @@ class ExecutionLifecycleMixin:
                 "symbol": symbol, "reason": reason,
                 "error": "no stop price or quantity to protect"})
             return None
-        def status_of(item: Any) -> str:
-            value = _value(item, "status", "")
-            return str(getattr(value, "value", value)).split(".")[-1].lower()
-
+        if isinstance(close_client_ids, str):
+            close_client_ids = (close_client_ids,)
+        close_client_ids = tuple(item for item in close_client_ids if item)
         try:
-            if close_client_id:
+            for client_id in close_client_ids:
                 traces = [item for item in (self.provider.orders(
-                    client_order_id=close_client_id) or [])
-                    if str(_value(item, "client_order_id", "") or "") ==
-                    close_client_id and
-                    (status_of(item) not in _PROTECTIVE_TERMINAL_STATUSES or
+                    client_order_id=client_id) or [])
+                    if str(_value(item, "client_order_id", "") or "") == client_id and
+                    (_status_text(item) not in _PROTECTIVE_TERMINAL_STATUSES or
                      (self._number(_value(item, "filled_qty", 0)) or 0.0) > 0)]
                 if traces:
                     self._event("protection_rearm_skipped", {
                         "symbol": symbol, "reason": reason,
-                        "close_client_order_id": close_client_id,
-                        "close_status": status_of(traces[0])})
+                        "close_client_order_id": client_id,
+                        "close_status": _status_text(traces[0])})
                     return None
-            working = [item for item in (self.provider.orders() or [])
+            every = self._all_orders()
+            working = [item for item in every
                        if str(_value(item, "symbol", "")).upper() == symbol and
-                       status_of(item) not in _PROTECTIVE_TERMINAL_STATUSES]
+                       _status_text(item) not in _PROTECTIVE_TERMINAL_STATUSES]
             fresh = [item for item in (self.provider.positions() or [])
                      if str(_value(item, "symbol", "")).upper() == symbol]
         except Exception as exc:  # noqa: BLE001
@@ -1603,9 +1702,21 @@ class ExecutionLifecycleMixin:
                 "symbol": symbol, "reason": reason,
                 "error": f"broker snapshot unavailable: {exc}"})
             return None
+        size = self._exposure_qty(trade)
+        if size is not None:
+            runtime = state.load_state()
+            exits_filled, _working_exits = self._exposure_exit_fills(
+                trade, every, orders_state=runtime.get("orders", {})
+                if isinstance(runtime, Mapping) else {},
+                close_client_ids=close_client_ids)
+            remaining = size - exits_filled
+            # The exposure's own exits are the truth for what is left; a
+            # position snapshot that disagrees has not caught up yet.
+            expected_qty = (Decimal(str(round(remaining, 12)))
+                            if remaining > 1e-9 else Decimal("0"))
         held = (abs(Decimal(str(_value(fresh[0], "qty", 0) or 0)))
                 if len(fresh) == 1 else Decimal("0"))
-        if held != expected_qty or working:
+        if expected_qty <= 0 or held != expected_qty or working:
             self._event("protection_rearm_skipped", {
                 "symbol": symbol, "reason": reason,
                 "held_qty": str(held), "expected_qty": str(expected_qty),
@@ -2099,7 +2210,8 @@ class ExecutionLifecycleMixin:
                         # through: restore a broker stop until the retry.
                         rearmed = self._rearm_protective_stop(
                             symbol, trade if isinstance(trade, Mapping) else None,
-                            position, reason=reason, close_client_id=close_client_id)
+                            position, reason=reason,
+                            close_client_ids=(close_client_id,) if close_client_id else ())
                         if rearmed:
                             # This pass ends by writing its own copy of the
                             # book; carry the live stop into that copy so the
@@ -2306,6 +2418,9 @@ class ExecutionLifecycleMixin:
         previous = deepcopy(previous) if isinstance(previous, Mapping) else {}
         order_state = current.get("orders", {})
         order_state = order_state if isinstance(order_state, dict) else {}
+        # Keys re-keyed away during this reconciliation; the final write must
+        # not merge them back from the durable map.
+        retired_keys: set[str] = set()
         by_id = {str(getattr(order, "id", "")): order for order in broker_orders
                  if getattr(order, "id", None)}
         by_client = {str(getattr(order, "client_order_id", "")): order
@@ -2321,6 +2436,8 @@ class ExecutionLifecycleMixin:
                     str(trade.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS):
                 self._recover_stop_replacement(symbol, trade, by_id)
             legs = _leg_rows(trade)
+            if not legs and isinstance(trade, dict):
+                legs = self._recover_pending_legs(symbol, trade, order_state)
             if not legs:
                 continue
             for leg in legs:
@@ -2367,7 +2484,9 @@ class ExecutionLifecycleMixin:
                 by_client.get(str(saved.get("client_order_id") or ""))
             if broker_order is not None and saved.get("submit_unresolved") is True:
                 broker_order = self._adopt_unresolved_entry(
-                    order_state, str(key), saved, broker_order)
+                    order_state, str(key), saved, broker_order, retired_keys)
+                if broker_order is None:
+                    continue
             if broker_order is None:
                 if str(saved.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES:
                     misses = int(saved.get("not_found_count", 0) or 0) + 1
@@ -3021,7 +3140,9 @@ class ExecutionLifecycleMixin:
         current = state.update_state(lambda latest: {
             **latest,
             "active_trades": active,
-            "orders": {**latest.get("orders", {}), **order_state},
+            "orders": {key: row for key, row in
+                       {**latest.get("orders", {}), **order_state}.items()
+                       if key not in retired_keys or key in order_state},
             "protection": protection,
             "last_reconciliation_ts": reconciled_at,
             "edge_outbox": self._queued_edge_outbox(latest),
