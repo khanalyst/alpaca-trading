@@ -13,6 +13,7 @@ for p in sorted(glob.glob("results/replay/*.json")):
     row = {"vid": a["vid"], "cohort": a["cohort"], "family": a["family"], "role": a["role"],
            "first": {k: stats(ft, k) for k in ("gross", "real", "model")},
            "first_unseen": stats([t for t in ft if t["win"] == "unseen"], "real"),
+           "first_fresh": stats([t for t in ft if t["win"] == "fresh"], "real"),
            "first_examined": stats([t for t in ft if t["win"] == "examined"], "real"),
            "first_delayed_real": stats(fd, "real"),
            "exit_mix_first": {k: round(v / max(1, len(ft)), 3) for k, v in collections.Counter(t["reason"] for t in ft).items()},

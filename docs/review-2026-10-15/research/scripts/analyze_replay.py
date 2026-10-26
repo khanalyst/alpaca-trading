@@ -13,7 +13,12 @@ BARS = {s: collections.defaultdict(dict) for s in RAW}
 for s, rows in RAW.items():
     for r in rows: BARS[s][r["session"]][r["minute"]] = r
 SESS = sorted({r["session"] for rows in RAW.values() for r in rows})
+# Optional later out-of-sample window (for example 2026-10-14 for the 26 October
+# refresh). Unset, the windows are exactly those of the 15 October review.
+FRESH_FROM = os.environ.get("REVIEW_FRESH_FROM")
 def window(d):
+    if FRESH_FROM and d >= FRESH_FROM:
+        return "fresh"
     return "examined" if d <= "2026-09-21" else ("audit_fwd" if d <= "2026-09-23" else "unseen")
 
 def cluster_t(values, groups):
