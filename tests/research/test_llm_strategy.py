@@ -153,8 +153,10 @@ class LLMRuleStrategyTests(unittest.TestCase):
             branch["properties"]["schema"]["enum"][0]
             for branch in option["properties"]["rule_spec"]["anyOf"]
         }
-        # Equity keeps the full audited grammar, which grew v6 and v7.
-        self.assertEqual(equity_schemas, set(RULE_SCHEMAS))
+        # Only executable grammars are offered: v6 and v7 are diagnostic.
+        self.assertEqual(equity_schemas, {"rule-strategy.v1", "rule-strategy.v2",
+                                          RULE_SCHEMA_V3, RULE_SCHEMA_V4, "rule-strategy.v5"})
+        self.assertTrue(set(RULE_SCHEMAS) - equity_schemas)
         self.assertEqual(option_schemas, {"rule-strategy.v1", "rule-strategy.v2"})
 
     def test_evidence_hashes_the_vehicle_specific_rule_grammar(self):

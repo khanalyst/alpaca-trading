@@ -23,7 +23,8 @@ from urllib.parse import urlparse
 from agent.contracts.rule import (DEFAULT_RULE_SPEC, RULE_SCHEMA_V1,
                                   RULE_SCHEMA_V2, RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5,
                                   rule_spec_hash, rule_variant_id,
-                                  rule_spec_json_schema, validate_rule_spec)
+                                  rule_spec_json_schema, rule_vehicle_executable,
+                                  validate_rule_spec)
 
 
 PROPOSAL_SCHEMA = "llm-rule-proposal.v1"
@@ -649,12 +650,20 @@ def _stressed_ladder_value(field: str, value: Any) -> bool:
 
 
 def _validate_vehicle_rule_spec(spec: Mapping[str, Any], vehicle: str) -> None:
-    """Apply the vehicle executable-schema gate after grammar validation."""
+    """Apply the vehicle executable-schema gate after grammar validation.
+
+    A proposal the runtime can never execute (for example the diagnostic
+    v6 and v7 grammars) would spend provider calls and replay budget on a
+    candidate that cannot be promoted, so it is refused here.
+    """
 
     if (vehicle == "option" and
             spec.get("schema") in {RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5}):
         raise ValueError(
             f"{spec.get('schema')} is not executable for options")
+    if not rule_vehicle_executable(spec, vehicle or "equity"):
+        raise ValueError(
+            f"{spec.get('schema')} is not executable for {vehicle or 'equity'}")
 
 
 def _tuning_reason_check(reason: str, root: Mapping[str, Any],
@@ -1289,20 +1298,26 @@ class RuleProposalAdapter:
     def _grammar_schema(vehicle: str | None = None) -> dict[str, Any]:
         """Return the provider-facing rule grammar for one vehicle.
 
-        The full audited grammar remains the default for backwards
-        compatibility. Options are intentionally narrowed to v1/v2 because
-        v3's exit amendment is not executable in the option lane. Internal
+        Only grammars the runtime can execute are offered. Options are
+        narrowed to v1/v2 because v3's exit amendment is not executable in the
+        option lane. Equity is narrowed to v1 to v5: v6 and v7 are diagnostic
+        grammars that ``rule_vehicle_executable`` refuses, so a proposal in
+        them could never be promoted. A call without a vehicle keeps the full
+        audited grammar for backwards compatibility. Internal
         ``validate_rule_spec`` remains authoritative for bounds and ordering.
         """
 
-        if vehicle == "option":
+        if vehicle in {"option", "equity"}:
             # ``rule_spec_json_schema`` is family-stratified per schema. Keep
-            # the option union flat so the provider adapter's ``anyOf`` has
-            # direct object branches (and can inspect schema/family fields)
-            # rather than nested oneOf wrappers.
+            # the union flat so the provider adapter's ``anyOf`` has direct
+            # object branches (and can inspect schema/family fields) rather
+            # than nested oneOf wrappers.
+            schemas = ((RULE_SCHEMA_V1, RULE_SCHEMA_V2) if vehicle == "option" else
+                       (RULE_SCHEMA_V1, RULE_SCHEMA_V2, RULE_SCHEMA_V3,
+                        RULE_SCHEMA_V4, RULE_SCHEMA_V5))
             return {"oneOf": [
                 branch
-                for schema_name in (RULE_SCHEMA_V1, RULE_SCHEMA_V2)
+                for schema_name in schemas
                 for branch in rule_spec_json_schema(schema_name)["oneOf"]
             ]}
         return rule_spec_json_schema()
