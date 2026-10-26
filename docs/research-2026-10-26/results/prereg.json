@@ -1,0 +1,209 @@
+{
+ "vwap-reversion-control-adjusted.v1": {
+  "schema": "preregistered-evaluation.v1",
+  "hypothesis_id": "vwap-reversion-control-adjusted.v1",
+  "manifest_hash": "d2e56d80bdb0e367bcceebbe4792bf4a00aee815eb442e62f043ee2e40b7c48e",
+  "authorizing": false,
+  "trading_authorized": false,
+  "decision_eligible": false,
+  "eligibility_reasons": [
+   "public consolidated-tape bars, not Alpaca IEX forward_observed"
+  ],
+  "sealed_boundary": "2026-09-21",
+  "sealed_sessions": [
+   "2026-09-22",
+   "2026-09-23",
+   "2026-09-24",
+   "2026-09-25",
+   "2026-09-28",
+   "2026-09-29",
+   "2026-09-30",
+   "2026-10-01",
+   "2026-10-02",
+   "2026-10-05",
+   "2026-10-06",
+   "2026-10-07",
+   "2026-10-08",
+   "2026-10-09",
+   "2026-10-12",
+   "2026-10-13",
+   "2026-10-14",
+   "2026-10-15",
+   "2026-10-16",
+   "2026-10-19",
+   "2026-10-20",
+   "2026-10-21",
+   "2026-10-22",
+   "2026-10-23"
+  ],
+  "excluded_examined_bars": 56091,
+  "interim": {
+   "sessions": 24,
+   "decision": "none_before_first_look",
+   "primary_60m": {
+    "candidate_count": 511,
+    "matched_count": 511,
+    "session_clusters": 24,
+    "delta_bps": 1.9387812065407644,
+    "cluster_stderr_bps": 3.5258455446377726,
+    "cluster_t_stat": 0.54987695348406,
+    "cluster_df": 23,
+    "sign_flip_p_value": 0.29127087291270876,
+    "event_t_stat": 1.0059287745007153,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 511
+    }
+   },
+   "subject_120m": {
+    "candidate_count": 498,
+    "matched_count": 498,
+    "session_clusters": 24,
+    "delta_bps": 6.9654676118901735,
+    "cluster_stderr_bps": 4.427959793565574,
+    "cluster_t_stat": 1.5730647830208266,
+    "cluster_df": 23,
+    "sign_flip_p_value": 0.06369363063693631,
+    "event_t_stat": 2.9081389471150123,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 497,
+     "same_session_minute_band": 1
+    }
+   },
+   "mirror_60m": {
+    "candidate_count": 419,
+    "matched_count": 419,
+    "session_clusters": 24,
+    "delta_bps": -1.5653357896188136,
+    "cluster_stderr_bps": 2.840118811051029,
+    "cluster_t_stat": -0.5511515164534745,
+    "cluster_df": 23,
+    "sign_flip_p_value": 0.6981301869813019,
+    "event_t_stat": -0.6976625973380305,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 419
+    }
+   }
+  },
+  "looks": [
+   {
+    "look": 1,
+    "sessions_required": 30,
+    "status": "not_reached"
+   },
+   {
+    "look": 2,
+    "sessions_required": 60,
+    "status": "not_reached"
+   }
+  ],
+  "decision": "diagnostic_only",
+  "rule_outcome_if_eligible": "accruing",
+  "provenance": {
+   "source": "public chart endpoint",
+   "feed": "delayed_sip",
+   "fetched": "2026-10-14"
+  }
+ },
+ "opening-range-fade-control-adjusted.v1": {
+  "schema": "preregistered-evaluation.v1",
+  "hypothesis_id": "opening-range-fade-control-adjusted.v1",
+  "manifest_hash": "a0ae21f5ffd765142f2f4b92c47e33f652e0fb3213f1fd8d5a6d82c3915c2b9e",
+  "authorizing": false,
+  "trading_authorized": false,
+  "decision_eligible": false,
+  "eligibility_reasons": [
+   "public consolidated-tape bars, not Alpaca IEX forward_observed"
+  ],
+  "sealed_boundary": "2026-09-23",
+  "sealed_sessions": [
+   "2026-09-24",
+   "2026-09-25",
+   "2026-09-28",
+   "2026-09-29",
+   "2026-09-30",
+   "2026-10-01",
+   "2026-10-02",
+   "2026-10-05",
+   "2026-10-06",
+   "2026-10-07",
+   "2026-10-08",
+   "2026-10-09",
+   "2026-10-12",
+   "2026-10-13",
+   "2026-10-14",
+   "2026-10-15",
+   "2026-10-16",
+   "2026-10-19",
+   "2026-10-20",
+   "2026-10-21",
+   "2026-10-22",
+   "2026-10-23"
+  ],
+  "excluded_examined_bars": 74777,
+  "interim": {
+   "sessions": 22,
+   "decision": "none_before_first_look",
+   "primary_60m": {
+    "candidate_count": 124,
+    "matched_count": 124,
+    "session_clusters": 21,
+    "delta_bps": 2.738334383910956,
+    "cluster_stderr_bps": 6.056577858480948,
+    "cluster_t_stat": 0.45212568019356036,
+    "cluster_df": 20,
+    "sign_flip_p_value": 0.33906609339066096,
+    "event_t_stat": 0.6767285097687077,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 124
+    }
+   },
+   "subject_120m": {
+    "candidate_count": 116,
+    "matched_count": 116,
+    "session_clusters": 21,
+    "delta_bps": 2.323760047331398,
+    "cluster_stderr_bps": 8.282313832991893,
+    "cluster_t_stat": 0.28056894416085737,
+    "cluster_df": 20,
+    "sign_flip_p_value": 0.39676032396760325,
+    "event_t_stat": 0.44877858621316113,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 116
+    }
+   },
+   "mirror_60m": {
+    "candidate_count": 481,
+    "matched_count": 481,
+    "session_clusters": 22,
+    "delta_bps": -1.0648904977798228,
+    "cluster_stderr_bps": 3.2502626146267097,
+    "cluster_t_stat": -0.32763214055001066,
+    "cluster_df": 21,
+    "sign_flip_p_value": 0.6032396760323968,
+    "event_t_stat": -0.5887918318638533,
+    "control_matching_counts": {
+     "cross_session_same_session_minute": 481
+    }
+   }
+  },
+  "looks": [
+   {
+    "look": 1,
+    "sessions_required": 30,
+    "status": "not_reached"
+   },
+   {
+    "look": 2,
+    "sessions_required": 60,
+    "status": "not_reached"
+   }
+  ],
+  "decision": "diagnostic_only",
+  "rule_outcome_if_eligible": "accruing",
+  "provenance": {
+   "source": "public chart endpoint",
+   "feed": "delayed_sip",
+   "fetched": "2026-10-14"
+  }
+ }
+}

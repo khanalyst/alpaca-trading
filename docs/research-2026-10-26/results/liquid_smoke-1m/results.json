@@ -1,0 +1,850 @@
+{
+ "schema": "liquid-reversion-study.v1",
+ "mode": "smoke",
+ "out_of_sample": false,
+ "banner": "SMOKE RUN: NOT EVIDENCE. There are fewer sessions than one training block plus one test block, so no parameters were selected and nothing here was tested out of sample. It checks that the pipeline runs end to end on real bars; the numbers are far too few to support or reject the hypothesis.",
+ "hypothesis": "On the five most liquid US equity ETFs (SPY, QQQ, IWM, DIA, VTI), on days classified as range days from the first 30 minutes alone, a fade of a volatility-scaled deviation from the session VWAP, entered after 10:00 and targeting the VWAP, earns positive expectancy net of realistic per-symbol costs.",
+ "data": {
+  "format": "public",
+  "path_name": "bars_1m.json",
+  "interval_seconds": 60,
+  "files": 1,
+  "sha256": "8ed9d157fe78158a2f1718c0efa93c92782a447ac472a7155a87b0e1751bb72b",
+  "source": "public consolidated-tape chart bars as used by the 2026-10-15 review (diagnostic only, not Alpaca SIP)",
+  "symbols": [
+   "SPY",
+   "QQQ",
+   "IWM",
+   "DIA",
+   "VTI"
+  ],
+  "sessions": 30,
+  "first_session": "2026-09-14",
+  "last_session": "2026-10-23",
+  "early_closes": 0,
+  "coverage": {
+   "SPY": {
+    "sessions": 30,
+    "bars": 11698,
+    "bars_per_session": {
+     "min": 389,
+     "median": 390.0,
+     "max": 390
+    },
+    "expected_bars_per_full_session": 390,
+    "short_sessions": 2,
+    "zero_volume_bars": 5,
+    "first_session": "2026-09-14",
+    "last_session": "2026-10-23",
+    "median_close": 768.4
+   },
+   "QQQ": {
+    "sessions": 30,
+    "bars": 11697,
+    "bars_per_session": {
+     "min": 389,
+     "median": 390.0,
+     "max": 390
+    },
+    "expected_bars_per_full_session": 390,
+    "short_sessions": 3,
+    "zero_volume_bars": 9,
+    "first_session": "2026-09-14",
+    "last_session": "2026-10-23",
+    "median_close": 738.83
+   },
+   "IWM": {
+    "sessions": 30,
+    "bars": 11698,
+    "bars_per_session": {
+     "min": 389,
+     "median": 390.0,
+     "max": 390
+    },
+    "expected_bars_per_full_session": 390,
+    "short_sessions": 2,
+    "zero_volume_bars": 12,
+    "first_session": "2026-09-14",
+    "last_session": "2026-10-23",
+    "median_close": 279.05
+   },
+   "DIA": {
+    "sessions": 30,
+    "bars": 11696,
+    "bars_per_session": {
+     "min": 389,
+     "median": 390.0,
+     "max": 390
+    },
+    "expected_bars_per_full_session": 390,
+    "short_sessions": 4,
+    "zero_volume_bars": 2,
+    "first_session": "2026-09-14",
+    "last_session": "2026-10-23",
+    "median_close": 516.095
+   },
+   "VTI": {
+    "sessions": 30,
+    "bars": 11698,
+    "bars_per_session": {
+     "min": 389,
+     "median": 390.0,
+     "max": 390
+    },
+    "expected_bars_per_full_session": 390,
+    "short_sessions": 2,
+    "zero_volume_bars": 2,
+    "first_session": "2026-09-14",
+    "last_session": "2026-10-23",
+    "median_close": 377.5525
+   }
+  }
+ },
+ "rules": {
+  "text": [
+   "Session VWAP: cumulative typical price x volume over volume from 09:30, completed bars only.",
+   "Volatility: 1.4826 x median absolute bar log return over the current session's completed bars and the prior 5 sessions, in bps per minute (five-minute returns divided by the square root of 5).",
+   "Score: z = (close - VWAP) / VWAP x 1e4 / (sigma x sqrt(60)).",
+   "Day type at 10:00: drive and gap, each over its median for the previous 20 sessions (at least 10 needed); range day if both ratios are below k_drive and k_gap.",
+   "Signal on a completed bar ending in [10:00, 15:00): range day, |z| >= k_entry, and the move to VWAP at least cost_multiple x round-trip cost. Short above VWAP, long below.",
+   "One trade per symbol-session: the first qualifying signal consumes it, even if the entry is refused.",
+   "Entry at the next bar's open, only if that bar starts before 15:00 and the open has not already crossed the frozen target.",
+   "Target: VWAP frozen at the signal. Stop: entry +/- stop_mult x |entry - target|.",
+   "Exit on bar highs and lows from the entry bar: stop first on a tie, a gap beyond a level fills at the open; time stop at the close of the bar ending 60 minutes after entry; flat at the bar ending 15:50."
+  ],
+  "horizon_minutes": 60,
+  "entry_window": [
+   "10:00",
+   "15:00"
+  ],
+  "flat_time": "15:50",
+  "sigma_sessions": 5,
+  "day_type_lookback": 20,
+  "day_type_min_history": 10
+ },
+ "cost_model": {
+  "text": "Round trip in bps of entry notional ($25,000 per trade, Alpaca charges no commission): one full quoted spread, max(one tick, measured spread; measured: none supplied, so one tick is used); slippage 0.5 bps per side; SEC Section 31 fee on the sell leg only ($20.60 per million); FINRA TAF $0.000195 per share sold, capped at $9.79 per trade. Cost stress multiplies the whole round trip.",
+  "notional": 25000.0,
+  "slippage_bps_per_side": 0.5,
+  "measured_spreads_bps": {},
+  "per_symbol_at_median_close": {
+   "SPY": {
+    "price": 768.4,
+    "spread_bps": 0.1301,
+    "slippage_bps": 1.0,
+    "sec_fee_bps": 0.206,
+    "taf_bps": 0.0025,
+    "round_trip_bps": 1.3387
+   },
+   "QQQ": {
+    "price": 738.83,
+    "spread_bps": 0.1353,
+    "slippage_bps": 1.0,
+    "sec_fee_bps": 0.206,
+    "taf_bps": 0.0026,
+    "round_trip_bps": 1.344
+   },
+   "IWM": {
+    "price": 279.05,
+    "spread_bps": 0.3584,
+    "slippage_bps": 1.0,
+    "sec_fee_bps": 0.206,
+    "taf_bps": 0.007,
+    "round_trip_bps": 1.5713
+   },
+   "DIA": {
+    "price": 516.1,
+    "spread_bps": 0.1938,
+    "slippage_bps": 1.0,
+    "sec_fee_bps": 0.206,
+    "taf_bps": 0.0038,
+    "round_trip_bps": 1.4035
+   },
+   "VTI": {
+    "price": 377.55,
+    "spread_bps": 0.2649,
+    "slippage_bps": 1.0,
+    "sec_fee_bps": 0.206,
+    "taf_bps": 0.0052,
+    "round_trip_bps": 1.476
+   }
+  }
+ },
+ "grid": {
+  "size": 108,
+  "values": {
+   "k_drive": [
+    0.6,
+    0.8,
+    1.0
+   ],
+   "k_gap": [
+    1.0,
+    1.5,
+    "inf"
+   ],
+   "k_entry": [
+    1.0,
+    1.5,
+    2.0
+   ],
+   "cost_multiple": [
+    1.5,
+    2.0
+   ],
+   "stop_mult": [
+    1.0,
+    1.5
+   ]
+  }
+ },
+ "selection": {
+  "kind": "none (smoke run)",
+  "params": {
+   "k_drive": 0.8,
+   "k_gap": 1.5,
+   "k_entry": 1.5,
+   "cost_multiple": 1.5,
+   "stop_mult": 1.5
+  },
+  "combinations_tried": 1,
+  "sessions": 30,
+  "sessions_with_known_day_type": 19,
+  "sessions_needed_for_walk_forward": 630
+ },
+ "evaluation": {
+  "trades": 23,
+  "sessions_available": 19,
+  "sessions_traded": 12,
+  "trades_per_traded_session": 1.917,
+  "net_bps_per_trade": {
+   "mean": -10.258,
+   "median": -2.758
+  },
+  "gross_bps_per_trade_mean": -8.834,
+  "cost_bps_per_trade_mean": 1.424,
+  "session_level": {
+   "mean": -19.661,
+   "sd": 41.87,
+   "count": 12
+  },
+  "clustered_t": -1.712,
+  "sign_flip_p_one_sided": 0.9302,
+  "permutation": {
+   "draws": 10000,
+   "seed": 20261019,
+   "unit": "session",
+   "alternative": "mean above zero"
+  },
+  "win_rate": 0.391,
+  "exit_mix": {
+   "stop": 4,
+   "stop_gap": 1,
+   "target": 1,
+   "time": 17
+  },
+  "refused_entries": {},
+  "sides": {
+   "long": 9,
+   "short": 14
+  },
+  "by_symbol": {
+   "DIA": {
+    "trades": 5,
+    "sessions": 5,
+    "net_bps_mean": -5.558,
+    "gross_bps_mean": -4.154,
+    "win_rate": 0.6,
+    "clustered_t": -0.547
+   },
+   "IWM": {
+    "trades": 4,
+    "sessions": 4,
+    "net_bps_mean": -13.889,
+    "gross_bps_mean": -12.314,
+    "win_rate": 0.25,
+    "clustered_t": -1.168
+   },
+   "QQQ": {
+    "trades": 4,
+    "sessions": 4,
+    "net_bps_mean": -28.686,
+    "gross_bps_mean": -27.341,
+    "win_rate": 0.25,
+    "clustered_t": -1.658
+   },
+   "SPY": {
+    "trades": 5,
+    "sessions": 5,
+    "net_bps_mean": -8.141,
+    "gross_bps_mean": -6.804,
+    "win_rate": 0.2,
+    "clustered_t": -1.192
+   },
+   "VTI": {
+    "trades": 5,
+    "sessions": 5,
+    "net_bps_mean": 0.573,
+    "gross_bps_mean": 2.047,
+    "win_rate": 0.6,
+    "clustered_t": 0.122
+   }
+  },
+  "by_year": {
+   "2026": {
+    "trades": 23,
+    "sessions": 12,
+    "net_bps_mean": -10.258,
+    "gross_bps_mean": -8.834,
+    "win_rate": 0.391,
+    "clustered_t": -1.712
+   }
+  },
+  "cost_stress": {
+   "1x": {
+    "net_bps_per_trade_mean": -10.258,
+    "session_mean": -19.661,
+    "clustered_t": -1.712,
+    "sign_flip_p_one_sided": 0.9302
+   },
+   "2x": {
+    "net_bps_per_trade_mean": -11.682,
+    "session_mean": -22.39,
+    "clustered_t": -1.949,
+    "sign_flip_p_one_sided": 0.9462
+   }
+  },
+  "power": {
+   "sd_bps": 41.87,
+   "trades_per_session": 1.917,
+   "traded_share": 0.632,
+   "sessions_available": 19,
+   "mde_per_trade_bps": 15.68,
+   "observed_effect_bps_per_trade": -10.258,
+   "traded_sessions_needed": null,
+   "note": "the observed effect is not positive, so no sample size detects it"
+  },
+  "decision": {
+   "checks": {
+    "session_mean_above_zero": false,
+    "sign_flip_p_below_0_05": false,
+    "session_mean_at_2x_cost_above_zero": false
+   },
+   "deploy_to_paper": false,
+   "inputs": {
+    "session_mean": -19.66098569399915,
+    "sign_flip_p_one_sided": 0.9302069793020697,
+    "session_mean_at_2x_cost": -22.390421003598277
+   },
+   "design": {
+    "mode": "smoke",
+    "format": "public",
+    "timeframe": null,
+    "symbols": [
+     "SPY",
+     "QQQ",
+     "IWM",
+     "DIA",
+     "VTI"
+    ],
+    "train": 504,
+    "test": 126,
+    "min_trades": 60,
+    "permutations": 10000,
+    "seed": 20261019,
+    "partial_files": null,
+    "calendar_covers_data": false
+   },
+   "design_deviations": [
+    "mode",
+    "format",
+    "timeframe",
+    "partial_files",
+    "calendar_covers_data"
+   ],
+   "applicable": false
+  }
+ },
+ "power_table": {
+  "alpha": 0.05,
+  "power": 0.8,
+  "one_sided": true,
+  "sd_bps": 41.8701,
+  "trades_per_session": 1.9167,
+  "traded_share": 0.6316,
+  "cost_bps_per_trade": 1.4241,
+  "rows": [
+   {
+    "effect_bps_per_trade": 0.5,
+    "traded_sessions": 11802,
+    "calendar_sessions": 18687,
+    "rule_traded_sessions": null,
+    "rule_calendar_sessions": null
+   },
+   {
+    "effect_bps_per_trade": 1.0,
+    "traded_sessions": 2951,
+    "calendar_sessions": 4673,
+    "rule_traded_sessions": null,
+    "rule_calendar_sessions": null
+   },
+   {
+    "effect_bps_per_trade": 2.0,
+    "traded_sessions": 738,
+    "calendar_sessions": 1169,
+    "rule_traded_sessions": 1020,
+    "rule_calendar_sessions": 1615
+   },
+   {
+    "effect_bps_per_trade": 3.0,
+    "traded_sessions": 328,
+    "calendar_sessions": 520,
+    "rule_traded_sessions": 328,
+    "rule_calendar_sessions": 520
+   }
+  ],
+  "mde": {
+   "calendar_sessions": 2500,
+   "traded_sessions": 1578,
+   "session_bps": 2.6208,
+   "per_trade_bps": 1.3674,
+   "rule_per_trade_bps": 1.8869
+  }
+ },
+ "deflated_sharpe": {
+  "note": "not computed: no selection took place in a smoke run"
+ },
+ "decision": {
+  "checks": {
+   "session_mean_above_zero": false,
+   "sign_flip_p_below_0_05": false,
+   "session_mean_at_2x_cost_above_zero": false
+  },
+  "deploy_to_paper": false,
+  "inputs": {
+   "session_mean": -19.66098569399915,
+   "sign_flip_p_one_sided": 0.9302069793020697,
+   "session_mean_at_2x_cost": -22.390421003598277
+  },
+  "design": {
+   "mode": "smoke",
+   "format": "public",
+   "timeframe": null,
+   "symbols": [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA",
+    "VTI"
+   ],
+   "train": 504,
+   "test": 126,
+   "min_trades": 60,
+   "permutations": 10000,
+   "seed": 20261019,
+   "partial_files": null,
+   "calendar_covers_data": false
+  },
+  "design_deviations": [
+   "mode",
+   "format",
+   "timeframe",
+   "partial_files",
+   "calendar_covers_data"
+  ],
+  "applicable": false
+ },
+ "trades": [
+  {
+   "symbol": "DIA",
+   "session": "2026-09-29",
+   "side": "long",
+   "signal_ts": "2026-09-29T15:01:00+00:00",
+   "entry_ts": "2026-09-29T15:01:00+00:00",
+   "entry": 511.76,
+   "exit_ts": "2026-09-29T16:01:00+00:00",
+   "exit": 510.77,
+   "reason": "time",
+   "gross_bps": -19.345,
+   "cost_bps": 1.405,
+   "net_bps": -20.751,
+   "target": 513.004,
+   "stop": 509.894,
+   "z": -1.591
+  },
+  {
+   "symbol": "IWM",
+   "session": "2026-09-29",
+   "side": "long",
+   "signal_ts": "2026-09-29T14:08:00+00:00",
+   "entry_ts": "2026-09-29T14:08:00+00:00",
+   "entry": 279.22,
+   "exit_ts": "2026-09-29T15:08:00+00:00",
+   "exit": 278.445,
+   "reason": "time",
+   "gross_bps": -27.756,
+   "cost_bps": 1.571,
+   "net_bps": -29.327,
+   "target": 280.234,
+   "stop": 277.699,
+   "z": -1.628
+  },
+  {
+   "symbol": "QQQ",
+   "session": "2026-10-01",
+   "side": "long",
+   "signal_ts": "2026-10-01T14:02:00+00:00",
+   "entry_ts": "2026-10-01T14:02:00+00:00",
+   "entry": 738.76,
+   "exit_ts": "2026-10-01T15:02:00+00:00",
+   "exit": 737.87,
+   "reason": "time",
+   "gross_bps": -12.047,
+   "cost_bps": 1.344,
+   "net_bps": -13.391,
+   "target": 741.7817,
+   "stop": 734.2275,
+   "z": -1.762
+  },
+  {
+   "symbol": "SPY",
+   "session": "2026-10-05",
+   "side": "short",
+   "signal_ts": "2026-10-05T17:45:00+00:00",
+   "entry_ts": "2026-10-05T17:45:00+00:00",
+   "entry": 774.87,
+   "exit_ts": "2026-10-05T18:45:00+00:00",
+   "exit": 775.1,
+   "reason": "time",
+   "gross_bps": -2.968,
+   "cost_bps": 1.338,
+   "net_bps": -4.306,
+   "target": 772.8315,
+   "stop": 777.9278,
+   "z": 1.694
+  },
+  {
+   "symbol": "VTI",
+   "session": "2026-10-05",
+   "side": "short",
+   "signal_ts": "2026-10-05T14:21:00+00:00",
+   "entry_ts": "2026-10-05T14:21:00+00:00",
+   "entry": 379.71,
+   "exit_ts": "2026-10-05T15:21:00+00:00",
+   "exit": 379.55,
+   "reason": "time",
+   "gross_bps": 4.214,
+   "cost_bps": 1.474,
+   "net_bps": 2.739,
+   "target": 378.591,
+   "stop": 381.3885,
+   "z": 1.587
+  },
+  {
+   "symbol": "IWM",
+   "session": "2026-10-08",
+   "side": "long",
+   "signal_ts": "2026-10-08T15:02:00+00:00",
+   "entry_ts": "2026-10-08T15:02:00+00:00",
+   "entry": 275.19,
+   "exit_ts": "2026-10-08T16:02:00+00:00",
+   "exit": 275.12,
+   "reason": "time",
+   "gross_bps": -2.544,
+   "cost_bps": 1.576,
+   "net_bps": -4.12,
+   "target": 276.1449,
+   "stop": 273.7576,
+   "z": -1.553
+  },
+  {
+   "symbol": "QQQ",
+   "session": "2026-10-08",
+   "side": "long",
+   "signal_ts": "2026-10-08T16:48:00+00:00",
+   "entry_ts": "2026-10-08T16:48:00+00:00",
+   "entry": 751.71,
+   "exit_ts": "2026-10-08T16:57:00+00:00",
+   "exit": 748.174,
+   "reason": "stop",
+   "gross_bps": -47.04,
+   "cost_bps": 1.342,
+   "net_bps": -48.381,
+   "target": 754.0674,
+   "stop": 748.174,
+   "z": -1.7
+  },
+  {
+   "symbol": "SPY",
+   "session": "2026-10-08",
+   "side": "long",
+   "signal_ts": "2026-10-08T16:50:00+00:00",
+   "entry_ts": "2026-10-08T16:50:00+00:00",
+   "entry": 773.23,
+   "exit_ts": "2026-10-08T17:27:00+00:00",
+   "exit": 770.6171,
+   "reason": "stop",
+   "gross_bps": -33.792,
+   "cost_bps": 1.338,
+   "net_bps": -35.13,
+   "target": 774.9719,
+   "stop": 770.6171,
+   "z": -1.66
+  },
+  {
+   "symbol": "VTI",
+   "session": "2026-10-08",
+   "side": "long",
+   "signal_ts": "2026-10-08T16:50:00+00:00",
+   "entry_ts": "2026-10-08T16:50:00+00:00",
+   "entry": 379.01,
+   "exit_ts": "2026-10-08T17:50:00+00:00",
+   "exit": 378.475,
+   "reason": "time",
+   "gross_bps": -14.116,
+   "cost_bps": 1.475,
+   "net_bps": -15.591,
+   "target": 379.8504,
+   "stop": 377.7495,
+   "z": -1.552
+  },
+  {
+   "symbol": "IWM",
+   "session": "2026-10-09",
+   "side": "short",
+   "signal_ts": "2026-10-09T18:50:00+00:00",
+   "entry_ts": "2026-10-09T18:50:00+00:00",
+   "entry": 279.53,
+   "exit_ts": "2026-10-09T19:50:00+00:00",
+   "exit": 279.07,
+   "reason": "time",
+   "gross_bps": 16.456,
+   "cost_bps": 1.571,
+   "net_bps": 14.885,
+   "target": 278.6586,
+   "stop": 280.8371,
+   "z": 1.552
+  },
+  {
+   "symbol": "SPY",
+   "session": "2026-10-09",
+   "side": "short",
+   "signal_ts": "2026-10-09T16:51:00+00:00",
+   "entry_ts": "2026-10-09T16:51:00+00:00",
+   "entry": 778.47,
+   "exit_ts": "2026-10-09T17:51:00+00:00",
+   "exit": 778.205,
+   "reason": "time",
+   "gross_bps": 3.404,
+   "cost_bps": 1.337,
+   "net_bps": 2.067,
+   "target": 776.8588,
+   "stop": 780.8868,
+   "z": 1.611
+  },
+  {
+   "symbol": "VTI",
+   "session": "2026-10-09",
+   "side": "short",
+   "signal_ts": "2026-10-09T16:31:00+00:00",
+   "entry_ts": "2026-10-09T16:31:00+00:00",
+   "entry": 381.77,
+   "exit_ts": "2026-10-09T17:31:00+00:00",
+   "exit": 381.75,
+   "reason": "time",
+   "gross_bps": 0.524,
+   "cost_bps": 1.473,
+   "net_bps": -0.949,
+   "target": 381.046,
+   "stop": 382.856,
+   "z": 1.519
+  },
+  {
+   "symbol": "DIA",
+   "session": "2026-10-12",
+   "side": "short",
+   "signal_ts": "2026-10-12T14:35:00+00:00",
+   "entry_ts": "2026-10-12T14:35:00+00:00",
+   "entry": 518.42,
+   "exit_ts": "2026-10-12T15:35:00+00:00",
+   "exit": 518.24,
+   "reason": "time",
+   "gross_bps": 3.472,
+   "cost_bps": 1.403,
+   "net_bps": 2.069,
+   "target": 517.362,
+   "stop": 520.0069,
+   "z": 1.539
+  },
+  {
+   "symbol": "SPY",
+   "session": "2026-10-13",
+   "side": "short",
+   "signal_ts": "2026-10-13T18:07:00+00:00",
+   "entry_ts": "2026-10-13T18:07:00+00:00",
+   "entry": 778.1,
+   "exit_ts": "2026-10-13T19:07:00+00:00",
+   "exit": 778.041,
+   "reason": "time",
+   "gross_bps": 0.758,
+   "cost_bps": 1.337,
+   "net_bps": -0.579,
+   "target": 776.7495,
+   "stop": 780.1256,
+   "z": 1.638
+  },
+  {
+   "symbol": "VTI",
+   "session": "2026-10-13",
+   "side": "long",
+   "signal_ts": "2026-10-13T15:30:00+00:00",
+   "entry_ts": "2026-10-13T15:30:00+00:00",
+   "entry": 380.46,
+   "exit_ts": "2026-10-13T16:30:00+00:00",
+   "exit": 381.02,
+   "reason": "time",
+   "gross_bps": 14.719,
+   "cost_bps": 1.474,
+   "net_bps": 13.245,
+   "target": 381.1759,
+   "stop": 379.3861,
+   "z": -1.577
+  },
+  {
+   "symbol": "DIA",
+   "session": "2026-10-14",
+   "side": "long",
+   "signal_ts": "2026-10-14T15:02:00+00:00",
+   "entry_ts": "2026-10-14T15:02:00+00:00",
+   "entry": 515.28,
+   "exit_ts": "2026-10-14T16:02:00+00:00",
+   "exit": 515.56,
+   "reason": "time",
+   "gross_bps": 5.433,
+   "cost_bps": 1.404,
+   "net_bps": 4.029,
+   "target": 516.3202,
+   "stop": 513.7197,
+   "z": -1.569
+  },
+  {
+   "symbol": "DIA",
+   "session": "2026-10-15",
+   "side": "short",
+   "signal_ts": "2026-10-15T14:36:00+00:00",
+   "entry_ts": "2026-10-15T14:36:00+00:00",
+   "entry": 519.14,
+   "exit_ts": "2026-10-15T15:06:00+00:00",
+   "exit": 520.9119,
+   "reason": "stop",
+   "gross_bps": -34.13,
+   "cost_bps": 1.402,
+   "net_bps": -35.533,
+   "target": 517.9588,
+   "stop": 520.9119,
+   "z": 1.558
+  },
+  {
+   "symbol": "IWM",
+   "session": "2026-10-15",
+   "side": "short",
+   "signal_ts": "2026-10-15T14:02:00+00:00",
+   "entry_ts": "2026-10-15T14:02:00+00:00",
+   "entry": 272.21,
+   "exit_ts": "2026-10-15T14:10:00+00:00",
+   "exit": 273.174,
+   "reason": "stop",
+   "gross_bps": -35.414,
+   "cost_bps": 1.581,
+   "net_bps": -36.995,
+   "target": 271.5673,
+   "stop": 273.174,
+   "z": 1.596
+  },
+  {
+   "symbol": "DIA",
+   "session": "2026-10-19",
+   "side": "short",
+   "signal_ts": "2026-10-19T14:17:00+00:00",
+   "entry_ts": "2026-10-19T14:17:00+00:00",
+   "entry": 519.77,
+   "exit_ts": "2026-10-19T14:33:00+00:00",
+   "exit": 518.533,
+   "reason": "target",
+   "gross_bps": 23.799,
+   "cost_bps": 1.402,
+   "net_bps": 22.397,
+   "target": 518.533,
+   "stop": 521.6255,
+   "z": 1.56
+  },
+  {
+   "symbol": "QQQ",
+   "session": "2026-10-20",
+   "side": "short",
+   "signal_ts": "2026-10-20T14:02:00+00:00",
+   "entry_ts": "2026-10-20T14:02:00+00:00",
+   "entry": 716.86,
+   "exit_ts": "2026-10-20T14:27:00+00:00",
+   "exit": 721.42,
+   "reason": "stop_gap",
+   "gross_bps": -63.611,
+   "cost_bps": 1.348,
+   "net_bps": -64.959,
+   "target": 713.8515,
+   "stop": 721.3727,
+   "z": 1.57
+  },
+  {
+   "symbol": "QQQ",
+   "session": "2026-10-21",
+   "side": "short",
+   "signal_ts": "2026-10-21T16:40:00+00:00",
+   "entry_ts": "2026-10-21T16:40:00+00:00",
+   "entry": 727.55,
+   "exit_ts": "2026-10-21T17:40:00+00:00",
+   "exit": 726.5799,
+   "reason": "time",
+   "gross_bps": 13.334,
+   "cost_bps": 1.346,
+   "net_bps": 11.988,
+   "target": 724.2191,
+   "stop": 732.5463,
+   "z": 1.522
+  },
+  {
+   "symbol": "SPY",
+   "session": "2026-10-21",
+   "side": "short",
+   "signal_ts": "2026-10-21T17:09:00+00:00",
+   "entry_ts": "2026-10-21T17:09:00+00:00",
+   "entry": 773.79,
+   "exit_ts": "2026-10-21T18:09:00+00:00",
+   "exit": 773.8999,
+   "reason": "time",
+   "gross_bps": -1.421,
+   "cost_bps": 1.338,
+   "net_bps": -2.758,
+   "target": 771.6873,
+   "stop": 776.9441,
+   "z": 1.523
+  },
+  {
+   "symbol": "VTI",
+   "session": "2026-10-21",
+   "side": "short",
+   "signal_ts": "2026-10-21T16:40:00+00:00",
+   "entry_ts": "2026-10-21T16:40:00+00:00",
+   "entry": 379.6951,
+   "exit_ts": "2026-10-21T17:40:00+00:00",
+   "exit": 379.5093,
+   "reason": "time",
+   "gross_bps": 4.893,
+   "cost_bps": 1.475,
+   "net_bps": 3.419,
+   "target": 378.2993,
+   "stop": 381.7888,
+   "z": 1.855
+  }
+ ]
+}

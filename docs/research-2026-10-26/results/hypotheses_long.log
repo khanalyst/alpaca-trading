@@ -1,0 +1,57 @@
+hourly sessions {'n': 486, 'first': '2024-10-29', 'last': '2026-10-23'}
+H1 SPY beta -0.003 t -0.13 sign-strat {'n': 486, 'mean_bps': -0.493, 't': -0.508, 'hit': 0.488, 'sd_bps': 21.397} halves -0.04 / -0.94
+H1 QQQ beta 0.003 t 0.18 sign-strat {'n': 486, 'mean_bps': -0.523, 't': -0.425, 'hit': 0.479, 'sd_bps': 27.139} halves -1.02 / -0.03
+H1 IWM beta 0.001 t 0.11 sign-strat {'n': 486, 'mean_bps': 0.112, 't': 0.103, 'hit': 0.5, 'sd_bps': 24.085} halves 0.38 / -0.16
+H1 DIA beta 0.007 t 0.39 sign-strat {'n': 486, 'mean_bps': -0.782, 't': -0.948, 'hit': 0.473, 'sd_bps': 18.185} halves -0.75 / -0.81
+H1 TLT beta -0.001 t -0.05 sign-strat {'n': 486, 'mean_bps': 0.324, 't': 0.68, 'hit': 0.486, 'sd_bps': 10.511} halves 0.56 / 0.09
+H1 GLD beta 0.013 t 1.46 sign-strat {'n': 486, 'mean_bps': 1.722, 't': 2.299, 'hit': 0.545, 'sd_bps': 16.509} halves 0.79 / 2.65
+H1 ALL beta 0.006 t 0.71 sign-strat {'n': 11664, 'mean_bps': 0.204, 't': 0.916, 'hit': 0.496, 'sd_bps': 24.052} halves -0.16 / 0.56
+H3 {'long_losers_short_winners': {'n': 486, 'mean_bps': 2.618, 't': 0.837, 'hit': 0.502, 'sd_bps': 68.965}, 'first_half': {'n': 243, 'mean_bps': 0.828, 't': 0.205, 'hit': 0.494, 'sd_bps': 62.864}, 'second_half': {'n': 243, 'mean_bps': 4.408, 't': 0.92, 'hit': 0.51, 'sd_bps': 74.658}, 'note': '8 legs per day, gross of costs; real round trip on 8 legs ~2-3 bps per leg'}
+H2 SPY   beta 0.030 t 0.90 | fade>2sd n 179 mean -4.7 t -0.37 | last2y n 19 mean 33.6 | years+ 6/11
+H2 QQQ   beta 0.007 t 0.19 | fade>2sd n 202 mean -2.2 t -0.17 | last2y n 35 mean 27.0 | years+ 6/14
+H2 IWM   beta 0.015 t 0.42 | fade>2sd n 174 mean -7.7 t -0.53 | last2y n 19 mean 69.3 | years+ 4/11
+H2 DIA   beta 0.056 t 1.46 | fade>2sd n 168 mean -10.0 t -0.82 | last2y n 14 mean 18.4 | years+ 4/9
+H2 XLF   beta 0.018 t 0.51 | fade>2sd n 169 mean -2.9 t -0.18 | last2y n 10 mean 34.1 | years+ 7/10
+H2 XLK   beta 0.006 t 0.18 | fade>2sd n 195 mean 2.9 t 0.20 | last2y n 57 mean 19.6 | years+ 6/12
+H2 XLE   beta 0.043 t 1.31 | fade>2sd n 176 mean 2.4 t 0.13 | last2y n 18 mean 28.7 | years+ 5/10
+H2 XLV   beta 0.013 t 0.34 | fade>2sd n 165 mean 11.1 t 0.90 | last2y n 26 mean 22.5 | years+ 6/10
+H2 XLI   beta 0.040 t 1.16 | fade>2sd n 168 mean -10.8 t -0.81 | last2y n 17 mean 27.6 | years+ 7/11
+H2 XLP   beta -0.001 t -0.01 | fade>2sd n 162 mean -0.7 t -0.06 | last2y n 24 mean 42.8 | years+ 4/9
+H2 XLY   beta -0.024 t -0.73 | fade>2sd n 197 mean 21.7 t 1.72 | last2y n 32 mean 55.6 | years+ 8/13
+H2 XLU   beta 0.113 t 1.93 | fade>2sd n 165 mean -21.8 t -1.49 | last2y n 23 mean 11.8 | years+ 5/10
+H2 XLB   beta -0.023 t -0.33 | fade>2sd n 166 mean 2.6 t 0.17 | last2y n 9 mean 13.8 | years+ 5/9
+H2 XLRE  beta 0.100 t 1.56 | fade>2sd n 119 mean -6.8 t -0.38 | last2y n 13 mean 120.2 | years+ 4/8
+H2 VTI   beta 0.029 t 0.82 | fade>2sd n 182 mean -7.4 t -0.62 | last2y n 19 mean 44.1 | years+ 6/13
+H2 VO    beta 0.048 t 1.39 | fade>2sd n 191 mean -7.6 t -0.63 | last2y n 14 mean 29.5 | years+ 5/11
+H2 VB    beta 0.057 t 1.56 | fade>2sd n 169 mean -13.7 t -0.99 | last2y n 17 mean 57.2 | years+ 6/11
+H2 EFA   beta 0.007 t 0.34 | fade>2sd n 194 mean -8.8 t -0.97 | last2y n 12 mean 56.1 | years+ 3/9
+H2 EEM   beta 0.029 t 1.65 | fade>2sd n 194 mean -5.6 t -0.57 | last2y n 35 mean 2.9 | years+ 6/12
+H2 TLT   beta 0.023 t 0.80 | fade>2sd n 192 mean 1.3 t 0.16 | last2y n 10 mean 43.6 | years+ 3/11
+H2 HYG   beta -0.013 t -0.31 | fade>2sd n 144 mean 4.4 t 0.58 | last2y n 9 mean 60.5 | years+ 5/8
+H2 GLD   beta 0.051 t 2.42 | fade>2sd n 209 mean -14.8 t -2.12 | last2y n 82 mean -15.4 | years+ 3/13
+H2 SLV   beta 0.042 t 1.28 | fade>2sd n 209 mean -25.9 t -1.60 | last2y n 72 mean -13.4 | years+ 3/14
+H2 SMH   beta 0.028 t 0.95 | fade>2sd n 211 mean 15.2 t 0.92 | last2y n 74 mean 26.5 | years+ 6/12
+H4 SPY   overnight 3.57 bps (t 3.39) intraday 2.20 bps (t 1.76)
+H4 QQQ   overnight 5.04 bps (t 4.12) intraday 2.58 bps (t 1.64)
+H4 IWM   overnight 5.19 bps (t 4.02) intraday -0.24 bps (t -0.14)
+H4 DIA   overnight 3.28 bps (t 3.22) intraday 1.84 bps (t 1.58)
+H4 XLF   overnight 3.79 bps (t 2.76) intraday 1.48 bps (t 0.95)
+H4 XLK   overnight 4.85 bps (t 3.60) intraday 3.15 bps (t 1.91)
+H4 XLE   overnight 4.62 bps (t 2.80) intraday 0.12 bps (t 0.06)
+H4 XLV   overnight 2.52 bps (t 2.83) intraday 2.78 bps (t 2.16)
+H4 XLI   overnight 3.89 bps (t 3.30) intraday 1.73 bps (t 1.22)
+H4 XLP   overnight 1.21 bps (t 1.60) intraday 3.07 bps (t 2.78)
+H4 XLY   overnight 4.02 bps (t 3.22) intraday 2.08 bps (t 1.34)
+H4 XLU   overnight 2.49 bps (t 3.19) intraday 1.82 bps (t 1.26)
+H4 XLB   overnight 2.84 bps (t 2.24) intraday 1.49 bps (t 0.94)
+H4 XLRE  overnight 5.00 bps (t 3.80) intraday -1.64 bps (t -0.85)
+H4 VTI   overnight 5.34 bps (t 4.98) intraday 0.37 bps (t 0.29)
+H4 VO    overnight 5.74 bps (t 5.19) intraday -0.57 bps (t -0.42)
+H4 VB    overnight 6.47 bps (t 5.47) intraday -1.32 bps (t -0.84)
+H4 EFA   overnight 0.17 bps (t 0.12) intraday 3.06 bps (t 2.88)
+H4 EEM   overnight 1.63 bps (t 0.99) intraday 0.97 bps (t 0.79)
+H4 TLT   overnight -0.31 bps (t -0.31) intraday 1.67 bps (t 1.67)
+H4 HYG   overnight 1.72 bps (t 3.14) intraday 0.37 bps (t 0.63)
+H4 GLD   overnight 3.50 bps (t 2.90) intraday -0.12 bps (t -0.11)
+H4 SLV   overnight 5.83 bps (t 2.52) intraday -1.41 bps (t -0.72)
+H4 SMH   overnight 7.66 bps (t 4.30) intraday 2.98 bps (t 1.35)

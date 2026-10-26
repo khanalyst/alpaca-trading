@@ -1,0 +1,158 @@
+{
+ "1m_22s": {
+  "V1_ORF_pro": {
+   "n": 306,
+   "sessions": 30,
+   "gross": 0.7439470571390828,
+   "real": -2.192586560594949,
+   "cluster_t": -1.9470601119190074,
+   "win": 0.3627450980392157,
+   "first_half_real": -3.1418837021666177,
+   "second_half_real": -1.3033715165911064,
+   "exits": {
+    "stop": 178,
+    "target": 108,
+    "stop_gap": 13,
+    "time": 7
+   },
+   "median_risk_bps": 10.834168288124342
+  },
+  "V2_VWAP_rev_pro": {
+   "n": 580,
+   "sessions": 25,
+   "gross": 0.15857380897824738,
+   "real": -2.626835103051615,
+   "cluster_t": -1.0644917159694882,
+   "win": 0.5103448275862069,
+   "first_half_real": -0.32349064674691896,
+   "second_half_real": -4.761828801752647,
+   "exits": {
+    "target": 192,
+    "stop": 91,
+    "time": 285,
+    "stop_gap": 8,
+    "flat": 4
+   },
+   "median_risk_bps": 44.92940250507618
+  },
+  "V4_VWAP_trend_mirror": {
+   "n": 580,
+   "sessions": 25,
+   "gross": -1.0660338038073434,
+   "real": -3.851442715837206,
+   "cluster_t": -1.6089896238235588,
+   "win": 0.47413793103448276,
+   "first_half_real": -7.174501483709611,
+   "second_half_real": -0.7712653197029825,
+   "exits": {
+    "time": 298,
+    "target": 188,
+    "stop": 81,
+    "stop_gap": 9,
+    "flat": 4
+   },
+   "median_risk_bps": 44.92940250507618
+  }
+ },
+ "5m_42s": {
+  "V1_ORF_pro": {
+   "n": 688,
+   "sessions": 49,
+   "gross": 0.5383664584320443,
+   "real": -2.2777524113491663,
+   "cluster_t": -2.1748612686617217,
+   "win": 0.47819767441860467,
+   "first_half_real": -2.580600834434113,
+   "second_half_real": -1.9903466840589195,
+   "exits": {
+    "target": 319,
+    "time": 48,
+    "stop": 315,
+    "stop_gap": 6
+   },
+   "median_risk_bps": 16.446347588721636
+  },
+  "V2_VWAP_rev_pro": {
+   "n": 1003,
+   "sessions": 44,
+   "gross": 1.7686534964525416,
+   "real": -0.998477920310331,
+   "cluster_t": -0.5720751919984088,
+   "win": 0.5174476570289133,
+   "first_half_real": 0.8551375368509916,
+   "second_half_real": -2.870666678645615,
+   "exits": {
+    "time": 542,
+    "target": 317,
+    "stop": 135,
+    "flat": 8,
+    "stop_gap": 1
+   },
+   "median_risk_bps": 43.52728475288483
+  },
+  "V3_ORB5": {
+   "n": 1165,
+   "sessions": 49,
+   "gross": -0.9757550542946418,
+   "real": -3.7414687552700765,
+   "cluster_t": -1.7826192370119203,
+   "win": 0.27639484978540774,
+   "first_half_real": -7.236987944922556,
+   "second_half_real": -0.38129795174892334,
+   "exits": {
+    "stop": 765,
+    "stop_gap": 8,
+    "flat": 392
+   },
+   "median_risk_bps": 24.142558798099543
+  },
+  "V4_VWAP_trend_mirror": {
+   "n": 1003,
+   "sessions": 44,
+   "gross": -1.410626368221048,
+   "real": -4.17775778498392,
+   "cluster_t": -2.5171701761013523,
+   "win": 0.4596211365902293,
+   "first_half_real": -5.0663408630838935,
+   "second_half_real": -3.280271068826834,
+   "exits": {
+    "time": 564,
+    "target": 299,
+    "stop": 130,
+    "flat": 9,
+    "stop_gap": 1
+   },
+   "median_risk_bps": 43.52728475288483
+  },
+  "V3_ORB5_SPY": {
+   "n": 49,
+   "sessions": 49,
+   "gross": -0.15441489300461067,
+   "real": -2.4054148930046106,
+   "cluster_t": -0.5869234495591822,
+   "win": 0.16326530612244897,
+   "first_half_real": -8.440716814906608,
+   "second_half_real": 3.3884749520213058,
+   "exits": {
+    "flat": 10,
+    "stop": 39
+   },
+   "median_risk_bps": 11.462426962604727
+  },
+  "V3_ORB5_QQQ": {
+   "n": 49,
+   "sessions": 49,
+   "gross": 6.751165395129758,
+   "real": 4.177165395129757,
+   "cluster_t": 0.5760153889483098,
+   "win": 0.30612244897959184,
+   "first_half_real": -10.624096197573058,
+   "second_half_real": 18.386376524124458,
+   "exits": {
+    "stop": 32,
+    "flat": 17
+   },
+   "median_risk_bps": 22.654698551488476
+  }
+ }
+}
