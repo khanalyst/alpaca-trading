@@ -126,16 +126,15 @@ REGISTERED_CONTROL_TIER = "cross_session_same_session_minute"
 # --- v2 ---------------------------------------------------------------------
 # Both v1 sealed windows are compromised (D1-01): the decision rule and the
 # instrument changed after sealed sessions were examined, and every session up
-# to 2026-10-23 has since been examined.  v2 registers the same two subjects
-# on a fresh window and freezes the instrument as well as the text.
+# to V2_LAST_EXAMINED_SESSION has since been examined.  v2 registers the same
+# two subjects on a fresh window and freezes the instrument as well as the
+# text.  The dates and digests are in the registration block below.
 PREREGISTRATION_SCHEMA_V2 = "preregistered-hypothesis.v2"
 EVALUATION_SCHEMA_V2 = "preregistered-evaluation.v2"
 LOOK_RECORD_SCHEMA = "preregistered-look-record.v1"
 INSTRUMENT_IDENTITY_SCHEMA = "preregistered-instrument-identity.v1"
 VWAP_REVERSION_HYPOTHESIS_V2 = "vwap-reversion-control-adjusted.v2"
 OPENING_RANGE_FADE_HYPOTHESIS_V2 = "opening-range-fade-control-adjusted.v2"
-V2_REGISTERED_ON = "2026-10-27"
-V2_SEALED_FROM = "2026-10-27"
 V2_LOOK_SESSIONS = (30, 60)
 # The repository's own static round trip at registration (research/costs.py):
 # 2 x (4 bps spread / 2 + 6 bps adverse slippage + 0.5 bps fee) = 17 bps.
@@ -165,9 +164,18 @@ _INSTRUMENT_ROOTS = (
     ("research.preregistered", "_evaluate_v2"),
 )
 _INSTRUMENT_PACKAGES = ("research", "agent")
-# Frozen when v2 was registered.  ``evaluate`` recomputes the identity of the
-# running code and refuses a v2 decision if it differs.  Never update these
-# literals to make a test pass: register a new version instead.
+# === v2 registration literals ================================================
+# Everything that is fixed at the moment v2 is published lives in this one
+# block.  ``V2_SEALED_FROM`` must be the first full session after the
+# registration is published (pushed), and later than every examined session.
+# The instrument literals are the output of :func:`v2_registration_literals`
+# on the published tree; ``evaluate`` recomputes the identity of the running
+# code and refuses a v2 decision if it differs.  Once a sealed session has
+# been examined, never change anything here to make a test pass: register a
+# new version instead.  Every test and manifest reads these constants.
+V2_LAST_EXAMINED_SESSION = "2026-10-23"
+V2_REGISTERED_ON = "2026-10-27"
+V2_SEALED_FROM = "2026-10-27"
 V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
     "agent.contracts.market_context":
         "fd6c1459b0d17d0d284d43d1b85d8a2561a5808b5efd647981b2ed36aa60589f",
@@ -190,6 +198,7 @@ V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
 }
 V2_INSTRUMENT_DIGEST = (
     "4b7075f72e6c9097e784b7248edfc3210028cb824b9f675d19931bdd8b0df36d")
+# === end of v2 registration literals =========================================
 
 
 class PreregistrationError(ValueError):
@@ -467,10 +476,10 @@ def _v2_shared() -> dict[str, Any]:
         "sealed_window": {
             "sessions_on_or_after": V2_SEALED_FROM,
             "rationale": (
-                "written on 2026-10-26, while that session was trading, and "
-                "committed on 2026-10-27 before that session opened; every "
-                "session up to 2026-10-23 had been examined, so the first "
-                "session no analysis can have seen is 2026-10-27"),
+                f"registered on {V2_REGISTERED_ON}, when every session up to "
+                f"{V2_LAST_EXAMINED_SESSION} had been examined; the window "
+                f"starts at {V2_SEALED_FROM}, the first full session after the "
+                "registration was published, so no analysis can have seen it"),
             "control_pool": "restricted to the complete sessions of the look window",
         },
         "session_definition": {
@@ -684,12 +693,12 @@ COMPROMISED_HYPOTHESES = {
         "2026-09-22 after the first sealed interim, and the instrument "
         "(research/signal_quality.py, agent/contracts/rule.py) changed on "
         "2026-10-07 and 2026-10-08 while sealed sessions were being examined; "
-        f"superseded by {VWAP_REVERSION_HYPOTHESIS_V2} on 2026-10-27"),
+        f"superseded by {VWAP_REVERSION_HYPOTHESIS_V2} on {V2_REGISTERED_ON}"),
     OPENING_RANGE_FADE_HYPOTHESIS: (
         "compromised (D1-01): the instrument (research/signal_quality.py, "
         "agent/contracts/rule.py) changed on 2026-10-07 and 2026-10-08 while "
         "sealed sessions were being examined; superseded by "
-        f"{OPENING_RANGE_FADE_HYPOTHESIS_V2} on 2026-10-27"),
+        f"{OPENING_RANGE_FADE_HYPOTHESIS_V2} on {V2_REGISTERED_ON}"),
 }
 
 
@@ -1347,6 +1356,40 @@ def _load(path: Path, manifest: Mapping[str, Any]) -> tuple[list[Any], bool, lis
     return bars, eligible, reasons, provenance
 
 
+def v2_registration_literals() -> str:
+    """Return the v2 registration literals for the code that is running now.
+
+    The output is Python source to paste: the instrument block for this
+    module, then the pins for ``tests/research/test_preregistered_v2.py``.
+    The manifest hashes are those the manifests will have once the printed
+    instrument literals are in place.  Print it with::
+
+        python -B -c "from research.preregistered import v2_registration_literals as f; print(f())"
+    """
+    identity = instrument_identity()
+    module = globals()
+    saved = (module["V2_INSTRUMENT_COMPONENTS"], module["V2_INSTRUMENT_DIGEST"])
+    try:
+        module["V2_INSTRUMENT_COMPONENTS"] = dict(identity["components"])
+        module["V2_INSTRUMENT_DIGEST"] = identity["digest"]
+        hashes = {hypothesis: preregistration(hypothesis)["manifest_hash"]
+                  for hypothesis in V2_HYPOTHESES}
+    finally:
+        module["V2_INSTRUMENT_COMPONENTS"], module["V2_INSTRUMENT_DIGEST"] = saved
+    lines = ["# research/preregistered.py (registration block)",
+             "V2_INSTRUMENT_COMPONENTS: dict[str, str] = {"]
+    for name, digest in identity["components"].items():
+        lines += [f'    "{name}":', f'        "{digest}",']
+    lines += ["}", "V2_INSTRUMENT_DIGEST = (", f'    "{identity["digest"]}")', "",
+              "# tests/research/test_preregistered_v2.py",
+              "V2_VWAP_MANIFEST_HASH = (",
+              f'    "{hashes[VWAP_REVERSION_HYPOTHESIS_V2]}")',
+              "V2_ORF_MANIFEST_HASH = (",
+              f'    "{hashes[OPENING_RANGE_FADE_HYPOTHESIS_V2]}")',
+              "V2_INSTRUMENT_DIGEST = (", f'    "{identity["digest"]}")']
+    return "\n".join(lines)
+
+
 def read_look_records(stream: Any) -> list[dict[str, Any]]:
     """Parse an append-only JSONL look record; a malformed line is refused."""
     records: list[dict[str, Any]] = []
@@ -1467,7 +1510,8 @@ __all__ = [
     "PREREGISTRATION_SCHEMA_V2", "PreregistrationError",
     "V2_HYPOTHESES", "VWAP_REVERSION_HYPOTHESIS", "VWAP_REVERSION_HYPOTHESIS_V2",
     "evaluate", "instrument_identity", "look_outcome", "look_outcome_v2",
-    "main", "preregistration", "read_look_records", "v2_session_quality",
+    "main", "preregistration", "read_look_records", "v2_registration_literals",
+    "v2_session_quality",
 ]
 
 

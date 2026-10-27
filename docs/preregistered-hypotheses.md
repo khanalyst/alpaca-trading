@@ -129,12 +129,16 @@ Each hypothesis spends its own alpha and is reported separately.
 
 ## `vwap-reversion-control-adjusted.v2` and `opening-range-fade-control-adjusted.v2`
 
-Registered 2026-10-27, before that session opened (written on 2026-10-26
-while that session was trading). Same frozen subjects and mirrors as v1.
+Registered 2026-10-27; the window starts at the first full session after
+the registration was published. Same frozen subjects and mirrors as v1. The
+registration date, the first sealed session, the last examined session and
+the instrument digest are one block of literals at the top of
+`research/preregistered.py`; `v2_registration_literals()` prints the
+instrument literals and the manifest hashes for the running tree.
 Manifest hashes, pinned by `tests/research/test_preregistered_v2.py`:
 
-- VWAP: `dbc0306e96556e5748264102ab9bf3b0c6e04af8326546557136671eff4280e1`
-- ORF: `27833a93a4dbb87945a9284b4a315c1cd382e7a10a9c8de96ebe8ee314a7228e`
+- VWAP: `c18b38c580f256ea60e860eda700841e73c2e622b4a628cb76d6856d36b4f0f5`
+- ORF: `20a86ca6c05c7f26c56343b015960f2463fab8ffd18c3df185cee0e8122851bd`
 
 **Claim.** Entering at the open of the bar after the frozen rule fires is
 followed over the next 60 minutes by a return, in the rule's direction, that

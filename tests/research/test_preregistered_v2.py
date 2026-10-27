@@ -28,12 +28,23 @@ UTC = timezone.utc
 # Pinned deliberately, like the v1 hashes.  If one fails, a registered v2
 # hypothesis (or the instrument digest inside it) was edited: revert the
 # edit, or register v3 with its own window.  Never update these to pass.
+# ``python -B -c "from research.preregistered import v2_registration_literals
+# as f; print(f())"`` prints these three for the running tree.
 V2_VWAP_MANIFEST_HASH = (
-    "dbc0306e96556e5748264102ab9bf3b0c6e04af8326546557136671eff4280e1")
+    "c18b38c580f256ea60e860eda700841e73c2e622b4a628cb76d6856d36b4f0f5")
 V2_ORF_MANIFEST_HASH = (
-    "27833a93a4dbb87945a9284b4a315c1cd382e7a10a9c8de96ebe8ee314a7228e")
+    "20a86ca6c05c7f26c56343b015960f2463fab8ffd18c3df185cee0e8122851bd")
 V2_INSTRUMENT_DIGEST = (
     "4b7075f72e6c9097e784b7248edfc3210028cb824b9f675d19931bdd8b0df36d")
+
+
+# Every fixture date is relative to the registered window, so moving the
+# registration literals does not break the fixtures.
+SEALED = date.fromisoformat(prereg.V2_SEALED_FROM)
+
+
+def _on(offset: int) -> date:
+    return SEALED + timedelta(days=offset)
 
 
 def _weekdays(first: date, count: int) -> list[date]:
@@ -101,7 +112,7 @@ class _FakeInstrument:
 
 
 def _run(bars, *, manifest=None, records=(), eligible=True, metric=None,
-         as_of=datetime(2027, 6, 30, 12, 0, tzinfo=UTC)):
+         as_of=datetime.combine(_on(250), time(12, 0), UTC)):
     fake = _FakeInstrument(metric)
     with patch.object(prereg, "measure_signal_quality", side_effect=fake):
         report = prereg._evaluate_v2(
@@ -127,11 +138,15 @@ class RegistrationTests(unittest.TestCase):
             prereg.preregistration(prereg.OPENING_RANGE_FADE_HYPOTHESIS)["manifest_hash"],
             "a0ae21f5ffd765142f2f4b92c47e33f652e0fb3213f1fd8d5a6d82c3915c2b9e")
 
-    def test_fresh_window_starts_on_27_october_2026(self):
+    def test_fresh_window_starts_after_every_examined_session(self):
+        self.assertGreater(prereg.V2_SEALED_FROM, prereg.V2_LAST_EXAMINED_SESSION)
+        self.assertGreaterEqual(prereg.V2_SEALED_FROM, prereg.V2_REGISTERED_ON)
+        self.assertGreater(prereg.V2_REGISTERED_ON, "2026-10-23")
         for hypothesis in prereg.V2_HYPOTHESES:
             manifest = prereg.preregistration(hypothesis)
             self.assertEqual(manifest["sealed_window"]["sessions_on_or_after"],
-                             "2026-10-27")
+                             prereg.V2_SEALED_FROM)
+            self.assertEqual(manifest["registered_on"], prereg.V2_REGISTERED_ON)
             self.assertEqual(manifest["supersedes"]["hypothesis_id"],
                              hypothesis.replace(".v2", ".v1"))
             self.assertIn(manifest["supersedes"]["hypothesis_id"],
@@ -159,7 +174,7 @@ class InstrumentIdentityTests(unittest.TestCase):
             registered = prereg.preregistration(hypothesis)["instrument_identity"]
             self.assertEqual(registered["digest"], V2_INSTRUMENT_DIGEST)
             # If this fails, code the v2 instrument reaches was edited.  Do
-            # not re-pin after 2026-10-27's data have been examined: register
+            # not re-pin after a sealed session's data have been examined: register
             # v3 with a new window instead.
             self.assertEqual(current["components"], registered["components"])
             self.assertEqual(current["digest"], registered["digest"])
@@ -204,8 +219,7 @@ class InstrumentIdentityTests(unittest.TestCase):
         manifest = _small_manifest()
         manifest["instrument_identity"] = {
             **manifest["instrument_identity"], "digest": "0" * 64}
-        bars = [bar for day in _weekdays(date(2026, 10, 27), 31)
-                for bar in _session(day)]
+        bars = [bar for day in _weekdays(SEALED, 31) for bar in _session(day)]
         report, _fake = _run(bars, manifest=manifest)
         self.assertEqual(report["decision"], "refused")
         self.assertEqual(report["decision_refusals"],
@@ -218,16 +232,19 @@ class InstrumentIdentityTests(unittest.TestCase):
         self.assertEqual(report["look_records_to_append"], [])
 
     def test_public_evaluate_dispatches_v2_and_refuses_without_a_record_store(self):
-        bars = [bar for day in _weekdays(date(2026, 10, 27), 2)
+        days = _weekdays(SEALED, 2)
+        bars = [bar for day in days
                 for bar in _session(day, prereg.V2_UNIVERSE[:18])]
         fake = _FakeInstrument()
         with patch.object(prereg, "measure_signal_quality", side_effect=fake):
             report = prereg.evaluate(
                 bars, hypothesis_id=prereg.VWAP_REVERSION_HYPOTHESIS_V2,
                 decision_eligible=True,
-                as_of=datetime(2026, 11, 2, 12, tzinfo=UTC))
+                as_of=datetime.combine(days[-1] + timedelta(days=5),
+                                       time(12, 0), NEW_YORK))
         self.assertEqual(report["schema"], prereg.EVALUATION_SCHEMA_V2)
-        self.assertEqual(report["sealed_sessions"], ["2026-10-27", "2026-10-28"])
+        self.assertEqual(report["sealed_sessions"],
+                         [day.isoformat() for day in days])
         self.assertIn("look_record_store_missing", report["decision_refusals"])
         self.assertEqual(report["decision"], "refused")
         self.assertFalse(report["trading_authorized"])
@@ -241,23 +258,23 @@ class SessionDefinitionTests(unittest.TestCase):
             prereg.VWAP_REVERSION_HYPOTHESIS_V2)["session_definition"]
         universe = prereg.V2_UNIVERSE[:18]
         bars = (
-            _session(date(2026, 10, 23), universe) +            # examined
-            _session(date(2026, 10, 27), universe) +            # complete
-            _session(date(2026, 10, 28), universe, calendar=False) +
-            _session(date(2026, 10, 29), universe, minutes=210,
+            _session(_on(-4), universe) +                       # examined
+            _session(_on(0), universe) +                        # complete
+            _session(_on(1), universe, calendar=False) +
+            _session(_on(2), universe, minutes=210,
                      close=time(13, 0)) +                       # early close
-            _session(date(2026, 10, 30), universe,
+            _session(_on(3), universe,
                      keep=lambda minute: minute < 300) +        # outage
-            _session(date(2026, 11, 2), universe[:10]) +        # thin
-            _session(date(2026, 11, 3), universe[:1]) +
-            _session(date(2026, 11, 3), universe[1:],
+            _session(_on(6), universe[:10]) +                   # thin
+            _session(_on(7), universe[:1]) +
+            _session(_on(7), universe[1:],
                      keep=lambda minute: minute % 3) +          # 2/3 coverage
-            _session(date(2026, 11, 4), universe))              # today
-        as_of = datetime(2026, 11, 4, 21, 30, tzinfo=UTC)       # after close
+            _session(_on(8), universe))                         # today
+        as_of = datetime.combine(_on(8), time(17, 30), NEW_YORK)  # after close
         quality = prereg.v2_session_quality(
-            bars, definition, first=date(2026, 10, 27), as_of=as_of)
+            bars, definition, first=SEALED, as_of=as_of)
         self.assertEqual(quality["complete_sessions"],
-                         ["2026-10-27", "2026-11-03"])
+                         [_on(0).isoformat(), _on(7).isoformat()])
         self.assertEqual(quality["excluded_counts"], {
             "before_sealed_window": 1,
             "calendar_metadata_missing_or_conflicting": 1,
@@ -269,23 +286,23 @@ class SessionDefinitionTests(unittest.TestCase):
 
     def test_a_session_still_trading_is_not_counted(self):
         definition = _small_manifest()["session_definition"]
-        bars = _session(date(2026, 10, 27))
-        during = datetime(2026, 10, 27, 15, 0, tzinfo=UTC)
+        bars = _session(SEALED)
+        during = datetime.combine(SEALED, time(11, 0), NEW_YORK)
         self.assertEqual(prereg.v2_session_quality(
-            bars, definition, first=date(2026, 10, 27),
+            bars, definition, first=SEALED,
             as_of=during)["complete_sessions"], [])
-        later = datetime(2026, 10, 28, 9, 0, tzinfo=UTC)
+        later = datetime.combine(_on(1), time(5, 0), NEW_YORK)
         self.assertEqual(prereg.v2_session_quality(
-            bars, definition, first=date(2026, 10, 27),
-            as_of=later)["complete_sessions"], ["2026-10-27"])
+            bars, definition, first=SEALED,
+            as_of=later)["complete_sessions"], [SEALED.isoformat()])
         with self.assertRaises(ValueError):
-            prereg.v2_session_quality(bars, definition, first=date(2026, 10, 27),
-                                      as_of=datetime(2026, 10, 28))
+            prereg.v2_session_quality(bars, definition, first=SEALED,
+                                      as_of=datetime.combine(_on(1), time(5, 0)))
 
     def test_excluded_dates_never_reach_the_measurement(self):
-        days = _weekdays(date(2026, 10, 27), 31)
+        days = _weekdays(SEALED, 31)
         bars = [bar for day in days for bar in _session(day)]
-        bars += _session(date(2026, 10, 26))                    # before window
+        bars += _session(_on(-1))                               # before window
         bars += _session(days[3] + timedelta(days=0), ("QQQ",), calendar=False)
         report, fake = _run(bars)
         self.assertEqual(len(report["sealed_sessions"]), 30)
@@ -298,7 +315,7 @@ class LookRecordTests(unittest.TestCase):
     """D1-04: a look is decided once and later runs reproduce it."""
 
     def setUp(self):
-        self.days = _weekdays(date(2026, 10, 27), 61)
+        self.days = _weekdays(SEALED, 61)
         self.bars = [bar for day in self.days for bar in _session(day)]
 
     def bars_for(self, count):
@@ -379,7 +396,8 @@ class LookRecordTests(unittest.TestCase):
                     prereg.main(["--data", tmp, "--out", str(out),
                                  "--hypothesis", prereg.VWAP_REVERSION_HYPOTHESIS_V2,
                                  "--look-records", str(records),
-                                 "--as-of", "2026-12-31T12:00:00+00:00"])
+                                 "--as-of", datetime.combine(
+                                     _on(120), time(12, 0), UTC).isoformat()])
                 outputs.append(json.loads(out.read_text()))
             lines = [line for line in records.read_text().splitlines() if line]
             self.assertEqual(len(lines), 1)
@@ -457,7 +475,7 @@ class DecisionRuleTests(unittest.TestCase):
         self.assertEqual(result["reason"], "clustered_inference_unavailable")
 
     def test_the_decision_measures_the_executable_registered_endpoint(self):
-        days = _weekdays(date(2026, 10, 27), 31)
+        days = _weekdays(SEALED, 31)
         bars = [bar for day in days for bar in _session(day)]
         _report, fake = _run(bars, records=[])
         anchors = {call["outcome_anchor"] for call in fake.calls}
