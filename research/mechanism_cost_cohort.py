@@ -28,6 +28,10 @@ def mechanism_cost_cohort() -> dict:
         "source_manifest_hash": source["manifest_hash"], "registered_arms": 12,
         "diagnostic_only": True, "authorizing": False,
         "selection_policy": "diagnostic_only_no_automatic_winner_selection",
+        # Stale label, frozen: the runtime rung has been 9 bps
+        # (risk.stressed_cost_scenario_bps) since commit 2249cc5.  The text
+        # is part of the manifest hash pinned by mechanism_refresh_cohort.py,
+        # so it is not edited; read the rung from the configuration.
         "risk_policy": "unchanged_25bps_stress_and_0.30_cost_to_risk_veto",
         "comparison_policy": "only_authored_floor_changes_targets_and_hold_horizons_inherited",
         "runtime_config_changed": False,

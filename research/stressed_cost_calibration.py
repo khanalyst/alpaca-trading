@@ -815,6 +815,8 @@ verify_stress_calibration = verify_stress_calibration_artifact
 
 
 __all__ = [
+    "COST_BASES", "COST_BASIS_ONE_WAY_V1", "COST_BASIS_ROUND_TRIP",
+    "SELL_LEG_FEE_BPS",
     "DEFAULT_FALLBACK_SCENARIO_BPS", "DEFAULT_MIN_SESSIONS_PER_CELL",
     "STRESS_CALIBRATION_SCHEMA", "StressCalibrationError",
     "activation_overlay", "load_stress_calibration_artifact",

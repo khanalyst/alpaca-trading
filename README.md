@@ -343,10 +343,21 @@ spread-only. Missing or under-covered cells fail closed. The checked-in block is
 disabled because the repository does not contain one universal corpus-specific
 schedule that could honestly be activated for every deployment.
 Proofs also persist preregistered all-in stress scenarios of
-9, 15, 25, and 50 bps. The shipped runtime uses 25 bps as its default and
-fail-closed fallback; an explicitly activated, valid held-out calibration
-artifact may select one of the preregistered rungs for a symbol/time cell.
+9, 15, 25, and 50 bps; each is a round trip in bps of entry notional. The
+shipped `config.yaml` sets the runtime scenario to 9 bps
+(`risk.stressed_cost_scenario_bps`, lowered from 25 in commit 2249cc5; the
+built-in default when the key is absent is 25 bps), and that configured rung
+is the fail-closed fallback; an explicitly activated, valid held-out
+calibration artifact may select one of the preregistered rungs for a
+symbol/time cell. The cost provenance label
+`shipped_conservative_v1_plus_25bps_stress` predates the change and is stale,
+but it is part of every candidate identity and is left unchanged.
 No stress rung by itself authorizes a candidate.
+The flat cost schedule above is cost model `static_v1` (17 bps per round trip
+on bar references). Research also has `per_symbol_v2`, a per-symbol,
+order-type-aware model with fees on the sell leg only (about 1.75 to 4.07 bps
+per round trip on this universe); it is the default for new research runs.
+See `research/README.md`, "Cost-model versions".
 Runtime rejection caps are separate from expected costs. Stress applies the
 scenario bps to entry notional and then adds listed-option round-trip fees for
 both per-contract sides; it is not a per-side bps charge. The shipped
