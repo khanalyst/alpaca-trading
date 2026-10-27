@@ -65,6 +65,24 @@ _MEASUREMENT_SCOPES = frozenset({
 _TIME_BUCKETS = ((60.0, "opening_0_60m"), (300.0, "midday_60_300m"))
 _LAST_BUCKET = "close_300m_plus"
 _CONTROL_MINUTE_BAND = 20.0
+CONTROL_TIERS = (
+    "cross_session_same_session_minute", "same_session_minute_band",
+    "same_session_time_bucket", "same_session_entry_window",
+)
+# Outcome anchoring.  ``signal_close`` with ``bar_count`` is the original
+# measurement and remains the default, so existing callers and stored results
+# are unchanged.  The other anchors price the outcome where a runtime acting on
+# the completed signal bar could first trade: the open of the next bar, or of
+# the bar after it when a full minute of decision latency is allowed for.
+# Their horizon is fixed on the wall clock (``wall_clock``): the outcome is the
+# close of the bar that ends exactly ``horizon`` minutes after the entry
+# instant, whatever happened to the minutes in between, so a missing minute can
+# neither stretch the candidate's horizon nor shorten its control's.
+OUTCOME_ANCHORS = ("signal_close", "next_bar_open", "skip_one_bar_open")
+HORIZON_CLOCKS = ("bar_count", "wall_clock")
+_ANCHOR_DELAY_MINUTES = {
+    "signal_close": 0, "next_bar_open": 0, "skip_one_bar_open": 1,
+}
 
 
 def _time_bucket(minutes: float) -> str:
@@ -720,28 +738,19 @@ def _eligible_by_minute(rows: Sequence[Any], policy: _ControlPolicy, *,
     return eligible
 
 
-def _control_return(candidate_cell: tuple[str, str], candidate_minutes: float, *,
-                    eligible: Mapping[tuple[str, str], dict[int, tuple[int, float]]],
-                    session_rows: Mapping[tuple[str, str], Sequence[Any]],
-                    candidate_index: int, direction: str, horizon: int,
-                    allow_backfill: bool,
-                    policy: _ControlPolicy | None = None,
-                    ) -> tuple[float | None, str | None, dict[str, Any]]:
-    """Average every admissible null draw whose clock matches the candidate.
+def _choose_controls(candidate_cell: tuple[str, str], candidate_minutes: float, *,
+                     eligible: Mapping[tuple[str, str], Mapping[int, tuple]],
+                     candidate_index: int,
+                     tiers: Sequence[str] | None = None,
+                     ) -> tuple[list[tuple[tuple[str, str], int, float]], str, str | None]:
+    """Select the clock-matched null pool and name the tier it came from.
 
-    The null has to answer "does the predicate beat entering at a comparable
-    time?", so the comparable time is matched exactly: the same instrument, at
-    the same minute of the session, on every *other* session in the corpus.  A
-    same-session draw cannot do this — a rule that fires at the earliest bar
-    its own window allows sits systematically ahead of any draw spread across
-    that window, and intraday drift over that gap alone reads as an edge.
-    Same-session tiers remain as a fallback for corpora too small to supply a
-    cross-session match, and the tier used is reported.
-
-    Averaging the whole pool rather than selecting one member keeps the null
-    deterministic without spending sample: a single draw carries the same
-    variance as the candidate itself and inflates the paired standard error by
-    roughly the square root of two.
+    The tier is the tightest one with any admissible member: the same minute
+    on other sessions, then same-session fallbacks.  With ``tiers`` the
+    selected tier must be one of them; a candidate whose tier is not is left
+    unmatched (and the excluded tier is returned) rather than being matched
+    on a looser tier, so it counts against coverage instead of voiding the
+    whole measurement.
     """
     symbol, session = candidate_cell
     minute_key = int(round(candidate_minutes))
@@ -765,8 +774,45 @@ def _control_return(candidate_cell: tuple[str, str], candidate_minutes: float, *
         picked, matching = ((near, "same_session_minute_band") if near else
                             (same_bucket, "same_session_time_bucket")
                             if same_bucket else (own, "same_session_entry_window"))
-        choices = [(candidate_cell, index, minutes) for index, minutes in picked]
+        choices = [(candidate_cell, item[0], item[1]) for item in picked]
     if not choices:
+        return [], "none", None
+    if tiers is not None and matching not in tiers:
+        return [], "none", matching
+    return choices, matching, None
+
+
+def _control_return(candidate_cell: tuple[str, str], candidate_minutes: float, *,
+                    eligible: Mapping[tuple[str, str], dict[int, tuple[int, float]]],
+                    session_rows: Mapping[tuple[str, str], Sequence[Any]],
+                    candidate_index: int, direction: str, horizon: int,
+                    allow_backfill: bool,
+                    policy: _ControlPolicy | None = None,
+                    tiers: Sequence[str] | None = None,
+                    ) -> tuple[float | None, str | None, dict[str, Any]]:
+    """Average every admissible null draw whose clock matches the candidate.
+
+    The null has to answer "does the predicate beat entering at a comparable
+    time?", so the comparable time is matched exactly: the same instrument, at
+    the same minute of the session, on every *other* session in the corpus.  A
+    same-session draw cannot do this — a rule that fires at the earliest bar
+    its own window allows sits systematically ahead of any draw spread across
+    that window, and intraday drift over that gap alone reads as an edge.
+    Same-session tiers remain as a fallback for corpora too small to supply a
+    cross-session match, and the tier used is reported.
+
+    Averaging the whole pool rather than selecting one member keeps the null
+    deterministic without spending sample: a single draw carries the same
+    variance as the candidate itself and inflates the paired standard error by
+    roughly the square root of two.
+    """
+    choices, matching, excluded = _choose_controls(
+        candidate_cell, candidate_minutes, eligible=eligible,
+        candidate_index=candidate_index, tiers=tiers)
+    if not choices:
+        if excluded is not None:
+            return None, "control_tier_not_registered", {
+                "matching": f"excluded_{excluded}", "pool": 0}
         return None, "no_matched_control", {"matching": "none", "pool": 0}
     values: list[float] = []
     minutes_used: list[float] = []
@@ -801,6 +847,152 @@ def _control_return(candidate_cell: tuple[str, str], candidate_minutes: float, *
         return None, "no_matched_control", {"matching": matching, "pool": 0}
     metadata = {"matching": matching, "pool": len(values),
                 "mean_session_minute": mean(minutes_used)}
+    if decision_delays:
+        metadata["mean_decision_delay_seconds"] = mean(decision_delays)
+    if outcome_delays:
+        metadata["mean_outcome_observation_delay_seconds"] = mean(outcome_delays)
+    return mean(values), None, metadata
+
+
+def _row_at(rows: Sequence[Any], start: int, stamp: datetime) -> int | None:
+    """Index of the row whose market timestamp is exactly ``stamp``."""
+    for probe in range(max(0, int(start)), len(rows)):
+        current = _timestamp(rows[probe])
+        if current is None:
+            continue
+        if current == stamp:
+            return probe
+        if current > stamp:
+            return None
+    return None
+
+
+def _clock_outcome(rows: Sequence[Any], *, signal_index: int, horizon: int,
+                   anchor: str, direction: str, allow_backfill: bool,
+                   decision_at: datetime | None,
+                   signal_price: float | None = None,
+                   ) -> tuple[float | None, str | None, int | None]:
+    """Return an outcome whose entry and horizon are fixed on the wall clock.
+
+    The entry instant is the end of the signal bar, plus one minute for the
+    one-bar-skip variant.  ``signal_close`` prices it at the signal bar's
+    close (the original, non-executable anchor, kept as a diagnostic); the
+    open anchors price it at the open of the bar that starts exactly at that
+    instant, which must exist and must still have been in progress when the
+    decision was taken.  The outcome is the close of the bar that ends exactly
+    ``horizon`` minutes after the entry instant.  Minutes missing in between
+    do not move either end, and a missing entry or horizon bar is refused
+    rather than replaced by a neighbour.
+    """
+    signal_end = _bar_end(rows[signal_index])
+    if signal_end is None:
+        return None, "signal_end_unavailable", None
+    entry_at = signal_end + timedelta(minutes=_ANCHOR_DELAY_MINUTES[anchor])
+    if anchor == "signal_close":
+        entry_price = (signal_price if signal_price is not None
+                       else _number(_value(rows[signal_index], "close")))
+    else:
+        entry_index = _row_at(rows, signal_index + 1, entry_at)
+        if entry_index is None:
+            return None, "entry_bar_missing", None
+        entry_end = _bar_end(rows[entry_index])
+        if (decision_at is not None and entry_end is not None and
+                decision_at >= entry_end):
+            return None, "entry_bar_elapsed_before_decision", None
+        entry_price = _number(_value(rows[entry_index], "open"))
+    exit_index = _row_at(rows, signal_index + 1,
+                         entry_at + timedelta(minutes=int(horizon) - 1))
+    if exit_index is None:
+        return None, "horizon_bar_missing", None
+    future = rows[exit_index]
+    complete, reason, _available = _completed_record_is_available(
+        future, allow_backfill=allow_backfill, decision_at=decision_at)
+    if not complete:
+        return None, str(reason or "future_bar_unavailable"), None
+    future_close = _number(_value(future, "close"))
+    if (future_close is None or future_close <= 0 or entry_price is None or
+            entry_price <= 0):
+        return None, "future_price_invalid", None
+    sign = 1.0 if direction == "long" else -1.0
+    return sign * (future_close / entry_price - 1.0) * 10_000.0, None, exit_index
+
+
+def _clock_control_pool(rows: Sequence[Any], policy: _ControlPolicy, *,
+                        horizon: int, anchor: str, allow_backfill: bool,
+                        ) -> dict[int, tuple[int, float, float, float | None, float | None]]:
+    """Admissible wall-clock null draws for one session, keyed by minute.
+
+    Each value is ``(index, session_minute, long_return_bps,
+    decision_delay_seconds, outcome_observation_delay_seconds)``.  The control
+    uses exactly the candidate's anchor and horizon rule, so the two cannot
+    differ by construction after a missing minute.
+    """
+    pool: dict[int, tuple[int, float, float, float | None, float | None]] = {}
+    for signal_index in range(0, len(rows)):
+        minutes = policy.admissible(rows, signal_index)
+        if minutes is None:
+            continue
+        decision_at = _decision_at(
+            rows, signal_index, policy, allow_backfill=allow_backfill)
+        if decision_at is None:
+            continue
+        signal_ok, _reason, _available = _completed_record_is_available(
+            rows[signal_index], allow_backfill=allow_backfill)
+        if not signal_ok:
+            continue
+        value, _reason, exit_index = _clock_outcome(
+            rows, signal_index=signal_index, horizon=horizon, anchor=anchor,
+            direction="long", allow_backfill=allow_backfill,
+            decision_at=decision_at)
+        if value is None or exit_index is None:
+            continue
+        signal_end = _bar_end(rows[signal_index])
+        decision_delay = (max(0.0, (decision_at - signal_end).total_seconds())
+                          if signal_end is not None else None)
+        available = replay_available_at(
+            rows[exit_index], allow_historical_backfill_diagnostics=allow_backfill)
+        exit_end = _bar_end(rows[exit_index])
+        outcome_delay = (max(0.0, (available - exit_end).total_seconds())
+                         if available is not None and exit_end is not None
+                         else None)
+        pool.setdefault(int(round(minutes)), (
+            signal_index, minutes, value, decision_delay, outcome_delay))
+    return pool
+
+
+def _clock_control_return(
+        candidate_cell: tuple[str, str], candidate_minutes: float, *,
+        pools: Mapping[tuple[str, str], Mapping[int, tuple]],
+        candidate_index: int, direction: str,
+        tiers: Sequence[str] | None = None,
+        ) -> tuple[float | None, str | None, dict[str, Any]]:
+    """Average the wall-clock null pool matched to one candidate."""
+    choices, matching, excluded = _choose_controls(
+        candidate_cell, candidate_minutes, eligible=pools,
+        candidate_index=candidate_index, tiers=tiers)
+    if not choices:
+        if excluded is not None:
+            return None, "control_tier_not_registered", {
+                "matching": f"excluded_{excluded}", "pool": 0}
+        return None, "no_matched_control", {"matching": "none", "pool": 0}
+    sign = 1.0 if direction == "long" else -1.0
+    by_index = {(cell, item[0]): item for cell, minute_map in pools.items()
+                if cell in {choice[0] for choice in choices}
+                for item in minute_map.values()}
+    values: list[float] = []
+    minutes_used: list[float] = []
+    decision_delays: list[float] = []
+    outcome_delays: list[float] = []
+    for cell, index, item_minutes in choices:
+        item = by_index[(cell, index)]
+        values.append(sign * float(item[2]))
+        minutes_used.append(item_minutes)
+        if item[3] is not None:
+            decision_delays.append(float(item[3]))
+        if item[4] is not None:
+            outcome_delays.append(float(item[4]))
+    metadata: dict[str, Any] = {"matching": matching, "pool": len(values),
+                                "mean_session_minute": mean(minutes_used)}
     if decision_delays:
         metadata["mean_decision_delay_seconds"] = mean(decision_delays)
     if outcome_delays:
@@ -967,8 +1159,23 @@ def measure_signal_quality(
         eligibility_provenance: Mapping[str, Any] | None = None,
         bars_by_symbol: Mapping[str, Sequence[Any]] | None = None,
         measurement_scope: str = "fit_only",
+        outcome_anchor: str = "signal_close",
+        horizon_clock: str = "bar_count",
+        control_tiers: Sequence[str] | None = None,
+        delta_hurdle_bps: float | None = None,
         ) -> dict[str, Any]:
     """Measure conditional forward returns and a matched random-entry control.
+
+    The defaults reproduce the original measurement exactly: the outcome is
+    anchored at the signal bar's close and its horizon counts contiguous
+    bars.  ``outcome_anchor`` (``next_bar_open`` or ``skip_one_bar_open``) and
+    ``horizon_clock="wall_clock"`` select the executable, clock-defined
+    outcome described at :data:`OUTCOME_ANCHORS`; ``signal_close`` with
+    ``wall_clock`` is the close-anchored figure on the same clock.
+    ``control_tiers`` restricts which control tier may match a candidate; a
+    candidate whose tier is outside it is reported unmatched.
+    ``delta_hurdle_bps`` adds clustered tests of the control-adjusted delta
+    against that hurdle instead of against zero.
 
     ``precomputed_first_signals`` is an optional internal hand-off from
     :func:`research.fit_diagnostics._fit_prefixes`. When omitted, the
@@ -995,6 +1202,22 @@ def measure_signal_quality(
         cost_hurdle_bps = float(cost_hurdle_bps)
         if not math.isfinite(cost_hurdle_bps) or cost_hurdle_bps < 0:
             raise ValueError("cost_hurdle_bps must be finite and non-negative")
+    if outcome_anchor not in OUTCOME_ANCHORS:
+        raise ValueError(f"outcome_anchor must be one of {OUTCOME_ANCHORS}")
+    if horizon_clock not in HORIZON_CLOCKS:
+        raise ValueError(f"horizon_clock must be one of {HORIZON_CLOCKS}")
+    legacy_outcome = (outcome_anchor, horizon_clock) == ("signal_close", "bar_count")
+    if horizon_clock == "bar_count" and not legacy_outcome:
+        raise ValueError("open anchors are defined on the wall clock only")
+    if control_tiers is not None:
+        control_tiers = tuple(str(item) for item in control_tiers)
+        if not control_tiers or any(item not in CONTROL_TIERS
+                                    for item in control_tiers):
+            raise ValueError(f"control_tiers must be drawn from {CONTROL_TIERS}")
+    if delta_hurdle_bps is not None:
+        delta_hurdle_bps = float(delta_hurdle_bps)
+        if not math.isfinite(delta_hurdle_bps):
+            raise ValueError("delta_hurdle_bps must be finite")
     allow_backfill = _allow_backfill(policy)
     grouped: dict[tuple[str, str], list[Any]] = {}
     for row in bars:
@@ -1154,9 +1377,16 @@ def measure_signal_quality(
         cells: set[str] = set()
         # Built once per horizon rather than once per candidate: the null pool
         # for a session does not depend on which candidate is asking for it.
-        eligible = {cell: _eligible_by_minute(
-            rows, control_policy, horizon=horizon, allow_backfill=allow_backfill)
-            for cell, rows in grouped.items()}
+        if legacy_outcome:
+            eligible = {cell: _eligible_by_minute(
+                rows, control_policy, horizon=horizon,
+                allow_backfill=allow_backfill)
+                for cell, rows in grouped.items()}
+        else:
+            eligible = {cell: _clock_control_pool(
+                rows, control_policy, horizon=horizon, anchor=outcome_anchor,
+                allow_backfill=allow_backfill)
+                for cell, rows in grouped.items()}
         for symbol, session, rows, event in events:
             direction = str(event["signal"]["direction"])
             signal_index = int(event["signal_index"])
@@ -1164,13 +1394,24 @@ def measure_signal_quality(
             decision_at = event.get("entry_at")
             if not isinstance(decision_at, datetime):
                 decision_at = signal_end
-            candidate, reason = _forward_return(
-                # Keep the outcome clock anchored to the signal close.  The
-                # selected entry row remains provenance for delayed decisions
-                # but must not shift the conditional-return horizon.
-                rows, entry_index=signal_index + 1, horizon=horizon,
-                entry_price=float(event["entry_price"]), direction=direction,
-                allow_backfill=allow_backfill, decision_at=decision_at)
+            if legacy_outcome:
+                candidate, reason = _forward_return(
+                    # Keep the outcome clock anchored to the signal close.  The
+                    # selected entry row remains provenance for delayed
+                    # decisions but must not shift the conditional-return
+                    # horizon.
+                    rows, entry_index=signal_index + 1, horizon=horizon,
+                    entry_price=float(event["entry_price"]), direction=direction,
+                    allow_backfill=allow_backfill, decision_at=decision_at)
+                outcome_index = signal_index + horizon
+            else:
+                candidate, reason, clock_index = _clock_outcome(
+                    rows, signal_index=signal_index, horizon=horizon,
+                    anchor=outcome_anchor, direction=direction,
+                    allow_backfill=allow_backfill, decision_at=decision_at,
+                    signal_price=float(event["entry_price"]))
+                outcome_index = (clock_index if clock_index is not None
+                                 else len(rows))
             if candidate is None:
                 unavailable[str(reason or "candidate_unavailable")] += 1
                 continue
@@ -1182,7 +1423,6 @@ def measure_signal_quality(
             if signal_end is not None and decision_at is not None:
                 candidate_decision_delays.append(max(
                     0.0, (decision_at - signal_end).total_seconds()))
-            outcome_index = signal_index + horizon
             if outcome_index < len(rows):
                 outcome_available = replay_available_at(
                     rows[outcome_index],
@@ -1195,12 +1435,19 @@ def measure_signal_quality(
             minutes = (session_minutes(signal_stamp)
                        if signal_stamp is not None else 0.0)
             candidate_minutes.append(minutes)
-            control, control_reason, control_meta = _control_return(
-                (symbol, session), minutes, eligible=eligible,
-                session_rows=grouped,
-                candidate_index=int(event["signal_index"]),
-                direction=direction, horizon=horizon,
-                allow_backfill=allow_backfill, policy=control_policy)
+            if legacy_outcome:
+                control, control_reason, control_meta = _control_return(
+                    (symbol, session), minutes, eligible=eligible,
+                    session_rows=grouped,
+                    candidate_index=int(event["signal_index"]),
+                    direction=direction, horizon=horizon,
+                    allow_backfill=allow_backfill, policy=control_policy,
+                    tiers=control_tiers)
+            else:
+                control, control_reason, control_meta = _clock_control_return(
+                    (symbol, session), minutes, pools=eligible,
+                    candidate_index=int(event["signal_index"]),
+                    direction=direction, tiers=control_tiers)
             matching_counts[str(control_meta["matching"])] += 1
             if control is None:
                 unavailable[str(control_reason or "control_unavailable")] += 1
@@ -1303,6 +1550,25 @@ def measure_signal_quality(
             "symbol_clusters": len(symbols),
             "session_symbol_cells": len(cells),
         }
+        if delta_hurdle_bps is not None:
+            # The same session-clustered tests, of the delta against the
+            # hurdle rather than against zero.  The sign flip centres every
+            # paired delta on the hurdle before flipping whole sessions.
+            shifted_flip = (sign_flip_null_statistics(
+                [value - delta_hurdle_bps for value in paired_deltas],
+                delta_sessions, draws=DEFAULT_NULL_DRAWS)
+                if len(set(delta_sessions)) >= 2 else None)
+            horizon_metrics[f"{horizon}m"].update({
+                "delta_hurdle_bps": delta_hurdle_bps,
+                "candidate_minus_control_after_hurdle_cluster_t_stat": (
+                    cluster_robust_mean_inference(
+                        paired_deltas, delta_sessions,
+                        shift=delta_hurdle_bps)["t_stat"]),
+                "candidate_minus_control_after_hurdle_sign_flip_p_value": (
+                    shifted_flip["p_value"]
+                    if shifted_flip and shifted_flip.get("available")
+                    else None),
+            })
     # Build a compact summary from the actual event rejection categories.  A
     # precomputed fit hand-off may additionally supply detailed prefix counts;
     # those are copied only through the bounded summary helper.
@@ -1349,6 +1615,22 @@ def measure_signal_quality(
         "horizon_metrics": horizon_metrics,
         "eligibility_provenance": quality_provenance,
     }
+    if not legacy_outcome:
+        result["return_basis"] = (
+            f"{outcome_anchor}_to_wall_clock_horizon_close")
+        result["outcome_anchor"] = outcome_anchor
+        result["horizon_clock"] = horizon_clock
+        result["timing_policy"] = {
+            **result["timing_policy"],
+            "entry_semantics": {
+                "signal_close": "conditional_signal_close_anchor",
+                "next_bar_open": "open_of_bar_starting_at_signal_end",
+                "skip_one_bar_open": "open_of_bar_starting_one_minute_after_signal_end",
+            }[outcome_anchor],
+            "horizon": "close_of_bar_ending_horizon_minutes_after_entry_instant",
+        }
+    if control_tiers is not None:
+        result["control_tiers"] = list(control_tiers)
     if normalized["family"] == "cross_sectional_residual":
         context_rejections = {
             reason: count for reason, count in event_reasons.items()
@@ -1385,5 +1667,6 @@ def measure_signal_quality(
     return result
 
 
-__all__ = ["DEFAULT_HORIZONS", "SIGNAL_QUALITY_ELIGIBILITY_SCHEMA",
+__all__ = ["CONTROL_TIERS", "DEFAULT_HORIZONS", "HORIZON_CLOCKS",
+           "OUTCOME_ANCHORS", "SIGNAL_QUALITY_ELIGIBILITY_SCHEMA",
            "SIGNAL_QUALITY_SCHEMA", "measure_signal_quality"]

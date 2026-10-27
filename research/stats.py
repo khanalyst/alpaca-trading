@@ -7,12 +7,14 @@ recomputed rather than merely re-hashed.
 
 from __future__ import annotations
 
+from datetime import datetime
 import hashlib
 import json
 import math
 import random
 from statistics import NormalDist
 from typing import Mapping
+from zoneinfo import ZoneInfo
 
 
 PAIRED_SIGN_FLIP_NULL_ASSUMPTION = (
@@ -362,6 +364,76 @@ def student_t_sf(t: float, df: float) -> float:
     tail = 0.5 * _regularized_incomplete_beta(
         freedom / 2.0, 0.5, freedom / (freedom + value * value))
     return tail if value >= 0 else 1.0 - tail
+
+
+def student_t_isf(probability: float, df: float) -> float:
+    """Return ``t`` with ``P(T > t) = probability`` for Student's t.
+
+    The inverse of :func:`student_t_sf`, found by bisection so it agrees with
+    that function to its own precision.  A one-sided ``1 - alpha`` lower
+    confidence bound on a mean is ``mean - student_t_isf(alpha, df) * se``.
+    """
+    p, freedom = float(probability), float(df)
+    if not math.isfinite(p) or not 0.0 < p < 1.0:
+        raise ValueError("probability must be in (0,1)")
+    if not math.isfinite(freedom) or freedom <= 0:
+        raise ValueError("df must be a positive finite number")
+    low, high = -1.0, 1.0
+    while student_t_sf(low, freedom) < p:
+        low *= 2.0
+    while student_t_sf(high, freedom) > p:
+        high *= 2.0
+    for _ in range(200):
+        middle = 0.5 * (low + high)
+        if middle in (low, high):
+            break
+        if student_t_sf(middle, freedom) > p:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+
+
+def cluster_sign_flip_p_value(values, clusters, *, shift: float = 0.0,
+                              alternative: str = "greater",
+                              exact_max_clusters: int = 16,
+                              iterations: int = 20_000,
+                              seed: int | None = None) -> dict:
+    """One-sided sign-flip test of a clustered mean against ``shift``.
+
+    Each observation is centred on ``shift`` and summed into its cluster; the
+    cluster totals are sign-flipped as whole units.  Small cluster counts are
+    enumerated exactly, so the p-value at the session counts a paper trial or
+    a preregistered look actually has is not a Monte Carlo estimate.
+    ``alternative="less"`` tests the mean below ``shift``.
+    """
+    if alternative not in {"greater", "less"}:
+        raise ValueError("alternative must be greater or less")
+    centre = float(shift)
+    sign = 1.0 if alternative == "greater" else -1.0
+    centred, keys = [], []
+    for value, cluster in zip(values, clusters):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            centred.append(sign * (number - centre))
+            keys.append(str(cluster))
+    contributions = cluster_contributions(centred, keys)
+    common = {"kind": "cluster_sign_flip", "alternative": alternative,
+              "shift": centre, "clusters": len(contributions),
+              "observations": len(centred)}
+    if not contributions:
+        return {**common, "method": "unavailable", "exact": False,
+                "resamples": 0, "seed": None, "p_value": 1.0}
+    resolved_seed = int(stable_seed({"values": centred, "clusters": keys,
+                                     "iterations": int(iterations)})
+                        if seed is None else seed)
+    return {**common, **_sign_flip(
+        contributions, sum(contributions),
+        exact_max_clusters=exact_max_clusters, iterations=iterations,
+        seed=resolved_seed)}
 
 
 def cluster_robust_mean_inference(values, clusters, *,
@@ -1274,11 +1346,30 @@ cross_family_dependence = cross_family_dependence_report
 family_dependence_report = cross_family_dependence_report
 
 
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _new_york_session_ordinal(timestamp: float) -> int | None:
+    """Return the New York calendar date of an epoch timestamp as an ordinal."""
+    try:
+        return datetime.fromtimestamp(float(timestamp), _NEW_YORK).date().toordinal()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def paired_cluster_sign_flip(
         pairs: list[tuple[float, float, float]], *,
-        cluster_seconds: int = 21_600, exact_max_clusters: int = 16,
+        cluster_seconds: int | None = None, exact_max_clusters: int = 16,
         iterations: int = 20_000, seed: int = 20260728) -> dict:
-    """Test paired candidate-minus-baseline deltas by market-time cluster."""
+    """Test paired candidate-minus-baseline deltas by market-time cluster.
+
+    Without ``cluster_seconds`` every pair is clustered by its New York
+    session date, so one regular session is always one cluster.  The former
+    default of 21,600 seconds cut each 09:30 to 16:00 session at 18:00 UTC
+    into two clusters and overstated the number of independent units.  A
+    caller that passes ``cluster_seconds`` keeps fixed epoch buckets exactly
+    as before (the gates pass 86,400).
+    """
     clean: list[tuple[float, float]] = []
     for timestamp, candidate, baseline in pairs:
         try:
@@ -1286,19 +1377,28 @@ def paired_cluster_sign_flip(
         except (TypeError, ValueError):
             continue
         if all(math.isfinite(value) for value in values):
+            if (cluster_seconds is None and
+                    _new_york_session_ordinal(values[0]) is None):
+                continue
             clean.append((values[0], values[1] - values[2]))
     clusters: dict[int, list[float]] = {}
     for timestamp, delta in clean:
-        clusters.setdefault(int(timestamp // cluster_seconds), []).append(delta)
+        key = (int(timestamp // cluster_seconds) if cluster_seconds is not None
+               else _new_york_session_ordinal(timestamp))
+        clusters.setdefault(int(key), []).append(delta)
     contributions = [sum(clusters[key]) for key in sorted(clusters)]
     observed_sum = sum(contributions)
     common = {
         "kind": "paired_cluster_sign_flip",
         "null_assumption": PAIRED_SIGN_FLIP_NULL_ASSUMPTION,
-        "alternative": "greater", "cluster_seconds": int(cluster_seconds),
+        "alternative": "greater",
+        "cluster_seconds": (int(cluster_seconds)
+                            if cluster_seconds is not None else None),
         "clusters": len(contributions), "paired_n": len(clean),
         "observed_mean": observed_sum / len(clean) if clean else 0.0,
     }
+    if cluster_seconds is None:
+        common["cluster_unit"] = "new_york_session_date"
     if not clean or not contributions:
         return {**common, "method": "unavailable", "exact": False,
                 "resamples": 0, "seed": None, "p_value": 1.0}
@@ -1375,7 +1475,8 @@ __all__ = ["DEPENDENCE_POLICY_SCHEMA", "DEPENDENCE_MIN_COMPLETE_SESSIONS",
            "DEFAULT_CLUSTER_BLOCK_LENGTH",
            "benjamini_hochberg", "benjamini_yekutieli",
            "cluster_bootstrap_lower_bound", "cluster_contributions",
-           "cluster_robust_mean_inference", "student_t_sf",
+           "cluster_robust_mean_inference", "cluster_sign_flip_p_value",
+           "student_t_isf", "student_t_sf",
            "clustered_mde_power_report", "clustered_mde_report",
            "clustered_mde_power", "mde_power_report",
            "effective_breadth_report",
