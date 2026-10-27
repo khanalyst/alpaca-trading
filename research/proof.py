@@ -14,16 +14,20 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import re
+import tempfile
 from threading import Thread
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
 from .proof_payload import (
     PROOF_SCHEMA,
+    PROOF_SCHEMA_V1,
+    PROOF_SCHEMA_V2,
     SESSION_ZONE,
     build_proof_payload,
     canonical_json,
     payload_hash,
+    proof_statistics,
     render_markdown,
 )
 
@@ -113,44 +117,98 @@ def send_webhook(url: str, metadata: Mapping[str, Any], *,
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _publish_once(target: Path, data: bytes) -> bool:
+    """Publish ``data`` at ``target`` atomically; never replace an existing file.
+
+    The bytes are written and fsynced under a temporary name in the same
+    directory, then hard-linked to the final name, which fails if the name
+    exists.  The final name therefore never exists partially written: a
+    crash or a full disk leaves at most a stray temporary file, and a retry
+    with the same payload succeeds (review finding D1-10).  Returns whether
+    this call created the artefact.
+    """
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".partial", dir=str(target.parent))
+    try:
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, str(target))
+        except FileExistsError:
+            if target.read_bytes() != data:
+                raise RuntimeError(
+                    f"existing proof artifact does not match payload: {target}")
+            return False
+        _fsync_directory(target.parent)
+        return True
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _artifact_path(output_root: str | Path, vehicle: str, candidate_id: str,
+                   digest: str, hash_prefix_length: int) -> Path:
+    safe_candidate = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(candidate_id)).strip("._") or "candidate"
+    return Path(output_root) / vehicle / f"{safe_candidate}-{digest[:hash_prefix_length]}.md"
+
+
 def write_proof(ledger: Any, candidate_id: str, context: Mapping[str, Any] | None = None,
                 output_root: str | Path = "research/results/edges",
                 webhook_url: str | None = None,
                 webhook_sender: Callable[..., Any] | None = None,
                 webhook_timeout_seconds: float = 5.0,
-                hash_prefix_length: int = 16) -> ProofResult:
-    """Create one deterministic artifact atomically and never overwrite it."""
+                hash_prefix_length: int = 16,
+                schema: str | None = None) -> ProofResult:
+    """Create one deterministic artifact atomically and never overwrite it.
 
-    payload = build_proof_payload(ledger, candidate_id, context)
-    digest = payload_hash(payload)
+    Without ``schema`` an artefact already written under the v1 payload is
+    reproduced exactly (no new file, no webhook), and anything new is written
+    under the current payload schema.
+    """
+
     if hash_prefix_length < 8 or hash_prefix_length > 64:
         raise ValueError("hash_prefix_length must be between 8 and 64")
+    payload = None
+    if schema is None:
+        legacy = build_proof_payload(ledger, candidate_id, context,
+                                     schema=PROOF_SCHEMA_V1)
+        legacy_digest = payload_hash(legacy)
+        legacy_target = _artifact_path(output_root, str(legacy["vehicle"]),
+                                       candidate_id, legacy_digest,
+                                       hash_prefix_length)
+        if legacy_target.exists():
+            payload, digest = legacy, legacy_digest
+    if payload is None:
+        payload = build_proof_payload(ledger, candidate_id, context,
+                                      schema=schema or PROOF_SCHEMA)
+        digest = payload_hash(payload)
     vehicle = str(payload["vehicle"])
-    safe_candidate = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(candidate_id)).strip("._") or "candidate"
-    target_dir = Path(output_root) / vehicle
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"{safe_candidate}-{digest[:hash_prefix_length]}.md"
+    target = _artifact_path(output_root, vehicle, candidate_id, digest,
+                            hash_prefix_length)
+    target.parent.mkdir(parents=True, exist_ok=True)
     markdown = render_markdown(payload, digest)
-    data = markdown.encode("utf-8")
-    # O_EXCL gives atomic create/no overwrite semantics even for concurrent
-    # proof writers targeting the same candidate and payload.
-    created = True
-    try:
-        descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        created = False
-        if target.read_bytes() != data:
-            raise RuntimeError(f"existing proof artifact does not match payload: {target}")
-    else:
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                descriptor = -1
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-        finally:
-            if descriptor != -1:
-                os.close(descriptor)
+    created = _publish_once(target, markdown.encode("utf-8"))
 
     webhook = None
     if webhook_url and created:
@@ -164,6 +222,7 @@ def write_proof(ledger: Any, candidate_id: str, context: Mapping[str, Any] | Non
 
 
 __all__ = [
-    "PROOF_SCHEMA", "ProofResult", "canonical_json", "payload_hash",
-    "build_proof_payload", "render_markdown", "send_webhook", "write_proof",
+    "PROOF_SCHEMA", "PROOF_SCHEMA_V1", "PROOF_SCHEMA_V2", "ProofResult",
+    "canonical_json", "payload_hash", "build_proof_payload",
+    "proof_statistics", "render_markdown", "send_webhook", "write_proof",
 ]
