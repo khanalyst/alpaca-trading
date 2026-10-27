@@ -1,0 +1,3851 @@
+{
+"arms": [
+{
+"config_identity": "485d6e6479c738fa1cce4decc92f041b3a5d7f73c08c7e09493a6415f3c85fc8",
+"effective_config": "9d5ce998b1b5a63be5167ddb4618550bef15ccff4a001d970d96bf474c2c684f",
+"fallback_config": "6e751972739b13e2d4573402d68076404199fc9e60796f773f46f1f5680dfef1",
+"replay_bar_fallback": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"replay_strict": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"runtime": [
+{
+"full_scan": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"spec_identity": "f9fed37355ca0e1807d151ede4ebe05ec74c291a6f7cb07a7744be328dbce4f9",
+"strict_config": "1f1c3a3b6553053b3f2c520d505eb29f44eb7a01da8f93cd0d34e977c85bb48c",
+"variant_id": "ibr.baseline"
+},
+{
+"config_identity": "79d5899d74751f5d94ead016d0c4e9abf0f16d13d907ca77637f1edfa4219b0b",
+"effective_config": "9a35f5a7acc3bec1e2199a0e1697feb3f436bc5bddc9820546e4373f8228febf",
+"fallback_config": "656d217003129bd3d0de8b623060cf033a3d501e98a68412b667eab9a2bfe4ec",
+"replay_bar_fallback": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 30,
+"observed": 29
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"replay_strict": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 30,
+"observed": 29
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"runtime": [
+{
+"full_scan": "c44d9a0caf530061081da948e276c8decc38303a91d34a8d4a3e1856290a18b9",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "c44d9a0caf530061081da948e276c8decc38303a91d34a8d4a3e1856290a18b9"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "d2ead082ceee6554f1de98c9edcde6e7daa9f83fa300b9d0fdeb76ac3add958f",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "d2ead082ceee6554f1de98c9edcde6e7daa9f83fa300b9d0fdeb76ac3add958f"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "fa1b5fb64fab1eb17b76ce1561ca464f1733ca961bd6b69034223a277f252b17",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "fa1b5fb64fab1eb17b76ce1561ca464f1733ca961bd6b69034223a277f252b17"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "e45ee98b638e2cdbbc2323b764d1af2fdc20a939c06cf9210505ab8a070039bf",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "e45ee98b638e2cdbbc2323b764d1af2fdc20a939c06cf9210505ab8a070039bf"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "0e482b399860caa559754b633e106604a9070675c2c251f498eb115098c5098f",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "0e482b399860caa559754b633e106604a9070675c2c251f498eb115098c5098f"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "1fdd38597e9a11901b1f3a70203f15193035ef9886e8d796a25b1d24cac16a8d",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "1fdd38597e9a11901b1f3a70203f15193035ef9886e8d796a25b1d24cac16a8d"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "31d24f87dac664b3b49b7085b4ef8511d7d067ec3a1f4328a50aa13ce3d89a2c",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "31d24f87dac664b3b49b7085b4ef8511d7d067ec3a1f4328a50aa13ce3d89a2c"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "19e3106d6036928ca320a50617618b8e094ffd93f711de51128c5d62f51d44ab",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "19e3106d6036928ca320a50617618b8e094ffd93f711de51128c5d62f51d44ab"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "75f05e9455869591c66514aeb804230cd60eba8981208fa200710aefa0385dd9",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "75f05e9455869591c66514aeb804230cd60eba8981208fa200710aefa0385dd9"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "05eefa3174dd55dd69bc26753ad6fb6cba8d5c14e76bca5febe5d4754e4f1e40",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "05eefa3174dd55dd69bc26753ad6fb6cba8d5c14e76bca5febe5d4754e4f1e40"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "66c7067c92c1cbaa99aafc7e3c899078a9ff4ab6be2289ef8561f974137dd823",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "66c7067c92c1cbaa99aafc7e3c899078a9ff4ab6be2289ef8561f974137dd823"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "97df31b2f73956c5df3e29c0f0edd7087e945c3a7ddc0b37120adb82eda0b99f",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "97df31b2f73956c5df3e29c0f0edd7087e945c3a7ddc0b37120adb82eda0b99f"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"spec_identity": "89ef45eb670b3c0274a83376c5a660232826c13d9bf1decf00d37c13311a2d56",
+"strict_config": "8896cd2fe405ecf862c6be7dc93c0f1211f93c120651b9253f102c17a1dcf951",
+"variant_id": "ibr.range.30"
+},
+{
+"config_identity": "17c7926808ce001077812bc07fbebb546b83eb1631f8422d62f02c7c60913247",
+"effective_config": "9362773760f81f305725aefcf436b8083c61ed7481c6bfffa69468e9c3200fbb",
+"fallback_config": "3696f5c80210b60627d123ac09f15b5477c36a1154251cb069be188d02d4c996",
+"replay_bar_fallback": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 45,
+"observed": 44
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"replay_strict": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 45,
+"observed": 44
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"runtime": [
+{
+"full_scan": "02c067b980894bc89bcb9e323189b3bd6b3cf1707dc7ccf3cc33dd95c32299f5",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "02c067b980894bc89bcb9e323189b3bd6b3cf1707dc7ccf3cc33dd95c32299f5"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "70a68131e05f6ff82f2b4a689a0f5f51cf78ceaa2f684d53019d9f127a5b4704",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "70a68131e05f6ff82f2b4a689a0f5f51cf78ceaa2f684d53019d9f127a5b4704"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "f448ed0411895de3d1b57128fa9547294001f147788ae954104677d8fa90555a",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "f448ed0411895de3d1b57128fa9547294001f147788ae954104677d8fa90555a"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "a0dc27f98b96cd2c5829e818990123c8071c8e6ccccec413ae9eb0173b2f1e44",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "a0dc27f98b96cd2c5829e818990123c8071c8e6ccccec413ae9eb0173b2f1e44"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "25401f7d0f1454b572241034c33e71403454e89fafb2fe553e393d79808b6435",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "25401f7d0f1454b572241034c33e71403454e89fafb2fe553e393d79808b6435"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "c1beab051cc60e342e65008ecdb8377a54997cd45945461375caaf01a568b3a9",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "c1beab051cc60e342e65008ecdb8377a54997cd45945461375caaf01a568b3a9"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "774e3bab64b977b4f9660ecc48c21e948e8dee380ee400fa3b14a50932116a5e",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "774e3bab64b977b4f9660ecc48c21e948e8dee380ee400fa3b14a50932116a5e"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "e67cc072639969f05626515a074dbd30c8cb230ac99583478c5ae795f73a6445",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "e67cc072639969f05626515a074dbd30c8cb230ac99583478c5ae795f73a6445"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "62a4331da749cec5726a7e958720c42cc1f522dc0a1f4f04b350d9847a4d1e05",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "62a4331da749cec5726a7e958720c42cc1f522dc0a1f4f04b350d9847a4d1e05"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "c0b1c5db4ba0cd9139821c43af1d5388d4f9b1c32e93022bbca8e290eb6d53d2",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "c0b1c5db4ba0cd9139821c43af1d5388d4f9b1c32e93022bbca8e290eb6d53d2"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "623d8d52a8e03f994c4917966a0b9ad359bd4551f0e244378b66b687e5d93528",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "623d8d52a8e03f994c4917966a0b9ad359bd4551f0e244378b66b687e5d93528"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "00cc690862e823dddcd5ac26021ee0e82cf61f916fee11d6d0ec2e14002a5681",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "00cc690862e823dddcd5ac26021ee0e82cf61f916fee11d6d0ec2e14002a5681"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"spec_identity": "b56bd24bfe316f677d57ab67cbe182cb57d7d5829d05873d8c4b14cde11aac21",
+"strict_config": "1b9cfe0ba2aadf6e430763f74d3dcd9f16a7b44c32ce650d30f376b1745009d3",
+"variant_id": "ibr.range.45"
+},
+{
+"config_identity": "c4d9431062ca7a7d4d5414d2cb08295af765a14f43fd4bd709c9aaefc3b6e335",
+"effective_config": "7d693a5f4841d539c2733c00c33911e4272179068809a827318eddc02206a5f6",
+"fallback_config": "f4bb7d6ab94eab549e6656573fa214507c2e3f49b2c378893c57474e844c8293",
+"replay_bar_fallback": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "ab5fdbaa9428f014728d6ddb386054423371161d3d66953de7fdf03ac5a42a33",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "71f197a50aaebaea50496f0c492050f0f7cd2dc7732d65ce31eae6fb90302431",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "6df1d7514161e901661975cdb6f1bbe9f9dd42328cbe62f5007b965f2adac3e7",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "d90a1e2e02fe2c3816cc3aa2085c549bc0c4cd05b20984a6d517ab3d770490b8",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "7dc4677c97b48ecacd328571871927dc50d27b8904308c157a4c85da82ba7873",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "39188bb44b14219e5097495a0a3e170ffd61641fb52e507850fb8d22d3968482",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "da24f67806bfc656af4839b36d751dc182af7ce6ce472aa572b3b2e3cbead0f3",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "d870d864dc4ce285185e69ab99a4fc7ea9d3c363aadc39ab9a53594707bf8011",
+"symbol": "XLB"
+}
+]
+},
+"replay_strict": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "ab5fdbaa9428f014728d6ddb386054423371161d3d66953de7fdf03ac5a42a33",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "71f197a50aaebaea50496f0c492050f0f7cd2dc7732d65ce31eae6fb90302431",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "6df1d7514161e901661975cdb6f1bbe9f9dd42328cbe62f5007b965f2adac3e7",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "d90a1e2e02fe2c3816cc3aa2085c549bc0c4cd05b20984a6d517ab3d770490b8",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "7dc4677c97b48ecacd328571871927dc50d27b8904308c157a4c85da82ba7873",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "39188bb44b14219e5097495a0a3e170ffd61641fb52e507850fb8d22d3968482",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "da24f67806bfc656af4839b36d751dc182af7ce6ce472aa572b3b2e3cbead0f3",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "d870d864dc4ce285185e69ab99a4fc7ea9d3c363aadc39ab9a53594707bf8011",
+"symbol": "XLB"
+}
+]
+},
+"runtime": [
+{
+"full_scan": "e0b20c0092fc3d41b6a7aa562df953d91df3ce67d5b3400d081e2294061e6adb",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "e0b20c0092fc3d41b6a7aa562df953d91df3ce67d5b3400d081e2294061e6adb"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "158be14bb1e10fefc3680eecab72d1c43e79f23abbb4142b421d4135a2f5d59e",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "158be14bb1e10fefc3680eecab72d1c43e79f23abbb4142b421d4135a2f5d59e"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "2d3ec808126377d6b33b6edf438a47ad1ab71d319d13da35edf7d83ac94ca3ff",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "2d3ec808126377d6b33b6edf438a47ad1ab71d319d13da35edf7d83ac94ca3ff"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "c3e3d18074b683df526476e49d234881599934c880c6e78815f834945b5951da",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "c3e3d18074b683df526476e49d234881599934c880c6e78815f834945b5951da"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "5cd4b9521bf1c4c23e81a0d201915abf55f0a4a60a5ee0db425b9dcabb54d72a",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "5cd4b9521bf1c4c23e81a0d201915abf55f0a4a60a5ee0db425b9dcabb54d72a"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "22b33ae3cf1dbc1e32a288f7ee04b3a059ff33fa92e23e3306db8a0ef1920093",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "22b33ae3cf1dbc1e32a288f7ee04b3a059ff33fa92e23e3306db8a0ef1920093"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "7efb99575ef79a7785d0c5a00e5a2f3b60666b7022285dbec8f188c10b9e75f7",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "7efb99575ef79a7785d0c5a00e5a2f3b60666b7022285dbec8f188c10b9e75f7"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "32de220439306cc19efa9ecc8a95dfd6a01e33c1be5e2a33d87d81806b932204",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "32de220439306cc19efa9ecc8a95dfd6a01e33c1be5e2a33d87d81806b932204"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "0fbca65caa53a70f37a62c743525ce07a24f16439ffcac319a384f5c31ec311d",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "0fbca65caa53a70f37a62c743525ce07a24f16439ffcac319a384f5c31ec311d"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "fdbec60d1f1837ef362159203287157bb4819289db53f433c6296bb3e402d7d1",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "fdbec60d1f1837ef362159203287157bb4819289db53f433c6296bb3e402d7d1"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "58cfbdbf394c0835c63e62985b8786f624287a654ead139af5286ba3ccbd8d22",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "58cfbdbf394c0835c63e62985b8786f624287a654ead139af5286ba3ccbd8d22"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "b597fb44d0c501a15e678d39ace5315615f4bfa005a9e58ef0aa2a728de4ece6",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "b597fb44d0c501a15e678d39ace5315615f4bfa005a9e58ef0aa2a728de4ece6"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"spec_identity": "8e702477d3272be577455d0a355acad4c7dec998b407191744986a9e44a868e2",
+"strict_config": "51facd78b9e61bdba0f4bd88de8ce5b9320cf1c0e69d8bd66796da853c113adc",
+"variant_id": "ibr.target.1_5r"
+},
+{
+"config_identity": "7784a2e9390e663e3c50db49855ed13c1e630faf5c9db9842e3b94fa10ccead8",
+"effective_config": "3f50db3a37716466388ce4ad245195bc6bcdb37b5590ebefa63fe160af204a43",
+"fallback_config": "5e534515c4921dd17b194d5b8b9c15c4a1523cc710d9ad1dcf20763d8f7e88df",
+"replay_bar_fallback": {
+"authorizing": false,
+"diagnostic_only": true,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-03",
+"sha256": "b70926b39aebd0f1d82487759b10e2f907b7cffd98aae7027677ab9ae31bb780",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "bf4eb44d81d4dc922214a725b04afe904ef2a924726b7398d558b52c17fbc424",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "e23631d04afbb12e1604aadf9562b374f5510a08f28f7368681c4fe7c67a6cb3",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-10",
+"sha256": "7e1d825cc2d84343908f37f3762dd37d51396702790fc7cfad55b39114ca542a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "2126c41a6aa288300b3f611c18ac98c954dd7a4210291cd8aeecf3a062eca8da",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "6a62d271ec2d5a0baf3b12f006bfcff210c1b6c0ceee9ba40073c5c1e96c0779",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "3b64a169a5fad158c32078453d8679b0061ef77ccaa69c14485ec26582531535",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "cab0aafff96f94629d68421bff48b1e20e2af6e0dfae5b02e8e4486eef0206e2",
+"symbol": "XLB"
+}
+]
+},
+"replay_strict": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_quote_at_force_flat_exit",
+"session_date": "2026-03-10",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_quote_at_force_flat_exit",
+"session_date": "2026-03-05",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-03",
+"sha256": "b70926b39aebd0f1d82487759b10e2f907b7cffd98aae7027677ab9ae31bb780",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "bf4eb44d81d4dc922214a725b04afe904ef2a924726b7398d558b52c17fbc424",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "e23631d04afbb12e1604aadf9562b374f5510a08f28f7368681c4fe7c67a6cb3",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "2126c41a6aa288300b3f611c18ac98c954dd7a4210291cd8aeecf3a062eca8da",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "3b64a169a5fad158c32078453d8679b0061ef77ccaa69c14485ec26582531535",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "cab0aafff96f94629d68421bff48b1e20e2af6e0dfae5b02e8e4486eef0206e2",
+"symbol": "XLB"
+}
+]
+},
+"runtime": [
+{
+"full_scan": "f99356d0cdaf201c0c6f10c0dffa16136c34022e89c10d16ff2332143a3f467e",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "f99356d0cdaf201c0c6f10c0dffa16136c34022e89c10d16ff2332143a3f467e"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "4d1b0c2d235089459a6acf919a0d1598f8bad897a7ad080a17b7ca4dd6794e46",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "4d1b0c2d235089459a6acf919a0d1598f8bad897a7ad080a17b7ca4dd6794e46"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "c848a9ea3a3cd21c4f98baca143371073323ca23088c4b79d73c950e6c5a3b4f",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "c848a9ea3a3cd21c4f98baca143371073323ca23088c4b79d73c950e6c5a3b4f"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "3d6fc4a7540459a63c856a82f5900b38ff60fc9a4aa49a32b8f3bf36e66f11bf",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "3d6fc4a7540459a63c856a82f5900b38ff60fc9a4aa49a32b8f3bf36e66f11bf"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "ac799c71089a06b9f02080cc86a170e7ea37597af408494b20770d509ffcf6f7",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "ac799c71089a06b9f02080cc86a170e7ea37597af408494b20770d509ffcf6f7"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "700e42a8f8e1a3cfb7c0b02e957324b863e2d3fbba1ad5e1197515622b233ad5",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "700e42a8f8e1a3cfb7c0b02e957324b863e2d3fbba1ad5e1197515622b233ad5"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "9a707390beb71715f90c778be4db1b61f72f19c61c6b8af96643c9e324a1f077",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "9a707390beb71715f90c778be4db1b61f72f19c61c6b8af96643c9e324a1f077"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "eea6d17cba9a543676207f976f7b651156703c7aa7de254e58ee27c9e0199346",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "eea6d17cba9a543676207f976f7b651156703c7aa7de254e58ee27c9e0199346"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "e18446edbc81102735c73b9323f9c0ee1b24c79d7cd2542317ae524ce9ffd1c9",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "e18446edbc81102735c73b9323f9c0ee1b24c79d7cd2542317ae524ce9ffd1c9"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "5bfa2413eb4c737b2453c01bad810bd7854c50a7b47cfad944e858165c71cfb7",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "5bfa2413eb4c737b2453c01bad810bd7854c50a7b47cfad944e858165c71cfb7"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "f5a20e014e99138a951e9bfab7c58e9d303412bd291ad5b648bc896e376a4ff6",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "f5a20e014e99138a951e9bfab7c58e9d303412bd291ad5b648bc896e376a4ff6"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "6f7252403e07308f6a7f963b8bf55332afa2044195e653da0cdc0a11a8058627",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "6f7252403e07308f6a7f963b8bf55332afa2044195e653da0cdc0a11a8058627"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"spec_identity": "8616f43d5b06f5fb1700bac8eb2153308e32d7356ac6bf7d1c87319e14b12a8a",
+"strict_config": "0a346d557a3f4c2d024f6c43d6eeecc56a0f5beafe6805ab0624c72d8169bbcb",
+"variant_id": "ibr.target.3r"
+},
+{
+"config_identity": "916e44bd2806d51389026301309570690fd852fdab771b91e9d381eba1ebb9dc",
+"effective_config": "9a47c72159fb6c4e2b34cdd2ac9a6758ce0063a243dedcf8fc698311a2c983b1",
+"fallback_config": "4900642f9d283f97a791c21b71da080c0ef92082300760be7526a21a662dc73c",
+"replay_bar_fallback": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"replay_strict": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"runtime": [
+{
+"full_scan": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"spec_identity": "153d6f9e39a175e8f0ff201d2c0ad5b1cfe1bd6c286c4f2d54e453c0d97b58eb",
+"strict_config": "67d5aad5d123c8bafae955c3f5f10f08709287a6cb0617492f19c00807f1b066",
+"variant_id": "ibr.buffer.0bps"
+},
+{
+"config_identity": "8cd114b13715e0e6998ef92ff9868bddb02057b9cedf32aa21a3050b0eab4d22",
+"effective_config": "47d4b30fa7a179258bf1dc95cf6294fe3c42e491f6230520cd5f3bcea450275a",
+"fallback_config": "803a17f5a8f9f2332c6530cb5e21f7fd388b70f5c038ad4fbebb29d5644631bb",
+"replay_bar_fallback": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"replay_strict": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-02",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 15,
+"observed": 14
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {
+"authored_stop_distance": "f:0.8400000000000034",
+"authored_stop_distance_bps": "f:95.35702122828964",
+"effective_stop_floor_bps": "f:30.0",
+"reject_stage": "risk_geometry",
+"stop_geometry_activation_reason": "activation_disabled",
+"stop_geometry_max_cost_to_risk_ratio": "f:0.3",
+"stop_geometry_scenario_bps": "f:9.0",
+"stress_floor_binding": true
+},
+"reason": "stressed_cost_risk_limit",
+"session_date": "2026-03-04",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "exact_session_calendar_missing",
+"session_date": "2026-03-06",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "a060d861f7de124509ceb30284543cc15ffdc156124941151de3c6ea814d3246",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "30a96ce1917a6485da68082db1ccc8baf1ad47e52eafbbc113ffd0b6d032d7db",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "9d9f7aed45a4d6a9bf92fb9f64e01ecf8d739d20058b494dc656c0d0ae9f0f9a",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "eb95050d87f20ba1db8bf8c3bd156e9eda9251837a6bd56e2a10faadf4ee8df1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "cfcad98adec972b39796d0992c691b680c7943081cb4d96894a7acf6e507833f",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "6f82fc95f452ecd37d1c43a8981700b6df2ecf276f99b5eb4f796156b45a5f47",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "708c8765f39a194aa018ceb87cef09050d9ad4117d050d17db2f610463219425",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "2c792cc393c62071424087345056cf1d2d4a692033cf1565e071c4bff2405762",
+"symbol": "XLB"
+}
+]
+},
+"runtime": [
+{
+"full_scan": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"spec_identity": "be63d7d8b9cbb4fb3f96c34ec94e97a5ffc646d4c6fc8666783e18c78c72a47f",
+"strict_config": "5d1f277ff0072424fe6d1c5030c856eb62aaf71ddaea0fd13469b60515ae3dfb",
+"variant_id": "ibr.buffer.10bps"
+}
+],
+"legacy_research_defaults": {
+"config": "87a538005b10445bf7ed97dbb2f16c69a218ce245f90b1a7783093e52cb53c94",
+"replay_bar_fallback": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 30,
+"observed": 29
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 30,
+"observed": 29
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-02",
+"sha256": "e0c614ae1dfc21ff4a87bfc4cd9aad6e89b6981006a7172f3e5418fef95a6bbe",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "ac6170ef4a756ac6d7c6b378704f53c56a4ddba12fa577e7b1350ea098228f99",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "2869ffac6fbc07e38661747fc43cedc5bd01cfb9b705b478edb3e2ee1adc14c1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "ae978d3c55e732b2bca35076b7145cd2572d423338ba54d5e1241add1ca63953",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "3bb561e2e0a152053cd469874f900c724586c87b526098de5ba2a756a8af9a06",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "1ab45e9bc142f0708838be8b97a021169ff37ce5e9fe21bcdb8ccfec091eb4e2",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-02",
+"sha256": "ab5d0434cff9c86bf9a472b2a4bda2dff8d203422baa2da632ab55c32d3d19a5",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-04",
+"sha256": "7876ed38338dae14aba7fc157f9fce4d16dd0c39709d215053ee672999aa0d8a",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "9afe28ec43c1c07ce6856f77094705c1a06a89767fe4009a44ec6766b1fcc5df",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-06",
+"sha256": "c35f2286088550c6768c7abf0a3da6e3873fccff9ead976bb21d395b27cec15c",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "5e8de602c5990069960bdecd88e22e766ca4aa8a59a24af3add36f8316a2f5dc",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "25219100ed642613a53fde677326d58635cb15fe92c981a1bafaa12579de57f3",
+"symbol": "XLB"
+}
+]
+},
+"replay_default": {
+"authorizing": true,
+"diagnostic_only": false,
+"refusals": [
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-04",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 30,
+"observed": 29
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-06",
+"symbol": "SPY",
+"vehicle": "equity"
+},
+{
+"detail": {
+"expected": 30,
+"observed": 29
+},
+"reason": "incomplete_opening_range",
+"session_date": "2026-03-03",
+"symbol": "XLB",
+"vehicle": "equity"
+},
+{
+"detail": {},
+"reason": "no_breakout",
+"session_date": "2026-03-11",
+"symbol": "XLB",
+"vehicle": "equity"
+}
+],
+"trades": [
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-02",
+"sha256": "e0c614ae1dfc21ff4a87bfc4cd9aad6e89b6981006a7172f3e5418fef95a6bbe",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-03",
+"sha256": "ac6170ef4a756ac6d7c6b378704f53c56a4ddba12fa577e7b1350ea098228f99",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-05",
+"sha256": "2869ffac6fbc07e38661747fc43cedc5bd01cfb9b705b478edb3e2ee1adc14c1",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "ae978d3c55e732b2bca35076b7145cd2572d423338ba54d5e1241add1ca63953",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "3bb561e2e0a152053cd469874f900c724586c87b526098de5ba2a756a8af9a06",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-11",
+"sha256": "1ab45e9bc142f0708838be8b97a021169ff37ce5e9fe21bcdb8ccfec091eb4e2",
+"symbol": "SPY"
+},
+{
+"canonical_exit_reason": "session_force_flat",
+"exit_reason": "force_flat",
+"session_date": "d:2026-03-02",
+"sha256": "ab5d0434cff9c86bf9a472b2a4bda2dff8d203422baa2da632ab55c32d3d19a5",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-04",
+"sha256": "7876ed38338dae14aba7fc157f9fce4d16dd0c39709d215053ee672999aa0d8a",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-05",
+"sha256": "9afe28ec43c1c07ce6856f77094705c1a06a89767fe4009a44ec6766b1fcc5df",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-06",
+"sha256": "c35f2286088550c6768c7abf0a3da6e3873fccff9ead976bb21d395b27cec15c",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-09",
+"sha256": "5e8de602c5990069960bdecd88e22e766ca4aa8a59a24af3add36f8316a2f5dc",
+"symbol": "XLB"
+},
+{
+"canonical_exit_reason": "target",
+"exit_reason": "target",
+"session_date": "d:2026-03-10",
+"sha256": "25219100ed642613a53fde677326d58635cb15fe92c981a1bafaa12579de57f3",
+"symbol": "XLB"
+}
+]
+}
+},
+"record_keys": {
+"effective_config": [
+"broker",
+"costs",
+"execution",
+"mode",
+"replay",
+"research",
+"risk",
+"session",
+"strategy",
+"universe"
+],
+"replay_config": [
+"atr_period",
+"breakout_buffer_bps",
+"close_confirmed",
+"costs",
+"force_flat",
+"max_entry_extension_r",
+"max_ibr_width_atr",
+"max_ibr_width_pct",
+"max_spread_bps",
+"min_ibr_width_atr",
+"min_relative_volume",
+"policy",
+"quantity",
+"range_minutes",
+"range_stop",
+"session_open",
+"stale_minutes",
+"stop_pct",
+"target_pct",
+"target_r",
+"timezone"
+],
+"signal": [
+"action",
+"direction",
+"entry_price",
+"extension_r",
+"force_flat",
+"force_flat_at",
+"force_flat_reason",
+"force_flat_ts",
+"range_high",
+"range_low",
+"range_width",
+"relative_volume",
+"session",
+"setup_type",
+"signal_time",
+"signal_ts",
+"stop_distance",
+"stop_price",
+"symbol",
+"target_price",
+"target_r"
+],
+"trade": [
+"authored_stop_distance",
+"authorizing",
+"canonical_exit_reason",
+"contract_multiplier",
+"cost_economics",
+"costs",
+"decision_timestamp",
+"diagnostic_only",
+"diagnostic_reason",
+"direction",
+"directional_authorizing",
+"effective_stop_floor_bps",
+"entry_bar_feed",
+"entry_bar_provider",
+"entry_cost_model_fee_bps",
+"entry_cost_model_provenance",
+"entry_cost_model_slippage_bps",
+"entry_cost_model_spread_bps",
+"entry_feed",
+"entry_fill_source",
+"entry_price",
+"entry_provider",
+"entry_quote_age_seconds",
+"entry_reference",
+"entry_timestamp",
+"evidence_mode",
+"exit_bar_feed",
+"exit_bar_provider",
+"exit_cost_model_fee_bps",
+"exit_cost_model_provenance",
+"exit_cost_model_slippage_bps",
+"exit_cost_model_spread_bps",
+"exit_feed",
+"exit_fill_bar_timestamp",
+"exit_fill_claim",
+"exit_fill_schema",
+"exit_fill_source",
+"exit_price",
+"exit_provider",
+"exit_quote_age_seconds",
+"exit_reason",
+"exit_reference",
+"exit_timestamp",
+"gap_fill",
+"gross_pnl",
+"net_pnl",
+"quantity",
+"range_high",
+"range_low",
+"realized_risk_per_unit",
+"risk_per_unit",
+"risk_usd",
+"session_date",
+"signal_bar_feed",
+"signal_bar_provider",
+"signal_timestamp",
+"stop_geometry_activation_reason",
+"stop_geometry_max_cost_to_risk_ratio",
+"stop_geometry_scenario_bps",
+"stop_price",
+"stress_floor_binding",
+"symbol",
+"target_price",
+"tie_broken",
+"underlying_entry",
+"underlying_quote_feed",
+"vehicle"
+]
+},
+"schema": "ibr-golden-signals.v1",
+"sessions": [
+{
+"bars": 390,
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"bars": 390,
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"bars": 390,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"bars": 387,
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"bars": 389,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"bars": 390,
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"bars": 210,
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"bars": 390,
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"bars": 387,
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"bars": 389,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"bars": 390,
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"bars": 210,
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"bars": 390,
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"bars": 390,
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"bars": 390,
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"bars": 390,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"shipped_runtime": {
+"raw": [
+{
+"full_scan": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+],
+"validated": [
+{
+"full_scan": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "8f8de857e2fe74d3089319d6219ee76f369a24cf34b80f451e380a772426c2f1"
+},
+"scenario": "up",
+"session": "2026-03-02",
+"symbol": "SPY"
+},
+{
+"full_scan": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b",
+"incremental": {
+"index": 50,
+"now": "2026-03-03T15:21:02+00:00",
+"signal": "b5d03d7e567e6a7ae3abd3dc2484cd492665711729a7fbf562f7aa9c9e6f119b"
+},
+"scenario": "down",
+"session": "2026-03-03",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-04",
+"symbol": "SPY"
+},
+{
+"full_scan": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "d4b5b7a5e8ae0ffe4fd3aa421b0068be900b8b96cc5a5825aac02d796ce0e65f"
+},
+"scenario": "gap_hold",
+"session": "2026-03-05",
+"symbol": "SPY"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-06",
+"symbol": "SPY"
+},
+{
+"full_scan": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "201323d6f103fc685090734f94ff993e82b5f741f09b3ac52fbe10a3308e722d"
+},
+"scenario": "wide_spread",
+"session": "2026-03-09",
+"symbol": "SPY"
+},
+{
+"full_scan": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "4e4d1bca8dfccc8b7654589a877e64cf68bc7a317f57650930a1216410d58a26"
+},
+"scenario": "early_end",
+"session": "2026-03-10",
+"symbol": "SPY"
+},
+{
+"full_scan": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f",
+"incremental": {
+"index": 140,
+"now": "2026-03-11T15:51:02+00:00",
+"signal": "e6e420f4cf8cf2baee954133cc2cf14fd67773ee585115634ddd3185c1455b3f"
+},
+"scenario": "late_up",
+"session": "2026-03-11",
+"symbol": "SPY"
+},
+{
+"full_scan": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647",
+"incremental": {
+"index": 50,
+"now": "2026-03-02T15:21:02+00:00",
+"signal": "fc4edf92370af46d6294ccbc2476a5b5c4110c91ec974c26a0700988b322e647"
+},
+"scenario": "gap_hold",
+"session": "2026-03-02",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "range_gap",
+"session": "2026-03-03",
+"symbol": "XLB"
+},
+{
+"full_scan": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c",
+"incremental": {
+"index": 50,
+"now": "2026-03-04T15:21:02+00:00",
+"signal": "224cf1e79f0f61de55734e88d7c71df90ea2b12bff358699e3693dd4e8e11a0c"
+},
+"scenario": "wide_spread",
+"session": "2026-03-04",
+"symbol": "XLB"
+},
+{
+"full_scan": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6",
+"incremental": {
+"index": 50,
+"now": "2026-03-05T15:21:02+00:00",
+"signal": "0cd5056524cb95a07d120c2dace28d7fd103ed4a041c2a3190e82accd8e401f6"
+},
+"scenario": "early_end",
+"session": "2026-03-05",
+"symbol": "XLB"
+},
+{
+"full_scan": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a",
+"incremental": {
+"index": 140,
+"now": "2026-03-06T16:51:02+00:00",
+"signal": "5ca86e42ffe950adcaa4a0e3b86bd0d49aec833c989127817e0b446161ed991a"
+},
+"scenario": "late_up",
+"session": "2026-03-06",
+"symbol": "XLB"
+},
+{
+"full_scan": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5",
+"incremental": {
+"index": 50,
+"now": "2026-03-09T14:21:02+00:00",
+"signal": "c7ac38150a5dfef9d895c48beacfdb1cd1f27f45dc9c20253cb13d094712f1e5"
+},
+"scenario": "up",
+"session": "2026-03-09",
+"symbol": "XLB"
+},
+{
+"full_scan": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442",
+"incremental": {
+"index": 50,
+"now": "2026-03-10T14:21:02+00:00",
+"signal": "db09f5177448ba0f8284535bc9e416871d88e96a4e8acd99dcf403040bd88442"
+},
+"scenario": "down",
+"session": "2026-03-10",
+"symbol": "XLB"
+},
+{
+"full_scan": null,
+"incremental": null,
+"scenario": "flat",
+"session": "2026-03-11",
+"symbol": "XLB"
+}
+]
+}
+}
