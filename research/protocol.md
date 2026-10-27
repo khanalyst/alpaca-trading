@@ -142,8 +142,11 @@ and `max_spread_bps` are rejection caps, not expectations: they bound the
 model, and a model expecting a cost the runtime would refuse to submit fails
 closed. The pure entry-slippage check applies that cap to quote-versus-reference
 prices in every quote-entry lane and keeps the stable invalid and over-cap
-reasons above. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps; 25
-bps is the authorization requirement and the others remain diagnostics.
+reasons above. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps,
+persisted with every proof. Under gate protocol 1, 25 bps on fit plus held-out
+rows is the authorization requirement; gate protocol 2 replaces it with a
+veto relative to the expected per-symbol round trip whenever one is supplied
+(see "Proof gate protocol" below) and keeps 25 bps only as the fallback.
 For equity proofs, an explicitly enabled `costs.measured_quote` block replaces
 the flat spread/slippage assumption with one frozen per-symbol, per-half-hour
 schedule. Its verified content hash, feed/provider identity, spread/depth
@@ -154,7 +157,7 @@ cells fail closed. The checked-in block is disabled until a corpus-specific
 schedule is deliberately fitted and frozen.
 Stress bps are charged against entry notional, with listed-option round-trip
 fees added for both per-contract sides; they are not per-side bps. The shipped
-admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
+admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. The proof-time stress in `research/gates.py` is described under "Proof gate protocol" below.
 For equity geometry, a broker-normalized authored stop below
 `max(30 bps, scenario / max-cost-to-risk ratio)` is likewise refused as
 `stressed_cost_risk_limit` before sizing or fill. The stop is never widened and
@@ -217,6 +220,118 @@ and require a fresh executable quote. Direct replay APIs default to strict;
 only a lane orchestrator or the standalone `backtest-ibr` command opts into
 historical fallback. A passing backtest is evidence for the next gate, never
 authorization to trade paper.
+
+## Proof gate protocol
+
+`research/gates.py` builds and re-verifies the content-hashed gate envelope
+behind every proof. Its decision semantics are versioned by
+`gate_protocol_version`, separately from the envelope schema string
+(`verified-research-gate.v3`), which the proof ledger keys its current-epoch
+rule on. An envelope without the field was produced under protocol 1 and is
+re-verified under exactly those semantics: the protocol-1 builder reproduces a
+stored envelope byte for byte, and
+`tests/research/fixtures/gate_envelope_protocol_v1.json.gz` (written by the
+pre-versioning code) must keep verifying. Protocol 1 is never written
+explicitly, and an unknown version fails verification. New envelopes are
+protocol 2, introduced after the October 2026 review (findings D2-01 to D2-09):
+
+- **Cost stress (D2-01).** Protocol 1 charged 25 bps of entry notional on fit
+  plus held-out rows and required a positive sum, which needs about 25 bps of
+  gross edge per trade whatever an ETF's real spread. Protocol 2 accepts an
+  expected round trip (complete round trip, fees included, in bps of entry
+  notional) either as `expected_round_trip_bps` on each row (the cost model's
+  output in the evidence) or as a builder parameter, keyed by symbol or as one
+  scalar. Each executed held-out and sealed-qualification row (never a fit
+  row) is then charged `max(recorded round trip, 2 x expected round trip)`,
+  and the veto requires a positive 95% moving-block session-bootstrap lower
+  bound of the mean stressed P&L per trade, not a positive sum. A row without
+  a resolvable round trip fails the veto closed. When no round trip is
+  supplied at all, the 25 bps protocol-1 veto applies unchanged. The 9, 15, 25
+  and 50 bps scenarios stay persisted as diagnostics either way. The declared
+  round trip is part of the verified evidence; because the stress never falls
+  below what a row already paid, an understated round trip can at most reduce
+  the veto to a lower bound on net P&L.
+- **Held-out drawdown (D2-07).** `max_drawdown_supported` was a presence check
+  (`max_drawdown_of` always returns a finite number). Under protocol 2 it also
+  requires the held-out drawdown to stay within 10R, R being the median
+  `risk_usd` of the executed held-out rows: the rule the sealed qualification
+  window already applies when it has no explicit currency limit. This is a
+  real veto with a power cost: in a simulation of 180 held-out trades with
+  full -1R stops, a 45% win rate and +0.1R expectancy, a 10R limit held in
+  about 29% of worlds (13% at zero edge). Trades that exit on time rather than
+  at the stop have smaller dispersion and pass more often.
+- **Pairing keys (D2-06).** Paired statistics key rows by `comparison_id` when
+  a producer supplies one, otherwise by `vehicle:symbol:session_date`. A key
+  seen twice in an arm is ambiguous and is dropped from every pairing while
+  the coverage denominator still counts the rows. Protocol 1 dropped such
+  rows silently; protocol 2 fails `comparison_keys_unique` and lists the
+  keys in `pairing_integrity`. Factory and IBR replay emit at most one row
+  per symbol-session, so the default key is exact there; any lane whose rule
+  can re-enter a symbol within a session must stamp candidate and control rows
+  with `opportunity_comparison_id` (symbol plus signal bar).
+- **Bounded parameters (D2-09).** Re-verification recomputes every statistic
+  from parameters the envelope declares. A passing protocol-2 envelope must
+  therefore declare a required held-out floor (and a required fit floor in the
+  backtest lane), walk-forward parameters at or above
+  `protocol_walk_forward_minimums(lane)` (3 folds; a 30-session aggregate
+  floor; 9 test sessions, and 16 backtest or 25 shadow trades, per fold;
+  80% coverage), and a paired control that carries its deltas and was drawn
+  with the preregistered seed and at least 20,000 draws. The
+  `protocol_parameters_bound` check records this and verification rejects a
+  passing envelope that fails it.
+- **Monte Carlo resolution (D2-05).** A Monte Carlo sign-flip p-value is
+  `(e+1)/(N+1)`; with 20,000 draws and no extreme draw it is pinned at
+  `5.0e-05`, which makes a lone Benjamini-Yekutieli discovery impossible once
+  a batch reaches 175 candidates. When no null draw reaches the observed
+  statistic, protocol 2 reports the smaller of that floor and Hoeffding's
+  bound on the exact sign-flip tail, `exp(-t^2/(2*sum c_i^2))` over session
+  contributions `c_i`. The result is still a valid p-value: at levels at or
+  above `1/(N+1)` it rejects exactly when the Monte Carlo p-value does, and
+  below that level only when the bound, which is never smaller than the exact
+  permutation p-value, does. Re-verification repeats the persisted draw count
+  and seed in every protocol (D2-03).
+- **Power (D2-04).** The floors (backtest 100 trades/30 sessions/30 clusters,
+  shadow 150/30/30, qualification 100/30/30) were set as sample-size
+  minimums; they were not sized to any target effect. `protocol_power_report`
+  publishes, for the protocol's actual parameters, the per-trade minimum
+  detectable effect at 80% power from a normal approximation on session-level
+  P&L, and every protocol-2 envelope carries the same report as a
+  non-authorizing `power` diagnostic, estimated from its own held-out matched
+  deltas. For a per-trade standard deviation of 40 bps, uncorrelated trades
+  and the shipped floors:
+
+  | trades per session | window sessions | held-out or qualification test | lone BY discovery, batch of 48 | first live-shadow LORD++ test (alpha 0.0125) |
+  |---|---|---|---|---|
+  | 1 | 100 (backtest), 150 (shadow) | 9.95 / 8.12 bps | 17.36 / 14.18 bps | 12.33 / 10.07 bps |
+  | 5 | 30 | 8.12 bps | 14.18 bps | 10.07 bps |
+  | 10 | 30 | 5.74 bps | 10.02 bps | 7.12 bps |
+
+  A within-session correlation of 0.2 raises the 5-trade figure from 8.12 to
+  10.90 bps. Under protocol 1 a lone discovery in a batch of 175 or more is
+  unattainable; under protocol 2 the 5-trade figure is 17.29 bps at 175 and
+  17.56 bps at 240. `lane_minimums_for_target_mde` is the opt-in way to size a
+  lane from a target effect: it returns trade and session floors that detect
+  the target at 80% power and never fall below the protocol, so the sized
+  floors verify unchanged (40 bps per trade, 5 trades per session: 80 sessions
+  for 5 bps, 495 for 2 bps).
+- **Check classification (D2-08).** `gate_check_classification` and every
+  protocol-2 envelope's `check_classification` state, for each check, whether
+  it is independent (can bind on its own), implied (by the named checks, for
+  the evidence shipped producers emit) or diagnostic (vacuous or near-vacuous
+  for production evidence). No check is removed. Of protocol 1's 31 required
+  checks, 16 are independent, 11 implied and 4 diagnostic; protocol 2 has 33
+  required checks, of which 19 are independent, 11 implied and 3 diagnostic.
+
+  | class | checks |
+  |---|---|
+  | independent | `actual_control_available`, `heldout_delta_lcb_positive`, `heldout_net_pnl_positive`, `separated`, `walk_forward_adequate`, `null_control_delta_positive` (repeats the held-out test for root hypotheses, whose null is the actual control), `fit_floor_adequate`, `heldout_floor_adequate`, `global_fdr_significant`, `multiple_testing_batch_bound`, `cumulative_fdr_significant`, `qualification_net_positive`, `qualification_floor_adequate`, `qualification_confidence_supported`, `risk_unit_adequate`, `cost_stress_adequate`; protocol 2 adds `max_drawdown_supported`, `comparison_keys_unique`, `protocol_parameters_bound` |
+  | implied | `actual_control_adequate` (by `actual_control_available`), `heldout_delta_positive` (by the lower bound), `heldout_p_significant` (a BY q is never below its raw p), `heldout_expectancy_positive` (by net P&L), `falsification` (reuses the held-out p), `walk_forward_available`, `null_control_available`, `family_fdr_significant` (by global BY for a lone signal), `qualification_available`, `qualification_delta_positive` (by its lower bound), `qualification_drawdown_supported` (inside the qualification floor) |
+  | diagnostic | `fit_delta_positive` (fit-derived proposals), `walk_forward_majority_positive` (passes about 99.9% of the time once the held-out test passes), `fill_quality_adequate` (the projection already admits only quote-priced rows), and under protocol 1 `max_drawdown_supported` |
+
+Factory forward ("shadow") workers take their trade and session floors from
+`protocol_minimums("shadow")`, so a forward envelope declares at least 150
+trades; the factory refuses to start if a lane cannot meet its protocol
+(D2-02).
 
 ## Evidence
 

@@ -688,5 +688,25 @@ class ProtocolParameterTests(unittest.TestCase):
             "control_seed_not_preregistered"])
 
 
+class FactoryReportDisplayTests(unittest.TestCase):
+    """The factory report shows the new diagnostics and check names."""
+
+    def test_report_shows_power_classification_and_new_failures(self):
+        from research import factory_report
+        envelope = verified_gate_envelope(**_passing_v2_inputs(
+            held_value=lambda index, symbol: 1.0 + index % 2))
+        summary = factory_report._gate_power_summary(envelope)
+        self.assertGreater(summary["heldout_mde"], 0.0)
+        self.assertGreater(summary["lone_discovery_mde"], summary["heldout_mde"])
+        self.assertEqual((summary["independent_passed"],
+                          summary["independent_required"]), (19, 19))
+        self.assertIsNone(factory_report._gate_power_summary({}))
+        repeat = _row("SPY", "2025-03-05", "held-repeat", 2.0, minute=55)
+        failing = verified_gate_envelope(
+            **_passing_v2_inputs(heldout_extra=[repeat]))
+        self.assertIn("every trade pairs unambiguously with its control",
+                      factory_report._failed_checks({"verified_gate": failing}))
+
+
 if __name__ == "__main__":
     unittest.main()
