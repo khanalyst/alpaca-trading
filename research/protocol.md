@@ -565,6 +565,47 @@ The v6 guarantee is scope-local. Legacy epochs (including v5) remain auditable
 but their discoveries and v6 discoveries must not be pooled and described as one
 cumulative LORD++ guarantee.
 
+The balanced sequence front-loads its wealth (review finding D1-08): before a
+discovery, test `t` in the shared v6 scope receives `0.025/(t(t+1))`, falling as
+`1/t^2`, so a realistic intraday edge cannot pass after a few tests. A
+`shadow-confirmation-v7` scope is therefore registered with the same
+`W0=alpha/2` and rewards but the slowly decaying sequence of Javanmard and
+Montanari (2018), `gamma_j = log(max(j,2)) / (j*exp(sqrt(log j))) / S` with
+`S = 12.64510787288` (the series sum, rounded up so the sequence sums to less
+than one; `research/factory_ledger.py::FDR_JM_GAMMA_SERIES_SUM`). v7 is
+selected only by its scope prefix: `CONFIRMATORY_SCOPE_VERSION` remains v6, so
+every existing v6 decision, and every live-shadow proof bound to the v6 scope,
+reproduces. Switching the live lane to v7 is an explicit operator change of
+that constant, and it also needs `research/edge_ledger_proof.py` (which today
+verifies a run only against the single active scope) to verify each run
+against the scope version recorded in its own online-FDR envelope; until then
+a v7 test cannot authorize.
+
+One-sided z required before any discovery at `alpha=0.05` (`W0=0.025`), from
+`NormalDist().inv_cdf(1 - alpha_t)`:
+
+| test `t` | v6 `alpha_t` | v6 z | v7 `alpha_t` | v7 z |
+| --- | --- | --- | --- | --- |
+| 1 | 1.25e-2 | 2.24 | 1.37e-3 | 3.00 |
+| 2 | 4.17e-3 | 2.64 | 2.98e-4 | 3.43 |
+| 3 | 2.08e-3 | 2.87 | 2.54e-4 | 3.48 |
+| 5 | 8.33e-4 | 3.14 | 1.79e-4 | 3.57 |
+| 10 | 2.27e-4 | 3.51 | 9.98e-5 | 3.72 |
+| 20 | 5.95e-5 | 3.85 | 5.25e-5 | 3.88 |
+| 30 | 2.69e-5 | 4.04 | 3.55e-5 | 3.97 |
+| 50 | 9.80e-6 | 4.27 | 2.14e-5 | 4.09 |
+| 100 | 2.48e-6 | 4.57 | 1.07e-5 | 4.25 |
+| 200 | 6.22e-7 | 4.85 | 5.24e-6 | 4.41 |
+| 500 | 9.98e-8 | 5.20 | 2.03e-6 | 4.61 |
+| 1000 | 2.50e-8 | 5.45 | 9.86e-7 | 4.76 |
+
+v7 is stricter than v6 for the first 22 tests and more lenient from test 23
+on. It keeps a long-running scope open; it does not make the first tests
+easier. With roughly 30 confirmatory sessions a z of 3 still needs a
+per-session Sharpe of about 0.55. If the lane will run only a handful of
+confirmatory tests per epoch, a Bonferroni split of alpha over a
+preregistered, bounded test count is the stronger choice for those tests.
+
 The cited LORD++ result controls mFDR when null p-values are conditionally
 super-uniform given the online history. Its full FDR guarantee additionally
 requires independent null p-values and predictable test levels that are
