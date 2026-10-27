@@ -9,22 +9,82 @@ paper-trial transition is performed.
 | Family | New mechanism |
 | --- | --- |
 | Opening-range breakout | Two completed post-range closes beyond the range |
-| Opening-range fade | Failed breakout and closeback, with a session-VWAP exit |
+| Opening-range fade | Failed breakout and closeback, with a session-VWAP exit; **invalid, see below** |
 | Momentum continuation | Volume confirmation and bounded entry/holding windows |
-| Mean reversion | Sequenced reclaim and a rolling-mean exit |
+| Mean reversion | Sequenced reclaim and a rolling-mean exit; **invalid, see below** |
 | Trend pullback | Reclaim within completed five-minute trend context |
 | Volatility breakout | Compression relative to prior-bar ATR |
 | Volume breakout | Same-clock volume against five prior exact-feed sessions |
-| VWAP reversion | Reclaim, range context, and a session-VWAP exit |
+| VWAP reversion | Reclaim, range context, and a session-VWAP exit; **invalid, see below** |
 | VWAP trend | Two equal completed windows for a stable VWAP comparison |
 | Range expansion | Directional candle body and close-location requirements |
 | Opening drive | Three completed post-window closes holding displacement |
 | Cross-sectional residual | Explicitly described as outright relative strength against SPY |
 
 Missing prior-session volume samples fail closed. The relative-strength arm
-does not establish a hedge or beta neutrality. The authored one-ATR stop,
-30 bps stop floor, preserved 25 bps stressed admission scenario, and 30%
-cost-to-risk ceiling are not relaxed to manufacture trades.
+does not establish a hedge or beta neutrality. Every arm also carries a 1.5R
+completed-close trailing stop (`trailing_stop_r` 1.5), which the table above
+does not show. The authored one-ATR stop, 30 bps stop floor, configured 9 bps
+stressed admission scenario (`config.yaml:52`) and 30% cost-to-risk ceiling
+(`config.yaml:53`) are not relaxed to manufacture trades. Under that
+configuration the admission floor is 9 / 0.30 = 30 bps, the same as the stop
+floor. A one-minute ATR is a few basis points on these ETFs, so the 30 bps
+floor sets essentially every stop and the one-ATR multiple has no effect
+(review finding A-02).
+
+## Errata (October 2026 review)
+
+**Three v2 arms are invalid (finding A-01).** `exit_before_minutes` counts
+minutes before the 16:00 close, not after the open. The opening-range-fade,
+mean-reversion and VWAP-reversion arms set 360, which is a 10:00 New York
+thesis deadline against entry windows of 09:50 to 12:30, 09:45 to 12:30 and
+10:00 to 14:30. Research refuses every entry at or after the deadline, so the
+VWAP-reversion arm can never trade and the other two can only enter in the
+minutes before 10:00. Their v2 results, and those of the same three arms in
+`intraday-mechanisms.cost-compatible.v1` (which inherits the deadline), do not
+test the stated thesis and must be read as invalid. The arms stay loadable
+with their identities; each manifest now lists them under `errata`, outside
+the hashed body, so no pinned hash changes.
+`intraday-mechanisms.deadline-compatible.v1` sets 30 (15:30) and is the
+valid version of these three arms.
+
+**The stress scenario in the cohort labels (finding A-12).** The
+`risk_policy` labels of the cost-compatible and deadline-compatible manifests
+name a 25 bps stressed cost scenario. That value belongs to the paper profile
+activated on 2026-09-15 (`docs/paper-activation-2026-09-15.json:119`). Every
+shipped configuration (`config.yaml:52`, `deploy/paper-orb.config.json:79`,
+`deploy/paper-orf.config.json:79`) uses 9 bps, so the configured admission
+floor is 30 bps and the 100 bps "cost-compatible" floor (sized for
+25 / 0.30 = 83 bps) is not required for admission. The labels are frozen
+inside their manifest hashes; the correction is recorded in each manifest's
+`errata`.
+
+## Corrected cohort `intraday-mechanisms.v3`
+
+`research/mechanism_cohort_v3.py` registers one diagnostic arm per family.
+Each arm is its v2 parent on the V7 grammar with declared corrections, and
+every other field (including the 1.5R trailing stop) is inherited:
+
+| Finding | Correction | Arms |
+| --- | --- | --- |
+| A-01 | 15:30 thesis deadline; the builder rejects any window plus hold that passes it | fade, mean reversion, VWAP reversion |
+| A-02 | `stop_mode: horizon_atr`: `stop_atr` x the symbol's own prior-bar ATR x sqrt(`max_hold_bars`), above the 30 bps floor | all but the fade |
+| A-03 | Session-VWAP and rolling-mean targets (inherited from v2) | fade, mean reversion, VWAP reversion |
+| A-04 | `signal_event: first_cross`: signal only on the bar at which the predicate turns true | opening-range breakout and fade, momentum, volatility and volume breakout, opening drive |
+| A-05 | `stop_mode: structure`: one ATR beyond the failed-breakout extreme | fade |
+| A-09 | `residual_mode: beta`: residual net of a causal OLS beta from the five prior sessions | cross-sectional residual |
+| A-10 | Same-clock volume confirmation; volume breakout drops its current-feed confirmation | momentum, trend pullback, volume breakout |
+| A-14 | A same-clock participation filter instead of none (a trend filter would repeat the predicate) | trend pullback |
+| A-15 | Dedicated `range_multiplier` | range expansion |
+
+These corrections are optional V7 fields with no default, so every existing
+spec keeps its normalized form, hash and variant id;
+`tests/research/test_rule_golden_equivalence.py` replays all 75 registered
+rule arms and checks they evaluate exactly as before. Limits: V7 cannot
+trade; `research.strategy_factory.run_factory` dispatches only the v1 and v2
+cohort ids; and the factory replay passes the cross-sectional family only the
+current session's SPY bars, so the beta-adjusted arm fails closed there until
+the replay context supplies prior sessions.
 
 ## Bounded evidence preparation
 
