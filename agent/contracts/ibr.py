@@ -260,7 +260,8 @@ def wilder_atr_series(bars: Iterable[Mapping],
       overnight gap.  Non-mapping rows are skipped entirely.
 
     Callers: ``generate_ibr_signal`` (through ``_bars_with_atr``, which
-    overwrites any ``atr`` the market boundary attached),
+    overwrites the ``atr`` the market boundary attached on every row where
+    it computes a value of its own),
     ``evaluate_ibr_breakout`` (its ``history`` fallback) and the research
     replay's width/ATR admission in ``research.ibr``.  The same recursion,
     returned as ``Decimal``, is ``agent.market.wilder_atr_decimal_series``.

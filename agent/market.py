@@ -45,9 +45,10 @@ def wilder_atr_decimal_series(bars: Iterable[Any],
 
     Caller: :func:`attach_atr`, used by ``MarketData.stock_bars`` to attach
     ``atr`` at the market boundary.  The IBR contract recomputes the value
-    from the bars it is handed and overwrites it
-    (``agent.contracts.ibr._bars_with_atr``); the rule families never read
-    it and use their own simple-mean definition (``agent.contracts.rule._atr``).
+    from the bars it is handed and overwrites it on every row where it has
+    one (``agent.contracts.ibr._bars_with_atr``); the rule families never
+    read it and use their own simple-mean definition
+    (``agent.contracts.rule._atr``).
     """
     period = int(period)
     if period <= 0:
