@@ -34,7 +34,7 @@ from research.factory_ledger import CONFIRMATORY_SCOPE_VERSION, FactoryLedger
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 
 
-def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex"):
+def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex", lane="backtest"):
     """Build the statistical evidence a persisted proof must now reproduce.
 
     The zero baseline makes the matched deltas equal to the held-out P&L, so
@@ -75,8 +75,15 @@ def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex"):
     }
     absolute = performance_floor(
         heldout, vehicle="equity", equity_feed=equity_feed)
+    # A passing gate must declare walk-forward parameters that meet the
+    # protocol for its lane (gate protocol 2, review D2-09).
+    minimums = gates.protocol_walk_forward_minimums(lane)
     walk = walk_forward_report(
-        heldout, baseline, vehicle="equity", equity_feed=equity_feed)
+        heldout, baseline, vehicle="equity", equity_feed=equity_feed,
+        folds=minimums["folds"],
+        min_test_sessions=minimums["test_sessions_required"],
+        min_test_trades=minimums["test_trades_required"],
+        requested_min_sessions=minimums["requested_min_sessions"])
     return control, falsification, absolute, walk
 
 
@@ -275,7 +282,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": True, "mode": "new_data"})
     control, falsification, absolute, walk = _gate_evidence(
-        heldout, equity_feed=equity_feed)
+        heldout, equity_feed=equity_feed, lane=lane)
     fit_control = (matched_cluster_test(
                        fit, fit_baseline, vehicle="equity",
                        equity_feed=equity_feed)

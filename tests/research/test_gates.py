@@ -1147,7 +1147,9 @@ class EvidenceGateTests(unittest.TestCase):
             online_fdr={"required": False,
                         "status": "deferred_to_live_shadow",
                         "tested": False, "decision": False},
-            candidate_id="legacy-v2-null")
+            candidate_id="legacy-v2-null",
+            # Historical v2-schema envelopes predate gate protocol versions.
+            protocol_version=gates_module.LEGACY_GATE_PROTOCOL_VERSION)
         self.assertTrue(verify_gate_envelope(envelope))
         legacy = copy.deepcopy(envelope)
         legacy["schema"] = gates_module.LEGACY_GATE_ENVELOPE_SCHEMA_V2

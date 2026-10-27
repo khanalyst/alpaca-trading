@@ -61,7 +61,7 @@ from .gates import (chronological_split, heldout_separation,
                     RETIREMENT_MIN_USEFUL_R,
                     falsification_gate,
                     qualification_report as _qualification_report,
-                    validate_protocol_floor,
+                    protocol_minimums, validate_protocol_floor,
                     sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
                     fdr_batch_evidence,
@@ -3043,6 +3043,36 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         _close_task_quotes(quotes)
 
 
+def _lane_protocol_floors(min_trades: int, min_sessions: int) -> dict[str, dict[str, int]]:
+    """Derive every replay lane's floors from its own protocol (review D2-02).
+
+    The configured floors belong to the backtest lane.  Workers re-run in
+    ``shadow`` mode (forward validation of a ``backtest_passed`` hypothesis)
+    are judged against the larger live-shadow protocol, so their floors are
+    raised to it; otherwise every forward envelope would declare the backtest
+    floor and fail ``fit_floor_adequate``/``heldout_floor_adequate`` however
+    good the evidence.  Fails fast when a lane cannot meet its protocol,
+    including when the promotion cluster floor sits below the lane's cluster
+    minimum (every envelope would then fail silently).
+    """
+    floors: dict[str, dict[str, int]] = {}
+    for lane in ("backtest", "shadow"):
+        required = protocol_minimums(lane)
+        floors[lane] = {"trades": max(int(min_trades), int(required["trades"])),
+                        "sessions": max(int(min_sessions), int(required["sessions"]))}
+        try:
+            validate_protocol_floor(lane=lane, min_trades=floors[lane]["trades"],
+                                    min_sessions=floors[lane]["sessions"])
+        except ValueError as exc:
+            raise FactoryError(f"{lane} lane cannot meet its protocol: {exc}") from exc
+        if MIN_PROMOTION_CLUSTERS < int(required["clusters"]):
+            raise FactoryError(
+                f"{lane} lane cannot meet its protocol: the promotion cluster "
+                f"floor {MIN_PROMOTION_CLUSTERS} is below the protocol "
+                f"minimum {required['clusters']}")
+    return floors
+
+
 def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
           vehicle: str, mode: str,
           min_trades: int, min_sessions: int, alpha: float,
@@ -4041,6 +4071,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                                 min_sessions=min_sessions)
     except ValueError as exc:
         raise FactoryError(str(exc)) from exc
+    lane_floors = _lane_protocol_floors(min_trades, min_sessions)
     if not 0 < alpha <= 1:
         raise FactoryError("alpha must be in (0,1]")
     if int(max_generations) < 1:
@@ -4854,8 +4885,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         for variant in worker["variants"]:
             gate = _gate(variant["account"]["rows"], vehicle=vehicle,
                          baseline=worker["control_rows"],
-                         mode=worker["mode"], min_trades=min_trades,
-                         min_sessions=min_sessions, alpha=alpha,
+                         mode=worker["mode"],
+                         min_trades=lane_floors[worker["mode"]]["trades"],
+                         min_sessions=lane_floors[worker["mode"]]["sessions"],
+                         alpha=alpha,
                          is_root=(variant["variant_id"] == rule_variant_id(
                              worker["hypothesis"]["rule_spec"])),
                          null_rows=(worker.get("null_rows") or {}).get(

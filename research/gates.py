@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
-from statistics import mean, median
+from statistics import NormalDist, mean, median
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -161,6 +161,186 @@ COST_STRESS_REQUIRED_BPS = 25.0
 FALSIFICATION_P_VALUE_SOURCE = "heldout_paired_cluster_sign_flip"
 FALSIFICATION_INDEPENDENT_P_VALUE_SOURCE = "independent_placebo_null_tail"
 FALSIFICATION_INDEPENDENT_METHOD = "independent_empirical_null_tail"
+# The preregistered paired sign-flip test.  Its seed and minimum draw count
+# are code-owned: a passing protocol-2 envelope may use more draws (the
+# live-shadow lane scales them to its online allocation) but never fewer, and
+# never a different seed.
+PAIRED_TEST_SEED = 20260728
+PAIRED_TEST_MIN_ITERATIONS = 20_000
+
+# Gate protocol versions (review D2, October 2026).  The envelope schema
+# string stays ``verified-research-gate.v3`` because the proof ledger keys its
+# current-epoch rule on it; the protocol version records which decision
+# semantics a v3 envelope was built under.  An envelope without the
+# ``gate_protocol_version`` field was produced under protocol 1 and is
+# re-verified under exactly those semantics.  Protocol 1 is never written
+# explicitly, so each envelope has one representation.
+#
+# Protocol 2 changes what a passing envelope must show:
+# - cost stress: when an expected per-symbol round trip is supplied (as a
+#   parameter or as ``expected_round_trip_bps`` on the rows), the veto charges
+#   ``COST_STRESS_RELATIVE_MULTIPLE`` times that round trip on the held-out
+#   and sealed qualification rows only and requires a positive stressed
+#   lower confidence bound.  Without one it falls back to the protocol-1 25
+#   bps veto.  The 9/15/25/50 bps scenarios stay persisted as diagnostics;
+# - ``max_drawdown_supported`` requires the held-out drawdown to stay within
+#   ``HELDOUT_MAX_DRAWDOWN_R`` times the median per-trade risk;
+# - ``comparison_keys_unique``: no arm may silently lose rows to an ambiguous
+#   pairing key;
+# - ``protocol_parameters_bound``: the held-out floor is required, the
+#   walk-forward parameters meet the protocol, and the paired control carries
+#   its deltas with the preregistered seed and at least the minimum draws;
+# - when no Monte Carlo null draw reaches the observed statistic, the paired
+#   p-value is the smaller of the 1/(N+1) floor and a Hoeffding bound on the
+#   exact sign-flip tail, so a lone BY discovery stays attainable in large
+#   batches;
+# - the envelope carries a power (minimum detectable effect) diagnostic and a
+#   classification of every check as independent, implied or diagnostic.
+LEGACY_GATE_PROTOCOL_VERSION = 1
+GATE_PROTOCOL_VERSION = 2
+SUPPORTED_GATE_PROTOCOL_VERSIONS = frozenset({
+    LEGACY_GATE_PROTOCOL_VERSION, GATE_PROTOCOL_VERSION,
+})
+GATE_PROTOCOL_V2_CHECKS = frozenset({
+    "comparison_keys_unique", "protocol_parameters_bound",
+})
+GATE_PROTOCOL_V2_REQUIRED_CHECKS = GATE_REQUIRED_CHECKS | GATE_PROTOCOL_V2_CHECKS
+COST_STRESS_RELATIVE_MULTIPLE = 2.0
+COST_STRESS_RELATIVE_SCHEMA = "relative-cost-stress.v1"
+HELDOUT_MAX_DRAWDOWN_R = QUALIFICATION_MAX_DRAWDOWN_R
+WALK_FORWARD_PROTOCOL_FOLDS = 3
+POWER_TARGET = .80
+GATE_POWER_SCHEMA = "gate-power-report.v1"
+GATE_CHECK_CLASSIFICATION_SCHEMA = "gate-check-classification.v1"
+# Machine-readable classification of each decision check (review D2-08).
+# ``independent``: not implied by another required check and able to bind on
+# its own.  ``implied``: logically implied by (or equal to) the named checks
+# for the evidence shipped producers emit, so it cannot fail alone.
+# ``diagnostic``: vacuous or near-vacuous for production evidence; retained for
+# audit, it carries no independent authorizing content.  No check is removed:
+# the classification only states honestly what the required set contains.
+_CHECK_CLASSES: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "actual_control_available": (
+        "independent", (), "matched baseline with >= 30 pairs and 80% coverage"),
+    "actual_control_adequate": (
+        "implied", ("actual_control_available",),
+        "the adequacy predicate is part of actual_control_available"),
+    "fit_delta_positive": (
+        "diagnostic", (),
+        "proposals are fit-derived, so a positive fit delta is largely a "
+        "selection artefact; always true in the shadow lane"),
+    "heldout_delta_positive": (
+        "implied", ("heldout_delta_lcb_positive",),
+        "a positive lower bound implies a positive mean in practice"),
+    "heldout_p_significant": (
+        "implied", ("global_fdr_significant", "multiple_testing_batch_bound"),
+        "a BY q-value is never below the raw p bound into the batch"),
+    "heldout_delta_lcb_positive": (
+        "independent", (), "95% moving-block bootstrap lower bound of the "
+        "held-out paired delta"),
+    "heldout_net_pnl_positive": (
+        "independent", (), "absolute held-out profitability after costs"),
+    "heldout_expectancy_positive": (
+        "implied", ("heldout_net_pnl_positive",),
+        "net / trades has the sign of net whenever trades > 0"),
+    "falsification": (
+        "implied", ("heldout_p_significant",),
+        "reuses the preregistered held-out p; its ratio test is weaker than "
+        "p <= alpha and the reseeded stream is an integrity check"),
+    "separated": (
+        "independent", (), "integrity: fit precedes held-out with no shared "
+        "session"),
+    "walk_forward_available": (
+        "implied", ("walk_forward_adequate",),
+        "every adequate walk-forward is available"),
+    "walk_forward_adequate": (
+        "independent", (), "every fold meets its session/trade/control floor"),
+    "walk_forward_majority_positive": (
+        "diagnostic", (),
+        "folds subdivide the held-out sample, so this passes about 99.9% of "
+        "the time once the held-out test passes"),
+    "null_control_available": (
+        "implied", ("null_control_delta_positive",),
+        "the positive-delta check requires an available null"),
+    "null_control_delta_positive": (
+        "independent", (),
+        "randomized-entry null for mutants; for root hypotheses the null is "
+        "the actual control, so it repeats the held-out test"),
+    "fit_floor_adequate": (
+        "independent", (), "fit sample meets the lane protocol"),
+    "heldout_floor_adequate": (
+        "independent", (), "held-out sample meets the lane protocol"),
+    "family_fdr_significant": (
+        "implied", ("global_fdr_significant",),
+        "for a lone signal the family batch is a subset of the global batch"),
+    "global_fdr_significant": (
+        "independent", (), "Benjamini-Yekutieli across the cycle"),
+    "multiple_testing_batch_bound": (
+        "independent", (), "integrity: the complete BY batch is recomputed "
+        "and bound to this candidate"),
+    "cumulative_fdr_significant": (
+        "independent", (), "online LORD++ decision, or an explicit deferral "
+        "to the live-shadow lane"),
+    "qualification_available": (
+        "implied", ("qualification_floor_adequate",),
+        "every qualification_* check requires an available window"),
+    "qualification_net_positive": (
+        "independent", (), "sealed-window profitability"),
+    "qualification_delta_positive": (
+        "implied", ("qualification_confidence_supported",),
+        "a positive sealed-window lower bound implies a positive mean in "
+        "practice"),
+    "max_drawdown_supported": (
+        "diagnostic", (),
+        "protocol 1: a presence check; max_drawdown_of always returns a "
+        "finite number"),
+    "risk_unit_adequate": (
+        "independent", (), "every executed row's risk covers its round trip"),
+    "fill_quality_adequate": (
+        "diagnostic", (),
+        "the authorizing projection already admits only quote-priced rows on "
+        "the bound feed and provider"),
+    "cost_stress_adequate": (
+        "independent", (), "preregistered cost stress veto"),
+    "qualification_floor_adequate": (
+        "independent", (), "sealed window meets its protocol floor, control "
+        "coverage and drawdown limit"),
+    "qualification_confidence_supported": (
+        "independent", (), "sealed-window 95% lower bound of the paired delta"),
+    "qualification_drawdown_supported": (
+        "implied", ("qualification_floor_adequate",),
+        "the drawdown limit is already inside the qualification floor"),
+    # Producer-added checks that appear in factory/discovery envelopes.
+    "fit_structurally_adequate": (
+        "implied", ("fit_floor_adequate",), "same floor report"),
+    "heldout_structurally_adequate": (
+        "implied", ("heldout_floor_adequate",), "same floor report"),
+    "promotable_cluster_floor": (
+        "implied", ("heldout_floor_adequate",),
+        "the cluster floor is inside the held-out floor"),
+    "qualification_cluster_floor": (
+        "implied", ("qualification_floor_adequate",),
+        "the cluster floor is inside the qualification floor"),
+    "cluster_fdr_significant": (
+        "independent", (), "frozen dependence-cluster BY veto"),
+}
+_CHECK_CLASSES_V2 = {
+    **_CHECK_CLASSES,
+    "max_drawdown_supported": (
+        "independent", (),
+        "held-out drawdown within HELDOUT_MAX_DRAWDOWN_R times the median "
+        "per-trade risk"),
+    "cost_stress_adequate": (
+        "independent", (),
+        "positive stressed lower bound at twice the expected per-symbol round "
+        "trip on held-out and qualification rows (25 bps fallback)"),
+    "comparison_keys_unique": (
+        "independent", (), "integrity: no arm loses rows to an ambiguous "
+        "pairing key"),
+    "protocol_parameters_bound": (
+        "independent", (), "integrity: producer-declared floors, walk-forward "
+        "parameters and paired-test evidence meet the protocol"),
+}
 
 
 def fdr_batch_evidence(*, candidate_id: str,
@@ -401,6 +581,8 @@ _GATE_SOURCE_STATISTICS = {
     "risk_unit_adequate": ("risk_unit_report.adequate",),
     "fill_quality_adequate": ("fill_quality.adequate",),
     "cost_stress_adequate": ("cost_stress.adequate",),
+    "comparison_keys_unique": ("pairing_integrity.unique",),
+    "protocol_parameters_bound": ("protocol_parameters.bound",),
 }
 _LEGACY_FALSIFICATION_SOURCE_STATISTICS = (
     "falsification.p_value", "falsification.alpha",
@@ -830,6 +1012,520 @@ def _qualification_minimums_meet(minimums: Mapping[str, Any] | None) -> bool:
         return False
 
 
+def _resolve_protocol_version(value: Any) -> int:
+    """Validate a gate protocol version supplied by a builder caller."""
+    if (isinstance(value, bool) or not isinstance(value, int) or
+            value not in SUPPORTED_GATE_PROTOCOL_VERSIONS):
+        raise ValueError("unsupported gate protocol version")
+    return int(value)
+
+
+def envelope_protocol_version(envelope: Mapping | None) -> int | None:
+    """Return the gate protocol an envelope was built under, or ``None``.
+
+    An absent field means protocol 1, the semantics of every envelope written
+    before versioning existed.  Protocol 1 is never written explicitly, and
+    the quarantined v2 schema predates versioning altogether, so either
+    representation is rejected as ambiguous.
+    """
+    if not isinstance(envelope, Mapping):
+        return None
+    if "gate_protocol_version" not in envelope:
+        return LEGACY_GATE_PROTOCOL_VERSION
+    value = envelope.get("gate_protocol_version")
+    if (isinstance(value, bool) or not isinstance(value, int) or
+            value not in SUPPORTED_GATE_PROTOCOL_VERSIONS or
+            value == LEGACY_GATE_PROTOCOL_VERSION or
+            envelope.get("schema") != GATE_ENVELOPE_SCHEMA):
+        return None
+    return int(value)
+
+
+def required_gate_checks(protocol_version: int = GATE_PROTOCOL_VERSION) -> frozenset:
+    """Return the checks a passing envelope of this protocol must hold."""
+    version = _resolve_protocol_version(protocol_version)
+    return (GATE_REQUIRED_CHECKS if version == LEGACY_GATE_PROTOCOL_VERSION
+            else GATE_PROTOCOL_V2_REQUIRED_CHECKS)
+
+
+def gate_check_classification(protocol_version: int = GATE_PROTOCOL_VERSION, *,
+                              checks: Mapping[str, Any] | None = None,
+                              include_notes: bool = False) -> dict:
+    """Classify each decision check as independent, implied or diagnostic.
+
+    The classification is code-owned and versioned.  It never changes a
+    decision; it states how much independent content a passing envelope
+    actually carries (review D2-08).  ``checks`` adds any producer checks
+    present in an envelope and counts which independent checks held.
+    """
+    version = _resolve_protocol_version(protocol_version)
+    table = (_CHECK_CLASSES if version == LEGACY_GATE_PROTOCOL_VERSION
+             else _CHECK_CLASSES_V2)
+    required = required_gate_checks(version)
+    present = checks if isinstance(checks, Mapping) else {}
+    names = sorted(set(required) | {str(name) for name in present})
+    classes: dict[str, str] = {}
+    implied_by: dict[str, list[str]] = {}
+    notes: dict[str, str] = {}
+    for name in names:
+        kind, sources, note = table.get(name, (
+            "unclassified", (),
+            "producer check without a protocol classification"))
+        classes[name] = kind
+        if sources:
+            implied_by[name] = list(sources)
+        notes[name] = note
+    summary: dict[str, Any] = {
+        "required": len(required),
+        **{kind: sum(1 for name in required if classes[name] == kind)
+           for kind in ("independent", "implied", "diagnostic")},
+    }
+    if present:
+        independent = sorted(name for name in required
+                             if classes[name] == "independent")
+        summary["independent_passed"] = sum(
+            1 for name in independent if present.get(name) is True)
+        summary["independent_failed"] = [
+            name for name in independent if present.get(name) is not True]
+    report = {"schema": GATE_CHECK_CLASSIFICATION_SCHEMA,
+              "protocol_version": version,
+              "required_checks": sorted(required),
+              "classes": classes, "implied_by": implied_by,
+              "summary": summary}
+    if include_notes:
+        report["notes"] = notes
+    return report
+
+
+def protocol_walk_forward_minimums(
+        lane: str, *, folds: int = WALK_FORWARD_PROTOCOL_FOLDS) -> dict:
+    """Protocol floor for the walk-forward parameters a producer declares.
+
+    The aggregate session floor is the lane's session floor in whole folds;
+    each fold keeps a one-session fit history and its proportional share of
+    the remaining sessions and of half the lane's trade floor, exactly as the
+    factory and discovery producers derive them.  A fold is adequate only
+    when its matched pairs reach the fold trade floor, so that floor also
+    bounds the per-fold control count.  Constants are read at call time so a
+    compact test protocol scales these floors with it.
+    """
+    required = protocol_minimums(lane)
+    count = max(1, int(folds))
+    fit = 1
+    sessions = int(required["sessions"])
+    return {
+        "folds": count,
+        "fit_sessions_required": fit,
+        "requested_min_sessions": (sessions if sessions < count else
+                                   count * (sessions // count)),
+        "test_sessions_required": max(1, (sessions - fit) // count),
+        "test_trades_required": max(1, int(required["trades"]) // (2 * count)),
+        "min_coverage": float(ACTUAL_CONTROL_MIN_COVERAGE),
+    }
+
+
+def protocol_parameter_report(*, lane: str, floors: Mapping | None,
+                              walk_forward: Mapping | None,
+                              control: Mapping | None) -> dict:
+    """Check producer-declared parameters against the protocol (D2-09).
+
+    Re-verification recomputes every statistic from the parameters an
+    envelope declares, so a declared parameter must itself be bounded: the
+    held-out floor (and the backtest fit floor) must be required, the
+    walk-forward parameters must meet :func:`protocol_walk_forward_minimums`,
+    and the paired control must carry the deltas its p-value and lower bound
+    are recomputed from, drawn with the preregistered seed and at least the
+    minimum number of Monte Carlo draws.
+    """
+    failures: list[str] = []
+    floor_reports = floors if isinstance(floors, Mapping) else {}
+    heldout_floor = floor_reports.get("heldout")
+    if not isinstance(heldout_floor, Mapping) or heldout_floor.get("required") is not True:
+        failures.append("heldout_floor_not_required")
+    fit_floor = floor_reports.get("fit")
+    if lane == "backtest" and (not isinstance(fit_floor, Mapping) or
+                               fit_floor.get("required") is not True):
+        failures.append("fit_floor_not_required")
+    try:
+        minimums = protocol_walk_forward_minimums(lane)
+    except ValueError:
+        minimums = None
+        failures.append("lane_invalid")
+    walk = walk_forward if isinstance(walk_forward, Mapping) else {}
+    if minimums is not None:
+        if not walk:
+            failures.append("walk_forward_missing")
+        else:
+            for name in ("folds", "fit_sessions_required", "requested_min_sessions",
+                         "test_sessions_required", "test_trades_required",
+                         "min_coverage"):
+                value = walk.get(name)
+                try:
+                    ok = (not isinstance(value, bool) and value is not None and
+                          math.isfinite(float(value)) and
+                          float(value) >= float(minimums[name]))
+                except (TypeError, ValueError, OverflowError):
+                    ok = False
+                if not ok:
+                    failures.append(f"walk_forward_{name}_below_protocol")
+    paired = control if isinstance(control, Mapping) else {}
+    deltas = paired.get("deltas")
+    clusters = paired.get("delta_clusters")
+    matched = paired.get("matched")
+    if (not isinstance(deltas, Sequence) or isinstance(deltas, (str, bytes)) or
+            not deltas or
+            not isinstance(clusters, Sequence) or isinstance(clusters, (str, bytes)) or
+            len(clusters) != len(deltas) or
+            isinstance(matched, bool) or not isinstance(matched, int) or
+            matched != len(deltas)):
+        failures.append("control_deltas_missing")
+    method = paired.get("method")
+    if method == "monte_carlo":
+        resamples = paired.get("resamples")
+        if (isinstance(resamples, bool) or not isinstance(resamples, int) or
+                resamples < PAIRED_TEST_MIN_ITERATIONS):
+            failures.append("control_iterations_below_protocol")
+        seed = paired.get("seed")
+        if isinstance(seed, bool) or seed != PAIRED_TEST_SEED:
+            failures.append("control_seed_not_preregistered")
+    elif method != "exact_enumeration":
+        failures.append("control_method_unknown")
+    return {"schema": "gate-protocol-parameters.v1", "lane": str(lane),
+            "walk_forward_minimums": minimums,
+            "paired_test": {"seed": PAIRED_TEST_SEED,
+                            "min_iterations": PAIRED_TEST_MIN_ITERATIONS},
+            "failures": failures, "bound": not failures}
+
+
+def comparison_key_report(arms: Mapping[str, Iterable[Mapping]], *,
+                          vehicle: str, equity_feed: str = "iex",
+                          equity_provider: str | None = "alpaca") -> dict:
+    """Report pairing keys that would silently drop rows (review D2-06).
+
+    Every paired statistic keys rows by ``comparison_id`` when a producer
+    supplies one, otherwise by ``vehicle:symbol:session_date``.  A key seen
+    more than once in an arm (or an empty key) is ambiguous and is dropped
+    from every pairing, while the coverage denominator still counts the rows.
+    Protocol 1 dropped them silently; protocol 2 fails the named check
+    instead.  A lane that can re-enter a symbol within a session must stamp
+    each row with an explicit ``comparison_id`` (see :func:`opportunity_comparison_id`).
+    """
+    report: dict[str, dict[str, Any]] = {}
+    unique = True
+    for name, rows in arms.items():
+        counts: dict[str, int] = {}
+        for row in _authorizing_rows(rows, vehicle=vehicle,
+                                     equity_feed=equity_feed,
+                                     equity_provider=equity_provider):
+            if row.get("vehicle", vehicle) != vehicle:
+                continue
+            key = _match_key(row, vehicle)
+            counts[key] = counts.get(key, 0) + 1
+        duplicates = sorted(key for key, count in counts.items()
+                            if count > 1 or not key)
+        report[str(name)] = {
+            "rows": sum(counts.values()),
+            "duplicate_key_count": len(duplicates),
+            "dropped_rows": sum(counts[key] for key in duplicates),
+            # Bounded so a pathological arm cannot inflate the envelope.
+            "duplicate_keys": duplicates[:20],
+        }
+        unique = unique and not duplicates
+    return {"schema": "comparison-key-integrity.v1",
+            "key": "comparison_id, else vehicle:symbol:session_date",
+            "arms": report, "unique": bool(unique)}
+
+
+def opportunity_comparison_id(row: Mapping[str, Any], *, vehicle: str) -> str:
+    """Explicit per-opportunity comparison id: symbol plus signal bar.
+
+    Producers whose rules can enter one symbol more than once per session
+    should persist this as ``comparison_id`` on candidate and control rows,
+    so each opportunity pairs with the control's decision on the same signal
+    bar instead of being dropped as an ambiguous symbol-session.
+    """
+    symbol = row.get("symbol") or row.get("underlying_symbol")
+    signal = row.get("signal_timestamp") or row.get("entry_timestamp")
+    if not symbol or not signal:
+        raise ValueError("a comparison id needs a symbol and a signal bar")
+    return f"{row.get('vehicle', vehicle)}:{symbol}:{signal}"
+
+
+def _normal_quantile(probability: float) -> float:
+    return NormalDist().inv_cdf(float(probability))
+
+
+def _power_inputs(sd_per_trade: Any, trades_per_session: Any,
+                  intra_session_correlation: Any, alpha: Any,
+                  target_power: Any) -> tuple[float, float, float, float, float]:
+    try:
+        sd = float(sd_per_trade)
+        per_session = float(trades_per_session)
+        rho = float(intra_session_correlation)
+        level = float(alpha)
+        power = float(target_power)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("power inputs must be numeric") from exc
+    if not math.isfinite(sd) or sd < 0:
+        raise ValueError("sd_per_trade must be finite and non-negative")
+    if not math.isfinite(per_session) or per_session <= 0:
+        raise ValueError("trades_per_session must be positive")
+    if not math.isfinite(rho) or not 0.0 <= rho <= 1.0:
+        raise ValueError("intra_session_correlation must be in [0,1]")
+    if not math.isfinite(level) or not 0.0 < level < 1.0:
+        raise ValueError("alpha must be between zero and one")
+    if not math.isfinite(power) or not 0.0 < power < 1.0:
+        raise ValueError("target_power must be between zero and one")
+    return sd, per_session, rho, level, power
+
+
+def minimum_detectable_effect(*, sd_per_trade: float, trades_per_session: float,
+                              sessions: int, alpha: float = .05,
+                              target_power: float = POWER_TARGET,
+                              intra_session_correlation: float = 0.0,
+                              critical_value: float | None = None) -> dict:
+    """One-sided minimum detectable mean effect per trade.
+
+    Normal approximation on session-level P&L: a session of ``k`` trades has
+    sum variance ``k * sd**2 * (1 + (k - 1) * rho)``, so the per-trade mean
+    over ``n`` sessions has standard error
+    ``sd * sqrt((1 + (k - 1) * rho) / (k * n))`` and the effect detected with
+    probability ``target_power`` at one-sided level ``alpha`` is
+    ``(z_(1-alpha) + z_power)`` standard errors.
+    """
+    sd, per_session, rho, level, power = _power_inputs(
+        sd_per_trade, trades_per_session, intra_session_correlation, alpha,
+        target_power)
+    if isinstance(sessions, bool) or int(sessions) < 1:
+        raise ValueError("sessions must be a positive integer")
+    count = int(sessions)
+    design_effect = 1.0 + max(0.0, per_session - 1.0) * rho
+    standard_error = sd * math.sqrt(design_effect / (per_session * count))
+    critical = (_normal_quantile(1.0 - level) if critical_value is None
+                else float(critical_value))
+    power_quantile = _normal_quantile(power)
+    return {"alpha": level, "target_power": power, "sessions": count,
+            "trades": per_session * count, "design_effect": design_effect,
+            "standard_error": standard_error, "critical_value": critical,
+            "mde": (critical + power_quantile) * standard_error}
+
+
+def sessions_for_target_mde(target_mde: float, *, sd_per_trade: float,
+                            trades_per_session: float, alpha: float = .05,
+                            target_power: float = POWER_TARGET,
+                            intra_session_correlation: float = 0.0) -> int:
+    """Sessions a window needs to detect ``target_mde`` per trade."""
+    sd, per_session, rho, level, power = _power_inputs(
+        sd_per_trade, trades_per_session, intra_session_correlation, alpha,
+        target_power)
+    try:
+        target = float(target_mde)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("target_mde must be positive") from exc
+    if not math.isfinite(target) or target <= 0:
+        raise ValueError("target_mde must be positive")
+    design_effect = 1.0 + max(0.0, per_session - 1.0) * rho
+    multiplier = _normal_quantile(1.0 - level) + _normal_quantile(power)
+    return max(1, math.ceil(
+        (multiplier * sd / target) ** 2 * design_effect / per_session))
+
+
+def lane_minimums_for_target_mde(lane: str, *, target_mde: float,
+                                 sd_per_trade: float,
+                                 trades_per_session: float,
+                                 alpha: float = .05,
+                                 target_power: float = POWER_TARGET,
+                                 intra_session_correlation: float = 0.0) -> dict:
+    """Opt-in floors sized from a target MDE; never below the lane protocol.
+
+    The protocol floors were not sized to any target effect.  A caller that
+    wants a lane powered for ``target_mde`` passes the returned ``trades``
+    and ``sessions`` as its ``min_trades``/``min_sessions``.  The result only
+    ever raises the protocol minimums, so every sized floor still satisfies
+    :func:`validate_protocol_floor` and verifies under the unchanged protocol.
+    """
+    required = protocol_minimums(lane)
+    sessions = sessions_for_target_mde(
+        target_mde, sd_per_trade=sd_per_trade,
+        trades_per_session=trades_per_session, alpha=alpha,
+        target_power=target_power,
+        intra_session_correlation=intra_session_correlation)
+    sized_sessions = max(int(required["sessions"]), sessions)
+    return {
+        "lane": str(lane),
+        "trades": max(int(required["trades"]),
+                      math.ceil(sized_sessions * float(trades_per_session))),
+        "sessions": sized_sessions,
+        "clusters": max(int(required["clusters"]), sized_sessions),
+        "sizing": {"target_mde": float(target_mde),
+                   "sd_per_trade": float(sd_per_trade),
+                   "trades_per_session": float(trades_per_session),
+                   "alpha": float(alpha), "target_power": float(target_power),
+                   "intra_session_correlation": float(intra_session_correlation),
+                   "sessions_for_target": sessions,
+                   "protocol_minimums": required},
+    }
+
+
+def protocol_power_report(*, sd_per_trade: float, trades_per_session: float,
+                          lane: str = "backtest", alpha: float = .05,
+                          target_power: float = POWER_TARGET,
+                          intra_session_correlation: float = 0.0,
+                          batch_size: int = 1,
+                          online_alpha: float | None = None,
+                          monte_carlo_draws: int = PAIRED_TEST_MIN_ITERATIONS,
+                          protocol_version: int = GATE_PROTOCOL_VERSION,
+                          effect_unit: str = "per_trade") -> dict:
+    """Publish the minimum detectable effect of the protocol's own floors.
+
+    For the lane's held-out floor and the sealed qualification floor this
+    reports the per-trade effect detectable with ``target_power`` at the
+    levels the gate chain actually applies: the single held-out test (and the
+    95% lower bound, which has the same one-sided level), a lone BY discovery
+    in a batch of ``batch_size`` candidates (``alpha / (m * H_m)``) and, when
+    supplied, the online allocation.  A window holds the smallest number of
+    sessions that meets all of its trade, session and cluster floors at
+    ``trades_per_session``.  Under protocol 1 a level below the Monte Carlo
+    floor ``1/(draws+1)`` cannot be reached at all; protocol 2 uses the
+    Hoeffding tail there, whose critical value is ``sqrt(2*ln(1/level))``.
+    The floors were not sized to a target effect, and this report says so.
+    It is diagnostic only and never changes a decision (review D2-04).
+    """
+    sd, per_session, rho, level, power = _power_inputs(
+        sd_per_trade, trades_per_session, intra_session_correlation, alpha,
+        target_power)
+    version = _resolve_protocol_version(protocol_version)
+    if isinstance(batch_size, bool) or int(batch_size) < 1:
+        raise ValueError("batch_size must be a positive integer")
+    batch = int(batch_size)
+    draws = int(monte_carlo_draws)
+    if draws < 1:
+        raise ValueError("monte_carlo_draws must be positive")
+    harmonic = sum(1.0 / rank for rank in range(1, batch + 1))
+    floor_p = 1.0 / (draws + 1)
+    levels: dict[str, float] = {"single_test": level,
+                                "by_lone_discovery": level / (batch * harmonic)}
+    if online_alpha is not None:
+        online = float(online_alpha)
+        if not math.isfinite(online) or not 0.0 < online < 1.0:
+            raise ValueError("online_alpha must be between zero and one")
+        levels["online_fdr"] = online
+    windows = {
+        "heldout": protocol_minimums(lane),
+        "qualification": {"trades": PROTOCOL_QUALIFICATION_MIN_TRADES,
+                          "sessions": PROTOCOL_QUALIFICATION_MIN_SESSIONS,
+                          "clusters": PROTOCOL_QUALIFICATION_MIN_CLUSTERS},
+    }
+    results: dict[str, Any] = {}
+    for name, floor in windows.items():
+        sessions = max(int(floor["sessions"]), int(floor["clusters"]),
+                       math.ceil(int(floor["trades"]) / per_session))
+        tests: dict[str, Any] = {}
+        for test, test_level in levels.items():
+            if name == "qualification" and test != "single_test":
+                continue
+            critical = _normal_quantile(1.0 - test_level)
+            bounded = test_level < floor_p
+            if bounded and version == LEGACY_GATE_PROTOCOL_VERSION:
+                tests[test] = {"alpha": test_level, "attainable": False,
+                               "mde": None,
+                               "reason": "below_monte_carlo_floor"}
+                continue
+            if bounded:
+                critical = max(critical, math.sqrt(2.0 * math.log(1.0 / test_level)))
+            tests[test] = {
+                "attainable": True,
+                **minimum_detectable_effect(
+                    sd_per_trade=sd, trades_per_session=per_session,
+                    sessions=sessions, alpha=test_level, target_power=power,
+                    intra_session_correlation=rho, critical_value=critical),
+                "tail": ("hoeffding_bound" if bounded else "normal"),
+            }
+        results[name] = {"floor": dict(floor), "sessions": sessions,
+                         "trades": per_session * sessions, "tests": tests}
+    return {
+        "schema": GATE_POWER_SCHEMA, "diagnostic_only": True,
+        "authorizing": False,
+        "method": "normal_approximation_session_level_pnl",
+        "protocol_version": version, "lane": str(lane),
+        "effect_unit": str(effect_unit),
+        "floors_sized_to_target_mde": False,
+        "inputs": {"sd_per_trade": sd, "trades_per_session": per_session,
+                   "intra_session_correlation": rho, "alpha": level,
+                   "target_power": power, "batch_size": batch,
+                   "online_alpha": (float(online_alpha)
+                                    if online_alpha is not None else None),
+                   "monte_carlo_draws": draws},
+        "monte_carlo_floor": floor_p,
+        "iterations_for_lone_discovery": math.ceil(batch * harmonic / level),
+        "windows": results,
+    }
+
+
+def _envelope_power_report(*, lane: str, deltas: Sequence[float],
+                           clusters: Sequence[Any], alpha: Any,
+                           fdr_batch: Mapping | None, online_fdr: Mapping | None,
+                           control: Mapping | None, protocol_version: int) -> dict:
+    """Power diagnostic of one envelope from its held-out matched deltas."""
+    try:
+        values = [float(value) for value in deltas]
+        keys = [str(value) for value in clusters]
+        values_by_session: dict[str, list[float]] = {}
+        for value, key in zip(values, keys):
+            if math.isfinite(value):
+                values_by_session.setdefault(key, []).append(value)
+        finite = [value for group in values_by_session.values() for value in group]
+        if len(finite) < 2 or len(values_by_session) < 2:
+            return {"schema": GATE_POWER_SCHEMA, "available": False,
+                    "reason": "insufficient_matched_deltas",
+                    "floors_sized_to_target_mde": False}
+        observed_mean = sum(finite) / len(finite)
+        sd = math.sqrt(sum((value - observed_mean) ** 2 for value in finite) /
+                       (len(finite) - 1))
+        per_session = len(finite) / len(values_by_session)
+        rho = 0.0
+        if sd > 0 and per_session > 1:
+            sums = [sum(group) for group in values_by_session.values()]
+            sizes = [len(group) for group in values_by_session.values()]
+            # Moment estimate of the within-session correlation from the
+            # design effect of the session sums, clipped to [0, 1].
+            excess = sum((total - size * observed_mean) ** 2
+                         for total, size in zip(sums, sizes))
+            design_effect = excess / (len(sums) - 1) / (per_session * sd * sd)
+            rho = min(1.0, max(0.0, (design_effect - 1.0) / (per_session - 1.0)))
+        batch_values = (fdr_batch.get("global_values")
+                        if isinstance(fdr_batch, Mapping) else None)
+        batch_size = (len(batch_values) if isinstance(batch_values, Mapping) and
+                      batch_values else 1)
+        online = online_fdr if isinstance(online_fdr, Mapping) else {}
+        online_alpha = online.get("allocated_alpha")
+        if (isinstance(online_alpha, bool) or
+                not isinstance(online_alpha, (int, float)) or
+                not math.isfinite(float(online_alpha)) or
+                not 0.0 < float(online_alpha) < 1.0):
+            online_alpha = None
+        resamples = (control or {}).get("resamples") if isinstance(control, Mapping) else None
+        draws = (int(resamples) if isinstance(resamples, int) and
+                 not isinstance(resamples, bool) and resamples > 0 and
+                 (control or {}).get("method") == "monte_carlo"
+                 else PAIRED_TEST_MIN_ITERATIONS)
+        report = protocol_power_report(
+            sd_per_trade=sd, trades_per_session=per_session, lane=lane,
+            alpha=float(alpha), intra_session_correlation=rho,
+            batch_size=batch_size, online_alpha=online_alpha,
+            monte_carlo_draws=draws, protocol_version=protocol_version,
+            effect_unit="usd_per_trade_heldout_matched_delta")
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
+        return {"schema": GATE_POWER_SCHEMA, "available": False,
+                "reason": f"invalid_power_inputs: {exc}",
+                "floors_sized_to_target_mde": False}
+    report["available"] = True
+    report["observed"] = {"matched": len(finite),
+                          "sessions": len(values_by_session),
+                          "mean_delta": observed_mean}
+    return report
+
+
 class SealedWindowError(RuntimeError):
     """Raised when sealed final-qualification data is used more than once."""
 
@@ -1235,17 +1931,80 @@ def matched_pairs(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
             "r_clusters": r_clusters, "r_matched": len(r_deltas)}
 
 
+def _sign_flip_resolution_tail(result: Mapping[str, Any],
+                               deltas: Sequence[Any],
+                               clusters: Sequence[Any]) -> dict:
+    """Bound the exact tail when no Monte Carlo null draw reached the statistic.
+
+    A Monte Carlo sign-flip p-value is ``(e + 1) / (N + 1)``, so with ``e = 0``
+    it is pinned at ``1/(N+1)`` however extreme the evidence; with 20,000
+    draws that floor alone makes a lone Benjamini-Yekutieli discovery
+    impossible once a batch reaches about 175 candidates (review D2-05).
+    Hoeffding's inequality bounds the exact one-sided tail of a Rademacher
+    sum: ``P(sum s_i c_i >= t) <= exp(-t**2 / (2 * sum c_i**2))`` for session
+    contributions ``c_i`` and ``t > 0``.  Protocol 2 therefore reports
+    ``min(1/(N+1), bound)`` when ``e = 0`` and the Monte Carlo value
+    otherwise.  This remains a valid p-value: at any level at or above
+    ``1/(N+1)`` it rejects exactly when the Monte Carlo p-value does, and below
+    that level it rejects only when the bound, which is never smaller than the
+    exact permutation p-value, does.
+    """
+    report = dict(result)
+    if result.get("method") != "monte_carlo":
+        return report
+    resamples = result.get("resamples")
+    if isinstance(resamples, bool) or not isinstance(resamples, int) or resamples < 1:
+        return report
+    monte_carlo_p = float(result.get("p_value", 1.0))
+    floor = 1.0 / (resamples + 1)
+    grouped: dict[str, float] = {}
+    for delta, cluster in zip(deltas, clusters):
+        try:
+            value = float(delta)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            key = str(cluster)
+            grouped[key] = grouped.get(key, 0.0) + value
+    contributions = [grouped[key] for key in sorted(grouped)]
+    observed = sum(contributions)
+    threshold = observed - 1e-15 * max(1.0, abs(observed))
+    energy = sum(value * value for value in contributions)
+    bound = (math.exp(-(threshold * threshold) / (2.0 * energy))
+             if threshold > 0 and energy > 0 else 1.0)
+    no_extreme_draw = abs(monte_carlo_p * (resamples + 1) - 1.0) < 1e-6
+    applied = bool(no_extreme_draw and bound < monte_carlo_p)
+    report["monte_carlo_p_value"] = monte_carlo_p
+    report["resolution_tail"] = {
+        "method": "hoeffding_rademacher_tail_bound",
+        "monte_carlo_floor": floor,
+        "no_extreme_draw": bool(no_extreme_draw),
+        "bound": bound,
+        "applied": applied,
+    }
+    if applied:
+        report["p_value"] = bound
+    return report
+
+
 def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
-                         vehicle: str, seed: int = 20260728,
+                         vehicle: str, seed: int = PAIRED_TEST_SEED,
                          confidence: float = LOWER_BOUND_CONFIDENCE,
-                         iterations: int = 20_000,
+                         iterations: int = PAIRED_TEST_MIN_ITERATIONS,
                          min_matched: int = ACTUAL_CONTROL_MIN_MATCHED,
                          min_coverage: float = ACTUAL_CONTROL_MIN_COVERAGE,
                          equity_feed: str = "iex",
-                         equity_provider: str | None = "alpaca") -> dict:
-    """Test matched opportunity deltas with deterministic session clustering."""
+                         equity_provider: str | None = "alpaca",
+                         protocol_version: int = GATE_PROTOCOL_VERSION) -> dict:
+    """Test matched opportunity deltas with deterministic session clustering.
+
+    ``protocol_version`` 1 reproduces the historical Monte Carlo p-value
+    exactly; protocol 2 adds the resolution tail of
+    :func:`_sign_flip_resolution_tail`.
+    """
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
         raise ValueError("iterations must be a positive integer")
+    version = _resolve_protocol_version(protocol_version)
     # The statistic and the adequacy report consume the same evidence twice.
     # Materialize one-shot iterables once so a generator cannot appear matched
     # to the test and empty to the authorization floor.
@@ -1258,6 +2017,9 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
                in zip(pairs["timestamps"], pairs["deltas"])]
     result = paired_cluster_sign_flip(triples, cluster_seconds=CLUSTER_SECONDS,
                                        iterations=iterations, seed=seed)
+    if version >= GATE_PROTOCOL_VERSION:
+        result = _sign_flip_resolution_tail(
+            result, pairs["deltas"], pairs["clusters"])
     cluster_count = len(set(pairs["clusters"]))
     block_length = min(SERIAL_BLOCK_LENGTH, max(1, cluster_count))
     bound = moving_block_cluster_bootstrap_lower_bound(
@@ -1449,6 +2211,90 @@ def matched_effective_breadth(candidate: Iterable[Mapping],
     return effective_breadth_report(observations)
 
 
+def _stress_row_inputs(row: Mapping[str, Any], index: int, *, vehicle: str,
+                       model: CostModel,
+                       base_by_id: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Price one executed row for a cost stress, or ``None`` when unpriceable.
+
+    Rows with recomputable measured economics use their own round trip; other
+    rows use the risk report's recorded round trip, else the report's model.
+    """
+    def number(*names, default=None):
+        for name in names:
+            raw = row.get(name)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value):
+                return value
+        return default
+
+    row_economics: dict[str, Any] | None = None
+    row_economics_error: str | None = None
+    try:
+        row_economics = recompute_row_cost_economics(row, vehicle=vehicle)
+    except (CostError, TypeError, ValueError, OverflowError) as exc:
+        row_economics_error = str(exc)
+    entry = number("entry_price", "entry_reference", "plan_entry")
+    exit_price = number("exit_price", "exit_reference", default=entry)
+    quantity = number("quantity", "contracts", default=1.0)
+    multiplier = number(
+        "contract_multiplier", "multiplier",
+        default=100.0 if vehicle == "option" else 1.0)
+    net = number("net_pnl")
+    if row_economics is not None:
+        entry = row_economics["entry_price"]
+        exit_price = row_economics["exit_price"]
+        quantity = row_economics["quantity"]
+        multiplier = row_economics["contract_multiplier"]
+        net = row_economics["net_pnl"]
+    if (entry is None or exit_price is None or quantity is None or
+            multiplier is None or net is None or entry <= 0 or
+            quantity <= 0 or multiplier <= 0 or
+            row_economics_error is not None):
+        return None
+    base = base_by_id.get(str(row.get("opportunity_id", index)))
+    try:
+        if row_economics is not None:
+            base_cost = float(row_economics["round_trip_cost"])
+        else:
+            base_cost = (float(base) if base is not None else
+                         model.round_trip_cost(
+                             entry, exit_price, quantity, multiplier,
+                             vehicle=vehicle,
+                             entry_executable_quote=(
+                                 row.get("entry_fill_source") == QUOTE_FILL),
+                             exit_executable_quote=(
+                                 row.get("exit_fill_source") == QUOTE_FILL)))
+    except (CostError, TypeError, ValueError, OverflowError):
+        return None
+    option_fees = None
+    if vehicle == "option":
+        if row_economics is not None:
+            option_fees = abs(quantity) * (
+                row_economics["entry_option_fee_per_contract_side"] +
+                row_economics["exit_option_fee_per_contract_side"])
+        else:
+            option_fees = abs(quantity) * 2.0 * \
+                model.option_fee_per_contract_side
+    return {"net": net, "base_cost": base_cost,
+            "notional": abs(entry) * abs(quantity) * abs(multiplier),
+            "option_fees": option_fees}
+
+
+def _stress_risk_inputs(risk_report: Mapping | None) -> tuple[CostModel, dict]:
+    model = CostModel.from_dict((risk_report or {}).get("cost_model") or {})
+    base_by_id = {
+        str(item.get("opportunity_id")): item.get("round_trip_cost")
+        for item in (risk_report or {}).get("observations", ())
+        if isinstance(item, Mapping)
+    }
+    return model, base_by_id
+
+
 def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
                        risk_report: Mapping,
                        equity_feed: str = "iex",
@@ -1459,96 +2305,37 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
     scenario therefore subtracts only the incremental cost above the model's
     recorded round trip.  Scenario bps are charged once against entry
     notional; listed options additionally include two per-contract fee sides.
-    The 25 bps scenario is the authorization veto; 9, 15 and 50 bps remain
-    persisted diagnostics so sensitivity is visible rather than selected
-    after seeing the result.
+    The 25 bps scenario is the protocol-1 authorization veto and the
+    protocol-2 fallback when no expected round trip is supplied; 9, 15 and
+    50 bps remain persisted diagnostics so sensitivity is visible rather than
+    selected after seeing the result.
     """
     if vehicle not in {"equity", "option"}:
         raise ValueError("vehicle must be equity or option")
-    model = CostModel.from_dict((risk_report or {}).get("cost_model") or {})
-    base_by_id = {
-        str(item.get("opportunity_id")): item.get("round_trip_cost")
-        for item in (risk_report or {}).get("observations", ())
-        if isinstance(item, Mapping)
-    }
+    model, base_by_id = _stress_risk_inputs(risk_report)
     executed = [dict(row) for row in _authorizing_rows(
         rows, vehicle=vehicle, equity_feed=equity_feed,
         equity_provider=equity_provider)
                 if isinstance(row, Mapping) and
                 row.get("vehicle", vehicle) == vehicle and
                 row.get("no_trade") is not True]
+    priced = [(str(row.get("opportunity_id", index)),
+               _stress_row_inputs(row, index, vehicle=vehicle, model=model,
+                                  base_by_id=base_by_id))
+              for index, row in enumerate(executed)]
     scenarios = []
     for scenario_bps in COST_STRESS_SCENARIOS_BPS:
         stressed_values = []
         missing = []
-        for index, row in enumerate(executed):
-            def number(*names, default=None):
-                for name in names:
-                    raw = row.get(name)
-                    if raw is None:
-                        continue
-                    try:
-                        value = float(raw)
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-                    if math.isfinite(value):
-                        return value
-                return default
-
-            opportunity_id = str(row.get("opportunity_id", index))
-            row_economics: dict[str, Any] | None = None
-            row_economics_error: str | None = None
-            try:
-                row_economics = recompute_row_cost_economics(
-                    row, vehicle=vehicle)
-            except (CostError, TypeError, ValueError, OverflowError) as exc:
-                row_economics_error = str(exc)
-            entry = number("entry_price", "entry_reference", "plan_entry")
-            exit_price = number("exit_price", "exit_reference", default=entry)
-            quantity = number("quantity", "contracts", default=1.0)
-            multiplier = number(
-                "contract_multiplier", "multiplier",
-                default=100.0 if vehicle == "option" else 1.0)
-            net = number("net_pnl")
-            if row_economics is not None:
-                entry = row_economics["entry_price"]
-                exit_price = row_economics["exit_price"]
-                quantity = row_economics["quantity"]
-                multiplier = row_economics["contract_multiplier"]
-                net = row_economics["net_pnl"]
-            if (entry is None or exit_price is None or quantity is None or
-                    multiplier is None or net is None or entry <= 0 or
-                    quantity <= 0 or multiplier <= 0 or
-                    row_economics_error is not None):
+        for opportunity_id, inputs in priced:
+            if inputs is None:
                 missing.append(opportunity_id)
                 continue
-            base = base_by_id.get(opportunity_id)
-            try:
-                if row_economics is not None:
-                    base_cost = float(row_economics["round_trip_cost"])
-                else:
-                    base_cost = (float(base) if base is not None else
-                                  model.round_trip_cost(
-                                      entry, exit_price, quantity, multiplier,
-                                      vehicle=vehicle,
-                                      entry_executable_quote=(
-                                          row.get("entry_fill_source") == QUOTE_FILL),
-                                      exit_executable_quote=(
-                                          row.get("exit_fill_source") == QUOTE_FILL)))
-            except (CostError, TypeError, ValueError, OverflowError):
-                missing.append(opportunity_id)
-                continue
-            notional = abs(entry) * abs(quantity) * abs(multiplier)
-            stressed_cost = notional * float(scenario_bps) / 10_000.0
-            if vehicle == "option":
-                if row_economics is not None:
-                    stressed_cost += abs(quantity) * (
-                        row_economics["entry_option_fee_per_contract_side"] +
-                        row_economics["exit_option_fee_per_contract_side"])
-                else:
-                    stressed_cost += abs(quantity) * 2.0 * \
-                        model.option_fee_per_contract_side
-            stressed_values.append(net - max(0.0, stressed_cost - base_cost))
+            stressed_cost = inputs["notional"] * float(scenario_bps) / 10_000.0
+            if inputs["option_fees"] is not None:
+                stressed_cost += inputs["option_fees"]
+            stressed_values.append(
+                inputs["net"] - max(0.0, stressed_cost - inputs["base_cost"]))
         net_pnl = sum(stressed_values)
         scenarios.append({
             "entry_notional_bps": float(scenario_bps),
@@ -1580,6 +2367,201 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
     }
 
 
+def _normalized_expected_round_trip(value: Any) -> float | dict[str, float] | None:
+    """Validate an expected round trip in bps of entry notional.
+
+    A scalar applies to every symbol; a mapping is keyed by symbol.  Every
+    value must be finite and positive.
+    """
+    def positive(raw: Any) -> float:
+        if isinstance(raw, bool):
+            raise ValueError("expected round trip must be a positive number")
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("expected round trip must be a positive number") from exc
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError("expected round trip must be a positive number")
+        return number
+
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        normalized = {str(symbol): positive(raw)
+                      for symbol, raw in value.items()}
+        return dict(sorted(normalized.items())) or None
+    return positive(value)
+
+
+def relative_cost_stress_report(partitions: Mapping[str, Iterable[Mapping]], *,
+                                vehicle: str, risk_report: Mapping,
+                                expected_round_trip_bps: Any = None,
+                                multiple: float = COST_STRESS_RELATIVE_MULTIPLE,
+                                confidence: float = LOWER_BOUND_CONFIDENCE,
+                                equity_feed: str = "iex",
+                                equity_provider: str | None = "alpaca"
+                                ) -> dict | None:
+    """Stress realized P&L at a multiple of the expected per-symbol round trip.
+
+    The protocol-1 veto charged 25 bps of entry notional on fit plus held-out
+    rows and required a positive sum, which demands about 25 bps of gross
+    edge per trade whatever an ETF's real spread (review D2-01).  Here each
+    executed held-out or sealed-qualification row is charged
+    ``max(recorded round trip, multiple * expected round trip)``: the stress
+    never drops below what the row already paid.  The expected round trip
+    (complete round trip, fees included, in bps of entry notional) comes from
+    the row's own ``expected_round_trip_bps`` (the cost model's output in the
+    evidence) or else from ``expected_round_trip_bps`` here, keyed by symbol
+    or one scalar.  The veto requires a positive one-sided lower confidence
+    bound of the mean stressed P&L per trade from the same seeded moving-block
+    session bootstrap as the paired test; a positive sum is not enough.
+    Returns ``None`` when neither source supplies a round trip, so the caller
+    falls back to the protocol-1 veto.
+    """
+    if vehicle not in {"equity", "option"}:
+        raise ValueError("vehicle must be equity or option")
+    expected = _normalized_expected_round_trip(expected_round_trip_bps)
+    selected: list[tuple[str, dict]] = []
+    for name, rows in partitions.items():
+        for row in _authorizing_rows(rows, vehicle=vehicle,
+                                     equity_feed=equity_feed,
+                                     equity_provider=equity_provider):
+            if (isinstance(row, Mapping) and
+                    row.get("vehicle", vehicle) == vehicle and
+                    row.get("no_trade") is not True):
+                selected.append((str(name), dict(row)))
+    if expected is None and not any(
+            row.get("expected_round_trip_bps") is not None
+            for _, row in selected):
+        return None
+    selected.sort(key=lambda item: (
+        _session_key(item[1]), str(item[1].get("entry_timestamp", "")),
+        str(item[1].get("opportunity_id", "")), item[0]))
+    model, base_by_id = _stress_risk_inputs(risk_report)
+    values: list[float] = []
+    clusters: list[str] = []
+    used_bps: list[float] = []
+    missing: list[str] = []
+    sources = {"row": 0, "symbol": 0, "scalar": 0}
+    counts = {str(name): 0 for name in partitions}
+    for index, (partition, row) in enumerate(selected):
+        counts[partition] += 1
+        opportunity_id = str(row.get("opportunity_id", index))
+        inputs = _stress_row_inputs(row, index, vehicle=vehicle, model=model,
+                                    base_by_id=base_by_id)
+        bps = None
+        if row.get("expected_round_trip_bps") is not None:
+            try:
+                bps = _normalized_expected_round_trip(
+                    row.get("expected_round_trip_bps"))
+                source = "row"
+            except ValueError:
+                bps = None
+        elif isinstance(expected, Mapping):
+            symbol = (row.get("underlying_symbol") if vehicle == "option" else None) \
+                or row.get("symbol") or row.get("underlying_symbol")
+            bps = expected.get(str(symbol)) if symbol is not None else None
+            source = "symbol"
+        elif expected is not None:
+            bps = float(expected)
+            source = "scalar"
+        if inputs is None or bps is None:
+            missing.append(opportunity_id)
+            continue
+        sources[source] += 1
+        expected_cost = inputs["notional"] * float(bps) / 10_000.0
+        stressed_cost = max(inputs["base_cost"], float(multiple) * expected_cost)
+        values.append(inputs["net"] - (stressed_cost - inputs["base_cost"]))
+        clusters.append(str(row.get("cluster") or _session_key(row)))
+        used_bps.append(float(bps))
+    cluster_count = len(set(clusters))
+    bound = moving_block_cluster_bootstrap_lower_bound(
+        values, clusters, confidence=float(confidence),
+        block_length=min(SERIAL_BLOCK_LENGTH, max(1, cluster_count)))
+    lower = bound.get("lower_bound")
+    net_pnl = sum(values)
+    return {
+        "schema": COST_STRESS_RELATIVE_SCHEMA, "vehicle": vehicle,
+        "basis": "max(recorded_round_trip, multiple * expected_round_trip)",
+        "multiple": float(multiple), "confidence": float(confidence),
+        "expected_round_trip_bps": expected,
+        "expected_round_trip_sources": sources,
+        "partitions": dict(sorted(counts.items())),
+        "trades": len(values),
+        "missing_opportunities": missing,
+        "net_pnl": net_pnl,
+        "expectancy": net_pnl / len(values) if values else None,
+        "mean_expected_round_trip_bps": (sum(used_bps) / len(used_bps)
+                                          if used_bps else None),
+        "lower_bound": lower,
+        "bootstrap": {key: bound.get(key) for key in (
+            "method", "available", "confidence", "draws", "seed",
+            "block_length", "clusters", "observations", "reason")},
+        "adequate": bool(values and not missing and lower is not None and
+                         float(lower) > 0),
+    }
+
+
+def _gate_cost_stress(*, fit: Sequence[Mapping], heldout: Sequence[Mapping],
+                      qualification: Mapping | None, vehicle: str,
+                      risk: Mapping, protocol_version: int,
+                      expected_round_trip_bps: Any,
+                      equity_feed: str,
+                      equity_provider: str | None,
+                      strict: bool = False) -> dict:
+    """Build the persisted cost-stress block for one protocol version.
+
+    The builder records an unpriceable stress as a failed, auditable report;
+    verification passes ``strict`` so the same failure rejects the envelope,
+    exactly as protocol-1 verification always did.
+    """
+    try:
+        stress = cost_stress_report(
+            [*fit, *heldout], vehicle=vehicle, risk_report=risk,
+            equity_feed=equity_feed, equity_provider=equity_provider)
+    except (CostError, TypeError, ValueError, OverflowError):
+        if strict:
+            raise
+        stress = {"schema": "cost-stress-report.v1", "vehicle": vehicle,
+                  "stress_basis_schema": STRESSED_COST_SCHEMA,
+                  "stress_basis": dict(STRESSED_COST_BASIS),
+                  "required_entry_notional_bps": COST_STRESS_REQUIRED_BPS,
+                  "required_round_trip_bps": COST_STRESS_REQUIRED_BPS,
+                  "scenarios": [], "adequate": False}
+    if protocol_version == LEGACY_GATE_PROTOCOL_VERSION:
+        return stress
+    expected = _normalized_expected_round_trip(expected_round_trip_bps)
+    qual = qualification if isinstance(qualification, Mapping) else {}
+    observations = qual.get("candidate_observations") if qual.get("available") else ()
+    qualification_rows = (
+        [row for row in observations if isinstance(row, Mapping)]
+        if isinstance(observations, Sequence) and
+        not isinstance(observations, (str, bytes)) else [])
+    try:
+        relative = relative_cost_stress_report(
+            {"heldout": heldout, "qualification": qualification_rows},
+            vehicle=vehicle, risk_report=risk,
+            expected_round_trip_bps=expected,
+            equity_feed=equity_feed, equity_provider=equity_provider)
+    except (CostError, TypeError, ValueError, OverflowError) as exc:
+        if strict:
+            raise
+        relative = {"schema": COST_STRESS_RELATIVE_SCHEMA, "vehicle": vehicle,
+                    "multiple": COST_STRESS_RELATIVE_MULTIPLE,
+                    "expected_round_trip_bps": expected,
+                    "error": str(exc), "adequate": False}
+    report = {**stress, "schema": "cost-stress-report.v2",
+              "protocol_version": protocol_version}
+    if relative is None:
+        report["veto"] = "entry_notional_bps"
+        report["relative_veto"] = None
+        return report
+    report["veto"] = "relative_expected_round_trip"
+    report["relative_veto"] = relative
+    # The 25 bps outcome stays visible as a diagnostic beside the veto.
+    report["entry_notional_bps_adequate"] = bool(stress.get("adequate"))
+    report["adequate"] = bool(relative.get("adequate"))
+    return report
 def placebo_null_distribution(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
                               vehicle: str, draws: int = DEFAULT_NULL_DRAWS,
                               seed: int | None = None,
@@ -1760,6 +2742,54 @@ def max_drawdown_of(rows_or_values: Iterable[Mapping] | Iterable[float]) -> floa
             peak = max(peak, equity)
         drawdown = max(drawdown, peak - equity)
     return float(drawdown) if math.isfinite(drawdown) else 0.0
+
+
+def heldout_drawdown_report(rows: Iterable[Mapping], *, vehicle: str,
+                            max_drawdown_r: float = HELDOUT_MAX_DRAWDOWN_R,
+                            equity_feed: str = "iex",
+                            equity_provider: str | None = "alpaca") -> dict:
+    """Preregistered held-out drawdown limit in R (review D2-07).
+
+    Protocol 1's ``max_drawdown_supported`` only asked whether the reported
+    drawdown was a finite number, which :func:`max_drawdown_of` always
+    returns.  Protocol 2 bounds the held-out drawdown by ``max_drawdown_r``
+    times the median per-trade risk of the executed held-out rows, the same
+    10R rule the sealed qualification window derives when it has no explicit
+    currency limit.  Rows without a positive finite ``risk_usd`` cannot
+    establish the unit, and an envelope without one cannot pass.
+    """
+    limit_r = float(max_drawdown_r)
+    if not math.isfinite(limit_r) or limit_r <= 0:
+        raise ValueError("max_drawdown_r must be finite and positive")
+    selected = [row for row in _authorizing_rows(
+        rows, vehicle=vehicle, equity_feed=equity_feed,
+        equity_provider=equity_provider)
+        if row.get("vehicle", vehicle) == vehicle]
+    risks = []
+    for row in selected:
+        if row.get("no_trade") is True:
+            continue
+        raw = row.get("risk_usd")
+        if isinstance(raw, bool):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value > 0:
+            risks.append(value)
+    observed = max_drawdown_of(selected)
+    unit = float(median(risks)) if risks else None
+    limit = unit * limit_r if unit is not None else None
+    return {"schema": "heldout-drawdown-limit.v1",
+            "max_drawdown": observed,
+            "max_drawdown_r": limit_r,
+            "risk_unit_usd": unit,
+            "risk_unit_source": "median_executed_risk_usd",
+            "risk_rows": len(risks),
+            "max_drawdown_limit": limit,
+            "max_drawdown_in_r": (observed / unit if unit else None),
+            "within_limit": bool(limit is not None and observed <= limit)}
 
 
 def heldout_separation(fit: Sequence[Mapping], heldout: Sequence[Mapping]) -> dict:
@@ -2712,6 +3742,10 @@ def gate_dependence_report(envelope: Mapping | None = None, *,
                      "falsification.independent_method",
                      "falsification.independent_result_hash",
                      "falsification.alpha")
+        if (name == "max_drawdown_supported" and
+                isinstance(lookup("gate_protocol_version"), int) and
+                lookup("gate_protocol_version") >= GATE_PROTOCOL_VERSION):
+            paths = (*paths, "heldout_drawdown.within_limit")
         if not paths:
             # Unknown/additional checks are still represented, but are not
             # assigned an invented statistic or policy meaning.
@@ -2874,13 +3908,26 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                            risk_unit: Mapping | None = None,
                            risk_unit_report: Mapping | None = None,
                            equity_feed: str = "iex",
-                           equity_provider: str | None = "alpaca") -> dict:
+                           equity_provider: str | None = "alpaca",
+                           expected_round_trip_bps: Any = None,
+                           protocol_version: int = GATE_PROTOCOL_VERSION) -> dict:
     """Build the immutable, content-addressed gate decision persisted per run.
 
     ``q_value`` is the cycle-global false-discovery q; ``family_q_value`` is
     the family-local one.  Both are persisted so a proof states exactly which
     correction authorized it.
+
+    ``protocol_version`` selects the decision semantics (see
+    ``GATE_PROTOCOL_VERSION``).  Protocol 1 reproduces the historical
+    envelope byte for byte and is used to re-verify envelopes recorded before
+    versioning.  ``expected_round_trip_bps`` (protocol 2 only) is the expected
+    per-symbol round trip in bps of entry notional, a scalar or a mapping by
+    symbol; rows may instead carry their own ``expected_round_trip_bps``.
     """
+    version = _resolve_protocol_version(protocol_version)
+    expected_round_trip = _normalized_expected_round_trip(expected_round_trip_bps)
+    if version == LEGACY_GATE_PROTOCOL_VERSION and expected_round_trip is not None:
+        raise ValueError("protocol 1 has no relative cost stress")
     equity_feed = str(equity_feed or "").strip().lower().replace("-", "_")
     if equity_feed == "delayed":
         equity_feed = "delayed_sip"
@@ -3102,6 +4149,14 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     derived["max_drawdown_supported"] = bool(
         isinstance(reported.get("max_drawdown"), (int, float)) and
         math.isfinite(float(reported.get("max_drawdown"))))
+    heldout_drawdown = None
+    if version >= GATE_PROTOCOL_VERSION:
+        heldout_drawdown = heldout_drawdown_report(
+            heldout, vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider)
+        derived["max_drawdown_supported"] = bool(
+            derived["max_drawdown_supported"] and
+            heldout_drawdown["within_limit"])
     # Persist the complete risk-unit calculation.  Callers may supply a
     # precomputed report, but verification always rebuilds it from source rows
     # and the model captured in the report.
@@ -3130,17 +4185,11 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     derived["fill_quality_adequate"] = _fill_quality_adequate(
         fit, heldout, vehicle=vehicle, lane=str(lane),
         equity_feed=equity_feed, equity_provider=equity_provider)
-    try:
-        stress = cost_stress_report(
-            [*fit, *heldout], vehicle=vehicle, risk_report=risk,
-            equity_feed=equity_feed, equity_provider=equity_provider)
-    except (CostError, TypeError, ValueError, OverflowError):
-        stress = {"schema": "cost-stress-report.v1", "vehicle": vehicle,
-                  "stress_basis_schema": STRESSED_COST_SCHEMA,
-                  "stress_basis": dict(STRESSED_COST_BASIS),
-                  "required_entry_notional_bps": COST_STRESS_REQUIRED_BPS,
-                  "required_round_trip_bps": COST_STRESS_REQUIRED_BPS,
-                  "scenarios": [], "adequate": False}
+    stress = _gate_cost_stress(
+        fit=fit, heldout=heldout, qualification=qualification,
+        vehicle=vehicle, risk=risk, protocol_version=version,
+        expected_round_trip_bps=expected_round_trip,
+        equity_feed=equity_feed, equity_provider=equity_provider)
     derived["cost_stress_adequate"] = bool(stress.get("adequate"))
     try:
         breadth = matched_effective_breadth(
@@ -3219,6 +4268,41 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         cluster_multiple_tests=(cluster_multiple_tests
                                 if isinstance(cluster_multiple_tests, Mapping)
                                 else None))
+    protocol_v2: dict[str, Any] = {}
+    if version >= GATE_PROTOCOL_VERSION:
+        qual_observations = {
+            name: ([row for row in qual.get(source) if isinstance(row, Mapping)]
+                   if qual.get("available") and
+                   isinstance(qual.get(source), Sequence) and
+                   not isinstance(qual.get(source), (str, bytes)) else [])
+            for name, source in (
+                ("qualification", "candidate_observations"),
+                ("qualification_baseline", "baseline_observations"))}
+        pairing = comparison_key_report(
+            {"fit": fit, "heldout": heldout, "fit_baseline": fit_baseline,
+             "heldout_baseline": heldout_baseline, "null": null_source,
+             **qual_observations},
+            vehicle=vehicle, equity_feed=equity_feed,
+            equity_provider=equity_provider)
+        derived["comparison_keys_unique"] = bool(pairing["unique"])
+        parameters = protocol_parameter_report(
+            lane=str(lane), floors={"fit": fit_floor, "heldout": heldout_floor},
+            walk_forward=walk_forward, control=control)
+        derived["protocol_parameters_bound"] = bool(parameters["bound"])
+        heldout_pairs = matched_pairs(
+            heldout, heldout_baseline, vehicle=vehicle,
+            equity_feed=equity_feed, equity_provider=equity_provider)
+        protocol_v2 = {
+            "gate_protocol_version": version,
+            "heldout_drawdown": heldout_drawdown,
+            "pairing_integrity": pairing,
+            "protocol_parameters": parameters,
+            "power": _envelope_power_report(
+                lane=str(lane), deltas=heldout_pairs["deltas"],
+                clusters=heldout_pairs["clusters"], alpha=alpha,
+                fdr_batch=batch, online_fdr=online, control=control,
+                protocol_version=version),
+        }
     # Required checks are the minimum schema, not a licence to ignore an
     # additional veto supplied by a caller.  A passing envelope must agree
     # with every persisted boolean decision, exactly as durable proof
@@ -3229,11 +4313,14 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         # row projections above enforce exact entry/exit feed parity; delayed
         # SIP remains diagnostic-only and therefore cannot pass this boundary.
         (vehicle != "equity" or equity_feed in {"iex", "sip"}) and
-        all(derived.get(key, False) for key in GATE_REQUIRED_CHECKS) and
+        all(derived.get(key, False) for key in required_gate_checks(version)) and
         all(derived.values()) and
         (cost_model_binding is None or
          cost_model_binding.get("valid") is True)
     )
+    if protocol_v2:
+        protocol_v2["check_classification"] = gate_check_classification(
+            version, checks=derived)
     body: dict[str, Any] = {
         "schema": GATE_ENVELOPE_SCHEMA,
         "lane": str(lane),
@@ -3297,6 +4384,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "candidate_id": (str(candidate_id) if candidate_id is not None else None),
         "checks": derived,
         "passes": effective_passes,
+        **protocol_v2,
     }
     return {**body, "content_hash": _content_hash(body)}
 
@@ -3309,8 +4397,13 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         if schema not in SUPPORTED_GATE_ENVELOPE_SCHEMAS:
             return False
         legacy_v2 = schema == LEGACY_GATE_ENVELOPE_SCHEMA_V2
+        # Each envelope is re-verified under the protocol it was built with;
+        # an envelope without a version field is protocol 1.
+        version = envelope_protocol_version(envelope)
+        if version is None:
+            return False
         required_checks = (LEGACY_GATE_REQUIRED_CHECKS_V2
-                           if legacy_v2 else GATE_REQUIRED_CHECKS)
+                           if legacy_v2 else required_gate_checks(version))
         has_equity_feed = "equity_feed" in envelope
         has_equity_provider = "equity_provider" in envelope
         # Envelopes created before feed binding used SIP.  Rebuild those exact
@@ -3580,6 +4673,16 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         if envelope.get("passes") and not _qualification_minimums_meet(
                 qualification.get("minimums")):
             return False
+        # Protocol 2 also bounds the parameters the recomputations below
+        # take from the envelope (review D2-09): a passing envelope cannot
+        # declare an optional held-out floor, a walk-forward weaker than the
+        # protocol, or a control whose p-value cannot be recomputed.
+        if (envelope.get("passes") and version >= GATE_PROTOCOL_VERSION and
+                not protocol_parameter_report(
+                    lane=lane, floors=floors,
+                    walk_forward=envelope.get("walk_forward"),
+                    control=envelope.get("control"))["bound"]):
+            return False
         for name, source in (("fit", sources_fit), ("heldout", sources_held)):
             report = floors.get(name)
             if not isinstance(report, Mapping):
@@ -3717,11 +4820,21 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             }
             if envelope.get("arm_diagnostics") != expected_arm_diagnostics:
                 return False
-        expected_stress = cost_stress_report(
-            [*sources_fit_eligible, *sources_held_eligible], vehicle=vehicle,
-            risk_report=risk, equity_feed=equity_feed,
-            equity_provider=equity_provider)
-        if envelope.get("cost_stress") != expected_stress:
+        persisted_stress = envelope.get("cost_stress")
+        relative_veto = (persisted_stress.get("relative_veto")
+                         if isinstance(persisted_stress, Mapping) else None)
+        expected_round_trip = (
+            _normalized_expected_round_trip(
+                relative_veto.get("expected_round_trip_bps"))
+            if isinstance(relative_veto, Mapping) else None)
+        expected_stress = _gate_cost_stress(
+            fit=sources_fit_eligible, heldout=sources_held_eligible,
+            qualification=qualification, vehicle=vehicle, risk=risk,
+            protocol_version=version,
+            expected_round_trip_bps=expected_round_trip,
+            equity_feed=equity_feed, equity_provider=equity_provider,
+            strict=True)
+        if persisted_stress != expected_stress:
             return False
         expected_breadth = matched_effective_breadth(
             sources_held_eligible, baseline_held_eligible, vehicle=vehicle,
@@ -3746,7 +4859,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     vehicle=vehicle, iterations=int(
                         (envelope.get("control") or {}).get("resamples") or 20_000),
                     equity_feed=equity_feed,
-                    equity_provider=equity_provider)
+                    equity_provider=equity_provider,
+                    protocol_version=version)
                 if not _close_number(expected_effect.get("mean_r_delta"),
                                      performance.get("heldout_r_delta")):
                     return False
@@ -3758,7 +4872,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     vehicle=vehicle, iterations=int(
                         (envelope.get("control") or {}).get("resamples") or 20_000),
                     equity_feed=equity_feed,
-                    equity_provider=equity_provider)
+                    equity_provider=equity_provider,
+                    protocol_version=version)
                 if not _close_number(expected_delta.get("mean_delta"),
                                      performance.get("heldout_delta")):
                     return False
@@ -3935,7 +5050,15 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     if isinstance(measured_authority, Mapping) else None),
                 equity_feed=equity_feed,
                 equity_provider=equity_provider,
+                expected_round_trip_bps=expected_round_trip,
+                protocol_version=version,
             )
+            if version >= GATE_PROTOCOL_VERSION and any(
+                    envelope.get(key) != rebuilt.get(key) for key in (
+                        "gate_protocol_version", "heldout_drawdown",
+                        "pairing_integrity", "protocol_parameters", "power",
+                        "check_classification")):
+                return False
             rebuilt_checks = dict(rebuilt.get("checks") or {})
             rebuilt_passes = rebuilt.get("passes")
             if legacy_v2:
@@ -3987,7 +5110,7 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 rebuilt_passes = bool(
                     envelope.get("passes") and
                     all(rebuilt_checks.get(key, False)
-                        for key in GATE_REQUIRED_CHECKS) and
+                        for key in required_checks) and
                     all(rebuilt_checks.values()))
             if (rebuilt_checks != dict(checks) or
                     rebuilt_passes != envelope.get("passes")):
@@ -4051,7 +5174,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     control_adequacy.get(
                         "minimum_coverage", ACTUAL_CONTROL_MIN_COVERAGE))),
                 equity_feed=equity_feed,
-                equity_provider=equity_provider)
+                equity_provider=equity_provider,
+                protocol_version=version)
             if not _compare_statistical_report(expected_control, control):
                 return False
         fit_control = envelope.get("fit_control") or {}
@@ -4077,7 +5201,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     fit_adequacy.get(
                         "minimum_coverage", ACTUAL_CONTROL_MIN_COVERAGE))),
                 equity_feed=equity_feed,
-                equity_provider=equity_provider)
+                equity_provider=equity_provider,
+                protocol_version=version)
             if not _compare_statistical_report(expected_fit_control,
                                                fit_control):
                 return False
@@ -4092,7 +5217,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 expected_null = matched_cluster_test(
                     sources_held_eligible, null_eligible, vehicle=vehicle,
                     iterations=null_iterations, equity_feed=equity_feed,
-                    equity_provider=equity_provider)
+                    equity_provider=equity_provider,
+                    protocol_version=version)
                 persisted_adequacy = null_control.get("paired_adequacy")
                 if isinstance(persisted_adequacy, Mapping):
                     min_matched = int(persisted_adequacy.get(
@@ -4118,7 +5244,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                         null_control.get(
                             "minimum_coverage", NULL_CONTROL_MIN_COVERAGE))),
                     equity_feed=equity_feed,
-                    equity_provider=equity_provider)
+                    equity_provider=equity_provider,
+                    protocol_version=version)
             # ``null_control.available`` is the authorizing availability
             # (paired adequacy applied), while the descriptive matched test's
             # ``available`` only means at least one pair.  Compare the latter
@@ -4289,6 +5416,9 @@ def recompute_gate_statistics(envelope: Mapping) -> dict:
     and the falsification decision.  Re-verification compares these against
     the recorded conclusions rather than trusting them.
     """
+    version = envelope_protocol_version(envelope)
+    if version is None:
+        return {"available": False, "reason": "gate protocol version is invalid"}
     control = envelope.get("control")
     if not isinstance(control, Mapping):
         return {"available": False, "reason": "control evidence is missing"}
@@ -4312,7 +5442,24 @@ def recompute_gate_statistics(envelope: Mapping) -> dict:
         values.append(value)
     triples = [(float(cluster) * CLUSTER_SECONDS, value, 0.0)
                for cluster, value in zip(clusters, values)]
-    sign_flip = paired_cluster_sign_flip(triples, cluster_seconds=CLUSTER_SECONDS)
+    # Repeat the persisted test exactly: the producer may have drawn more
+    # than the default 20,000 sign flips (the live-shadow lane scales them to
+    # its online allocation), and the Monte Carlo p-value (e+1)/(N+1) depends
+    # on that count and on the seed (review D2-03).
+    # Anything other than a positive integer count or an integer seed keeps
+    # the historical defaults; the verifier rejects such a control when it
+    # recomputes the persisted report.
+    iterations = control.get("resamples")
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+        iterations = PAIRED_TEST_MIN_ITERATIONS
+    seed = control.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        seed = PAIRED_TEST_SEED
+    sign_flip = paired_cluster_sign_flip(
+        triples, cluster_seconds=CLUSTER_SECONDS, iterations=iterations,
+        seed=seed)
+    if version >= GATE_PROTOCOL_VERSION:
+        sign_flip = _sign_flip_resolution_tail(sign_flip, values, clusters)
     falsification = envelope.get("falsification")
     draws = None
     seed = None
@@ -4458,4 +5605,16 @@ __all__ = ["AcceptanceFloor", "ARM_EVIDENCE_SCHEMA", "CLUSTER_SECONDS", "GATE_EN
            "placebo_null_distribution", "placebo_ratio", "qualification_report",
            "recompute_gate_statistics", "risk_unit_report", "sample_counts", "seal_final_window",
            "structural_floor", "verified_gate_envelope", "verify_gate_envelope",
-           "walk_forward_report"]
+           "walk_forward_report",
+           "GATE_PROTOCOL_VERSION", "LEGACY_GATE_PROTOCOL_VERSION",
+           "SUPPORTED_GATE_PROTOCOL_VERSIONS", "GATE_PROTOCOL_V2_CHECKS",
+           "GATE_PROTOCOL_V2_REQUIRED_CHECKS", "COST_STRESS_RELATIVE_MULTIPLE",
+           "HELDOUT_MAX_DRAWDOWN_R", "PAIRED_TEST_SEED",
+           "PAIRED_TEST_MIN_ITERATIONS", "POWER_TARGET",
+           "envelope_protocol_version", "required_gate_checks",
+           "gate_check_classification", "protocol_walk_forward_minimums",
+           "protocol_parameter_report", "comparison_key_report",
+           "opportunity_comparison_id", "minimum_detectable_effect",
+           "sessions_for_target_mde", "lane_minimums_for_target_mde",
+           "protocol_power_report", "relative_cost_stress_report",
+           "heldout_drawdown_report"]
