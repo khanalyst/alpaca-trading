@@ -550,5 +550,22 @@ class ThesisDeadlineCalendarCloseTests(unittest.TestCase):
                                      session_close=session_close)
 
 
+class DeadCodeTests(unittest.TestCase):
+    """A-18: unused proof helper and a contradictory refresh branch."""
+
+    def test_unused_edge_proof_helper_is_gone(self):
+        import agent.edge
+        self.assertFalse(hasattr(agent.edge, "_latest_passing_proof"))
+
+    def test_refresh_parent_check_has_no_360_minute_branch(self):
+        import inspect
+        import research.mechanism_refresh_cohort as refresh
+        self.assertNotIn("360", inspect.getsource(refresh._verified_parent_spec))
+        # The refresh manifest is unchanged (hash computed before the edit).
+        self.assertEqual(
+            refresh.mechanism_refresh_cohort()["manifest_hash"],
+            "67525c166888c5d10c2294ec1223200245d8ea89335cbaed1a75cd2418cbef76")
+
+
 if __name__ == "__main__":
     unittest.main()
