@@ -103,9 +103,6 @@ ROW_COST_MODEL_FIELDS = (
 )
 
 CONFIG_BLOCK = "costs"
-# Replay bars are one minute long.  The close-relative entry cut-off keeps one
-# bar between the latest entry and the force-flat time.
-REPLAY_BAR_MINUTES = 1
 
 _MEASURED_PROVENANCE_RE = re.compile(
     r"^measured:(?P<schedule>[0-9a-f]{12}):"
@@ -570,10 +567,13 @@ def replay_policy_for_session(
         latest = min(latest, policy.latest_entry_time)
     # The entry cut-off is close-relative but the force-flat time can be
     # earlier: on a 13:00 early close the shipped offsets give a 12:55 latest
-    # entry against a 12:50 force-flat, so an entry would be flattened at once
-    # and pay a full round trip for nothing.  Leave room for one bar.
-    latest = min(latest, (closed - timedelta(
-        minutes=flat_minutes + REPLAY_BAR_MINUTES)).time().replace(tzinfo=None))
+    # entry against a 12:50 force-flat.  Never let the latest entry fall after
+    # the force-flat time.  The clamp stops at the force-flat time rather than
+    # one bar before it: account simulation already refuses an entry whose
+    # entry bar ends after force-flat (``entry_bar_after_exit_deadline``), and
+    # an event exactly at force-flat must keep the runtime's force-flat
+    # refusal reason (``tests/research/test_ibr_runtime_parity.py``).
+    latest = min(latest, force)
     return replace(policy, force_flat_time=force, latest_entry_time=latest)
 
 

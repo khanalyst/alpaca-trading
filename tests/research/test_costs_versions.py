@@ -614,7 +614,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(rows[0]["cost_coverage_leg"], "entry")
         self.assertIn("under-covered", rows[0]["cost_coverage_detail"])
 
-    def test_early_close_entries_stop_one_bar_before_force_flat(self):
+    def test_early_close_latest_entry_never_follows_force_flat(self):
         policy = ReplayPolicy.from_config({
             "strategy": {"latest_entry_time": "15:00"},
             "session": {"require_exact_calendar": True,
@@ -624,7 +624,9 @@ class ReplayTests(unittest.TestCase):
             policy, session_open=datetime(2026, 11, 27, 9, 30, tzinfo=NEW_YORK),
             session_close=datetime(2026, 11, 27, 13, 0, tzinfo=NEW_YORK))
         self.assertEqual(early.force_flat_time, time(12, 50))
-        self.assertEqual(early.latest_entry_time, time(12, 49))
+        # Was 12:55.  Account simulation also refuses an entry whose bar ends
+        # after force-flat, so the last admissible one-minute entry is 12:49.
+        self.assertEqual(early.latest_entry_time, time(12, 50))
         normal = replay_policy_for_session(
             policy, session_open=datetime(2026, 10, 14, 9, 30, tzinfo=NEW_YORK),
             session_close=datetime(2026, 10, 14, 16, 0, tzinfo=NEW_YORK))
