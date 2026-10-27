@@ -398,9 +398,61 @@ def timing_report(measured: Sequence[Mapping[str, Any]]) -> dict:
             "paper_fill_caveat": "paper fills do not measure live queue position, market impact or latency slippage"}
 
 
+def _evidence_age(report: dict[str, Any], measured: Sequence[Mapping[str, Any]],
+                  *, as_of: datetime | float | None,
+                  max_age_days: float) -> dict[str, Any]:
+    """Fail closed when too little of the evidence is recent (finding D1-12).
+
+    At least ``MIN_FILLS`` scored orders must have been filled within
+    ``max_age_days`` before ``as_of`` (default now); evidence dated after
+    ``as_of`` is not evidence at that instant.  Only an otherwise authorized
+    report changes verdict; every other state is already a veto.
+    """
+    limit = float(max_age_days)
+    if not math.isfinite(limit) or limit <= 0:
+        raise ValueError("max_age_days must be positive and finite")
+    if as_of is None:
+        moment = datetime.now().timestamp()
+    elif isinstance(as_of, datetime):
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        moment = as_of.timestamp()
+    else:
+        moment = float(as_of)
+    stamps = [float(item["ts"]) for item in measured
+              if _finite(item.get("ts")) is not None]
+    future = [stamp for stamp in stamps if stamp > moment]
+    recent = [stamp for stamp in stamps
+              if 0.0 <= moment - stamp <= limit * 86_400.0]
+    newest = max((stamp for stamp in stamps if stamp <= moment), default=None)
+    stale = len(recent) < MIN_FILLS
+    report.update({
+        "evidence_as_of": moment, "max_evidence_age_days": limit,
+        "recent_fills": len(recent), "fills_after_as_of": len(future),
+        "newest_fill_age_days": (None if newest is None
+                                 else (moment - newest) / 86_400.0),
+        "stale_evidence": stale,
+    })
+    if report.get("authorization_verdict") == "authorized" and (stale or future):
+        report["authorization_verdict"] = (
+            "veto_stale_calibration" if stale else "veto_evidence_after_as_of")
+        report["authorization_exit_code"] = 2
+    return report
+
+
 def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | Mapping | None = None, *,
               runtime_mode: str | None = None, vehicle: str | None = None,
-              execution_profile: str | None = None) -> dict[str, Any]:
+              execution_profile: str | None = None,
+              as_of: datetime | float | None = None,
+              max_age_days: float | None = None) -> dict[str, Any]:
+    """Score fills against the cost model and return an authorization verdict.
+
+    ``max_age_days`` (with ``as_of``, default now) makes old evidence a veto:
+    fewer than ``MIN_FILLS`` orders filled within that window cannot
+    authorize, however many older fills the journal holds.
+    """
+    if as_of is not None and max_age_days is None:
+        raise ValueError("as_of requires max_age_days")
     selected_vehicle = _vehicle_filter(vehicle)
     # A vehicle-filtered authorization report must price itself with that
     # vehicle's configured schedule.  An explicit CostModel remains
@@ -437,6 +489,9 @@ def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | Mapping | No
                        # promotion boundary cannot mistake an empty/thin
                        # journal for a verified execution model.
                        "authorization_exit_code": 2})
+        if max_age_days is not None:
+            _evidence_age(report, measured, as_of=as_of,
+                          max_age_days=max_age_days)
         return report
 
     distinct_vehicles = {str(item["vehicle"]) for item in measured}
@@ -521,13 +576,17 @@ def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | Mapping | No
         # report and continue generating candidates.
         "authorization_exit_code": 0 if authorization == "authorized" else 2,
     })
+    if max_age_days is not None:
+        _evidence_age(report, measured, as_of=as_of, max_age_days=max_age_days)
     return report
 
 
 def json_report(db: sqlite3.Connection, costs: CostModel | Mapping | None = None, *,
                 runtime_mode: str | None = None,
                 vehicle: str | None = None,
-                execution_profile: str | None = None) -> dict[str, Any]:
+                execution_profile: str | None = None,
+                as_of: datetime | float | None = None,
+                max_age_days: float | None = None) -> dict[str, Any]:
     """Return a journal calibration report, optionally scoped to one vehicle.
 
     A mixed journal is diagnostic only.  Callers authorizing a lane should
@@ -536,7 +595,8 @@ def json_report(db: sqlite3.Connection, costs: CostModel | Mapping | None = None
     """
     return calibrate(load_execution_fills(db), costs,
                      runtime_mode=runtime_mode, vehicle=vehicle,
-                     execution_profile=execution_profile)
+                     execution_profile=execution_profile, as_of=as_of,
+                     max_age_days=max_age_days)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -546,6 +606,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="JSON config carrying the costs/execution blocks")
     parser.add_argument("--vehicle", choices=("equity", "option"), default=None,
                         help="scope calibration to one vehicle (recommended for authorization)")
+    parser.add_argument("--max-age-days", type=float, default=None,
+                        help=("veto unless at least the minimum number of fills "
+                              "were filled within this many days (recommended "
+                              "for authorization)"))
     return parser
 
 
@@ -570,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
                 db,
                 CostModel.from_config(
                     static_cost_config(config), vehicle=args.vehicle),
-                vehicle=args.vehicle)
+                vehicle=args.vehicle, max_age_days=args.max_age_days)
     except (OSError, sqlite3.Error) as exc:
         print(f"journal read failed: {exc}", file=sys.stderr)
         return 1

@@ -172,6 +172,28 @@ below 80% of requested quantity, or a partial-cancel rate above 20% returns a
 veto and non-zero status. Offline diagnostics may still run, but shadow
 authorization remains blocked. In-flight orders are excluded, and the model is
 never adjusted automatically.
+Staleness is measured only when asked for (review finding D1-12):
+`calibrate(..., as_of=, max_age_days=)`, or `--max-age-days` on the command
+line, vetoes (`veto_stale_calibration`) unless at least 20 scored orders were
+filled within that many days before `as_of` (default now); fills dated after
+`as_of` do not count. Without a maximum age no age is checked, so an
+authorization caller must pass one.
+
+For equity entries this check cannot veto on cost (review finding D1-06): the
+journal reference is the limit price, the IEX ask or bid, a DAY limit fills at
+or better than it, so every entry scores zero or less against a model figure
+that includes the half spread, and unfilled entries are never scored.
+`research/entry_calibration.py` scores like with like: each filled entry
+order against the decision-time mid (spread included) and the signal bar's
+close, and every entry order that ended unfilled as a missed fill, with its
+opportunity cost when the mid at expiry is recorded; more than 20% missed
+entries is a veto. It reads `decision_mid` (or `decision_bid` and
+`decision_ask`, or the existing `mid_price`), `signal_close` and `expiry_mid`
+from the journal, which the runtime does not yet write for shares, so it
+reports `insufficient_data` and fails closed until it does. It is not yet
+part of `calibrate`'s authorization; wiring it in, and journalling those
+fields from `agent/market_entry_risk.py` and `agent/execution_lifecycle.py`
+(with columns in `agent/journal.py`), are the remaining steps.
 
 The scheduled calibration-only pass measures per-symbol/session stress on the
 9/15/25/50-bps ladder and is disabled by default. Runtime use requires an
