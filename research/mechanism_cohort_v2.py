@@ -10,12 +10,55 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.contracts.rule import RULE_SCHEMA_V6, validate_rule_spec, rule_variant_id
+from agent.contracts.rule import (
+    RULE_SCHEMA_V6, SESSION_MINUTES, rule_variant_id, thesis_deadline_conflict,
+    validate_rule_spec,
+)
 from .edge_ledger_store import content_hash
 from .factory_core import family_template
 
 
 COHORT_ID = "intraday-mechanisms.v2"
+ERRATA_SCHEMA = "mechanism-cohort-errata.v1"
+REVIEW_SOURCE = "docs/review-2026-10-15/reviews/handoff-A_signals.md"
+
+
+def _clock(minutes_after_open: int) -> str:
+    total = 9 * 60 + 30 + int(minutes_after_open)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def thesis_deadline_errata(families: list[dict[str, Any]], *,
+                           corrected_by: str) -> list[dict[str, Any]]:
+    """Arms whose thesis deadline leaves no room for their entry window.
+
+    Review finding A-01: ``exit_before_minutes`` counts minutes before the
+    16:00 close, so 360 is a 10:00 New York deadline.  The arms stay loadable
+    and keep their identities; this list marks their results as not testing
+    the stated thesis.  It is derived, not hand-written, from
+    :func:`agent.contracts.rule.thesis_deadline_conflict`.
+    """
+    invalid = []
+    for family in families:
+        for arm in family["arms"]:
+            spec = arm["rule_spec"]
+            reason = thesis_deadline_conflict(spec, require_full_window=True)
+            if reason is None:
+                continue
+            invalid.append({
+                "family": family["name"],
+                "variant_id": arm["variant_id"],
+                "finding": "A-01",
+                "status": "invalid_thesis_test",
+                "reason": reason,
+                "entry_window_new_york": (
+                    f"{_clock(spec['entry_after_minutes'])}-"
+                    f"{_clock(spec['entry_before_minutes'])}"),
+                "thesis_deadline_new_york": _clock(
+                    SESSION_MINUTES - spec["exit_before_minutes"]),
+                "corrected_by": corrected_by,
+            })
+    return invalid
 
 
 def _arm(family: str, *, after: int, before: int, hold: int,
@@ -127,7 +170,21 @@ def mechanism_cohort(name: str = COHORT_ID) -> dict[str, Any]:
         "diagnostic_only": True,
         "authorizing": False,
     }
-    return {**manifest, "manifest_hash": content_hash(manifest)}
+    # Errata found after the cohort was frozen are reported beside the
+    # manifest, never inside it: manifest_hash (pinned by the cost, deadline
+    # and refresh cohorts) still covers exactly the registered content.
+    errata = {
+        "schema": ERRATA_SCHEMA,
+        "covered_by_manifest_hash": False,
+        "source": REVIEW_SOURCE,
+        "invalid_arms": thesis_deadline_errata(
+            families, corrected_by="intraday-mechanisms.v3"),
+        "undocumented_inheritance": [
+            "every arm carries trailing_stop_r 1.5 (finding A-12)"],
+    }
+    return {**manifest, "manifest_hash": content_hash(manifest),
+            "errata": errata}
 
 
-__all__ = ["COHORT_ID", "mechanism_cohort"]
+__all__ = ["COHORT_ID", "ERRATA_SCHEMA", "mechanism_cohort",
+           "thesis_deadline_errata"]
