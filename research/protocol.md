@@ -310,6 +310,19 @@ earlier epoch's wins or losses.
 Underpowered windows and outcomes without a usable risk reference are never
 treated as failure; a failed or unverifiable latest shadow proof quarantines
 history rather than falling back to lifetime aggregation.
+The default (v1) verdict re-tests a 1,000-draw, five-session-block bootstrap
+bound at every review and dashboard render, which under zero edge lets about
+18% of candidates read "passed" at some point (review finding D1-07); its
+[5th, 95th] percentile pair is a 90% two-sided interval. It is kept so existing
+verdicts reproduce. `research.trial.verdict_version: v2` selects a verdict
+decided once, on the shortest prefix of sessions meeting both the session and
+trade floors (so where it falls depends on counts, not outcomes), by a CR1
+session-clustered t with G - 1 degrees of freedom and a one-sided session
+sign-flip test (exact up to 16 sessions) against the mean-R floor at
+`alpha_one_sided` (default 0.05). Both must pass, with positive total and
+mean R; failing mirrors it. Neither is terminal `not_established`. The first
+terminal verdict is appended to the edge ledger as a `paper_trial_verdict`
+event and every later review returns it instead of deciding again.
 
 *Pinned* is an operator-declared promotion: an entry in `strategy.pinned`
 carrying an operator-assigned id, an exact `variant_id`, and a vehicle.
