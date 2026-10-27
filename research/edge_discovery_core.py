@@ -609,6 +609,15 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
     # flat CostModel schema.  Keep it in the effective assumptions below, but
     # derive the static fallback from the schema-compatible projection.
     costs = CostModel.from_config(static_cost_config(source), vehicle=vehicle)
+    # The runtime admission filters travel with the config so replay and the
+    # live contract admit the same candidate bars.  A key the strategy
+    # supplies is used as supplied; a key it omits takes the runtime
+    # contract's default (``agent.contracts.ibr.IBRConfig.from_mapping``),
+    # never a permissive replay-only value such as an unlimited spread.  A
+    # validated runtime config supplies every key whose contract default
+    # differs from the old fallback, so its replay is unchanged.
+    from .ibr import runtime_admission_fields
+    admission = runtime_admission_fields(strategy)
     cfg = IBRConfig(
         range_minutes=int(strategy.get("range_minutes", 15)),
         stop_pct=float(strategy.get("stop_pct", .003)),
@@ -618,18 +627,7 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
         breakout_buffer_bps=float(strategy.get("breakout_buffer_bps", 5.0)),
         costs=costs,
         close_confirmed=bool(close_confirmed),
-        # The runtime admission filters travel with the config so replay and
-        # the live contract admit the same candidate bars.  Omission keeps the
-        # contract's own permissive default rather than inventing a limit.
-        min_relative_volume=float(strategy.get("min_relative_volume", 0.0)),
-        min_ibr_width_atr=float(strategy.get("min_ibr_width_atr", 0.0)),
-        max_ibr_width_atr=float(strategy.get("max_ibr_width_atr", float("inf"))),
-        max_ibr_width_pct=float(strategy.get("max_ibr_width_pct", float("inf"))),
-        atr_period=int(strategy.get("atr_period", 14)),
-        max_entry_extension_r=float(
-            strategy.get("max_entry_extension_r", float("inf"))),
-        stale_minutes=float(strategy.get("stale_minutes", float("inf"))),
-        max_spread_bps=float(strategy.get("max_spread_bps", float("inf"))),
+        **admission,
         timezone=str((source.get("session") or {}).get("timezone", "America/New_York")),
         policy=(ReplayPolicy.from_config(source) if policy is None else policy),
     )
