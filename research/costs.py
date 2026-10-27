@@ -51,6 +51,28 @@ RUNTIME_MAX_SLIPPAGE_BPS = 50.0
 # Runtime may select one of these scenarios, but must not invent a new stress
 # level that has no corresponding research evidence.
 COST_STRESS_SCENARIOS_BPS = (9.0, 15.0, 25.0, 50.0)
+# Every rung above is a round trip: one all-in charge, in bps of entry
+# notional, standing for both legs together.  No rung is a per-side figure,
+# so compare a rung with a model's expected *round trip*, never with its
+# per-side cost (see ``stress_coherence``).
+COST_STRESS_RUNG_BASIS = "round_trip_all_in_bps_of_entry_notional"
+
+# Cost-model versions.  ``static_v1`` is the original flat model (a 4 bps
+# spread and 6 bps slippage per side, and a 0.5 bps fee on both legs: 17 bps
+# per round trip on bar references).  It stays the behaviour of
+# :class:`CostModel` and of every caller that does not ask for another
+# version, so stored evidence and sealed tests recompute exactly; a row or
+# report without a version field was priced by ``static_v1``.
+# ``per_symbol_v2`` is :class:`PerSymbolCostModel`: one full per-symbol spread
+# per round trip, explicit slippage by order type, and regulatory fees on the
+# sell leg only.  It is the default for new research runs (``cost_rerun``) and
+# records its version in every leg provenance and report it produces.
+COST_MODEL_STATIC_V1 = "static_v1"
+COST_MODEL_PER_SYMBOL_V2 = "per_symbol_v2"
+COST_MODEL_MEASURED_QUOTE_V1 = "measured_quote_v1"
+COST_MODEL_VERSIONS = (COST_MODEL_STATIC_V1, COST_MODEL_PER_SYMBOL_V2,
+                       COST_MODEL_MEASURED_QUOTE_V1)
+DEFAULT_RESEARCH_COST_MODEL_VERSION = COST_MODEL_PER_SYMBOL_V2
 # The stress is deliberately a cost shock, not a multiplier on configured
 # replay costs or risk.  Keep this machine-readable so runtime telemetry and
 # fit reports cannot describe the same arithmetic in contradictory terms.
@@ -81,6 +103,9 @@ ROW_COST_MODEL_FIELDS = (
 )
 
 CONFIG_BLOCK = "costs"
+# Replay bars are one minute long.  The close-relative entry cut-off keeps one
+# bar between the latest entry and the force-flat time.
+REPLAY_BAR_MINUTES = 1
 
 _MEASURED_PROVENANCE_RE = re.compile(
     r"^measured:(?P<schedule>[0-9a-f]{12}):"
@@ -88,7 +113,10 @@ _MEASURED_PROVENANCE_RE = re.compile(
     r":spread-(?P<spread>p25|median|p75|p90|p95)"
     r":depth-(?P<depth>p25|median|p75|p90|p95)"
     r":feed-(?P<feed>[^:]+):provider-(?P<provider>[^:]+)"
-    r":coverage-(?P<coverage>strict)$")
+    r":coverage-(?P<coverage>strict)"
+    # A stop leg's explicit trigger slippage (E1-05).  Rows written before it
+    # existed carry no suffix and keep their original meaning.
+    r"(?::stop-trigger-(?P<stop_trigger>\d+\.\d{4}))?$")
 
 
 class CostError(ValueError):
@@ -540,6 +568,12 @@ def replay_policy_for_session(
     latest = (closed - timedelta(minutes=reject_minutes)).time().replace(tzinfo=None)
     if policy.latest_entry_time is not None:
         latest = min(latest, policy.latest_entry_time)
+    # The entry cut-off is close-relative but the force-flat time can be
+    # earlier: on a 13:00 early close the shipped offsets give a 12:55 latest
+    # entry against a 12:50 force-flat, so an entry would be flattened at once
+    # and pay a full round trip for nothing.  Leave room for one bar.
+    latest = min(latest, (closed - timedelta(
+        minutes=flat_minutes + REPLAY_BAR_MINUTES)).time().replace(tzinfo=None))
     return replace(policy, force_flat_time=force, latest_entry_time=latest)
 
 
@@ -741,6 +775,29 @@ class CostModel:
                      qty * mult)
         return execution + self.fees(entry, exit, qty, mult, vehicle=vehicle)
 
+    @property
+    def cost_model_version(self) -> str:
+        """The version that produced this model, read from its provenance.
+
+        A leg built by :class:`PerSymbolCostModel` or by the measured-quote
+        resolver says so in its provenance; anything else is ``static_v1``.
+        This is deliberately not a dataclass field, so ``as_dict`` (and every
+        identity hash built from it) is unchanged for ``static_v1``.
+        """
+        return cost_model_version_of(self.provenance)
+
+    def expected_round_trip_bps(self, *, entry_executable_quote: bool = False,
+                                exit_executable_quote: bool = False) -> float:
+        """Expected round trip in bps of notional, both legs and fees.
+
+        Under ``static_v1`` this is 17 bps on bar references, 13 bps when both
+        legs are executable quotes and 15 bps for a quote entry with a resting
+        exit.  It is the figure a stress rung must be compared with.
+        """
+        return self.round_trip_cost(
+            1.0, 1.0, 1.0, 1.0, entry_executable_quote=entry_executable_quote,
+            exit_executable_quote=exit_executable_quote) * 10_000.0
+
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CostModel":
         """Rebuild a model persisted inside a risk-unit report."""
@@ -844,6 +901,427 @@ class CostModel:
             provenance=str(selected.get(
                 "provenance", "default" if not block else "config")),
         )
+
+
+def cost_model_version_of(provenance: Any) -> str:
+    """Map a cost-model provenance string onto its model version."""
+    text = str(provenance or "").strip().lower()
+    if text.startswith(COST_MODEL_PER_SYMBOL_V2 + ":"):
+        return COST_MODEL_PER_SYMBOL_V2
+    if text.startswith("measured:"):
+        return COST_MODEL_MEASURED_QUOTE_V1
+    return COST_MODEL_STATIC_V1
+
+
+def stress_relative_to_expected(expected_round_trip_bps: float, *,
+                                multiple: float = 1.0,
+                                add_bps: float = 0.0) -> float:
+    """Stressed round trip defined from the expected model.
+
+    ``expected x multiple + add_bps``, both in round-trip bps of entry
+    notional (the same basis as every ladder rung).  A stress defined this way
+    can never fall below the expected cost it stresses, which the absolute
+    9 bps runtime rung does under ``static_v1`` (E1-02).
+    """
+    values = []
+    for name, value in (("expected_round_trip_bps", expected_round_trip_bps),
+                        ("multiple", multiple), ("add_bps", add_bps)):
+        values.append(_bps(value, name))
+    expected, factor, extra = values
+    if factor < 1.0:
+        raise CostError("a stress multiple below 1 would understate expected cost")
+    return expected * factor + extra
+
+
+def stress_coherence(scenario_bps: Any, expected_round_trip_bps: Any) -> dict[str, Any]:
+    """Compare one absolute stress rung with an expected round trip.
+
+    Both figures are round trips in bps of entry notional.  A rung at or
+    below the expected round trip is not a stress: the runtime veto would
+    then claim a cost-to-risk ratio lower than the model's own expectation,
+    and the research gate's ``max(0, scenario - base)`` adds nothing.
+    """
+    scenario = _bps(scenario_bps, "scenario_bps")
+    expected = _bps(expected_round_trip_bps, "expected_round_trip_bps")
+    return {
+        "basis": COST_STRESS_RUNG_BASIS,
+        "scenario_bps": scenario,
+        "expected_round_trip_bps": expected,
+        "multiple_of_expected": (scenario / expected if expected > 0 else None),
+        "stress_above_expected": scenario > expected,
+    }
+
+
+# ---------------------------------------------------------------------------
+# per_symbol_v2: the per-symbol, order-type-aware cost model (E1-01).
+#
+# The arithmetic mirrors ``studies/liquid_reversion/costs.py`` (the worked
+# reference; a test pins the two together).  Alpaca charges no commission on
+# API equity trades, so a round trip is:
+#
+# * one full quoted spread, the larger of one tick and the symbol's measured
+#   or reference spread, split as half a spread per marketable leg;
+# * explicit slippage per side, on legs that can slip (market and stop);
+# * a stop-trigger term on stop legs, in ticks (a triggered stop-market order
+#   in a moving market pays more than the touch);
+# * the SEC Section 31 fee, $20.60 per million of sell notional from 4 April
+#   2026 (SEC Fee Rate Advisory 2026-2), on the sell leg only;
+# * the FINRA Trading Activity Fee, $0.000195 per share sold capped at $9.79
+#   per trade, on the sell leg only.  FINRA paused the fee from 1 October to
+#   31 December 2026 (SR-FINRA-2026-021); it stays a parameter, and at these
+#   prices it is below 0.01 bps either way.
+#
+# Order types follow the runtime: the equity entry is a marketable DAY limit
+# at the executable quote (``agent/market_entry_risk.py``), the take-profit is
+# a resting limit and the stop loss a stop-market leg; time and force-flat
+# exits are market orders.  A limit leg cannot fill worse than its limit, so it
+# pays no slippage, but it can fail to fill; the replay assumes it fills and
+# the leg says so in its provenance.
+# ---------------------------------------------------------------------------
+TICK_SIZE = 0.01
+SEC_FEE_PER_MILLION = 20.60
+FINRA_TAF_PER_SHARE = 0.000195
+FINRA_TAF_CAP = 9.79
+DEFAULT_SLIPPAGE_BPS_PER_SIDE_V2 = 0.5
+DEFAULT_STOP_TRIGGER_SLIPPAGE_TICKS = 1.0
+DEFAULT_ROUND_TRIP_NOTIONAL = 25_000.0
+MARKET = "market"
+STOP = "stop"
+MARKETABLE_LIMIT = "marketable_limit"
+RESTING_LIMIT = "resting_limit"
+ORDER_TYPES = (MARKET, STOP, MARKETABLE_LIMIT, RESTING_LIMIT)
+# Per-symbol reference spreads: the Corwin-Schultz high-low median over 19
+# sessions from ``docs/audit-2026-09-21/spread-reference.json`` (a test pins
+# this table to that file).  It is a diagnostic estimate, not a fitted quote
+# schedule, so a measured spread replaces it whenever one is supplied; the
+# one-tick floor always applies.  For the tightest names it is above one tick
+# (SPY 0.97 bps against 0.13), which errs towards cost.
+REFERENCE_SPREAD_SOURCE = "reference_spread_2026_09_21"
+REFERENCE_SPREADS_BPS = {
+    "DIA": 0.744, "EEM": 1.138, "EFA": 0.69, "GLD": 1.694, "HYG": 0.626,
+    "IWM": 1.281, "QQQ": 1.294, "SLV": 2.832, "SMH": 2.165, "SPY": 0.971,
+    "TLT": 0.796, "VB": 0.54, "VO": 0.833, "VTI": 0.776, "XLB": 1.434,
+    "XLE": 2.288, "XLF": 1.551, "XLI": 1.206, "XLK": 1.463, "XLP": 1.179,
+    "XLRE": 1.121, "XLU": 1.773, "XLV": 1.274, "XLY": 1.276,
+}
+# Median closes over the same 19 sessions: the reference prices at which the
+# documented round trips are quoted.
+REFERENCE_PRICES = {
+    "DIA": 527.7, "EEM": 67.15, "EFA": 106.87, "GLD": 401.79, "HYG": 79.14,
+    "IWM": 291.92, "QQQ": 715.35, "SLV": 59.7, "SMH": 556.74, "SPY": 765.15,
+    "TLT": 81.86, "VB": 296.05, "VO": 81.45, "VTI": 377.02, "XLB": 52.14,
+    "XLE": 64.43, "XLF": 57.4, "XLI": 172.67, "XLK": 185.94, "XLP": 84.53,
+    "XLRE": 43.76, "XLU": 42.6, "XLV": 168.91, "XLY": 114.16,
+}
+
+
+def _positive_number(value: Any, name: str) -> float:
+    number = _bps(value, name)
+    if number <= 0:
+        raise CostError(f"{name} must be positive")
+    return number
+
+
+@dataclass(frozen=True)
+class PerSymbolCostModel:
+    """Per-symbol expected cost, priced leg by leg (``per_symbol_v2``).
+
+    ``spreads`` holds ``(symbol, spread_bps, source)`` rows; a symbol with no
+    row cannot be priced and fails closed rather than borrowing another
+    symbol's spread.  :meth:`leg_model` returns an ordinary :class:`CostModel`
+    for one leg, so every existing replay lane (account simulation, IBR
+    repricing, row recomputation) applies it unchanged and persists its
+    parameters, while its provenance carries the version, symbol, side,
+    order type and spread source.
+    """
+
+    spreads: tuple[tuple[str, float, str], ...] = tuple(
+        (symbol, spread, REFERENCE_SPREAD_SOURCE)
+        for symbol, spread in sorted(REFERENCE_SPREADS_BPS.items()))
+    slippage_bps_per_side: float = DEFAULT_SLIPPAGE_BPS_PER_SIDE_V2
+    stop_trigger_slippage_ticks: float = DEFAULT_STOP_TRIGGER_SLIPPAGE_TICKS
+    sec_fee_per_million: float = SEC_FEE_PER_MILLION
+    finra_taf_per_share: float = FINRA_TAF_PER_SHARE
+    finra_taf_cap: float = FINRA_TAF_CAP
+    tick_size: float = TICK_SIZE
+    entry_order_type: str = MARKETABLE_LIMIT
+    # Probability that a touched take-profit limit fills.  The replay books a
+    # touch as a fill; below 1, the unfilled share is charged the cost of the
+    # market exit that would replace it.
+    target_fill_probability: float = 1.0
+    max_spread_bps: float = RUNTIME_MAX_SPREAD_BPS
+    max_slippage_bps: float = RUNTIME_MAX_SLIPPAGE_BPS
+
+    version = COST_MODEL_PER_SYMBOL_V2
+
+    def __post_init__(self) -> None:
+        rows = []
+        seen = set()
+        for row in self.spreads:
+            if not isinstance(row, (tuple, list)) or len(row) != 3:
+                raise CostError("spreads rows must be (symbol, spread_bps, source)")
+            symbol = str(row[0] or "").strip().upper()
+            source = str(row[2] or "").strip()
+            if not symbol or not source or ":" in symbol or ":" in source:
+                raise CostError("spread rows need a symbol and a source without ':'")
+            if symbol in seen:
+                raise CostError(f"duplicate spread row for {symbol}")
+            seen.add(symbol)
+            rows.append((symbol, _bps(row[1], f"{symbol} spread_bps"), source))
+        object.__setattr__(self, "spreads", tuple(sorted(rows)))
+        for name in ("slippage_bps_per_side", "stop_trigger_slippage_ticks",
+                     "sec_fee_per_million", "finra_taf_per_share",
+                     "finra_taf_cap", "max_spread_bps", "max_slippage_bps"):
+            object.__setattr__(self, name, _bps(getattr(self, name), name))
+        object.__setattr__(self, "tick_size",
+                           _positive_number(self.tick_size, "tick_size"))
+        if self.entry_order_type not in {MARKET, MARKETABLE_LIMIT}:
+            raise CostError("entry_order_type must be market or marketable_limit")
+        probability = _bps(self.target_fill_probability, "target_fill_probability")
+        if probability > 1.0:
+            raise CostError("target_fill_probability must be between 0 and 1")
+        object.__setattr__(self, "target_fill_probability", probability)
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any] | None = None, *,
+                    spreads: Mapping[str, float] | None = None,
+                    spread_source: str = "measured",
+                    **overrides: Any) -> "PerSymbolCostModel":
+        """Build with the runtime rejection caps and optional measured spreads.
+
+        ``spreads`` (symbol to measured spread in bps) replaces the reference
+        spread for those symbols and is labelled ``spread_source``.
+        """
+        execution = (dict(config or {}).get("execution") or {})
+        if not isinstance(execution, Mapping):
+            raise CostError("execution must be a mapping")
+        table = {symbol: (spread, REFERENCE_SPREAD_SOURCE)
+                 for symbol, spread in REFERENCE_SPREADS_BPS.items()}
+        for symbol, spread in dict(spreads or {}).items():
+            table[str(symbol).strip().upper()] = (spread, spread_source)
+        values = {
+            "spreads": tuple((symbol, spread, source)
+                             for symbol, (spread, source) in sorted(table.items())),
+            "max_spread_bps": execution.get("max_spread_bps", RUNTIME_MAX_SPREAD_BPS),
+            "max_slippage_bps": execution.get("max_slippage_bps",
+                                              RUNTIME_MAX_SLIPPAGE_BPS),
+        }
+        values.update(overrides)
+        return cls(**values)
+
+    def spread_entry(self, symbol: str) -> tuple[float, str]:
+        wanted = str(symbol or "").strip().upper()
+        for name, spread, source in self.spreads:
+            if name == wanted:
+                return spread, source
+        raise CostError(
+            f"{COST_MODEL_PER_SYMBOL_V2} has no measured or reference spread "
+            f"for {wanted or 'an unnamed symbol'}")
+
+    def tick_bps(self, price: float) -> float:
+        """One tick as bps of ``price``."""
+        return 10_000.0 * self.tick_size / _positive_number(price, "price")
+
+    def spread_bps(self, symbol: str, price: float) -> float:
+        """The full quoted spread: ``max(one tick, measured or reference)``."""
+        spread, _source = self.spread_entry(symbol)
+        return max(self.tick_bps(price), spread)
+
+    def sell_fee_usd(self, price: float, shares: float) -> float:
+        """SEC fee plus FINRA TAF on one sale; a purchase pays neither."""
+        notional = _positive_number(price, "price") * _positive_number(shares, "shares")
+        return (self.sec_fee_per_million * notional / 1_000_000.0 +
+                min(self.finra_taf_per_share * shares, self.finra_taf_cap))
+
+    def leg(self, symbol: str, price: float, shares: float, *, side: str,
+            order_type: str, executable_quote: bool = False) -> dict[str, Any]:
+        """Components of one leg in bps of that leg's notional."""
+        if side not in {"buy", "sell"}:
+            raise CostError("side must be buy or sell")
+        if order_type not in ORDER_TYPES:
+            raise CostError(f"order_type must be one of {ORDER_TYPES}")
+        if not isinstance(executable_quote, bool):
+            raise CostError("executable_quote must be true or false")
+        price = _positive_number(price, "price")
+        shares = _positive_number(shares, "shares")
+        spread = self.spread_bps(symbol, price)
+        _spread, source = self.spread_entry(symbol)
+        crosses = order_type in {MARKET, STOP, MARKETABLE_LIMIT}
+        # An executable quote already sits on the far side of the spread.
+        half_spread = spread / 2.0 if crosses and not executable_quote else 0.0
+        slippage = (self.slippage_bps_per_side
+                    if order_type in {MARKET, STOP} else 0.0)
+        trigger = (self.stop_trigger_slippage_ticks * self.tick_bps(price)
+                   if order_type == STOP else 0.0)
+        non_fill = ((1.0 - self.target_fill_probability) *
+                    (spread / 2.0 + self.slippage_bps_per_side)
+                    if order_type == RESTING_LIMIT else 0.0)
+        notional = price * shares
+        sec = (10_000.0 * self.sec_fee_per_million * notional / 1_000_000.0 /
+               notional if side == "sell" else 0.0)
+        taf = (10_000.0 * min(self.finra_taf_per_share * shares,
+                              self.finra_taf_cap) / notional
+               if side == "sell" else 0.0)
+        return {
+            "cost_model_version": COST_MODEL_PER_SYMBOL_V2,
+            "symbol": str(symbol).strip().upper(), "side": side,
+            "order_type": order_type, "executable_quote": executable_quote,
+            "price": price, "shares": shares, "spread_source": source,
+            "spread_bps": spread, "half_spread_bps": half_spread,
+            "slippage_bps": slippage, "stop_trigger_bps": trigger,
+            "non_fill_fallback_bps": non_fill,
+            "sec_fee_bps": sec, "taf_bps": taf,
+            "total_bps": half_spread + slippage + trigger + non_fill + sec + taf,
+            "non_fill_risk": order_type in {MARKETABLE_LIMIT, RESTING_LIMIT},
+        }
+
+    def leg_model(self, symbol: str, price: float, shares: float, *,
+                  side: str, order_type: str) -> CostModel:
+        """One leg as a :class:`CostModel` that existing lanes can apply.
+
+        ``execution_price`` then moves a bar reference by half the spread plus
+        the leg's slippage, or an executable quote by the slippage alone, and
+        ``fees(p, p, q) / 2`` (the per-leg split every lane uses) is the leg's
+        sell-side fee.  The TAF is per share, so it is converted to bps at this
+        reference price and size; the persisted ``fee_bps`` then recomputes the
+        row exactly.
+        """
+        parts = self.leg(symbol, price, shares, side=side, order_type=order_type)
+        spread = 0.0 if order_type == RESTING_LIMIT else parts["spread_bps"]
+        slippage = (parts["slippage_bps"] + parts["stop_trigger_bps"] +
+                    parts["non_fill_fallback_bps"])
+        if order_type == MARKETABLE_LIMIT:
+            flag = ":nonfill-unmodelled"
+        elif order_type == RESTING_LIMIT:
+            flag = f":target-fill-probability-{self.target_fill_probability:.4f}"
+        else:
+            flag = ""
+        return CostModel(
+            spread_bps=spread, slippage_bps=slippage,
+            fee_bps=parts["sec_fee_bps"] + parts["taf_bps"],
+            max_spread_bps=self.max_spread_bps,
+            max_slippage_bps=self.max_slippage_bps,
+            provenance=(f"{COST_MODEL_PER_SYMBOL_V2}:{parts['symbol']}:{side}:"
+                        f"{order_type}:spread-{parts['spread_source']}{flag}"))
+
+    def round_trip(self, symbol: str, price: float, *, shares: float | None = None,
+                   notional: float = DEFAULT_ROUND_TRIP_NOTIONAL,
+                   direction: str = "long", entry_order_type: str = MARKET,
+                   exit_order_type: str = MARKET,
+                   entry_executable_quote: bool = False,
+                   exit_executable_quote: bool = False) -> dict[str, Any]:
+        """Both legs at one reference price, in bps of entry notional.
+
+        With the defaults (marketable entry and exit priced from a bar) this
+        is the study formula: one full spread, two sides of slippage and the
+        sell-leg fees.
+        """
+        if direction not in {"long", "short"}:
+            raise CostError("direction must be long or short")
+        price = _positive_number(price, "price")
+        if shares is None:
+            shares = _positive_number(notional, "notional") / price
+        entry_side, exit_side = (("buy", "sell") if direction == "long"
+                                 else ("sell", "buy"))
+        entry = self.leg(symbol, price, shares, side=entry_side,
+                         order_type=entry_order_type,
+                         executable_quote=entry_executable_quote)
+        exit_ = self.leg(symbol, price, shares, side=exit_side,
+                         order_type=exit_order_type,
+                         executable_quote=exit_executable_quote)
+        components = {
+            name: entry[name] + exit_[name]
+            for name in ("half_spread_bps", "slippage_bps", "stop_trigger_bps",
+                         "non_fill_fallback_bps", "sec_fee_bps", "taf_bps")}
+        return {
+            "cost_model_version": COST_MODEL_PER_SYMBOL_V2,
+            "basis": "round_trip_bps_of_entry_notional",
+            "symbol": entry["symbol"], "price": price, "shares": shares,
+            "direction": direction, "spread_bps": entry["spread_bps"],
+            "spread_source": entry["spread_source"],
+            **components,
+            "total_bps": sum(components.values()),
+            "legs": {"entry": entry, "exit": exit_},
+        }
+
+    def round_trip_bps(self, symbol: str, price: float, **kwargs: Any) -> float:
+        return float(self.round_trip(symbol, price, **kwargs)["total_bps"])
+
+    def stressed_round_trip_bps(self, symbol: str, price: float, *,
+                                multiple: float = 1.0, add_bps: float = 0.0,
+                                **kwargs: Any) -> float:
+        """Stress defined relative to this model's expected round trip."""
+        return stress_relative_to_expected(
+            self.round_trip_bps(symbol, price, **kwargs),
+            multiple=multiple, add_bps=add_bps)
+
+    def leg_for_context(self, context: Mapping[str, Any] | None) -> CostModel:
+        """Resolve one replay leg from an opportunity or leg context.
+
+        The context is the mapping account simulation and IBR repricing hand
+        to a cost resolver: ``cost_leg`` (entry when absent), ``direction``,
+        ``symbol``, ``quantity``/``shares``, the leg's reference price and,
+        for an exit, ``exit_reason`` (``stop`` is a stop-market leg,
+        ``target`` a resting limit and anything else a market exit).
+        """
+        item = context if isinstance(context, Mapping) else {}
+        vehicle = str(item.get("vehicle") or "equity").strip().lower()
+        if vehicle != "equity":
+            raise CostError(f"{COST_MODEL_PER_SYMBOL_V2} prices equity legs only")
+        leg = str(item.get("cost_leg") or "entry").strip().lower()
+        direction = str(item.get("direction") or "long").strip().lower()
+        if leg not in {"entry", "exit"} or direction not in {"long", "short"}:
+            raise CostError("cost context needs an entry/exit leg and a direction")
+        long_position = direction == "long"
+        if leg == "entry":
+            side = "buy" if long_position else "sell"
+            order_type = self.entry_order_type
+        else:
+            side = "sell" if long_position else "buy"
+            reason = str(item.get("exit_reason") or "").strip().lower()
+            order_type = (STOP if reason == "stop" else
+                          RESTING_LIMIT if reason == "target" else MARKET)
+        price = next((value for value in (
+            _finite_row_number(item, f"{leg}_reference"),
+            _finite_row_number(item, f"{leg}_price"),
+            _finite_row_number(item, "entry_reference"))
+            if value is not None and value > 0), None)
+        shares = next((value for value in (
+            _finite_row_number(item, "shares"),
+            _finite_row_number(item, "quantity"))
+            if value is not None and value > 0), None)
+        if price is None or shares is None:
+            raise CostError(
+                f"{COST_MODEL_PER_SYMBOL_V2} needs the leg's reference price "
+                "and a positive share count")
+        return self.leg_model(str(item.get("symbol") or ""), price, shares,
+                              side=side, order_type=order_type)
+
+    def resolver(self):
+        """A cost resolver for ``simulate_account`` or ``reprice_ibr_result``."""
+        def resolve(context: Mapping[str, Any] | None = None, **_: Any) -> CostModel:
+            return self.leg_for_context(context)
+        return resolve
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "cost_model_version": COST_MODEL_PER_SYMBOL_V2,
+            "spreads_bps": {symbol: spread for symbol, spread, _ in self.spreads},
+            "spread_sources": {symbol: source for symbol, _, source in self.spreads},
+            "spread_rule": "max(one_tick, measured_or_reference_spread), one per round trip",
+            "slippage_bps_per_side": self.slippage_bps_per_side,
+            "slippage_legs": [MARKET, STOP],
+            "stop_trigger_slippage_ticks": self.stop_trigger_slippage_ticks,
+            "sec_fee_per_million": self.sec_fee_per_million,
+            "finra_taf_per_share": self.finra_taf_per_share,
+            "finra_taf_cap": self.finra_taf_cap,
+            "fee_legs": ["sell"],
+            "tick_size": self.tick_size,
+            "entry_order_type": self.entry_order_type,
+            "target_fill_probability": self.target_fill_probability,
+            "max_spread_bps": self.max_spread_bps,
+            "max_slippage_bps": self.max_slippage_bps,
+        }
 
 
 def _finite_row_number(row: Mapping[str, Any], name: str, *,
@@ -1064,10 +1542,12 @@ def _row_cost_model_pair(row: Mapping[str, Any], *,
     # for diagnostics, including static and option rows.  Without the exact
     # IBR economics block, those non-measured fields retain their historical
     # static report path. A measured dynamic row is identified by both leg
-    # provenance values, while a block is itself an explicit opt-in.
+    # provenance values, while a block is itself an explicit opt-in.  A
+    # ``per_symbol_v2`` row is priced leg by leg in the same way, so it too
+    # is recomputed from its own legs rather than from a static report model.
     if (row.get("cost_economics") is None and not any(
-            str(row.get(f"{leg}_cost_model_provenance") or "")
-            .strip().lower().startswith("measured:")
+            cost_model_version_of(row.get(f"{leg}_cost_model_provenance"))
+            != COST_MODEL_STATIC_V1
             for leg in ("entry", "exit"))):
         return None
 
@@ -1190,8 +1670,8 @@ def _compute_row_cost_economics(
     # measured cells (identified by their immutable provenance) and all rows
     # with an economics block use their own entry/exit legs independently.
     static_provenance = not any(
-        str(row.get(f"{leg}_cost_model_provenance") or "")
-        .strip().lower().startswith("measured:")
+        cost_model_version_of(row.get(f"{leg}_cost_model_provenance"))
+        != COST_MODEL_STATIC_V1
         for leg in ("entry", "exit"))
     models_match = all(
         math.isclose(float(getattr(entry_model, name)),

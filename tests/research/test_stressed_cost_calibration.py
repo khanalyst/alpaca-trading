@@ -72,14 +72,21 @@ def _rehash_schedule(schedule):
     return schedule
 
 
+# The rungs asserted in this module are the original one-way arithmetic
+# (spread / 2 + impact + 0.5 bps); calls that depend on them pin that basis so
+# stored artifacts stay reproducible.  The round-trip default is covered in
+# tests/research/test_costs_versions.py.
+LEGACY = {"cost_basis": "one_way_v1"}
+
+
 class StressCalibrationTests(unittest.TestCase):
     def test_liquid_cells_select_upward_ladder_rungs(self):
         low = calibrate_stressed_cost(
             _schedule(spread=4.0), expected_provider="alpaca",
-            expected_feed="iex")
+            expected_feed="iex", **LEGACY)
         high = calibrate_stressed_cost(
             _schedule(spread=20.0), expected_provider="alpaca",
-            expected_feed="iex")
+            expected_feed="iex", **LEGACY)
         self.assertEqual(low["cells"][0]["selected_scenario_bps"], 9.0)
         self.assertEqual(high["cells"][0]["selected_scenario_bps"], 15.0)
 
@@ -98,9 +105,11 @@ class StressCalibrationTests(unittest.TestCase):
         validation_wide = _schedule(spread=20.0, digest="validation")
         validation_tight = _schedule(spread=1.0, digest="validation-tight")
         widened = calibrate_stressed_cost(
-            fit, validation_schedule=validation_wide, expected_feed="iex")
+            fit, validation_schedule=validation_wide, expected_feed="iex",
+            **LEGACY)
         retained = calibrate_stressed_cost(
-            fit, validation_schedule=validation_tight, expected_feed="iex")
+            fit, validation_schedule=validation_tight, expected_feed="iex",
+            **LEGACY)
         self.assertEqual(widened["cells"][0]["selected_scenario_bps"], 15.0)
         self.assertEqual(retained["cells"][0]["selected_scenario_bps"], 9.0)
 
@@ -183,7 +192,7 @@ class StressCalibrationTests(unittest.TestCase):
             _schedule(spread=16.0, digest="fit"),
             validation_schedule=_schedule(spread=20.0, digest="validation",
                                            session_start=6),
-            expected_provider="alpaca", expected_feed="iex")
+            expected_provider="alpaca", expected_feed="iex", **LEGACY)
         self.assertEqual(
             resolve_stress_scenario(artifact, symbol="SPY", bucket="m000_030",
                                     operator_enabled=True,
@@ -330,7 +339,7 @@ class StressCalibrationTests(unittest.TestCase):
         _rehash_schedule(validation)
         artifact = calibrate_stressed_cost(
             fit, validation_schedule=validation,
-            expected_provider="alpaca", expected_feed="iex")
+            expected_provider="alpaca", expected_feed="iex", **LEGACY)
         self.assertEqual(artifact["effective_after_session"], "2026-01-15")
         self.assertEqual(resolve_stress_scenario(
             artifact, symbol="SPY", bucket="m000_030", operator_enabled=True,
@@ -348,7 +357,7 @@ class StressCalibrationTests(unittest.TestCase):
             _schedule(spread=16.0, digest="fit", session_start=0),
             validation_schedule=_schedule(
                 spread=20.0, digest="validation", session_start=6),
-            expected_provider="alpaca", expected_feed="iex")
+            expected_provider="alpaca", expected_feed="iex", **LEGACY)
 
     def test_overlapping_validation_sessions_fail_closed(self):
         artifact = self._validated_artifact()

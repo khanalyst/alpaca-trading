@@ -33,8 +33,9 @@ from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from .costs import (CostError, CostModel, DEFAULT_FEE_BPS,
+                    DEFAULT_STOP_TRIGGER_SLIPPAGE_TICKS,
                     RUNTIME_MAX_SLIPPAGE_BPS, RUNTIME_MAX_SPREAD_BPS,
-                    static_cost_config)
+                    TICK_SIZE, static_cost_config)
 from .edge_ledger import content_hash
 
 
@@ -58,6 +59,13 @@ _SPREAD_BIN_BPS = .05
 _DEPTH_LOG_CEILING = 7.0          # 10**7 shares
 _DEPTH_LOG_BIN = .02
 _SUM_SCALE = 1_000_000_000_000
+# A cell's quote count is a count of autocorrelated snapshots: a 30 s recorder
+# fills a half-hour cell's 500-quote floor in about nine sessions, and an
+# event-level feed does it in one.  A cell must also span this many sessions.
+DEFAULT_MIN_SESSIONS_PER_CELL = 5
+# Buckets outside the regular session.  Their quotes are kept in their own
+# cells but no longer shape the symbol and universe aggregates.
+EXTENDED_HOURS_BUCKETS = frozenset({"pre_open", "post_close"})
 _DIGEST_MODULUS = 1 << 256
 _DEFAULT_PROVIDER = "alpaca"
 
@@ -376,6 +384,12 @@ def reprice_ibr_result(result: Any, *, resolver: Any,
         common = {
             "vehicle": vehicle, "symbol": str(getattr(trade, "symbol", "")),
             "quantity": quantity, "shares": quantity,
+            # The leg type (stop, target, other) and its reference price let
+            # a resolver price stop and limit legs by order type.
+            "direction": direction,
+            "exit_reason": getattr(trade, "exit_reason", None),
+            "entry_reference": float(trade.entry_reference),
+            "exit_reference": float(trade.exit_reference),
             "entry_timestamp": (entry_timestamp.isoformat()
                                  if hasattr(entry_timestamp, "isoformat")
                                  else entry_timestamp),
@@ -702,7 +716,9 @@ def _session_minutes(stamp: datetime) -> float:
 def measure_quote_costs(quotes: Iterable[Any], *,
                         feed: str | None = None,
                         provider: str | None = None,
-                        min_quotes_per_cell: int = 500) -> dict[str, Any]:
+                        min_quotes_per_cell: int = 500,
+                        min_sessions_per_cell: int | None = DEFAULT_MIN_SESSIONS_PER_CELL,
+                        regular_session_aggregates: bool = True) -> dict[str, Any]:
     """Fit a spread and depth schedule from recorded two-sided quotes.
 
     Accepts anything iterable — normalized ``QuoteSnapshot`` records or raw
@@ -710,9 +726,20 @@ def measure_quote_costs(quotes: Iterable[Any], *,
     held in memory. A quote is used for spread measurement only when its
     bid/ask are two-sided and positive; missing or malformed displayed sizes
     leave that spread observation intact but do not shape executable depth.
+
+    A bucket cell is emitted only with ``min_quotes_per_cell`` quotes from at
+    least ``min_sessions_per_cell`` sessions, and pre-open and post-close
+    quotes stay out of the symbol and universe aggregates.  Passing
+    ``min_sessions_per_cell=None`` and ``regular_session_aggregates=False``
+    reproduces a schedule fitted before both rules existed, byte for byte.
     """
     min_quotes = _positive_integer(min_quotes_per_cell,
                                    "min_quotes_per_cell")
+    min_sessions = (None if min_sessions_per_cell is None else
+                    _positive_integer(min_sessions_per_cell,
+                                      "min_sessions_per_cell"))
+    if not isinstance(regular_session_aggregates, bool):
+        raise QuoteCostError("regular_session_aggregates must be true or false")
     universe = _Accumulator()
     by_symbol: dict[str, _Accumulator] = defaultdict(_Accumulator)
     by_cell: dict[tuple[str, str], _Accumulator] = defaultdict(_Accumulator)
@@ -803,7 +830,11 @@ def measure_quote_costs(quotes: Iterable[Any], *,
             universe.rejected += 1
             by_symbol[symbol].rejected += 1
             continue
-        for accumulator in (universe, by_symbol[symbol], by_cell[cell]):
+        targets = ((by_cell[cell],)
+                   if regular_session_aggregates and
+                   cell[1] in EXTENDED_HOURS_BUCKETS else
+                   (universe, by_symbol[symbol], by_cell[cell]))
+        for accumulator in targets:
             accumulator.spread.add(spread_bps)
             accumulator.sessions.add(session)
             if sizes:
@@ -851,6 +882,10 @@ def measure_quote_costs(quotes: Iterable[Any], *,
             "quote-cost measurement requires one explicit provider; "
             f"got {sorted(providers)}")
 
+    def covered(cell: _Accumulator) -> bool:
+        return (cell.spread.count >= min_quotes and
+                (min_sessions is None or len(cell.sessions) >= min_sessions))
+
     symbols = {}
     for symbol, accumulator in sorted(by_symbol.items()):
         if not accumulator.spread.count:
@@ -858,14 +893,13 @@ def measure_quote_costs(quotes: Iterable[Any], *,
         buckets = {
             bucket: cell.summary()
             for (cell_symbol, bucket), cell in sorted(by_cell.items())
-            if cell_symbol == symbol and
-            cell.spread.count >= min_quotes}
+            if cell_symbol == symbol and covered(cell)}
         symbols[symbol] = {**accumulator.summary(), "buckets": buckets,
                            "sparse_buckets": sum(
                                1 for (cell_symbol, _bucket), cell
                                in by_cell.items()
                                if cell_symbol == symbol and
-                               cell.spread.count < min_quotes),
+                               not covered(cell)),
                            "depth_sparse_buckets": sum(
                                1 for (cell_symbol, _bucket), cell
                                in by_cell.items()
@@ -885,6 +919,12 @@ def measure_quote_costs(quotes: Iterable[Any], *,
             "missing_feed_rows": int(missing_feed_rows),
             "missing_provider_rows": int(missing_provider_rows),
             "min_quotes_per_cell": min_quotes,
+            # Recorded only when the rule applies, so a legacy fit keeps its
+            # original body and hash.
+            **({"min_sessions_per_cell": min_sessions}
+               if min_sessions is not None else {}),
+            **({"aggregate_scope": "regular_session"}
+               if regular_session_aggregates else {}),
             "bucket_minutes": BUCKET_MINUTES,
             "quote_content_hash": quote_content_hash,
             "quote_content_hash_algorithm": "sha256-multiset-sum-xor.v1",
@@ -954,6 +994,15 @@ def _required_quote_coverage(measured_meta: Mapping[str, Any]) -> int:
     return required
 
 
+def _required_session_coverage(measured_meta: Mapping[str, Any]) -> int | None:
+    """The schedule's per-cell session floor; absent on legacy schedules."""
+    if not isinstance(measured_meta, Mapping) or \
+            measured_meta.get("min_sessions_per_cell") is None:
+        return None
+    return _positive_integer(measured_meta.get("min_sessions_per_cell"),
+                             "cost schedule min_sessions_per_cell")
+
+
 def _cell(schedule: Mapping[str, Any], symbol: str | None,
           bucket: str | None, *, required_quotes: int | None = None
           ) -> tuple[Mapping[str, Any], str]:
@@ -975,10 +1024,17 @@ def _cell(schedule: Mapping[str, Any], symbol: str | None,
                                        else None)
                 observed_quotes = (_section_count(measured, depth=False)
                                    if isinstance(measured, Mapping) else None)
+                required_sessions = _required_session_coverage(
+                    schedule.get("measured"))
+                observed_sessions = (_number(measured.get("session_count"))
+                                     if isinstance(measured, Mapping) else None)
+                sessions_ok = (required_sessions is None or (
+                    observed_sessions is not None and
+                    observed_sessions >= required_sessions))
                 if (isinstance(measured, Mapping) and measured and
                         required_quotes is not None and
                         observed_quotes is not None and
-                        observed_quotes >= required_quotes):
+                        observed_quotes >= required_quotes and sessions_ok):
                     return measured, (f"symbol_bucket:{normalized_symbol}:"
                                       f"{normalized_bucket}")
                 # A bucket omitted by ``measure_quote_costs`` did not meet
@@ -1021,7 +1077,8 @@ def cost_model_from_schedule(
         max_slippage_bps: float = RUNTIME_MAX_SLIPPAGE_BPS,
         expected_feed: str | None = None,
         expected_provider: str | None = None,
-        coverage_policy: str = "strict") -> CostModel:
+        coverage_policy: str = "strict",
+        stop_trigger_slippage_bps: float = 0.0) -> CostModel:
     """Build a :class:`CostModel` from a measured schedule.
 
     ``percentile`` selects how conservative the spread assumption is; the
@@ -1032,10 +1089,19 @@ def cost_model_from_schedule(
     defensible charge for the excess is a further half spread per depth
     multiple, bounded by ``max_impact_half_spreads``.
 
+    Depth impact is zero for an order that fits the displayed size, so on its
+    own it would price a triggered stop at half the quoted spread.
+    ``stop_trigger_slippage_bps`` is the explicit extra a stop-market leg pays
+    once triggered; it is added to the slippage of that leg only and named in
+    the provenance (``measured_cost_resolver`` sets it for stop exits).
+
     The result is an ordinary ``CostModel`` and is validated against the same
     runtime rejection caps as a configured one, so a schedule cannot license a
     fill the runtime would refuse to submit.
     """
+    trigger = _number(stop_trigger_slippage_bps)
+    if trigger is None or trigger < 0:
+        raise QuoteCostError("stop_trigger_slippage_bps must be non-negative")
     if str(schedule.get("schema")) != QUOTE_COST_SCHEMA:
         raise QuoteCostError(
             f"expected {QUOTE_COST_SCHEMA}, got {schedule.get('schema')!r}")
@@ -1106,13 +1172,16 @@ def cost_model_from_schedule(
                 f"measurement at {depth_percentile}")
         multiple = max(0.0, shares / depth_shares - 1.0)
         impact_bps = half_spread * min(multiple, impact_cap)
+    # Round once so the provenance label and the charged slippage agree.
+    trigger = round(trigger, 4)
     return CostModel(
-        spread_bps=spread_bps, slippage_bps=impact_bps, fee_bps=fee_bps,
+        spread_bps=spread_bps, slippage_bps=impact_bps + trigger, fee_bps=fee_bps,
         max_spread_bps=max_spread_bps, max_slippage_bps=max_slippage_bps,
         provenance=(f"measured:{schedule.get('schedule_hash', '')[:12]}"
                     f":{origin}:spread-{percentile}:depth-{depth_percentile}"
                     f":feed-{schedule_feed}:provider-{schedule_provider}"
-                    f":coverage-{coverage_policy}"))
+                    f":coverage-{coverage_policy}" +
+                    (f":stop-trigger-{trigger:.4f}" if trigger > 0 else "")))
 
 
 def schedule_costs_block(schedule: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -1134,14 +1203,26 @@ def measured_cost_resolver(schedule: Mapping[str, Any], *,
                            max_slippage_bps: float = RUNTIME_MAX_SLIPPAGE_BPS,
                            expected_feed: str | None = None,
                            expected_provider: str | None = None,
-                           coverage_policy: str = "strict"):
+                           coverage_policy: str = "strict",
+                           stop_trigger_slippage_ticks: float = DEFAULT_STOP_TRIGGER_SLIPPAGE_TICKS,
+                           tick_size: float = TICK_SIZE):
     """Return the causal per-opportunity schedule resolver.
 
     Replay/account code can call this immediately before admission and each
     execution leg.  It intentionally accepts a row-like mapping rather than
     mutating account state, making the same resolver usable by configured and
     measured arms without changing the authored rule or sizing policy.
+
+    An exit leg whose ``exit_reason`` is ``stop`` is a triggered stop-market
+    order: it pays ``stop_trigger_slippage_ticks`` ticks at the leg's
+    reference price on top of the measured half spread and depth impact.
+    Passing ``0`` reproduces the earlier measured pricing.
     """
+    ticks = _number(stop_trigger_slippage_ticks)
+    tick = _number(tick_size)
+    if ticks is None or ticks < 0 or tick is None or tick <= 0:
+        raise QuoteCostError(
+            "stop_trigger_slippage_ticks must be non-negative and tick_size positive")
     if not isinstance(schedule, Mapping):
         raise QuoteCostError("schedule must be a mapping")
     if str(vehicle).strip().lower() != "equity":
@@ -1203,6 +1284,16 @@ def measured_cost_resolver(schedule: Mapping[str, Any], *,
                 resolved_bucket = bucket_label(minutes)
         if order_shares is None:
             order_shares = _number(item.get("quantity", item.get("shares")))
+        trigger_bps = 0.0
+        stop_leg = (str(item.get("cost_leg") or "").strip().lower() == "exit" and
+                    str(item.get("exit_reason") or "").strip().lower() == "stop")
+        if stop_leg and ticks > 0:
+            price = _number(item.get("exit_reference", item.get("exit_price")))
+            if price is None or price <= 0:
+                raise QuoteCostError(
+                    "measured stop-trigger slippage needs the stop leg's "
+                    "reference price")
+            trigger_bps = ticks * tick / price * 10_000.0
         return cost_model_from_schedule(
             schedule, symbol=(None if resolved_symbol in (None, "") else str(resolved_symbol)),
             bucket=resolved_bucket, percentile=percentile,
@@ -1210,7 +1301,8 @@ def measured_cost_resolver(schedule: Mapping[str, Any], *,
             max_impact_half_spreads=max_impact_half_spreads, fee_bps=fee_bps,
             max_spread_bps=max_spread_bps, max_slippage_bps=max_slippage_bps,
             expected_feed=expected_feed, expected_provider=expected_provider,
-            coverage_policy=coverage_policy)
+            coverage_policy=coverage_policy,
+            stop_trigger_slippage_bps=trigger_bps)
     return resolve
 
 

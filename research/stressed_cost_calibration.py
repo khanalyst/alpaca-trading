@@ -5,7 +5,27 @@ spread percentile and a depth impact).  Runtime risk, however, deliberately
 accepts only the preregistered stress ladder ``9/15/25/50`` bps.  This module
 bridges those two representations without changing runtime configuration:
 fit cells select a ladder rung, validation cells may keep or widen it, and
-missing or untrusted evidence falls back to the configured 25 bps rung.
+missing or untrusted evidence falls back to the configured runtime rung
+(``risk.stressed_cost_scenario_bps``, 9 bps in the shipped ``config.yaml``;
+callers pass it as ``fallback_scenario_bps``).
+
+Every ladder rung is an all-in round trip, so a cell is laddered on its
+round-trip cost: the full quoted spread at the chosen percentile, depth impact
+on both legs and the regulatory fee on the one sell leg.  Fit and validation
+are compared on the rung they select, not on the continuous cost, so a
+one-tick change that stays inside one rung cannot mark a cell unusable.
+``cost_basis="one_way_v1"`` reproduces artifacts made before these rules (a
+one-way cost on the round-trip ladder, continuous materiality and zero impact
+when depth is missing), so stored artifacts recompute exactly.
+
+Limitation, kept deliberately visible (``narrowing_possible`` in the
+artifact): the lowest rung (9 bps) equals the shipped runtime scenario, so an
+activated artifact can keep or widen the runtime stress but never narrow it.
+At the shipped configuration it therefore changes no decision.  It is kept,
+diagnostic and disabled (``risk.stressed_cost_calibration_enabled`` false),
+rather than parked behind an error, because ``deploy/trader_projection.py``,
+``research/live_shadow.py`` and ``research/cost_rerun.py`` consume its
+artifacts, and an error would turn their diagnostic output into a failure.
 
 The returned object is JSON-like and content-addressed.  It is suitable for a
 rerun report or a persisted diagnostic artifact, but it is not self-authorizing:
@@ -20,14 +40,25 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .costs import COST_STRESS_SCENARIOS_BPS, DEFAULT_FEE_BPS
+from .costs import (COST_STRESS_RUNG_BASIS, COST_STRESS_SCENARIOS_BPS,
+                    DEFAULT_FEE_BPS, SEC_FEE_PER_MILLION)
 from .edge_ledger import content_hash
 
 
 STRESS_CALIBRATION_SCHEMA = "stressed-cost-calibration.v1"
+# Used only when a caller supplies no configured runtime rung.  It is not the
+# runtime scenario: the shipped config.yaml runs at 9 bps, and callers that
+# know the configuration pass ``risk.stressed_cost_scenario_bps``.
 DEFAULT_FALLBACK_SCENARIO_BPS = 25.0
 DEFAULT_MIN_SESSIONS_PER_CELL = 5
 DEFAULT_VALIDATION_MATERIALITY_RATIO = 1.25
+COST_BASIS_ROUND_TRIP = "round_trip"
+COST_BASIS_ONE_WAY_V1 = "one_way_v1"
+COST_BASES = (COST_BASIS_ROUND_TRIP, COST_BASIS_ONE_WAY_V1)
+# The Section 31 fee in bps of sell notional (0.206 bps).  The FINRA TAF is
+# per share and needs a price the schedule does not carry; it is below
+# 0.01 bps at these prices and is left out of the schedule-level round trip.
+SELL_LEG_FEE_BPS = SEC_FEE_PER_MILLION / 100.0
 
 
 class StressCalibrationError(ValueError):
@@ -450,6 +481,34 @@ def _one_way_cost(section: Mapping[str, Any], *, percentile: str,
                    "one_way_entry_cost_bps": total}
 
 
+def _round_trip_cost(section: Mapping[str, Any], *, percentile: str,
+                     depth_percentile: str, order_shares: float | None,
+                     fee_bps: float, max_impact_half_spreads: float) -> tuple[float | None, dict[str, Any]]:
+    """Round-trip cost of one cell, on the same basis as the ladder rungs.
+
+    The full spread (half on each leg), depth impact on both legs and the fee
+    on the sell leg.  A positive order size with no usable depth measurement
+    fails closed, as ``cost_model_from_schedule`` does.
+    """
+    spread = _number(_section_value(section, ("spread_bps", percentile)))
+    depth = _number(_section_value(section, ("touch_shares", depth_percentile)))
+    if depth is not None and depth <= 0:
+        depth = None
+    parts = {"spread_bps": spread, "depth_shares": depth, "impact_bps": None,
+             "fee_bps": fee_bps, "round_trip_cost_bps": None}
+    if spread is None or spread < 0:
+        return None, parts
+    shares = _number(order_shares)
+    impact = 0.0
+    if shares is not None and shares > 0:
+        if depth is None:
+            return None, {**parts, "depth_missing_for_order_shares": True}
+        impact = (spread / 2.0) * min(
+            max(0.0, shares / depth - 1.0), max_impact_half_spreads)
+    total = spread + 2.0 * impact + fee_bps
+    return total, {**parts, "impact_bps": impact, "round_trip_cost_bps": total}
+
+
 def _ladder(value: float | None) -> tuple[float | None, str | None]:
     if value is None or not math.isfinite(value) or value < 0:
         return None, "measured_cost_invalid"
@@ -486,7 +545,7 @@ def calibrate_stressed_cost(
         validation_schedule: Mapping[str, Any] | None = None,
         percentile: str = "p95", depth_percentile: str = "p25",
         order_shares: float | None = None,
-        fee_bps: float = DEFAULT_FEE_BPS,
+        fee_bps: float | None = None,
         max_impact_half_spreads: float = 4.0,
         min_quotes_per_cell: int | None = None,
         min_sessions_per_cell: int = DEFAULT_MIN_SESSIONS_PER_CELL,
@@ -496,14 +555,25 @@ def calibrate_stressed_cost(
         fallback_scenario_bps: float = DEFAULT_FALLBACK_SCENARIO_BPS,
         max_cost_to_risk_ratio: float = 0.30,
         validation_materiality_ratio: float = DEFAULT_VALIDATION_MATERIALITY_RATIO,
-        cells: Iterable[tuple[str, str]] | None = None) -> dict[str, Any]:
-    """Calibrate one-way entry stress from fit and optional validation schedules.
+        cells: Iterable[tuple[str, str]] | None = None,
+        cost_basis: str = COST_BASIS_ROUND_TRIP) -> dict[str, Any]:
+    """Calibrate the round-trip stress rung from fit and validation schedules.
 
     Fit cells are the only source of a narrower scenario.  If a validation
     cell is valid, its rung is ``max(fit_rung, validation_rung)``; it can never
-    lower the fit result.  Any malformed provenance, sparse fit cell, or cost
-    above 50 bps falls back to the configured 25 bps rung.
+    lower the fit result.  A validation rung above ``materiality`` times the
+    fit rung marks the cell unusable.  Any malformed provenance, sparse fit
+    cell, missing measurement, or cost above 50 bps falls back to
+    ``fallback_scenario_bps``, which callers set to the configured runtime
+    rung.  ``fee_bps`` defaults to the sell-leg SEC fee (0.5 bps per side
+    under ``one_way_v1``).
     """
+    if cost_basis not in COST_BASES:
+        raise StressCalibrationError(f"cost_basis must be one of {COST_BASES}")
+    round_trip = cost_basis == COST_BASIS_ROUND_TRIP
+    if fee_bps is None:
+        fee_bps = SELL_LEG_FEE_BPS if round_trip else DEFAULT_FEE_BPS
+    cell_cost = _round_trip_cost if round_trip else _one_way_cost
     if not isinstance(fit_schedule, Mapping):
         raise StressCalibrationError("fit_schedule must be a mapping")
     _validate_schedule(fit_schedule, schema="quote-cost-schedule.v1")
@@ -574,7 +644,7 @@ def calibrate_stressed_cost(
             reason = "sparse_cell_coverage"
         elif validation_present and not validation_ok:
             reason = validation_provenance_reason
-        fit_cost, fit_parts = _one_way_cost(
+        fit_cost, fit_parts = cell_cost(
             fit_section, percentile=percentile, depth_percentile=depth_percentile,
             order_shares=order_shares, fee_bps=fee, max_impact_half_spreads=cap)
         if reason is None and fit_cost is None:
@@ -609,7 +679,7 @@ def calibrate_stressed_cost(
             validation_session_count = v_sessions
             validation_session_ids = _sessions(validation_section)
             if v_count >= int(min_quotes) and v_sessions >= int(min_sessions_per_cell):
-                validation_cost, validation_parts = _one_way_cost(
+                validation_cost, validation_parts = cell_cost(
                     validation_section, percentile=percentile,
                     depth_percentile=depth_percentile, order_shares=order_shares,
                     fee_bps=fee, max_impact_half_spreads=cap)
@@ -617,15 +687,25 @@ def calibrate_stressed_cost(
                 if validation_scenario is None:
                     # A validation cost above the ladder is evidence for the
                     # fail-closed rung, not permission to narrow the fit.
-                    validation_reason = "validation_cost_exceeds_ladder_max"
+                    validation_reason = (
+                        "validation_measurement_missing"
+                        if round_trip and validation_cost is None else
+                        "validation_cost_exceeds_ladder_max")
                     validation_scenario = float(fallback)
                 validation_used = validation_cost is not None
             else:
                 validation_reason = "validation_cell_coverage"
         selected = max(float(fit_scenario), float(validation_scenario or fit_scenario))
-        materially_wider = bool(
-            validation_cost is not None and fit_cost is not None and
-            validation_cost > fit_cost * float(materiality))
+        if round_trip:
+            # Materiality is judged on the decision, the rung: a validation
+            # cost that moves within one rung leaves the selection unchanged.
+            materially_wider = bool(
+                validation_cost is not None and validation_scenario is not None and
+                float(validation_scenario) > float(fit_scenario) * float(materiality))
+        else:
+            materially_wider = bool(
+                validation_cost is not None and fit_cost is not None and
+                validation_cost > fit_cost * float(materiality))
         if materially_wider:
             # A validation shock this large is evidence that the fit cell is
             # not stable enough to select a narrower rung.  Retain the
@@ -709,6 +789,19 @@ def calibrate_stressed_cost(
         "aggregate_feasible_minimum_stop_bps": aggregate / ratio,
         "cells": cells_out,
     }
+    if round_trip:
+        # Recorded only for the current basis, so a ``one_way_v1`` artifact
+        # keeps its original body and content hash.
+        body.update({
+            "cost_basis": COST_BASIS_ROUND_TRIP,
+            "rung_basis": COST_STRESS_RUNG_BASIS,
+            "fee_basis": "sell_leg_only",
+            "materiality_basis": "ladder_rung",
+            # The lowest rung is the floor of any selection.  When it is not
+            # below the configured runtime rung, an activated artifact can
+            # only keep or widen the runtime stress (E1-04).
+            "narrowing_possible": min(COST_STRESS_SCENARIOS_BPS) < float(fallback),
+        })
     body["content_hash"] = content_hash(body)
     return body
 
