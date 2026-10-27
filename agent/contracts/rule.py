@@ -147,6 +147,8 @@ V4_DEFAULT_EXTENSIONS: dict[str, Any] = {
     "target_mode": "fixed_r",
     "target_lookback": 20,
     "trailing_stop_r": None,
+    # Minutes *before the session close*, not after the open: on a regular
+    # session 30 is a 15:30 New York thesis deadline and 360 is 10:00.
     "exit_before_minutes": None,
 }
 _V4_TARGET_MODES = ("fixed_r", "session_vwap", "rolling_mean")
@@ -1083,8 +1085,41 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     return spec
 
 
-def thesis_exit_deadline(entry_ts: Any, spec: Mapping[str, Any]) -> float | None:
+def _session_close_epoch(local_entry: datetime, session_close: Any) -> float:
+    """Resolve the entry session's close, defaulting to the regular 16:00."""
+    zone = ZoneInfo("America/New_York")
+    if session_close is None:
+        return datetime.combine(local_entry.date(), time(16, 0),
+                                tzinfo=zone).timestamp()
+    if isinstance(session_close, time):
+        if session_close.tzinfo is not None:
+            raise RuleSpecError(
+                "session close time must be a New York wall-clock time")
+        return datetime.combine(local_entry.date(), session_close,
+                                tzinfo=zone).timestamp()
+    if isinstance(session_close, datetime) and (
+            session_close.tzinfo is None or session_close.utcoffset() is None):
+        raise RuleSpecError("session close datetime must be timezone-aware")
+    close = _epoch(session_close, "session close")
+    if (datetime.fromtimestamp(close, timezone.utc).astimezone(zone).date() !=
+            local_entry.date()):
+        raise RuleSpecError(
+            "session close must fall on the entry session's New York date")
+    return close
+
+
+def thesis_exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
+                         session_close: Any = None) -> float | None:
     """Return the v4 thesis deadline anchored to the entry session.
+
+    ``exit_before_minutes`` counts minutes before the session *close*, not
+    after the open: on a regular session 360 is 10:00 New York.
+    ``session_close`` is the caller's calendar close for the entry session
+    (a timezone-aware datetime, an epoch second on that New York date, or a
+    New York wall-clock ``time``).  When it is omitted the regular 16:00 close
+    is assumed, which is the historical behaviour; on a 13:00 early close that
+    unanchored deadline can fall after the close, where only the session
+    force-flat bounds the position.
 
     This is intentionally separate from the safety force-flat deadline.  A
     v4 plan persists both timestamps so an operator can distinguish a thesis
@@ -1103,8 +1138,7 @@ def thesis_exit_deadline(entry_ts: Any, spec: Mapping[str, Any]) -> float | None
     start = _epoch(entry_ts, "entry timestamp")
     zone = ZoneInfo("America/New_York")
     local = datetime.fromtimestamp(start, timezone.utc).astimezone(zone)
-    close = datetime.combine(local.date(), time(16, 0), tzinfo=zone)
-    return close.timestamp() - minutes * 60.0
+    return _session_close_epoch(local, session_close) - minutes * 60.0
 
 
 def canonical_exit_reason(reason: Any, *,
@@ -1131,11 +1165,14 @@ def canonical_exit_reason(reason: Any, *,
 
 
 def exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
-                  force_flat_ts: Any = None) -> dict[str, Any] | None:
+                  force_flat_ts: Any = None,
+                  session_close: Any = None) -> dict[str, Any] | None:
     """Return the earliest bounded exit deadline and its canonical cause.
 
     Equal timestamps use runtime precedence: the session safety flatten wins,
     then the authored thesis deadline, then the ordinary maximum hold.
+    ``session_close`` anchors the thesis deadline (see
+    :func:`thesis_exit_deadline`).
     """
     held = spec.get("max_hold_bars") if isinstance(spec, Mapping) else None
     candidates: list[tuple[float, int, str]] = []
@@ -1149,7 +1186,7 @@ def exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
         start = _epoch(entry_ts, "entry timestamp")
         candidates.append((start + (held + 1) * BAR_SECONDS, 2,
                            EXIT_REASON_MAX_HOLD))
-    thesis = thesis_exit_deadline(entry_ts, spec)
+    thesis = thesis_exit_deadline(entry_ts, spec, session_close=session_close)
     if thesis is not None:
         candidates.append((thesis, 1, EXIT_REASON_THESIS_DEADLINE))
     if force_flat_ts is not None:
@@ -1162,7 +1199,8 @@ def exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
 
 
 def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
-                  force_flat_ts: Any = None) -> float | None:
+                  force_flat_ts: Any = None,
+                  session_close: Any = None) -> float | None:
     """Absolute epoch second by which a bounded rule position must be flat.
 
     *entry_ts* is the opening timestamp of the entry bar, which is the bar
@@ -1172,7 +1210,8 @@ def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
     definition; a session force-flat always clamps it.  A spec without any
     bounded exit has no deadline.
     """
-    resolved = exit_deadline(entry_ts, spec, force_flat_ts=force_flat_ts)
+    resolved = exit_deadline(entry_ts, spec, force_flat_ts=force_flat_ts,
+                             session_close=session_close)
     return None if resolved is None else float(resolved["timestamp"])
 
 
