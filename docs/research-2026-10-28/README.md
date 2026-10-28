@@ -214,7 +214,16 @@ Full disjoint shards (`deploy/test_suite.py`) on the final code, `4d82354`. Earl
 - factory: 7 tests, all pass;
 - research: 1,550 tests, 3 failures. All three are fixed in `c3e84ef` and `166b094`: the E1-11 shadow-deadline regression and the legacy-envelope fixture.
 
-The run on `4d82354` is in progress, and its results will be added here.
+The run on `4d82354`, the code as pushed (the later commits change docs only), finished at 19:04 UTC on 28 October:
+
+| shard | tests | result |
+| --- | --- | --- |
+| runtime | 1,036 | OK (1 skipped) |
+| research | 1,570 | OK |
+| edge | 62 | OK |
+| factory | 7 | OK |
+
+That is 2,675 tests with no failures.
 
 ## 8. Reproducing section 4
 
