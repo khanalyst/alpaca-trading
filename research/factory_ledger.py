@@ -78,7 +78,10 @@ FDR_GAMMA_METHOD = "balanced_telescoping"
 # gamma_j proportional to log(max(j, 2)) / (j * exp(sqrt(log j))).  The
 # balanced 1/(j(j+1)) of v6 spends half its base wealth on the first test and
 # falls as 1/j^2, so by the tenth test without a discovery it needs z of
-# about 3.5 (research/protocol.md tabulates both sequences).
+# about 3.5.  v7 is *stricter* than v6 for the first 22 tests (z 3.00 against
+# 2.24 at test 1, 3.72 against 3.51 at test 10) and more lenient only from
+# test 23, so it does not unblock the first confirmatory tests and is not
+# the active scope (research/protocol.md tabulates both sequences).
 FDR_INITIAL_WEALTH_FRACTION_V7 = 0.5
 FDR_GAMMA_METHOD_V7 = "javanmard_montanari_2018"
 # Sum over j >= 1 of log(max(j, 2)) / (j * exp(sqrt(log j))), computed as the

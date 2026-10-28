@@ -31,16 +31,30 @@ UTC = timezone.utc
 # ``python -B -c "from research.preregistered import v2_registration_literals
 # as f; print(f())"`` prints these three for the running tree.
 V2_VWAP_MANIFEST_HASH = (
-    "232a0b94350ea65b5786e79064662a5c30aee4c5fd3234a5ff366fcb35a510e4")
+    "b1435cc484a48e699f3657e163cd7084836049a307394a35cfdbb7f62a70931e")
 V2_ORF_MANIFEST_HASH = (
-    "fbbe1be763ee465a7304da8b27c8af455a5acdf252782cca07fa2f296f9a3623")
+    "3c9550dd67c31cf82835bf62cb91742c2653cb5b7b1bf3c7f077ab0e817f2355")
 V2_INSTRUMENT_DIGEST = (
-    "7162116bb85e5b8f24be7cdeca6cac988a8b3e1aada614dddd9d97f911e9e646")
+    "bca6df022725c18bed2ddc2a031e83cae24ead80c0386b9a149f34343c53b8ab")
 
 
 # Every fixture date is relative to the registered window, so moving the
 # registration literals does not break the fixtures.
 SEALED = date.fromisoformat(prereg.V2_SEALED_FROM)
+# The sealed window is in the future when these tests are written, and v2
+# refuses an evaluation instant later than the wall clock.  Fix the clock well
+# after every fixture date; AsOfTests checks the refusal itself.
+_CLOCK = patch.object(
+    prereg, "_utc_now",
+    return_value=datetime.combine(SEALED + timedelta(days=3 * 365), time(12, 0), UTC))
+
+
+def setUpModule():
+    _CLOCK.start()
+
+
+def tearDownModule():
+    _CLOCK.stop()
 
 
 def _on(offset: int) -> date:
@@ -83,6 +97,7 @@ def _metric(**over):
             "candidate_minus_control_cluster_df": 29,
             "candidate_minus_control_cluster_sign_flip_p_value": 0.0001,
             "candidate_minus_control_after_hurdle_sign_flip_p_value": 0.001,
+            "after_hurdle_cluster_t_stat": 3.0,
             "control_matching_counts": {"cross_session_same_session_minute": 380}}
     return {**base, **over}
 
@@ -106,6 +121,7 @@ class _FakeInstrument:
     def __call__(self, rows, rule, **kwargs):
         sessions = {row.identity.session_date for row in rows}
         self.calls.append({"family": rule["family"], "sessions": len(sessions),
+                           "symbols": sorted({row.symbol for row in rows}),
                            **kwargs})
         value = self.metric(len(sessions), kwargs)
         return {"horizon_metrics": {f"{h}m": value for h in kwargs["horizons"]}}
@@ -131,6 +147,9 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(prereg.preregistration(
             prereg.OPENING_RANGE_FADE_HYPOTHESIS_V2)["manifest_hash"],
             V2_ORF_MANIFEST_HASH)
+        self.assertEqual(prereg.V2_MANIFEST_HASHES, {
+            prereg.VWAP_REVERSION_HYPOTHESIS_V2: V2_VWAP_MANIFEST_HASH,
+            prereg.OPENING_RANGE_FADE_HYPOTHESIS_V2: V2_ORF_MANIFEST_HASH})
         self.assertEqual(
             prereg.preregistration(prereg.VWAP_REVERSION_HYPOTHESIS)["manifest_hash"],
             "d2e56d80bdb0e367bcceebbe4792bf4a00aee815eb442e62f043ee2e40b7c48e")
@@ -169,67 +188,106 @@ class InstrumentIdentityTests(unittest.TestCase):
     """D1-01: the registered instrument is the code that runs."""
 
     def test_registered_digest_is_the_running_instrument(self):
-        current = prereg.instrument_identity()
         for hypothesis in prereg.V2_HYPOTHESES:
             registered = prereg.preregistration(hypothesis)["instrument_identity"]
             self.assertEqual(registered["digest"], V2_INSTRUMENT_DIGEST)
-            # If this fails, code the v2 instrument reaches was edited.  Do
-            # not re-pin after a sealed session's data have been examined: register
-            # v3 with a new window instead.
-            self.assertEqual(current["components"], registered["components"])
-            self.assertEqual(current["digest"], registered["digest"])
-            self.assertEqual(registered["roots"], current["roots"])
+        current = prereg.instrument_identity()
+        if current["digest"] != V2_INSTRUMENT_DIGEST:
+            # Expected once the repository moves on: the instrument is every
+            # byte of every module it can import.  v2 is decided from a
+            # checkout of the registration commit, where this holds.
+            self.skipTest("the tree has moved on from the v2 registration commit")
+        self.assertEqual(current["components"], registered["components"])
+        self.assertEqual(registered["roots"], current["roots"])
 
     def test_identity_covers_the_instrument_modules(self):
         components = prereg.instrument_identity()["components"]
         for module in ("research.signal_quality", "research.stats",
                        "research.preregistered", "research.market_data",
-                       "agent.contracts.rule"):
+                       "agent.contracts.rule",
+                       # imported inside a function body by the loader
+                       "research.edge_discovery_core",
+                       "research.source_validation",
+                       # package initialisers on the path
+                       "research", "agent", "agent.contracts"):
             self.assertIn(module, components)
-        self.assertNotIn("research.costs", components)
 
-    def test_identity_follows_reached_code_and_ignores_the_rest(self):
-        base = ("from .helpers import shared\n"
-                "LIMIT = 3\n"
-                "def root(x):\n    return helper(x) + LIMIT + shared\n"
-                "def helper(x):\n    return x * 2\n"
-                "def unrelated():\n    return 1\n")
-        helpers = "shared = 5\nother = 6\n"
+    def test_identity_is_every_byte_of_every_reachable_module(self):
+        sources = {
+            "research.fake": ("import json\n"
+                              "def root():\n"
+                              "    from .helpers import shared\n"
+                              "    return shared\n", "research"),
+            "research.helpers": ("shared = 5\n", "research"),
+            "research.unrelated": ("value = 1\n", "research"),
+            "research": ("", "research"),
+        }
 
-        def index_for(root_source, helper_source):
-            sources = {"research.fake": root_source,
-                       "research.helpers": helper_source}
-            return lambda name: prereg._index_source(name, sources[name], "research")
+        def identity(**changed):
+            table = {**sources, **{name.replace("_", "."): (text, "research")
+                                   for name, text in changed.items()}}
+            return prereg._module_closure(
+                ["research.fake"], packages=("research",),
+                read=lambda name: table.get(name))
 
-        def digest(root_source, helper_source=helpers):
-            entries = prereg._code_closure(
-                [("research.fake", "root")], packages=("research",),
-                index=index_for(root_source, helper_source))
-            return json.dumps(sorted([list(key), value]
-                                     for key, value in entries.items()))
+        original = identity()
+        self.assertEqual(sorted(original),
+                         ["research", "research.fake", "research.helpers"])
+        # A lazily imported module, a comment and a module-level statement
+        # all count; a module nothing imports does not; neither does json.
+        self.assertNotEqual(original, identity(research_helpers="shared = 6\n"))
+        self.assertNotEqual(original, identity(
+            research_helpers="shared = 5\n# a comment\n"))
+        self.assertNotEqual(original, identity(research="import os\n"))
+        self.assertEqual(original, identity(research_unrelated="value = 2\n"))
 
-        original = digest(base)
-        self.assertEqual(original, digest(base.replace("return 1", "return 2")))
-        self.assertEqual(original, digest(base, helpers.replace("6", "7")))
-        self.assertNotEqual(original, digest(base.replace("x * 2", "x * 3")))
-        self.assertNotEqual(original, digest(base.replace("LIMIT = 3", "LIMIT = 4")))
-        self.assertNotEqual(original, digest(base, helpers.replace("5", "9")))
+    def test_only_the_registration_block_is_left_out(self):
+        begin, end = prereg._REGISTRATION_BEGIN, prereg._REGISTRATION_END
+        source = (f"A = 1\n{begin} ===\nV2_X = 2\n{end} ===\nB = 3\n")
+        stripped = prereg._registration_free_source(prereg.__name__, source)
+        self.assertEqual(stripped, "A = 1\nB = 3\n")
+        self.assertEqual(prereg._registration_free_source("research.other", source),
+                         source)
+        with self.assertRaises(prereg.PreregistrationError):
+            prereg._registration_free_source(prereg.__name__, "A = 1\n")
 
-    def test_a_changed_instrument_refuses_the_decision_but_reports(self):
+    def test_a_changed_instrument_refuses_and_discloses_nothing(self):
         manifest = _small_manifest()
         manifest["instrument_identity"] = {
             **manifest["instrument_identity"], "digest": "0" * 64}
         bars = [bar for day in _weekdays(SEALED, 31) for bar in _session(day)]
-        report, _fake = _run(bars, manifest=manifest)
+        report, fake = _run(bars, manifest=manifest)
         self.assertEqual(report["decision"], "refused")
         self.assertEqual(report["decision_refusals"],
                          ["instrument_digest_mismatch"])
         self.assertFalse(report["instrument_identity"]["matches"])
-        # Diagnostic output is still produced, and nothing is recorded.
-        self.assertEqual(report["rule_outcome_if_eligible"], "pass")
-        self.assertEqual(report["looks"][0]["status"], "evaluated")
-        self.assertEqual(report["looks"][0]["look_record_status"], "not_recorded")
+        # Review of D1-01: a refused run used to print the look's outcome,
+        # which let someone see sealed results, change the rule and re-pin.
+        self.assertEqual(report["rule_outcome_if_eligible"], "withheld")
+        self.assertEqual(report["looks"][0]["status"], "withheld")
+        self.assertNotIn("delta_bps", report["looks"][0])
+        self.assertNotIn("outcome", report["looks"][0])
+        self.assertEqual(report["looks"][1]["status"],
+                         "blocked_until_earlier_look_is_recorded")
         self.assertEqual(report["look_records_to_append"], [])
+        self.assertEqual(fake.calls, [])
+
+    def test_an_edited_manifest_refuses_through_evaluate(self):
+        days = _weekdays(SEALED, 31)
+        bars = [bar for day in days for bar in _session(day, prereg.V2_UNIVERSE[:18])]
+        fake = _FakeInstrument()
+        with patch.object(prereg, "measure_signal_quality", side_effect=fake), \
+                patch.dict(prereg.V2_MANIFEST_HASHES,
+                           {prereg.VWAP_REVERSION_HYPOTHESIS_V2: "1" * 64}):
+            report = prereg.evaluate(
+                bars, hypothesis_id=prereg.VWAP_REVERSION_HYPOTHESIS_V2,
+                decision_eligible=True, look_records=[],
+                as_of=datetime.combine(days[-1] + timedelta(days=5),
+                                       time(12, 0), NEW_YORK))
+        self.assertIn("manifest_hash_mismatch", report["decision_refusals"])
+        self.assertEqual(report["decision"], "refused")
+        self.assertEqual(report["look_records_to_append"], [])
+        self.assertEqual(fake.calls, [])
 
     def test_public_evaluate_dispatches_v2_and_refuses_without_a_record_store(self):
         days = _weekdays(SEALED, 2)
@@ -303,7 +361,9 @@ class SessionDefinitionTests(unittest.TestCase):
         days = _weekdays(SEALED, 31)
         bars = [bar for day in days for bar in _session(day)]
         bars += _session(_on(-1))                               # before window
-        bars += _session(days[3] + timedelta(days=0), ("QQQ",), calendar=False)
+        # A second, calendar-less copy of a universe symbol's bars makes the
+        # date's calendar conflict.  (A non-universe symbol is dropped first.)
+        bars += _session(days[3] + timedelta(days=0), ("SPY",), calendar=False)
         report, fake = _run(bars)
         self.assertEqual(len(report["sealed_sessions"]), 30)
         self.assertNotIn(days[3].isoformat(), report["sealed_sessions"])
@@ -355,7 +415,8 @@ class LookRecordTests(unittest.TestCase):
         self.assertEqual(changed["looks"][0]["look_record_status"], "conflict")
         self.assertEqual(changed["looks"][0]["look_record_mismatch"],
                          ["result_digest"])
-        self.assertEqual(changed["looks"][0]["recorded_outcome"], "inconclusive")
+        self.assertEqual(changed["looks"][0]["status"], "withheld")
+        self.assertNotIn("outcome", changed["looks"][0])
         self.assertEqual(changed["decision"], "look_record_conflict")
         self.assertEqual(changed["look_records_to_append"], [])
 
@@ -412,11 +473,91 @@ class LookRecordTests(unittest.TestCase):
                 prereg.main(["--data", tmp, "--out", str(Path(tmp) / "r.json"),
                              "--hypothesis", prereg.VWAP_REVERSION_HYPOTHESIS_V2])
 
+    def test_a_tampered_record_is_a_conflict_not_a_decision(self):
+        noisy = _metric(candidate_minus_control_bps=17.0,
+                        candidate_minus_control_cluster_stderr_bps=10.0)
+        first, _fake = _run(self.bars_for(31), records=[],
+                            metric=lambda sessions, kwargs: noisy)
+        record = copy.deepcopy(first["look_records_to_append"][0])
+        self.assertEqual(record["result"]["outcome"], "inconclusive")
+        record["result"]["outcome"] = "pass"          # digest left untouched
+        tampered, _fake = _run(self.bars_for(31), records=[record],
+                               metric=lambda sessions, kwargs: noisy)
+        self.assertEqual(tampered["decision"], "look_record_conflict")
+        self.assertIn("recorded_result_does_not_match_its_digest",
+                      tampered["looks"][0]["look_record_mismatch"])
+        self.assertEqual(tampered["rule_outcome_if_eligible"], "withheld")
+
+    def test_a_second_record_for_a_look_is_a_conflict(self):
+        first, _fake = _run(self.bars_for(31), records=[])
+        record = first["look_records_to_append"][0]
+        other = {**copy.deepcopy(record), "result_digest": "f" * 64}
+        report, _fake = _run(self.bars_for(31), records=[record, other])
+        self.assertEqual(report["decision"], "look_record_conflict")
+        self.assertIn("duplicate_look_record",
+                      report["looks"][0]["look_record_mismatch"])
+
+    def test_an_interim_or_diagnostic_run_discloses_nothing(self):
+        interim, fake = _run(self.bars_for(20), records=[])
+        self.assertEqual(interim["interim"], {
+            "sessions": 20, "decision": "none_before_first_look",
+            "statistics": "withheld"})
+        self.assertEqual(fake.calls, [])
+        diagnostic, fake = _run(self.bars_for(31), records=[], eligible=False)
+        self.assertEqual(diagnostic["decision"], "diagnostic_only")
+        self.assertEqual(diagnostic["rule_outcome_if_eligible"], "withheld")
+        self.assertEqual(diagnostic["looks"][0]["status"], "withheld")
+        self.assertEqual(fake.calls, [])
+
+    def test_an_unterminated_final_line_is_dropped_under_the_lock(self):
+        bars = self.bars_for(31)
+        with tempfile.TemporaryDirectory() as tmp:
+            records = Path(tmp) / "looks.jsonl"
+            records.write_text('{"schema": "preregistered-look-rec')
+            fake = _FakeInstrument()
+            with patch.object(prereg, "measure_signal_quality", side_effect=fake), \
+                    patch.object(prereg, "preregistration",
+                                 return_value=_small_manifest()):
+                report = prereg._evaluate_with_look_record(
+                    records, bars, hypothesis_id=prereg.VWAP_REVERSION_HYPOTHESIS_V2,
+                    decision_eligible=True, eligibility_reasons=(), provenance={},
+                    as_of=datetime.combine(_on(120), time(12, 0), UTC))
+            self.assertTrue(report["look_record_unterminated_line_dropped"])
+            lines = records.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])["look"], 1)
+            self.assertTrue(records.read_text().endswith("\n"))
+
     def test_a_malformed_record_line_is_refused(self):
         with self.assertRaises(prereg.PreregistrationError):
             prereg.read_look_records(io.StringIO('{"schema": "other"}\n'))
         with self.assertRaises(prereg.PreregistrationError):
             prereg.read_look_records(io.StringIO("not json\n"))
+
+
+class EvaluationInstantAndUniverseTests(unittest.TestCase):
+    """Review of D1-04 and D1-01: no future instant, no outside symbols."""
+
+    def test_an_instant_after_the_wall_clock_is_refused(self):
+        days = _weekdays(SEALED, 31)
+        bars = [bar for day in days for bar in _session(day)]
+        now = datetime.combine(days[-1], time(19, 45), UTC)   # 15:45 New York
+        with patch.object(prereg, "_utc_now", return_value=now):
+            report, fake = _run(bars, records=[],
+                                as_of=now + timedelta(days=1))
+        self.assertIn("as_of_in_future", report["decision_refusals"])
+        self.assertEqual(report["decision"], "refused")
+        self.assertEqual(report["look_records_to_append"], [])
+        self.assertEqual(fake.calls, [])
+
+    def test_bars_outside_the_registered_universe_are_never_measured(self):
+        days = _weekdays(SEALED, 31)
+        bars = [bar for day in days for bar in _session(day, ("SPY", "ARKK"))]
+        report, fake = _run(bars, records=[])
+        self.assertEqual(report["bars_outside_universe"], 31 * 390)
+        self.assertTrue(fake.calls)
+        for call in fake.calls:
+            self.assertEqual(call["symbols"], ["SPY"])
 
 
 class DecisionRuleTests(unittest.TestCase):
@@ -468,6 +609,16 @@ class DecisionRuleTests(unittest.TestCase):
         self.assertGreater(clear["delta_lower_bound_bps"], 17.0)
         self.assertAlmostEqual(clear["cr1_critical_t"], 2.0452296, places=5)
 
+    def test_the_candidate_itself_must_clear_the_cost(self):
+        # Review of D1-03: a 30 bps delta over a falling control is not a pass
+        # when the candidate itself loses money after the round trip.
+        losing = prereg.look_outcome_v2(
+            _metric(after_hurdle_cluster_t_stat=-2.5), alpha=0.025, cost_bps=17.0)
+        self.assertEqual(losing["outcome"], "inconclusive")
+        self.assertFalse(losing["candidate_after_cost_clears"])
+        winning = prereg.look_outcome_v2(_metric(), alpha=0.025, cost_bps=17.0)
+        self.assertEqual(winning["outcome"], "pass")
+
     def test_the_after_cost_sign_flip_must_agree(self):
         result = self.v2(candidate_minus_control_after_hurdle_sign_flip_p_value=0.2)
         self.assertNotEqual(result["outcome"], "pass")
@@ -487,7 +638,8 @@ class DecisionRuleTests(unittest.TestCase):
                              ["cross_session_same_session_minute"])
             self.assertEqual(call["delta_hurdle_bps"], 17.0)
         decision_calls = [call for call in fake.calls if call["sessions"] == 30
-                          and call["outcome_anchor"] == "next_bar_open"]
+                          and call["outcome_anchor"] == "next_bar_open"
+                          and call["family"] == "vwap_reversion"]
         self.assertEqual(len(decision_calls), 1)
 
 

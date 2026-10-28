@@ -152,10 +152,32 @@ def _publish_once(target: Path, data: bytes) -> bool:
         try:
             os.link(temporary, str(target))
         except FileExistsError:
-            if target.read_bytes() != data:
-                raise RuntimeError(
-                    f"existing proof artifact does not match payload: {target}")
-            return False
+            existing = target.read_bytes()
+            if existing == data:
+                return False
+            if len(existing) < len(data) and data.startswith(existing):
+                # A strict prefix is the remains of a write the code before
+                # this fix interrupted; it was never a complete artefact.
+                os.replace(temporary, str(target))
+                _fsync_directory(target.parent)
+                return True
+            raise RuntimeError(
+                f"existing proof artifact does not match payload: {target}")
+        except OSError:
+            # No hard links on this filesystem: fall back to an exclusive
+            # create.  The name can then hold a partial file after a crash,
+            # which the strict-prefix repair above recovers on the next run.
+            try:
+                handle = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                if target.read_bytes() != data:
+                    raise RuntimeError(
+                        f"existing proof artifact does not match payload: {target}")
+                return False
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
         _fsync_directory(target.parent)
         return True
     finally:

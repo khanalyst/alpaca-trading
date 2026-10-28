@@ -165,8 +165,8 @@ the instrument digest are one block of literals at the top of
 instrument literals and the manifest hashes for the running tree.
 Manifest hashes, pinned by `tests/research/test_preregistered_v2.py`:
 
-- VWAP: `232a0b94350ea65b5786e79064662a5c30aee4c5fd3234a5ff366fcb35a510e4`
-- ORF: `fbbe1be763ee465a7304da8b27c8af455a5acdf252782cca07fa2f296f9a3623`
+- VWAP: `b1435cc484a48e699f3657e163cd7084836049a307394a35cfdbb7f62a70931e`
+- ORF: `3c9550dd67c31cf82835bf62cb91742c2653cb5b7b1bf3c7f077ab0e817f2355`
 
 **Claim.** Entering at the open of the bar after the frozen rule fires is
 followed over the next 60 minutes by a return, in the rule's direction, that
@@ -176,7 +176,7 @@ round-trip cost, as a one-sided lower confidence bound.
 | item | fixed value |
 | --- | --- |
 | sealed window | complete sessions on or after **2026-10-29**; every session up to 2026-10-23 had been examined |
-| instrument | digest `7162116bb85e5b8f24be7cdeca6cac988a8b3e1aada614dddd9d97f911e9e646` of the running code (below) |
+| instrument | digest `bca6df022725c18bed2ddc2a031e83cae24ead80c0386b9a149f34343c53b8ab` of the running code (below) |
 | primary endpoint | 60-minute control-adjusted return from the **next bar's open**, horizon fixed on the wall clock |
 | sensitivity | the same from the open one bar later (one-bar skip), reported, never decisive |
 | diagnostic | the v1-style signal-close anchored figure on the same clock, reported only |
@@ -185,52 +185,100 @@ round-trip cost, as a one-sided lower confidence bound.
 | looks | first 30 and first 60 countable sessions, one-sided alpha 0.025 each, each decided once |
 | hurdle | 17.0 bps round trip, on the one-sided lower confidence bound |
 
-**Instrument identity (D1-01).** The manifest records a sha256 digest of the
-exact source text of every module-level definition reachable from
-`research.signal_quality.measure_signal_quality` and from the v2 evaluator
-`research.preregistered._evaluate_v2` (which contains the session definition,
-the look and record logic and `look_outcome_v2`), following imports inside
-the `research` and `agent` packages: the signal-quality instrument, the
-statistics it uses in `research/stats.py`, the market-data availability
-rules and the family evaluator in `agent/contracts/rule.py`. Editing code
-the instrument does not reach leaves the digest unchanged. `evaluate()`
-recomputes the digest of the running code and, if it differs, reports the
-statistics as a diagnostic but decides nothing (`decision: refused`,
-`decision_refusals: ["instrument_digest_mismatch"]`). Any change to that code
-before a look therefore needs a new registration (v3) with a new window.
+**Instrument identity (D1-01).** The manifest records one sha256 per module
+over the exact source of every module that `research.preregistered` and
+`research.signal_quality` can import, at any depth and including imports
+inside function bodies, within the `research`, `agent` and `deploy`
+packages, together with each package `__init__`, and one digest over those
+(46 modules at registration). The only text left out is the registration
+literal block of `research/preregistered.py`, which holds the identity
+itself. Whole modules are hashed on purpose: the review of this registration
+showed that a definition-level closure missed a module-level statement that
+changes an anchor, an `__init__` that changes a default, and the corpus
+readers imported inside `_load`. `evaluate()` recomputes the identity of the
+running code and the manifest hash, and refuses any decision when either
+differs (`instrument_digest_mismatch`, `manifest_hash_mismatch`).
+
+Because every byte of those 46 modules counts, the repository's own tree
+stops matching as soon as any of them is edited. **v2 is therefore always
+evaluated from a checkout of the registration commit**, never from the
+current tree:
+
+```sh
+git worktree add /opt/prereg-v2 <registration commit>
+cd /opt/prereg-v2 && python -m research.preregistered ...   # as below
+```
+
+The unit test that compares the running tree with the registration skips
+itself once the tree has moved on.
+
+**Disclosure.** No statistic computed on sealed sessions is reported before a
+look is decided and recorded. An interim run (fewer than 30 sessions), a
+refused run, a diagnostic run (a corpus that is not decision-eligible) and a
+run that meets a look-record conflict report session counts only, and a
+later look is not evaluated until the earlier one is recorded. This closes
+the route the review found: see sealed results in a refused run, change the
+rule, re-register.
 
 **Decision at each look.**
 
 - **pass**: the one-sided 97.5% CR1 lower confidence bound of the mean
   control-adjusted delta is above 17.0 bps, *and* a one-sided session
-  sign-flip test of the deltas less 17.0 bps has p < 0.025.
-- **futility**: the one-sided 97.5% upper bound is below 17.0 bps. Retire.
-  It is decided on the same registered-tier statistics as a pass.
+  sign-flip test of the deltas less 17.0 bps has p < 0.025, *and* the
+  candidate's own mean return less 17.0 bps has a CR1 t statistic above the
+  same critical value. The last condition means a pass cannot coexist with
+  a candidate that loses money after costs while beating a falling control.
+- **futility**: on a look that meets the control floor, the one-sided 97.5%
+  upper bound is below 17.0 bps. Retire. An underpowered look (fewer than 30
+  matched controls, or coverage below 80%) is inconclusive whatever its
+  bounds.
 - **inconclusive**: neither. Continue to look 2; at look 2 not established.
 - A candidate with no control in the registered cross-session tier is left
-  out of the statistics and counts as unmatched (D1-02). Fewer than 30
-  matched controls, or coverage below 80%, is inconclusive.
+  out of the statistics and counts as unmatched (D1-02).
 - No look follows a pass or a futility.
 
-**Countable sessions (D1-04).** A date counts only if every bar carries the
-same exact Alpaca `session_open`/`session_close`, the session is a regular
-09:30 to 16:00 New York session (early closes are excluded), its date is
-before the evaluation date and its close is at or before the evaluation
-instant (the session in progress never counts), at least 95% of its minutes
-carry a bar for some universe symbol, and at least 18 of the 24 universe
-symbols have a bar in at least half of its minutes. Excluded dates are
-dropped entirely and listed with a reason. These floors were set before any
-v2 session existed; if IEX coverage makes them unreachable, register v3
-rather than editing v2.
+The 17.0 bps hurdle is the static round trip of `research/costs.py` at
+registration. The per-symbol model added in the same change (`per_symbol_v2`)
+puts the true round trip for these ETFs at about 1.75 to 4.07 bps, so the
+hurdle is deliberately conservative: it makes a false pass unlikely and costs
+power.
+
+**Countable sessions (D1-04).** Bars of symbols outside the registered
+24-ETF universe are dropped before anything else, so a change to the
+recorder's symbol list cannot change the tested population. A date counts
+only if every bar carries the same exact Alpaca `session_open`/`session_close`,
+the session is a regular 09:30 to 16:00 New York session (early closes are
+excluded), its date is before the evaluation date and its close is at or
+before the evaluation instant, at least 95% of its minutes carry a bar for
+some universe symbol, and at least 18 of the 24 universe symbols have a bar
+in at least half of its minutes. An evaluation instant later than the wall
+clock is refused (`as_of_in_future`), so a session still trading can never be
+counted. Excluded dates are dropped entirely and listed with a reason. These
+floors were set before any v2 session existed; if IEX coverage makes them
+unreachable, register v3 rather than editing v2.
 
 **Each look is decided once (D1-04).** A decision-bearing run appends one
 record per newly decided look to an append-only JSONL file: look number,
 session list and its digest, the instrument digest, the result and its
 digest. Every later run recomputes the look and must reproduce that record;
-it never decides it again. A mismatch (different sessions, code or result)
-is reported as a conflict and the run decides nothing.
+it never decides it again. A mismatch (different sessions, code or result),
+a record whose result does not match its own digest, or a second record for
+the same look is a conflict, and the run decides nothing. A final line
+without its newline (an append interrupted before it was acknowledged) is
+dropped under the lock and the look is decided again, deterministically.
+
+**Amendments before the window opened.** The registration was published at
+13:05 UTC on 28 October with manifest hashes `65e38c51...` (VWAP) and an
+instrument digest `a809497f...`. It was amended twice on 28 October, both
+times before any sealed session existed: once for an opt-in change to
+`agent/contracts/rule.py` (`232a0b94...`, digest `7162116b...`), and once for
+the review fixes above (the hashes in this section). The sealed window starts
+at the first full session after the final amendment was published. No
+session on or after that date had been examined by anyone when it was set.
 
 ### Running v2
+
+From a checkout of the registration commit:
 
 ```sh
 python -m research.preregistered \
@@ -242,7 +290,7 @@ python -m research.preregistered \
 
 `--look-records` is required for v2; the file is locked while a run reads,
 evaluates and appends. Do not delete or edit it. `--as-of` sets the
-evaluation instant (default now).
+evaluation instant (default now; never later than now).
 
 ## Running it
 
@@ -271,9 +319,10 @@ takes eligibility from the source preflight only.
 
 ## Changing a hypothesis
 
-Don't. Any edit changes the manifest hash and fails the suite, and for v2 any
-edit to the code the instrument reaches changes the instrument digest and
-fails `tests/research/test_preregistered_v2.py`. Register a new version
+Don't. Any edit to a manifest changes its hash and fails the suite. For v2,
+the in-tree instrument is expected to drift as the repository moves on; that
+is why decisions are made from the registration commit, where the digest and
+the manifest hashes are checked at run time. Register a new version
 (`...v3`) with its own sealed window starting after the last session anyone
 has examined, and leave earlier versions and their reports intact. Do not
 commit unblinded interim results before look 1.

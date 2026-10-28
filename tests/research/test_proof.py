@@ -361,6 +361,26 @@ class AtomicProofWriteTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "does not match payload"):
                 write_proof(FakeLedger(), "candidate-1", output_root=directory)
 
+    def test_a_truncated_artifact_from_the_old_writer_is_repaired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = write_proof(FakeLedger(), "candidate-1", output_root=directory)
+            full = result.path.read_bytes()
+            result.path.write_bytes(full[:len(full) // 2])
+            again = write_proof(FakeLedger(), "candidate-1", output_root=directory)
+            self.assertTrue(again.created)
+            self.assertEqual(again.path.read_bytes(), full)
+            self.assertEqual(list(again.path.parent.iterdir()), [again.path])
+
+    def test_a_filesystem_without_hard_links_still_publishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("os.link", side_effect=PermissionError(1, "Operation not permitted")):
+                result = write_proof(FakeLedger(), "candidate-1", output_root=directory)
+                self.assertTrue(result.created)
+                again = write_proof(FakeLedger(), "candidate-1", output_root=directory)
+                self.assertFalse(again.created)
+            self.assertIn("Canonical payload", result.path.read_text())
+            self.assertEqual(list(result.path.parent.iterdir()), [result.path])
+
 
 class ProofStatisticNamingTests(unittest.TestCase):
     """Review finding D1-11: no derived 'confidence' in new payloads."""

@@ -39,6 +39,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
@@ -132,7 +133,7 @@ REGISTERED_CONTROL_TIER = "cross_session_same_session_minute"
 PREREGISTRATION_SCHEMA_V2 = "preregistered-hypothesis.v2"
 EVALUATION_SCHEMA_V2 = "preregistered-evaluation.v2"
 LOOK_RECORD_SCHEMA = "preregistered-look-record.v1"
-INSTRUMENT_IDENTITY_SCHEMA = "preregistered-instrument-identity.v1"
+INSTRUMENT_IDENTITY_SCHEMA = "preregistered-instrument-identity.v2"
 VWAP_REVERSION_HYPOTHESIS_V2 = "vwap-reversion-control-adjusted.v2"
 OPENING_RANGE_FADE_HYPOTHESIS_V2 = "opening-range-fade-control-adjusted.v2"
 V2_LOOK_SESSIONS = (30, 60)
@@ -157,47 +158,129 @@ V2_MIN_SYMBOL_COVERAGE = 0.50
 V2_MIN_COVERED_SYMBOLS = 18
 V2_MIN_RECORDER_COVERAGE = 0.95
 _NEW_YORK = ZoneInfo("America/New_York")
-# The code whose identity is registered: everything these definitions reach
-# through module-level names inside the research and agent packages.
-_INSTRUMENT_ROOTS = (
-    ("research.signal_quality", "measure_signal_quality"),
-    ("research.preregistered", "_evaluate_v2"),
-)
-_INSTRUMENT_PACKAGES = ("research", "agent")
+# The code whose identity is registered: every module these modules can
+# import, at any depth, inside the repository's own packages.
+_INSTRUMENT_ROOT_MODULES = ("research.preregistered", "research.signal_quality")
+_INSTRUMENT_PACKAGES = ("research", "agent", "deploy")
+# Built so that the marker text appears in this file only at the block.
+_REGISTRATION_BEGIN = "# " + "=== v2 registration literals"
+_REGISTRATION_END = "# " + "=== end of v2 registration literals"
 # === v2 registration literals ================================================
 # Everything that is fixed at the moment v2 is published lives in this one
 # block.  ``V2_SEALED_FROM`` must be the first full session after the
 # registration is published (pushed), and later than every examined session.
-# The instrument literals are the output of :func:`v2_registration_literals`
-# on the published tree; ``evaluate`` recomputes the identity of the running
-# code and refuses a v2 decision if it differs.  Once a sealed session has
+# The instrument and manifest literals are the output of
+# :func:`v2_registration_literals` on the published tree; ``evaluate``
+# recomputes the identity of the running code and the manifest hashes and
+# refuses a v2 decision if either differs.  This block is the only part of
+# this module outside the instrument identity.  Once a sealed session has
 # been examined, never change anything here to make a test pass: register a
 # new version instead.  Every test and manifest reads these constants.
 V2_LAST_EXAMINED_SESSION = "2026-10-23"
 V2_REGISTERED_ON = "2026-10-28"
 V2_SEALED_FROM = "2026-10-29"
 V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
+    "agent":
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "agent.alpaca_domain":
+        "63f648a92c89a37d7af64bf7a044111a07d77d70d40fab535e3ff6395811afa6",
+    "agent.alpaca_market_data":
+        "f50f77cc9548ed2bea59f118e213a220c5bb9b9a452eac00468ead0e27dfece3",
+    "agent.alpaca_provider":
+        "a444bcba267200dec627a58cef31f2bc16597a2843841a25622f81638e7171da",
+    "agent.alpaca_sdk":
+        "e6dc6cc4a8a63952269bbd483f517140af28c671d47fd4701698b5b5d720d83b",
+    "agent.alpaca_session":
+        "99bf3c6f720075c036ef5e88474c9ba6fcba0b0e8a4ac16cc0a6072a9e74782d",
+    "agent.config":
+        "0d0ee869ef54d7591b3fcfaef31d11818f8221a41c4134d112dd4d1d4f108c4f",
+    "agent.contracts":
+        "78ee9d24545aeb6e710a2078cf8532f04bda0ef164bba3ab2cd5b0f9ffbf8606",
+    "agent.contracts.ibr":
+        "832e3270aeb16b33b7a4f97bcdc1c5054d255efd1f10b2c9bf38338d9eb6cf0e",
     "agent.contracts.market_context":
-        "fd6c1459b0d17d0d284d43d1b85d8a2561a5808b5efd647981b2ed36aa60589f",
+        "4944ca5e877d659fe60425b41c672d6f7dabeefafb8cd03b89db749e5a7516b7",
+    "agent.contracts.risk_geometry":
+        "a5af0cf5eb4db6d3d6fd26a8c7d0db53bca5c9e189ffa54b50032c421ece6dd9",
     "agent.contracts.rule":
-        "3dc742b8fe63747188b2f75df23ca64b557f13ade4a5801c348da35fc09cf012",
+        "42517549f463a5d8e77bd39ff8fa1e588fa7bb63f9e6efa6ce16e12e872e821e",
+    "agent.governance":
+        "2faec8c3b178ad30255c56cf2b2504661b11aa689726666b3dd816de3ce5b1b0",
     "agent.instruments":
-        "13b3926e7f2bdcd92302ff6ca84153832ecde7a0e3e47028fe76ffde6eebb8f2",
+        "5f6f068767db7fceb5d2501c38ee20d6239254dfa49d5de2e39afcb83ea49fa4",
+    "agent.journal":
+        "388fa06ec79ca9b4ea577fee01d64f3894e0f1816a7a4cba34da105c95f3dd5e",
+    "agent.order_timing":
+        "0845e5da46a303ee2fa1b98a1bd672945e3f3cd13f1f7d03cb984bac38584712",
+    "agent.paper_trial":
+        "ea47fa68479a9be9944f36fb0dc89fb196034ebb4ae53de755ad84069b9d46e9",
+    "agent.paper_trial_operator":
+        "b2c0f793dfcd424042f8c99df65a7a02978d875c9d9182a0a671a3f61a94a006",
+    "agent.registry":
+        "9478e69d8a6586ef06a2ec52dfd2a0db23a50e29d9e7c3c7f57435f230353897",
+    "agent.state":
+        "f6384c743c896773f07b8321ac4a2ead42b2eea49511d8c383a61a8490edadc6",
+    "agent.state_store":
+        "c4276e4581d57545979e79379d951dee6ca62009c1a746680f06458e8f0a516e",
+    "agent.variants":
+        "44799208776154dfc96e6fa00c49fcfaa8bbc0a006cd00fc5d4abdc54ef5a568",
+    "research":
+        "bc65c6643fa0aa9b248e23ae8a2d65847182dcd707ce4dac12e3d9ee7671a5b4",
+    "research.costs":
+        "e862873d7969e910f6fc9b05ef92b1a96aeaea28094922e3bb14fdcdfc5a0037",
+    "research.diagnostic_cohort_contract":
+        "1b4926d0eeb56b1d9373758e2c624674b73156322cb1a6cfb0a83069e07c02e2",
+    "research.diagnostic_shadow":
+        "cd1ac019f416dfd2f8703327be1de006194c3821b5bd11ac8e57e2e601ada104",
+    "research.edge_discovery_core":
+        "3d75778e993a4cc4687b3adf6c0efbeaefaeb4ad70f9bc591b09e01271c5eeec",
+    "research.edge_identity":
+        "bfeafba2b4a3fb8cd970586f216aca98ec75676f470d09d3fd92c14010b9c4aa",
+    "research.edge_lab":
+        "66f53c8aaa82a8d56066f67ccf7b563c6d126d9b7fc446b30b9369057f9c7dec",
+    "research.edge_ledger":
+        "cdf2ff28d599a7a4ef4586af75d0f7864807d773f3b841b390ad4de90fb4428c",
+    "research.edge_ledger_proof":
+        "1ec5129f083c2c0362613e168a1cf7cdea3ca456b06728fdc26106993029372f",
     "research.edge_ledger_store":
-        "62b0b03f6327b79d4654c96f966150258e61879c5acbe31c58449cfde08d77b4",
+        "878628b48fa550e59ef6c0a48ec167bcf3a53e69978baa77298f938bf96b870a",
+    "research.factory_core":
+        "ec034d65f0d533463f8a0d7ee4069b5e7ae365551870aa878345172ec4198cec",
+    "research.factory_ledger":
+        "567240cbb77efb03b347b21ac89f836939123fc1e50f53525c203a3586659c98",
+    "research.gates":
+        "49681df3fe3b795326984d61e757b8d1621f86c07263f83037d52956ec014750",
+    "research.ibr":
+        "d0124683b413a6a732ed4509c0c76f57f64af9b7d7016218e07e859b7171d320",
     "research.market_data":
-        "10ef56f25e3be61e354f399b7c5980771eff7869a9a6cd944df9ddc21220d8c5",
+        "a199a4364b8940fe19b7906344242faec2f89fd4df931a1babd86b027b184fad",
     "research.maturity":
-        "92b61078283b186fab6b9636070e013e2ab2a0e1987bc249fc2236e543d9be7b",
+        "0e37eba5522d7bc6f90d0642faf0260fb4e60e72dac322a5cae083a9ea28afde",
+    "research.path_telemetry":
+        "ce14697bf785c41f0fd1668a5299b93a392d5a2ffdf53d5da9b1c85721928665",
     "research.preregistered":
-        "6b09ab54cba73f00f1d77ea46dc45c554759fcd67dfbe77195ba84bb38b42e05",
+        "9f6743e7751a789d76883af04beb482eb7a9a446641a699602ef7cc9a7c56acf",
+    "research.quote_costs":
+        "c3c296f48207160b30a4bcb0e4549789846aa25b5e4d16e9e633f9fee8e9b335",
     "research.signal_quality":
-        "7e8a64e054f2c4c2f9c2728746864d01c84edad556882af66990513c8776546b",
+        "d803eb374dd2768134c42384d57c0d6f29b9fde22b88c3d8889337facac68499",
+    "research.source_validation":
+        "ec97ee2220a8bfded56c69c4f3fba9b415af4cb49b953c847f84eaec26f00ef8",
     "research.stats":
-        "c990b10d4044a587bdc309b90c722b4f3f1daecfc40a0f8af382be8e845e4906",
+        "3dc4c2df18bea3f760755ca7566289572b645209de3978d6799aa056800b8791",
+    "research.stressed_cost_calibration":
+        "8695d7d30b36a3fcdcb6044c0a72219849988d794b34e23852105b6d7348db84",
+    "research.trial":
+        "0f209ee5d7fd8ffaa029f8b094b2a2c4c53fee4ae2db19c95e1d20636feff1cc",
 }
 V2_INSTRUMENT_DIGEST = (
-    "7162116bb85e5b8f24be7cdeca6cac988a8b3e1aada614dddd9d97f911e9e646")
+    "bca6df022725c18bed2ddc2a031e83cae24ead80c0386b9a149f34343c53b8ab")
+V2_MANIFEST_HASHES: dict[str, str] = {
+    "vwap-reversion-control-adjusted.v2":
+        "b1435cc484a48e699f3657e163cd7084836049a307394a35cfdbb7f62a70931e",
+    "opening-range-fade-control-adjusted.v2":
+        "3c9550dd67c31cf82835bf62cb91742c2653cb5b7b1bf3c7f077ab0e817f2355",
+}
 # === end of v2 registration literals =========================================
 
 
@@ -494,6 +577,13 @@ def _v2_shared() -> dict[str, Any]:
                 "and its close is at or before the evaluation instant, so the "
                 "session in progress never counts"),
             "universe": list(V2_UNIVERSE),
+            "universe_rule": (
+                "bars of any other symbol are dropped before anything is "
+                "measured, so a change to the recorder's symbol list cannot "
+                "change the tested population"),
+            "evaluation_instant": (
+                "an evaluation instant later than the wall clock is refused, "
+                "so a session still trading can never be counted"),
             "min_symbol_coverage": V2_MIN_SYMBOL_COVERAGE,
             "min_covered_symbols": V2_MIN_COVERED_SYMBOLS,
             "min_recorder_coverage": V2_MIN_RECORDER_COVERAGE,
@@ -527,9 +617,17 @@ def _v2_shared() -> dict[str, Any]:
             "date order and is decided once: its look number, session list "
             "digest, instrument digest and result are appended to an "
             "append-only look record, and every later run must reproduce that "
-            "record rather than decide again; a run that cannot reproduce it "
-            "reports a conflict and decides nothing; alpha is split 0.025 per "
-            "look, 0.05 overall, and no look follows a pass or futility"),
+            "record rather than decide again; a run that cannot reproduce it, "
+            "a record whose result does not match its own digest, or a second "
+            "record for the same look is a conflict that decides nothing; "
+            "alpha is split 0.025 per look, 0.05 overall, and no look follows "
+            "a pass or futility"),
+        "disclosure_rule": (
+            "no statistic computed on sealed sessions is reported before a "
+            "look is decided and recorded: interim runs, refused runs, "
+            "diagnostic runs and runs that hit a look-record conflict report "
+            "session counts only, and a later look is not evaluated until the "
+            "earlier one is recorded"),
         "decision_rule": {
             "round_trip_cost_bps": V2_ROUND_TRIP_COST_BPS,
             "cost_origin": (
@@ -540,12 +638,15 @@ def _v2_shared() -> dict[str, Any]:
                 "the one-sided (1 - alpha) CR1 lower confidence bound of the "
                 "mean control-adjusted delta is above round_trip_cost_bps AND "
                 "the one-sided session sign-flip test of the deltas less "
-                "round_trip_cost_bps has p < alpha"),
+                "round_trip_cost_bps has p < alpha AND the candidate's own "
+                "mean return less round_trip_cost_bps has a CR1 t statistic "
+                "above the same critical value, so a pass cannot coexist with "
+                "a money-losing executable return"),
             "futility": (
-                "the one-sided (1 - alpha) CR1 upper confidence bound is below "
-                "round_trip_cost_bps: retire the hypothesis; decided on the "
-                "registered-tier statistics, independently of how many "
-                "candidates lacked a registered-tier control"),
+                "on a look that meets the control floor below, the one-sided "
+                "(1 - alpha) CR1 upper confidence bound is below "
+                "round_trip_cost_bps: retire the hypothesis; an underpowered "
+                "look is inconclusive whatever its bounds"),
             "inconclusive": (
                 "neither; at look 1 continue to look 2, at look 2 the claim is "
                 "not established and the hypothesis is retired"),
@@ -553,22 +654,25 @@ def _v2_shared() -> dict[str, Any]:
                 f"fewer than {MIN_MATCHED_CONTROLS} matched controls or "
                 f"coverage below {MIN_CONTROL_COVERAGE:.0%} counts as "
                 "inconclusive"),
-            "before_first_look": "descriptive only; no decision and no early stop",
+            "before_first_look": (
+                "nothing is computed or reported; no decision and no early stop"),
         },
         "instrument_identity": {
             "schema": INSTRUMENT_IDENTITY_SCHEMA,
             "method": (
-                "sha256 over the exact source text of every module-level "
-                "definition reachable from the roots through module-level "
-                "names, following imports inside the research and agent "
-                "packages"),
-            "roots": [f"{module}:{name}" for module, name in _INSTRUMENT_ROOTS],
+                "sha256 over the exact source of every module the root modules "
+                "can import, at any depth and inside function bodies, within "
+                "the research, agent and deploy packages, with each package "
+                "__init__; this module's registration literal block is the "
+                "only text left out"),
+            "roots": list(_INSTRUMENT_ROOT_MODULES),
             "components": dict(V2_INSTRUMENT_COMPONENTS),
             "digest": V2_INSTRUMENT_DIGEST,
             "enforcement": (
                 "evaluate() recomputes the identity of the running code and "
-                "refuses any decision when it differs; the statistics are "
-                "still reported as a diagnostic"),
+                "the manifest hash and refuses any decision when either "
+                "differs; a refused run reports no statistics.  Decisions are "
+                "made from a checkout of the registration commit"),
         },
         "authorizes": (
             "a pass earns entry to the existing proof pipeline; it never "
@@ -785,116 +889,105 @@ def _canonical_bytes(value: Any) -> bytes:
                       ensure_ascii=False).encode("utf-8")
 
 
-def _definition_source(source: str, node: ast.AST) -> str:
-    parts = [ast.get_source_segment(source, item) or ""
-             for item in getattr(node, "decorator_list", [])]
-    parts.append(ast.get_source_segment(source, node) or "")
-    return "\n".join(parts)
+def _registration_free_source(module_name: str, source: str) -> str:
+    """The module's source without the v2 registration literal block.
 
-
-def _index_source(module_name: str, source: str, package: str,
-                  ) -> tuple[dict[str, list[tuple[str, tuple[str, ...]]]],
-                             dict[str, tuple[str, str]]]:
-    """Index a module's top-level definitions and ``from`` imports.
-
-    Each definition keeps its exact source text and the names it mentions;
-    each imported name keeps the module and name it resolves to.
+    The block holds the identity of everything else, so it cannot be part of
+    that identity.  Every other byte of the module is.
     """
-    tree = ast.parse(source)
-    definitions: dict[str, list[tuple[str, tuple[str, ...]]]] = {}
-    imports: dict[str, tuple[str, str]] = {}
-    for node in tree.body:
-        if isinstance(node, ast.ImportFrom):
+    if module_name != __name__:
+        return source
+    begin = source.find(_REGISTRATION_BEGIN)
+    finish = source.find(_REGISTRATION_END)
+    if begin < 0 or finish < begin:
+        raise PreregistrationError("the v2 registration block markers are missing")
+    finish = source.index("\n", finish) + 1
+    return source[:begin] + source[finish:]
+
+
+def _imported_modules(source: str, package: str) -> set[str]:
+    """Every module an import statement anywhere in *source* may load.
+
+    Imports inside function bodies count: a reader imported lazily is as much
+    a part of the instrument as one imported at the top.  ``from x import y``
+    contributes ``x`` and, in case ``y`` is a submodule, ``x.y``.
+    """
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
             relative = "." * node.level + (node.module or "")
             try:
                 base = (importlib.util.resolve_name(relative, package)
                         if node.level else str(node.module))
             except (ImportError, ValueError):
                 continue
-            for alias in node.names:
-                if alias.name != "*":
-                    imports[alias.asname or alias.name] = (base, alias.name)
-            continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names = [node.name]
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            names = [item.id for target in targets for item in ast.walk(target)
-                     if isinstance(item, ast.Name)]
-        else:
-            continue
-        referenced = tuple(sorted({item.id for item in ast.walk(node)
-                                   if isinstance(item, ast.Name)}))
-        segment = _definition_source(source, node)
-        for name in names:
-            definitions.setdefault(name, []).append((segment, referenced))
-    return definitions, imports
+            found.add(base)
+            found.update(f"{base}.{alias.name}" for alias in node.names
+                         if alias.name != "*")
+    return found
 
 
-@lru_cache(maxsize=None)
-def _module_index(module_name: str):
-    module = importlib.import_module(module_name)
-    source = Path(str(module.__file__)).read_text(encoding="utf-8")
-    package = module.__package__ or module_name.rpartition(".")[0]
-    return _index_source(module_name, source, package)
+def _module_source(module_name: str) -> tuple[str, str] | None:
+    """Return (source, package) for a pure-Python module, else ``None``."""
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ImportError, ValueError, AttributeError):
+        return None
+    if spec is None or not spec.origin or not str(spec.origin).endswith(".py"):
+        return None
+    package = (module_name if spec.submodule_search_locations is not None
+               else module_name.rpartition(".")[0])
+    return Path(spec.origin).read_text(encoding="utf-8"), package
 
 
-def _code_closure(roots: Sequence[tuple[str, str]], *,
-                  packages: Sequence[str], index: Any,
-                  ) -> dict[tuple[str, str], list[str]]:
-    """Return the source digests of every definition the roots reach.
+def _module_closure(roots: Sequence[str], *, packages: Sequence[str],
+                    read: Any) -> dict[str, str]:
+    """Return the exact source of every module the roots can import.
 
-    The walk follows module-level names and ``from`` imports inside
-    ``packages``.  It is deliberately name-based and over-inclusive: a local
-    variable that shares a module-level name pulls that definition in too,
-    which can only make the identity stricter.  Attribute access through an
-    imported module object is not followed.
+    The walk follows every import statement, at any depth in a module, that
+    stays inside ``packages``, and adds each package's ``__init__`` on the
+    way.  It hashes whole modules on purpose: a module-level statement, a
+    constant mutated at import time or a lazily imported reader can change a
+    measurement as surely as a function body can (review of D1-01).
     """
-    entries: dict[tuple[str, str], list[str]] = {}
-    seen: set[tuple[str, str]] = set()
-    queue = [(str(module), str(name)) for module, name in roots]
+    sources: dict[str, str] = {}
+    queue = list(roots)
     while queue:
-        module_name, name = queue.pop()
-        if (module_name, name) in seen:
+        name = queue.pop()
+        if name in sources or name.split(".")[0] not in packages:
             continue
-        seen.add((module_name, name))
-        if module_name.split(".")[0] not in packages:
+        found = read(name)
+        if found is None:
             continue
-        definitions, imports = index(module_name)
-        if name in definitions:
-            digests = []
-            for segment, referenced in definitions[name]:
-                digests.append(hashlib.sha256(segment.encode("utf-8")).hexdigest())
-                queue.extend((module_name, item) for item in referenced
-                             if item in definitions or item in imports)
-            entries[(module_name, name)] = digests
-        elif name in imports:
-            target = imports[name]
-            entries[(module_name, name)] = [f"import:{target[0]}:{target[1]}"]
-            queue.append(target)
-        else:
-            entries[(module_name, name)] = ["unresolved"]
-    return entries
+        source, package = found
+        sources[name] = _registration_free_source(name, source)
+        parts = name.split(".")
+        queue.extend(".".join(parts[:end]) for end in range(1, len(parts)))
+        queue.extend(_imported_modules(source, package))
+    return sources
 
 
-def instrument_identity(*, index: Any = None) -> dict[str, Any]:
+def instrument_identity(*, read: Any = None) -> dict[str, Any]:
     """Return the identity of the running measurement instrument.
 
-    One digest per module over the source of every definition reached from
-    :data:`_INSTRUMENT_ROOTS`, and one digest over those.  Editing code the
-    instrument does not reach leaves it unchanged; editing anything it does
-    reach, in any of these modules, changes it.
+    One sha256 per module over its exact source (this module's registration
+    block excepted) for every module in :func:`_module_closure` of
+    :data:`_INSTRUMENT_ROOT_MODULES`, and one digest over those.  Any edit to
+    any of those modules, even a comment, changes it.  A v2 decision is
+    therefore made from a checkout of the registration commit (see
+    docs/preregistered-hypotheses.md); the running tree is not expected to
+    keep matching as the repository moves on.
     """
-    entries = _code_closure(_INSTRUMENT_ROOTS, packages=_INSTRUMENT_PACKAGES,
-                            index=index or _module_index)
-    components: dict[str, str] = {}
-    for module in sorted({module for module, _name in entries}):
-        items = sorted([name, entries[(owner, name)]]
-                       for owner, name in entries if owner == module)
-        components[module] = hashlib.sha256(_canonical_bytes(items)).hexdigest()
+    sources = _module_closure(_INSTRUMENT_ROOT_MODULES,
+                              packages=_INSTRUMENT_PACKAGES,
+                              read=read or _module_source)
+    components = {name: hashlib.sha256(sources[name].encode("utf-8")).hexdigest()
+                  for name in sorted(sources)}
     return {"schema": INSTRUMENT_IDENTITY_SCHEMA,
-            "roots": [f"{module}:{name}" for module, name in _INSTRUMENT_ROOTS],
-            "definitions": len(entries), "components": components,
+            "roots": list(_INSTRUMENT_ROOT_MODULES),
+            "modules": len(components), "components": components,
             "digest": hashlib.sha256(_canonical_bytes(components)).hexdigest()}
 
 
@@ -1010,9 +1103,10 @@ def look_outcome_v2(metric: Mapping[str, Any], *, alpha: float,
 
     The hurdle is the round-trip cost, applied to a one-sided confidence
     bound of the executable control-adjusted delta rather than to its point
-    estimate.  Only registered-tier controls are in ``metric`` (the
-    instrument leaves other candidates unmatched), so there is no tier gate
-    and futility is decided on the same statistics as a pass.
+    estimate, and the candidate's own return less that cost must clear the
+    same critical value.  Only registered-tier controls are in ``metric``
+    (the instrument leaves other candidates unmatched), so there is no tier
+    gate; an underpowered look is inconclusive before either rule is read.
     """
     summary = _summary_v2(metric)
     candidates = summary["candidate_count"] or 0
@@ -1036,7 +1130,12 @@ def look_outcome_v2(metric: Mapping[str, Any], *, alpha: float,
               "delta_upper_bound_bps": mean + critical * error,
               "cr1_p_above_cost": student_t_sf(t_cost, df),
               "cr1_p_below_cost": student_t_sf(-t_cost, df)}
-    if detail["cr1_p_above_cost"] < level and float(flip_p) < level:
+    candidate_t = summary.get("candidate_after_cost_cluster_t_stat")
+    detail["candidate_after_cost_clears"] = (
+        candidate_t is not None and math.isfinite(float(candidate_t)) and
+        float(candidate_t) > critical)
+    if (detail["cr1_p_above_cost"] < level and float(flip_p) < level and
+            detail["candidate_after_cost_clears"]):
         return {**detail, "outcome": "pass",
                 "reason": "lower_bound_clears_round_trip_cost"}
     if detail["cr1_p_below_cost"] < level:
@@ -1047,11 +1146,17 @@ def look_outcome_v2(metric: Mapping[str, Any], *, alpha: float,
 
 # --- v2: evaluation ---------------------------------------------------------
 
+def _utc_now() -> datetime:
+    """The wall clock an evaluation instant may not exceed."""
+    return datetime.now(timezone.utc)
+
+
 def _evaluate_v2(bars: Sequence[Any], manifest: Mapping[str, Any], *,
                  decision_eligible: bool, eligibility_reasons: Sequence[str],
                  provenance: Mapping[str, Any] | None,
                  look_records: Sequence[Mapping[str, Any]] | None,
-                 as_of: datetime, policy: Any = None) -> dict[str, Any]:
+                 as_of: datetime, policy: Any = None,
+                 refused_because: Sequence[str] = ()) -> dict[str, Any]:
     """Evaluate a v2 hypothesis; see :func:`evaluate`.
 
     The manifest is passed in rather than looked up so that this function,
@@ -1066,6 +1171,11 @@ def _evaluate_v2(bars: Sequence[Any], manifest: Mapping[str, Any], *,
     spec = manifest["subject"]["rule_spec"]
     mirror = next(item for item in manifest["secondary_descriptive"]
                   if item["name"] == "mirror")
+    universe = {str(symbol).upper()
+                for symbol in manifest["session_definition"]["universe"]}
+    received = len(bars)
+    bars = [bar for bar in bars
+            if str(getattr(bar, "symbol", "")).upper() in universe]
     quality = v2_session_quality(bars, manifest["session_definition"],
                                  first=boundary, as_of=as_of)
     sessions = [date.fromisoformat(item) for item in quality["complete_sessions"]]
@@ -1073,9 +1183,11 @@ def _evaluate_v2(bars: Sequence[Any], manifest: Mapping[str, Any], *,
     sealed = [bar for bar in bars if _session_of(bar) in counted]
     current = instrument_identity()
     registered = manifest["instrument_identity"]["digest"]
-    refusals: list[str] = []
+    refusals: list[str] = list(refused_because)
     if current["digest"] != registered:
         refusals.append("instrument_digest_mismatch")
+    if as_of.astimezone(timezone.utc) > _utc_now():
+        refusals.append("as_of_in_future")
     if look_records is None:
         refusals.append("look_record_store_missing")
     if decision_eligible:
@@ -1091,101 +1203,112 @@ def _evaluate_v2(bars: Sequence[Any], manifest: Mapping[str, Any], *,
             control_tiers=endpoint["control_tiers"], delta_hurdle_bps=cost,
             cost_hurdle_bps=cost)
 
+    # Nothing measured on sealed sessions is reported before a look is
+    # decided and recorded (the manifest's disclosure rule).
     interim: dict[str, Any] = {"sessions": len(sessions),
-                               "decision": "none_before_first_look"}
-    if sealed:
-        subject = measure(sealed, spec, endpoint["outcome_anchor"],
-                          (minutes, SECONDARY_HORIZON_MINUTES))
-        interim.update({
-            "primary_60m": _summary_v2(_horizon(subject, minutes)),
-            "subject_120m": _summary_v2(_horizon(
-                subject, SECONDARY_HORIZON_MINUTES)),
-            "skip_one_bar_60m": _summary_v2(_horizon(measure(
-                sealed, spec, endpoint["sensitivity_anchor"], (minutes,)),
-                minutes)),
-            "signal_close_60m": _summary_v2(_horizon(measure(
-                sealed, spec, endpoint["diagnostic_anchor"], (minutes,)),
-                minutes)),
-            "mirror_60m": _summary_v2(_horizon(measure(
-                sealed, mirror["rule_spec"], endpoint["outcome_anchor"],
-                (minutes,)), minutes)),
-        })
+                               "decision": "none_before_first_look",
+                               "statistics": "withheld"}
 
-    recorded: dict[int, Mapping[str, Any]] = {}
+    recorded: dict[int, list[Mapping[str, Any]]] = {}
     for item in look_records or ():
         if (isinstance(item, Mapping) and
                 item.get("hypothesis_id") == manifest["hypothesis_id"]):
-            recorded.setdefault(int(item.get("look", 0)), item)
+            recorded.setdefault(int(item.get("look", 0)), []).append(item)
     looks: list[dict[str, Any]] = []
     new_records: list[dict[str, Any]] = []
     conflicts: list[int] = []
     outcome = "accruing"
+    withheld = False
     for look in manifest["looks"]:
         number, needed = int(look["look"]), int(look["sessions"])
-        prior = recorded.get(number)
+        priors = recorded.get(number, [])
         if outcome != "accruing":
             looks.append({"look": number, "sessions_required": needed,
                           "status": "not_needed_after_terminal_decision"})
             continue
+        if withheld:
+            looks.append({"look": number, "sessions_required": needed,
+                          "status": "blocked_until_earlier_look_is_recorded"})
+            continue
         if len(sessions) < needed:
             entry: dict[str, Any] = {"look": number, "sessions_required": needed,
                                      "status": "not_reached"}
-            if prior is not None:
+            if priors:
                 entry.update({"look_record_status": "conflict",
                               "look_record_mismatch": ["sessions_available"]})
                 conflicts.append(number)
             looks.append(entry)
             continue
         window = sessions[:needed]
+        session_list = [item.isoformat() for item in window]
+        entry = {"look": number, "sessions_required": needed,
+                 "window_first": session_list[0],
+                 "window_last": session_list[-1],
+                 "session_list_digest": content_hash(session_list)}
+        if not decision_eligible or refusals or conflicts:
+            # Neither recordable nor reproducible here: measure nothing.
+            entry.update({"status": "withheld", "look_record_status": "not_recorded"})
+            looks.append(entry)
+            withheld = True
+            continue
         window_set = set(window)
         subset = [bar for bar in sealed if _session_of(bar) in window_set]
         result = look_outcome_v2(
             _horizon(measure(subset, spec, endpoint["outcome_anchor"],
                              (minutes,)), minutes),
             alpha=float(look["alpha_one_sided"]), cost_bps=cost)
-        session_list = [item.isoformat() for item in window]
         record = {
             "schema": LOOK_RECORD_SCHEMA,
             "hypothesis_id": manifest["hypothesis_id"],
             "manifest_hash": manifest["manifest_hash"],
             "look": number, "sessions_required": needed,
             "session_list": session_list,
-            "session_list_digest": content_hash(session_list),
+            "session_list_digest": entry["session_list_digest"],
             "instrument_digest": current["digest"],
             "result": result, "result_digest": content_hash(result),
         }
-        entry = {"look": number, "sessions_required": needed,
-                 "window_first": session_list[0],
-                 "window_last": session_list[-1],
-                 "status": "evaluated", **result,
-                 "session_list_digest": record["session_list_digest"],
-                 "skip_one_bar_60m": _summary_v2(_horizon(measure(
-                     subset, spec, endpoint["sensitivity_anchor"], (minutes,)),
-                     minutes)),
-                 "signal_close_60m": _summary_v2(_horizon(measure(
-                     subset, spec, endpoint["diagnostic_anchor"], (minutes,)),
-                     minutes))}
-        if prior is not None:
+        if priors:
+            prior = priors[0]
             mismatch = [field for field in (
                 "manifest_hash", "session_list_digest", "instrument_digest",
                 "result_digest") if prior.get(field) != record[field]]
-            decided = str((prior.get("result") or {}).get("outcome") or "")
+            try:
+                intact = content_hash(prior.get("result")) == prior.get("result_digest")
+            except (TypeError, ValueError):
+                intact = False
+            if not intact:
+                mismatch.append("recorded_result_does_not_match_its_digest")
+            if len(priors) > 1:
+                mismatch.append("duplicate_look_record")
             entry.update({"look_record_status": (
                               "conflict" if mismatch else "reproduced"),
-                          "look_record_mismatch": mismatch,
-                          "recorded_outcome": decided})
-            if mismatch:
-                conflicts.append(number)
+                          "look_record_mismatch": mismatch})
         else:
-            decided = result["outcome"]
-            if decision_eligible and not refusals and not conflicts:
-                entry["look_record_status"] = "recorded_now"
-                new_records.append(record)
-            else:
-                entry["look_record_status"] = "not_recorded"
+            mismatch = []
+            entry["look_record_status"] = "recorded_now"
+            new_records.append(record)
+        if mismatch:
+            conflicts.append(number)
+            entry["status"] = "withheld"
+            looks.append(entry)
+            withheld = True
+            continue
+        # Recorded now or reproduced exactly: the recomputed result is the
+        # recorded one, so it is the decision and may be reported.
+        entry.update({
+            "status": "evaluated", **result,
+            "skip_one_bar_60m": _summary_v2(_horizon(measure(
+                subset, spec, endpoint["sensitivity_anchor"], (minutes,)),
+                minutes)),
+            "signal_close_60m": _summary_v2(_horizon(measure(
+                subset, spec, endpoint["diagnostic_anchor"], (minutes,)),
+                minutes)),
+            "mirror_60m": _summary_v2(_horizon(measure(
+                subset, mirror["rule_spec"], endpoint["outcome_anchor"],
+                (minutes,)), minutes))})
         looks.append(entry)
-        if decided in {"pass", "futility"}:
-            outcome = decided
+        if result["outcome"] in {"pass", "futility"}:
+            outcome = result["outcome"]
         elif number == manifest["looks"][-1]["look"]:
             outcome = "not_established"
 
@@ -1217,13 +1340,14 @@ def _evaluate_v2(bars: Sequence[Any], manifest: Mapping[str, Any], *,
         "session_quality": {key: quality[key] for key in (
             "excluded_counts", "excluded_sessions")},
         "sealed_sessions": [item.isoformat() for item in sessions],
+        "bars_outside_universe": received - len(bars),
         "excluded_bars": len(bars) - len(sealed),
         "interim": interim,
         "looks": looks,
         "look_records_to_append": new_records,
         "look_record_conflicts": conflicts,
         "decision": decision,
-        "rule_outcome_if_eligible": outcome,
+        "rule_outcome_if_eligible": "withheld" if withheld else outcome,
         "provenance": dict(provenance or {}),
     }
 
@@ -1251,12 +1375,17 @@ def evaluate(bars: Sequence[Any], *,
     """
     manifest = preregistration(hypothesis_id)
     if manifest["schema"] == PREREGISTRATION_SCHEMA_V2:
-        moment = as_of if as_of is not None else datetime.now(timezone.utc)
+        moment = as_of if as_of is not None else _utc_now()
+        # The manifest is built by code in this module; its hash is pinned
+        # in the registration block so an edited rule cannot decide a look.
+        pinned = V2_MANIFEST_HASHES.get(hypothesis_id)
         return _evaluate_v2(
             bars, manifest, decision_eligible=decision_eligible,
             eligibility_reasons=eligibility_reasons, provenance=provenance,
             look_records=look_records, as_of=moment,
-            policy=None if decision_eligible else diagnostic_backfill_policy())
+            policy=None if decision_eligible else diagnostic_backfill_policy(),
+            refused_because=(() if manifest["manifest_hash"] == pinned
+                             else ("manifest_hash_mismatch",)))
     boundary = date.fromisoformat(manifest["sealed_window"]["sessions_after"])
     spec = manifest["subject"]["rule_spec"]
     mirror = next(item for item in manifest["secondary_descriptive"]
@@ -1357,12 +1486,12 @@ def _load(path: Path, manifest: Mapping[str, Any]) -> tuple[list[Any], bool, lis
 
 
 def v2_registration_literals() -> str:
-    """Return the v2 registration literals for the code that is running now.
+    """Return the body of the v2 registration block for the running tree.
 
-    The output is Python source to paste: the instrument block for this
-    module, then the pins for ``tests/research/test_preregistered_v2.py``.
-    The manifest hashes are those the manifests will have once the printed
-    instrument literals are in place.  Print it with::
+    It is Python source: the dates as they stand, then the instrument
+    identity of the running code and the manifest hashes the manifests have
+    with that identity in place.  The instrument does not read the block, so
+    one pass is enough.  Print it with::
 
         python -B -c "from research.preregistered import v2_registration_literals as f; print(f())"
     """
@@ -1376,17 +1505,17 @@ def v2_registration_literals() -> str:
                   for hypothesis in V2_HYPOTHESES}
     finally:
         module["V2_INSTRUMENT_COMPONENTS"], module["V2_INSTRUMENT_DIGEST"] = saved
-    lines = ["# research/preregistered.py (registration block)",
+    lines = [f'V2_LAST_EXAMINED_SESSION = "{V2_LAST_EXAMINED_SESSION}"',
+             f'V2_REGISTERED_ON = "{V2_REGISTERED_ON}"',
+             f'V2_SEALED_FROM = "{V2_SEALED_FROM}"',
              "V2_INSTRUMENT_COMPONENTS: dict[str, str] = {"]
     for name, digest in identity["components"].items():
         lines += [f'    "{name}":', f'        "{digest}",']
-    lines += ["}", "V2_INSTRUMENT_DIGEST = (", f'    "{identity["digest"]}")', "",
-              "# tests/research/test_preregistered_v2.py",
-              "V2_VWAP_MANIFEST_HASH = (",
-              f'    "{hashes[VWAP_REVERSION_HYPOTHESIS_V2]}")',
-              "V2_ORF_MANIFEST_HASH = (",
-              f'    "{hashes[OPENING_RANGE_FADE_HYPOTHESIS_V2]}")',
-              "V2_INSTRUMENT_DIGEST = (", f'    "{identity["digest"]}")']
+    lines += ["}", "V2_INSTRUMENT_DIGEST = (", f'    "{identity["digest"]}")',
+              "V2_MANIFEST_HASHES: dict[str, str] = {"]
+    for hypothesis, digest in hashes.items():
+        lines += [f'    "{hypothesis}":', f'        "{digest}",']
+    lines.append("}")
     return "\n".join(lines)
 
 
@@ -1417,9 +1546,13 @@ def _evaluate_with_look_record(path: Path, bars: Sequence[Any], *,
     """Evaluate under an exclusive lock and append any newly decided looks.
 
     The lock spans read, evaluation and append, so two concurrent runs cannot
-    both decide the same look.  Records are only ever appended.
+    both decide the same look.  Records are only ever appended.  A final line
+    without its newline is the remains of an append that crashed before it
+    was acknowledged; it is dropped under the lock (deciding that look again
+    is deterministic) rather than left to make every later run fail.
     """
     import fcntl
+    import io
     import os
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1427,7 +1560,14 @@ def _evaluate_with_look_record(path: Path, bars: Sequence[Any], *,
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
         try:
             stream.seek(0)
-            records = read_look_records(stream)
+            content = stream.read()
+            dropped = bool(content) and not content.endswith("\n")
+            if dropped:
+                content = content[:content.rfind("\n") + 1]
+                stream.truncate(len(content.encode("utf-8")))
+                stream.flush()
+                os.fsync(stream.fileno())
+            records = read_look_records(io.StringIO(content))
             report = evaluate(bars, hypothesis_id=hypothesis_id,
                               decision_eligible=decision_eligible,
                               eligibility_reasons=eligibility_reasons,
@@ -1443,6 +1583,8 @@ def _evaluate_with_look_record(path: Path, bars: Sequence[Any], *,
                 os.fsync(stream.fileno())
         finally:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    if dropped:
+        report["look_record_unterminated_line_dropped"] = True
     return report
 
 
