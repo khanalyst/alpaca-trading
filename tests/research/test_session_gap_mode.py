@@ -143,19 +143,40 @@ class SessionGapReplayTests(unittest.TestCase):
         self.assertFalse(_traded(_outcome(TOLERANT, drop=(0,))))
 
 
+class SignalQualityParityTests(unittest.TestCase):
+    """Review of A-08: the opt-in must reach every sampler, not only the factory."""
+
+    def test_signal_quality_and_controls_honour_the_opt_in(self):
+        from research.signal_quality import _ControlPolicy, _first_event
+        bars = _read_discovery_rows(_rows(drop=(5,)))[1]
+        strict, strict_reason = _first_event(bars, STRICT, allow_backfill=False)
+        tolerant, _reason = _first_event(bars, TOLERANT, allow_backfill=False)
+        self.assertIsNone(strict, strict_reason)
+        self.assertIsNotNone(tolerant)
+        # Bar 40 (the flush) is list index 39 once bar 5 is missing.
+        self.assertIsNone(_ControlPolicy(STRICT).admissible(bars, 39))
+        self.assertIsNotNone(_ControlPolicy(TOLERANT).admissible(bars, 39))
+
+
 class PrefixGapReportTests(unittest.TestCase):
     def test_counts_the_minutes_a_strict_prefix_rule_loses(self):
         report = prefix_gap_report({"AAA": _rows(drop=(5,)), "BBB": _rows(),
                                     "CCC": _rows(drop=(0,))})
         aaa, bbb, ccc = (report["symbols"][name] for name in ("AAA", "BBB", "CCC"))
+        observed = len(_CLOSES) - 1
         self.assertEqual((aaa["sessions"], aaa["sessions_with_gap"],
                           aaa["median_first_gap_minute"]), (1, 1, 5))
-        self.assertAlmostEqual(aaa["strict_prefix_minutes_lost_share"],
-                               (len(_CLOSES) - 6) / (len(_CLOSES) - 1))
+        lost = (len(_CLOSES) - 6) / observed
+        self.assertAlmostEqual(aaa["strict_prefix_minutes_lost_share"], lost)
+        self.assertAlmostEqual(aaa["opening_anchored_minutes_lost_share"], lost)
         self.assertEqual(bbb["sessions_complete"], 1)
         self.assertEqual(bbb["strict_prefix_minutes_lost_share"], 0.0)
+        # A missing 09:30 bar costs the opening families the whole session;
+        # a session VWAP rule still has an unbroken prefix from its first bar.
         self.assertEqual(ccc["sessions_missing_open"], 1)
-        self.assertEqual(ccc["median_first_gap_minute"], 0)
+        self.assertEqual(ccc["sessions_with_gap"], 0)
+        self.assertEqual(ccc["strict_prefix_minutes_lost_share"], 0.0)
+        self.assertEqual(ccc["opening_anchored_minutes_lost_share"], 1.0)
         self.assertEqual(report["universe"]["sessions"], 3)
 
 

@@ -1245,7 +1245,10 @@ def _thesis_deadline_conflict(spec: Mapping[str, Any], *,
     deadline = SESSION_MINUTES - int(minutes)
     after = int(spec.get("entry_after_minutes", 0))
     before = int(spec.get("entry_before_minutes", SESSION_MINUTES))
-    if deadline <= after:
+    # The earliest entry is the open of the bar after a signal on minute
+    # ``after``, i.e. minute ``after + 1``; a deadline there or earlier can
+    # never hold a position.
+    if deadline <= after + 1:
         return THESIS_DEADLINE_BEFORE_ENTRY_WINDOW
     if require_full_window and deadline < before + int(spec["max_hold_bars"]) + 1:
         return THESIS_DEADLINE_INSIDE_ENTRY_HORIZON

@@ -233,5 +233,41 @@ class FrozenCohortErrataTests(unittest.TestCase):
             self.assertIn("9 / 0.30 = 30 bps", correction["statement"])
 
 
+
+class BetaContextRefusalTests(unittest.TestCase):
+    """Review of A-09: a beta arm without prior sessions is a context refusal."""
+
+    def test_factory_reports_missing_beta_history_not_a_quiet_rule(self):
+        from collections import Counter
+        from datetime import timedelta
+        from research.costs import ReplayPolicy
+        from research.factory_core import simulate_account
+        from research.market_data import normalize_underlying_bar
+
+        market = harness.synthetic_market()
+        bars = []
+        for symbol in ("SPY", "QQQ"):
+            for row in market[symbol]:
+                end = row["timestamp"] + timedelta(minutes=1)
+                bars.append(normalize_underlying_bar({
+                    **row, "timestamp": row["timestamp"].isoformat(),
+                    "provider": "alpaca", "source_mode": "forward_observed",
+                    "as_of": end.isoformat(), "observed_at": end.isoformat(),
+                    "session_date": row["timestamp"].astimezone(
+                        harness.NY).date().isoformat()}))
+        bars.sort(key=lambda bar: (bar.timestamp, bar.symbol))
+        spec = next(family["arms"][0]["rule_spec"]
+                    for family in mechanism_cohort()["families"]
+                    if family["name"] == "cross_sectional_residual")
+        rows = simulate_account(bars, [], spec, vehicle="equity", account_id="beta",
+                                policy=ReplayPolicy(strict_market_data=False))["rows"]
+        reasons = Counter(row.get("no_signal_reason") for row in rows
+                          if row.get("symbol") == "QQQ" and
+                          row.get("prefix_status") == "valid_prefix_no_signal")
+        self.assertTrue(reasons)
+        self.assertNotIn("rule_not_triggered", reasons)
+        self.assertEqual(set(reasons), {"residual_beta_unavailable"})
+
+
 if __name__ == "__main__":
     unittest.main()

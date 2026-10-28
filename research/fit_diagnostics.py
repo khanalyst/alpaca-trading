@@ -23,7 +23,8 @@ from agent.contracts.rule import (
     RULE_SCHEMA_V7,
     cross_sectional_symbol_eligibility,
     evaluate_rule_signal_metadata,
-    evaluate_rule_signal_trace, feature_window_bars, rule_variant_id,
+    continuity_window_bars, evaluate_rule_signal_trace, feature_window_bars,
+    rule_variant_id,
     validate_rule_spec, SESSION_MINUTES,
 )
 from .costs import (STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
@@ -726,6 +727,8 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
             grouped.setdefault((day, symbol), []).append(row)
     needed = causal_maturity_bars(spec)
     feature_window = feature_window_bars(spec)
+    # The gap-free span (A-08 opt-in), as in research/factory_core.py.
+    continuity = continuity_window_bars(spec)
     total_prefixes = eligible_prefixes = mature_prefixes = 0
     first_signals: list[dict[str, Any]] = []
     eligible_sessions = 0
@@ -798,7 +801,9 @@ def _fit_prefixes(bars: Sequence[Any], spec: Mapping[str, Any], *,
                 cell_status[reason] += 1
                 continue
             decision_timestamp = max([signal_end, *available])
-            if not _contiguous(rows, feature_start, index + 1):
+            if not _contiguous(rows, (0 if continuity is None else
+                                      max(0, index + 1 - int(continuity))),
+                               index + 1):
                 prefix_status["feature_gap"] += 1
                 cell_status["feature_gap"] += 1
                 continue

@@ -199,6 +199,17 @@ class A06DefaultsTests(unittest.TestCase):
         self.assertEqual((legacy.range_minutes, legacy.close_confirmed,
                           legacy.range_stop, legacy.max_spread_bps),
                          (30, False, False, float("inf")))
+    def test_contract_defaults_are_part_of_the_identity_only_when_used(self):
+        # Review of A-06: an unvalidated config that omits admission keys now
+        # replays with the contract defaults; that must show in its identity.
+        _cfg, bare = _effective_ibr_config({}, {}, vehicle="equity")
+        self.assertEqual(bare["replay"]["runtime_admission_defaults"],
+                         {"max_spread_bps": 25.0, "min_relative_volume": 1.0,
+                          "stale_minutes": 0.5})
+        _cfg, shipped = _effective_ibr_config(golden.shipped_config(), {},
+                                              vehicle="equity")
+        self.assertNotIn("runtime_admission_defaults", shipped["replay"])
+
 
 
 class A07HoldGapTests(unittest.TestCase):
@@ -254,6 +265,40 @@ class A07HoldGapTests(unittest.TestCase):
                                   config=replay_config(hold_across_gaps=True))
         self.assertEqual(carried_flat.trades[0].canonical_exit_reason,
                          "session_force_flat")
+
+    def test_a_late_gap_under_hold_across_gaps_is_a_discontinuity(self):
+        # Review: with 15:30-15:49 missing and the force-flat bar not yet
+        # visible, the opted-in hold exits on the 15:29 bar.  That is a data
+        # discontinuity, not a session flatten.
+        from dataclasses import replace as dc_replace
+        from datetime import datetime as dt
+        from research.edge_discovery_core import _effective_ibr_config
+        from research.ibr import replay_ibr
+        from research.market_data import normalize_quote, normalize_underlying_bar
+        from tests.research import ibr_golden_support as golden
+
+        cfg, _ = _effective_ibr_config(golden.shipped_config(), {},
+                                       vehicle="equity", close_confirmed=True)
+        flat = cfg.policy.force_flat_time.hour * 60 + cfg.policy.force_flat_time.minute
+        labels = []
+        for symbol in golden.SYMBOLS:
+            for day in golden.DATES:
+                rows = []
+                for row in golden.session_rows(symbol, day):
+                    local = dt.fromisoformat(row["timestamp"]).astimezone(golden.NEW_YORK)
+                    if not flat - 20 <= local.hour * 60 + local.minute < flat:
+                        rows.append(row)
+                quotes = [normalize_quote(q) for q in golden.quote_rows(symbol, day)]
+                bars = [normalize_underlying_bar(row) for row in rows]
+                out = replay_ibr(bars, config=dc_replace(cfg, hold_across_gaps=True),
+                                 quotes=quotes)
+                for trade in out.trades:
+                    local = trade.exit_timestamp.astimezone(golden.NEW_YORK)
+                    if (trade.exit_reason == "force_flat" and
+                            local.hour * 60 + local.minute < flat - 20 + 1):
+                        labels.append(trade.canonical_exit_reason)
+        self.assertTrue(labels, "the fixture must hold a trade into the late gap")
+        self.assertEqual(set(labels), {"data_discontinuity"})
 
 
 def same_clock_corpus(*, current_volume: float = 3_000.0,

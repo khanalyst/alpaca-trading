@@ -636,6 +636,17 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
     effective["replay"] = {"close_confirmed": cfg.close_confirmed,
                             "range_stop": cfg.range_stop,
                             "runtime_admission_filters": "mapped"}
+    # Review of A-06: an admission key the strategy omitted now replays with
+    # the contract default rather than the old permissive fallback.  Record
+    # each such value in the identity, so a candidate built from an
+    # unvalidated config cannot replay differently under an unchanged
+    # identity.  A validated config supplies these keys, so it adds nothing.
+    from .ibr import LEGACY_REPLAY_DEFAULTS
+    defaulted = {name: value for name, value in admission.items()
+                 if name not in strategy and name in LEGACY_REPLAY_DEFAULTS and
+                 value != LEGACY_REPLAY_DEFAULTS[name]}
+    if defaulted:
+        effective["replay"]["runtime_admission_defaults"] = dict(sorted(defaulted.items()))
     # Persist the selected model at the top level (the effective replay
     # economics) while retaining the complete normalized schedule.  The
     # latter belongs to candidate identity: changing an option-only override

@@ -1536,11 +1536,17 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     # calendar close.  That is a data discontinuity, not a session flatten;
     # the compatibility ``exit_reason`` stays ``force_flat``, as the factory
     # replay keeps ``time``, and only the canonical cause changes.
-    hold_end = hold[-1].end
+    # Judge the bar the trade actually exits on.  It is the hold's last bar
+    # in the default replay; with ``hold_across_gaps`` the hold can run past
+    # a late gap to a force-flat bar that is not yet visible, and the exit
+    # then falls back to the last visible bar before the gap, which is a
+    # discontinuity too (it is not re-priced at force-flat: that bar's open
+    # is not known at that instant).
+    hold_end = last.end
     hold_cut_short = bool(
         boundary is None and hold_end < close_at and
-        not (hold[-1].session_close is not None and
-             hold_end >= hold[-1].session_close))
+        not (last.session_close is not None and
+             hold_end >= last.session_close))
     if vehicle == "option":
         # Option liquidation is always priced from the selected contract's
         # latest visible bid, including the force-flat boundary path.

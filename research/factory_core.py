@@ -598,7 +598,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             last_cross_metadata = dict(trace.get("market_context") or {})
             if signal is None:
                 reason = str((trace.get("stages") or [{}])[-1].get("reason") or "")
-                if reason.startswith(("benchmark_context_", "subject_context_")):
+                # A beta-adjusted residual without enough prior sessions (A-09)
+                # is missing context too, not a predicate that never fired.
+                if reason.startswith(("benchmark_context_", "subject_context_",
+                                      "residual_beta_unavailable")):
                     cross_context_refusals += 1
                     last_cross_reason = reason
                 else:

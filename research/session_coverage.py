@@ -20,7 +20,7 @@ from statistics import median
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
-SESSION_COVERAGE_SCHEMA = "session-prefix-coverage.v1"
+SESSION_COVERAGE_SCHEMA = "session-prefix-coverage.v2"
 _NEW_YORK = ZoneInfo("America/New_York")
 _OPEN = time(9, 30)
 
@@ -53,46 +53,56 @@ def _session_offsets(rows: Iterable[Any]) -> dict[Any, set[int]]:
 
 def _summarize(per_session: list[dict[str, Any]]) -> dict[str, Any]:
     observed = sum(item["observed_minutes"] for item in per_session)
-    lost = sum(item["strict_lost_minutes"] for item in per_session)
-    gaps = [item["first_gap_minute"] for item in per_session
-            if item["first_gap_minute"] is not None]
+    gaps = [item["first_internal_gap_minute"] for item in per_session
+            if item["first_internal_gap_minute"] is not None]
+
+    def share(key: str) -> float | None:
+        return (sum(item[key] for item in per_session) / observed) if observed else None
+
     return {
         "sessions": len(per_session),
         "sessions_complete": sum(1 for item in per_session
-                                 if item["first_gap_minute"] is None),
+                                 if item["open_present"] and
+                                 item["first_internal_gap_minute"] is None),
         "sessions_missing_open": sum(1 for item in per_session
                                      if not item["open_present"]),
         "sessions_with_gap": len(gaps),
         "median_first_gap_minute": median(gaps) if gaps else None,
-        # Share of observed session minutes at or after the first missing
-        # minute: where a strict-prefix session-anchored rule cannot signal.
-        "strict_prefix_minutes_lost_share": (lost / observed) if observed else None,
+        # Share of observed minutes a strict-prefix rule cannot signal on.
+        # Session VWAP families need adjacency from the session's first bar,
+        # so they lose the minutes from the first gap *after* it; opening
+        # range and opening drive need the 09:30 bar as well, so a missing
+        # open costs them the whole session.
+        "strict_prefix_minutes_lost_share": share("vwap_lost_minutes"),
+        "opening_anchored_minutes_lost_share": share("opening_lost_minutes"),
     }
 
 
 def prefix_gap_report(rows_by_symbol: Mapping[str, Iterable[Any]]) -> dict[str, Any]:
     """Per-symbol and universe coverage of the gap-free session prefix.
 
-    A session's span runs from 09:30 to its last observed minute, so an early
-    close or a quiet final minute is not counted as a gap.  ``first_gap_minute``
-    is the earliest missing minute inside that span (0 means the 09:30 bar is
-    missing); every observed minute at or after it is lost to a strict-prefix
-    rule.
+    A session's span runs from its first to its last observed minute, so an
+    early close or a quiet final minute is not counted as a gap.
+    ``first_gap_minute`` is the earliest missing minute inside that span; a
+    missing 09:30 bar is reported separately (``sessions_missing_open``).
     """
     symbols: dict[str, Any] = {}
     every: list[dict[str, Any]] = []
     for symbol in sorted(rows_by_symbol):
         per_session = []
         for _day, offsets in sorted(_session_offsets(rows_by_symbol[symbol]).items()):
-            span = max(offsets) + 1
-            missing = sorted(set(range(span)) - offsets)
-            first_gap = missing[0] if missing else None
+            first, last = min(offsets), max(offsets)
+            missing = sorted(set(range(first, last + 1)) - offsets)
+            internal = missing[0] if missing else None
+            opening = 0 if first > 0 else internal
             per_session.append({
-                "open_present": 0 in offsets,
+                "open_present": first == 0,
                 "observed_minutes": len(offsets),
-                "first_gap_minute": first_gap,
-                "strict_lost_minutes": 0 if first_gap is None else
-                sum(1 for offset in offsets if offset >= first_gap),
+                "first_internal_gap_minute": internal,
+                "vwap_lost_minutes": 0 if internal is None else
+                sum(1 for offset in offsets if offset >= internal),
+                "opening_lost_minutes": 0 if opening is None else
+                sum(1 for offset in offsets if offset >= opening),
             })
         symbols[str(symbol)] = _summarize(per_session)
         every.extend(per_session)

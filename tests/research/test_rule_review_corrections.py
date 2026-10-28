@@ -460,6 +460,18 @@ class ThesisDeadlineGuardTests(unittest.TestCase):
         self.assertIsNone(thesis_deadline_conflict(
             accepted, require_full_window=True))
 
+    def test_a_deadline_at_the_first_possible_entry_is_unreachable(self):
+        # Review: a signal on minute 30 enters at minute 31, so a deadline at
+        # minute 31 (exit_before 359) can never hold a position either.
+        spec = {"schema": RULE_SCHEMA_V7, "family": "momentum_continuation",
+                "entry_after_minutes": 30, "entry_before_minutes": 300,
+                "exit_before_minutes": 359, "max_hold_bars": 15,
+                "signal_event": "first_cross"}
+        with self.assertRaisesRegex(RuleSpecError, "minutes before the 16:00"):
+            validate_rule_spec(spec)
+        validate_rule_spec({**spec, "exit_before_minutes": 358,
+                            "entry_before_minutes": 31, "max_hold_bars": 1})
+
 
 class TrendPullbackConfirmationTests(unittest.TestCase):
     """A-14: the trend confirmation repeats the trend_pullback predicate."""

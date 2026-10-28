@@ -20,7 +20,8 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, entry_window_bounds, evaluate_rule_signal,
-    evaluate_rule_signal_trace, feature_window_bars, rule_variant_id,
+    continuity_window_bars, evaluate_rule_signal_trace, feature_window_bars,
+    rule_variant_id,
     cross_sectional_symbol_eligibility,
     session_minutes, validate_rule_spec,
 )
@@ -495,6 +496,9 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
                  ) -> tuple[dict[str, Any] | None, str | None]:
     """Return the first causal signal/entry pair for one symbol-session."""
     window = feature_window_bars(spec)
+    # The gap-free span; it differs from ``window`` only under the opt-in V7
+    # session_gap_mode (A-08), exactly as in research/factory_core.py.
+    continuity = continuity_window_bars(spec)
     minimum_prefix = causal_maturity_bars(spec)
     context_reason: str | None = None
     status_counts: Counter[str] = Counter()
@@ -532,7 +536,8 @@ def _first_event(rows: Sequence[Any], spec: Mapping[str, Any], *,
             continue
         feature_start = 0 if window is None else max(0, index + 1 - int(window))
         feature_rows = rows[feature_start:index + 1]
-        if not _contiguous(rows, feature_start, index + 1):
+        if not _contiguous(rows, (0 if continuity is None else
+                                  max(0, index + 1 - int(continuity))), index + 1):
             status_counts["feature_gap"] += 1
             continue
         signal_end = _bar_end(rows[index])
@@ -664,7 +669,7 @@ class _ControlPolicy:
     of the predicate.
     """
 
-    __slots__ = ("minimum_prefix", "window", "after", "before")
+    __slots__ = ("minimum_prefix", "window", "continuity", "after", "before")
 
     def __init__(self, spec: Mapping[str, Any]) -> None:
         # ``feature_window_bars`` is the executable rule's dependency
@@ -674,6 +679,7 @@ class _ControlPolicy:
         # Session-anchored families return ``None`` because their input is the
         # complete session prefix rather than a bounded trailing window.
         self.window = feature_window_bars(spec)
+        self.continuity = continuity_window_bars(spec)
         self.minimum_prefix = _mature_prefix(spec, self.window)
         self.after, self.before = entry_window_bounds(spec)
 
@@ -684,9 +690,9 @@ class _ControlPolicy:
         # with a shorter prefix would silently change the rule being measured.
         if index + 1 < self.minimum_prefix:
             return None
-        feature_start = (0 if self.window is None
-                         else max(0, index + 1 - int(self.window)))
-        if not _contiguous(rows, feature_start, index + 1):
+        continuity_start = (0 if self.continuity is None
+                            else max(0, index + 1 - int(self.continuity)))
+        if not _contiguous(rows, continuity_start, index + 1):
             return None
         stamp = _timestamp(rows[index])
         if stamp is None:
