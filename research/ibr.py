@@ -1109,6 +1109,14 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     if (cfg.policy.latest_entry_time is not None and
             _local(entry_at, zone).time() > cfg.policy.latest_entry_time):
         return refuse("past_latest_entry_time")
+    if (cfg.policy.force_flat_time is not None and
+            _local(entry_at, zone).time() > cfg.policy.force_flat_time):
+        # E1-11: on an early close the close-relative latest entry (12:55)
+        # falls after force-flat (12:50).  Account simulation and live shadow
+        # already refuse such an entry; this replay used to book a position
+        # the session flatten closed at once.  An entry exactly at force-flat
+        # keeps the runtime's force-flat outcome, as the live gate does.
+        return refuse("entry_at_or_after_force_flat")
     # The hold window begins at the first full bar whose timestamp is not
     # earlier than the causal entry instant.  A delayed signal therefore does
     # not read the already-open next bar's high/low/close as if it were known.

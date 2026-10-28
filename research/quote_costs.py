@@ -1207,7 +1207,7 @@ def measured_cost_resolver(schedule: Mapping[str, Any], *,
                            expected_feed: str | None = None,
                            expected_provider: str | None = None,
                            coverage_policy: str = "strict",
-                           stop_trigger_slippage_ticks: float = DEFAULT_STOP_TRIGGER_SLIPPAGE_TICKS,
+                           stop_trigger_slippage_ticks: float = 0.0,
                            tick_size: float = TICK_SIZE):
     """Return the causal per-opportunity schedule resolver.
 
@@ -1217,9 +1217,12 @@ def measured_cost_resolver(schedule: Mapping[str, Any], *,
     measured arms without changing the authored rule or sizing policy.
 
     An exit leg whose ``exit_reason`` is ``stop`` is a triggered stop-market
-    order: it pays ``stop_trigger_slippage_ticks`` ticks at the leg's
-    reference price on top of the measured half spread and depth impact.
-    Passing ``0`` reproduces the earlier measured pricing.
+    order.  With ``stop_trigger_slippage_ticks`` above zero (review finding
+    E1-05, opt-in; ``DEFAULT_STOP_TRIGGER_SLIPPAGE_TICKS`` is the suggested
+    value) it pays that many ticks at the leg's reference price on top of the
+    measured half spread and depth impact, named in the provenance.  The
+    default of ``0`` is ``measured_quote_v1`` exactly as it was, so measured
+    evidence and its gate binding are unchanged unless a run opts in.
     """
     ticks = _number(stop_trigger_slippage_ticks)
     tick = _number(tick_size)

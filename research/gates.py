@@ -870,6 +870,9 @@ def _cost_model_binding_report(
         fee_bps = authority.get("fee_bps")
         if not isinstance(schedule, Mapping) or fee_bps is None:
             return False
+        leg = binding.get("leg")
+        if leg not in {"entry", "exit"}:
+            return False
         try:
             from .quote_costs import cost_model_from_schedule
             origin = str(binding.get("origin") or "")
@@ -877,8 +880,7 @@ def _cost_model_binding_report(
             bucket = None
             if origin.startswith("symbol_bucket:"):
                 _prefix, _symbol, bucket = origin.split(":", 2)
-            model = cost_model_from_schedule(
-                schedule,
+            rebuild = dict(
                 symbol=(str(symbol) if symbol not in (None, "") else None),
                 bucket=bucket,
                 percentile=str(authority.get("percentile")),
@@ -891,10 +893,22 @@ def _cost_model_binding_report(
                 expected_provider=str(authority.get("provider")),
                 coverage_policy=str(authority.get("coverage_policy")),
             )
+            model = cost_model_from_schedule(schedule, **rebuild)
+            marker = ":stop-trigger-"
+            provenance = str(binding.get("provenance") or "")
+            if marker in provenance:
+                # An opted-in stop-trigger charge (E1-05) on a stop exit.  The
+                # schedule fixes everything else, so the declared extra is the
+                # leg's slippage above the rebuilt base.  It can only raise the
+                # cost, it must agree with the suffix the resolver wrote, and
+                # only an exit leg can carry it.
+                extra = float(binding["slippage_bps"]) - model.slippage_bps
+                if (leg != "exit" or not extra > 0 or
+                        f"{extra:.4f}" != provenance.rsplit(marker, 1)[1]):
+                    return False
+                model = cost_model_from_schedule(
+                    schedule, **rebuild, stop_trigger_slippage_bps=extra)
         except (CostError, TypeError, ValueError, OverflowError):
-            return False
-        leg = binding.get("leg")
-        if leg not in {"entry", "exit"}:
             return False
         expected_provenance = model.provenance
         return (
@@ -2282,7 +2296,27 @@ def _stress_row_inputs(row: Mapping[str, Any], index: int, *, vehicle: str,
                 model.option_fee_per_contract_side
     return {"net": net, "base_cost": base_cost,
             "notional": abs(entry) * abs(quantity) * abs(multiplier),
-            "option_fees": option_fees}
+            "option_fees": option_fees, "entry_price": abs(entry)}
+
+
+def _code_owned_round_trip_floor(row: Mapping[str, Any], *, vehicle: str,
+                                 entry_price: float) -> float | None:
+    """The least expected round trip a relative stress may assume for a row.
+
+    A declared round trip is evidence written by the producer, so the gate
+    never lets it fall below the repository's own expectation: the
+    ``per_symbol_v2`` round trip at the row's entry price for a listed ETF,
+    else one tick of that price.  Options carry no floor (they cannot produce
+    authorizing evidence in this deployment), so their declared value stands.
+    """
+    if vehicle != "equity" or not entry_price > 0:
+        return None
+    from .costs import PerSymbolCostModel, TICK_SIZE
+    try:
+        return float(PerSymbolCostModel().round_trip(
+            str(row.get("symbol") or ""), entry_price)["total_bps"])
+    except CostError:
+        return TICK_SIZE / entry_price * 10_000.0
 
 
 def _stress_risk_inputs(risk_report: Mapping | None) -> tuple[CostModel, dict]:
@@ -2409,10 +2443,12 @@ def relative_cost_stress_report(partitions: Mapping[str, Iterable[Mapping]], *,
     executed held-out or sealed-qualification row is charged
     ``max(recorded round trip, multiple * expected round trip)``: the stress
     never drops below what the row already paid.  The expected round trip
-    (complete round trip, fees included, in bps of entry notional) comes from
-    the row's own ``expected_round_trip_bps`` (the cost model's output in the
-    evidence) or else from ``expected_round_trip_bps`` here, keyed by symbol
-    or one scalar.  The veto requires a positive one-sided lower confidence
+    (complete round trip, fees included, in bps of entry notional) is the
+    largest of the row's own ``expected_round_trip_bps`` (the cost model's
+    output in the evidence), ``expected_round_trip_bps`` here (keyed by symbol
+    or one scalar) and the code-owned floor of
+    :func:`_code_owned_round_trip_floor`, so neither a row nor a caller can
+    declare the stress away.  The veto requires a positive one-sided lower confidence
     bound of the mean stressed P&L per trade from the same seeded moving-block
     session bootstrap as the paired test; a positive sum is not enough.
     Returns ``None`` when neither source supplies a round trip, so the caller
@@ -2442,32 +2478,34 @@ def relative_cost_stress_report(partitions: Mapping[str, Iterable[Mapping]], *,
     clusters: list[str] = []
     used_bps: list[float] = []
     missing: list[str] = []
-    sources = {"row": 0, "symbol": 0, "scalar": 0}
+    sources = {"row": 0, "symbol": 0, "scalar": 0, "floor": 0}
     counts = {str(name): 0 for name in partitions}
     for index, (partition, row) in enumerate(selected):
         counts[partition] += 1
         opportunity_id = str(row.get("opportunity_id", index))
         inputs = _stress_row_inputs(row, index, vehicle=vehicle, model=model,
                                     base_by_id=base_by_id)
-        bps = None
+        declared: list[tuple[float, str]] = []
         if row.get("expected_round_trip_bps") is not None:
             try:
-                bps = _normalized_expected_round_trip(
-                    row.get("expected_round_trip_bps"))
-                source = "row"
-            except ValueError:
-                bps = None
-        elif isinstance(expected, Mapping):
+                declared.append((float(_normalized_expected_round_trip(
+                    row.get("expected_round_trip_bps"))), "row"))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(expected, Mapping):
             symbol = (row.get("underlying_symbol") if vehicle == "option" else None) \
                 or row.get("symbol") or row.get("underlying_symbol")
-            bps = expected.get(str(symbol)) if symbol is not None else None
-            source = "symbol"
+            if symbol is not None and expected.get(str(symbol)) is not None:
+                declared.append((float(expected[str(symbol)]), "symbol"))
         elif expected is not None:
-            bps = float(expected)
-            source = "scalar"
-        if inputs is None or bps is None:
+            declared.append((float(expected), "scalar"))
+        if inputs is None or not declared:
             missing.append(opportunity_id)
             continue
+        floor = _code_owned_round_trip_floor(
+            row, vehicle=vehicle, entry_price=inputs["entry_price"])
+        candidates = declared + ([(floor, "floor")] if floor is not None else [])
+        bps, source = max(candidates, key=lambda item: item[0])
         sources[source] += 1
         expected_cost = inputs["notional"] * float(bps) / 10_000.0
         stressed_cost = max(inputs["base_cost"], float(multiple) * expected_cost)

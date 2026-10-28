@@ -294,8 +294,8 @@ class CostStressTests(unittest.TestCase):
 
     def test_relative_veto_admits_a_realistic_edge_the_25bps_veto_rejects(self):
         envelope = verified_gate_envelope(
-            **self._realistic(), expected_round_trip_bps={"SPY": .5, "QQQ": .5,
-                                                          "IWM": 1.0, "DIA": 1.0})
+            **self._realistic(), expected_round_trip_bps={"SPY": 3.0, "QQQ": 3.0,
+                                                          "IWM": 4.0, "DIA": 4.0})
         stress = envelope["cost_stress"]
         self.assertEqual(stress["veto"], "relative_expected_round_trip")
         self.assertTrue(envelope["checks"]["cost_stress_adequate"])
@@ -312,8 +312,29 @@ class CostStressTests(unittest.TestCase):
         self.assertTrue(verify_gate_envelope(envelope))
         # The declared round trip is part of the verified evidence.
         tampered = copy.deepcopy(envelope)
-        tampered["cost_stress"]["relative_veto"]["expected_round_trip_bps"]["SPY"] = .1
+        tampered["cost_stress"]["relative_veto"]["expected_round_trip_bps"]["SPY"] = 40.0
         self.assertFalse(verify_gate_envelope(_rehash(tampered)))
+
+    def test_a_declared_round_trip_cannot_fall_below_the_code_owned_floor(self):
+        # Review of D2-01: a producer (row or caller) declaring a near-zero
+        # round trip used to reduce the veto to "lower bound of net P&L > 0".
+        # Every row is floored at the per_symbol_v2 round trip at its price.
+        from research.costs import PerSymbolCostModel
+        tiny = verified_gate_envelope(
+            **self._realistic(), expected_round_trip_bps=1e-9)
+        relative = tiny["cost_stress"]["relative_veto"]
+        self.assertEqual(relative["expected_round_trip_sources"]["floor"], 240)
+        floor = PerSymbolCostModel().round_trip("SPY", 100.0)["total_bps"]
+        self.assertGreater(relative["mean_expected_round_trip_bps"], floor * .9)
+        self.assertTrue(verify_gate_envelope(tiny))
+        # A row cannot override a larger caller value either.
+        overridden = verified_gate_envelope(
+            **self._realistic(arm_extra={"held": {"expected_round_trip_bps": 1e-9},
+                                         "qual": {"expected_round_trip_bps": 1e-9}}),
+            expected_round_trip_bps=50.0)
+        relative = overridden["cost_stress"]["relative_veto"]
+        self.assertEqual(relative["expected_round_trip_sources"]["scalar"], 240)
+        self.assertFalse(overridden["checks"]["cost_stress_adequate"])
 
     def test_relative_veto_charges_a_multiple_of_the_round_trip_above_cost(self):
         # A 10 bps expected round trip stressed twice (20 bps, 20 USD) is
@@ -348,7 +369,7 @@ class CostStressTests(unittest.TestCase):
         self.assertFalse(envelope["checks"]["cost_stress_adequate"])
 
     def test_row_level_round_trip_from_the_cost_model_activates_the_veto(self):
-        round_trip = {"expected_round_trip_bps": 1.0}
+        round_trip = {"expected_round_trip_bps": 3.0}
         envelope = verified_gate_envelope(
             **self._realistic(arm_extra={"held": round_trip}))
         relative = envelope["cost_stress"]["relative_veto"]

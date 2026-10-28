@@ -567,13 +567,13 @@ def replay_policy_for_session(
         latest = min(latest, policy.latest_entry_time)
     # The entry cut-off is close-relative but the force-flat time can be
     # earlier: on a 13:00 early close the shipped offsets give a 12:55 latest
-    # entry against a 12:50 force-flat.  Never let the latest entry fall after
-    # the force-flat time.  The clamp stops at the force-flat time rather than
-    # one bar before it: account simulation already refuses an entry whose
-    # entry bar ends after force-flat (``entry_bar_after_exit_deadline``), and
-    # an event exactly at force-flat must keep the runtime's force-flat
-    # refusal reason (``tests/research/test_ibr_runtime_parity.py``).
-    latest = min(latest, force)
+    # entry against a 12:50 force-flat (review finding E1-11).  The policy
+    # keeps both values, because every lane's refusal *reason* is pinned to
+    # them: account simulation refuses an entry at or after force-flat
+    # (``entry_at_or_after_force_flat``), live shadow reports the force-flat
+    # cutoff, and the IBR replay refuses an entry after force-flat
+    # (research/ibr.py).  Clamping the latest entry here instead relabelled
+    # those refusals as entry-cutoff or no-signal outcomes.
     return replace(policy, force_flat_time=force, latest_entry_time=latest)
 
 

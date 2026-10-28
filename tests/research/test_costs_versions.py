@@ -520,10 +520,61 @@ class CalibrationTests(unittest.TestCase):
 class MeasuredModeTests(unittest.TestCase):
     """E1-05 (stop-trigger slippage) and E1-10 (sessions, regular hours)."""
 
-    def test_a_measured_stop_leg_pays_trigger_slippage(self):
+    def test_measured_v1_stop_legs_are_unchanged_by_default(self):
         schedule = measure_quote_costs(_session_quotes(sessions=6),
                                        min_quotes_per_cell=50)
-        resolver = measured_cost_resolver(schedule)
+        stop = measured_cost_resolver(schedule)(
+            {"symbol": "SPY", "cost_leg": "exit", "quantity": 10,
+             "cost_timestamp": "2026-01-05T14:40:00+00:00",
+             "exit_reference": 100.0, "exit_reason": "stop"})
+        self.assertEqual(stop.slippage_bps, 0.0)
+        self.assertNotIn("stop-trigger", stop.provenance)
+
+    def test_an_opted_in_stop_trigger_binds_at_the_gate(self):
+        from research.gates import _cost_model_binding_report
+        schedule = measure_quote_costs(_session_quotes(sessions=6),
+                                       min_quotes_per_cell=50)
+        authority = {"percentile": "p75", "depth_percentile": "p25",
+                     "max_impact_half_spreads": 4.0, "feed": "iex",
+                     "provider": "alpaca", "coverage_policy": "strict"}
+        context = {"symbol": "SPY", "quantity": 10, "exit_reference": 100.37,
+                   "cost_timestamp": "2026-01-05T14:40:00+00:00"}
+
+        def report(ticks, reason, tamper=None):
+            resolver = measured_cost_resolver(
+                schedule, expected_feed="iex", expected_provider="alpaca",
+                stop_trigger_slippage_ticks=ticks)
+            entry = resolver({**context, "cost_leg": "entry",
+                              "cost_timestamp": "2026-01-05T14:35:00+00:00"})
+            exit_ = resolver({**context, "cost_leg": "exit", "exit_reason": reason})
+            row = {"symbol": "SPY", "quantity": 10, "opportunity_id": "x",
+                   "entry_timestamp": "2026-01-05T14:35:00+00:00",
+                   "exit_timestamp": "2026-01-05T14:40:00+00:00"}
+            for leg, model in (("entry", entry), ("exit", exit_)):
+                row.update({f"{leg}_cost_model_provenance": model.provenance,
+                            f"{leg}_cost_model_spread_bps": model.spread_bps,
+                            f"{leg}_cost_model_slippage_bps": model.slippage_bps,
+                            f"{leg}_cost_model_fee_bps": model.fee_bps,
+                            f"{leg}_feed": "iex", f"{leg}_provider": "alpaca"})
+            if tamper:
+                row.update(tamper(row))
+            return _cost_model_binding_report(
+                {"heldout": [row]}, vehicle="equity",
+                authority={**authority, "schedule": schedule,
+                           "fee_bps": entry.fee_bps})["valid"]
+
+        for ticks in (0, 1, 2.5):
+            for reason in ("time", "stop", "target"):
+                self.assertTrue(report(ticks, reason), (ticks, reason))
+        # A suffix that disagrees with the charged slippage does not bind.
+        self.assertFalse(report(1, "stop", lambda row: {
+            "exit_cost_model_slippage_bps":
+                row["exit_cost_model_slippage_bps"] + 0.5}))
+
+    def test_a_measured_stop_leg_pays_trigger_slippage_when_opted_in(self):
+        schedule = measure_quote_costs(_session_quotes(sessions=6),
+                                       min_quotes_per_cell=50)
+        resolver = measured_cost_resolver(schedule, stop_trigger_slippage_ticks=1)
         context = {"symbol": "SPY", "cost_leg": "exit", "quantity": 10,
                    "cost_timestamp": "2026-01-05T14:40:00+00:00",
                    "exit_reference": 100.0}
@@ -616,7 +667,11 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(rows[0]["cost_coverage_leg"], "entry")
         self.assertIn("under-covered", rows[0]["cost_coverage_detail"])
 
-    def test_early_close_latest_entry_never_follows_force_flat(self):
+    def test_early_close_policy_keeps_both_cutoffs(self):
+        # E1-11 is closed where an entry is admitted (account simulation, live
+        # shadow and now the IBR replay refuse an entry after force-flat), not
+        # by rewriting the policy: every lane's refusal reason reads both
+        # values (tests/research/test_shadow_deadlines.py).
         policy = ReplayPolicy.from_config({
             "strategy": {"latest_entry_time": "15:00"},
             "session": {"require_exact_calendar": True,
@@ -626,9 +681,7 @@ class ReplayTests(unittest.TestCase):
             policy, session_open=datetime(2026, 11, 27, 9, 30, tzinfo=NEW_YORK),
             session_close=datetime(2026, 11, 27, 13, 0, tzinfo=NEW_YORK))
         self.assertEqual(early.force_flat_time, time(12, 50))
-        # Was 12:55.  Account simulation also refuses an entry whose bar ends
-        # after force-flat, so the last admissible one-minute entry is 12:49.
-        self.assertEqual(early.latest_entry_time, time(12, 50))
+        self.assertEqual(early.latest_entry_time, time(12, 55))
         normal = replay_policy_for_session(
             policy, session_open=datetime(2026, 10, 14, 9, 30, tzinfo=NEW_YORK),
             session_close=datetime(2026, 10, 14, 16, 0, tzinfo=NEW_YORK))
