@@ -13,10 +13,10 @@ it does not override it.
 
 | hypothesis | status |
 | --- | --- |
-| `vwap-reversion-control-adjusted.v1` | **compromised** (review finding D1-01); superseded by v2 on 2026-10-27 |
-| `opening-range-fade-control-adjusted.v1` | **compromised** (review finding D1-01); superseded by v2 on 2026-10-27 |
-| `vwap-reversion-control-adjusted.v2` | registered 2026-10-27, sealed from 2026-10-27, accruing |
-| `opening-range-fade-control-adjusted.v2` | registered 2026-10-27, sealed from 2026-10-27, accruing |
+| `vwap-reversion-control-adjusted.v1` | **compromised** (review finding D1-01); superseded by v2 on 2026-10-28 |
+| `opening-range-fade-control-adjusted.v1` | **compromised** (review finding D1-01); superseded by v2 on 2026-10-28 |
+| `vwap-reversion-control-adjusted.v2` | registered 2026-10-28, sealed from 2026-10-29, accruing |
+| `opening-range-fade-control-adjusted.v2` | registered 2026-10-28, sealed from 2026-10-29, accruing |
 
 Why v1 is compromised. A manifest hash freezes the manifest's text and
 nothing else. For the VWAP hypothesis, committed at 21:27:48 UTC on
@@ -157,7 +157,7 @@ Each hypothesis spends its own alpha and is reported separately.
 
 ## `vwap-reversion-control-adjusted.v2` and `opening-range-fade-control-adjusted.v2`
 
-Registered 2026-10-27; the window starts at the first full session after
+Registered 2026-10-28; the window starts at the first full session after
 the registration was published. Same frozen subjects and mirrors as v1. The
 registration date, the first sealed session, the last examined session and
 the instrument digest are one block of literals at the top of
@@ -165,8 +165,8 @@ the instrument digest are one block of literals at the top of
 instrument literals and the manifest hashes for the running tree.
 Manifest hashes, pinned by `tests/research/test_preregistered_v2.py`:
 
-- VWAP: `c18b38c580f256ea60e860eda700841e73c2e622b4a628cb76d6856d36b4f0f5`
-- ORF: `20a86ca6c05c7f26c56343b015960f2463fab8ffd18c3df185cee0e8122851bd`
+- VWAP: `65e38c51d4502632b054577c53905a66331d3eb7f5509441c1d63e95ec3bf23c`
+- ORF: `bc0ee3aa6802e6cc58c831621089d9c496965e6d1b3fe73eccd948972a72ae83`
 
 **Claim.** Entering at the open of the bar after the frozen rule fires is
 followed over the next 60 minutes by a return, in the rule's direction, that
@@ -175,8 +175,8 @@ round-trip cost, as a one-sided lower confidence bound.
 
 | item | fixed value |
 | --- | --- |
-| sealed window | complete sessions on or after **2026-10-27**; every session up to 2026-10-23 had been examined |
-| instrument | digest `4b7075f72e6c9097e784b7248edfc3210028cb824b9f675d19931bdd8b0df36d` of the running code (below) |
+| sealed window | complete sessions on or after **2026-10-29**; every session up to 2026-10-23 had been examined |
+| instrument | digest `a809497f623a21e04159dc0db20e6f3e1009dd78827e30308416d831e21b88da` of the running code (below) |
 | primary endpoint | 60-minute control-adjusted return from the **next bar's open**, horizon fixed on the wall clock |
 | sensitivity | the same from the open one bar later (one-bar skip), reported, never decisive |
 | diagnostic | the v1-style signal-close anchored figure on the same clock, reported only |

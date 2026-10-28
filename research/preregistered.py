@@ -174,13 +174,13 @@ _INSTRUMENT_PACKAGES = ("research", "agent")
 # been examined, never change anything here to make a test pass: register a
 # new version instead.  Every test and manifest reads these constants.
 V2_LAST_EXAMINED_SESSION = "2026-10-23"
-V2_REGISTERED_ON = "2026-10-27"
-V2_SEALED_FROM = "2026-10-27"
+V2_REGISTERED_ON = "2026-10-28"
+V2_SEALED_FROM = "2026-10-29"
 V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
     "agent.contracts.market_context":
         "fd6c1459b0d17d0d284d43d1b85d8a2561a5808b5efd647981b2ed36aa60589f",
     "agent.contracts.rule":
-        "5df2046cb4639070288411fbbe5abf763d2cc6bdf57837cfaea59893d18542b0",
+        "911d8bf3804557cd522bb0a13668d81cc00484c217460fc6162b60e4972e1df4",
     "agent.instruments":
         "13b3926e7f2bdcd92302ff6ca84153832ecde7a0e3e47028fe76ffde6eebb8f2",
     "research.edge_ledger_store":
@@ -197,7 +197,7 @@ V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
         "c990b10d4044a587bdc309b90c722b4f3f1daecfc40a0f8af382be8e845e4906",
 }
 V2_INSTRUMENT_DIGEST = (
-    "4b7075f72e6c9097e784b7248edfc3210028cb824b9f675d19931bdd8b0df36d")
+    "a809497f623a21e04159dc0db20e6f3e1009dd78827e30308416d831e21b88da")
 # === end of v2 registration literals =========================================
 
 
