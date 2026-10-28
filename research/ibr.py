@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 import math
+from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -20,7 +21,13 @@ from agent.contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
     quantize_equity_bracket,
 )
-from agent.contracts.ibr import atr_series, close_breaks_range
+from agent.contracts.ibr import IBRConfig as ContractIBRConfig
+from agent.contracts.ibr import (
+    DEFAULT_RELATIVE_VOLUME_SESSIONS, RELATIVE_VOLUME_MODES,
+    RELATIVE_VOLUME_OPENING_RANGE_MEAN, RELATIVE_VOLUME_SAME_CLOCK,
+    RELATIVE_VOLUME_SESSIONS_BOUNDS, close_breaks_range,
+    same_clock_prior_row, same_clock_relative_volume, wilder_atr_series,
+)
 from agent.contracts.rule import canonical_exit_reason
 from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS,
                                   MIN_STOP_DISTANCE_FRACTION)
@@ -45,47 +52,204 @@ class ReplayError(ValueError):
     """Raised for malformed or look-ahead-prone replay input."""
 
 
+# The research replay's historical defaults, under an explicit name.  They
+# describe a different strategy from the runtime contract
+# (``agent.contracts.ibr.IBRConfig``): a 30-minute range, a wick (high/low)
+# breakout with no buffer, a fixed 0.30%/0.60% bracket and none of the
+# runtime admission filters, where the runtime trades a 15-minute range, a
+# close-confirmed break of 5 bps, a range stop, relative volume of at least
+# 1.0 and a 25 bps spread cap.  They stay the bare ``IBRConfig()`` defaults
+# because the research CLI (``research.py``), the existing fixtures and any
+# replay built from ``IBRConfig()`` or ``replay_ibr(config=None)`` depend on
+# them, and changing them in place would silently change those results.
+# Research that means the runtime strategy uses
+# :meth:`IBRConfig.from_runtime_contract`; the live and diagnostic lanes map
+# the mounted configuration through ``_effective_ibr_config``, which takes
+# the contract defaults for any key the configuration omits.
+LEGACY_REPLAY_DEFAULTS: Mapping[str, object] = MappingProxyType({
+    "range_minutes": 30,
+    "session_open": time(9, 30),
+    "force_flat": time(15, 55),
+    "stop_pct": 0.003,
+    "target_pct": 0.006,
+    "target_r": None,
+    "range_stop": False,
+    "breakout_buffer_bps": 0.0,
+    "close_confirmed": False,
+    "min_relative_volume": 0.0,
+    "min_ibr_width_atr": 0.0,
+    "max_ibr_width_atr": float("inf"),
+    "max_ibr_width_pct": float("inf"),
+    "atr_period": 14,
+    "max_entry_extension_r": float("inf"),
+    "stale_minutes": float("inf"),
+    "max_spread_bps": float("inf"),
+})
+
+# The runtime admission filters the replay mirrors, and how a supplied value
+# is converted.  :func:`runtime_admission_fields` resolves them.
+RUNTIME_ADMISSION_FIELDS: Mapping[str, type] = MappingProxyType({
+    "min_relative_volume": float,
+    "min_ibr_width_atr": float,
+    "max_ibr_width_atr": float,
+    "max_ibr_width_pct": float,
+    "atr_period": int,
+    "max_entry_extension_r": float,
+    "stale_minutes": float,
+    "max_spread_bps": float,
+    "relative_volume_mode": str,
+    "relative_volume_sessions": int,
+})
+
+
+def runtime_admission_fields(strategy: Mapping | None) -> dict[str, object]:
+    """Resolve the replay's runtime admission filters from a strategy block.
+
+    A key the block supplies is used as supplied, converted exactly as the
+    replay mapper has always converted it.  A key it omits takes the runtime
+    contract's own default, resolved through
+    ``agent.contracts.ibr.IBRConfig.from_mapping`` (including that method's
+    aliases such as ``max_range_width_pct``), never a permissive replay-only
+    value: an omitted ``max_spread_bps`` is the contract's 25 bps, not
+    infinity, and an omitted ``min_relative_volume`` is 1.0, not 0.0.  A
+    validated runtime config (``agent.config.validate_config``) always
+    supplies every key except ``max_ibr_width_pct`` and the opt-in
+    relative-volume keys, whose contract defaults equal the old replay
+    fallbacks, so for such a config the result is unchanged.
+    """
+    source = strategy if isinstance(strategy, Mapping) else {}
+    if isinstance(source.get("strategy"), Mapping):
+        source = source["strategy"]
+    # Only the absent keys come from the contract, so a supplied value is
+    # never re-validated or re-interpreted on its way through.
+    contract = ContractIBRConfig.from_mapping({
+        key: value for key, value in source.items()
+        if key not in RUNTIME_ADMISSION_FIELDS})
+    return {
+        name: convert(source[name] if name in source else
+                      getattr(contract, name))
+        for name, convert in RUNTIME_ADMISSION_FIELDS.items()
+    }
+
+
 @dataclass(frozen=True)
 class IBRConfig:
-    range_minutes: int = 30
-    session_open: time = time(9, 30)
-    force_flat: time = time(15, 55)
-    stop_pct: float = 0.003
-    target_pct: float = 0.006
+    """Replay parameters for one IBR run.
+
+    The bare defaults are :data:`LEGACY_REPLAY_DEFAULTS`, the historical
+    research harness, not the runtime contract; :meth:`legacy` names that
+    choice explicitly and :meth:`from_runtime_contract` builds the runtime
+    strategy instead.
+
+    Opt-in behaviour, all off by default so existing configurations replay
+    exactly as before:
+
+    * ``relative_volume_mode="same_clock"`` divides the candidate's volume by
+      its same-clock mean over ``relative_volume_sessions`` prior sessions in
+      the replayed corpus (``agent.contracts.ibr.same_clock_relative_volume``)
+      instead of by the opening-range mean volume;
+    * ``hold_across_gaps=True`` carries an open position across missing
+      minutes to the next observed bar, whose open fills a stop or target the
+      gap jumped through, instead of resolving the trade on the last bar
+      before the first missing minute.
+    """
+
+    range_minutes: int = LEGACY_REPLAY_DEFAULTS["range_minutes"]
+    session_open: time = LEGACY_REPLAY_DEFAULTS["session_open"]
+    force_flat: time = LEGACY_REPLAY_DEFAULTS["force_flat"]
+    stop_pct: float = LEGACY_REPLAY_DEFAULTS["stop_pct"]
+    target_pct: float = LEGACY_REPLAY_DEFAULTS["target_pct"]
     # One shared executable-cost model; there are deliberately no per-replay
     # spread/slippage/fee knobs left to drift from the other lanes.
     costs: CostModel = field(default_factory=CostModel)
     timezone: str = "America/New_York"
     quantity: float = 1.0
-    target_r: float | None = None
-    range_stop: bool = False
-    breakout_buffer_bps: float = 0.0
+    target_r: float | None = LEGACY_REPLAY_DEFAULTS["target_r"]
+    range_stop: bool = LEGACY_REPLAY_DEFAULTS["range_stop"]
+    breakout_buffer_bps: float = LEGACY_REPLAY_DEFAULTS["breakout_buffer_bps"]
     # Legacy fixtures use wick breakouts; production parity can require the
     # completed signal close explicitly.  The option is persisted in the
     # config hash so the two interpretations cannot be mixed in one run.
-    close_confirmed: bool = False
+    close_confirmed: bool = LEGACY_REPLAY_DEFAULTS["close_confirmed"]
     # Runtime admission filters, mirrored field-for-field from
-    # ``agent.contracts.ibr.IBRConfig`` and carrying that contract's own
-    # permissive defaults.  Before these existed the replay applied none of
-    # them, so the two lanes shared only three substantive parameters and a
-    # replayed IBR result described a materially different strategy from the
-    # one the runtime would execute.  A caller that supplies the mounted
-    # runtime values now gets the same admission decision in both lanes; a
-    # caller that omits them keeps the historical permissive replay.
-    min_relative_volume: float = 0.0
-    min_ibr_width_atr: float = 0.0
-    max_ibr_width_atr: float = float("inf")
-    max_ibr_width_pct: float = float("inf")
-    atr_period: int = 14
-    max_entry_extension_r: float = float("inf")
-    stale_minutes: float = float("inf")
-    max_spread_bps: float = float("inf")
+    # ``agent.contracts.ibr.IBRConfig``.  Their bare defaults here are the
+    # legacy permissive replay (see ``LEGACY_REPLAY_DEFAULTS``), not the
+    # contract's: a caller that omits them keeps the historical replay.  A
+    # caller that supplies the mounted runtime values, or builds the config
+    # with ``from_runtime_contract``, gets the runtime admission decision.
+    min_relative_volume: float = LEGACY_REPLAY_DEFAULTS["min_relative_volume"]
+    min_ibr_width_atr: float = LEGACY_REPLAY_DEFAULTS["min_ibr_width_atr"]
+    max_ibr_width_atr: float = LEGACY_REPLAY_DEFAULTS["max_ibr_width_atr"]
+    max_ibr_width_pct: float = LEGACY_REPLAY_DEFAULTS["max_ibr_width_pct"]
+    atr_period: int = LEGACY_REPLAY_DEFAULTS["atr_period"]
+    max_entry_extension_r: float = LEGACY_REPLAY_DEFAULTS[
+        "max_entry_extension_r"]
+    stale_minutes: float = LEGACY_REPLAY_DEFAULTS["stale_minutes"]
+    max_spread_bps: float = LEGACY_REPLAY_DEFAULTS["max_spread_bps"]
     # Replay always uses the checked runtime policy.  Diagnostics that need
     # legacy bar fallback must opt out explicitly with
     # ``ReplayPolicy(strict_market_data=False)``.
     policy: ReplayPolicy | Mapping | None = field(default_factory=ReplayPolicy)
+    # Opt-in replay behaviour (see the class docstring).  The defaults keep
+    # the registered behaviour exactly.
+    relative_volume_mode: str = RELATIVE_VOLUME_OPENING_RANGE_MEAN
+    relative_volume_sessions: int = DEFAULT_RELATIVE_VOLUME_SESSIONS
+    hold_across_gaps: bool = False
+
+    @classmethod
+    def legacy(cls, **overrides) -> "IBRConfig":
+        """The historical research harness, named explicitly.
+
+        Identical to ``IBRConfig(**overrides)``; it exists so a caller that
+        wants :data:`LEGACY_REPLAY_DEFAULTS` says so instead of relying on
+        the bare defaults.
+        """
+        return cls(**overrides)
+
+    @classmethod
+    def from_runtime_contract(cls, strategy: Mapping | None = None,
+                              **replay_fields) -> "IBRConfig":
+        """Replay the runtime IBR contract rather than the legacy harness.
+
+        ``strategy`` is a runtime strategy block (or a whole config holding
+        one).  Every key it omits takes the runtime contract's default via
+        ``agent.contracts.ibr.IBRConfig.from_mapping``; the breakout is
+        close-confirmed and the stop is the opposite range boundary, as at
+        runtime.  ``replay_fields`` (``costs``, ``policy``, ``quantity``,
+        ``hold_across_gaps`` and so on) are passed through and win over the
+        contract-derived values.  The entry deadline and the force-flat clock
+        are replay policy, so a caller that needs the runtime's supplies
+        ``policy=ReplayPolicy.from_config(config)``.
+        """
+        source = strategy if isinstance(strategy, Mapping) else {}
+        if isinstance(source.get("strategy"), Mapping):
+            source = source["strategy"]
+        contract = ContractIBRConfig.from_mapping(source)
+        values: dict[str, object] = {
+            "range_minutes": int(contract.range_minutes),
+            "breakout_buffer_bps": float(contract.breakout_buffer_bps),
+            "target_r": float(contract.target_r),
+            "range_stop": True,
+            "close_confirmed": True,
+            **runtime_admission_fields(source),
+        }
+        values.update(replay_fields)
+        return cls(**values)
 
     def __post_init__(self) -> None:
+        if self.relative_volume_mode not in RELATIVE_VOLUME_MODES:
+            raise ReplayError(
+                "relative_volume_mode must be one of "
+                + ", ".join(RELATIVE_VOLUME_MODES))
+        lower, upper = RELATIVE_VOLUME_SESSIONS_BOUNDS
+        sessions = self.relative_volume_sessions
+        if (isinstance(sessions, bool) or not isinstance(sessions, int) or
+                not lower <= sessions <= upper):
+            raise ReplayError(
+                f"relative_volume_sessions must be an integer from {lower} "
+                f"to {upper}")
+        if not isinstance(self.hold_across_gaps, bool):
+            raise ReplayError("hold_across_gaps must be true or false")
         if (isinstance(self.range_minutes, bool)
                 or not isinstance(self.range_minutes, int)
                 or self.range_minutes <= 0):
@@ -416,6 +580,22 @@ def _open_visible(record: object, event_time: datetime,
     )
 
 
+def _same_clock_mapping(bar: UnderlyingBar,
+                        policy: ReplayPolicy) -> dict[str, object] | None:
+    """Project a replay bar into the contract's same-clock input shape.
+
+    Its availability is the replay policy's own, so a bar the policy cannot
+    see never enters a baseline.
+    """
+    available = _available(bar, policy)
+    if available is None:
+        return None
+    return {"timestamp": bar.timestamp, "open": bar.open, "high": bar.high,
+            "low": bar.low, "close": bar.close, "volume": bar.volume,
+            "feed": bar.feed, "provider": bar.provider,
+            "available_at": max(available, bar.end)}
+
+
 def _validate_bars(bars: Sequence[UnderlyingBar], cfg: IBRConfig) -> list[UnderlyingBar]:
     last_by_symbol: dict[str, datetime] = {}
     for bar in bars:
@@ -582,6 +762,7 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      stop_geometry_max_cost_to_risk_ratio: float | None = None,
                      stop_geometry_activation_reason: str | None = None,
                      evidence_records: Sequence[object] = (),
+                     discontinuity: bool = False,
                      ) -> IBRTrade:
     # Listed options are always bought to open in the runtime, including puts
     # used for a short-underlying thesis.  Their P&L is therefore long-option
@@ -676,7 +857,11 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         stop_geometry_max_cost_to_risk_ratio=(
             stop_geometry_max_cost_to_risk_ratio),
         stop_geometry_activation_reason=stop_geometry_activation_reason,
-        canonical_exit_reason=canonical_exit_reason(reason),
+        # ``exit_reason`` stays the compatibility alias (a hold cut short by
+        # missing data still exits through the force-flat path); the durable
+        # cause records the data discontinuity, as the factory replay does.
+        canonical_exit_reason=canonical_exit_reason(
+            reason, discontinuity=discontinuity),
     )
 
 
@@ -684,7 +869,14 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                     cfg: IBRConfig, option_snapshots: Mapping[datetime, OptionSnapshot] | None = None,
                     quotes: Mapping[str, Sequence[QuoteSnapshot]] | None = None,
                     multiplier: int = 1,
-                    refusals: list[IBRRefusal] | None = None) -> IBRTrade | None:
+                    refusals: list[IBRRefusal] | None = None,
+                    prior_sessions: Sequence[Sequence[UnderlyingBar]] | None = None,
+                    ) -> IBRTrade | None:
+    """Replay one symbol/session.
+
+    ``prior_sessions`` (earlier sessions of the same symbol, oldest first) is
+    read only by the opt-in ``relative_volume_mode="same_clock"``.
+    """
     if not bars:
         return None
     zone = ZoneInfo(cfg.timezone)
@@ -778,6 +970,37 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                          if range_bars else 0.0)
     admission_rejects: Counter = Counter()
 
+    def same_clock_relvol(bar: UnderlyingBar) -> float | None:
+        """Same-clock RVOL from the most recent eligible prior sessions.
+
+        Sessions are taken newest first and kept when at least one of their
+        bars passes the contract's own prior-row filter, until the configured
+        number is reached; the contract function then applies its exact
+        clock-minute and volume checks to those sessions.
+        """
+        candidate = _same_clock_mapping(bar, cfg.policy)
+        if candidate is None:
+            return None
+        boundary = candidate["available_at"]
+        feed = str(bar.feed or "").strip().lower().replace("-", "_") or None
+        provider = (str(bar.provider or "").strip().lower().replace("-", "_")
+                    or None)
+        chosen: list[list[dict]] = []
+        for prior in reversed(prior_sessions or ()):
+            rows = [row for row in (_same_clock_mapping(item, cfg.policy)
+                                    for item in prior) if row is not None]
+            if any(same_clock_prior_row(
+                    row, feed=feed, provider=provider, available_by=boundary,
+                    before=day, zone=zone) is not None for row in rows):
+                chosen.append(rows)
+                if len(chosen) == cfg.relative_volume_sessions:
+                    break
+        return same_clock_relative_volume(
+            candidate, [row for rows in chosen for row in rows],
+            sessions=cfg.relative_volume_sessions,
+            session_start=cfg.session_open.strftime("%H:%M"),
+            timezone_name=cfg.timezone, available_by=boundary)
+
     def admitted(index: int, bar: UnderlyingBar) -> bool:
         if width <= 0:
             admission_rejects["nonpositive_range_width"] += 1
@@ -789,7 +1012,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             history = [{"timestamp": b.timestamp, "high": b.high,
                         "low": b.low, "close": b.close}
                        for b in [*range_bars, *post[:index + 1]]]
-            series = atr_series(history, period=cfg.atr_period)
+            series = wilder_atr_series(history, period=cfg.atr_period)
             atr = series[-1] if series else None
             if not atr or atr <= 0:
                 admission_rejects["atr_unavailable"] += 1
@@ -800,7 +1023,17 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             if ratio < cfg.min_ibr_width_atr or ratio > cfg.max_ibr_width_atr:
                 admission_rejects["ibr_width_atr_outside_band"] += 1
                 return False
-        if cfg.min_relative_volume > 0:
+        if cfg.relative_volume_mode == RELATIVE_VOLUME_SAME_CLOCK:
+            # Opt-in.  Mirrors the contract, which refuses a candidate whose
+            # same-clock baseline is unavailable whatever the threshold.
+            relvol = same_clock_relvol(bar)
+            if relvol is None:
+                admission_rejects["same_clock_relative_volume_unavailable"] += 1
+                return False
+            if relvol < cfg.min_relative_volume:
+                admission_rejects["relative_volume_below_limit"] += 1
+                return False
+        elif cfg.min_relative_volume > 0:
             if range_volume_mean <= 0:
                 admission_rejects["relative_volume_unavailable"] += 1
                 return False
@@ -879,9 +1112,17 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     # The hold window begins at the first full bar whose timestamp is not
     # earlier than the causal entry instant.  A delayed signal therefore does
     # not read the already-open next bar's high/low/close as if it were known.
+    # By default (the registered behaviour) it ends at the first missing
+    # minute, and the trade is resolved on the last bar before it.  IEX
+    # prints no bar for a minute without IEX trades, so on a thin ETF that
+    # truncates the hold long before the session flatten; the exit is then
+    # labelled a data discontinuity below.  ``hold_across_gaps`` opts into
+    # carrying the position to the next observed bar instead, as the broker
+    # would: a stop or target the gap jumped through fills at that bar's
+    # open through the ordinary gap-fill path.
     hold = [entry_bar]
     for bar in post[entry_index + 1:]:
-        if bar.timestamp != hold[-1].end:
+        if bar.timestamp != hold[-1].end and not cfg.hold_across_gaps:
             break
         hold.append(bar)
     long_break = (buffer_long(signal) if cfg.close_confirmed else signal.high > high)
@@ -1281,6 +1522,17 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         last = candidates[-1]
         exit_ref, exit_source, exit_feed, exit_provider = boundary_exit(
             last.close, last.end)
+    # The force-flat path also resolves a hold that missing data cut short:
+    # the observed hold ended before the force-flat instant, at a missing
+    # minute or where the observed data stops, rather than at the exact
+    # calendar close.  That is a data discontinuity, not a session flatten;
+    # the compatibility ``exit_reason`` stays ``force_flat``, as the factory
+    # replay keeps ``time``, and only the canonical cause changes.
+    hold_end = hold[-1].end
+    hold_cut_short = bool(
+        boundary is None and hold_end < close_at and
+        not (hold[-1].session_close is not None and
+             hold_end >= hold[-1].session_close))
     if vehicle == "option":
         # Option liquidation is always priced from the selected contract's
         # latest visible bid, including the force-flat boundary path.
@@ -1294,6 +1546,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                             entry_bar=entry_bar, entry_reference=entry_ref,
                             exit_bar=last, exit_reference=exit_ref,
                             reason="force_flat", tie=False, gap=False, cfg=cfg,
+                            discontinuity=hold_cut_short,
                             multiplier=multiplier, stop_price=stop,
                             target_price=target, entry_source=entry_source,
                             entry_timestamp=entry_at,
@@ -1327,6 +1580,10 @@ def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
 
     ``vehicle`` is either ``equity`` or ``option``.  To compare vehicles call
     this function twice; intentionally there is no pooled result API.
+
+    ``config=None`` replays :data:`LEGACY_REPLAY_DEFAULTS`, the historical
+    research harness, not the runtime contract; pass
+    ``IBRConfig.from_runtime_contract(...)`` for the runtime strategy.
     """
     if vehicle not in {"equity", "option"}:
         raise ReplayError("vehicle must be 'equity' or 'option'")
@@ -1398,10 +1655,18 @@ def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
                 reason="source_preflight_failed", detail=detail))
         return result
     bar_fallback_diagnostic = False
+    # Only the opt-in same-clock baseline reads earlier sessions; sessions are
+    # visited oldest first per symbol, so each sees just its predecessors.
+    same_clock = cfg.relative_volume_mode == RELATIVE_VOLUME_SAME_CLOCK
+    earlier_sessions: dict[str, list[list[UnderlyingBar]]] = {}
     for (sym, _), session_bars in sorted(sessions.items(), key=lambda item: item[0]):
+        prior = earlier_sessions.setdefault(sym, [])
         trade = _replay_session(session_bars, vehicle=vehicle, symbol=sym, cfg=cfg,
                                 option_snapshots=option_snapshots,
-                                quotes=quote_index, refusals=result.refusals)
+                                quotes=quote_index, refusals=result.refusals,
+                                prior_sessions=prior if same_clock else None)
+        if same_clock:
+            prior.append(session_bars)
         if trade is not None:
             # A valid quote-backed entry with a broker-resident resting
             # bracket exit is still forward evidence.  Only a non-quote,
@@ -1471,6 +1736,7 @@ def replay_ibr_vehicles(
 
 
 __all__ = [
-    "IBRConfig", "IBRResult", "IBRTrade", "ReplayError", "replay_ibr",
-    "replay_ibr_vehicles",
+    "IBRConfig", "IBRResult", "IBRTrade", "LEGACY_REPLAY_DEFAULTS",
+    "ReplayError", "RUNTIME_ADMISSION_FIELDS", "replay_ibr",
+    "replay_ibr_vehicles", "runtime_admission_fields",
 ]

@@ -25,13 +25,30 @@ def _bar_number(value: Any, key: str) -> float | None:
         return None
 
 
-def atr_series(bars: Iterable[Any], period: int = 14) -> list[Decimal | None]:
+def wilder_atr_decimal_series(bars: Iterable[Any],
+                              period: int = 14) -> list[Decimal | None]:
     """Compute a close-confirmed Wilder ATR for each OHLCV bar.
 
     The value at index *i* uses true ranges through index *i* only (and the
     prior close at *i - 1*).  No future bar is consulted, so attaching the
     result to a production bar cannot introduce look-ahead.  Values before a
     complete ``period`` are ``None`` rather than a partial-window estimate.
+
+    This is the Wilder recursion of
+    ``agent.contracts.ibr.wilder_atr_series`` (simple-mean seed over the
+    first ``period`` true ranges, then ``(ATR * (period - 1) + TR) /
+    period``, no session reset), computed in float and returned as
+    ``Decimal(str(value))``, which converts back to the identical float.  It
+    differs only at the input boundary: it also reads attribute objects such
+    as :class:`Bar`, reads only the full ``high``/``low``/``close`` names,
+    and keeps every row in place rather than skipping non-mappings.
+
+    Caller: :func:`attach_atr`, used by ``MarketData.stock_bars`` to attach
+    ``atr`` at the market boundary.  The IBR contract recomputes the value
+    from the bars it is handed and overwrites it on every row where it has
+    one (``agent.contracts.ibr._bars_with_atr``); the rule families never
+    read it and use their own simple-mean definition
+    (``agent.contracts.rule._atr``).
     """
     period = int(period)
     if period <= 0:
@@ -61,10 +78,17 @@ def atr_series(bars: Iterable[Any], period: int = 14) -> list[Decimal | None]:
     return output
 
 
+# Historical name kept for existing callers; it is the same function object.
+atr_series = wilder_atr_decimal_series
+
+
 def attach_atr(bars: Iterable[Any], period: int = 14) -> list[Any]:
-    """Return bars with a no-lookahead ``atr`` field attached."""
+    """Return bars with a no-lookahead ``atr`` field attached.
+
+    The value is :func:`wilder_atr_decimal_series`.
+    """
     rows = list(bars or ())
-    values = atr_series(rows, period=period)
+    values = wilder_atr_decimal_series(rows, period=period)
     output = []
     for row, atr in zip(rows, values):
         if isinstance(row, Bar):

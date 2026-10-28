@@ -5,6 +5,15 @@ market collection, replay, and unit tests without importing the engine.  A
 bar's timestamp is its *open* timestamp; a one-minute bar is therefore
 eligible only after ``timestamp + 1 minute`` has completed.  All comparisons
 use completed closes, never a wick.
+
+Signal timestamps.  An IBR signal's ``signal_ts`` is the *close* of the
+completed signal bar (its open plus one minute), and it keeps that meaning:
+the setup plan, its idempotency key and the shadow signatures all read it.
+Rule signals (``agent.contracts.rule``) use ``signal_ts`` for the signal
+bar's *open*, so the same field name differs by one bar between the two
+families.  Every IBR signal therefore also carries the unambiguous pair
+``signal_bar_open_ts`` and ``signal_bar_close_ts``; a consumer that compares
+signals across families should read those instead of ``signal_ts``.
 """
 
 from __future__ import annotations
@@ -21,6 +30,20 @@ from .rule import MIN_STOP_DISTANCE_FRACTION
 DEFAULT_IBR_TIMEZONE = "America/New_York"
 DEFAULT_SESSION_START = "09:30"
 DEFAULT_SESSION_END = "09:45"
+
+# Relative-volume baselines.  ``opening_range_mean`` is the registered
+# behaviour: the candidate bar's volume over the mean volume of the opening
+# range minutes.  Intraday volume is U-shaped, so that ratio mostly measures
+# how far the candidate is from the open.  ``same_clock`` is an explicit
+# opt-in that divides by the mean volume of the same clock minute over the
+# exact prior sessions, the time-of-day adjusted baseline the rule family's
+# v6 ``relative_volume_mode="same_clock"`` already uses.
+RELATIVE_VOLUME_OPENING_RANGE_MEAN = "opening_range_mean"
+RELATIVE_VOLUME_SAME_CLOCK = "same_clock"
+RELATIVE_VOLUME_MODES = (RELATIVE_VOLUME_OPENING_RANGE_MEAN,
+                         RELATIVE_VOLUME_SAME_CLOCK)
+DEFAULT_RELATIVE_VOLUME_SESSIONS = 5
+RELATIVE_VOLUME_SESSIONS_BOUNDS = (5, 20)
 
 
 def _dt(value, tz: ZoneInfo = ZoneInfo(DEFAULT_IBR_TIMEZONE)) -> datetime | None:
@@ -214,12 +237,37 @@ def close_breaks_range(close: float, boundary: float, breakout_buffer_bps: float
     return close > boundary + buffer if direction == "long" else close < boundary - buffer
 
 
-def atr_series(bars: Iterable[Mapping], period: int = 14) -> list[float | None]:
+def wilder_atr_series(bars: Iterable[Mapping],
+                      period: int = 14) -> list[float | None]:
     """Return Wilder ATR values using each bar and its prior close only.
 
     ATR is intentionally computed here as a strategy input rather than read
     from a model response.  The first value appears only after ``period``
     complete bars; a signal bar therefore cannot borrow a future close.
+
+    Definition (pinned by ``tests/research/test_ibr_review_gaps.py``):
+
+    * true range ``TR_i = max(H_i - L_i, |H_i - C_{i-1}|, |L_i - C_{i-1}|)``,
+      and ``H_0 - L_0`` for the first row, which has no prior close;
+    * the first value, at index ``period - 1``, is the simple mean of the
+      first ``period`` true ranges;
+    * every later value is Wilder's recursion
+      ``ATR_i = (ATR_{i-1} * (period - 1) + TR_i) / period``;
+    * a malformed row contributes a NaN true range, so no value is emitted
+      until ``period`` finite true ranges follow it, after which the
+      recursion resumes from the last emitted value;
+    * there is no session reset: rows from several sessions seed across the
+      overnight gap.  Non-mapping rows are skipped entirely.
+
+    Callers: ``generate_ibr_signal`` (through ``_bars_with_atr``, which
+    overwrites the ``atr`` the market boundary attached on every row where
+    it computes a value of its own),
+    ``evaluate_ibr_breakout`` (its ``history`` fallback) and the research
+    replay's width/ATR admission in ``research.ibr``.  The same recursion,
+    returned as ``Decimal``, is ``agent.market.wilder_atr_decimal_series``.
+    The rule families use a different definition, the simple mean of the
+    last ``period`` true ranges (``agent.contracts.rule._atr``), so an
+    ``atr_period`` of 14 does not mean the same average in the two families.
     """
     period = int(period)
     if period <= 0:
@@ -247,9 +295,13 @@ def atr_series(bars: Iterable[Mapping], period: int = 14) -> list[float | None]:
     return values
 
 
+# Historical name kept for existing callers; it is the same function object.
+atr_series = wilder_atr_series
+
+
 def _bars_with_atr(rows: Iterable[Mapping], period: int = 14) -> list[dict]:
     source = [dict(row) for row in (rows or ()) if isinstance(row, Mapping)]
-    values = atr_series(source, period=period)
+    values = wilder_atr_series(source, period=period)
     for row, atr in zip(source, values):
         if atr is not None:
             row["atr"] = atr
@@ -267,7 +319,20 @@ def _parse_clock(value: str, fallback: time) -> time:
 
 @dataclass(frozen=True)
 class IBRConfig:
-    """IBR parameters; values may also be supplied in a strategy mapping."""
+    """IBR parameters; values may also be supplied in a strategy mapping.
+
+    These defaults are the runtime contract.  The research replay's bare
+    ``research.ibr.IBRConfig()`` defaults describe a different, legacy
+    harness (a 30-minute wick breakout with a fixed 30/60 bps bracket and no
+    admission filters); research callers that mean this contract build it
+    with ``research.ibr.IBRConfig.from_runtime_contract``, which resolves
+    every absent key through :meth:`from_mapping` and therefore through the
+    defaults below.
+
+    ``relative_volume_mode`` and ``relative_volume_sessions`` are opt-in:
+    the default keeps the registered opening-range-mean baseline, so every
+    existing configuration admits exactly the same bars as before.
+    """
 
     timezone: str = DEFAULT_IBR_TIMEZONE
     session_start: str = DEFAULT_SESSION_START
@@ -285,8 +350,21 @@ class IBRConfig:
     max_entry_extension_r: float = float("inf")
     stale_minutes: float = 0.5
     max_spread_bps: float = 25.0
+    relative_volume_mode: str = RELATIVE_VOLUME_OPENING_RANGE_MEAN
+    relative_volume_sessions: int = DEFAULT_RELATIVE_VOLUME_SESSIONS
 
     def __post_init__(self) -> None:
+        if self.relative_volume_mode not in RELATIVE_VOLUME_MODES:
+            raise ValueError(
+                "relative_volume_mode must be one of "
+                + ", ".join(RELATIVE_VOLUME_MODES))
+        lower, upper = RELATIVE_VOLUME_SESSIONS_BOUNDS
+        sessions = self.relative_volume_sessions
+        if (isinstance(sessions, bool) or not isinstance(sessions, int) or
+                not lower <= sessions <= upper):
+            raise ValueError(
+                f"relative_volume_sessions must be an integer from {lower} "
+                f"to {upper}")
         # ``inf`` is the omitted/default policy.  Any supplied finite value
         # must be an actual nonnegative number; mapping callers are checked
         # before construction and direct construction is checked here.
@@ -496,6 +574,124 @@ def _range_from_mapping(value: Mapping) -> dict | None:
     return ibr_range_summary(value)
 
 
+def _row_label(row: Mapping, key: str) -> str | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("-", "_")
+    return text or None
+
+
+def same_clock_prior_row(row: object, *, feed: str | None,
+                         provider: str | None, available_by: datetime,
+                         before: date, zone: ZoneInfo) -> datetime | None:
+    """Return a prior row's timestamp when it may enter a same-clock baseline.
+
+    The row must be a valid completed bar mapping, available by
+    ``available_by``, dated (in ``zone``) before ``before``, carry ``feed``
+    and, when ``provider`` is given, that provider.  This is the one filter
+    :func:`same_clock_relative_volume` applies, exposed so a caller that
+    selects prior sessions (the research replay) uses exactly the same rule.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    row_ts = _bar_time(row)
+    if row_ts is None or not _valid_bar_payload(row):
+        return None
+    row_available = _bar_available(row, row_ts)
+    if row_available is None or row_available > available_by:
+        return None
+    if row_ts.astimezone(zone).date() >= before:
+        return None
+    if _row_label(row, "feed") != feed:
+        return None
+    if provider is not None and _row_label(row, "provider") != provider:
+        return None
+    return row_ts
+
+
+def same_clock_relative_volume(
+    bar: Mapping,
+    prior_session_bars: Iterable[Mapping] | None,
+    *,
+    sessions: int = DEFAULT_RELATIVE_VOLUME_SESSIONS,
+    session_start: str = DEFAULT_SESSION_START,
+    timezone_name: str = DEFAULT_IBR_TIMEZONE,
+    available_by: datetime | None = None,
+) -> float | None:
+    """Return the candidate's volume over its same-clock prior-session mean.
+
+    This is the IBR counterpart of the rule family's v6 same-clock RVOL
+    (``agent.contracts.rule._same_clock_relative_volume``).  The candidate's
+    offset from its own session's local ``session_start`` is matched in the
+    ``sessions`` most recent prior session dates found in
+    ``prior_session_bars``.  Each of those sessions must contain exactly one
+    valid bar at that clock minute, with the candidate's feed (and provider,
+    when the candidate names one) and a positive volume; anything else fails
+    closed with ``None`` instead of quietly changing the baseline population.
+    Matching is by each session's own local open, so a daylight-saving change
+    between sessions does not shift the clock.  A prior row is used only once
+    it was available by ``available_by`` (the candidate bar's close when
+    omitted); rows on or after the candidate's date are ignored.
+    """
+    if not isinstance(bar, Mapping):
+        return None
+    lower, upper = RELATIVE_VOLUME_SESSIONS_BOUNDS
+    if (isinstance(sessions, bool) or not isinstance(sessions, int) or
+            not lower <= sessions <= upper):
+        return None
+    try:
+        zone = ZoneInfo(timezone_name)
+    except Exception:  # noqa: BLE001 - invalid config fails closed
+        return None
+    stamp = _bar_time(bar)
+    if stamp is None:
+        return None
+    local = stamp.astimezone(zone)
+    clock = _parse_clock(session_start, time(9, 30))
+    opened = datetime.combine(local.date(), clock, tzinfo=zone)
+    elapsed_seconds = (local - opened).total_seconds()
+    if (elapsed_seconds < 0 or elapsed_seconds % 60 != 0 or
+            local.second or local.microsecond):
+        return None
+    elapsed_minutes = int(elapsed_seconds // 60)
+    boundary = (available_by if available_by is not None
+                else stamp + timedelta(minutes=1))
+    feed = _row_label(bar, "feed")
+    provider = _row_label(bar, "provider")
+    grouped: dict[date, list[tuple[datetime, Mapping]]] = {}
+    for row in prior_session_bars or ():
+        row_ts = same_clock_prior_row(
+            row, feed=feed, provider=provider, available_by=boundary,
+            before=local.date(), zone=zone)
+        if row_ts is None:
+            continue
+        grouped.setdefault(row_ts.astimezone(zone).date(), []).append(
+            (row_ts, row))
+    prior_days = sorted(grouped)
+    if len(prior_days) < sessions:
+        return None
+    volumes: list[float] = []
+    for prior_day in prior_days[-sessions:]:
+        target = (datetime.combine(prior_day, clock, tzinfo=zone) +
+                  timedelta(minutes=elapsed_minutes))
+        matches = [row for row_ts, row in grouped[prior_day]
+                   if row_ts == target]
+        if len(matches) != 1:
+            return None
+        volume = _bar_value(matches[0], "volume", "v")
+        if volume is None or volume <= 0:
+            return None
+        volumes.append(volume)
+    current_volume = _bar_value(bar, "volume", "v")
+    if current_volume is None or current_volume <= 0:
+        return None
+    baseline = math.fsum(volumes) / len(volumes)
+    if not math.isfinite(baseline) or baseline <= 0:
+        return None
+    return current_volume / baseline
+
+
 def evaluate_ibr_breakout(
     ibr: Mapping,
     bar: Mapping,
@@ -504,8 +700,14 @@ def evaluate_ibr_breakout(
     symbol: str | None = None,
     session_state: Mapping | None = None,
     now=None,
+    prior_session_bars: Iterable[Mapping] | None = None,
 ) -> dict | None:
-    """Evaluate one completed post-range bar and return a signal or ``None``."""
+    """Evaluate one completed post-range bar and return a signal or ``None``.
+
+    ``prior_session_bars`` is read only when the configuration opts into
+    ``relative_volume_mode="same_clock"``; it holds earlier sessions' bars
+    for the same symbol.
+    """
     cfg = config if isinstance(config, IBRConfig) else IBRConfig.from_mapping(config)
     rng = _range_from_mapping(ibr)
     if rng is None or rng.get("complete") is False:
@@ -601,7 +803,7 @@ def evaluate_ibr_breakout(
                 if current is not None and item_available > current:
                     continue
                 bounded_history.append(item)
-            values = (atr_series(
+            values = (wilder_atr_series(
                 bounded_history, period=int(getattr(cfg, "atr_period", 14)))
                       if history_valid else [])
             if values:
@@ -625,10 +827,21 @@ def evaluate_ibr_breakout(
             return None
     elif cfg.min_ibr_width_atr > 0 or cfg.max_ibr_width_atr < float("inf"):
         return None
-    mean_volume = finite(rng.get("volume_mean"))
-    relvol = finite(bar.get("relative_volume"))
-    if relvol is None and mean_volume and mean_volume > 0 and volume is not None:
-        relvol = volume / mean_volume
+    same_clock = cfg.relative_volume_mode == RELATIVE_VOLUME_SAME_CLOCK
+    if same_clock:
+        # Opt-in only.  A bar-supplied ``relative_volume`` is ignored here:
+        # it may have been computed against another baseline, and a signal
+        # labelled same-clock must carry a same-clock value.
+        relvol = same_clock_relative_volume(
+            bar, prior_session_bars,
+            sessions=cfg.relative_volume_sessions,
+            session_start=cfg.session_start, timezone_name=cfg.timezone,
+            available_by=current if current is not None else available)
+    else:
+        mean_volume = finite(rng.get("volume_mean"))
+        relvol = finite(bar.get("relative_volume"))
+        if relvol is None and mean_volume and mean_volume > 0 and volume is not None:
+            relvol = volume / mean_volume
     if relvol is None or relvol < cfg.min_relative_volume:
         return None
     direction = ("long" if close_breaks_range(
@@ -653,7 +866,12 @@ def evaluate_ibr_breakout(
     signal = {
         "action": "open", "symbol": symbol, "direction": direction,
         "setup_type": "ibr_breakout", "session": session,
+        # ``signal_ts`` is the signal bar's close and keeps that meaning
+        # (rule signals use the bar open); the explicit pair below removes
+        # the ambiguity for any consumer that compares the two families.
         "signal_ts": close_ts.timestamp(), "signal_time": close_ts.isoformat(),
+        "signal_bar_open_ts": ts.timestamp(),
+        "signal_bar_close_ts": close_ts.timestamp(),
         "entry_price": entry, "stop_price": stop, "target_price": target,
         "stop_distance": distance, "target_r": cfg.target_r,
         "relative_volume": relvol, "range_high": float(rng["high"]),
@@ -663,6 +881,9 @@ def evaluate_ibr_breakout(
         "force_flat_ts": _dt(flat_at, cfg.zone).timestamp() if _dt(flat_at, cfg.zone) else None,
         "force_flat_reason": "regular_session_close",
     }
+    if same_clock:
+        signal["relative_volume_mode"] = RELATIVE_VOLUME_SAME_CLOCK
+        signal["relative_volume_sessions"] = cfg.relative_volume_sessions
     if isinstance(session_state, dict):
         if isinstance(session_state.get("signals"), set):
             session_state["signals"].add((symbol, session))
@@ -716,8 +937,14 @@ def generate_ibr_signal(
     config: IBRConfig | Mapping | None = None,
     session_state: dict | None = None,
     now=None,
+    prior_session_bars: Iterable[Mapping] | None = None,
 ) -> dict | None:
-    """Build the opening range and scan completed bars for the first signal."""
+    """Build the opening range and scan completed bars for the first signal.
+
+    ``bars`` is the current session.  ``prior_session_bars`` (earlier
+    sessions of the same symbol) is consulted only by the opt-in
+    ``relative_volume_mode="same_clock"`` baseline.
+    """
     cfg = config if isinstance(config, IBRConfig) else IBRConfig.from_mapping(config)
     current = None
     if now is not None:
@@ -767,7 +994,8 @@ def generate_ibr_signal(
     candidates = sorted(rows, key=lambda row: _bar_time(row) or datetime.min.replace(tzinfo=timezone.utc))
     for bar in candidates:
         signal = evaluate_ibr_breakout(rng, bar, config=cfg, symbol=symbol,
-                                       session_state=session_state, now=now)
+                                       session_state=session_state, now=now,
+                                       prior_session_bars=prior_session_bars)
         if signal is not None:
             if session_state is not None:
                 if isinstance(session_state.get("signals"), set):
