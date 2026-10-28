@@ -1,0 +1,50 @@
+{
+ "opening_range_breakout": [
+  "rule.opening-range-breakout.5771672df3d271bf",
+  "rule.opening-range-breakout.e7bf7cf599d2212e"
+ ],
+ "opening_range_fade": [
+  "rule.opening-range-fade.d14784e58e82b85d",
+  "rule.opening-range-fade.ddabf6b55dc8617c"
+ ],
+ "momentum_continuation": [
+  "rule.momentum-continuation.cf95671310bd900a",
+  "rule.momentum-continuation.0e8fed23b39eb8b2"
+ ],
+ "mean_reversion": [
+  "rule.mean-reversion.b16bcd1b7b43486b",
+  "rule.mean-reversion.022db7a0df31f106"
+ ],
+ "trend_pullback": [
+  "rule.trend-pullback.c68742515fe499d2",
+  "rule.trend-pullback.9140fd797a16059c"
+ ],
+ "volatility_breakout": [
+  "rule.volatility-breakout.313968ada600d516",
+  "rule.volatility-breakout.5e9c9b9924ce2284"
+ ],
+ "volume_breakout": [
+  "rule.volume-breakout.4e8c6e63e58cfd2e",
+  "rule.volume-breakout.465d223d5ec94f9e"
+ ],
+ "vwap_reversion": [
+  "rule.vwap-reversion.0e38e68e3177ac1d",
+  "rule.vwap-reversion.8679c8c06a7b7a1e"
+ ],
+ "vwap_trend": [
+  "rule.vwap-trend.c854ed87b3ef4c0b",
+  "rule.vwap-trend.b4fbbeeedf5dd011"
+ ],
+ "range_expansion": [
+  "rule.range-expansion.d434cc4fa1c7e2ee",
+  "rule.range-expansion.0e890d6aa42e0560"
+ ],
+ "opening_drive": [
+  "rule.opening-drive.86d9e5e75ad2af64",
+  "rule.opening-drive.a083492d6437b241"
+ ],
+ "cross_sectional_residual": [
+  "rule.cross-sectional-residual.06ff2f3804db78ef",
+  "rule.cross-sectional-residual.fb2ccaeb9c54907c"
+ ]
+}

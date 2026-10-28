@@ -1,0 +1,15 @@
+arms 12 todo 12
+opening_range_breakout trades 1287 signals 1287 vetoed 0 errors {} secs 103.4
+opening_range_fade trades 141 signals 141 vetoed 0 errors {} secs 117.3
+mean_reversion trades 4211 signals 4211 vetoed 0 errors {} secs 18.1
+momentum_continuation trades 1214 signals 1214 vetoed 0 errors {} secs 85.4
+volatility_breakout trades 611 signals 611 vetoed 0 errors {} secs 16.3
+trend_pullback trades 520 signals 520 vetoed 0 errors {} secs 77.2
+vwap_reversion trades 2143 signals 2143 vetoed 0 errors {} secs 429.9
+vwap_trend trades 2637 signals 2637 vetoed 0 errors {} secs 12.0
+range_expansion trades 1250 signals 1250 vetoed 0 errors {} secs 13.8
+opening_drive trades 838 signals 838 vetoed 0 errors {} secs 72.2
+arms 12 todo 2
+volume_breakout trades 697 signals 697 vetoed 0 errors {} secs 1092.5
+cross_sectional_residual trades 1879 signals 1879 vetoed 0 errors {} secs 1239.4
+DONE

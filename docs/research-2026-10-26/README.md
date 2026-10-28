@@ -1,5 +1,7 @@
 # Strategy and edge performance, refreshed on 26 October 2026
 
+> Follow-up: the review's strategy, cost, statistics and gate findings were closed on 28 October, and a corrected cohort was replayed on these bars ([`../research-2026-10-28/README.md`](../research-2026-10-28/README.md)). It still shows no edge.
+
 This refresh re-runs the 15 October review's research ([`../review-2026-10-15/README.md`](../review-2026-10-15/README.md), sections 4 and 6) on newer bars. It adds eight one-minute sessions, 14 to 23 October 2026, that no analysis had seen before. Everything here is diagnostic. The bars are public consolidated-tape bars, not the Alpaca IEX `forward_observed` corpus the repository's protocol requires, so nothing in this document is decision-bearing.
 
 ## 1. What was run

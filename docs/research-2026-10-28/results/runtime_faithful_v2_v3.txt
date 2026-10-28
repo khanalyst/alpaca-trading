@@ -1,0 +1,30 @@
+cohort      family                    role                        n  gross    net      t   win  unseen   t_un  delay  port% taken
+mech_v2     cross_sectional_residual  cross_sectional_residual  540   0.50  -2.29  -1.15  0.44   -5.43  -1.84  -1.89  -0.37    67
+mech_v2     mean_reversion            mean_reversion#0          220   0.71  -2.03  -2.51  0.41   -0.90  -1.00  -2.38  -0.61    86
+mech_v2     momentum_continuation     momentum_continuation#0   640   0.30  -2.52  -1.96  0.46   -2.30  -1.24  -2.29  -1.21   179
+mech_v2     opening_drive             opening_drive#0           238  -0.43  -3.42  -1.07  0.39   -6.51  -2.21  -3.70  -0.31    99
+mech_v2     opening_range_breakout    opening_range_breakout#0  660  -1.17  -3.97  -2.42  0.40   -5.25  -2.22  -3.33  -1.70   189
+mech_v2     opening_range_fade        opening_range_fade#0       21  -1.67  -4.97  -1.90  0.29   -7.66  -1.85  -4.39  -0.26    21
+mech_v2     range_expansion           range_expansion#0         627  -0.19  -2.99  -2.43  0.42   -3.44  -1.62  -3.67  -0.48   231
+mech_v2     trend_pullback            trend_pullback#0          701  -0.27  -3.06  -2.22  0.45   -2.40  -1.73  -2.90  -1.42   191
+mech_v2     volatility_breakout       volatility_breakout#0     409   2.08  -0.85  -0.53  0.46   -3.03  -1.43  -0.72  -0.30   206
+mech_v2     volume_breakout           volume_breakout#0         338   1.33  -1.52  -0.81  0.46   -2.71  -1.03  -1.42  -0.47   165
+mech_v2     vwap_reversion            vwap_reversion#0            0      -      -      -     -       -      -      -      -     -
+mech_v2     vwap_trend                vwap_trend#0              689   1.91  -0.88  -0.48  0.47   -0.86  -0.28  -0.88  -0.33   114
+mech_v3     cross_sectional_residual  cross_sectional_residual  450  -2.17  -4.96  -1.76  0.45   -9.04  -2.39  -4.74  -0.26    55
+mech_v3     mean_reversion            mean_reversion#0          720   1.35  -1.43  -1.05  0.60    1.08   0.75  -1.72  -1.14   172
+mech_v3     momentum_continuation     momentum_continuation#0   518  -0.09  -2.91  -1.62  0.50   -2.54  -1.27  -2.51  -1.02   148
+mech_v3     opening_drive             opening_drive#0           238   0.66  -2.33  -0.57  0.41   -6.64  -2.22  -2.33  -0.07    94
+mech_v3     opening_range_breakout    opening_range_breakout#0  660  -1.71  -4.51  -2.26  0.42   -5.63  -2.73  -4.05  -1.78   165
+mech_v3     opening_range_fade        opening_range_fade#0      109   2.81  -0.33  -0.13  0.60    1.53   0.45  -0.34   0.07    97
+mech_v3     range_expansion           range_expansion#0         627   0.16  -2.64  -2.03  0.44   -3.47  -1.64  -3.55  -0.65   225
+mech_v3     trend_pullback            trend_pullback#0          391   0.73  -2.08  -0.99  0.49   -5.19  -3.42  -2.03  -1.65   146
+mech_v3     volatility_breakout       volatility_breakout#0     409   1.05  -1.88  -1.09  0.49   -2.63  -1.14  -1.63  -0.95   184
+mech_v3     volume_breakout           volume_breakout#0         415   0.97  -1.87  -0.95  0.46   -3.87  -1.77  -1.79  -0.55   162
+mech_v3     vwap_reversion            vwap_reversion#0          562  -0.05  -2.91  -3.31  0.42   -1.73  -1.44  -2.72  -2.05   371
+mech_v3     vwap_trend                vwap_trend#0              689   1.84  -0.95  -0.46  0.50   -1.76  -0.56  -1.04  -0.40    95
+
+arms with trades 23 | positive net 0 []
+net t<-2: 7 | net t>+2: 0
+mean of arm means: gross 0.38 net -2.49 model -16.62
+portfolio (first trades, real costs) positive: [('mech_v3', 'opening_range_fade', 'opening_range_fade#0', 0.07)]
