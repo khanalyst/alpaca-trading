@@ -630,8 +630,12 @@ def _measure_set(paths: Sequence[Path], *, csv_mode: str,
         partition_sources=partition_sources, required=required,
         trusted_recorder=trusted_recorder)
     try:
+        # The projection keeps the schedule it has always fitted (all-hours
+        # aggregates); the regular-hours default (E1-10) is opt-in here so
+        # earlier projection artefacts still reproduce their hashes.
         schedule = measure_quote_costs(stream, feed=feed, provider=provider,
-                                       min_quotes_per_cell=500)
+                                       min_quotes_per_cell=500,
+                                       regular_session_aggregates=False)
     except QuoteCostError as exc:
         message = str(exc)
         # An empty/no-usable quote set is an explicit diagnostic outcome.  A
@@ -806,7 +810,10 @@ def project_corpus(
                     min_quotes_per_cell=500, min_sessions_per_cell=5,
                     expected_provider=provider, expected_feed=feed,
                     fallback_scenario_bps=25.0,
-                    max_cost_to_risk_ratio=0.30)
+                    max_cost_to_risk_ratio=0.30,
+                    # The one-way basis these artefacts were calibrated on;
+                    # the round-trip ladder (E1-06) is opt-in for this tool.
+                    cost_basis="one_way_v1")
             except Exception as exc:
                 calibration = {"schema": "stressed-cost-calibration-unavailable.v1",
                                "status": "unavailable", "reason": str(exc),

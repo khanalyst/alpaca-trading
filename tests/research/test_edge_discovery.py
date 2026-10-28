@@ -597,6 +597,30 @@ class EdgeLedgerStoreExtractionTests(unittest.TestCase):
             self.assertEqual(delayed["equity_feed"], "delayed_sip")
             self.assertFalse(delayed["passes"])
 
+    def test_a_new_run_refuses_a_protocol_1_envelope(self):
+        # Review of D2: protocol 1 stays verifiable for runs recorded before
+        # protocol 2, but a run recorded now cannot be proved by a protocol-1
+        # envelope built today, which would skip the protocol-2 checks.
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity",
+                hypothesis="protocol floor", config={})
+            run, envelope = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", record=False)
+            stored = ledger.run(run["run_id"])
+            self.assertEqual(stored["metrics"]["minimum_gate_protocol"], 2)
+            self.assertIsNone(ledger._gate_envelope_error(stored, envelope))
+            legacy = {key: value for key, value in envelope.items()
+                      if key != "gate_protocol_version"}
+            self.assertEqual(ledger._gate_envelope_error(stored, legacy),
+                             "this run requires a newer verified gate protocol")
+            older = {**stored, "metrics": {
+                key: value for key, value in stored["metrics"].items()
+                if key != "minimum_gate_protocol"}}
+            self.assertNotEqual(ledger._gate_envelope_error(older, legacy),
+                                "this run requires a newer verified gate protocol")
+
     def test_store_symbols_are_identical_through_edge_facades(self):
         names = (
             "VEHICLES", "LANES", "LIFECYCLE", "CANDIDATE", "BACKTEST_PASSED",

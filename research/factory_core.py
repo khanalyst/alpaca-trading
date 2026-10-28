@@ -1880,11 +1880,13 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 "cost_timestamp": raw.get("exit_timestamp"),
             })
         except QuoteCostError as exc:
-            rows.append(_cost_coverage_refusal(
-                vehicle=vehicle, symbol=symbol, day=day,
-                opportunity=opportunity, leg="exit", error=exc,
-                telemetry=sizing_telemetry))
-            continue
+            # Unlike the entry leg, the exit leg's cell depends on how the
+            # trade played out (a stop at 10:05 or a time exit at 15:40), so
+            # refusing the trade here would keep or drop it by its outcome.
+            # The variant stops instead, as before E1-09.
+            raise QuoteCostError(
+                f"measured exit cost unavailable for {symbol} {day}: {exc}; "
+                "refusing only this trade would select on its outcome") from exc
         entry = model.execution_price(
             raw["entry_reference"], execution_direction, entry=True,
             executable_quote=(vehicle == "option" and _fresh(

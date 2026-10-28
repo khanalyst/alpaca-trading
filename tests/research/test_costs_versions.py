@@ -667,6 +667,24 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(rows[0]["cost_coverage_leg"], "entry")
         self.assertIn("under-covered", rows[0]["cost_coverage_detail"])
 
+    def test_an_uncovered_exit_cell_stops_the_variant(self):
+        # Review of E1-09: the exit leg's cell depends on how the trade played
+        # out, so refusing that one trade would keep or drop it by outcome.
+        schedule = measure_quote_costs(_session_quotes(sessions=6),
+                                       min_quotes_per_cell=50)
+        measured = measured_cost_resolver(schedule)
+
+        def exit_uncovered(context):
+            if context.get("cost_leg") == "exit":
+                raise QuoteCostError("requested measured cost bucket is under-covered")
+            return measured(context)
+
+        with self.assertRaisesRegex(QuoteCostError, "select on its outcome"):
+            simulate_account(
+                _bars(TIME_EXIT), [], validate_rule_spec(SPEC), vehicle="equity",
+                account_id="coverage", risk_pct=.05, policy=PERMISSIVE,
+                cost_resolver=exit_uncovered)
+
     def test_early_close_policy_keeps_both_cutoffs(self):
         # E1-11 is closed where an entry is admitted (account simulation, live
         # shadow and now the IBR replay refuse an entry after force-flat), not

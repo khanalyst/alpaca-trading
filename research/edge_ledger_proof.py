@@ -312,10 +312,17 @@ class EdgeLedgerProofMixin:
     def _gate_envelope_error(self, run: Mapping, envelope: Mapping) -> str | None:
         if envelope.get("lane") != run.get("lane") or envelope.get("vehicle") != run.get("vehicle"):
             return "verified gate lane/vehicle does not match the persisted run"
-        from .gates import GATE_ENVELOPE_SCHEMA
+        from .gates import GATE_ENVELOPE_SCHEMA, envelope_protocol_version
         if (run_engine_epoch_current(run) and
                 envelope.get("schema") != GATE_ENVELOPE_SCHEMA):
             return "current replay epoch requires the current verified gate schema"
+        metrics = run.get("metrics")
+        minimum = (metrics.get("minimum_gate_protocol")
+                   if isinstance(metrics, Mapping) else None)
+        if isinstance(minimum, int) and not isinstance(minimum, bool):
+            version = envelope_protocol_version(envelope)
+            if version is None or version < minimum:
+                return "this run requires a newer verified gate protocol"
         equity_feed = str(
             envelope.get("equity_feed", "sip")
         ).strip().lower().replace("-", "_")

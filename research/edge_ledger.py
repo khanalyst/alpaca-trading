@@ -154,6 +154,12 @@ class EdgeLedger(EdgeLedgerProofMixin):
         # claim an engine it was not measured under; runs written before the
         # stamp existed carry none and are treated as epoch 1.
         payload["replay_engine_epoch"] = int(REPLAY_ENGINE_EPOCH)
+        # Likewise the least gate protocol this run's envelope may use: a run
+        # recorded now cannot be proved by a protocol-1 envelope built today
+        # (review of D2).  Runs recorded before the stamp carry none and keep
+        # their original protocol.
+        from .gates import GATE_PROTOCOL_VERSION
+        payload["minimum_gate_protocol"] = int(GATE_PROTOCOL_VERSION)
         payload.setdefault("fit_trades", len(fit_rows))
         payload.setdefault("heldout_trades", len(held_rows))
         run_id = run_id or uuid.uuid4().hex
