@@ -373,7 +373,14 @@ def persist_rule_gate(ledger, candidate_id, lane, *, learning_epoch=None,
         "independent_draws": int(independent["draws"]),
         "independent_seed": int(independent["seed"])}
     absolute = performance_floor(heldout, vehicle="equity")
-    walk = walk_forward_report(heldout, baseline, vehicle="equity", folds=3)
+    # A passing gate must declare walk-forward parameters that meet the
+    # protocol for its lane (gate protocol 2, review D2-09).
+    walk_minimums = gates.protocol_walk_forward_minimums(lane)
+    walk = walk_forward_report(
+        heldout, baseline, vehicle="equity", folds=walk_minimums["folds"],
+        min_test_sessions=walk_minimums["test_sessions_required"],
+        min_test_trades=walk_minimums["test_trades_required"],
+        requested_min_sessions=walk_minimums["requested_min_sessions"])
     qualification = qualification_report(
         heldout, baseline, vehicle="equity",
         sessions=sorted({row["session_date"] for row in heldout}),

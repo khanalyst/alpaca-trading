@@ -62,6 +62,10 @@ _CHECK_LABELS = {
     "family_fdr_significant": "survives multiple-testing within its family",
     "global_fdr_significant": "survives multiple-testing across the cycle",
     "cluster_fdr_significant": "survives frozen dependence-cluster multiplicity",
+    "cost_stress_adequate": "survives the preregistered cost stress",
+    "max_drawdown_supported": "held-out drawdown within its limit",
+    "comparison_keys_unique": "every trade pairs unambiguously with its control",
+    "protocol_parameters_bound": "declared floors and test parameters meet the protocol",
 }
 
 
@@ -687,6 +691,34 @@ def _failed_checks(gate: Mapping[str, Any]) -> list[str]:
             for name in _CHECK_LABELS if checks.get(name) is False]
 
 
+def _gate_power_summary(verified: Any) -> dict | None:
+    """Minimum detectable effect and independent-check count of a gate.
+
+    Protocol-2 envelopes carry both as non-authorizing diagnostics; older
+    envelopes have neither, and the report then shows nothing.
+    """
+    if not isinstance(verified, Mapping):
+        return None
+    power = verified.get("power")
+    classification = verified.get("check_classification")
+    if not isinstance(power, Mapping) or power.get("available") is not True:
+        return None
+    heldout = ((power.get("windows") or {}).get("heldout") or {})
+    tests = heldout.get("tests") if isinstance(heldout, Mapping) else None
+    tests = tests if isinstance(tests, Mapping) else {}
+    summary = (classification.get("summary")
+               if isinstance(classification, Mapping) else None)
+    summary = summary if isinstance(summary, Mapping) else {}
+    return {
+        "unit": power.get("effect_unit"),
+        "heldout_mde": _number((tests.get("single_test") or {}).get("mde")),
+        "lone_discovery_mde": _number(
+            (tests.get("by_lone_discovery") or {}).get("mde")),
+        "independent_passed": summary.get("independent_passed"),
+        "independent_required": summary.get("independent"),
+    }
+
+
 def _variant_row(record: Mapping[str, Any]) -> dict:
     """One variant's performance, without dragging its trade rows along."""
     gate = record.get("gate") if isinstance(record.get("gate"), Mapping) else {}
@@ -748,6 +780,7 @@ def _variant_row(record: Mapping[str, Any]) -> dict:
         # this is diagnostic provenance and does not alter the verdict.
         "gate_dependence": gate_dependence_report(
             verified if isinstance(verified, Mapping) else gate),
+        "gate_power": _gate_power_summary(verified),
         "gate_hash": gate.get("gate_hash"),
         # Why this variant was tried, and who decided to try it.  Fixed before
         # the gate beside it was computed, so the pair reads as a prediction
@@ -1674,6 +1707,14 @@ def render_text(report: Mapping[str, Any]) -> str:
                     if variant["failed_checks"]:
                         add("            failed: " +
                             "; ".join(variant["failed_checks"]))
+                    power = variant.get("gate_power")
+                    if power:
+                        add("            held-out MDE at 80% power "
+                            f"{_fmt(power['heldout_mde'])} (lone BY "
+                            f"{_fmt(power['lone_discovery_mde'])}) "
+                            f"{power['unit']}; independent checks "
+                            f"{power['independent_passed']}/"
+                            f"{power['independent_required']}")
                 outcome = item["outcome"]
                 add(f"      outcome: {outcome['kind'].replace('_', ' ')}"
                     f" — {outcome.get('reason') or ''}".rstrip(" —"))

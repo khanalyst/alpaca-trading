@@ -255,6 +255,26 @@ class EarnedGatePassTests(unittest.TestCase):
         self.assertEqual(rows[ROOT_VARIANT]["status"], "shadow")
         self.assertIsNone(result["champion"])
 
+    def test_the_shipped_trade_floor_reaches_the_forward_lane(self):
+        # Review D2-02: the shipped cycle passes ``--min-trades 100``.  The
+        # forward ("shadow") lane must still be judged against its own
+        # 150-trade protocol rather than declaring the backtest floor and
+        # failing both floor checks however good the evidence.
+        with tempfile.TemporaryDirectory(prefix="alpaca-e2e-floor-") as forward:
+            shutil.copytree(self.directory.name, forward, dirs_exist_ok=True)
+            result = run_factory(edge_corpus(SESSIONS, skip=SESSIONS),
+                                 db_path=Path(forward) / "edge.sqlite3",
+                                 strategies=1, variants_per_strategy=2,
+                                 workers=1, min_trades=100,
+                                 runtime_config=TEST_RUNTIME_CONFIG)
+        gate = self._by_variant(result)[ROOT_VARIANT]["gate"]
+        self.assertEqual(self._by_variant(result)[ROOT_VARIANT]["mode"], "shadow")
+        self.assertEqual(gate["heldout_floor"]["minimums"]["trades"], 150)
+        self.assertEqual(gate["fit_floor"]["minimums"]["trades"], 150)
+        self.assertTrue(gate["verified_gate"]["checks"]["heldout_floor_adequate"])
+        self.assertTrue(gate["verified_gate"]["checks"]["fit_floor_adequate"])
+        self.assertTrue(gate["passes"])
+
     def test_the_pass_is_bought_and_worse_costs_take_it_away(self):
         # The identical corpus under a materially worse — but still runtime
         # acceptable — cost model must not produce a passing candidate.  This
