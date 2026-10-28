@@ -1197,6 +1197,15 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             envelope["statistics"]["p_value"] = 1.0
             envelope["performance"]["heldout_delta"] = None
             envelope["performance"]["heldout_delta_lcb"] = None
+            # A protocol-2 producer also records that a control without
+            # deltas cannot bind the protocol parameters (review D2-09).
+            envelope["checks"]["protocol_parameters_bound"] = False
+            envelope["protocol_parameters"] = gates.protocol_parameter_report(
+                lane="backtest", floors=envelope["floors"],
+                walk_forward=envelope["walk_forward"],
+                control=envelope["control"])
+            envelope["check_classification"] = gates.gate_check_classification(
+                envelope["gate_protocol_version"], checks=envelope["checks"])
             envelope["content_hash"] = content_hash({
                 key: item for key, item in envelope.items()
                 if key != "content_hash"})
