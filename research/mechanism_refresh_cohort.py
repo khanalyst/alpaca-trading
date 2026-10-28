@@ -278,13 +278,14 @@ def _verified_parent_spec(
             raise ValueError(
                 f"refresh cohort expected parent value changed: {family}.{field}"
             )
-    expected_deadline = 30 if family in _DEADLINE_FAMILIES else 360
-    if family not in _DEADLINE_FAMILIES and normalized.get("exit_before_minutes") is not None:
-        # A cost parent may only use the frozen 360-minute reversion deadline;
-        # all other families carry the neutral V4 deadline.
+    if family in _DEADLINE_FAMILIES:
+        # Reversion parents come from the deadline-compatible cohort, whose
+        # 15:30 thesis deadline is 30 minutes before the close.
+        if normalized.get("exit_before_minutes") != 30:
+            raise ValueError(f"refresh cohort reversion parent deadline changed: {family}")
+    elif normalized.get("exit_before_minutes") is not None:
+        # Every other cost parent carries the neutral V4 deadline (none).
         raise ValueError(f"refresh cohort non-reversion parent deadline changed: {family}")
-    if family in _DEADLINE_FAMILIES and normalized.get("exit_before_minutes") != expected_deadline:
-        raise ValueError(f"refresh cohort reversion parent deadline changed: {family}")
     if source.get("cohort_id") not in {_COST_COHORT_ID, _DEADLINE_COHORT_ID}:
         raise ValueError(f"refresh cohort parent source changed: {family}")
     return deepcopy(normalized)

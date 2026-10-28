@@ -84,9 +84,7 @@ class PinnedResolutionTests(unittest.TestCase):
             config = _config([{"id": "pin-orb-may", "variant_id": VARIANT,
                                "vehicle": "equity",
                                "note": "cleared its live trial"}])
-            with patch("agent.edge._latest_passing_proof",
-                       return_value=_stub_proof(ledger, record)), \
-                    patch.object(
+            with patch.object(
                         EdgeLedger, "eligibility",
                         return_value={"eligible": True,
                                       "latest_verified_run": _stub_proof(ledger, record)}):
@@ -185,9 +183,7 @@ class UnresolvedPromotionTests(unittest.TestCase):
             record = ledger.candidate_by_variant(VARIANT, "equity")
             config = _config([{"id": "pin-ok", "variant_id": VARIANT,
                                "vehicle": "equity"}])
-            with patch("agent.edge._latest_passing_proof",
-                       return_value=_stub_proof(ledger, record)), \
-                    patch.object(
+            with patch.object(
                         EdgeLedger, "eligibility",
                         return_value={"eligible": True,
                                       "latest_verified_run": _stub_proof(ledger, record)}):

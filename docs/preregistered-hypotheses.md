@@ -25,6 +25,19 @@ audit (`docs/audit-2026-09-21/SIGNAL-VALUE.md`), and its mirror, `vwap_trend`,
 was the worst arm in the catalogue. It was chosen *because* of those results,
 which is exactly why it may only be confirmed on sessions they did not use.
 
+**Population caveat** (added October 2026, review finding A-11). The
+measurements that motivated this hypothesis were not taken on the population
+the sealed test uses. All of them used public consolidated-tape bars,
+labelled `historical_backfill` on `delayed_sip`
+(`docs/audit-2026-09-21/FORWARD-2026-09-23.md`), whereas the sealed test uses
+Alpaca IEX. The bracket replays among them also evaluated only bars from
+index 60 of each session onwards (`docs/audit-2026-09-21/q1trades.py:31`,
+`forward_costs.py:41`), about 10:30 on a complete session, whereas the
+registered subject can signal from 09:50, once its 21-bar warm-up completes. The
+control-adjusted signal-quality measurement (`step6c.py`) used the whole
+session. The registered rule and its decision rule are unchanged; this only
+states what the prior evidence does and does not describe.
+
 | item | fixed value |
 | --- | --- |
 | subject | `rule.vwap-reversion.ab97bfe87ed566de` (diagnostic-shadow slot 7 baseline) |
@@ -71,6 +84,21 @@ realistic costs in the audit's bracket replay (+10.2 bps per trade over 59
 trades, session-clustered t +2.57), with a +19.5 bps control-adjusted delta at
 60 minutes (clustered t +2.95). It also lost on 2026-09-22. All of that is
 in-sample, which is why it needs its own sealed test.
+
+**Population caveat** (added October 2026, review findings A-11 and I2-01).
+The +10.2 bps bracket replay evaluated only bars from index 60 of each
+session onwards (`docs/audit-2026-09-21/forward_costs.py:41`), about 10:30 on
+a complete session, on public consolidated-tape backfill (`delayed_sip`). The
+registered subject has `entry_after_minutes` 0 and a 20-minute range, so it
+can fire from 09:50, and the sealed test uses Alpaca IEX. The 09:50 to 10:30
+window, where an opening fade is most likely to fire, was therefore never in
+the trade-level sample, and the feed differs. The +19.5 bps control-adjusted
+delta (`step6c.py`) covered the whole session, but on the same consolidated
+backfill. The review later measured the gap on 22 fresh sessions: 35% of the
+subject's first trades signal before 10:30 and performed about the same as
+later ones (+5.9 bps against +5.7 bps net;
+`docs/review-2026-10-15/reviews/handoff-I2_audit_coordinator.md`). The
+registered rule and its decision rule are unchanged.
 
 | item | fixed value |
 | --- | --- |

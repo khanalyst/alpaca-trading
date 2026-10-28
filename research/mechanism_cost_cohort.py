@@ -3,10 +3,27 @@ from __future__ import annotations
 
 from agent.contracts.rule import RULE_SCHEMA_V7, rule_variant_id, validate_rule_spec
 from .edge_ledger_store import content_hash
-from .mechanism_cohort_v2 import mechanism_cohort
+from .mechanism_cohort_v2 import (
+    ERRATA_SCHEMA, REVIEW_SOURCE, mechanism_cohort, thesis_deadline_errata,
+)
 
 COHORT_ID = "intraday-mechanisms.cost-compatible.v1"
 AUTHORED_STOP_FLOOR_BPS = 100.0
+# Finding A-12: the frozen risk_policy label names a 25 bps stress scenario.
+STRESS_SCENARIO_ERRATUM = {
+    "field": "risk_policy",
+    "finding": "A-12",
+    "statement": (
+        "The 25 bps stressed cost scenario in this label is the value of the "
+        "paper profile activated on 2026-09-15 "
+        "(docs/paper-activation-2026-09-15.json:119). Every shipped "
+        "configuration (config.yaml:52, deploy/paper-orb.config.json:79, "
+        "deploy/paper-orf.config.json:79) sets stressed_cost_scenario_bps "
+        "9.0 with max_stressed_cost_to_risk_ratio 0.30, so the configured "
+        "admission floor is 9 / 0.30 = 30 bps, not 25 / 0.30 = 83 bps. The "
+        "100 bps authored floor is therefore not required for admission "
+        "under the shipped configuration."),
+}
 
 
 def mechanism_cost_cohort() -> dict:
@@ -34,7 +51,18 @@ def mechanism_cost_cohort() -> dict:
         "limitations": ["wider_stops_do_not_prove_edge_or_target_attainability",
                          "quote_gaps_and_invalid_tick_targets_remain_refusals",
                          "historical_diagnostics_require_unseen_forward_confirmation"]}
-    return {**manifest, "manifest_hash": content_hash(manifest)}
+    # Outside the hash: the refresh cohort pins this manifest_hash.
+    errata = {
+        "schema": ERRATA_SCHEMA,
+        "covered_by_manifest_hash": False,
+        "source": REVIEW_SOURCE,
+        "invalid_arms": thesis_deadline_errata(
+            families, corrected_by="intraday-mechanisms.deadline-compatible.v1"),
+        "label_corrections": [{**STRESS_SCENARIO_ERRATUM,
+                               "recorded_value": manifest["risk_policy"]}],
+    }
+    return {**manifest, "manifest_hash": content_hash(manifest),
+            "errata": errata}
 
 
-__all__ = ["COHORT_ID", "mechanism_cost_cohort"]
+__all__ = ["COHORT_ID", "STRESS_SCENARIO_ERRATUM", "mechanism_cost_cohort"]

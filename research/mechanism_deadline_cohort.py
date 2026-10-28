@@ -10,7 +10,8 @@ from __future__ import annotations
 from agent.contracts.rule import RULE_SCHEMA_V7, rule_variant_id, validate_rule_spec
 
 from .edge_ledger_store import content_hash
-from .mechanism_cost_cohort import mechanism_cost_cohort
+from .mechanism_cohort_v2 import ERRATA_SCHEMA, REVIEW_SOURCE
+from .mechanism_cost_cohort import STRESS_SCENARIO_ERRATUM, mechanism_cost_cohort
 
 
 COHORT_ID = "intraday-mechanisms.deadline-compatible.v1"
@@ -91,7 +92,26 @@ def mechanism_deadline_cohort() -> dict:
             "historical diagnostics require unseen forward confirmation",
         ],
     }
-    return {**manifest, "manifest_hash": content_hash(manifest)}
+    # Outside the hash: the refresh cohort pins this manifest_hash.
+    errata = {
+        "schema": ERRATA_SCHEMA,
+        "covered_by_manifest_hash": False,
+        "source": REVIEW_SOURCE,
+        "corrects": [{
+            "finding": "A-01",
+            "statement": (
+                "exit_before_minutes counts minutes before the 16:00 close. "
+                "The parents' 360 is a 10:00 New York thesis deadline, which "
+                "made the VWAP-reversion parent unable to enter and left the "
+                "fade and mean-reversion parents a few minutes; this cohort's "
+                "30 is a 15:30 deadline that fits every entry window and "
+                "maximum hold."),
+        }],
+        "label_corrections": [{**STRESS_SCENARIO_ERRATUM,
+                               "recorded_value": manifest["risk_policy"]}],
+    }
+    return {**manifest, "manifest_hash": content_hash(manifest),
+            "errata": errata}
 
 
 __all__ = ["COHORT_ID", "mechanism_deadline_cohort"]

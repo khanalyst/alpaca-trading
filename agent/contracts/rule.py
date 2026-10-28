@@ -147,6 +147,8 @@ V4_DEFAULT_EXTENSIONS: dict[str, Any] = {
     "target_mode": "fixed_r",
     "target_lookback": 20,
     "trailing_stop_r": None,
+    # Minutes *before the session close*, not after the open: on a regular
+    # session 30 is a 15:30 New York thesis deadline and 360 is 10:00.
     "exit_before_minutes": None,
 }
 _V4_TARGET_MODES = ("fixed_r", "session_vwap", "rolling_mean")
@@ -202,6 +204,40 @@ _V6_BOUNDS = {
 # the variant identity; legacy schemas retain their original 30-bps floor.
 V7_DEFAULT_EXTENSIONS = {"min_stop_distance_bps": MIN_STOP_DISTANCE_BPS}
 _V7_BOUNDS = {"min_stop_distance_bps": (MIN_STOP_DISTANCE_BPS, 1_000.0, float)}
+# Opt-in corrections from the October 2026 signal review (findings A-02, A-04,
+# A-05, A-09, A-10 and A-15).  They are accepted on the diagnostic V7 grammar
+# only and, unlike every earlier extension, are never filled with a default:
+# an omitted correction is absent from the normalized map and an explicit
+# neutral value is normalized away.  Every stored V7 spec therefore keeps its
+# exact normalized form, content hash and variant id, and evaluates exactly as
+# before.  A spec carrying a correction is by construction a new
+# registration, so the corrected-grammar guards in ``validate_rule_spec``
+# (thesis deadline, redundant trend confirmation) apply to it alone.
+V7_CORRECTION_MODES: dict[str, tuple[str, ...]] = {
+    # The first mode of each field is the frozen, neutral behaviour.
+    # first_cross: emit only on the completed bar at which the family
+    # predicate turns true in that direction, not on every later bar.
+    "signal_event": ("state", "first_cross"),
+    # horizon_atr: stop_atr x the subject's own prior-bar ATR x
+    # sqrt(max_hold_bars); structure (opening_range_fade only): one ATR beyond
+    # the failed-breakout extreme.  The authored floor still applies.
+    "stop_mode": ("floor_atr", "horizon_atr", "structure"),
+    # beta: subject return minus a causal prior-session beta x SPY return.
+    "residual_mode": ("raw", "beta"),
+    # same_clock: the volume confirmation compares the bar with the same
+    # clock minute of prior sessions instead of the preceding minutes.
+    "volume_confirmation_mode": ("current_feed", "same_clock"),
+}
+_V7_CORRECTION_BOUNDS = {
+    # range_expansion's own range multiple; absent means volume_multiplier.
+    "range_multiplier": (0.25, 10.0, float),
+    "residual_beta_sessions": (3, 60, int),
+}
+V7_CORRECTION_FIELDS = (*V7_CORRECTION_MODES, *_V7_CORRECTION_BOUNDS)
+DEFAULT_RESIDUAL_BETA_SESSIONS = 10
+MIN_RESIDUAL_BETA_OBSERVATIONS = 100
+THESIS_DEADLINE_BEFORE_ENTRY_WINDOW = "thesis_deadline_at_or_before_entry_window"
+THESIS_DEADLINE_INSIDE_ENTRY_HORIZON = "entry_window_and_hold_extend_past_thesis_deadline"
 _EXTRA_CONFIRMATIONS = tuple(name for name in CONFIRMATIONS if name != "none")
 MAX_CONFIRMATIONS = len(_EXTRA_CONFIRMATIONS)
 
@@ -382,6 +418,9 @@ def feature_window_bars(value: Mapping[str, Any]) -> int | None:
         # Retain enough minutes for N completed buckets at every alignment.
         needed = max(needed, (spec["regime_lookback_bars"] + 1) *
                      spec["regime_timeframe_minutes"] - 1)
+    if spec.get("signal_event") == "first_cross":
+        # A first-cross event also re-reads the previous bar's window.
+        needed += 1
     return needed
 
 
@@ -408,6 +447,13 @@ def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
                        "regime_lookback_bars", "regime_efficiency_threshold"))
     if spec.get("entry_trigger", "legacy") != "legacy":
         fields.update(("entry_trigger", "pullback_bars"))
+    # V7 corrections are present only when opted into (never defaulted).
+    fields.update(name for name in V7_CORRECTION_FIELDS if name in spec)
+    if "range_multiplier" in spec and "volume" not in confirmations:
+        # The range gate no longer reads volume_multiplier.
+        fields.discard("volume_multiplier")
+    if spec.get("volume_confirmation_mode") == "same_clock":
+        fields.add("relative_volume_sessions")
     return fields
 
 
@@ -474,7 +520,7 @@ def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) ->
     # integer coordinates such as lookback. Validation above remains the
     # source of truth for legal ranges.
     bounds = {**_BOUNDS, **_V2_BOUNDS, **_V3_BOUNDS, **_V4_BOUNDS, **_V5_BOUNDS,
-              **_V6_BOUNDS, **_V7_BOUNDS}
+              **_V6_BOUNDS, **_V7_BOUNDS, **_V7_CORRECTION_BOUNDS}
     fields = _semantic_fields(a) | _semantic_fields(b)
     for name, default in V2_DEFAULT_EXTENSIONS.items():
         if a.get(name, default) != default or b.get(name, default) != default:
@@ -776,11 +822,14 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if schema in {RULE_SCHEMA_V6, RULE_SCHEMA_V7}:
         permitted |= set(V6_DEFAULT_EXTENSIONS)
     if schema == RULE_SCHEMA_V7:
-        permitted |= set(V7_DEFAULT_EXTENSIONS)
+        permitted |= set(V7_DEFAULT_EXTENSIONS) | set(V7_CORRECTION_FIELDS)
     unknown = sorted(set(value) - permitted)
     if unknown:
         if any(name in V7_DEFAULT_EXTENSIONS for name in unknown):
             raise RuleSpecError(f"geometry fields require schema {RULE_SCHEMA_V7!r}")
+        if any(name in V7_CORRECTION_FIELDS for name in unknown):
+            raise RuleSpecError(
+                f"review correction fields require schema {RULE_SCHEMA_V7!r}")
         if any(name in V5_DEFAULT_EXTENSIONS for name in unknown):
             raise RuleSpecError(f"context fields require schema {RULE_SCHEMA_V5!r}")
         v6_extensions = [name for name in unknown if name in V6_DEFAULT_EXTENSIONS]
@@ -986,7 +1035,13 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if supplied_v6 & vwap_fields and family != "vwap_trend":
         raise RuleSpecError(
             "VWAP slope fields are only valid for vwap_trend")
-    if supplied_v6 & relative_volume_fields and family != "volume_breakout":
+    # A corrected same-clock volume confirmation reads the session count on
+    # any family; the family-level relative-volume mode stays scoped.
+    sessions_scoped = (schema == RULE_SCHEMA_V7 and
+                       value.get("volume_confirmation_mode") == "same_clock")
+    if family != "volume_breakout" and (
+            "relative_volume_mode" in supplied_v6 or
+            ("relative_volume_sessions" in supplied_v6 and not sessions_scoped)):
         raise RuleSpecError(
             "relative-volume fields are only valid for volume_breakout")
 
@@ -1080,11 +1135,141 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         if not math.isfinite(number) or not low <= number <= high:
             raise RuleSpecError("rule_spec.min_stop_distance_bps is outside its bounds")
         spec["min_stop_distance_bps"] = number
+        _validate_v7_corrections(spec)
     return spec
 
 
-def thesis_exit_deadline(entry_ts: Any, spec: Mapping[str, Any]) -> float | None:
+def _validate_v7_corrections(spec: dict[str, Any]) -> None:
+    """Normalize the opt-in V7 corrections and guard corrected registrations.
+
+    Absent and explicitly neutral corrections leave *spec* untouched, so a
+    stored V7 spec can never be rejected or re-identified here.
+    """
+    family = str(spec["family"])
+    for name, modes in V7_CORRECTION_MODES.items():
+        if name not in spec:
+            continue
+        raw = spec[name]
+        if raw is None or raw == modes[0]:
+            spec.pop(name)
+        elif not isinstance(raw, str) or raw not in modes:
+            raise RuleSpecError(
+                f"rule_spec.{name} must be one of {', '.join(modes)}")
+    for name in _V7_CORRECTION_BOUNDS:
+        if name in spec and spec[name] is None:
+            spec.pop(name)
+    if spec.get("residual_mode") == "beta":
+        spec.setdefault("residual_beta_sessions", DEFAULT_RESIDUAL_BETA_SESSIONS)
+    for name, (low, high, cast) in _V7_CORRECTION_BOUNDS.items():
+        if name not in spec:
+            continue
+        raw = spec[name]
+        if isinstance(raw, bool) or (cast is int and not isinstance(raw, int)):
+            raise RuleSpecError(f"rule_spec.{name} has an invalid type")
+        try:
+            number = cast(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuleSpecError(f"rule_spec.{name} must be numeric") from exc
+        if not math.isfinite(number) or not low <= number <= high:
+            raise RuleSpecError(
+                f"rule_spec.{name} must be between {low:g} and {high:g}")
+        spec[name] = number
+    if "range_multiplier" in spec and family != "range_expansion":
+        raise RuleSpecError("range_multiplier is only valid for range_expansion")
+    if spec.get("stop_mode") == "structure" and family != "opening_range_fade":
+        raise RuleSpecError(
+            "structural stops are only defined for opening_range_fade")
+    if "residual_mode" in spec and family != "cross_sectional_residual":
+        raise RuleSpecError(
+            "residual_mode is only valid for cross_sectional_residual")
+    if "residual_beta_sessions" in spec and spec.get("residual_mode") != "beta":
+        raise RuleSpecError("residual_beta_sessions requires residual_mode beta")
+    confirmations = {str(spec["confirmation"]), *spec["confirmations"]}
+    if ("volume_confirmation_mode" in spec and "volume" not in confirmations):
+        raise RuleSpecError(
+            "volume_confirmation_mode requires a volume confirmation")
+    if not any(name in spec for name in V7_CORRECTION_FIELDS):
+        return
+    # Guards for corrected registrations only (see V7_CORRECTION_MODES).
+    if _thesis_deadline_conflict(spec) is not None:
+        raise RuleSpecError(
+            "rule_spec.exit_before_minutes counts minutes before the 16:00 "
+            "close; this thesis deadline falls at or before the entry "
+            "window opens, so the rule can never hold a position")
+    if family == "trend_pullback" and "trend" in confirmations:
+        raise RuleSpecError(
+            "the trend confirmation repeats the trend_pullback predicate "
+            "(the same fast and slow moving averages); choose another filter")
+
+
+def _thesis_deadline_conflict(spec: Mapping[str, Any], *,
+                              require_full_window: bool = False) -> str | None:
+    minutes = spec.get("exit_before_minutes")
+    if minutes is None:
+        return None
+    deadline = SESSION_MINUTES - int(minutes)
+    after = int(spec.get("entry_after_minutes", 0))
+    before = int(spec.get("entry_before_minutes", SESSION_MINUTES))
+    if deadline <= after:
+        return THESIS_DEADLINE_BEFORE_ENTRY_WINDOW
+    if require_full_window and deadline < before + int(spec["max_hold_bars"]) + 1:
+        return THESIS_DEADLINE_INSIDE_ENTRY_HORIZON
+    return None
+
+
+def thesis_deadline_conflict(value: Mapping[str, Any], *,
+                             require_full_window: bool = False) -> str | None:
+    """Return why a rule's thesis deadline contradicts its entry window.
+
+    Measured on a regular 390-minute session, the thesis deadline lies
+    ``SESSION_MINUTES - exit_before_minutes`` minutes after 09:30.  ``None``
+    means no conflict (or no deadline).  The hard conflict is a deadline at or
+    before the entry window opens: such a rule can never hold a position.
+    With ``require_full_window`` the latest permitted entry plus its maximum
+    hold must also fit before the deadline, which is the check a new cohort
+    registration applies to every arm.  This is a diagnostic helper: it never
+    rejects a stored spec, and the corrected V7 grammar enforces only the hard
+    conflict.
+    """
+    return _thesis_deadline_conflict(
+        validate_rule_spec(value), require_full_window=require_full_window)
+
+
+def _session_close_epoch(local_entry: datetime, session_close: Any) -> float:
+    """Resolve the entry session's close, defaulting to the regular 16:00."""
+    zone = ZoneInfo("America/New_York")
+    if session_close is None:
+        return datetime.combine(local_entry.date(), time(16, 0),
+                                tzinfo=zone).timestamp()
+    if isinstance(session_close, time):
+        if session_close.tzinfo is not None:
+            raise RuleSpecError(
+                "session close time must be a New York wall-clock time")
+        return datetime.combine(local_entry.date(), session_close,
+                                tzinfo=zone).timestamp()
+    if isinstance(session_close, datetime) and (
+            session_close.tzinfo is None or session_close.utcoffset() is None):
+        raise RuleSpecError("session close datetime must be timezone-aware")
+    close = _epoch(session_close, "session close")
+    if (datetime.fromtimestamp(close, timezone.utc).astimezone(zone).date() !=
+            local_entry.date()):
+        raise RuleSpecError(
+            "session close must fall on the entry session's New York date")
+    return close
+
+
+def thesis_exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
+                         session_close: Any = None) -> float | None:
     """Return the v4 thesis deadline anchored to the entry session.
+
+    ``exit_before_minutes`` counts minutes before the session *close*, not
+    after the open: on a regular session 360 is 10:00 New York.
+    ``session_close`` is the caller's calendar close for the entry session
+    (a timezone-aware datetime, an epoch second on that New York date, or a
+    New York wall-clock ``time``).  When it is omitted the regular 16:00 close
+    is assumed, which is the historical behaviour; on a 13:00 early close that
+    unanchored deadline can fall after the close, where only the session
+    force-flat bounds the position.
 
     This is intentionally separate from the safety force-flat deadline.  A
     v4 plan persists both timestamps so an operator can distinguish a thesis
@@ -1103,8 +1288,7 @@ def thesis_exit_deadline(entry_ts: Any, spec: Mapping[str, Any]) -> float | None
     start = _epoch(entry_ts, "entry timestamp")
     zone = ZoneInfo("America/New_York")
     local = datetime.fromtimestamp(start, timezone.utc).astimezone(zone)
-    close = datetime.combine(local.date(), time(16, 0), tzinfo=zone)
-    return close.timestamp() - minutes * 60.0
+    return _session_close_epoch(local, session_close) - minutes * 60.0
 
 
 def canonical_exit_reason(reason: Any, *,
@@ -1131,11 +1315,14 @@ def canonical_exit_reason(reason: Any, *,
 
 
 def exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
-                  force_flat_ts: Any = None) -> dict[str, Any] | None:
+                  force_flat_ts: Any = None,
+                  session_close: Any = None) -> dict[str, Any] | None:
     """Return the earliest bounded exit deadline and its canonical cause.
 
     Equal timestamps use runtime precedence: the session safety flatten wins,
     then the authored thesis deadline, then the ordinary maximum hold.
+    ``session_close`` anchors the thesis deadline (see
+    :func:`thesis_exit_deadline`).
     """
     held = spec.get("max_hold_bars") if isinstance(spec, Mapping) else None
     candidates: list[tuple[float, int, str]] = []
@@ -1149,7 +1336,7 @@ def exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
         start = _epoch(entry_ts, "entry timestamp")
         candidates.append((start + (held + 1) * BAR_SECONDS, 2,
                            EXIT_REASON_MAX_HOLD))
-    thesis = thesis_exit_deadline(entry_ts, spec)
+    thesis = thesis_exit_deadline(entry_ts, spec, session_close=session_close)
     if thesis is not None:
         candidates.append((thesis, 1, EXIT_REASON_THESIS_DEADLINE))
     if force_flat_ts is not None:
@@ -1162,7 +1349,8 @@ def exit_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
 
 
 def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
-                  force_flat_ts: Any = None) -> float | None:
+                  force_flat_ts: Any = None,
+                  session_close: Any = None) -> float | None:
     """Absolute epoch second by which a bounded rule position must be flat.
 
     *entry_ts* is the opening timestamp of the entry bar, which is the bar
@@ -1172,7 +1360,8 @@ def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
     definition; a session force-flat always clamps it.  A spec without any
     bounded exit has no deadline.
     """
-    resolved = exit_deadline(entry_ts, spec, force_flat_ts=force_flat_ts)
+    resolved = exit_deadline(entry_ts, spec, force_flat_ts=force_flat_ts,
+                             session_close=session_close)
     return None if resolved is None else float(resolved["timestamp"])
 
 
@@ -1895,7 +2084,22 @@ def _cross_sectional_direction(
         return None, "cross_sectional_price_unavailable", metadata
     symbol_return = subject_end / subject_start - 1.0
     benchmark_return = benchmark_end / benchmark_start - 1.0
-    residual = symbol_return - benchmark_return
+    if spec.get("residual_mode") == "beta":
+        estimate = _prior_session_beta(
+            subject_symbol, current_stamp, bars, bars_by_symbol,
+            int(spec["residual_beta_sessions"]))
+        if estimate is None:
+            return None, "residual_beta_unavailable", metadata
+        beta, observations = estimate
+        residual = symbol_return - beta * benchmark_return
+        metadata.update({
+            "residual_mode": "beta",
+            "residual_beta": beta,
+            "residual_beta_sessions": int(spec["residual_beta_sessions"]),
+            "residual_beta_observations": observations,
+        })
+    else:
+        residual = symbol_return - benchmark_return
     context_digest = _context_digest(benchmark)
     metadata.update({
         "subject_symbol": subject_symbol,
@@ -1912,6 +2116,71 @@ def _cross_sectional_direction(
     if residual < -threshold:
         return "short", "passed", metadata
     return None, "residual_threshold_not_met", metadata
+
+
+def _prior_session_closes(rows: Sequence[Any], symbol: str, *,
+                          before_day: Any, cutoff: datetime) -> dict[Any, dict[datetime, float]]:
+    """Closes by New York session for sessions strictly before *before_day*."""
+    zone = ZoneInfo("America/New_York")
+    sessions: dict[Any, dict[datetime, float]] = {}
+    for row in rows:
+        stamp = _timestamp(row)
+        if stamp is None or _row_symbol(row) not in (None, symbol):
+            continue
+        if not _context_available_by(row, cutoff):
+            continue
+        day = stamp.astimezone(zone).date()
+        if day >= before_day:
+            continue
+        close = _number(row, "close")
+        if close > 0:
+            sessions.setdefault(day, {})[stamp.astimezone(timezone.utc)] = close
+    return sessions
+
+
+def _prior_session_beta(subject_symbol: str, current_stamp: datetime,
+                        bars: Sequence[Any],
+                        bars_by_symbol: Mapping[str, Sequence[Any]] | None,
+                        sessions: int) -> tuple[float, int] | None:
+    """Causal OLS beta of the subject on SPY from the latest prior sessions.
+
+    Uses synchronized one-minute close-to-close returns: both symbols must
+    have a bar at the minute and at the minute before, inside one New York
+    session.  Only sessions strictly before the signal's session, and rows
+    available by the signal bar, are read.  The subject's history comes from
+    its ``bars_by_symbol`` entry, or else from earlier sessions in *bars*.
+    Too few shared sessions or returns, or a flat benchmark, fail closed.
+    """
+    zone = ZoneInfo("America/New_York")
+    day = current_stamp.astimezone(zone).date()
+    subject_rows = _context_rows(bars_by_symbol, subject_symbol) or tuple(bars)
+    benchmark_rows = _context_rows(bars_by_symbol, CROSS_SECTIONAL_BENCHMARK) or ()
+    subject = _prior_session_closes(subject_rows, subject_symbol,
+                                    before_day=day, cutoff=current_stamp)
+    benchmark = _prior_session_closes(benchmark_rows, CROSS_SECTIONAL_BENCHMARK,
+                                      before_day=day, cutoff=current_stamp)
+    shared = sorted(set(subject) & set(benchmark))
+    if len(shared) < sessions:
+        return None
+    step = timedelta(minutes=1)
+    xs: list[float] = []
+    ys: list[float] = []
+    for session in shared[-sessions:]:
+        own, market = subject[session], benchmark[session]
+        for stamp in sorted(own):
+            previous = stamp - step
+            if previous in own and stamp in market and previous in market:
+                ys.append(own[stamp] / own[previous] - 1.0)
+                xs.append(market[stamp] / market[previous] - 1.0)
+    if len(xs) < MIN_RESIDUAL_BETA_OBSERVATIONS:
+        return None
+    x_mean, y_mean = mean(xs), mean(ys)
+    variance = sum((x - x_mean) ** 2 for x in xs)
+    covariance = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    if not math.isfinite(variance) or variance <= 0:
+        return None
+    beta = covariance / variance
+    return (beta, len(xs)) if math.isfinite(beta) else None
 
 
 def _sma(values: Sequence[float], length: int) -> float:
@@ -1996,10 +2265,19 @@ def _confirmations_pass(direction: str, rows: Sequence[Any],
 
 
 def _confirmation(direction: str, rows: Sequence[Any], spec: Mapping[str, Any],
-                  kind: str | None = None) -> bool:
+                  kind: str | None = None, *,
+                  bars_by_symbol: Mapping[str, Sequence[Any]] | None = None) -> bool:
     kind = spec["confirmation"] if kind is None else kind
     if kind == "none":
         return True
+    if kind == "volume" and spec.get("volume_confirmation_mode") == "same_clock":
+        # Intraday volume is U-shaped, so the preceding minutes are not a
+        # neutral baseline; compare with the same clock minute of the exact
+        # prior same-feed sessions instead (fails closed when unavailable).
+        relative = (_same_clock_relative_volume(
+            rows[-1], bars_by_symbol, int(spec["relative_volume_sessions"]))
+            if rows else None)
+        return relative is not None and relative >= float(spec["volume_multiplier"])
     closes = [_number(row, "close") for row in rows]
     if kind == "trend":
         if len(closes) < spec["slow_lookback"]:
@@ -2521,8 +2799,11 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
         ranges = [_number(row, "high") - _number(row, "low") for row in previous]
         average_range = mean(ranges) if ranges else 0.0
         current_range = _number(current, "high") - _number(current, "low")
+        # Legacy specs reuse volume_multiplier as the range multiple; a
+        # corrected V7 spec names its own range_multiplier.
+        multiplier = spec.get("range_multiplier", spec["volume_multiplier"])
         if (average_range > 0 and
-                current_range >= average_range * spec["volume_multiplier"]):
+                current_range >= average_range * multiplier):
             if close > opened * (1 + threshold):
                 if (spec.get("schema") not in {RULE_SCHEMA_V6, RULE_SCHEMA_V7} or
                         _range_expansion_directional_shape(current, "long", spec)):
@@ -2560,6 +2841,60 @@ def _family_direction(bars: Sequence[Any], spec: Mapping[str, Any], *,
                                      endpoint=last, direction="short"):
                 direction = "short"
     return direction, "passed" if direction is not None else reason
+
+
+def _previous_family_direction(
+        bars: Sequence[Any], spec: Mapping[str, Any], *,
+        bars_by_symbol: Mapping[str, Sequence[Any]] | None,
+        symbol: str | None) -> str | None:
+    """The family predicate's direction on the previous completed bar.
+
+    A prefix too short for the state predicate cannot have satisfied it, so
+    the current bar is then a first cross by definition.
+    """
+    prior = list(bars[:-1])
+    if len(prior) < _causal_maturity_bars(spec):
+        return None
+    if spec["family"] == "cross_sectional_residual":
+        return _cross_sectional_direction(
+            prior, spec, bars_by_symbol=bars_by_symbol, symbol=symbol)[0]
+    previous = prior[-1]
+    return _family_direction(
+        prior, spec, close=_number(previous, "close"),
+        opened=_number(previous, "open"), bars_by_symbol=bars_by_symbol)[0]
+
+
+def _corrected_stop_distance(bars: Sequence[Any], spec: Mapping[str, Any], *,
+                             atr: float, close: float,
+                             direction: str) -> tuple[float | None, float | None]:
+    """Authored stop distance for an opt-in V7 ``stop_mode``, before the floor.
+
+    ``horizon_atr`` scales the subject's own prior-bar ATR by the square root
+    of the authored holding horizon, so one multiple means a comparable
+    volatility distance on every symbol.  ``structure`` places an
+    opening-range fade one ATR beyond its failed-breakout extreme (the signal
+    bar's wick or the threshold level, whichever is further), the level whose
+    breach invalidates the fade.  Returns ``(distance, structural_level)``.
+    """
+    multiple = float(spec["stop_atr"])
+    if spec["stop_mode"] == "horizon_atr":
+        return atr * multiple * math.sqrt(int(spec["max_hold_bars"])), None
+    current = bars[-1]
+    opening = _complete_opening_window(bars, current, int(spec["range_minutes"]))
+    if opening is None:
+        return None, None
+    threshold = spec["threshold_bps"] / 10_000.0
+    if direction == "short":
+        level = max(_number(current, "high"),
+                    max(_number(row, "high") for row in opening) * (1 + threshold))
+        reach = level - close
+    else:
+        level = min(_number(current, "low"),
+                    min(_number(row, "low") for row in opening) * (1 - threshold))
+        reach = close - level
+    if not math.isfinite(reach) or reach <= 0:
+        return None, None
+    return reach + atr * multiple, level
 
 
 def _evaluate_rule_signal_staged(
@@ -2629,6 +2964,13 @@ def _evaluate_rule_signal_staged(
     if not stage("family_predicate", direction is not None, family_reason):
         return None, stages, family_metadata
     assert direction is not None
+    if spec.get("signal_event") == "first_cross":
+        previous = _previous_family_direction(
+            bars, spec, bars_by_symbol=bars_by_symbol, symbol=symbol)
+        fresh = previous != direction
+        if not stage("signal_event", fresh,
+                     "passed" if fresh else "predicate_already_held"):
+            return None, stages, family_metadata
     if spec.get("regime_mode", "none") != "none":
         source = []
         for row in bars:
@@ -2659,7 +3001,8 @@ def _evaluate_rule_signal_staged(
     confirmations = [str(spec["confirmation"]),
                      *(str(item) for item in spec.get("confirmations") or ())]
     for kind in confirmations:
-        passed = _confirmation(direction, bars, spec, kind)
+        passed = _confirmation(direction, bars, spec, kind,
+                               bars_by_symbol=bars_by_symbol)
         if not stage(f"confirmation:{kind}", passed,
                      "passed" if passed else "confirmation_failed"):
             return None, stages, family_metadata
@@ -2678,7 +3021,19 @@ def _evaluate_rule_signal_staged(
         return None, stages, family_metadata
     floor_fraction = (spec["min_stop_distance_bps"] / 10_000.0
                       if spec["schema"] == RULE_SCHEMA_V7 else MIN_STOP_DISTANCE_FRACTION)
-    distance = max(atr * spec["stop_atr"], close * floor_fraction)
+    stop_mode = spec.get("stop_mode")
+    structural_level = None
+    if stop_mode is None:
+        distance = max(atr * spec["stop_atr"], close * floor_fraction)
+    else:
+        authored, structural_level = _corrected_stop_distance(
+            bars, spec, atr=atr, close=close, direction=direction)
+        if not stage("stop_geometry", authored is not None,
+                     "passed" if authored is not None
+                     else "structural_stop_unavailable"):
+            return None, stages, family_metadata
+        assert authored is not None
+        distance = max(authored, close * floor_fraction)
     stop = close - distance if direction == "long" else close + distance
     target_mode = str(spec.get("target_mode") or "fixed_r")
     target_reference = frozen_target_reference(bars, spec)
@@ -2755,6 +3110,27 @@ def _evaluate_rule_signal_staged(
         result.update(family_metadata)
     if spec["schema"] == RULE_SCHEMA_V7:
         result["min_stop_distance_bps"] = spec["min_stop_distance_bps"]
+        # Opt-in corrections are reported only when the spec carries them,
+        # so a frozen V7 signal keeps its exact shape.
+        if "signal_event" in spec:
+            result["signal_event"] = spec["signal_event"]
+        if stop_mode is not None:
+            result.update({
+                "stop_mode": stop_mode,
+                "authored_stop_distance": authored,
+                "stop_floor_binding": bool(close * floor_fraction >= authored),
+            })
+            if structural_level is not None:
+                result["structural_stop_level"] = structural_level
+        if "range_multiplier" in spec:
+            result["range_multiplier"] = spec["range_multiplier"]
+        if spec.get("volume_confirmation_mode") == "same_clock":
+            result.update({
+                "volume_confirmation_mode": "same_clock",
+                "confirmation_relative_volume": _same_clock_relative_volume(
+                    current, bars_by_symbol,
+                    int(spec["relative_volume_sessions"])),
+            })
     if "intraday_context" in family_metadata:
         result["intraday_context"] = family_metadata["intraday_context"]
     stage("signal", True, "emitted")
@@ -2814,7 +3190,10 @@ def evaluate_rule_signal_metadata(rows: Sequence[Any],
                spec["atr_period"])
     atr_bps = (float(atr) / close * 10_000.0
                if atr is not None and close > 0 else None)
-    authored_distance = (float(atr) * float(spec["stop_atr"])
+    # A corrected V7 stop mode reports its own authored distance.
+    authored_distance = (float(signal["authored_stop_distance"])
+                         if "authored_stop_distance" in signal else
+                         float(atr) * float(spec["stop_atr"])
                          if atr is not None else None)
     floor_fraction = (spec["min_stop_distance_bps"] / 10_000.0
                       if spec["schema"] == RULE_SCHEMA_V7 else MIN_STOP_DISTANCE_FRACTION)
@@ -2932,6 +3311,8 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
         evidence["intraday_context"] = snapshot["intraday_context"]
     if spec["schema"] == RULE_SCHEMA_V7:
         evidence["min_stop_distance_bps"] = spec["min_stop_distance_bps"]
+        evidence.update({name: spec[name] for name in V7_CORRECTION_FIELDS
+                         if name in spec})
     if spec["family"] == "cross_sectional_residual":
         evidence.update({
             "benchmark_symbol": snapshot.get(
@@ -2954,6 +3335,10 @@ __all__ = [
     "EXIT_REASON_TARGET", "EXIT_REASON_THESIS_DEADLINE",
     "EXIT_REASON_UNKNOWN",
     "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
+    "DEFAULT_RESIDUAL_BETA_SESSIONS", "MIN_RESIDUAL_BETA_OBSERVATIONS",
+    "THESIS_DEADLINE_BEFORE_ENTRY_WINDOW",
+    "THESIS_DEADLINE_INSIDE_ENTRY_HORIZON",
+    "V7_CORRECTION_FIELDS", "V7_CORRECTION_MODES",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
            "RULE_SCHEMA_V2", "RULE_SCHEMA_V3", "RULE_SCHEMA_V4", "RULE_SCHEMA_V5", "RULE_SCHEMA_V6", "RULE_SCHEMA_V7", "SESSION_MINUTES",
            "V2_DEFAULT_EXTENSIONS", "V3_DEFAULT_EXTENSIONS", "V4_DEFAULT_EXTENSIONS", "V5_DEFAULT_EXTENSIONS", "V6_DEFAULT_EXTENSIONS", "V7_DEFAULT_EXTENSIONS", "V6_COMPRESSION_MODES", "V6_VWAP_SLOPE_MODES", "V6_RELATIVE_VOLUME_MODES",
@@ -2970,7 +3355,8 @@ __all__ = [
     "evaluate_rule_signal_metadata", "frozen_target_reference",
     "initialize_exit_state",
     "rule_signal_metadata",
-    "generate_rule_signal", "hold_deadline", "thesis_exit_deadline", "rule_spec_hash",
+    "generate_rule_signal", "hold_deadline", "thesis_deadline_conflict",
+    "thesis_exit_deadline", "rule_spec_hash",
     "rule_variant_id", "rule_vehicle_executable", "setup_evidence",
     "validate_rule_spec",
 ]
