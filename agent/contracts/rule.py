@@ -227,6 +227,13 @@ V7_CORRECTION_MODES: dict[str, tuple[str, ...]] = {
     # same_clock: the volume confirmation compares the bar with the same
     # clock minute of prior sessions instead of the preceding minutes.
     "volume_confirmation_mode": ("current_feed", "same_clock"),
+    # zero_volume (session-anchored rules only, A-08): a missing IEX minute
+    # after the 09:30 open is a minute with no IEX volume instead of voiding
+    # every later signal of the session.  Replay then needs adjacency only
+    # over the trailing causal window (continuity_window_bars), the opening
+    # range keeps its own complete-window check, and the session must still
+    # be observed from the bell so a session VWAP cannot start late.
+    "session_gap_mode": ("strict_prefix", "zero_volume"),
 }
 _V7_CORRECTION_BOUNDS = {
     # range_expansion's own range multiple; absent means volume_multiplier.
@@ -385,6 +392,34 @@ def causal_maturity_bars(value: Mapping[str, Any]) -> int:
     return _causal_maturity_bars(validate_rule_spec(value))
 
 
+def _session_anchored(spec: Mapping[str, Any]) -> bool:
+    """Whether a normalized spec retains a session-open anchor."""
+    family = str(spec["family"])
+    # Cumulative/session VWAP families retain a session-open anchor.  The V6
+    # rolling slope is different: its predicate reads only the final two
+    # equal windows, so replay can scope adjacency to that bounded horizon.
+    rolling_vwap = (
+        spec.get("schema") in {RULE_SCHEMA_V6, RULE_SCHEMA_V7} and
+        family == "vwap_trend" and
+        spec.get("vwap_slope_mode") == "rolling" and
+        spec.get("target_mode") != "session_vwap")
+    return ((family in SESSION_ACCUMULATING_FAMILIES and not rolling_vwap) or
+            family in OPENING_ANCHORED_FAMILIES or
+            spec.get("target_mode") == "session_vwap")
+
+
+def _trailing_window_bars(spec: Mapping[str, Any]) -> int:
+    needed = _causal_maturity_bars(spec)
+    if spec.get("regime_mode", "none") != "none":
+        # Retain enough minutes for N completed buckets at every alignment.
+        needed = max(needed, (spec["regime_lookback_bars"] + 1) *
+                     spec["regime_timeframe_minutes"] - 1)
+    if spec.get("signal_event") == "first_cross":
+        # A first-cross event also re-reads the previous bar's window.
+        needed += 1
+    return needed
+
+
 def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     """Trailing completed bars :func:`evaluate_rule_signal` reads for a spec.
 
@@ -400,28 +435,25 @@ def feature_window_bars(value: Mapping[str, Any]) -> int | None:
     signal, and deleting the observation for it would discard good evidence.
     """
     spec = validate_rule_spec(value)
-    family = str(spec["family"])
-    # Cumulative/session VWAP families retain a session-open anchor.  The V6
-    # rolling slope is different: its predicate reads only the final two
-    # equal windows, so replay can scope adjacency to that bounded horizon.
-    rolling_vwap = (
-        spec.get("schema") in {RULE_SCHEMA_V6, RULE_SCHEMA_V7} and
-        family == "vwap_trend" and
-        spec.get("vwap_slope_mode") == "rolling" and
-        spec.get("target_mode") != "session_vwap")
-    if ((family in SESSION_ACCUMULATING_FAMILIES and not rolling_vwap) or
-            family in OPENING_ANCHORED_FAMILIES or
-            spec.get("target_mode") == "session_vwap"):
+    if _session_anchored(spec):
         return None
-    needed = _causal_maturity_bars(spec)
-    if spec.get("regime_mode", "none") != "none":
-        # Retain enough minutes for N completed buckets at every alignment.
-        needed = max(needed, (spec["regime_lookback_bars"] + 1) *
-                     spec["regime_timeframe_minutes"] - 1)
-    if spec.get("signal_event") == "first_cross":
-        # A first-cross event also re-reads the previous bar's window.
-        needed += 1
-    return needed
+    return _trailing_window_bars(spec)
+
+
+def continuity_window_bars(value: Mapping[str, Any]) -> int | None:
+    """Trailing bars replay must find adjacent before it evaluates a spec.
+
+    This is :func:`feature_window_bars` except under the opt-in V7
+    ``session_gap_mode: zero_volume`` (review finding A-08).  There a missing
+    minute between the open and the trailing causal window is a minute with no
+    IEX volume, so only that trailing window must be adjacent; the evaluator
+    still reads the whole session prefix and refuses a session that was not
+    observed from 09:30.  ``None`` keeps the whole-prefix requirement.
+    """
+    spec = validate_rule_spec(value)
+    if spec.get("session_gap_mode") == "zero_volume":
+        return _trailing_window_bars(spec)
+    return feature_window_bars(spec)
 
 
 def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
@@ -1188,6 +1220,9 @@ def _validate_v7_corrections(spec: dict[str, Any]) -> None:
     if ("volume_confirmation_mode" in spec and "volume" not in confirmations):
         raise RuleSpecError(
             "volume_confirmation_mode requires a volume confirmation")
+    if "session_gap_mode" in spec and not _session_anchored(spec):
+        raise RuleSpecError(
+            "session_gap_mode is only valid for session-anchored rules")
     if not any(name in spec for name in V7_CORRECTION_FIELDS):
         return
     # Guards for corrected registrations only (see V7_CORRECTION_MODES).
@@ -2335,6 +2370,16 @@ def _session_prefix(bars: Sequence[Any], current: Any) -> list[Any]:
     return prefix
 
 
+def _session_opens_at_bell(bars: Sequence[Any], current: Any) -> bool:
+    """Whether *current*'s session prefix starts with the 09:30 bar."""
+    prefix = _session_prefix(bars, current)
+    stamp = _timestamp(prefix[0]) if prefix else None
+    if stamp is None:
+        return False
+    local = stamp.astimezone(ZoneInfo("America/New_York"))
+    return (local.hour, local.minute, local.second, local.microsecond) == (9, 30, 0, 0)
+
+
 def _volume_input_rows(bars: Sequence[Any], current: Any,
                        spec: Mapping[str, Any]) -> Sequence[Any] | None:
     """Return the exact prefix whose volume is part of the active evidence."""
@@ -2935,6 +2980,13 @@ def _evaluate_rule_signal_staged(
     if not stage("positive_close", close > 0,
                  "passed" if close > 0 else "nonpositive_close"):
         return None, stages, family_metadata
+    if spec.get("session_gap_mode") == "zero_volume":
+        # A-08: later gaps are tolerated as minutes without IEX volume, but a
+        # session first seen after the bell would start its VWAP late.
+        opened_at_bell = _session_opens_at_bell(bars, current)
+        if not stage("session_open", opened_at_bell,
+                     "passed" if opened_at_bell else "session_open_bar_missing"):
+            return None, stages, family_metadata
     volume_rows = _volume_input_rows(bars, current, spec)
     confirmations = {str(spec.get("confirmation") or "none")}
     confirmations.update(str(item) for item in spec.get("confirmations") or ())
@@ -3345,7 +3397,8 @@ __all__ = [
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "OPENING_ANCHORED_FAMILIES",
            "entry_window_bounds", "session_minutes",
-           "causal_maturity_bars", "feature_window_bars", "rule_behavior_identity",
+           "causal_maturity_bars", "feature_window_bars", "continuity_window_bars",
+           "rule_behavior_identity",
            "cross_sectional_symbol_eligibility",
            "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",

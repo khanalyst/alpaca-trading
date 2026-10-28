@@ -21,7 +21,8 @@ from agent.contracts.rule import (
     V2_DEFAULT_EXTENSIONS, V3_DEFAULT_EXTENSIONS, V4_DEFAULT_EXTENSIONS,
     canonical_exit_reason, completed_bar_exit_transition, evaluate_rule_signal,
     evaluate_rule_signal_trace, frozen_target_reference,
-    exit_deadline, feature_window_bars, thesis_exit_deadline,
+    continuity_window_bars, exit_deadline, feature_window_bars,
+    thesis_exit_deadline,
     rule_semantic_signature,
     initialize_exit_state, rule_behavior_identity, rule_variant_id,
     rule_vehicle_executable,
@@ -540,6 +541,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     # ``None`` means the family retains a session-open anchor, so its window
     # starts at the session's first bar rather than a trailing offset.
     window = feature_window_bars(spec)
+    # The span that must be gap-free.  It equals ``window`` except for the
+    # opt-in V7 session_gap_mode zero_volume (A-08), where a minute missing
+    # before the trailing causal window is a minute with no IEX volume.
+    continuity = continuity_window_bars(spec)
     minimum_prefix = causal_maturity_bars(spec)
     # A signal needs its complete causal prefix plus an entry bar.  Report a
     # short session as missing evidence, never as a tested predicate that did
@@ -571,7 +576,9 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         # silently evaluates a different statistic than the spec names.
         feature_start = (0 if window is None
                          else max(0, index + 1 - int(window)))
-        if not _contiguous(session_bars, feature_start, index + 1):
+        continuity_start = (0 if continuity is None
+                            else max(0, index + 1 - int(continuity)))
+        if not _contiguous(session_bars, continuity_start, index + 1):
             gapped_prefixes += 1
             continue
         evaluated_prefixes += 1
