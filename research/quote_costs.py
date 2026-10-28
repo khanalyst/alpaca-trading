@@ -717,7 +717,7 @@ def measure_quote_costs(quotes: Iterable[Any], *,
                         feed: str | None = None,
                         provider: str | None = None,
                         min_quotes_per_cell: int = 500,
-                        min_sessions_per_cell: int | None = DEFAULT_MIN_SESSIONS_PER_CELL,
+                        min_sessions_per_cell: int | None = None,
                         regular_session_aggregates: bool = True) -> dict[str, Any]:
     """Fit a spread and depth schedule from recorded two-sided quotes.
 
@@ -727,11 +727,14 @@ def measure_quote_costs(quotes: Iterable[Any], *,
     bid/ask are two-sided and positive; missing or malformed displayed sizes
     leave that spread observation intact but do not shape executable depth.
 
-    A bucket cell is emitted only with ``min_quotes_per_cell`` quotes from at
-    least ``min_sessions_per_cell`` sessions, and pre-open and post-close
-    quotes stay out of the symbol and universe aggregates.  Passing
-    ``min_sessions_per_cell=None`` and ``regular_session_aggregates=False``
-    reproduces a schedule fitted before both rules existed, byte for byte.
+    Pre-open and post-close quotes stay out of the symbol and universe
+    aggregates.  With ``min_sessions_per_cell`` (``DEFAULT_MIN_SESSIONS_PER_CELL``
+    for new research runs, as ``research.cost_rerun`` passes) a bucket cell is
+    emitted only when its quotes span that many sessions, and the schedule
+    records the floor so the resolver enforces it.  The floor is opt-in here
+    because existing callers fit deliberately small fixtures.  Passing
+    ``regular_session_aggregates=False`` (and no floor) reproduces a schedule
+    fitted before both rules existed, byte for byte.
     """
     min_quotes = _positive_integer(min_quotes_per_cell,
                                    "min_quotes_per_cell")

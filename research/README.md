@@ -269,10 +269,13 @@ missing or under-covered cell never falls back to a broader average. In
 account simulation (the factory lanes and `cost_rerun`) it refuses that one
 opportunity with `reject_stage` `cost_coverage` and `reject_reason`
 `measured_cost_unavailable`; IBR repricing and the edge-discovery account
-still abort. A bucket cell needs `min_quotes_per_cell` quotes from at least
-five sessions (`min_sessions_per_cell`, recorded in the schedule), because
-recorder snapshots within one session are autocorrelated, and pre-open and
-post-close quotes no longer enter the symbol and universe aggregates. Depth
+still abort. Schedules fitted by `cost_rerun` require each bucket cell to
+span at least five sessions as well as `min_quotes_per_cell` quotes
+(`min_sessions_per_cell`, recorded in the schedule and enforced by the
+resolver), because recorder snapshots within one session are autocorrelated;
+`measure_quote_costs` applies the floor only when asked, so other callers
+(`deploy/trader_projection.py`) still fit without it. Pre-open and post-close
+quotes no longer enter the symbol and universe aggregates. Depth
 impact is zero for an order that fits displayed size, so a stop exit also
 pays an explicit stop-trigger slippage of one tick at its reference price
 (named in the leg provenance as `stop-trigger-<bps>`). The checked-in block

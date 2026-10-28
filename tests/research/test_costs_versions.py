@@ -553,7 +553,9 @@ class MeasuredModeTests(unittest.TestCase):
     def test_cells_need_sessions_not_just_snapshots(self):
         # 600 snapshots in one half-hour cell, but from only two sessions.
         rows = _session_quotes(sessions=2, minutes=30) * 10
-        schedule = measure_quote_costs(rows, min_quotes_per_cell=500)
+        # cost_rerun (new research runs) fits with this floor.
+        schedule = measure_quote_costs(rows, min_quotes_per_cell=500,
+                                       min_sessions_per_cell=5)
         self.assertNotIn("m000_030", schedule["symbols"]["SPY"]["buckets"])
         self.assertEqual(schedule["measured"]["min_sessions_per_cell"], 5)
         with self.assertRaisesRegex(QuoteCostError, "under-covered"):

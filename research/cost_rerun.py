@@ -52,6 +52,7 @@ from .quote_costs import (measure_quote_costs, cost_model_from_schedule,
                           measured_cost_resolver, schedule_costs_block,
                           bucket_label, QuoteCostError)
 from .stressed_cost_calibration import (DEFAULT_FALLBACK_SCENARIO_BPS,
+                                        DEFAULT_MIN_SESSIONS_PER_CELL,
                                         activation_overlay,
                                         calibrate_stressed_cost)
 from .source_validation import validate_source
@@ -832,15 +833,19 @@ def _measure_calibration_rows(raw, bars, snapshot_map, quote_rows, policy_source
                            if quote_session(item) in fit_sessions))
     validation_source = (lambda: (item for item in raw_quotes()
                                   if quote_session(item) in validation_sessions))
+    # A cell's quote count is a count of autocorrelated snapshots; new runs
+    # also require each cell to span DEFAULT_MIN_SESSIONS_PER_CELL sessions.
     schedule = measure_quote_costs(
         fit_source() if fit_quote_count else raw_quotes(),
-        min_quotes_per_cell=int(min_quotes_per_cell))
+        min_quotes_per_cell=int(min_quotes_per_cell),
+        min_sessions_per_cell=DEFAULT_MIN_SESSIONS_PER_CELL)
     validation_schedule = None
     validation_schedule_reason = None
     if validation_quote_count:
         try:
             validation_schedule = measure_quote_costs(
-                validation_source(), min_quotes_per_cell=int(min_quotes_per_cell))
+                validation_source(), min_quotes_per_cell=int(min_quotes_per_cell),
+                min_sessions_per_cell=DEFAULT_MIN_SESSIONS_PER_CELL)
         except QuoteCostError as exc:
             validation_schedule_reason = str(exc)
     risk = runtime_config.get("risk") or {}
