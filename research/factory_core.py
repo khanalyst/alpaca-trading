@@ -50,6 +50,7 @@ from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
                           replay_record_is_available)
 from .maturity import causal_maturity_bars
 from .path_telemetry import compute_path_telemetry
+from .quote_costs import QuoteCostError
 
 
 # `risk.max_position_notional_pct` in the checked runtime config.  Research
@@ -1412,6 +1413,22 @@ def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime,
     return None if selected is None else selected[0]
 
 
+def _cost_coverage_refusal(*, vehicle: str, symbol: str, day: date,
+                           opportunity: Any, leg: str, error: Exception,
+                           telemetry: Mapping[str, Any]) -> dict[str, Any]:
+    """One refused opportunity whose measured cost leg is unavailable."""
+    return {"vehicle": vehicle, "symbol": symbol,
+            "session_date": day.isoformat(), "opportunity_id": opportunity,
+            "net_pnl": 0.0, "return_value": 0.0, "no_trade": True,
+            "execution_disposition": "refused",
+            "signal_opportunity": True,
+            "reject_stage": "cost_coverage",
+            "reject_reason": "measured_cost_unavailable",
+            "cost_coverage_leg": leg,
+            "cost_coverage_detail": str(error),
+            **telemetry}
+
+
 def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSnapshot],
                      spec: Mapping[str, Any], *, vehicle: str, account_id: str,
                      starting_cash: float = 100_000.0, risk_pct: float = .5,
@@ -1715,7 +1732,17 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             "contracts": quantity if vehicle == "option" else None,
             "entry_notional": float(entry_notional),
         }
-        model = resolve_cost_model(cost_context)
+        try:
+            model = resolve_cost_model(cost_context)
+        except QuoteCostError as exc:
+            # Strict measured coverage refuses this one opportunity (for
+            # example an under-covered half-hour cell); it must not abort the
+            # whole replay.
+            rows.append(_cost_coverage_refusal(
+                vehicle=vehicle, symbol=symbol, day=day,
+                opportunity=opportunity, leg="entry", error=exc,
+                telemetry=sizing_telemetry))
+            continue
         sizing_telemetry.update({
             "cost_model_provenance": model.provenance,
             "entry_cost_model_provenance": model.provenance,
@@ -1836,11 +1863,18 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                              "entry_slippage": slippage_telemetry})
                 continue
         execution_direction = "long" if vehicle == "option" else raw["direction"]
-        exit_model = resolve_cost_model({
-            **cost_context,
-            "cost_leg": "exit",
-            "cost_timestamp": raw.get("exit_timestamp"),
-        })
+        try:
+            exit_model = resolve_cost_model({
+                **cost_context,
+                "cost_leg": "exit",
+                "cost_timestamp": raw.get("exit_timestamp"),
+            })
+        except QuoteCostError as exc:
+            rows.append(_cost_coverage_refusal(
+                vehicle=vehicle, symbol=symbol, day=day,
+                opportunity=opportunity, leg="exit", error=exc,
+                telemetry=sizing_telemetry))
+            continue
         entry = model.execution_price(
             raw["entry_reference"], execution_direction, entry=True,
             executable_quote=(vehicle == "option" and _fresh(

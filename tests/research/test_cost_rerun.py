@@ -17,7 +17,6 @@ from agent.contracts.rule import validate_rule_spec
 from research.cost_rerun import (deterministic_cohort, render_text,
                                  run_cost_rerun, verify_cost_evidence,
                                  write_immutable_evidence)
-from research.quote_costs import QuoteCostError
 from tests.research.test_factory_end_to_end import edge_corpus
 
 
@@ -128,16 +127,23 @@ class CostRerunTests(unittest.TestCase):
             report["cost_models"]["measured"]["provenance"].startswith(
                 "measured:"))
 
-    def test_an_undercovered_requested_bucket_fails_the_rerun_clearly(self):
+    def test_an_undercovered_requested_bucket_is_refused_not_fatal(self):
         # Six sessions leave only 12 quotes in the late exit bucket at the
         # existing 50-quote floor.  The strict measured resolver must surface
-        # that missing evidence instead of producing a non-comparable report.
-        with self.assertRaisesRegex(
-                QuoteCostError,
-                r"requested measured cost bucket .*unavailable.*under-covered"):
-            run_cost_rerun(_depth_qualified_edge_corpus(6),
-                           runtime_config=self.config,
-                           specs=self.cohort[:1], min_quotes_per_cell=50)
+        # that missing evidence.  It used to abort the whole rerun; it now
+        # refuses that one opportunity with reject_stage cost_coverage, and
+        # the refusal is counted in the measured arm's breakdown (E1-09).
+        report = run_cost_rerun(_depth_qualified_edge_corpus(6),
+                                runtime_config=self.config,
+                                specs=self.cohort[:1], min_quotes_per_cell=50)
+
+        def refusals(arm):
+            return sum(cell["reject_reasons"].get("measured_cost_unavailable", 0)
+                       for item in report["results"]
+                       for cell in item[arm]["breakdown"])
+
+        self.assertGreater(refusals("measured"), 0)
+        self.assertEqual(refusals("configured"), 0)
 
     def test_only_the_cost_model_differs_between_arms(self):
         self.assertTrue(self.traded)

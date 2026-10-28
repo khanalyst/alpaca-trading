@@ -214,15 +214,73 @@ shipped defaults are 4 bps spread, 6 bps adverse slippage, 0.5 bps per-side
 notional fee, and a 0.65 currency-unit option fee per contract per side. These
 are expected costs, not rejection caps.
 
+### Cost-model versions
+
+The review of 15 October 2026 (E1-01) found those constants charge 17 bps per
+round trip on bar references (13 bps on top of executable quotes), against a
+realistic 1.5 to 4 bps on this universe. Two versions now exist:
+
+- `static_v1` is the original flat model above. It remains the behaviour of
+  `CostModel` and of every lane that does not ask for another version, so
+  stored evidence, candidate identities and sealed tests recompute exactly
+  (`tests/research/test_costs_versions.py` pins its outputs to a fingerprint
+  of the original code). Its rows and reports carry no version field; absence
+  means `static_v1`. Its `as_dict` is unchanged because identity hashes use it.
+- `per_symbol_v2` is `research.costs.PerSymbolCostModel`, the arithmetic of
+  `studies/liquid_reversion/costs.py`: one full spread per round trip, the
+  larger of one tick and the symbol's measured or reference spread
+  (`docs/audit-2026-09-21/spread-reference.json`, embedded in
+  `REFERENCE_SPREADS_BPS`); explicit slippage per side (0.5 bps) on market and
+  stop legs only, plus one tick of stop-trigger slippage on stop legs; the SEC
+  Section 31 fee ($20.60 per million, SEC Fee Rate Advisory 2026-2) and the
+  FINRA TAF ($0.000195 per share, capped at $9.79; paused from 1 October to
+  31 December 2026 under SR-FINRA-2026-021, kept as a parameter) on the sell
+  leg only. Legs are priced by the runtime's order types: the entry is a
+  marketable limit at the executable quote and the take-profit a resting limit,
+  so neither slips; each says in its provenance that its non-fill risk is not
+  modelled (a `target_fill_probability` below 1 charges the unfilled share the
+  cost of the market exit that replaces it). Every leg it prices records
+  `per_symbol_v2` in its provenance, and every report it produces records
+  `cost_model_version`.
+
+At the reference prices the `per_symbol_v2` round trip (marketable entry and
+exit from a bar) is 2.18 bps for SPY, 2.50 for QQQ, 2.49 for IWM and 2.49 for
+HYG; across the 24 symbols it runs from 1.75 (VB) to 4.07 (SLV).
+
+`per_symbol_v2` is the default for new research runs: `research.cost_rerun`
+replays every variant under it (with each quoted symbol's measured median
+spread) next to the configured and measured arms, and reports its round trips.
+It is not yet the default of the factory and gate lanes, because switching
+them changes every candidate identity, stored proof and sealed fixture; a
+lane opts in by passing `PerSymbolCostModel().resolver()` as the
+`cost_resolver` of `simulate_account`. Rows priced that way are recomputed
+from their own legs by `risk_unit_report`. One limit: account simulation
+stores a bar-priced entry's `realized_risk_per_unit` from the reference
+price, so a diagnostic bar-fallback row (not a strict quote-priced one) fails
+the row-economics check under any per-leg model, measured or `per_symbol_v2`.
+
 For equity, an explicitly enabled `costs.measured_quote` block supplies a
 frozen per-symbol, per-half-hour spread/depth schedule. Configuration verifies
 and embeds the declared schedule hash and binds its feed, provider, percentile,
 depth percentile, quote-count floor, and strict coverage policy into candidate
 identity. Candidate, root control, randomized null, sealed qualification, and
 live-shadow paths all resolve entry and exit costs from that same schedule; a
-missing or under-covered cell aborts the lane instead of falling back to a
-broader average. The checked-in block remains disabled until an operator fits
-and freezes a schedule from the corpus actually being proved.
+missing or under-covered cell never falls back to a broader average. In
+account simulation (the factory lanes and `cost_rerun`) it refuses that one
+opportunity with `reject_stage` `cost_coverage` and `reject_reason`
+`measured_cost_unavailable`; IBR repricing and the edge-discovery account
+still abort. Schedules fitted by `cost_rerun` require each bucket cell to
+span at least five sessions as well as `min_quotes_per_cell` quotes
+(`min_sessions_per_cell`, recorded in the schedule and enforced by the
+resolver), because recorder snapshots within one session are autocorrelated;
+`measure_quote_costs` applies the floor only when asked, so other callers
+(`deploy/trader_projection.py`) still fit without it. Pre-open and post-close
+quotes no longer enter the symbol and universe aggregates. Depth
+impact is zero for an order that fits displayed size, so a stop exit also
+pays an explicit stop-trigger slippage of one tick at its reference price
+(named in the leg provenance as `stop-trigger-<bps>`). The checked-in block
+remains disabled until an operator fits and freezes a schedule from the
+corpus actually being proved.
 The validated `broker.provider` is authoritative (default `alpaca`): the
 schedule may not self-declare a different provider, and explicit row-level
 provider/feed contradictions fail closed in the resolver and live shadow.
@@ -238,6 +296,19 @@ Every proof also persists the preregistered all-in stress scenarios of 9, 15,
 other scenarios remain diagnostics. A stress result that is missing, negative,
 or not positive at 25 bps cannot authorize a candidate.
 
+Every rung is a round trip (`COST_STRESS_RUNG_BASIS`): one all-in charge in
+bps of entry notional for both legs, never a per-side figure. A rung is a
+stress only above the model's expected round trip, and under `static_v1` the
+9 bps runtime rung is below it (17 bps on bars, 13 on quotes), so the 0.30
+cost-to-risk veto does not hold under that model's own expectation and the
+gate's 9 and 15 bps rungs add nothing for equity (E1-02). Under
+`per_symbol_v2` (1.75 to 4.07 bps) the same 9 bps rung is 2.2 to 5.1 times the
+expected round trip. `stress_coherence` makes that comparison and
+`stress_relative_to_expected` (and `PerSymbolCostModel.stressed_round_trip_bps`)
+defines a stress as `expected x multiple + add_bps` instead; `cost_rerun`
+reports the coherence of the configured rung against each model. The runtime
+veto is unchanged.
+
 Stress semantics are explicit: each scenario charges its bps against entry
 notional, then listed options add round-trip fees for both per-contract sides;
 the stress bps are not per-side bps. The shipped admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
@@ -248,9 +319,13 @@ a fixed-R target is never recomputed; explicitly wide authored brackets pass
 unchanged. The floor and binding decision remain in refusal/trade telemetry.
 
 The runtime's stressed-cost risk check abstains before order submission when
-the configured 25 bps scenario (or another preregistered 9/15/50 bps choice)
+the configured scenario (`risk.stressed_cost_scenario_bps`: 9 bps in the
+shipped `config.yaml` since commit 2249cc5, 25 bps when the key is absent)
 exceeds its allowed cost-to-risk ratio, and persists the scenario, cost, ratio,
-and vehicle telemetry. The runtime's `execution.max_slippage_bps` and
+and vehicle telemetry. The shipped cost provenance label
+`shipped_conservative_v1_plus_25bps_stress` predates that change and is
+stale; it is left as is because it is part of every candidate identity, so
+read the runtime rung from `risk.stressed_cost_scenario_bps`, not from it. The runtime's `execution.max_slippage_bps` and
 `max_spread_bps` are rejection caps, not expectations. They are read into the
 same model and bound it: a model expecting a cost the runtime would refuse to
 submit fails closed rather
@@ -297,8 +372,20 @@ The scheduled calibration-only pass is per symbol/session on the fixed
 explicit operator path and a content-addressed artifact with exact
 provider/feed identity, disjoint chronological held-out sessions, sufficient
 coverage, and one artifact-wide effective-after boundary. An unusable cell
-falls back to the configured scalar stress; the artifact cannot authorize
-itself.
+falls back to the configured scalar stress (`cost_rerun` passes
+`risk.stressed_cost_scenario_bps`); the artifact cannot authorize itself.
+Each cell is laddered on its round-trip cost (full spread, depth impact on
+both legs, sell-leg fee), a positive order size without a depth measurement
+fails closed, and fit and validation are compared on the rung they select, so
+a one-tick change inside one rung no longer voids the artifact. The artifact
+records `cost_basis`, `materiality_basis` and `narrowing_possible`;
+`cost_basis="one_way_v1"` reproduces earlier artifacts exactly. The module is
+kept rather than parked: its lowest rung equals the shipped 9 bps runtime
+rung, so it can keep or widen that stress but never narrow it
+(`narrowing_possible` is false) and changes no decision at the shipped
+configuration, but `deploy/trader_projection.py`, `research/live_shadow.py`
+and `research/cost_rerun.py` consume its artifacts, and an error would turn
+their diagnostic output into a failure.
 
 ## Evidence and provenance
 

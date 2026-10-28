@@ -37,8 +37,11 @@ from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, rule_variant_id,
                                   validate_rule_spec)
 from .cost_counterfactual import (_code_bundle_files, _code_bundle_hash,
                                   _cost_decomposition, load_frozen_specs)
-from .costs import (CostModel, ReplayPolicy, diagnostic_backfill_policy,
-                    static_cost_config)
+from .costs import (COST_MODEL_PER_SYMBOL_V2, COST_STRESS_SCENARIOS_BPS,
+                    DEFAULT_RESEARCH_COST_MODEL_VERSION, REFERENCE_PRICES,
+                    CostError, CostModel, PerSymbolCostModel, ReplayPolicy,
+                    diagnostic_backfill_policy, static_cost_config,
+                    stress_coherence)
 from .edge_ledger import content_hash
 from .edge_discovery_core import _read_discovery_rows
 from .factory_core import (DEFAULT_VARIANTS, FAMILY_TEMPLATES,
@@ -48,7 +51,10 @@ from .gates import max_drawdown_of
 from .quote_costs import (measure_quote_costs, cost_model_from_schedule,
                           measured_cost_resolver, schedule_costs_block,
                           bucket_label, QuoteCostError)
-from .stressed_cost_calibration import activation_overlay, calibrate_stressed_cost
+from .stressed_cost_calibration import (DEFAULT_FALLBACK_SCENARIO_BPS,
+                                        DEFAULT_MIN_SESSIONS_PER_CELL,
+                                        activation_overlay,
+                                        calibrate_stressed_cost)
 from .source_validation import validate_source
 
 RERUN_SCHEMA = "cost-rerun.v1"
@@ -87,6 +93,39 @@ def _collection_count(value: Any) -> int:
         return max(0, len(value))
     except (TypeError, ValueError, AttributeError):
         return 0
+
+
+def _configured_stress_rung(runtime_config: Mapping[str, Any]) -> float:
+    """The runtime rung an unusable calibration cell falls back to.
+
+    It is ``risk.stressed_cost_scenario_bps`` (9 bps in the shipped
+    ``config.yaml``), not a module constant: a hard-coded 25 bps here
+    described a stress the runtime no longer applies.
+    """
+    risk = runtime_config.get("risk") if isinstance(runtime_config, Mapping) else None
+    value = _finite((risk or {}).get("stressed_cost_scenario_bps")
+                    if isinstance(risk, Mapping) else None)
+    return (float(value) if value in COST_STRESS_SCENARIOS_BPS
+            else DEFAULT_FALLBACK_SCENARIO_BPS)
+
+
+def _per_symbol_model(schedule: Mapping[str, Any],
+                      runtime_config: Mapping[str, Any]) -> PerSymbolCostModel:
+    """``per_symbol_v2`` with each quoted symbol's measured median spread.
+
+    Symbols without quotes in the corpus keep their reference spread; the
+    one-tick floor applies to both.
+    """
+    spreads: dict[str, float] = {}
+    for symbol, section in (schedule.get("symbols") or {}).items():
+        median = _finite(((section or {}).get("spread_bps") or {}).get("median")
+                         if isinstance(section, Mapping) else None)
+        if median is not None and median >= 0:
+            spreads[str(symbol)] = median
+    digest = str(schedule.get("schedule_hash") or "")[:12]
+    return PerSymbolCostModel.from_config(
+        runtime_config, spreads=spreads,
+        spread_source=f"measured-{digest}-median")
 
 
 def _session_hash(sessions: Sequence[Any]) -> str:
@@ -580,6 +619,15 @@ def run_cost_rerun(
     measured = cost_model_from_schedule(schedule, percentile=percentile)
     measured_resolver = measured_cost_resolver(
         schedule, percentile=percentile, vehicle=vehicle)
+    # The per-symbol model is the default for new research runs; the static
+    # ``configured`` arm stays alongside it so results remain comparable.
+    per_symbol = _per_symbol_model(schedule, runtime_config)
+    arms = (("configured", configured, None),
+            ("measured", measured, measured_resolver),
+            (COST_MODEL_PER_SYMBOL_V2, configured, per_symbol.resolver()))
+    versions = {"configured": configured.cost_model_version,
+                "measured": measured.cost_model_version,
+                COST_MODEL_PER_SYMBOL_V2: COST_MODEL_PER_SYMBOL_V2}
 
     risk = runtime_config.get("risk") or {}
     scenario = risk.get("stressed_cost_scenario_bps")
@@ -602,16 +650,25 @@ def run_cost_rerun(
                       ",".join(f"{key}={value['to']}"
                                for key, value in sorted(delta.items()))),
             "stop_atr": spec.get("stop_atr"), "rule_spec": spec}
-        for name, model in (("configured", configured), ("measured", measured)):
-            account = simulate_account(
-                bars, snapshots, spec, vehicle=vehicle,
-                account_id=f"{name}:{variant_id}", starting_cash=starting_cash,
-                risk_pct=policy.risk_per_trade_pct, costs=model,
-                cost_resolver=(measured_resolver if name == "measured" else None),
-                quotes=quotes, policy=policy)
+        for name, model, resolver in arms:
+            try:
+                account = simulate_account(
+                    bars, snapshots, spec, vehicle=vehicle,
+                    account_id=f"{name}:{variant_id}", starting_cash=starting_cash,
+                    risk_pct=policy.risk_per_trade_pct, costs=model,
+                    cost_resolver=resolver, quotes=quotes, policy=policy)
+            except CostError as exc:
+                if name != COST_MODEL_PER_SYMBOL_V2:
+                    raise
+                # A symbol with neither a measured nor a reference spread is
+                # not priced with another symbol's spread.
+                row[name] = {"cost_model_version": versions[name],
+                             "unavailable": str(exc)}
+                continue
             measured_rows = [dict(item, family=spec["family"])
                              for item in account["rows"]]
-            row[name] = _arm(measured_rows, starting_cash=starting_cash).as_dict()
+            row[name] = {**_arm(measured_rows, starting_cash=starting_cash).as_dict(),
+                         "cost_model_version": versions[name]}
         results.append(row)
 
     try:
@@ -622,6 +679,23 @@ def run_cost_rerun(
     except (RiskGeometryError, TypeError, ValueError, ZeroDivisionError):
         stress_implied_min_stop_bps = None
         effective_min_stop_bps = None
+    per_symbol_round_trips: dict[str, float] = {}
+    for symbol, _spread, _source in per_symbol.spreads:
+        if symbol in REFERENCE_PRICES:
+            per_symbol_round_trips[symbol] = per_symbol.round_trip_bps(
+                symbol, REFERENCE_PRICES[symbol])
+    coherence: dict[str, Any] = {"scenario_bps": scenario, "models": {}}
+    if _finite(scenario) is not None and scenario >= 0:
+        coherence["models"] = {
+            "configured_bar_references": stress_coherence(
+                scenario, configured.expected_round_trip_bps()),
+            "configured_quote_references": stress_coherence(
+                scenario, configured.expected_round_trip_bps(
+                    entry_executable_quote=True, exit_executable_quote=True)),
+            **({f"{COST_MODEL_PER_SYMBOL_V2}_max": stress_coherence(
+                scenario, max(per_symbol_round_trips.values()))}
+               if per_symbol_round_trips else {}),
+        }
     report = {
         "schema": RERUN_SCHEMA,
         "diagnostic_only": True, "authorizing": False,
@@ -647,7 +721,16 @@ def run_cost_rerun(
                                           2 * configured.fee_bps,
             "measured_round_trip_bps": 2 * measured.entry_cost_bps +
                                         2 * measured.fee_bps,
+            COST_MODEL_PER_SYMBOL_V2: per_symbol.as_dict(),
+            # Marketable entry and exit priced from a bar, at the reference
+            # price of each symbol that has one.
+            "per_symbol_v2_round_trip_bps": per_symbol_round_trips,
+            "versions": versions,
+            "default_for_new_runs": DEFAULT_RESEARCH_COST_MODEL_VERSION,
         },
+        # Each rung is a round trip; compare it with each model's expected
+        # round trip.  A rung below the expected cost is not a stress.
+        "stress_coherence": coherence,
         "cost_schedule": schedule,
         "quote_schedule_evaluation": {
             "method": "chronological_quote_fit_validation_split",
@@ -750,15 +833,19 @@ def _measure_calibration_rows(raw, bars, snapshot_map, quote_rows, policy_source
                            if quote_session(item) in fit_sessions))
     validation_source = (lambda: (item for item in raw_quotes()
                                   if quote_session(item) in validation_sessions))
+    # A cell's quote count is a count of autocorrelated snapshots; new runs
+    # also require each cell to span DEFAULT_MIN_SESSIONS_PER_CELL sessions.
     schedule = measure_quote_costs(
         fit_source() if fit_quote_count else raw_quotes(),
-        min_quotes_per_cell=int(min_quotes_per_cell))
+        min_quotes_per_cell=int(min_quotes_per_cell),
+        min_sessions_per_cell=DEFAULT_MIN_SESSIONS_PER_CELL)
     validation_schedule = None
     validation_schedule_reason = None
     if validation_quote_count:
         try:
             validation_schedule = measure_quote_costs(
-                validation_source(), min_quotes_per_cell=int(min_quotes_per_cell))
+                validation_source(), min_quotes_per_cell=int(min_quotes_per_cell),
+                min_sessions_per_cell=DEFAULT_MIN_SESSIONS_PER_CELL)
         except QuoteCostError as exc:
             validation_schedule_reason = str(exc)
     risk = runtime_config.get("risk") or {}
@@ -774,6 +861,7 @@ def _measure_calibration_rows(raw, bars, snapshot_map, quote_rows, policy_source
         expected_provider=policy_source.equity_provider,
         expected_feed=policy_source.equity_feed,
         validation_failure_reason=validation_schedule_reason,
+        fallback_scenario_bps=_configured_stress_rung(runtime_config),
         max_cost_to_risk_ratio=ratio)
     split_valid = bool(fit_sessions and validation_sessions and
                        not (fit_sessions & validation_sessions) and
@@ -866,6 +954,14 @@ def render_text(report: Mapping[str, Any]) -> str:
         f"slippage {_fmt(models['measured']['slippage_bps'])} bps "
         f"-> round trip {_fmt(models['measured_round_trip_bps'])} bps",
         f"  provenance: {models['measured']['provenance']}",
+    ]
+    trips = models.get("per_symbol_v2_round_trip_bps") or {}
+    if trips:
+        lines.append(
+            f"  per_symbol_v2 (default for new runs): round trip "
+            f"{_fmt(min(trips.values()))} to {_fmt(max(trips.values()))} bps "
+            f"across {len(trips)} symbols at reference prices")
+    lines += [
         "  quote schedule: fit on the earlier 70% of sessions; later sessions "
         "are validation-only",
         "",
@@ -908,10 +1004,17 @@ def render_text(report: Mapping[str, Any]) -> str:
               f"{'gated':>7}"
               f"{'net $':>11}{'exp $':>9}{'win':>6}{'PF':>6}"
               f"{'refR':>8}{'dragR':>8}{'netR':>8}")
-    for arm in ("configured", "measured"):
+    for arm in ("configured", "measured", COST_MODEL_PER_SYMBOL_V2):
+        if not any(arm in item for item in report["results"]):
+            continue
         lines += [f"  === {arm} costs ===", header]
         for item in report["results"]:
-            row = item[arm]
+            row = item.get(arm)
+            if not isinstance(row, Mapping) or "unavailable" in row:
+                lines.append(f"  {item['family']:<23}{item['label'][:21]:<22}"
+                             f"  unavailable: "
+                             f"{(row or {}).get('unavailable', 'not run')}")
+                continue
             lines.append(
                 f"  {item['family']:<23}{item['label'][:21]:<22}"
                 f"{row['trades']:>7}{row['stress_floor_bindings']:>7}"

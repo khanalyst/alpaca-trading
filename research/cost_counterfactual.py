@@ -1325,6 +1325,9 @@ def run_counterfactual(
             arm_rows[name] = combined
             arms[name] = {
                 "max_stressed_cost_to_risk_ratio": ratio,
+                # This experiment changes only the stress ratio; both arms are
+                # priced by the configured static model.
+                "cost_model_version": costs.cost_model_version,
                 "replay_policy": policy.as_dict(),
                 "config_hash": content_hash(config),
                 "diagnostic_only": True,

@@ -1151,7 +1151,9 @@ class LiveShadowTests(unittest.TestCase):
         replay_config = replay.call_args.kwargs["config"]
         self.assertEqual(len(replay_bars), 1)
         self.assertEqual(replay_config.policy.force_flat_time.isoformat(), "12:50:00")
-        self.assertEqual(replay_config.policy.latest_entry_time.isoformat(), "12:55:00")
+        # The latest entry no longer falls after force-flat on an early close
+        # (it was 12:55; review finding E1-11).
+        self.assertEqual(replay_config.policy.latest_entry_time.isoformat(), "12:50:00")
         metadata = runner.store.replay_metadata(candidate["candidate_id"])[0]
         self.assertTrue(metadata["details"]["complete"])
         self.assertEqual(metadata["details"]["calendar_source"],
