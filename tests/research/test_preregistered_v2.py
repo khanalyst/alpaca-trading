@@ -31,11 +31,11 @@ UTC = timezone.utc
 # ``python -B -c "from research.preregistered import v2_registration_literals
 # as f; print(f())"`` prints these three for the running tree.
 V2_VWAP_MANIFEST_HASH = (
-    "b1435cc484a48e699f3657e163cd7084836049a307394a35cfdbb7f62a70931e")
+    "d0003f117e8e47a5b15653f645d0fa2ab72463e1d289ef118406c77774eb6b93")
 V2_ORF_MANIFEST_HASH = (
-    "3c9550dd67c31cf82835bf62cb91742c2653cb5b7b1bf3c7f077ab0e817f2355")
+    "22b7ca355aa42b72c766c5d56d829ba5f14618a010d29aceb4ce75caeab7c13f")
 V2_INSTRUMENT_DIGEST = (
-    "bca6df022725c18bed2ddc2a031e83cae24ead80c0386b9a149f34343c53b8ab")
+    "1dced3ad98f1aa089696c929773d5388e5ecd2993d2821cbd190108eb8325e31")
 
 
 # Every fixture date is relative to the registered window, so moving the

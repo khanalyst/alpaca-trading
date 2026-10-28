@@ -165,8 +165,8 @@ the instrument digest are one block of literals at the top of
 instrument literals and the manifest hashes for the running tree.
 Manifest hashes, pinned by `tests/research/test_preregistered_v2.py`:
 
-- VWAP: `b1435cc484a48e699f3657e163cd7084836049a307394a35cfdbb7f62a70931e`
-- ORF: `3c9550dd67c31cf82835bf62cb91742c2653cb5b7b1bf3c7f077ab0e817f2355`
+- VWAP: `d0003f117e8e47a5b15653f645d0fa2ab72463e1d289ef118406c77774eb6b93`
+- ORF: `22b7ca355aa42b72c766c5d56d829ba5f14618a010d29aceb4ce75caeab7c13f`
 
 **Claim.** Entering at the open of the bar after the frozen rule fires is
 followed over the next 60 minutes by a return, in the rule's direction, that
@@ -176,7 +176,7 @@ round-trip cost, as a one-sided lower confidence bound.
 | item | fixed value |
 | --- | --- |
 | sealed window | complete sessions on or after **2026-10-29**; every session up to 2026-10-23 had been examined |
-| instrument | digest `bca6df022725c18bed2ddc2a031e83cae24ead80c0386b9a149f34343c53b8ab` of the running code (below) |
+| instrument | digest `1dced3ad98f1aa089696c929773d5388e5ecd2993d2821cbd190108eb8325e31` of the running code (below) |
 | primary endpoint | 60-minute control-adjusted return from the **next bar's open**, horizon fixed on the wall clock |
 | sensitivity | the same from the open one bar later (one-bar skip), reported, never decisive |
 | diagnostic | the v1-style signal-close anchored figure on the same clock, reported only |

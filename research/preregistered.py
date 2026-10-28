@@ -203,7 +203,7 @@ V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
     "agent.contracts.risk_geometry":
         "a5af0cf5eb4db6d3d6fd26a8c7d0db53bca5c9e189ffa54b50032c421ece6dd9",
     "agent.contracts.rule":
-        "42517549f463a5d8e77bd39ff8fa1e588fa7bb63f9e6efa6ce16e12e872e821e",
+        "88b6c195b3173f5b07b99c3ab672aab147a84416dddba2db221c4a9efb44c216",
     "agent.governance":
         "2faec8c3b178ad30255c56cf2b2504661b11aa689726666b3dd816de3ce5b1b0",
     "agent.instruments":
@@ -233,25 +233,25 @@ V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
     "research.diagnostic_shadow":
         "cd1ac019f416dfd2f8703327be1de006194c3821b5bd11ac8e57e2e601ada104",
     "research.edge_discovery_core":
-        "3d75778e993a4cc4687b3adf6c0efbeaefaeb4ad70f9bc591b09e01271c5eeec",
+        "eddc333e787b34a2be86fb5cbb2691822332578ff3aebff86fb3b24e7897a9ed",
     "research.edge_identity":
         "bfeafba2b4a3fb8cd970586f216aca98ec75676f470d09d3fd92c14010b9c4aa",
     "research.edge_lab":
         "66f53c8aaa82a8d56066f67ccf7b563c6d126d9b7fc446b30b9369057f9c7dec",
     "research.edge_ledger":
-        "cdf2ff28d599a7a4ef4586af75d0f7864807d773f3b841b390ad4de90fb4428c",
+        "9fc781f94bb9eac728d1a6cdad1363fdbae81b1a9050540492a93035e9a88ddd",
     "research.edge_ledger_proof":
-        "1ec5129f083c2c0362613e168a1cf7cdea3ca456b06728fdc26106993029372f",
+        "1382357c850c991a415355061d97959f15476d48efe07f9040cd2c2fc3d4ac22",
     "research.edge_ledger_store":
         "878628b48fa550e59ef6c0a48ec167bcf3a53e69978baa77298f938bf96b870a",
     "research.factory_core":
-        "ec034d65f0d533463f8a0d7ee4069b5e7ae365551870aa878345172ec4198cec",
+        "80b8a52fd0d469d5153a7cd7d5749f060683d0bf924f60464323a820656be887",
     "research.factory_ledger":
         "567240cbb77efb03b347b21ac89f836939123fc1e50f53525c203a3586659c98",
     "research.gates":
         "49681df3fe3b795326984d61e757b8d1621f86c07263f83037d52956ec014750",
     "research.ibr":
-        "d0124683b413a6a732ed4509c0c76f57f64af9b7d7016218e07e859b7171d320",
+        "90f0b08b6a830a9b2d3b62f9379adaff02adb0344ec1eed9ab0c7b656f813f0d",
     "research.market_data":
         "a199a4364b8940fe19b7906344242faec2f89fd4df931a1babd86b027b184fad",
     "research.maturity":
@@ -263,7 +263,7 @@ V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
     "research.quote_costs":
         "c3c296f48207160b30a4bcb0e4549789846aa25b5e4d16e9e633f9fee8e9b335",
     "research.signal_quality":
-        "d803eb374dd2768134c42384d57c0d6f29b9fde22b88c3d8889337facac68499",
+        "9b4c7ebc29a7e75878922378c6639a8076f4a6c131c6eb4e2f6bc2fc888e5e1e",
     "research.source_validation":
         "ec97ee2220a8bfded56c69c4f3fba9b415af4cb49b953c847f84eaec26f00ef8",
     "research.stats":
@@ -274,12 +274,12 @@ V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
         "0f209ee5d7fd8ffaa029f8b094b2a2c4c53fee4ae2db19c95e1d20636feff1cc",
 }
 V2_INSTRUMENT_DIGEST = (
-    "bca6df022725c18bed2ddc2a031e83cae24ead80c0386b9a149f34343c53b8ab")
+    "1dced3ad98f1aa089696c929773d5388e5ecd2993d2821cbd190108eb8325e31")
 V2_MANIFEST_HASHES: dict[str, str] = {
     "vwap-reversion-control-adjusted.v2":
-        "b1435cc484a48e699f3657e163cd7084836049a307394a35cfdbb7f62a70931e",
+        "d0003f117e8e47a5b15653f645d0fa2ab72463e1d289ef118406c77774eb6b93",
     "opening-range-fade-control-adjusted.v2":
-        "3c9550dd67c31cf82835bf62cb91742c2653cb5b7b1bf3c7f077ab0e817f2355",
+        "22b7ca355aa42b72c766c5d56d829ba5f14618a010d29aceb4ce75caeab7c13f",
 }
 # === end of v2 registration literals =========================================
 
