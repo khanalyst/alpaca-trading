@@ -319,7 +319,10 @@ class EdgeLedgerProofMixin:
         metrics = run.get("metrics")
         minimum = (metrics.get("minimum_gate_protocol")
                    if isinstance(metrics, Mapping) else None)
-        if isinstance(minimum, int) and not isinstance(minimum, bool):
+        # Like the schema rule above, the floor binds runs of the current
+        # replay epoch; a stale-epoch run is auditable only.
+        if (run_engine_epoch_current(run) and isinstance(minimum, int) and
+                not isinstance(minimum, bool)):
             version = envelope_protocol_version(envelope)
             if version is None or version < minimum:
                 return "this run requires a newer verified gate protocol"

@@ -34,7 +34,8 @@ from research.factory_ledger import CONFIRMATORY_SCOPE_VERSION, FactoryLedger
 from tests.research.test_factory_end_to_end import ROOT_SPEC, edge_corpus
 
 
-def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex", lane="backtest"):
+def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex", lane="backtest",
+                   protocol_version=None):
     """Build the statistical evidence a persisted proof must now reproduce.
 
     The zero baseline makes the matched deltas equal to the held-out P&L, so
@@ -43,7 +44,8 @@ def _gate_evidence(heldout, *, alpha=.05, equity_feed="iex", lane="backtest"):
     baseline = [{**row, "net_pnl": 0.0, "opportunity_id": f"base-{index}"}
                 for index, row in enumerate(heldout)]
     control = matched_cluster_test(
-        heldout, baseline, vehicle="equity", equity_feed=equity_feed)
+        heldout, baseline, vehicle="equity", equity_feed=equity_feed,
+        **({"protocol_version": protocol_version} if protocol_version else {}))
     placebo = placebo_null_distribution(
         heldout, baseline, vehicle="equity", equity_feed=equity_feed)
     independent_seed = stable_seed({
@@ -281,11 +283,17 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     separation = (heldout_separation(fit, heldout) if lane == "backtest" else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": True, "mode": "new_data"})
+    # A legacy v2-schema fixture stands for evidence written before protocol
+    # versioning, so its statistics are computed under protocol 1.
+    legacy_protocol = (gates.LEGACY_GATE_PROTOCOL_VERSION if legacy_gate_v2 else None)
     control, falsification, absolute, walk = _gate_evidence(
-        heldout, equity_feed=equity_feed, lane=lane)
+        heldout, equity_feed=equity_feed, lane=lane,
+        protocol_version=legacy_protocol)
     fit_control = (matched_cluster_test(
                        fit, fit_baseline, vehicle="equity",
-                       equity_feed=equity_feed)
+                       equity_feed=equity_feed,
+                       **({"protocol_version": legacy_protocol}
+                          if legacy_protocol else {}))
                    if fit else {"available": True, "actual_control": True,
                                 "matched": 0, "mean_delta": None,
                                 "p_value": 1.0, "mode": "prior_backtest"})
@@ -423,7 +431,11 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                      "heldout_net_pnl": absolute["net_pnl"],
                      "heldout_expectancy": absolute["expectancy"],
                      "max_drawdown": max_drawdown_of(heldout)},
-        equity_feed=equity_feed)
+        equity_feed=equity_feed,
+        # A real v2-schema envelope predates protocol versioning, so the
+        # fixture for one is built under protocol 1 (no version field).
+        **({"protocol_version": gates.LEGACY_GATE_PROTOCOL_VERSION}
+           if legacy_gate_v2 else {}))
     if legacy_feedless:
         def strip_feed(value):
             if isinstance(value, dict):
