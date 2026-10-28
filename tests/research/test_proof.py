@@ -1,14 +1,17 @@
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from agent.contracts.rule import DEFAULT_RULE_SPEC
 import research.proof_payload as proof_payload
-from research.proof import (PROOF_SCHEMA, build_proof_payload, payload_hash,
-                             canonical_json, render_markdown, send_webhook,
-                             write_proof)
+from research.proof import (PROOF_SCHEMA, PROOF_SCHEMA_V1, PROOF_SCHEMA_V2,
+                             build_proof_payload, payload_hash,
+                             canonical_json, proof_statistics, render_markdown,
+                             send_webhook, write_proof)
 
 
 class FakeLedger:
@@ -309,6 +312,108 @@ class ProofTests(unittest.TestCase):
                     "https://example.test/hook", {}, timeout_seconds=timeout)
                 self.assertFalse(result["ok"])
                 self.assertIn("webhook timeout", result["error"])
+
+
+
+class _GateStatisticsLedger(FakeLedger):
+    """A run whose metrics carry only the gate's q-value and lower bound."""
+
+    def runs(self, candidate_id):
+        run = super().runs(candidate_id)[0]
+        run["metrics"] = {
+            "fit_samples": 12, "heldout_samples": 8, "shadow_samples": 5,
+            "gate": {"passes": True, "statistics": {"q_value": 0.03},
+                     "mean_delta_lcb": 0.4},
+            "max_drawdown": .12, "cost": 1.5}
+        return [run]
+
+
+class AtomicProofWriteTests(unittest.TestCase):
+    """Review finding D1-10: the final name never holds a partial artefact."""
+
+    def test_a_failed_write_leaves_nothing_and_a_retry_succeeds(self):
+        real_fsync = os.fsync
+        calls = []
+
+        def full_disk(descriptor):
+            calls.append(descriptor)
+            if len(calls) == 1:
+                raise OSError(28, "No space left on device")
+            return real_fsync(descriptor)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("os.fsync", side_effect=full_disk):
+                with self.assertRaises(OSError):
+                    write_proof(FakeLedger(), "candidate-1", output_root=directory)
+            leftovers = [path for path in Path(directory).rglob("*")
+                         if path.is_file()]
+            self.assertEqual(leftovers, [])
+            result = write_proof(FakeLedger(), "candidate-1", output_root=directory)
+            self.assertTrue(result.created)
+            self.assertIn("Canonical payload", result.path.read_text())
+            self.assertEqual([path for path in result.path.parent.iterdir()],
+                             [result.path])
+
+    def test_a_conflicting_artifact_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = write_proof(FakeLedger(), "candidate-1", output_root=directory)
+            result.path.write_text("tampered", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "does not match payload"):
+                write_proof(FakeLedger(), "candidate-1", output_root=directory)
+
+
+class ProofStatisticNamingTests(unittest.TestCase):
+    """Review finding D1-11: no derived 'confidence' in new payloads."""
+
+    def test_new_payloads_publish_q_value_and_lower_bound_by_name(self):
+        payload = build_proof_payload(_GateStatisticsLedger(), "candidate-1")
+        self.assertEqual(payload["schema"], PROOF_SCHEMA_V2)
+        self.assertNotIn("confidence", payload)
+        self.assertNotIn("confidence", payload["metrics"])
+        self.assertEqual(payload["q_value"], 0.03)
+        self.assertEqual(payload["lower_bound"], 0.4)
+        self.assertEqual(payload["lower_bound_source"], "gate.mean_delta_lcb")
+
+    def test_a_recorded_lower_bound_is_not_relabelled_as_confidence(self):
+        payload = build_proof_payload(FakeLedger(), "candidate-1")
+        # The run recorded a legacy 'confidence' only; it is not interpreted.
+        self.assertNotIn("confidence", payload)
+        self.assertIsNone(payload["q_value"])
+        self.assertIsNone(payload["lower_bound"])
+
+    def test_v1_payloads_still_build_and_read(self):
+        legacy = build_proof_payload(_GateStatisticsLedger(), "candidate-1",
+                                     schema=PROOF_SCHEMA_V1)
+        self.assertEqual(legacy["schema"], PROOF_SCHEMA_V1)
+        self.assertAlmostEqual(legacy["confidence"], 0.97)
+        read = proof_statistics(legacy)
+        self.assertEqual(read["q_value"], 0.03)
+        self.assertEqual(read["lower_bound"], 0.4)
+        self.assertAlmostEqual(read["legacy_confidence"], 0.97)
+        current = proof_statistics(build_proof_payload(
+            _GateStatisticsLedger(), "candidate-1"))
+        self.assertEqual((current["q_value"], current["lower_bound"]),
+                         (read["q_value"], read["lower_bound"]))
+        with self.assertRaises(ValueError):
+            build_proof_payload(FakeLedger(), "candidate-1", schema="other")
+
+    def test_an_existing_v1_artifact_is_reproduced_not_rewritten(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            first = write_proof(_GateStatisticsLedger(), "candidate-1",
+                                output_root=directory, schema=PROOF_SCHEMA_V1)
+            again = write_proof(_GateStatisticsLedger(), "candidate-1",
+                                output_root=directory,
+                                webhook_url="https://example.test/hook",
+                                webhook_sender=lambda *args: calls.append(args))
+            self.assertFalse(again.created)
+            self.assertEqual(again.path, first.path)
+            self.assertEqual(again.payload_hash, first.payload_hash)
+            self.assertEqual(calls, [])
+            fresh = write_proof(_GateStatisticsLedger(), "candidate-2",
+                                output_root=directory)
+            self.assertTrue(fresh.created)
+            self.assertEqual(fresh.payload["schema"], PROOF_SCHEMA_V2)
 
 
 if __name__ == "__main__":

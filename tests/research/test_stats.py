@@ -195,3 +195,73 @@ class ClusterRobustInferenceTests(unittest.TestCase):
         self.assertAlmostEqual(result["t_stat"],
                                (6.5 - 6.5) / result["stderr"])
 
+
+
+class SessionClusteredSignFlipTests(unittest.TestCase):
+    """Review finding D1-09: one New York session is one cluster."""
+
+    @staticmethod
+    def _session_pairs():
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo("America/New_York")
+        stamps = [datetime(2026, 9, 24, hour, minute, tzinfo=zone).timestamp()
+                  for hour, minute in ((9, 45), (11, 0), (14, 30), (15, 30))]
+        return [(stamp, 1.0 + index, 0.5) for index, stamp in enumerate(stamps)]
+
+    def test_default_clusters_by_new_york_session_date(self):
+        from research.stats import paired_cluster_sign_flip
+        result = paired_cluster_sign_flip(self._session_pairs())
+        # The former 21,600 s default split 09:45-15:30 ET at 18:00 UTC.
+        self.assertEqual(result["clusters"], 1)
+        self.assertEqual(result["cluster_unit"], "new_york_session_date")
+        self.assertIsNone(result["cluster_seconds"])
+        winter = [(stamp + 70 * 86_400, candidate, baseline)
+                  for stamp, candidate, baseline in self._session_pairs()]
+        self.assertEqual(paired_cluster_sign_flip(winter)["clusters"], 1)
+        both = paired_cluster_sign_flip(self._session_pairs() + winter)
+        self.assertEqual(both["clusters"], 2)
+
+    def test_explicit_callers_keep_fixed_epoch_buckets(self):
+        from research.stats import paired_cluster_sign_flip
+        pairs = self._session_pairs()
+        six_hours = paired_cluster_sign_flip(pairs, cluster_seconds=21_600)
+        self.assertEqual(six_hours["clusters"], 2)
+        day = paired_cluster_sign_flip(pairs, cluster_seconds=86_400)
+        self.assertEqual(day["clusters"], 1)
+        self.assertEqual(day["cluster_seconds"], 86_400)
+        self.assertNotIn("cluster_unit", day)
+        self.assertEqual(day["method"], "exact_enumeration")
+
+
+class TestInversionAndClusterSignFlipTests(unittest.TestCase):
+    def test_student_t_isf_inverts_the_survival_function(self):
+        from research.stats import student_t_isf, student_t_sf
+        for df in (1, 2, 5, 17, 29, 59):
+            for probability in (0.001, 0.025, 0.05, 0.5, 0.9):
+                value = student_t_isf(probability, df)
+                self.assertAlmostEqual(student_t_sf(value, df), probability,
+                                       places=12)
+        self.assertAlmostEqual(student_t_isf(0.025, 29), 2.0452296, places=6)
+        with self.assertRaises(ValueError):
+            student_t_isf(0.0, 10)
+
+    def test_cluster_sign_flip_is_exact_at_small_cluster_counts(self):
+        from itertools import product
+        from research.stats import cluster_sign_flip_p_value
+        values = [0.5, 1.5, -0.2, 0.9, 0.4, 2.0, -0.3]
+        clusters = ["a", "a", "b", "c", "d", "e", "f"]
+        result = cluster_sign_flip_p_value(values, clusters, shift=0.1)
+        totals = {}
+        for value, cluster in zip(values, clusters):
+            totals[cluster] = totals.get(cluster, 0.0) + value - 0.1
+        observed = sum(totals.values())
+        extreme = sum(
+            sum(sign * total for sign, total in zip(signs, totals.values()))
+            >= observed - 1e-12
+            for signs in product((1, -1), repeat=len(totals)))
+        self.assertTrue(result["exact"])
+        self.assertAlmostEqual(result["p_value"], extreme / 2 ** len(totals))
+        lower = cluster_sign_flip_p_value(values, clusters, shift=0.1,
+                                          alternative="less")
+        self.assertGreater(lower["p_value"], result["p_value"])

@@ -37,6 +37,18 @@ from .factory_ledger import FactoryError, FactoryLedger
 
 
 TRIAL_SCHEMA = "paper-trial.v1"
+# The v2 verdict (review finding D1-07) is selected explicitly with
+# ``research.trial.verdict_version: v2``; v1 stays the default so every
+# existing verdict reproduces.  v1 re-tests a 1,000-draw, five-session-block
+# bootstrap bound at every review and dashboard render, so under zero edge
+# about 18% of candidates read "passed" at some point.  v2 decides once, on
+# exactly the first window that meets both sample floors, with a CR1
+# session-clustered t (G - 1 df) and an exact or seeded session sign-flip
+# test, and persists the first terminal verdict.
+TRIAL_VERDICT_SCHEMA = "paper-trial-verdict.v2"
+TRIAL_VERDICT_EVENT = "paper_trial_verdict"
+DEFAULT_ALPHA_ONE_SIDED = 0.05
+_TERMINAL_V2 = frozenset({"passed", "failed", "not_established"})
 # Defaults chosen to need a real sample before acting.  A trial that concludes
 # from four trades is measuring noise, and parking an edge on noise costs more
 # search than it saves.
@@ -59,13 +71,22 @@ def trial_policy(config: Mapping[str, Any] | None) -> dict[str, Any]:
             return float(default)
         return float(value)
 
-    return {
+    policy = {
         "enabled": bool(raw.get("enabled", True)),
         "min_sessions": max(1, int(number("min_sessions", DEFAULT_MIN_SESSIONS))),
         "min_trades": max(1, int(number("min_trades", DEFAULT_MIN_TRADES))),
         "min_mean_r": number("min_mean_r", DEFAULT_MIN_MEAN_R),
         "min_total_r": number("min_total_r", DEFAULT_MIN_TOTAL_R),
     }
+    version = str(raw.get("verdict_version") or "v1").strip().lower()
+    if version not in {"v1", "v2"}:
+        raise ValueError("research.trial.verdict_version must be v1 or v2")
+    if version == "v2":
+        alpha = number("alpha_one_sided", DEFAULT_ALPHA_ONE_SIDED)
+        if not 0.0 < alpha < 0.5:
+            raise ValueError("research.trial.alpha_one_sided must be in (0, 0.5)")
+        policy.update({"verdict_version": "v2", "alpha_one_sided": alpha})
+    return policy
 
 
 def _verdict(performance: Mapping[str, Any], policy: Mapping[str, Any]) -> dict:
@@ -173,6 +194,58 @@ def _verdict(performance: Mapping[str, Any], policy: Mapping[str, Any]) -> dict:
             **common}
 
 
+def _epoch_r_observations(ledger: EdgeLedger, candidate_id: str,
+                          ) -> tuple[list[float], list[str], str | None]:
+    """Return the trial epoch's per-trade R values, their sessions and epoch.
+
+    Rows are in session order.  An outcome without a usable R (directly or as
+    net P&L over a positive risk) is skipped, as is one without a session.
+    """
+    epoch, has_shadow = ledger._trial_epoch_state(candidate_id)
+    with closing(sqlite3.connect(ledger.path)) as db:
+        db.row_factory = sqlite3.Row
+        if has_shadow and epoch is None:
+            rows = []
+        elif epoch is None:
+            rows = db.execute(
+                "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
+                "WHERE candidate_id=? AND proof_run_id IS NULL "
+                "ORDER BY session_date,created_at,outcome_id", (candidate_id,)).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
+                "WHERE candidate_id=? AND proof_run_id=? "
+                "ORDER BY session_date,created_at,outcome_id", (candidate_id, epoch)).fetchall()
+    values: list[float] = []
+    clusters: list[str] = []
+    for row in rows:
+        session = str(row["session_date"] or "").strip()
+        if not session:
+            continue
+        try:
+            payload = json.loads(row["outcome_json"])
+            if not isinstance(payload, Mapping):
+                continue
+            value = payload.get("r_multiple")
+            if value is None:
+                net = row["net_pnl"]
+                risk = payload.get("risk_usd")
+                net_value = float(net)
+                risk_value = float(risk)
+                value = (net_value / risk_value
+                         if math.isfinite(net_value) and
+                         math.isfinite(risk_value) and risk_value > 0
+                         else None)
+            value = float(value)
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError,
+                AttributeError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+            clusters.append(session)
+    return values, clusters, epoch
+
+
 def _session_cluster_confidence(ledger: EdgeLedger, candidate_id: str) -> dict:
     """Estimate uncertainty from independent live-paper session clusters.
 
@@ -188,48 +261,7 @@ def _session_cluster_confidence(ledger: EdgeLedger, candidate_id: str) -> dict:
         "reason": "no_usable_r_observations",
     }
     try:
-        epoch, has_shadow = ledger._trial_epoch_state(candidate_id)
-        with closing(sqlite3.connect(ledger.path)) as db:
-            db.row_factory = sqlite3.Row
-            if has_shadow and epoch is None:
-                rows = []
-            elif epoch is None:
-                rows = db.execute(
-                    "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
-                    "WHERE candidate_id=? AND proof_run_id IS NULL "
-                    "ORDER BY session_date,created_at,outcome_id", (candidate_id,)).fetchall()
-            else:
-                rows = db.execute(
-                    "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
-                    "WHERE candidate_id=? AND proof_run_id=? "
-                    "ORDER BY session_date,created_at,outcome_id", (candidate_id, epoch)).fetchall()
-        values: list[float] = []
-        clusters: list[str] = []
-        for row in rows:
-            session = str(row["session_date"] or "").strip()
-            if not session:
-                continue
-            try:
-                payload = json.loads(row["outcome_json"])
-                if not isinstance(payload, Mapping):
-                    continue
-                value = payload.get("r_multiple")
-                if value is None:
-                    net = row["net_pnl"]
-                    risk = payload.get("risk_usd")
-                    net_value = float(net)
-                    risk_value = float(risk)
-                    value = (net_value / risk_value
-                             if math.isfinite(net_value) and
-                             math.isfinite(risk_value) and risk_value > 0
-                             else None)
-                value = float(value)
-            except (TypeError, ValueError, OverflowError, json.JSONDecodeError,
-                    AttributeError):
-                continue
-            if math.isfinite(value):
-                values.append(value)
-                clusters.append(session)
+        values, clusters, epoch = _epoch_r_observations(ledger, candidate_id)
         if not values:
             return empty
         from .stats import moving_block_cluster_bootstrap_lower_bound
@@ -247,6 +279,139 @@ def _session_cluster_confidence(ledger: EdgeLedger, candidate_id: str) -> dict:
         }
     except (OSError, sqlite3.Error, TypeError, ValueError, KeyError):
         return {**empty, "reason": "confidence_unavailable"}
+
+
+def _verdict_v2(values: Sequence[float], clusters: Sequence[str],
+                policy: Mapping[str, Any],
+                performance: Mapping[str, Any] | None = None) -> dict:
+    """Decide a paper trial once, on its first window meeting both floors.
+
+    The decision window is the shortest prefix of sessions, in date order,
+    with at least ``min_sessions`` sessions and ``min_trades`` trades.  It is
+    fixed by sample counts alone, so where it falls cannot depend on the
+    outcomes, and later sessions never change the verdict.  The test is a CR1
+    session-clustered t with G - 1 degrees of freedom and a one-sided session
+    sign-flip test (exact up to 16 sessions, seeded Monte Carlo beyond), both
+    against the mean-R floor at ``alpha_one_sided``.
+    """
+    from .stats import (cluster_robust_mean_inference, cluster_sign_flip_p_value,
+                        student_t_sf)
+
+    performance = performance or {}
+    required_sessions = int(policy["min_sessions"])
+    required_trades = int(policy["min_trades"])
+    alpha = float(policy.get("alpha_one_sided", DEFAULT_ALPHA_ONE_SIDED))
+    floor, total_floor = float(policy["min_mean_r"]), float(policy["min_total_r"])
+    per_session: dict[str, int] = {}
+    for cluster in clusters:
+        per_session[str(cluster)] = per_session.get(str(cluster), 0) + 1
+    ordered = sorted(per_session)
+    window: list[str] | None = None
+    trades = 0
+    for index, session in enumerate(ordered, start=1):
+        trades += per_session[session]
+        if index >= required_sessions and trades >= required_trades:
+            window = ordered[:index]
+            break
+    base = {"verdict_version": "v2", "sessions_observed": len(ordered),
+            "trades_observed": len(values),
+            "sessions_required": required_sessions,
+            "trades_required": required_trades,
+            "net_pnl": performance.get("net_pnl"),
+            "win_rate": performance.get("win_rate")}
+    if window is None:
+        return {"state": "running", "sessions": len(ordered),
+                "trades": len(values), **base}
+    members = set(window)
+    sample = [float(value) for value, cluster in zip(values, clusters)
+              if str(cluster) in members]
+    sessions = [str(cluster) for cluster in clusters if str(cluster) in members]
+    total = sum(sample)
+    mean = total / len(sample)
+    inference = cluster_robust_mean_inference(sample, sessions, shift=floor)
+    common = {"sessions": len(window), "trades": len(sample),
+              "decision_window_first": window[0],
+              "decision_window_last": window[-1],
+              "total_r": total, "mean_r": mean,
+              "min_total_r": total_floor, "min_mean_r": floor,
+              "alpha_one_sided": alpha, **base,
+              "session_cluster_confidence": None}
+    error, df = inference.get("stderr"), inference.get("df")
+    if not error or not df:
+        return {"state": "not_established", "reason": (
+                    "decision window has no session-level spread to test"),
+                **common}
+    t_stat = (mean - floor) / float(error)
+    above = cluster_sign_flip_p_value(sample, sessions, shift=floor,
+                                      alternative="greater")
+    below = cluster_sign_flip_p_value(sample, sessions, shift=floor,
+                                      alternative="less")
+    common["session_cluster_inference"] = {
+        "method": "cr1_session_t_and_session_sign_flip",
+        "stderr_r": float(error), "df": float(df), "t_stat": t_stat,
+        "cr1_p_above_floor": student_t_sf(t_stat, df),
+        "cr1_p_below_floor": student_t_sf(-t_stat, df),
+        "sign_flip_p_above_floor": above["p_value"],
+        "sign_flip_p_below_floor": below["p_value"],
+        "sign_flip_exact": bool(above.get("exact")),
+    }
+    stats = common["session_cluster_inference"]
+    if (total > total_floor and mean > floor and
+            stats["cr1_p_above_floor"] < alpha and
+            stats["sign_flip_p_above_floor"] < alpha):
+        return {"state": "passed", **common}
+    if (total <= total_floor and mean <= floor and
+            stats["cr1_p_below_floor"] < alpha and
+            stats["sign_flip_p_below_floor"] < alpha):
+        return {"state": "failed", **common}
+    return {"state": "not_established", "reason": (
+                "decided once at the preregistered window: neither above nor "
+                "below the mean-R floor at the registered alpha"), **common}
+
+
+def _persisted_verdict(ledger: EdgeLedger, candidate_id: str,
+                       epoch: str | None) -> dict | None:
+    """Return the first terminal v2 verdict recorded for this trial epoch."""
+    for event in ledger.history(candidate_id):
+        if event.get("event_type") != TRIAL_VERDICT_EVENT:
+            continue
+        try:
+            payload = json.loads(event.get("payload_json") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if (isinstance(payload, Mapping) and
+                payload.get("schema") == TRIAL_VERDICT_SCHEMA and
+                payload.get("proof_run_id") == epoch and
+                isinstance(payload.get("verdict"), Mapping)):
+            return {**payload["verdict"], "persisted": True,
+                    "persisted_event_id": event.get("event_id")}
+    return None
+
+
+def _review_verdict_v2(ledger: EdgeLedger, candidate_id: str,
+                       performance: Mapping[str, Any],
+                       policy: Mapping[str, Any], *, apply: bool) -> dict:
+    """Return the persisted verdict, or decide and (when applying) persist it."""
+    try:
+        values, clusters, epoch = _epoch_r_observations(ledger, candidate_id)
+    except (OSError, sqlite3.Error, TypeError, ValueError, KeyError):
+        return {"state": "inconclusive", "verdict_version": "v2",
+                "sessions": None, "trades": None,
+                "reason": "paper outcomes could not be read"}
+    persisted = _persisted_verdict(ledger, candidate_id, epoch)
+    if persisted is not None:
+        return persisted
+    verdict = _verdict_v2(values, clusters, policy, performance)
+    if apply and verdict["state"] in _TERMINAL_V2:
+        event = ledger.append_event(
+            candidate_id=candidate_id, event_type=TRIAL_VERDICT_EVENT,
+            actor="trial",
+            reason="first terminal paper-trial verdict, decided once",
+            payload={"schema": TRIAL_VERDICT_SCHEMA, "proof_run_id": epoch,
+                     "verdict": verdict})
+        verdict = {**verdict, "persisted": True,
+                   "persisted_event_id": event.get("event_id")}
+    return verdict
 
 
 def _reason(record: Mapping[str, Any], verdict: Mapping[str, Any]) -> str:
@@ -333,12 +498,16 @@ def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
         candidate_vehicle = str(candidate.get("vehicle") or "")
         is_pinned = (variant_id, candidate_vehicle) in frozen
         performance = ledger.paper_performance(candidate_id)
-        performance = {
-            **performance,
-            "session_cluster_confidence": _session_cluster_confidence(
-                ledger, candidate_id),
-        }
-        verdict = _verdict(performance, policy)
+        if policy.get("verdict_version") == "v2":
+            verdict = _review_verdict_v2(ledger, candidate_id, performance,
+                                         policy, apply=apply)
+        else:
+            performance = {
+                **performance,
+                "session_cluster_confidence": _session_cluster_confidence(
+                    ledger, candidate_id),
+            }
+            verdict = _verdict(performance, policy)
         learning_epoch = _learning_epoch_of(ledger, candidate_id)
         review = {
             "candidate_id": candidate_id, "variant_id": variant_id,
@@ -519,5 +688,7 @@ def _capital_return_pct(performance: Mapping[str, Any]) -> float | None:
     return round(100.0 * pnl_value / denominator_value, 4)
 
 
-__all__ = ["DEFAULT_MIN_SESSIONS", "DEFAULT_MIN_TRADES", "TRIAL_SCHEMA",
-           "promotable_report", "review_trials", "trial_policy"]
+__all__ = ["DEFAULT_ALPHA_ONE_SIDED", "DEFAULT_MIN_SESSIONS",
+           "DEFAULT_MIN_TRADES", "TRIAL_SCHEMA", "TRIAL_VERDICT_EVENT",
+           "TRIAL_VERDICT_SCHEMA", "promotable_report", "review_trials",
+           "trial_policy"]

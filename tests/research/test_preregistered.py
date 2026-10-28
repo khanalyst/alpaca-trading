@@ -86,7 +86,10 @@ class OpeningRangeFadeManifestTests(unittest.TestCase):
     def test_registering_it_left_the_first_hypothesis_untouched(self):
         self.assertEqual(prereg.preregistration()["manifest_hash"],
                          FROZEN_MANIFEST_HASH)
-        self.assertEqual(set(prereg.PREREGISTERED_HYPOTHESES),
+        # v2 registrations were added later as separate hypotheses
+        # (tests/research/test_preregistered_v2.py); the v1 set is unchanged.
+        self.assertEqual({item for item in prereg.PREREGISTERED_HYPOTHESES
+                          if item.endswith(".v1")},
                          {prereg.VWAP_REVERSION_HYPOTHESIS, self.hypothesis})
 
     def test_subject_and_mirror_resolve_and_are_recorded_forward(self):

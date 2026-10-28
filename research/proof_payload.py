@@ -18,7 +18,15 @@ from zoneinfo import ZoneInfo
 from agent.contracts.rule import validate_rule_spec
 
 
-PROOF_SCHEMA = "research-proof.v1"
+PROOF_SCHEMA_V1 = "research-proof.v1"
+# v2 publishes the FDR q-value and the lower confidence bound under their own
+# names.  v1 reported one key, ``confidence``, holding either a lower bound
+# or ``1 - q_value`` (review finding D1-11); a reader could take 0.97 for the
+# probability that an edge is real.  v1 payloads remain buildable so existing
+# artefacts reproduce byte for byte, and :func:`proof_statistics` reads both.
+PROOF_SCHEMA_V2 = "research-proof.v2"
+PROOF_SCHEMA = PROOF_SCHEMA_V2
+PROOF_SCHEMAS = (PROOF_SCHEMA_V1, PROOF_SCHEMA_V2)
 
 
 _DIAGNOSTIC_HISTORICAL_BACKFILL = "diagnostic_historical_backfill"
@@ -355,9 +363,57 @@ def _provider_info(candidate: Mapping[str, Any], run: Mapping[str, Any],
     return {key: result.get(key) for key in ("provider", "feed", "schema", "as_of")}
 
 
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _lower_bound(metrics: Mapping[str, Any], gate: Mapping[str, Any],
+                 statistics: Mapping[str, Any]) -> tuple[float | None, str | None]:
+    """Return the recorded lower confidence bound and where it was found."""
+    for source, value in (("metrics.lower_bound", metrics.get("lower_bound")),
+                          ("metrics.ci_low", metrics.get("ci_low")),
+                          ("gate.mean_delta_lcb", gate.get("mean_delta_lcb")),
+                          ("gate.statistics.mean_delta_lcb",
+                           statistics.get("mean_delta_lcb"))):
+        number = _finite_number(value)
+        if number is not None:
+            return number, source
+    return None, None
+
+
+def proof_statistics(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the q-value and lower bound from a proof payload of either schema.
+
+    A v1 payload's ``confidence`` cannot be interpreted (it was a lower bound
+    or ``1 - q_value`` depending on what the run recorded), so it is returned
+    only as ``legacy_confidence``; the q-value and lower bound are recovered
+    from the verified gate the payload carries.
+    """
+    if payload.get("schema") == PROOF_SCHEMA_V2:
+        return {"schema": PROOF_SCHEMA_V2, "q_value": payload.get("q_value"),
+                "lower_bound": payload.get("lower_bound"),
+                "lower_bound_source": payload.get("lower_bound_source"),
+                "legacy_confidence": None}
+    gate = payload.get("gate") if isinstance(payload.get("gate"), Mapping) else {}
+    statistics = (gate.get("statistics")
+                  if isinstance(gate.get("statistics"), Mapping) else {})
+    lower, source = _lower_bound({}, gate, statistics)
+    return {"schema": payload.get("schema"),
+            "q_value": _finite_number(statistics.get("q_value")),
+            "lower_bound": lower, "lower_bound_source": source,
+            "legacy_confidence": payload.get("confidence")}
+
+
 def _metrics(run: Mapping[str, Any], context: Mapping[str, Any],
              evidence: Sequence[Mapping[str, Any]] = (),
-             trades: Sequence[Mapping[str, Any]] = ()) -> tuple[dict[str, Any], dict[str, int]]:
+             trades: Sequence[Mapping[str, Any]] = (), *,
+             schema: str = PROOF_SCHEMA) -> tuple[dict[str, Any], dict[str, int]]:
     raw = _json_field(run.get("metrics"), {})
     metrics = dict(raw) if isinstance(raw, Mapping) else {}
     supplied = context.get("metrics")
@@ -408,9 +464,10 @@ def _metrics(run: Mapping[str, Any], context: Mapping[str, Any],
     statistics = gate.get("statistics") if isinstance(gate.get("statistics"), Mapping) else {}
     performance = gate.get("performance") if isinstance(gate.get("performance"), Mapping) else {}
     q_value = statistics.get("q_value")
-    confidence = metrics.get("confidence", metrics.get("ci_low"))
-    if confidence is None and q_value is not None:
-        confidence = 1.0 - float(q_value)
+    if schema == PROOF_SCHEMA_V1:
+        confidence = metrics.get("confidence", metrics.get("ci_low"))
+        if confidence is None and q_value is not None:
+            confidence = 1.0 - float(q_value)
     drawdown = metrics.get("max_drawdown", metrics.get("drawdown",
                               performance.get("max_drawdown")))
     cost = metrics.get("cost", metrics.get("total_cost", metrics.get("costs")))
@@ -425,17 +482,32 @@ def _metrics(run: Mapping[str, Any], context: Mapping[str, Any],
                 finite_costs.append(value)
         if finite_costs:
             cost = {"total": sum(finite_costs), "trades_with_costs": len(finite_costs)}
-    selected = {"gate": _finite(gate), "confidence": confidence,
+    if schema == PROOF_SCHEMA_V1:
+        selected = {"gate": _finite(gate), "confidence": confidence,
+                    "drawdown": drawdown, "cost": cost}
+        for key in ("gate", "confidence", "drawdown", "cost"):
+            if selected[key] is None:
+                selected[key] = None
+        return selected, result_samples
+    if q_value is None:
+        q_value = metrics.get("q_value")
+    lower, lower_source = _lower_bound(metrics, gate, statistics)
+    selected = {"gate": _finite(gate), "q_value": _finite_number(q_value),
+                "lower_bound": lower, "lower_bound_source": lower_source,
                 "drawdown": drawdown, "cost": cost}
-    for key in ("gate", "confidence", "drawdown", "cost"):
-        if selected[key] is None:
-            selected[key] = None
     return selected, result_samples
 
 
 def build_proof_payload(ledger: Any, candidate_id: str,
-                        context: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Build a deterministic proof payload without writing an artifact."""
+                        context: Mapping[str, Any] | None = None, *,
+                        schema: str = PROOF_SCHEMA) -> dict[str, Any]:
+    """Build a deterministic proof payload without writing an artifact.
+
+    ``schema`` selects the payload version; :data:`PROOF_SCHEMA_V1` rebuilds
+    an existing v1 artefact exactly.
+    """
+    if schema not in PROOF_SCHEMAS:
+        raise ValueError(f"unsupported proof schema: {schema!r}")
 
     context = dict(context or {})
     candidate_id = str(candidate_id)
@@ -515,7 +587,8 @@ def build_proof_payload(ledger: Any, candidate_id: str,
         for key in ("variant_id", "strategy_id"):
             if context.get(key) is not None and str(context[key]) != str(candidate.get(key) or ""):
                 raise ValueError(f"proof context {key} does not match persisted candidate")
-    metric_values, samples = _metrics(run, trusted_context, evidence, trades)
+    metric_values, samples = _metrics(run, trusted_context, evidence, trades,
+                                      schema=schema)
     hashes = _hashes(candidate, run, trusted_context)
     if strict_authorization and isinstance(metric_values.get("gate"), Mapping) and \
             metric_values["gate"].get("passes") is True:
@@ -560,7 +633,7 @@ def build_proof_payload(ledger: Any, candidate_id: str,
                              if item.get("evidence_hash") is not None)
 
     payload: dict[str, Any] = {
-        "schema": PROOF_SCHEMA,
+        "schema": schema,
         "candidate_id": candidate_id,
         "run_id": run.get("run_id"),
         "authorized_run_id": run.get("run_id") if strict_authorization else None,
@@ -588,7 +661,12 @@ def build_proof_payload(ledger: Any, candidate_id: str,
         "timezone": SESSION_ZONE, "dst_label": session["dst_label"],
         "samples": samples, "fit_samples": samples["fit"],
         "heldout_samples": samples["heldout"], "shadow_samples": samples["shadow"],
-        "gate": metric_values["gate"], "confidence": metric_values["confidence"],
+        "gate": metric_values["gate"],
+        **({"confidence": metric_values["confidence"]}
+           if schema == PROOF_SCHEMA_V1 else
+           {"q_value": metric_values["q_value"],
+            "lower_bound": metric_values["lower_bound"],
+            "lower_bound_source": metric_values["lower_bound_source"]}),
         "drawdown": metric_values["drawdown"], "cost": metric_values["cost"],
         "metrics": metric_values,
         "normalized_rule_spec": spec,

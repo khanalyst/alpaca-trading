@@ -228,8 +228,10 @@ class FactoryFdrTests(unittest.TestCase):
     def test_unknown_versioned_scope_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            # v7 became a registered scope (Javanmard-Montanari gamma); the
+            # next unregistered version must still fail closed.
             with self.assertRaisesRegex(FactoryError, "unsupported"):
-                ledger.next_fdr_allocation("shadow-confirmation-v7:equity")
+                ledger.next_fdr_allocation("shadow-confirmation-v8:equity")
 
     def test_qualification_claim_survives_restart_and_rejects_overlap(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -250,6 +252,85 @@ class FactoryFdrTests(unittest.TestCase):
                 restarted.claim_qualification(
                     "cycle-b", hypothesis.hypothesis_id, vehicle="equity",
                     variant_id="variant-b", sessions=["2026-01-03", "2026-01-04"])
+
+
+
+class JavanmardMontanariScopeTests(unittest.TestCase):
+    """Review finding D1-08: a slowly decaying sequence as ledger version v7."""
+
+    @staticmethod
+    def _gamma(index):
+        import math
+        return math.log(max(index, 2)) / (index * math.exp(math.sqrt(math.log(index))))
+
+    def test_the_sequence_is_normalized_to_at_most_one_and_non_increasing(self):
+        import math
+        from research.factory_ledger import FDR_JM_GAMMA_SERIES_SUM, _jm_gamma
+        count = 200_000
+        partial = math.fsum(self._gamma(index) for index in range(1, count))
+        root = math.sqrt(math.log(count))
+        tail = 2.0 * math.exp(-root) * (root ** 3 + 3 * root ** 2 + 6 * root + 6)
+        total = partial + tail + self._gamma(count) / 2
+        self.assertAlmostEqual(total, 12.645107872871751, places=8)
+        self.assertGreaterEqual(FDR_JM_GAMMA_SERIES_SUM, total)
+        self.assertLess(FDR_JM_GAMMA_SERIES_SUM - total, 1e-9)
+        values = [_jm_gamma(index) for index in range(1, 20_000)]
+        self.assertTrue(all(left >= right for left, right in zip(values, values[1:])))
+        self.assertAlmostEqual(values[0], math.log(2) / FDR_JM_GAMMA_SERIES_SUM)
+
+    def test_v7_scope_spends_the_new_sequence_and_persists_its_method(self):
+        from research.factory_ledger import (
+            CONFIRMATORY_SCOPE_VERSION_V7, FDR_JM_GAMMA_SERIES_SUM,
+            FDR_METHOD_V7, _jm_gamma)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "edge.sqlite3"
+            ledger = FactoryLedger(path)
+            scope = f"{CONFIRMATORY_SCOPE_VERSION_V7}:equity"
+            first = ledger.next_fdr_allocation(scope)
+            self.assertEqual(first["method"], FDR_METHOD_V7)
+            self.assertEqual(first["method_version"], "v7")
+            self.assertEqual(first["gamma_series_sum"], FDR_JM_GAMMA_SERIES_SUM)
+            self.assertAlmostEqual(first["allocated_alpha"], .025 * _jm_gamma(1))
+            for index in range(1, 31):
+                recorded = ledger.record_fdr_decision(scope, f"t-{index}", 1.0)
+                self.assertAlmostEqual(recorded["allocated_alpha"],
+                                       .025 * _jm_gamma(index))
+            # A discovery starts the alpha/2 first-discovery reward stream.
+            hit = ledger.record_fdr_decision(scope, "hit", 0.0)
+            self.assertTrue(hit["decision"])
+            after = FactoryLedger(path).next_fdr_allocation(scope)
+            self.assertAlmostEqual(after["allocated_alpha"],
+                                   .025 * _jm_gamma(32) + .025 * _jm_gamma(1))
+            with sqlite3.connect(path) as db:
+                methods = {row[0] for row in db.execute(
+                    "SELECT method_version FROM factory_fdr WHERE scope=?",
+                    (scope,))}
+            self.assertEqual(methods, {"v7"})
+
+    def test_v6_ledgers_keep_their_recorded_sequence(self):
+        from research.factory_ledger import CONFIRMATORY_SCOPE_VERSION_V7
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            v6 = f"{CONFIRMATORY_SCOPE_VERSION}:equity"
+            v7 = f"{CONFIRMATORY_SCOPE_VERSION_V7}:equity"
+            for index in range(1, 6):
+                ledger.record_fdr_decision(v6, f"a-{index}", 1.0)
+                ledger.record_fdr_decision(v7, f"a-{index}", 1.0)
+            state = ledger.fdr_state(v6)
+            self.assertEqual(state["method"], FDR_METHOD)
+            self.assertEqual(
+                [round(row["allocated_alpha"], 12) for row in state["decisions"]],
+                [round(.025 / (index * (index + 1)), 12) for index in range(1, 6)])
+            self.assertAlmostEqual(state["next_allocated_alpha"], .025 / 42)
+
+    def test_v7_is_more_lenient_than_v6_only_after_22_tests(self):
+        # The protocol documents this honestly: the slowly decaying sequence
+        # gives up early wealth to keep later tests passable.
+        from research.factory_ledger import _fdr_gamma, _jm_gamma
+        crossover = next(index for index in range(1, 1000)
+                         if _jm_gamma(index) > _fdr_gamma(index))
+        self.assertEqual(crossover, 23)
+        self.assertGreater(_jm_gamma(100) / _fdr_gamma(100), 4.0)
 
 
 if __name__ == "__main__":  # pragma: no cover

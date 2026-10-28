@@ -48,8 +48,14 @@ LESSON_SOURCES = {"llm", "deterministic", "live_paper"}
 # v2/v3/v4 scopes likewise retain their historical methods.
 CONFIRMATORY_SCOPE_VERSION = "shadow-confirmation-v6"
 CONFIRMATORY_SCOPE_VERSION_V5 = "shadow-confirmation-v5"
+CONFIRMATORY_SCOPE_VERSION_V6 = CONFIRMATORY_SCOPE_VERSION
+# v7 replaces only the gamma sequence (review finding D1-08).  It is a new
+# durable scope, selected explicitly by its prefix; v6 stays the active scope
+# so every v6 decision, and every proof bound to it, reproduces.
+CONFIRMATORY_SCOPE_VERSION_V7 = "shadow-confirmation-v7"
 FDR_METHOD_V5 = "lord_plus_plus_balanced_raw_p_v5"
 FDR_METHOD_V6 = "lord_plus_plus_balanced_raw_p_v6"
+FDR_METHOD_V7 = "lord_plus_plus_jm_raw_p_v7"
 # FDR_METHOD is the active method for new callers.  Keep the explicit v5
 # symbol above for audit/replay consumers that must select the old semantics.
 FDR_METHOD = FDR_METHOD_V6
@@ -57,6 +63,7 @@ LEGACY_FDR_METHOD = "lord_balanced_v2"
 LEGACY_RAW_FDR_METHOD = "lord_balanced_raw_p_v3"
 FDR_METHOD_VERSION_V5 = "v5"
 FDR_METHOD_VERSION_V6 = "v6"
+FDR_METHOD_VERSION_V7 = "v7"
 FDR_METHOD_VERSION = FDR_METHOD_VERSION_V6
 # v5 spent the full nominal alpha before its first discovery.  v6 is the new
 # preregistration: half of alpha is initial wealth, leaving alpha/2 for the
@@ -66,6 +73,20 @@ FDR_INITIAL_WEALTH_FRACTION_V5 = 1.0
 FDR_INITIAL_WEALTH_FRACTION_V6 = 0.5
 FDR_INITIAL_WEALTH_FRACTION = FDR_INITIAL_WEALTH_FRACTION_V6
 FDR_GAMMA_METHOD = "balanced_telescoping"
+# v7 keeps v6's preregistered initial wealth (W0 = alpha/2) and changes only
+# the sequence, to the slowly decaying one of Javanmard and Montanari (2018):
+# gamma_j proportional to log(max(j, 2)) / (j * exp(sqrt(log j))).  The
+# balanced 1/(j(j+1)) of v6 spends half its base wealth on the first test and
+# falls as 1/j^2, so by the tenth test without a discovery it needs z of
+# about 3.5 (research/protocol.md tabulates both sequences).
+FDR_INITIAL_WEALTH_FRACTION_V7 = 0.5
+FDR_GAMMA_METHOD_V7 = "javanmard_montanari_2018"
+# Sum over j >= 1 of log(max(j, 2)) / (j * exp(sqrt(log j))), computed as the
+# direct sum to 10^6 plus the closed-form tail integral
+# 2 * exp(-a) * (a^3 + 3a^2 + 6a + 6), a = sqrt(log N), with Euler-Maclaurin
+# corrections (12.645107872871751), rounded *up* so the normalized sequence
+# sums to slightly less than one.  A literal, so the sequence is fixed.
+FDR_JM_GAMMA_SERIES_SUM = 12.64510787288
 
 
 def _paired_session_deltas(result: Mapping[str, Any], *, vehicle: str) -> list[dict[str, Any]]:
@@ -169,6 +190,8 @@ def _fdr_semantics(scope: str) -> tuple[str, str]:
         return FDR_METHOD_V5, "raw_confirmatory"
     if value.startswith(f"{CONFIRMATORY_SCOPE_VERSION}:"):
         return FDR_METHOD_V6, "raw_confirmatory"
+    if value.startswith(f"{CONFIRMATORY_SCOPE_VERSION_V7}:"):
+        return FDR_METHOD_V7, "raw_confirmatory"
     if value.startswith("shadow-confirmation-v"):
         raise FactoryError(f"unsupported confirmatory FDR scope: {value}")
     # Unversioned/custom scopes predate the v6 boundary.  Keep their old
@@ -246,6 +269,8 @@ def _fdr_method_version(method: str) -> str:
         return FDR_METHOD_VERSION_V5
     if method == FDR_METHOD_V6:
         return FDR_METHOD_VERSION_V6
+    if method == FDR_METHOD_V7:
+        return FDR_METHOD_VERSION_V7
     if method == LEGACY_RAW_FDR_METHOD:
         return "v3"
     if method == LEGACY_FDR_METHOD:
@@ -256,7 +281,8 @@ def _fdr_method_version(method: str) -> str:
 def _fdr_p_value_kind(method: str) -> str:
     if method == LEGACY_FDR_METHOD:
         return "legacy_q"
-    if method in {FDR_METHOD_V5, FDR_METHOD_V6, LEGACY_RAW_FDR_METHOD}:
+    if method in {FDR_METHOD_V5, FDR_METHOD_V6, FDR_METHOD_V7,
+                  LEGACY_RAW_FDR_METHOD}:
         return "raw_confirmatory"
     raise FactoryError(f"unsupported durable FDR method: {method}")
 
@@ -305,6 +331,15 @@ def _fdr_gamma(index: int) -> float:
     return 1.0 / (int(index) * (int(index) + 1))
 
 
+def _jm_gamma(index: int) -> float:
+    """Return the normalized Javanmard-Montanari weight for test ``index``."""
+    if index <= 0:
+        return 0.0
+    value = int(index)
+    return (math.log(max(value, 2)) /
+            (value * math.exp(math.sqrt(math.log(value))))) / FDR_JM_GAMMA_SERIES_SUM
+
+
 def _legacy_fdr_allocation(decisions: list[Mapping[str, Any]],
                            alpha: float) -> tuple[int, float]:
     """Return the pre-v5 balanced LORD-style allocation for old scopes."""
@@ -318,7 +353,8 @@ def _legacy_fdr_allocation(decisions: list[Mapping[str, Any]],
 
 def _lord_plus_plus_allocation(
         decisions: list[Mapping[str, Any]], alpha: float,
-        initial_wealth_fraction: float) -> tuple[int, float]:
+        initial_wealth_fraction: float,
+        gamma: Any = _fdr_gamma) -> tuple[int, float]:
     """Return a LORD++ allocation for one preregistered initial wealth.
 
     Let ``tau_j`` be the test index of the j-th prior discovery and let
@@ -333,24 +369,25 @@ def _lord_plus_plus_allocation(
     would reinterpret every prior allocation.
     indices with no prior discovery contribute nothing.  The balanced gamma
     sequence sums to one, so the base and each reward stream are separately
-    bounded as required by LORD++.
+    bounded as required by LORD++.  ``gamma`` is the preregistered sequence
+    of the scope: the balanced one for v5 and v6, Javanmard-Montanari for v7.
     """
     test_index = len(decisions) + 1
     fraction = float(initial_wealth_fraction)
     if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
         raise FactoryError("initial wealth fraction must be in (0,1]")
     initial_wealth = float(alpha) * fraction
-    allocated = initial_wealth * _fdr_gamma(test_index)
+    allocated = initial_wealth * gamma(test_index)
     discoveries = [index for index, row in enumerate(decisions, start=1)
                    if bool(row["decision"])]
     if discoveries:
         first = discoveries[0]
         if test_index > first:
-            allocated += (float(alpha) - initial_wealth) * _fdr_gamma(
+            allocated += (float(alpha) - initial_wealth) * gamma(
                 test_index - first)
         for discovery in discoveries[1:]:
             if test_index > discovery:
-                allocated += float(alpha) * _fdr_gamma(test_index - discovery)
+                allocated += float(alpha) * gamma(test_index - discovery)
     return test_index, min(float(alpha), allocated)
 
 
@@ -368,6 +405,13 @@ def _fdr_allocation_v6(decisions: list[Mapping[str, Any]],
         decisions, alpha, FDR_INITIAL_WEALTH_FRACTION_V6)
 
 
+def _fdr_allocation_v7(decisions: list[Mapping[str, Any]],
+                       alpha: float) -> tuple[int, float]:
+    """Return the v7 LORD++ allocation: W0=alpha/2, Javanmard-Montanari gamma."""
+    return _lord_plus_plus_allocation(
+        decisions, alpha, FDR_INITIAL_WEALTH_FRACTION_V7, gamma=_jm_gamma)
+
+
 def _fdr_allocation_for_method(decisions: list[Mapping[str, Any]], alpha: float,
                                method: str) -> tuple[int, float]:
     """Dispatch allocation while preserving the old scope semantics."""
@@ -377,6 +421,8 @@ def _fdr_allocation_for_method(decisions: list[Mapping[str, Any]], alpha: float,
         return _fdr_allocation(decisions, alpha)
     if method == FDR_METHOD_V6:
         return _fdr_allocation_v6(decisions, alpha)
+    if method == FDR_METHOD_V7:
+        return _fdr_allocation_v7(decisions, alpha)
     raise FactoryError(f"unsupported durable FDR method: {method}")
 
 
@@ -404,6 +450,36 @@ def _fdr_metadata(method: str, p_value_kind: str, alpha: float) -> dict[str, Any
             "reference_url": (
                 "https://proceedings.neurips.cc/paper_files/paper/2017/hash/"
                 "7f018eb7b301a66658931cb8a93fd6e8-Abstract.html"),
+            "guarantee": {
+                "mFDR": "conditional_super_uniform_null_p_values",
+                "FDR": "independent_null_p_values_and_monotone_predictable_levels",
+                "confirmatory_design_must_establish_assumptions": True,
+            },
+        })
+    elif method == FDR_METHOD_V7:
+        initial_wealth = float(alpha) * FDR_INITIAL_WEALTH_FRACTION_V7
+        metadata.update({
+            "method_version": _fdr_method_version(method),
+            "algorithm": "LORD++",
+            "gamma_method": FDR_GAMMA_METHOD_V7,
+            "gamma_formula": (
+                "log(max(i,2))/(i*exp(sqrt(log(i))))/"
+                f"{FDR_JM_GAMMA_SERIES_SUM!r}"),
+            "gamma_sum": 1.0,
+            "gamma_series_sum": FDR_JM_GAMMA_SERIES_SUM,
+            "initial_wealth": initial_wealth,
+            "initial_wealth_fraction": FDR_INITIAL_WEALTH_FRACTION_V7,
+            "first_discovery_reward": float(alpha) - initial_wealth,
+            "subsequent_discovery_reward": float(alpha),
+            "reference": (
+                "Ramdas-Yang-Wainwright-Jordan-2017-"
+                "online-FDR-with-decaying-memory"),
+            "reference_url": (
+                "https://proceedings.neurips.cc/paper_files/paper/2017/hash/"
+                "7f018eb7b301a66658931cb8a93fd6e8-Abstract.html"),
+            "gamma_reference": (
+                "Javanmard-Montanari-2018-online-rules-for-control-of-"
+                "false-discovery-rate-and-false-discovery-exceedance"),
             "guarantee": {
                 "mFDR": "conditional_super_uniform_null_p_values",
                 "FDR": "independent_null_p_values_and_monotone_predictable_levels",
@@ -443,6 +519,7 @@ def deferred_fdr(scope: str, test_id: str) -> dict[str, Any]:
     deferred_method = {
         FDR_METHOD_V5: "deferred_confirmatory_raw_p_v5",
         FDR_METHOD_V6: "deferred_confirmatory_raw_p_v6",
+        FDR_METHOD_V7: "deferred_confirmatory_raw_p_v7",
         LEGACY_RAW_FDR_METHOD: "deferred_confirmatory_raw_p_v3",
         LEGACY_FDR_METHOD: "deferred_confirmatory_legacy_q_v2",
     }.get(method, "deferred_confirmatory_legacy")
@@ -453,7 +530,8 @@ def deferred_fdr(scope: str, test_id: str) -> dict[str, Any]:
             "p_value_kind": p_kind,
             **({"method_version": _fdr_method_version(method),
                 "online_method": method}
-               if method in {FDR_METHOD_V5, FDR_METHOD_V6} else {})}
+               if method in {FDR_METHOD_V5, FDR_METHOD_V6, FDR_METHOD_V7}
+               else {})}
 
 
 def _real(value: Any) -> float | None:
@@ -1022,6 +1100,8 @@ class FactoryLedger:
                         method = FDR_METHOD_V5
                     elif scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION}:"):
                         method = FDR_METHOD_V6
+                    elif scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION_V7}:"):
+                        method = FDR_METHOD_V7
                     else:
                         method = LEGACY_RAW_FDR_METHOD
                     version = _fdr_method_version(method)
@@ -1040,6 +1120,8 @@ class FactoryLedger:
                             method = FDR_METHOD_V5
                         elif scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION}:"):
                             method = FDR_METHOD_V6
+                        elif scope.startswith(f"{CONFIRMATORY_SCOPE_VERSION_V7}:"):
+                            method = FDR_METHOD_V7
                         elif scope.startswith("shadow-confirmation-v2:"):
                             method = LEGACY_FDR_METHOD
                         else:
@@ -2387,9 +2469,10 @@ class FactoryLedger:
                             *, alpha: float = .05) -> dict[str, Any]:
         """Persist one deterministic cumulative online-FDR decision.
 
-        For v5 and the active v6 live-shadow scopes, ``p_value`` is the raw
-        confirmatory statistic and the allocation is standard LORD++ under
-        that scope's preregistered initial wealth. v2/v3/v4 scopes retain
+        For the v5, the active v6 and the explicitly selected v7 live-shadow
+        scopes, ``p_value`` is the raw confirmatory statistic and the
+        allocation is standard LORD++ under that scope's preregistered
+        initial wealth and gamma sequence. v2/v3/v4 scopes retain
         their legacy allocation for audit compatibility.
         Family/global batch-adjusted q-values are candidate-selection summaries and must
         not be passed to a raw-p scope.
@@ -2543,9 +2626,12 @@ __all__ = [
     "ACTIVE_HYPOTHESIS_STATES", "FACTORY_SCHEMA", "FACTORY_IDENTITY_SCHEMA", "FACTORY_STATUSES",
     "VARIANT_CLOSURE_MODES",
     "CONFIRMATORY_SCOPE_VERSION", "CONFIRMATORY_SCOPE_VERSION_V5",
-    "FDR_METHOD", "FDR_METHOD_V5", "FDR_METHOD_V6",
+    "CONFIRMATORY_SCOPE_VERSION_V6", "CONFIRMATORY_SCOPE_VERSION_V7",
+    "FDR_METHOD", "FDR_METHOD_V5", "FDR_METHOD_V6", "FDR_METHOD_V7",
     "LEGACY_FDR_METHOD", "LEGACY_RAW_FDR_METHOD",
     "FDR_METHOD_VERSION", "FDR_METHOD_VERSION_V5", "FDR_METHOD_VERSION_V6",
+    "FDR_METHOD_VERSION_V7", "FDR_INITIAL_WEALTH_FRACTION_V7",
+    "FDR_GAMMA_METHOD_V7", "FDR_JM_GAMMA_SERIES_SUM",
     "FDR_INITIAL_WEALTH_FRACTION", "FDR_INITIAL_WEALTH_FRACTION_V5",
     "FDR_INITIAL_WEALTH_FRACTION_V6", "FDR_GAMMA_METHOD", "LESSON_KINDS",
     "LESSON_SOURCES", "FactoryError", "FactoryLedger",
