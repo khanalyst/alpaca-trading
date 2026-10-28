@@ -180,7 +180,7 @@ V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
     "agent.contracts.market_context":
         "fd6c1459b0d17d0d284d43d1b85d8a2561a5808b5efd647981b2ed36aa60589f",
     "agent.contracts.rule":
-        "911d8bf3804557cd522bb0a13668d81cc00484c217460fc6162b60e4972e1df4",
+        "3dc742b8fe63747188b2f75df23ca64b557f13ade4a5801c348da35fc09cf012",
     "agent.instruments":
         "13b3926e7f2bdcd92302ff6ca84153832ecde7a0e3e47028fe76ffde6eebb8f2",
     "research.edge_ledger_store":
@@ -197,7 +197,7 @@ V2_INSTRUMENT_COMPONENTS: dict[str, str] = {
         "c990b10d4044a587bdc309b90c722b4f3f1daecfc40a0f8af382be8e845e4906",
 }
 V2_INSTRUMENT_DIGEST = (
-    "a809497f623a21e04159dc0db20e6f3e1009dd78827e30308416d831e21b88da")
+    "7162116bb85e5b8f24be7cdeca6cac988a8b3e1aada614dddd9d97f911e9e646")
 # === end of v2 registration literals =========================================
 
 
