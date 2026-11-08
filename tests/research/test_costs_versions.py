@@ -271,7 +271,7 @@ class PerSymbolModelTests(unittest.TestCase):
         self.model = PerSymbolCostModel()
 
     def test_reference_table_is_the_audit_file(self):
-        reference = json.loads((ROOT / "docs/audit-2026-09-21/spread-reference.json")
+        reference = json.loads((ROOT / "tests/research/fixtures/spread-reference.json")
                                .read_text(encoding="utf-8"))["symbols"]
         self.assertEqual(set(reference), set(REFERENCE_SPREADS_BPS))
         for symbol, row in reference.items():

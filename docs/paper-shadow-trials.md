@@ -167,8 +167,8 @@ positions, modeled orders, fills, and net P&L. Compose defaults
 arms); explicit `0` selects the 24-rule catalog. State and the consumed-event
 cursor commit together, so retries cannot credit a close twice. Cash carries
 across sessions and restarts. The activation session remains warmup-only.
-Deployment-specific cohort and release status is tracked in the [current
-findings](current-findings.md) and the [September 15 paper activation
+Deployment-specific cohort and release status is tracked in the
+[findings](findings.md) and the [September 15 paper activation
 receipt](paper-activation-2026-09-15.json).
 
 Entries and market exits use causal, exact-feed/provider forward quotes:

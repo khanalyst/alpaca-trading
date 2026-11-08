@@ -25,7 +25,6 @@ optional fetcher also uses `requests` (already pinned in `requirements.lock.txt`
 | `power.py` | sample-size and minimum-detectable-effect calculations |
 | `run.py` | command line: simulate, select or smoke-test, write `report.md` and `results.json` |
 | `fetch_sip.py` | command line: download Alpaca SIP bars into one gzip CSV per symbol and month |
-| `results/smoke-1m/`, `results/smoke-5m/` | the two smoke runs (not evidence) |
 | `tests/research/test_liquid_reversion_study.py` | 52 offline unit tests (in the repository's test tree) |
 
 ## Causal rules
@@ -269,12 +268,14 @@ How to read it:
 
 ## Smoke results (NOT EVIDENCE)
 
+The smoke-run output folders were removed from the tree on 8 November 2026; the reports are linked below at commit `21d9729`, and the consolidated findings are in [docs/findings.md](../../docs/findings.md).
+
 **These are smoke runs. They check that the pipeline runs end to end on real bars. They are far too
 small to support or reject the hypothesis, they are not out of sample, and no parameters were
 selected.** The data are public consolidated-tape chart bars from the 15 October 2026 review, not
 Alpaca SIP. The two samples overlap in time.
 
-| | one-minute ([report](results/smoke-1m/report.md)) | five-minute ([report](results/smoke-5m/report.md)) |
+| | one-minute ([report](https://github.com/khanalyst/alpaca-trading/blob/21d97293455b42ac2ef7298bf814b09b68680200/studies/liquid_reversion/results/smoke-1m/report.md)) | five-minute ([report](https://github.com/khanalyst/alpaca-trading/blob/21d97293455b42ac2ef7298bf814b09b68680200/studies/liquid_reversion/results/smoke-5m/report.md)) |
 | --- | --- | --- |
 | sessions (known day type) | 22 (11), 2026-09-14 to 2026-10-13 | 42 (31), 2026-08-17 to 2026-10-14 |
 | trades / traded sessions | 15 / 7 | 31 / 18 |

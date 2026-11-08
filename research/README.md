@@ -229,7 +229,7 @@ realistic 1.5 to 4 bps on this universe. Two versions now exist:
 - `per_symbol_v2` is `research.costs.PerSymbolCostModel`, the arithmetic of
   `studies/liquid_reversion/costs.py`: one full spread per round trip, the
   larger of one tick and the symbol's measured or reference spread
-  (`docs/audit-2026-09-21/spread-reference.json`, embedded in
+  (`tests/research/fixtures/spread-reference.json`, embedded in
   `REFERENCE_SPREADS_BPS`); explicit slippage per side (0.5 bps) on market and
   stop legs only, plus one tick of stop-trigger slippage on stop legs; the SEC
   Section 31 fee ($20.60 per million, SEC Fee Rate Advisory 2026-2) and the

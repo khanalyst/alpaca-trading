@@ -1,6 +1,6 @@
 # Core design: the 10,000 to 15,000 line system
 
-Status: a design and migration plan, not yet built. It follows Path A, Step 4, of the [review](README.md#11-what-to-do-three-paths). No existing module is deleted by this document; each stage below is a separate change with its own go-ahead.
+Status: a design and migration plan, not yet built. It follows Path A, Step 4, of the [15 October 2026 review](https://github.com/khanalyst/alpaca-trading/blob/21d97293455b42ac2ef7298bf814b09b68680200/docs/review-2026-10-15/README.md#11-what-to-do-three-paths) (removed from the tree on 8 November 2026; its conclusions are summarised in [findings](findings.md)). No existing module is deleted by this document; each stage below is a separate change with its own go-ahead.
 
 ## 1. What the core must do, and what it must not
 
