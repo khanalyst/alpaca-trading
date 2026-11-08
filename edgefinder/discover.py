@@ -212,12 +212,60 @@ def confirm(rank: int, cand: dict[str, Any], holm_p: float) -> dict[str, Any]:
             "tests": tests, "verdict": verdict}
 
 
-def caveats_for(cand: dict[str, Any]) -> list[str]:
+def leg_decomposition(panel: data.Panel, windows: dict[str, Window],
+                      reference: str = "SPY") -> dict[str, Any]:
+    """Mean overnight, intraday and close-to-close return per fund, and against SPY.
+
+    Two funds that own nearly the same stocks should differ little on any leg.
+    When a fund's overnight leg beats the reference and its intraday leg gives
+    the same amount back, the difference sits in where the open and close are
+    printed, not in what the fund earns over a day.
+    """
+    out: dict[str, Any] = {}
+    if reference not in panel.symbols:
+        return out
+    r = panel.index[reference]
+    for symbol in panel.symbols:
+        j = panel.index[symbol]
+        out[symbol] = {}
+        for name, w in windows.items():
+            m = w.mask(panel.dates) & np.isfinite(panel.ret_on[:, j]) & \
+                np.isfinite(panel.ret_id[:, j]) & np.isfinite(panel.ret_on[:, r]) & \
+                np.isfinite(panel.ret_id[:, r])
+            if m.sum() < 60:
+                continue
+            on, idr, cc = (panel.ret_on[m, j], panel.ret_id[m, j], panel.ret_cc[m, j])
+            ron, rid, rcc = (panel.ret_on[m, r], panel.ret_id[m, r], panel.ret_cc[m, r])
+            out[symbol][name] = {
+                "sessions": int(m.sum()),
+                "on_bps": 1e4 * float(on.mean()), "id_bps": 1e4 * float(idr.mean()),
+                "cc_bps": 1e4 * float(cc.mean()),
+                "on_minus_ref_bps": 1e4 * float((on - ron).mean()),
+                "id_minus_ref_bps": 1e4 * float((idr - rid).mean()),
+                "cc_minus_ref_bps": 1e4 * float((cc - rcc).mean()),
+                "on_minus_ref_t": stats.hac_mean(on - ron)[2],
+            }
+    return out
+
+
+def caveats_for(cand: dict[str, Any], legs: dict[str, Any] | None = None) -> list[str]:
     """Automatic warnings, so a reader sees the weak spots next to the number."""
     out: list[str] = []
     disc, oos, full = cand["discovery"], cand["holdout"], cand["full"]
     family = FAMILIES[cand["family"]]
     out += list(family.caveats)
+    if legs and cand["family"] in ("overnight", "weekday_overnight", "intraday") \
+            and len(cand["symbols"]) == 1 and cand["symbols"][0] != "SPY":
+        sym = cand["symbols"][0]
+        h = (legs.get(sym) or {}).get("holdout")
+        if h and h["on_minus_ref_bps"] > 0.5 and \
+                abs(h["cc_minus_ref_bps"]) < 0.5 * h["on_minus_ref_bps"]:
+            out.append(
+                f"{h['on_minus_ref_bps']:.1f} of {sym}'s {h['on_bps']:.1f} bps a session of "
+                f"holdout overnight return is a difference from SPY that its intraday leg gives "
+                f"back ({h['id_minus_ref_bps']:+.1f} bps; same-day close-to-close difference "
+                f"{h['cc_minus_ref_bps']:+.2f} bps). That is a print-location effect: it pays only "
+                f"if auction orders receive the printed open and close")
     be = oos.get("breakeven_cost_multiple")
     if be is not None and be < 3:
         out.append(f"holdout gross edge covers only {be:.1f}x the modelled cost; a cost "
@@ -309,8 +357,9 @@ def scan(panel: data.Panel, *, draws: int = BOOTSTRAP_DRAWS,
                                       for k in ("alpha", "alpha_t", "sharpe", "ann_excess")}
         rows[i]["discovery_rank"] = rank
         confirmations.append(confirm(rank, rows[i], hp))
+    legs = leg_decomposition(panel, windows)
     for i in top:
-        rows[i]["caveats"] = caveats_for(rows[i])
+        rows[i]["caveats"] = caveats_for(rows[i], legs)
     chosen = next((c for c in confirmations if c["verdict"] == "confirmed"), None)
 
     # rank stability between windows (all eligible candidates with a holdout)
@@ -372,6 +421,7 @@ def scan(panel: data.Panel, *, draws: int = BOOTSTRAP_DRAWS,
         "confirmations": confirmations,
         "selected": chosen["id"] if chosen else None,
         "walk_forward": wf, "families": families, "benchmarks": benchmarks,
+        "leg_decomposition": legs,
         "candidates": rows,
     }
 

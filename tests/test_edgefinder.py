@@ -299,6 +299,27 @@ class ScanTests(unittest.TestCase):
         self.assertIn(spec["verdict"], ("confirmed", "weak", None))
 
 
+class LegDecompositionTests(unittest.TestCase):
+    def test_print_location_effect_is_flagged(self):
+        panel = synthetic_panel(400, symbols=("SPY", "VTI"))
+        # VTI is SPY with its open printed 3 bps higher: overnight gains what intraday loses
+        for name in ("open", "high", "low", "close", "dividend"):
+            getattr(panel, name)[:, 1] = getattr(panel, name)[:, 0]
+        panel.open[:, 1] *= 1.0003
+        panel._derive()
+        windows = {"holdout": discover.Window("holdout", panel.dates[0], panel.dates[-1])}
+        legs = discover.leg_decomposition(panel, windows)
+        h = legs["VTI"]["holdout"]
+        self.assertAlmostEqual(h["on_minus_ref_bps"], -h["id_minus_ref_bps"], delta=0.2)
+        self.assertLess(abs(h["cc_minus_ref_bps"]), 0.5)
+        row = {"family": "overnight", "symbols": ["VTI"], "discovery": {}, "full": {},
+               "holdout": {}}
+        flags = discover.caveats_for(row, legs)
+        self.assertTrue(any("print-location" in f for f in flags))
+        self.assertFalse(any("print-location" in f for f in discover.caveats_for(
+            {**row, "symbols": ["SPY"]}, legs)))
+
+
 class SelectionRuleTests(unittest.TestCase):
     def _scan(self, verdicts, passed):
         confs = []

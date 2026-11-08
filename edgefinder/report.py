@@ -228,6 +228,24 @@ def render(scan: Mapping[str, Any]) -> str:
         for c in spec["caveats"] or ["none flagged"]:
             add(f"- {c}")
         add("")
+    legs = scan.get("leg_decomposition") or {}
+    if legs:
+        add("## Where each fund earns its return: overnight against intraday (holdout)")
+        add("")
+        add("Mean bps per session. The last three columns subtract SPY on the same sessions. A "
+            "fund whose overnight lead over SPY is handed back intraday, with no close-to-close "
+            "difference, owes that lead to where its open and close are printed.")
+        add("")
+        add("| fund | overnight | intraday | close to close | overnight minus SPY (t) | "
+            "intraday minus SPY | close to close minus SPY |")
+        add("| --- | --- | --- | --- | --- | --- | --- |")
+        for sym in ("SPY", "VTI", "QQQ", "IWM", "VB", "VO", "DIA", "EFA", "TLT", "HYG"):
+            h = (legs.get(sym) or {}).get("holdout")
+            if h:
+                add(f"| {sym} | {_num(h['on_bps'])} | {_num(h['id_bps'])} | {_num(h['cc_bps'])} | "
+                    f"{_num(h['on_minus_ref_bps'])} ({_num(h['on_minus_ref_t'], 1)}) | "
+                    f"{_num(h['id_minus_ref_bps'])} | {_num(h['cc_minus_ref_bps'])} |")
+        add("")
     add("## Buy and hold, for scale")
     add("")
     add("| fund | holdout excess a year | holdout Sharpe | holdout max drawdown | "
