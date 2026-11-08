@@ -1,0 +1,65 @@
+# Opt-in: the edgefinder auction trader, on its OWN Alpaca paper account.
+#
+# The intraday trader force-flats at 15:50 and its watchdog flattens any
+# position it does not know, so this trader must never share their account.
+# Create a second paper account in the Alpaca dashboard and put its keys in a
+# separate dotenv file (ALPACA_API_KEY=..., ALPACA_SECRET_KEY=...), mode 0600.
+#
+#   export EDGEFINDER_SECRET_FILE=/etc/alpaca-agent-trading/edgefinder.env
+#   docker compose -f compose.yaml -f deploy/compose.edgefinder.yaml up -d edgefinder-trader
+#   docker compose -f compose.yaml -f deploy/compose.edgefinder.yaml exec edgefinder-trader \
+#       python -m edgefinder.trader status --state /app/runtime/edgefinder
+#
+# It trades the spec frozen in the image (edgefinder/results/strategy.json).
+# A spec whose verdict is not "confirmed" is paper only; live mode is not
+# configured here at all.
+services:
+  edgefinder-trader:
+    image: alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}
+    container_name: alpaca-edgefinder-trader
+    command: ["python", "-m", "edgefinder.trader", "loop", "--submit",
+              "--state", "/app/runtime/edgefinder"]
+    user: "10001:10001"
+    working_dir: /app
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    restart: unless-stopped
+    environment:
+      EDGEFINDER_SECRETS_FILE: /run/secrets/edgefinder_credentials
+      ALPACA_LIVE_ENABLE: "false"
+      TZ: UTC
+    secrets:
+      - source: edgefinder_credentials
+        target: edgefinder_credentials
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    volumes:
+      - edgefinder-data:/app/runtime/edgefinder
+    healthcheck:
+      test: ["CMD", "python", "-m", "edgefinder.trader", "health",
+             "--state", "/app/runtime/edgefinder", "--max-age", "180"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 2m
+    cpus: "0.50"
+    mem_limit: 512m
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  edgefinder_credentials:
+    file: ${EDGEFINDER_SECRET_FILE:?set EDGEFINDER_SECRET_FILE to the dedicated paper account's dotenv file}
+
+volumes:
+  edgefinder-data:

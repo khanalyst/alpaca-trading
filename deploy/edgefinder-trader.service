@@ -1,0 +1,29 @@
+[Unit]
+Description=Edgefinder auction trader (dedicated Alpaca paper account)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alpaca
+Group=alpaca
+WorkingDirectory=/opt/alpaca-agent-trading
+# A separate dotenv file with the DEDICATED account's ALPACA_API_KEY and
+# ALPACA_SECRET_KEY. Never the intraday trader's agent.env.
+Environment=EDGEFINDER_SECRETS_FILE=/etc/alpaca-agent-trading/edgefinder.env
+Environment=ALPACA_LIVE_ENABLE=false
+ExecStart=/opt/alpaca-agent-trading/.venv/bin/python -m edgefinder.trader loop --submit --state /opt/alpaca-agent-trading/runtime/edgefinder
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alpaca-agent-trading/runtime
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=1m
+
+[Install]
+WantedBy=multi-user.target
