@@ -1,0 +1,96 @@
+{
+ "schema": "edgefinder.strategy.v1",
+ "created_from_scan": "2026-11-08T23:20:37.438831+00:00",
+ "code_commit": "669e3e8d109c62dc698120c7ce20b60745241d08",
+ "data_digest": "079a8a02a5224b5f760ffc24971380bed120cd752e9c236e8f1485b1f6277212",
+ "data_last_date": "2026-11-06",
+ "candidate": {
+  "id": "overnight:VTI:filter=sma200",
+  "family": "overnight",
+  "symbols": [
+   "VTI"
+  ],
+  "params": {
+   "filter": "sma200"
+  }
+ },
+ "verdict": "weak",
+ "live_allowed": false,
+ "tests": {
+  "holdout_alpha_significant": true,
+  "holdout_sharpe_positive": true,
+  "holdout_breakeven_cost_at_least_2x": true,
+  "discovery_deflated_sharpe": false,
+  "holdout_alpha_survives_best_year_removed": true
+ },
+ "holdout_alpha_p_holm": 0.033717,
+ "discovery_rank": 5,
+ "mechanism": "Hold from the closing auction to the next opening auction. The equity premium accrues mostly overnight (risk borne while markets are shut; retail buying at the open and institutional selling during the day).",
+ "execution": "buy market-on-close, sell market-on-open",
+ "evidence": {
+  "discovery": {
+   "years": 13.73,
+   "ann_excess": 0.077196,
+   "ann_vol": 0.063462,
+   "sharpe": 1.216405,
+   "alpha": 0.069715,
+   "alpha_t": 4.473468,
+   "alpha_ir": 1.154543,
+   "beta": 0.098687,
+   "max_drawdown": -0.130239,
+   "trades_per_year": 184.392021,
+   "net_bps_per_trade": 4.186493,
+   "breakeven_cost_multiple": 3.106759,
+   "cagr_cash_earns_nothing": 0.086686,
+   "exposure_overnight": 0.731714,
+   "exposure_intraday": 0.0
+  },
+  "holdout": {
+   "years": 10.83,
+   "ann_excess": 0.076255,
+   "ann_vol": 0.076041,
+   "sharpe": 1.002816,
+   "alpha": 0.055871,
+   "alpha_t": 2.634375,
+   "alpha_ir": 0.797588,
+   "beta": 0.16375,
+   "max_drawdown": -0.135085,
+   "trades_per_year": 207.290323,
+   "net_bps_per_trade": 3.678661,
+   "breakeven_cost_multiple": 2.851617,
+   "cagr_cash_earns_nothing": 0.093054,
+   "exposure_overnight": 0.822214,
+   "exposure_intraday": 0.0
+  },
+  "full": {
+   "years": 24.55,
+   "ann_excess": 0.076781,
+   "ann_vol": 0.069285,
+   "sharpe": 1.108196,
+   "alpha": 0.064673,
+   "alpha_t": 5.023553,
+   "alpha_ir": 0.993416,
+   "beta": 0.124487,
+   "max_drawdown": -0.135085,
+   "trades_per_year": 194.488444,
+   "net_bps_per_trade": 3.947839,
+   "breakeven_cost_multiple": 2.98687,
+   "cagr_cash_earns_nothing": 0.089489,
+   "exposure_overnight": 0.771618,
+   "exposure_intraday": 0.0
+  }
+ },
+ "holdout_2x_cost": {
+  "alpha": 0.014678,
+  "alpha_t": 0.693688,
+  "sharpe": 0.461425,
+  "ann_excess": 0.035072
+ },
+ "caveats": [
+  "one round trip every held session: the result is only as good as the assumption that auction orders receive the printed open and close",
+  "1.6 of VTI's 5.4 bps a session of holdout overnight return is a difference from SPY that its intraday leg gives back (-1.7 bps; same-day close-to-close difference -0.12 bps). That is a print-location effect: it pays only if auction orders receive the printed open and close",
+  "holdout gross edge covers only 2.9x the modelled cost; a cost error of that size erases it",
+  "207 round trips a year: every trade is a short-term gain for tax, and an auction-price shortfall repeats daily"
+ ],
+ "selection_rule": "weak: most confirmation tests passed, then discovery rank (rule chosen after the first scan was seen); paper only"
+}
