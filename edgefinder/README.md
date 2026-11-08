@@ -120,4 +120,4 @@ systemd: [`deploy/edgefinder-trader.service`](../deploy/edgefinder-trader.servic
 python -m unittest tests.test_edgefinder
 ```
 
-52 tests: data legs and dividends, cost parity with `research/costs.py`, look-ahead perturbation for every family, the engine's arithmetic, the statistics against known cases, an end-to-end scan that finds a planted edge, the selection rule, the auction re-pricing, and every trader check, phase and failure path against an in-memory broker.
+54 tests: data legs and dividends, cost parity with `research/costs.py`, look-ahead perturbation for every family, the engine's arithmetic, the statistics against known cases, an end-to-end scan that finds a planted edge, the selection rule, the auction re-pricing, every trader check, phase and failure path against an in-memory broker, and two checks that edgefinder stays out of every frozen identity of the intraday system.

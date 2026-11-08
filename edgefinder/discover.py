@@ -40,7 +40,7 @@ import numpy as np
 
 from edgefinder import SCHEMA, backtest, catalogue, costs, data, stats
 from edgefinder.backtest import Result
-from edgefinder.catalogue import FAMILIES, Candidate
+from edgefinder.catalogue import FAMILIES
 
 STATS_START = dt.date(2001, 6, 1)
 DISCOVERY_END = dt.date(2015, 12, 31)
@@ -192,7 +192,7 @@ def _buy_and_hold_excess(panel: data.Panel, symbol: str, dates: Sequence[dt.date
 
 
 def confirm(rank: int, cand: dict[str, Any], holm_p: float) -> dict[str, Any]:
-    oos, disc = cand["holdout"], cand["discovery"]
+    oos = cand["holdout"]
     tests = {
         "holdout_alpha_significant": holm_p < CONFIRM_ALPHA,
         "holdout_sharpe_positive": (oos.get("sharpe") or 0) > 0,

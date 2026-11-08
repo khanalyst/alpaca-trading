@@ -1,0 +1,4 @@
+# edgefinder only. Kept out of requirements.lock.txt on purpose: that file is
+# hashed into the paper-trial, live-shadow and cost-counterfactual code
+# identities, so adding a package there would void their evidence.
+numpy==2.5.3

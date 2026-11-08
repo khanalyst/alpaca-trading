@@ -607,6 +607,25 @@ class TraderCommandTests(unittest.TestCase):
             self.assertEqual(trader.health(cfg, 60), 1)
 
 
+class IdentityIsolationTests(unittest.TestCase):
+    """edgefinder must not change any frozen identity of the intraday system."""
+
+    def test_edgefinder_dependencies_stay_out_of_the_hashed_lock_file(self):
+        root = Path(__file__).resolve().parents[1]
+        lock = (root / "requirements.lock.txt").read_text(encoding="utf-8").lower()
+        extra = (root / "requirements-edgefinder.txt").read_text(encoding="utf-8")
+        for line in extra.splitlines():
+            name = line.split("==")[0].strip().lower()
+            if name and not name.startswith("#"):
+                self.assertNotIn(name + "==", lock)
+
+    def test_no_identity_root_imports_edgefinder(self):
+        root = Path(__file__).resolve().parents[1]
+        for package in ("agent", "research", "deploy"):
+            for path in (root / package).rglob("*.py"):
+                self.assertNotIn("edgefinder", path.read_text(encoding="utf-8"), path)
+
+
 class BrokerTests(unittest.TestCase):
     def test_alpaca_broker_needs_keys_and_only_alpaca_hosts(self):
         import os

@@ -21,9 +21,11 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-          cache-dependency-path: requirements.lock.txt
+          cache-dependency-path: |
+            requirements.lock.txt
+            requirements-edgefinder.txt
       - name: Install the locked runtime
-        run: python -m pip install --disable-pip-version-check -r requirements.lock.txt
+        run: python -m pip install --disable-pip-version-check -r requirements.lock.txt -r requirements-edgefinder.txt
       - name: Compile and run the assigned complete-suite shard
         run: |
           python -m compileall -q agent research deploy studies edgefinder main.py report.py research.py

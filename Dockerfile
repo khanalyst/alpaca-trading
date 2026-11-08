@@ -18,8 +18,9 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY requirements.lock.txt ./requirements.lock.txt
+COPY requirements-edgefinder.txt ./requirements-edgefinder.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check \
-    -r requirements.lock.txt
+    -r requirements.lock.txt -r requirements-edgefinder.txt
 
 RUN groupadd --gid 10001 alpaca \
     && useradd --uid 10001 --gid 10001 --no-create-home \
