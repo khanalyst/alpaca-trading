@@ -54,8 +54,16 @@ class Result:
         return self.candidate.id
 
 
-def run(panel: Panel, candidate: Candidate, *, stress: float = 1.0) -> Result:
-    open_w, close_w, ready = decide(panel, candidate)
+def run(panel: Panel, candidate: Candidate, *, stress: float = 1.0,
+        decision_panel: Panel | None = None) -> Result:
+    """Back-test ``candidate``; ``decision_panel`` (same dates) supplies the signals.
+
+    Deciding on one panel and earning on another isolates execution: signals
+    from the bars the trader sees, legs priced at the auction prints it gets.
+    """
+    if decision_panel is not None and decision_panel.dates != panel.dates:
+        raise ValueError("decision panel dates must match")
+    open_w, close_w, ready = decide(decision_panel or panel, candidate)
     cols = [panel.index[s] for s in candidate.symbols]
     on, idr = panel.ret_on[:, cols], panel.ret_id[:, cols]
     w_on = np.zeros_like(close_w)

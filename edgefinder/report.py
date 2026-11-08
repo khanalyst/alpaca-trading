@@ -303,9 +303,12 @@ def render(scan: Mapping[str, Any]) -> str:
 
 
 STANDING_CAVEATS = (
-    "The bars are public consolidated prices from an unofficial endpoint. The official open "
-    "and close are auction prices; whether a market-on-open or market-on-close order receives "
-    "exactly the printed open or close is not tested here. The paper trial measures it.",
+    "The bars are public consolidated prices from an unofficial endpoint, and their open is the "
+    "first valid trade of the session. A market-on-open order fills at the primary exchange's "
+    "opening auction, which can differ from that trade, and Alpaca's paper trading simulates "
+    "opening orders at the opening quote, so a paper trial cannot test this. "
+    "`python -m edgefinder.auctions` re-prices the selected strategy at the official auction "
+    "prints (2016 onwards) and is the test that settles it.",
     "One cost schedule (September 2026 spreads at 2026 prices) is applied to every year. "
     "Spreads were wider in the 2000s, so early-year results are flattered for the "
     "high-turnover families.",

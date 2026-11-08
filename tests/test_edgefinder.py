@@ -11,7 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
-from edgefinder import backtest, catalogue, costs, data, discover, report, stats, trader
+from edgefinder import (auctions, backtest, catalogue, costs, data, discover, report, stats,
+                        trader)
 from edgefinder.broker import BrokerError, FakeBroker
 from edgefinder.catalogue import Candidate
 from edgefinder.data import NY, Panel
@@ -320,6 +321,58 @@ class LegDecompositionTests(unittest.TestCase):
             {**row, "symbols": ["SPY"]}, legs)))
 
 
+class AuctionTests(unittest.TestCase):
+    def test_primary_print_is_the_largest(self):
+        entries = [{"p": 10.0, "s": 100, "x": "T", "c": "O"},
+                   {"p": 10.2, "s": 600000, "x": "P", "c": "Q"}]
+        self.assertEqual(auctions.primary_print(entries)["exchange"], "P")
+        self.assertIsNone(auctions.primary_print([]))
+
+    def test_parse_and_paginate(self):
+        pages = [{"auctions": {"SPY": [{"d": "2026-01-05", "o": [{"p": 1.0, "s": 5}],
+                                        "c": [{"p": 2.0, "s": 9}]}]}, "next_page_token": "x"},
+                 {"auctions": {"SPY": [{"d": "2026-01-06", "o": [{"p": 3.0, "s": 5}],
+                                        "c": []}]}, "next_page_token": None}]
+        calls = []
+
+        def http(url, headers=None):
+            calls.append(url)
+            return pages[len(calls) - 1]
+
+        got = auctions.fetch_auctions(["SPY"], dt.date(2026, 1, 1), dt.date(2026, 1, 9),
+                                      key="k", secret="s", http=http)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("page_token=x", calls[1])
+        self.assertEqual(got["SPY"]["2026-01-05"]["close"]["price"], 2.0)
+        self.assertIsNone(got["SPY"]["2026-01-06"]["close"])
+
+    def test_check_finds_a_print_location_edge_disappears_at_the_auction(self):
+        panel = synthetic_panel(700, symbols=("SPY", "VTI"))
+        for name in ("open", "high", "low", "close", "dividend"):
+            getattr(panel, name)[:, 1] = getattr(panel, name)[:, 0]
+        auction_open = panel.open[:, 1].copy()
+        panel.open[:, 1] *= 1.0008            # the bars print the open 8 bps high
+        panel._derive()
+        prints = {"VTI": {d.isoformat(): {"open": {"price": float(auction_open[i])},
+                                          "close": {"price": float(panel.close[i, 1])}}
+                          for i, d in enumerate(panel.dates)}}
+        c = Candidate("overnight", ("VTI",), (("filter", "none"),))
+        result = auctions.check(c, panel, prints)
+        gap = result["print_gaps"]["VTI"]["open_auction_minus_bar_bps"]
+        self.assertAlmostEqual(gap, -8.0, delta=0.05)
+        diff = (result["bar_priced"]["net_bps_per_held_session"]
+                - result["auction_priced"]["net_bps_per_held_session"])
+        self.assertAlmostEqual(diff, 8.0, delta=0.1)
+
+    def test_split_basis_sessions_are_left_out(self):
+        panel = synthetic_panel(80, symbols=("SPY",))
+        day = panel.dates[10].isoformat()
+        prints = {"SPY": {day: {"open": {"price": float(panel.open[10, 0]) * 4},
+                                "close": {"price": float(panel.close[10, 0]) * 4}}}}
+        _, covered = auctions.reprice(panel, prints)
+        self.assertFalse(covered.any())
+
+
 class SelectionRuleTests(unittest.TestCase):
     def _scan(self, verdicts, passed):
         confs = []
@@ -511,9 +564,30 @@ class TraderTests(unittest.TestCase):
                                                  NY).isoformat()
             o["submitted_at"] = o["filled_at"]
         out = trader.status(self.broker, self.cfg, days=100000,
-                            panel_loader=lambda c, cfg: self.panel)
+                            panel_loader=lambda c, cfg: self.panel, auction_loader=None)
         self.assertEqual(out["filled"], 1)
         self.assertAlmostEqual(out["auction_shortfall_bps"]["mean"], 1.0, places=6)
+        self.assertIn("bar", out["shortfall_reference"])
+        day = self.panel.dates[-1].isoformat()
+        auction = {"SPY": {day: {"close": {"price": self.panel.close[-1, 0] * 1.0002},
+                                 "open": None}}}
+        out = trader.status(self.broker, self.cfg, days=100000,
+                            panel_loader=lambda c, cfg: self.panel,
+                            auction_loader=lambda syms, start: auction)
+        self.assertIn("auction", out["shortfall_reference"])
+        self.assertAlmostEqual(out["auction_shortfall_bps"]["mean"], -1.0, delta=1e-3)
+
+
+class ExecutionVerdictTests(unittest.TestCase):
+    def test_verdicts(self):
+        rng = np.random.default_rng(8)
+        self.assertEqual(trader.execution_verdict([0.1] * 10)["verdict"], "pending")
+        good = rng.normal(0.2, 1.0, 400).tolist()
+        self.assertEqual(trader.execution_verdict(good)["verdict"], "pass")
+        bad = rng.normal(2.0, 1.0, 400).tolist()           # 4 bps a round trip
+        self.assertEqual(trader.execution_verdict(bad)["verdict"], "stop")
+        noisy = [0.8 + 8.0 * (-1) ** i for i in range(130)]   # 1.6 bps a round trip, wide
+        self.assertEqual(trader.execution_verdict(noisy)["verdict"], "inconclusive")
 
 
 class TraderCommandTests(unittest.TestCase):

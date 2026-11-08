@@ -60,6 +60,14 @@ CATCHUP_AFTER_OPEN_MINUTES = 5
 DEFAULT_SPEC = Path("edgefinder/results/strategy.json")
 DEFAULT_STATE = Path("runtime/edgefinder")
 TIF = {"open": "opg", "close": "cls", "catchup": "day", "flatten": "day"}
+# The paper trial's job is the execution check (the return itself needs about
+# four years of nights to test).  Shortfall is measured per auction leg against
+# the printed open or close the research used; a round trip has two legs.
+# On a paper account the fills are simulated, so the verdict there tests the
+# trader's mechanics and the simulator, not the auction; see status().
+TRIAL_MIN_LEGS = 120                  # about 60 round trips, three months
+TRIAL_PASS_ROUND_TRIP_BPS = 1.0       # mean shortfall per round trip
+TRIAL_STOP_ROUND_TRIP_BPS = 2.0       # beyond this the print-location share is gone
 
 
 class TraderError(RuntimeError):
@@ -438,9 +446,23 @@ def loop(broker: Broker, cfg: Config, *, submit: bool, live: bool, interval: flo
 # monitoring
 
 
+def _default_auctions(symbols: Sequence[str], start: dt.date) -> Mapping[str, Any]:
+    from edgefinder.auctions import fetch_auctions
+    return fetch_auctions(symbols, start)
+
+
 def status(broker: Broker, cfg: Config, *, days: int = 60,
-           panel_loader: Callable[[Candidate, Config], Panel] = load_live_panel) -> dict[str, Any]:
-    """Positions, recent strategy orders, auction fill shortfall and realised round trips."""
+           panel_loader: Callable[[Candidate, Config], Panel] = load_live_panel,
+           auction_loader: Callable[[Sequence[str], dt.date], Mapping[str, Any]] | None
+           = _default_auctions) -> dict[str, Any]:
+    """Positions, recent strategy orders, fill shortfall and realised round trips.
+
+    Shortfall is measured against the official auction prints when Alpaca
+    serves them, else against the bars.  On a paper account the fills are
+    Alpaca's simulation (an opening order fills like a market order at the
+    opening quote), so the shortfall there describes the simulator; only live
+    fills test the auction assumption.
+    """
     spec = load_spec(cfg.spec_path)
     candidate = candidate_of(spec)
     after = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
@@ -450,6 +472,19 @@ def status(broker: Broker, cfg: Config, *, days: int = 60,
     panel = panel_loader(candidate, cfg)
     position = {d: i for i, d in enumerate(panel.dates)}
     j = {s: i for i, s in enumerate(panel.symbols)}
+    reference = "bar open and close (first and last valid trade)"
+    prints: Mapping[str, Any] = {}
+    if auction_loader is _default_auctions and getattr(broker, "key", None):
+        from edgefinder.auctions import fetch_auctions
+
+        def auction_loader(symbols: Sequence[str], start: dt.date) -> Mapping[str, Any]:
+            return fetch_auctions(symbols, start, key=broker.key, secret=broker.secret)
+    if auction_loader is not None:
+        try:
+            prints = auction_loader(candidate.symbols, after.date())
+            reference = "official auction prints (largest print per session)"
+        except (data.DataError, BrokerError):
+            prints = {}
     shortfalls, legs = [], []
     for o in sorted(filled, key=lambda o: o.get("filled_at") or o["submitted_at"]):
         when = dt.datetime.fromisoformat(str(o.get("filled_at") or o["submitted_at"])
@@ -459,20 +494,55 @@ def status(broker: Broker, cfg: Config, *, days: int = 60,
         legs.append((s, o["side"], float(o["filled_qty"]), price, o.get("time_in_force")))
         if i is None or s not in j:
             continue
-        ref = panel.open[i, j[s]] if o.get("time_in_force") == "opg" else panel.close[i, j[s]]
+        kind = "open" if o.get("time_in_force") == "opg" else "close"
+        auction = ((prints.get(s) or {}).get(when.isoformat()) or {}).get(kind)
+        if prints and not auction:
+            continue                  # compare like with like once auctions are in use
+        ref = auction["price"] if auction else (panel.open[i, j[s]] if kind == "open"
+                                                else panel.close[i, j[s]])
         if math.isfinite(ref):
             sign = 1.0 if o["side"] == "buy" else -1.0
             shortfalls.append(sign * (price / ref - 1.0) * 1e4)
     trips = _round_trips(legs)
     expected = (spec.get("evidence", {}).get("holdout", {}) or {}).get("net_bps_per_trade")
+    check = execution_verdict(shortfalls)
     out = {"candidate": candidate.id, "verdict": spec.get("verdict"),
+           "account": "paper (simulated auction fills)" if broker.paper else "live",
+           "shortfall_reference": reference,
            "positions": broker.positions(), "equity": float(broker.account()["equity"]),
            "orders": len(ours), "filled": len(filled),
            "auction_shortfall_bps": _summary(shortfalls),
            "round_trip_net_bps_before_fees": _summary(trips),
            "backtest_holdout_net_bps_per_trade": expected,
+           "execution_check": check,
            "halted": cfg.halt_file.exists()}
     return out
+
+
+def execution_verdict(shortfall_per_leg: Sequence[float]) -> dict[str, Any]:
+    """``pending`` until enough legs; then ``pass``, ``stop`` or ``inconclusive``.
+
+    The round-trip figures are twice the per-leg mean and twice its upper 95%
+    bound, so a pass needs the bound, not just the mean, inside the limit.
+    """
+    n = len(shortfall_per_leg)
+    if n < TRIAL_MIN_LEGS:
+        return {"verdict": "pending", "legs": n, "needed": TRIAL_MIN_LEGS}
+    arr = np.asarray(shortfall_per_leg, float)
+    mean = float(arr.mean())
+    upper = mean + 1.96 * float(arr.std(ddof=1)) / math.sqrt(n)
+    lower = mean - 1.96 * float(arr.std(ddof=1)) / math.sqrt(n)
+    rt_mean, rt_upper, rt_lower = 2 * mean, 2 * upper, 2 * lower
+    if rt_lower > TRIAL_STOP_ROUND_TRIP_BPS:
+        verdict = "stop"
+    elif rt_mean <= TRIAL_PASS_ROUND_TRIP_BPS and rt_upper <= TRIAL_STOP_ROUND_TRIP_BPS:
+        verdict = "pass"
+    else:
+        verdict = "inconclusive"
+    return {"verdict": verdict, "legs": n, "round_trip_mean_bps": rt_mean,
+            "round_trip_upper95_bps": rt_upper, "round_trip_lower95_bps": rt_lower,
+            "pass_if_mean_at_most": TRIAL_PASS_ROUND_TRIP_BPS,
+            "stop_if_lower_bound_above": TRIAL_STOP_ROUND_TRIP_BPS}
 
 
 def _round_trips(legs: Sequence[tuple[str, str, float, float, Any]]) -> list[float]:
