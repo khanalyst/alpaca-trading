@@ -127,10 +127,32 @@ class _FakeInstrument:
         return {"horizon_metrics": {f"{h}m": value for h in kwargs["horizons"]}}
 
 
+def _registration_checkout():
+    """Stand in for deciding v2 from a checkout of its registration commit.
+
+    A v2 decision is made from that checkout, where the running instrument is
+    the registered one (``instrument_identity``'s docstring).  Tests of the
+    decision machinery must therefore not depend on the working tree still
+    matching it, or any later fix anywhere in the closure breaks them.  The
+    registration literals themselves are untouched; InstrumentIdentityTests
+    still compare the real running tree with them.
+    """
+    registered = {
+        "schema": prereg.INSTRUMENT_IDENTITY_SCHEMA,
+        "roots": list(prereg._INSTRUMENT_ROOT_MODULES),
+        "modules": len(prereg.V2_INSTRUMENT_COMPONENTS),
+        "components": dict(prereg.V2_INSTRUMENT_COMPONENTS),
+        "digest": prereg.V2_INSTRUMENT_DIGEST,
+    }
+    return patch.object(prereg, "instrument_identity",
+                        side_effect=lambda **_: dict(registered))
+
+
 def _run(bars, *, manifest=None, records=(), eligible=True, metric=None,
          as_of=datetime.combine(_on(250), time(12, 0), UTC)):
     fake = _FakeInstrument(metric)
-    with patch.object(prereg, "measure_signal_quality", side_effect=fake):
+    with patch.object(prereg, "measure_signal_quality", side_effect=fake), \
+            _registration_checkout():
         report = prereg._evaluate_v2(
             bars, manifest or _small_manifest(), decision_eligible=eligible,
             eligibility_reasons=(), provenance=None,
@@ -375,6 +397,9 @@ class LookRecordTests(unittest.TestCase):
     """D1-04: a look is decided once and later runs reproduce it."""
 
     def setUp(self):
+        checkout = _registration_checkout()
+        checkout.start()
+        self.addCleanup(checkout.stop)
         self.days = _weekdays(SEALED, 61)
         self.bars = [bar for day in self.days for bar in _session(day)]
 
@@ -537,6 +562,11 @@ class LookRecordTests(unittest.TestCase):
 
 class EvaluationInstantAndUniverseTests(unittest.TestCase):
     """Review of D1-04 and D1-01: no future instant, no outside symbols."""
+    def setUp(self):
+        checkout = _registration_checkout()
+        checkout.start()
+        self.addCleanup(checkout.stop)
+
 
     def test_an_instant_after_the_wall_clock_is_refused(self):
         days = _weekdays(SEALED, 31)
@@ -561,6 +591,11 @@ class EvaluationInstantAndUniverseTests(unittest.TestCase):
 
 
 class DecisionRuleTests(unittest.TestCase):
+    def setUp(self):
+        checkout = _registration_checkout()
+        checkout.start()
+        self.addCleanup(checkout.stop)
+
     def v2(self, **over):
         return prereg.look_outcome_v2(_metric(**over), alpha=0.025, cost_bps=17.0)
 
