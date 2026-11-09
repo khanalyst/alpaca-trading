@@ -154,7 +154,8 @@ class AlpacaSession:
                 from alpaca.trading.client import TradingClient
             except ImportError as exc:
                 raise AlpacaError("alpaca-py is not installed; install it for broker actions") from exc
-            self._trading = TradingClient(self.api_key, self.secret_key, paper=self.paper)
+            self._trading = with_http_timeout(
+                TradingClient(self.api_key, self.secret_key, paper=self.paper))
         return self._trading
 
     @property
@@ -165,7 +166,8 @@ class AlpacaSession:
                 from alpaca.data.historical import StockHistoricalDataClient
             except ImportError as exc:
                 raise AlpacaError("alpaca-py is not installed; install it for market data") from exc
-            self._stock_data = StockHistoricalDataClient(self.api_key, self.secret_key)
+            self._stock_data = with_http_timeout(
+                StockHistoricalDataClient(self.api_key, self.secret_key))
         return self._stock_data
 
     @property
@@ -176,8 +178,55 @@ class AlpacaSession:
                 from alpaca.data.historical import OptionHistoricalDataClient
             except ImportError as exc:
                 raise AlpacaError("alpaca-py is not installed; install it for option data") from exc
-            self._option_data = OptionHistoricalDataClient(self.api_key, self.secret_key)
+            self._option_data = with_http_timeout(
+                OptionHistoricalDataClient(self.api_key, self.secret_key))
         return self._option_data
+
+
+DEFAULT_HTTP_TIMEOUT_SECONDS = (5.0, 30.0)   # (connect, read)
+HTTP_TIMEOUT_ENV = "ALPACA_HTTP_TIMEOUT_SECONDS"
+
+
+def http_timeout() -> tuple[float, float]:
+    """``(connect, read)`` seconds for every Alpaca HTTP call (review finding B-10).
+
+    alpaca-py sends its requests with no timeout, so one hung connection
+    could block the trader, the watchdog or a recovery indefinitely while it
+    holds the run lock.  ``ALPACA_HTTP_TIMEOUT_SECONDS`` overrides the read
+    timeout; the value must be finite and positive.
+    """
+    raw = os.getenv(HTTP_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_HTTP_TIMEOUT_SECONDS
+    try:
+        read = float(raw)
+    except ValueError:
+        return DEFAULT_HTTP_TIMEOUT_SECONDS
+    if not (read > 0 and read == read and read != float("inf")):
+        return DEFAULT_HTTP_TIMEOUT_SECONDS
+    return (min(DEFAULT_HTTP_TIMEOUT_SECONDS[0], read), read)
+
+
+def with_http_timeout(client):
+    """Give an alpaca-py client's ``requests`` session a default timeout.
+
+    A call that already passes ``timeout`` keeps it.  A timeout raises before
+    any broker answer, so order submission classifies it as ambiguous and
+    resolves the order by client id before deciding anything.
+    """
+    session = getattr(client, "_session", None)
+    request = getattr(session, "request", None)
+    if request is None or getattr(request, "_alpaca_default_timeout", False):
+        return client
+    timeout = http_timeout()
+
+    def timed_request(method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return request(method, url, **kwargs)
+
+    timed_request._alpaca_default_timeout = True
+    session.request = timed_request
+    return client
 
 
 def paper_env_guard() -> None:
