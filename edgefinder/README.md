@@ -105,11 +105,16 @@ The trader refuses live mode unless `strategy.json` says `"live_allowed": true`,
 
 ## Deploy
 
-Compose (separate secret file and volume; nothing in `compose.yaml` changes):
+A standalone Compose project (`deploy/compose.edgefinder.yaml`, project name `alpaca-edgefinder`) with its own image tag, secret and volume. It shares nothing with `compose.yaml`, so building or starting it never touches the intraday services or their image. Run it from a separate checkout pinned to a reviewed commit:
 
 ```sh
+git clone https://github.com/khanalyst/alpaca-trading /opt/alpaca-edgefinder
+cd /opt/alpaca-edgefinder && git checkout <reviewed commit>
+# the dedicated paper account's keys; readable by uid 10001, which the container runs as
 export EDGEFINDER_SECRET_FILE=/etc/alpaca-agent-trading/edgefinder.env
-docker compose -f compose.yaml -f deploy/compose.edgefinder.yaml up -d edgefinder-trader
+docker compose -f deploy/compose.edgefinder.yaml up -d --build
+docker compose -f deploy/compose.edgefinder.yaml exec edgefinder-trader \
+    python -m edgefinder.trader status --state /app/runtime/edgefinder
 ```
 
 systemd: [`deploy/edgefinder-trader.service`](../deploy/edgefinder-trader.service).

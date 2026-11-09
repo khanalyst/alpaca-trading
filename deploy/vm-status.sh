@@ -95,5 +95,8 @@ if events.exists():
 PY
 
 section "edgefinder trader (if deployed)"
-run docker compose -f compose.yaml -f deploy/compose.edgefinder.yaml ps edgefinder-trader
+for dir in /opt/alpaca-edgefinder .; do
+  [ -f "$dir/deploy/compose.edgefinder.yaml" ] && \
+    run docker compose -f "$dir/deploy/compose.edgefinder.yaml" ps
+done
 echo "done"

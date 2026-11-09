@@ -608,20 +608,24 @@ orders. It must run on its **own** Alpaca paper account: the trader above
 force-flats at 15:50 and the watchdog flattens positions it does not know, and
 the edgefinder trader refuses to run beside positions in funds its strategy
 does not trade. Put the dedicated account's `ALPACA_API_KEY` and
-`ALPACA_SECRET_KEY` in a separate dotenv file (mode 0600), then:
+`ALPACA_SECRET_KEY` in a separate dotenv file, readable by uid 10001.
+
+`deploy/compose.edgefinder.yaml` is a standalone project (`alpaca-edgefinder`)
+with its own image tag, secret and volume, so it never rebuilds or restarts the
+intraday services. Run it from a separate checkout pinned to a reviewed commit:
 
 ```sh
+git clone https://github.com/khanalyst/alpaca-trading /opt/alpaca-edgefinder
+cd /opt/alpaca-edgefinder && git checkout <reviewed commit>
 export EDGEFINDER_SECRET_FILE=/etc/alpaca-agent-trading/edgefinder.env
-docker compose -f compose.yaml -f deploy/compose.edgefinder.yaml up -d edgefinder-trader
-docker compose -f compose.yaml -f deploy/compose.edgefinder.yaml exec edgefinder-trader \
+docker compose -f deploy/compose.edgefinder.yaml up -d --build
+docker compose -f deploy/compose.edgefinder.yaml exec edgefinder-trader \
     python -m edgefinder.trader status --state /app/runtime/edgefinder
 ```
 
-The override adds one service, one secret and one volume and changes nothing
-in `compose.yaml`. On a systemd host use
-[`edgefinder-trader.service`](edgefinder-trader.service). The current spec is
-paper only; see [docs/findings.md](../docs/findings.md) for why, and for the
-auction check to run first.
+On a systemd host use [`edgefinder-trader.service`](edgefinder-trader.service).
+The current spec is paper only; see [docs/findings.md](../docs/findings.md) for
+why, and for the auction check to run first.
 
 ## Legacy systemd lane
 
