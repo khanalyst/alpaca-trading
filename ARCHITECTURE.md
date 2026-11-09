@@ -504,7 +504,13 @@ per-run total-call budget, bounded attempts/time/response bytes, and an
 authentication circuit that stops further calls after an auth failure; evidence
 records schema/grammar hashes, call counts, circuit state, and per-attempt
 hashes/errors. The LLM decides what to try next; it cannot shorten the evidence
-path, retire a family on invalid output, or authorize trading. Every seeding and
+path, retire a family on invalid output, or authorize trading. Its inputs are
+the prior rule, a compacted aggregate diagnosis of at most 8 KB and graded
+lessons; it never sees prices, charts, news or a calendar. Its outputs are
+limited to the twelve `RULE_FAMILIES` and their existing fields: tuning may change
+one field (or two already-measured fields) by at most 20% of the root value, and
+the prompt and validator reject any new signal, indicator or data source
+(`research/llm_strategy.py` `TUNING_SYSTEM_PROMPT`). Every seeding and
 tuning path has a deterministic fallback, so the factory keeps discovering with
 no provider configured.
 

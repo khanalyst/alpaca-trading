@@ -9,6 +9,29 @@ Options are single-leg long calls or puts
 (buy-to-open, sell-to-close); multi-leg and naked/short option structures are
 unsupported. No performance claim is made.
 
+## Current state (checked against the code, 9 November 2026)
+
+- **No proved edge exists.** With the shipped `config.yaml` the trader requires one
+  (`research.require_validated_variant: true`), so every cycle writes a paused
+  heartbeat with reason `validated_edge_required` and places no order.
+- **Paper trading has not been running.** Seven independent gates in the code stop
+  it; they are listed with file references in
+  [findings section 9](docs/findings.md#9-why-paper-trading-has-not-been-running).
+- **The intraday discovery program cannot find an edge as configured.** It charges
+  17 bps a round trip, requires survival at 25 bps, trades only the 24 broad ETFs,
+  and learns only from its own forward IEX recordings
+  ([findings section 10](docs/findings.md#10-the-intraday-discovery-program-read-from-its-code-by-a-day-trader)).
+- **The LLM** (`research/llm_strategy.py`) only proposes or tunes a `rule_spec`
+  inside that closed grammar, at most 20% per field. It never sees market data, and
+  every proposal faces the same gates.
+- **Every edge tested, with results:**
+  - [edgefinder/results/all-edges.md](edgefinder/results/all-edges.md): 443 daily candidates;
+  - [docs/intraday-arms.md](docs/intraday-arms.md): all 82 intraday arms;
+  - [studies/stocks_in_play/](studies/stocks_in_play/README.md): the stocks-in-play test.
+- **The tradeable candidate** is the overnight VTI hold with a 200-day trend filter
+  from `edgefinder` (verdict *weak*, paper only). Its trader runs on a separate
+  Alpaca paper account.
+
 **Findings and research results** are in [docs/findings.md](docs/findings.md): what
 has been tested, what was found, the gap to a profitable automated strategy, and
 the caveats. The automated edge search and its auction trader are in
@@ -357,9 +380,13 @@ symbol/time cell. The cost provenance label
 but it is part of every candidate identity and is left unchanged.
 No stress rung by itself authorizes a candidate.
 The flat cost schedule above is cost model `static_v1` (17 bps per round trip
-on bar references). Research also has `per_symbol_v2`, a per-symbol,
-order-type-aware model with fees on the sell leg only (about 1.75 to 4.07 bps
-per round trip on this universe); it is the default for new research runs.
+on bar references). It is what the strategy factory, `edge discover`, the
+calibration tools and the runtime charge (`research.py` builds
+`CostModel.from_config(static_cost_config(config))`). Research also has
+`per_symbol_v2`, a per-symbol, order-type-aware model with fees on the sell leg
+only (about 1.75 to 4.07 bps per round trip on this universe); only
+`research.cost_rerun` uses it by default, and gate protocol 2 floors its
+expected round trip at it.
 See `research/README.md`, "Cost-model versions".
 Runtime rejection caps are separate from expected costs. Stress applies the
 scenario bps to entry notional and then adds listed-option round-trip fees for

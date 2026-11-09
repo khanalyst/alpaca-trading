@@ -1,11 +1,12 @@
 # Findings and research results
 
-Updated 8 November 2026, data to 6 November 2026. This is the single findings document for the repository. It replaces the dated findings reports, which are listed with permanent links in [section 12](#12-removed-documents).
+Updated 9 November 2026, data to 6 November 2026. This is the single findings document for the repository. It replaces the dated findings reports, which are listed with permanent links in [section 13](#13-removed-documents).
 
 ## 1. Bottom line
 
 1. **No strategy in the repository is a confirmed, tradeable edge.**
-2. **The intraday catalogue is dead after costs.** Every one of its 82 registered arms (12 rule families and IBR, across all cohorts) was replayed on fresh data in October 2026. None is significantly positive net of realistic costs, and the corrected `intraday-mechanisms.v3` cohort changed nothing ([section 7](#7-earlier-findings-consolidated)).
+2. **The intraday catalogue is dead after costs, and its discovery program cannot find an edge by construction** ([section 10](#10-the-intraday-discovery-program-read-from-its-code-by-a-day-trader)): it charges 17 bps a round trip, demands survival at 25 bps, trades only broad ETFs with no context, and uses the LLM as a 20% parameter tweaker.
+   **The catalogue result:** Every one of its 82 registered arms (12 rule families and IBR, across all cohorts) was replayed on fresh data in October 2026. None is significantly positive net of realistic costs, and the corrected `intraday-mechanisms.v3` cohort changed nothing ([section 7](#7-earlier-findings-consolidated)).
 3. **A new automated search** (`edgefinder/`) scanned 443 daily candidates in 11 documented families on 24 ETFs, from 2001 to 2026, under a protocol fixed in code before the first run.
    - No candidate passed all five holdout confirmation tests.
    - The best-supported is **overnight VTI with a 200-day trend filter**: buy at the closing auction, sell at the next opening auction, only while VTI is above its 200-day average.
@@ -225,7 +226,7 @@ General:
 
 - The review's signal, cost, statistics and gate findings were addressed as opt-in versions: `per_symbol_v2` costs, gate protocol 2, `rule-strategy.v7` corrections and preregistered v2. Several are only partly closed. An adversarial review of that work found 21 defects in the new code, all fixed.
 - The corrected cohort `intraday-mechanisms.v3` still has no positive arm over 30 sessions; three are significantly negative.
-- Open items are listed in section 11.
+- Open items are listed in section 12.
 
 **Preregistered hypotheses.**
 
@@ -251,6 +252,7 @@ The commands, phases, checks and deployment are in [edgefinder/README.md](../edg
   - market-on-close orders 25 to 12 minutes before the close.
 - It recomputes the frozen candidate's weights with the research's own code. It refuses on stale data, foreign positions, a halt file or a 20% drawdown, and its deterministic order ids make a retry harmless.
 - Live mode needs a `confirmed` spec. The current pick is `weak`, so the trader refuses live for it.
+- It deploys as the standalone Compose project `alpaca-edgefinder` (`deploy/compose.edgefinder.yaml`), with its own image, secret and volume, so it never rebuilds or restarts the intraday services.
 
 ## 9. Why paper trading has not been running
 
@@ -260,11 +262,11 @@ The VM was not reachable from this session. The last verified state is 11 Octobe
 
 | # | gate | where in the code | effect | still true? |
 | --- | --- | --- | --- | --- |
-| 1 | a pause latches on every shutdown | `main.py` `cmd_run` sends SIGTERM and SIGINT to `request_shutdown` in `agent/runtime_control.py`, which commits `operator_pause=True`; `deploy/trader_supervisor.py` `wait_until_resumed` then parks without starting a trader | a container restart, a deploy that recreates the trader, or a VM reboot pauses trading until an operator runs the authenticated `resume`, which also requires a broker-flat account and a clean state | yes, by design |
+| 1 | a pause latches on every shutdown | `main.py` `cmd_run` sends SIGTERM and SIGINT to `request_shutdown` in `agent/runtime_control.py`, which commits `operator_pause=True`; `deploy/trader_supervisor.py` `wait_until_resumed` then parks without starting a trader | a container restart, a deploy that recreates the trader, or a VM reboot pauses trading until an operator runs the authenticated `resume`, which also requires a broker-flat account and a clean state | **fixed, opt-in** (9 November): with `ALPACA_RESUME_AFTER_CLEAN_SHUTDOWN=1`, set in `compose.yaml` for the trader, a shutdown that ends with a broker-confirmed flat book and passes the same checks as `resume` clears the pause. The pause is still committed before the flatten starts, so a crash mid-shutdown keeps it; any fault, hang or incomplete flatten still pauses |
 | 2 | a crash or hang pauses too | `supervise` hands an unresponsive child (no heartbeat for 300 s) or a non-zero exit to `recover`, and returns with the pause kept; flatten and durability failures in `runtime_control.py` and `execution_lifecycle.py` commit the same pause | one incident stops trading until a manual resume | yes, by design |
 | 3 | no validated edge | `agent/engine.py` sets `_edge_required` from `research.require_validated_variant: true`; `_refresh_edge` in `startup_edge_policy.py` finds no proved ledger record | with the shipped `config.yaml`, every cycle writes a paused heartbeat with reason `validated_edge_required` and places nothing. No record can exist: the research found no edge, and a proof needs 100 recorded sessions and then a 150-trade live-shadow tail | yes |
 | 4 | the paper-trial identity covers the whole tree (review finding C1-03, unfixed) | `runtime_code_identity` in `agent/paper_trial.py` hashes every `.py` file in `agent/` and `research/`, plus `deploy/recorder.py` and `requirements.lock.txt`; `_same_incumbent` compares it | any change to those files after activation makes `refresh_state` raise `active paper trial identity/config changed`. The trial then cannot accrue or trade until it is cancelled (allowed only while it has no accepted sessions or outcomes) and a new one is activated on a flat book. Between the last verified image and `main`, 60 commits changed 43 of those files | yes, for any deploy after 11 October |
-| 5 | session acceptance accepts nothing (C2-02, unfixed) | `deploy/session_acceptance.py`: a session is accepted only when its list of reasons is empty (line 1112); a quote older than 30 s or one symbol's IEX bar published more than 30 s late in any 30-second sample adds a reason (lines 537 and 562) | IEX has empty minutes for thinner funds, so no session is accepted, and with fewer than 20 accepted sessions the trial can neither pass nor fail | yes; the file is unchanged since 30 September |
+| 5 | session acceptance accepts nothing (C2-02, unfixed) | `deploy/session_acceptance.py`: a session is accepted only when its list of reasons is empty (line 1112); a quote older than 30 s or one symbol's IEX bar published more than 30 s late in any 30-second sample adds a reason (lines 537 and 562) | IEX has empty minutes for thinner funds, so no session is accepted, and with fewer than 20 accepted sessions the trial can neither pass nor fail | yes. The same rule is enforced again in the frozen reader `agent/paper_trial.py` `_read_report`: an accepted report must show every sample healthy, no reason counts and every quote and bar within 30 s. A more tolerant producer would therefore be refused or would have to misstate the evidence, so this needs the frozen-module change in section 12 |
 | 6 | reports pin the first deployment | `_merge_reports` in `agent/paper_trial.py` records `report_deployment_drift` for any report from a later deployment | after a redeploy the refusal itself is a blocker, so entries stop | yes, after any redeploy |
 | 7 | a hung broker call can wedge start-up (B-10, C2-04, unfixed) | the REST layer of the pinned `alpaca-py==0.43.5` sets no timeout and the runtime adds none; the watchdog takes the run lock before un-timed reads | one hung call can hold the lock, so the next trader child exits and the supervisor pauses again | yes |
 
@@ -273,7 +275,7 @@ What it would trade if every gate cleared: the opening-range breakout or fade in
 Two further facts matter before anyone resumes it:
 
 - The last verified image (`20da966`) predates the 19 to 24 October runtime safety fixes (B-01, C1-01, C1-02, C2-01, B-03, B-04 and the 15 defects found after them). Do not resume that image; deploy current `main` first.
-- This change leaves the trial identity alone. The edgefinder dependency (numpy) lives in `requirements-edgefinder.txt`, not in the hashed `requirements.lock.txt`, and nothing in `agent/`, `research/` or `deploy/` imports edgefinder. The branch's paper-trial code identity is byte-identical to `main` (`2ac7dc10...`), and two tests keep it so.
+- edgefinder itself leaves the trial identity alone: its dependency (numpy) lives in `requirements-edgefinder.txt`, not in the hashed `requirements.lock.txt`, and nothing in `agent/`, `research/` or `deploy/` imports it (two tests keep it so). The 9 November runtime fixes in `agent/` (gate 1 and the logged exceptions) do change it, as any runtime fix must until C1-03 is fixed, so deploying them means cancelling and re-activating the trial, as step 3 below sets out. They also start a new live-shadow replay epoch, because `research/live_shadow.py` (`_REPLAY_CODE_BUNDLE_ROOTS`) hashes the same `agent/` and `research/` tree. No preregistered v2 module was touched.
 
 What to do, in order:
 
@@ -286,7 +288,65 @@ What to do, in order:
    - activate a new trial, then `resume`.
 4. The alternative, which I recommend: put the effort into the edgefinder trader on a dedicated paper account. It has none of these gates. It trades whenever the spec has a candidate, a restart resumes at the next phase, and its identity is the spec file.
 
-## 10. Code review of every file
+## 10. The intraday discovery program, read from its code by a day trader
+
+The intraday program (`research/strategy_factory.py` and its helpers, driven nightly by `deploy/research-cycle.sh`) has never produced a passing candidate. This section establishes what it does from the code, not the documents, and then reads it as a profitable day trader would.
+
+### 10.1 What it actually does
+
+| part | what the code does | where |
+| --- | --- | --- |
+| instruments | the 24 broad ETFs in `config.yaml` | `universe.symbols` |
+| signals | 12 fixed families on one-minute bars: opening-range breakout and fade, momentum continuation, mean reversion, trend pullback, volatility breakout, volume breakout, VWAP reversion and trend, range expansion, opening drive, SPY-relative momentum | `agent/contracts/rule.py` `RULE_FAMILIES` |
+| default geometry | stop 1 x the one-minute ATR(14) (about 4 bps on SPY), raised to the 30 bps stress floor; target 2R (60 bps); at most 90 minutes; one trade per symbol per session; entries 09:30 to 15:00, flat by 15:50 | `DEFAULT_RULE_SPEC`, `risk.stressed_cost_scenario_bps / max_stressed_cost_to_risk_ratio` |
+| data that can authorise | only `forward_observed` rows, the recorder's own live IEX capture; years of history are "diagnostic only" | `research/source_validation.py` |
+| split | chronological: 70% of the recorded sessions to fit, the rest held out, then a sealed qualification window, then a live-shadow tail | `_fit_partition`; floors of 100 trades and 30 sessions, then 150 trades and 30 sessions |
+| cost charged | `CostModel.from_config(static_cost_config(config))`: 4 bps spread, 6 bps slippage and 0.5 bps fee a side, which measures **17.0 bps a round trip** | `research.py` `cmd_factory_run` |
+| cost a pass must survive | a **25 bps** round-trip stress | `research/gates.py` `COST_STRESS_REQUIRED_BPS` |
+
+How the LLM is used (`research/llm_strategy.py`; `config.yaml` `research.strategy_llm`: OpenAI, model `gpt-5.6-terra`, temperature 0, up to 64 calls a cycle, 2 attempts, 30 s timeout):
+
+| call | the model sees | the model may return | what happens to it |
+| --- | --- | --- | --- |
+| `discover` | the rules already tried, a short sanitised context | one `rule_spec` in one of the 12 families, plus a one-sentence thesis | rejected if it repeats a family before all 12 are tried, or is a near-duplicate; then the deterministic ladder seeds the slot instead |
+| `tune` | one root rule, its fit diagnosis, graded "lessons" from earlier attempts | the same rule with one field changed (or two, once each was measured), by at most 20% of its value | each variant is replayed through the same gates |
+| `propose` | the failed rule and an aggregate diagnosis of at most 8 KB | a replacement `rule_spec` | as above |
+
+The model never sees a price, a chart, a headline, a calendar or another market. The prompt forbids new signals, indicators and data sources, and the validator rejects any field outside the grammar. In effect it is a hill-climber that can move parameters a little within a fixed, closed set of ideas.
+
+### 10.2 Why it cannot find an edge
+
+1. **The cost arithmetic decides before the signal does.** A pass must survive 25 bps a round trip, and every candidate is scored at 17 bps. These ETFs typically move 10 to 30 bps in the 30 to 90 minutes a trade is held, and the realistic round trip is about 2 bps. No signal in this grammar can clear that bar. Fixing the cost is necessary but not enough: the October replays at realistic cost still found no arm significantly positive ([intraday-arms.md](intraday-arms.md)).
+2. **It trades the most efficient instruments there are.** Broad ETFs have no catalysts of their own; their intraday path is index noise plus arbitrage. Profitable day traders trade the few names that are moving for a reason that day.
+3. **It has no context.** A rule sees its own symbol's one-minute bars (and SPY for one family). It has no overnight gap, no pre-market volume, no prior-day levels, no news, no earnings date and no market regime, and every family is applied to all 24 funds all day. Selection (which name, which day, which setup) is where a winning trader's edge lives, and it is absent.
+4. **Its exits are set by a cost floor, not by the market.** A 30 bps stop and a 60 bps target on instruments that move 10 to 30 bps in 90 minutes means 82 to 93% of trades end at the time limit. The strategies reduce to "hold for an hour and see".
+5. **Its evidence arrives at the speed of the calendar.** Only its own IEX recordings (IEX is a small share of US volume) can authorise, so every question waits months, and a decade of free consolidated history is unused.
+6. **The LLM cannot do what an LLM is good at.** Within this design it is a costly random search over a flat, negative landscape, and each proposal spends testing budget. Where a model would genuinely help a day trader (reading headlines to find stocks in play, classifying a morning as a trend or range day, summarising an earnings release), it is not allowed.
+7. **The base rate.** Fewer than 1% of Taiwanese day traders could predictably earn positive returns net of fees (Barber, Lee, Liu and Odean 2014), and 97% of Brazilian futures day traders who persisted 300 days lost money (Chague, De-Losso and Giovannetti 2019). The persistent winners' edge is skill in selection, speed and liquidity provision, not a parameter grid on index ETFs.
+
+### 10.3 Does changing the universe alone fix it?
+
+[`studies/stocks_in_play/`](../studies/stocks_in_play/README.md) runs the best-documented retail day-trading edge: opening-range breakout on the 20 stocks most "in play" by first-five-minute relative volume, after Zarattini, Barbon and Aziz (2024). The identical code also runs 20 random liquid stocks and the 24 ETFs.
+
+Data: 2,269 symbols, 46 sessions (September to November 2026), five-minute bars.
+
+| universe (stop at the other side of the first candle, no cost) | trades | mean R | daily t |
+| --- | --- | --- | --- |
+| stocks in play | 743 | -0.06 | -0.79 |
+| 20 random liquid stocks | 764 | -0.05 | -0.04 |
+| the 24 ETFs | 1,006 | -0.03 | +0.09 |
+
+Not in this window: stocks in play did no better than random stocks or the ETFs, and everything is negative after realistic costs. Had the paper's Sharpe ratio of 2.8 held, 46 sessions would show a t of about +1.2. That is mild evidence against a strong effect today, not a refutation: the sample is small, five-minute bars cannot resolve the paper's 10%-of-ATR stop, and there is no news filter.
+
+### 10.4 What would have to change
+
+| option | what it means | my view |
+| --- | --- | --- |
+| A. stop the intraday factory | put the effort into daily-horizon edges (`edgefinder`), where the edge-to-cost ratio is favourable and decades of data exist | recommended |
+| B. rebuild intraday around stocks in play | a pre-market scan (gap, pre-market volume, relative volume, an LLM reading headlines for a real catalyst); SIP one-minute history from 2016; per-symbol costs; stops at market structure; walk-forward and multiple-testing control as in `edgefinder` | the only intraday route with published support; the 46-session test above says verify on years of data before building more |
+| C. keep the factory, remove its handicaps | `per_symbol_v2` costs; gate protocol 2 (2x expected cost instead of 25 bps); history allowed for development, forward data only to confirm; context features in the grammar | necessary for any intraday result, but the October replays at realistic cost suggest there is little to find on these ETFs |
+
+## 11. Code review of every file
 
 **Scope.** 137 non-test Python files, 112,768 lines:
 
@@ -320,24 +380,30 @@ Findings, most serious first:
 | severity | finding | location | action |
 | --- | --- | --- | --- |
 | high | `null_control_account` reads `signal.get("relative_volume")`, but no `signal` exists in that function or module. The block was copied from `factory_core.py`, where it does. Any v6 or v7 rule arm that reaches it raises `NameError`. It came in on 7 October (`bba52bb`), and no test exercises it | `research/edge_discovery_core.py:1539` | not fixed here: the module is part of the frozen v2 instrument, and editing it would make both v2 hypotheses refuse their first look. Fix it after the v2 decision, as a new version; it affects only diagnostic, non-authorising arms |
-| high | gates 1 and 3 to 6 above | see section 9 | owner decision (section 9, step 3) |
+| high | gates 3 to 6 above (gate 1 is now fixed, opt-in) | see section 9 | gates 4 to 6 edit frozen modules; owner decision (section 9, step 3) |
 | medium | no HTTP timeout on any broker call (B-10), and the watchdog holds the run lock across un-timed reads (C2-04) | `agent/alpaca_provider.py`; `alpaca-py` 0.43.5 `alpaca/common/rest.py`; `deploy/watchdog.py` | wrap the SDK session with a timeout, as a reviewed runtime change |
-| medium | 36 `except Exception: pass` blocks in the core runtime (11 in `engine_cycle.py`, 14 in `runtime_control.py`, 6 in `startup_edge_policy.py`, 5 in `execution_lifecycle.py`) | as listed | log each one before passing |
+| medium | 36 `except Exception: pass` blocks in the core runtime (11 in `engine_cycle.py`, 14 in `runtime_control.py`, 6 in `startup_edge_policy.py`, 5 in `execution_lifecycle.py`) | as listed | **fixed** (9 November): each now logs a warning with the module and the error, and behaviour is otherwise unchanged. Three one-line `except Exception: pass` forms remain on heartbeat writes |
 | medium | B-02 (bracket legs anchored to the signal close), B-07 (a restart flattens the whole book) and B-08 (entry limits never expire) are not among the fixed findings | `agent/market_entry_risk.py`, `agent/startup_edge_policy.py`, `agent/engine.py` | runtime changes, each with tests |
 | low | `entry_calibration.py`, `mechanism_cohort_v3.py` and `session_coverage.py` are reachable only from tests: built on 28 October, never wired in | `research/` | wire them in or delete them |
 | low | 147 unused imports and 17 unused local variables. The safety-relevant ones were checked by hand and none hides a logic error: two are calls kept for their side effects, and one pair in `execution_lifecycle.py:2297` is dead code | across the tree | clean up with the next version of each module |
 | info | 21 functions are longer than 300 lines, the longest being `_run_factory` (1,986), `live_shadow.run_once` (1,360) and `verify_gate_envelope` (1,017). `live_shadow.py` alone is 8,350 lines. Paths this size cannot be tested exhaustively | `research/`, `agent/` | the reduction in [core-design.md](core-design.md) |
 | info | none of `shell=True`, `eval`, `exec`, `pickle`, unsafe YAML loading or disabled TLS appears anywhere; there are no TODO or FIXME markers and no hard-coded dates in `agent/` | whole tree | none |
 
-## 11. What to do next, in order
+## 12. What to do next, in order
 
 0. **Find out what the VM is doing**: `bash deploy/vm-status.sh > vm-status.txt` on the VM, read-only. Then decide on the intraday paper trial as set out in section 9.
-1. **Run the auction check** (one command, any Alpaca key, minutes):
+1. **Put the overnight VTI hold live on a dedicated paper account.** Each step needs the owner's machine, the VM or the Alpaca dashboard:
+   1. In the Alpaca dashboard, create a second paper account. The intraday account must not be shared: its force-flat at 15:50 and its watchdog would close the overnight position.
+   2. On the VM, put that account's `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in `/etc/alpaca-agent-trading/edgefinder.env`, readable by uid 10001.
+   3. From a separate checkout at the reviewed commit, run `docker compose -f deploy/compose.edgefinder.yaml up -d --build` (section 8). It shares no image, volume or secret with the intraday stack.
+   4. Check that it is alive with `... exec edgefinder-trader python -m edgefinder.trader status`. The first order is a market-on-close buy submitted between 15:35 and 15:48 New York time on a day VTI is above its 200-day average; the sell is a market-on-open the next morning.
+   5. Stop it at any time with `python -m edgefinder.trader halt`.
+2. **Run the auction check** (one command, any Alpaca key, minutes):
    - `survives`: the pick stands on the prices an order would get.
    - `weakened` or `fails`: the print-location share was the edge. Drop to the SPY-like core of about 2 bps a night, or move on.
-2. **Run the trader on a dedicated paper account.** This proves the mechanics, not the edge.
-3. **If the check survives, run a small live pilot** (a few thousand dollars, `--capital-fraction`). This is the only way to measure real auction fills. It needs a deliberate edit of `live_allowed` in the spec, which should be a reviewed commit, and it should stop on the trader's `stop` verdict.
-4. **Re-run the scan as data accrue** (`--refresh`); the holdout grows by about 250 sessions a year.
+3. **Let the paper trader run.** It proves the mechanics, not the edge: Alpaca's paper account simulates auction fills.
+4. **If the auction check survives, run a small live pilot** (a few thousand dollars, `--capital-fraction`). This is the only way to measure real auction fills. It needs a deliberate edit of `live_allowed` in the spec, which should be a reviewed commit, and it should stop on the trader's `stop` verdict.
+5. **Re-run the scan as data accrue** (`--refresh`); the holdout grows by about 250 sessions a year.
 
 Options worth weighing:
 
@@ -352,11 +418,13 @@ Open items carried from the 28 October gap closure:
 - factory replay has no prior-session context;
 - producers do not stamp `expected_round_trip_bps` or `comparison_id`;
 - the factory and gates default to `static_v1`;
+- frozen into the preregistered v2 instrument, so deferred until its looks conclude: broker-call timeouts (B-10, `agent/alpaca_provider.py`), the paper-trial identity over the whole tree (C1-03, `agent/paper_trial.py`), deployment pinning of session reports, the strict report reader behind gate 5, and the undefined name in `research/edge_discovery_core.py:1539`;
+- runtime defects outside the frozen set, not yet fixed: B-02, B-07 and B-08;
 - LORD++ v7 does not unblock the first confirmatory tests;
 - the runtime does not journal the decision-time mid;
 - `research/ibr.py` compares a raw stop with a cent-rounded floor.
 
-## 12. Removed documents
+## 13. Removed documents
 
 Removed on 8 November 2026 because they recorded findings that this page now summarises. Each link opens the file at commit `21d9729`, the last that holds it.
 
@@ -376,7 +444,7 @@ Two files were moved rather than removed:
 
 Frozen strings inside registered research modules still name the old paths. They are left as they are because editing those modules would change the preregistered instrument digest; the links above resolve them.
 
-## 13. Sources
+## 14. Sources
 
 - Alpaca, [Orders at Alpaca](https://docs.alpaca.markets/docs/orders-at-alpaca): `opg` orders are rejected from 09:28 to 19:00 New York time, and `cls` orders from 15:50 to 19:00.
 - Alpaca, [historical auctions endpoint](https://docs.alpaca.markets/reference/stockauctions-1).

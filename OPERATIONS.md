@@ -135,6 +135,14 @@ means residual positions remain and requires manual reconciliation. If the
 trader is unhealthy, stop it, cancel open orders, flatten manually in the
 scoped Alpaca account, and leave it stopped until reconciliation passes.
 
+With `ALPACA_RESUME_AFTER_CLEAN_SHUTDOWN=1` (the `compose.yaml` default for the
+trader since 9 November 2026), a stop, deploy or reboot whose shutdown flatten
+ends broker-flat, with no fault, no kill, no daily stop and no local trades or
+working orders, does not leave an operator pause, so the next start trades
+again. A crash, a hang, an incomplete flatten or any of those conditions still
+leaves the pause, and then the sequence below applies. Set it to `0` to require
+`resume` after every shutdown, as before.
+
 To recover an operator-paused runtime, use this sequence:
 
 1. Stop the trader and confirm the process has released its run lock.

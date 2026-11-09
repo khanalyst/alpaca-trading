@@ -1,5 +1,7 @@
 # Paper incumbent and persistent diagnostic shadows
 
+> **Status, 9 November 2026 (from the code):** this workflow has not produced a single accepted session. The incumbent identity hashes every file in `agent/` and `research/`, so each deploy since activation voids it. Session acceptance is zero-tolerance, so IEX's empty minutes reject every session. Both rules live in modules frozen by the preregistered v2 tests. The incumbents (opening-range breakout and fade) lose money after realistic costs. See [findings section 9](findings.md#9-why-paper-trading-has-not-been-running) before activating anything here.
+
 This is an experiment workflow, not evidence that a profitable strategy exists.
 It adds no services and no broker accounts. The existing trader manages one
 Alpaca paper incumbent; the existing shadow service maintains independent
