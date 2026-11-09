@@ -29,6 +29,9 @@ from .order_timing import broker_timing
 from .paper_trial import (REPLACEMENT_LOCAL_BOOK_ERROR,
                           replacement_local_book_is_flat)
 from research.costs import CostError, CostModel, static_cost_config
+import logging
+
+log = logging.getLogger("engine")
 
 _FILLED_ORDER_STATUSES = {"filled", "partially_filled"}
 _TERMINAL_ORDER_STATUSES = {
@@ -1172,8 +1175,8 @@ class ExecutionLifecycleMixin:
                 try:
                     state.commit({"operator_pause": True},
                                  transition=(state.RUNNING, state.PAUSED))
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as _suppressed:  # noqa: BLE001
+                    log.warning("suppressed %s: %r", "execution_lifecycle", _suppressed)
                 raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
             state.log_order(order, request, action="protect", run_id=self.run_id,
                             runtime_mode=self.mode,
@@ -1215,8 +1218,8 @@ class ExecutionLifecycleMixin:
                 try:
                     state.commit({"operator_pause": True},
                                  transition=(state.RUNNING, state.PAUSED))
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as _suppressed:  # noqa: BLE001
+                    log.warning("suppressed %s: %r", "execution_lifecycle", _suppressed)
                 raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
             return result
         side = "sell" if str(_value(position, "side", "long")).lower() in {"long", "buy"} else "buy"
@@ -1233,8 +1236,8 @@ class ExecutionLifecycleMixin:
             try:
                 state.commit({"operator_pause": True},
                              transition=(state.RUNNING, state.PAUSED))
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _suppressed:  # noqa: BLE001
+                log.warning("suppressed %s: %r", "execution_lifecycle", _suppressed)
             raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
         return result
 
@@ -1842,8 +1845,8 @@ class ExecutionLifecycleMixin:
             # broker state before any retry or local close is considered.
             try:
                 self.reconcile()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _suppressed:  # noqa: BLE001
+                log.warning("suppressed %s: %r", "execution_lifecycle", _suppressed)
             refreshed = state.load_state().get("active_trades", {}).get(symbol, trade)
             return False, dict(refreshed) if isinstance(refreshed, Mapping) else trade
         new_leg = self._replacement_leg(replacement, desired_stop)
@@ -2257,8 +2260,8 @@ class ExecutionLifecycleMixin:
                 try:
                     state.commit({"operator_pause": True},
                                  transition=(state.RUNNING, state.PAUSED))
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as _suppressed:  # noqa: BLE001
+                    log.warning("suppressed %s: %r", "execution_lifecycle", _suppressed)
                 raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
         return {"closed": closed, "failed": failed, "force_flat": force_flat}
 

@@ -86,6 +86,9 @@ services:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
       ALPACA_LIVE_ENABLE: "false"
+      # A shutdown that ends broker-flat with no fault (a deploy, restart or
+      # reboot) does not leave an operator pause; any fault still pauses.
+      ALPACA_RESUME_AFTER_CLEAN_SHUTDOWN: ${ALPACA_RESUME_AFTER_CLEAN_SHUTDOWN:-1}
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
       ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
       ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}

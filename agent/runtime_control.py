@@ -25,6 +25,20 @@ from .execution_lifecycle import (
 log = logging.getLogger("engine")
 
 
+RESUME_AFTER_CLEAN_SHUTDOWN_ENV = "ALPACA_RESUME_AFTER_CLEAN_SHUTDOWN"
+
+
+def resume_after_clean_shutdown() -> bool:
+    """Opt-in: a graceful, broker-flat shutdown does not leave an operator pause.
+
+    Off by default, so a restart still waits for ``main.py resume``.  When on,
+    a deploy, container restart or host reboot that shuts the trader down
+    cleanly lets the next start trade again; a crash, a hang, an incomplete
+    flatten or any fault still pauses.
+    """
+    return os.getenv(RESUME_AFTER_CLEAN_SHUTDOWN_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
 class _ResumeBlocked(AlpacaError):
     """Authorization failed after the resume command acquired its lock."""
 
@@ -141,8 +155,8 @@ class RuntimeControlMixin:
                     # An earlier call stripped this bracket and could not
                     # restore a stop; a failed close here must restore it.
                     unprotected[str(symbol).upper()] = (trade, None)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _suppressed:  # noqa: BLE001
+            log.warning("suppressed %s: %r", "runtime_control", _suppressed)
         failed_symbols: set[str] = set()
         # Client ids of every close this call submitted, per symbol.  The
         # end-of-call re-arm looks each up, so it never places a stop over a
@@ -373,8 +387,8 @@ class RuntimeControlMixin:
                     try:
                         state.commit({"operator_pause": True},
                                      transition=(state.RUNNING, state.PAUSED))
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as _suppressed:  # noqa: BLE001
+                        log.warning("suppressed %s: %r", "runtime_control", _suppressed)
                     raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
                 submitted[symbol] = {"order_id": order_id, "status": status,
                                      "attempt": close_attempt}
@@ -494,12 +508,12 @@ class RuntimeControlMixin:
                 runtime_mode=self.mode,
                 run_id=self.run_id,
             )
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _suppressed:  # noqa: BLE001
+            log.warning("suppressed %s: %r", "runtime_control", _suppressed)
         try:
             state.write_heartbeat("degraded", run_id=self.run_id, reason=reason)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _suppressed:  # noqa: BLE001
+            log.warning("suppressed %s: %r", "runtime_control", _suppressed)
 
     def resume(self) -> dict[str, Any]:
         """Authorize a paused runtime to be started again, without trading."""
@@ -648,14 +662,48 @@ class RuntimeControlMixin:
         finally:
             self._release_lock()
 
+    def _clear_pause_after_clean_shutdown(self, reason: str) -> None:
+        """Let a restart trade again after a shutdown that ended broker-flat.
+
+        Only reached when the operator opted in, the run raised nothing, and the
+        shutdown flatten reported a broker-confirmed flat book with no working
+        orders.  The pause was already durable before the flatten started (see
+        request_shutdown), so a crash mid-shutdown still leaves it set.  The same
+        invariants as ``resume`` must hold: paused, no kill reason, no daily
+        stop, no local trades, protection rows or non-terminal orders.  Any doubt
+        keeps the pause.
+        """
+        def clear(current: dict) -> dict:
+            self._resume_pause_invariants(current, check_orders=True)
+            current["operator_pause"] = False
+            return current
+
+        try:
+            state.update_state(clear)
+        except _ResumeBlocked as exc:
+            log.warning("clean-shutdown resume kept the pause: %s", exc.reason)
+            self._journal_event("clean_shutdown_resume_blocked", {
+                "reason": exc.reason, "shutdown_reason": reason})
+            return
+        except Exception as exc:  # noqa: BLE001 - keep the pause on any doubt
+            log.warning("clean-shutdown resume kept the pause: %s", exc)
+            return
+        self._journal_event("clean_shutdown_resume_authorized",
+                            {"shutdown_reason": reason})
+        try:
+            state.write_heartbeat("stopped", run_id=self.run_id,
+                                  reason="clean_shutdown_resume_authorized")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("clean-shutdown heartbeat unavailable: %s", exc)
+
     def request_shutdown(self, reason: str = "shutdown") -> None:
         self.shutdown_reason = reason
         self.running = False
         try:
             state.commit({"operator_pause": True}, transition=(state.RUNNING, state.PAUSED))
             state.write_heartbeat("pausing", run_id=self.run_id, reason=reason)
-        except Exception:
-            pass
+        except Exception as _suppressed:
+            log.warning("suppressed %s: %r", "runtime_control", _suppressed)
 
     def close(self) -> None:
         """Release the process lock and leave a truthful terminal heartbeat."""
@@ -671,8 +719,8 @@ class RuntimeControlMixin:
                 # operator_pause flag.
                 try:
                     state.commit({}, transition=(state.RUNNING, state.PAUSED))
-                except Exception:
-                    pass
+                except Exception as _suppressed:
+                    log.warning("suppressed %s: %r", "runtime_control", _suppressed)
                 try:
                     if getattr(self, "_observability_degraded", False):
                         state.write_heartbeat(
@@ -681,8 +729,8 @@ class RuntimeControlMixin:
                     else:
                         state.write_heartbeat("stopped", run_id=self.run_id,
                                               reason=self.shutdown_reason or "closed")
-                except Exception:
-                    pass
+                except Exception as _suppressed:
+                    log.warning("suppressed %s: %r", "runtime_control", _suppressed)
         finally:
             # State/heartbeat persistence is best effort, but a held process
             # lock is never allowed to survive close().
@@ -708,8 +756,8 @@ class RuntimeControlMixin:
             self._observability_degraded = False
             try:
                 state.clear_observability_degraded()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _suppressed:  # noqa: BLE001
+                log.warning("suppressed %s: %r", "runtime_control", _suppressed)
             self.config_version_id = str(result.get("config_version_id") or "")
             if result.get("recorded"):
                 self._journal_event("config_version_recorded", {
@@ -723,8 +771,8 @@ class RuntimeControlMixin:
             self._observability_degraded = True
             try:
                 state.mark_observability_degraded("config_audit_unavailable")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _suppressed:  # noqa: BLE001
+                log.warning("suppressed %s: %r", "runtime_control", _suppressed)
             detail = f"{type(exc).__name__}: {exc}"
             # Configuration provenance is part of runtime observability.  It
             # is intentionally non-blocking for trading, but a watchdog must
@@ -743,8 +791,8 @@ class RuntimeControlMixin:
             state.log_event(kind, json.dumps(dict(payload), sort_keys=True,
                                              default=str),
                             run_id=self.run_id, runtime_mode=self.mode)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _suppressed:  # noqa: BLE001
+            log.warning("suppressed %s: %r", "runtime_control", _suppressed)
 
 
     def run(self, *, max_cycles: int | None = None) -> None:
@@ -775,8 +823,8 @@ class RuntimeControlMixin:
                 state.write_heartbeat("degraded", run_id=self.run_id,
                                       reason=self._preflight_error or
                                       "runtime_readiness_failed")
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "runtime_control", _suppressed)
             self.close()
             raise
         if not ready:
@@ -785,8 +833,8 @@ class RuntimeControlMixin:
             self.running = False
             try:
                 state.write_heartbeat("degraded", run_id=self.run_id, reason=reason)
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "runtime_control", _suppressed)
             self.close()
             raise AlpacaError(reason)
         self.running = True
@@ -835,9 +883,12 @@ class RuntimeControlMixin:
                 try:
                     state.commit({"operator_pause": True},
                                  transition=(state.RUNNING, state.PAUSED))
-                except Exception:
-                    pass
+                except Exception as _suppressed:
+                    log.warning("suppressed %s: %r", "runtime_control", _suppressed)
             self.close()
+            if (flatten_failure_reason is None and run_failure is None and
+                    self.shutdown_reason and resume_after_clean_shutdown()):
+                self._clear_pause_after_clean_shutdown(exit_reason)
             if flatten_failure_reason is not None:
                 # close() deliberately emits stopped for normal shutdown, but
                 # residual exposure is not a normal terminal condition.  Keep
@@ -846,7 +897,7 @@ class RuntimeControlMixin:
                 try:
                     state.write_heartbeat("degraded", run_id=self.run_id,
                                           reason=flatten_failure_reason)
-                except Exception:
-                    pass
+                except Exception as _suppressed:
+                    log.warning("suppressed %s: %r", "runtime_control", _suppressed)
             if flatten_failure is not None and run_failure is None:
                 raise flatten_failure

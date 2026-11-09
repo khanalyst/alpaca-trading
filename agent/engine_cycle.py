@@ -22,6 +22,9 @@ from .execution_lifecycle import (
     _plain,
     _value,
 )
+import logging
+
+log = logging.getLogger("engine")
 
 
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -403,12 +406,12 @@ class EngineCycleMixin:
         try:
             if state.load_state().get("state") == state.KILLED:
                 return None
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _suppressed:  # noqa: BLE001
+            log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
         try:
             self.market.refresh_calendar()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _suppressed:  # noqa: BLE001
+            log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
         try:
             now = self._timestamp(_value(self.market.clock(), "timestamp", None))
         except Exception:  # noqa: BLE001
@@ -508,8 +511,8 @@ class EngineCycleMixin:
         try:
             state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
                 run_id=self.run_id, reason=reason))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _suppressed:  # noqa: BLE001
+            log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
         return {"action": "hold", "reason": reason, "error": str(error),
                 "transient": True, "consecutive_failures": count}
 
@@ -527,8 +530,8 @@ class EngineCycleMixin:
             try:
                 state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
                     run_id=self.run_id, reason=reason))
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
             if flattened is not None:
                 return flattened
             return {"action": "hold", "reason": reason}
@@ -575,8 +578,8 @@ class EngineCycleMixin:
                 state.write_heartbeat("running", **self._cycle_heartbeat_detail(
                     run_id=self.run_id, reason="outside_regular_session",
                     orders=0))
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
             self._transient_failures = 0
             return {"action": "force_flat", "reason": "outside_regular_session",
                     "closed": True, "residual": _plain(self.provider.positions())}
@@ -625,8 +628,8 @@ class EngineCycleMixin:
             try:
                 state.write_heartbeat("paused", **self._cycle_heartbeat_detail(
                     run_id=self.run_id, reason="daily_loss_limit", orders=0))
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
             try:
                 residual = _plain(self.provider.positions())
             except Exception as exc:  # noqa: BLE001
@@ -648,8 +651,8 @@ class EngineCycleMixin:
                 state.write_heartbeat("running", **self._cycle_heartbeat_detail(
                     run_id=self.run_id, reason="position_close_submitted",
                     orders=0))
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
             return {"action": "close", **monitored}
 
         if not self._refresh_edge():
@@ -661,8 +664,8 @@ class EngineCycleMixin:
                 if self.mode == "paper":
                     detail["paper_selection"] = self._paper_selection_status()
                 state.write_heartbeat("paused", **detail)
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
             return {"action": "hold", "reason": self._edge_error or
                     "validated edge champion is required"}
         if _value(clock, "is_open", None) is not True or not self.market.can_enter(now):
@@ -670,16 +673,16 @@ class EngineCycleMixin:
                 state.write_heartbeat("running", **self._cycle_heartbeat_detail(
                     run_id=self.run_id, reason="outside_regular_session",
                     orders=0))
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
             return {"action": "hold", "reason": "outside_regular_session"}
         if not self._latest_entry_allowed(now):
             try:
                 state.write_heartbeat("running", **self._cycle_heartbeat_detail(
                     run_id=self.run_id, reason="latest_entry_time_passed",
                     orders=0))
-            except Exception:
-                pass
+            except Exception as _suppressed:
+                log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
             return {"action": "hold", "reason": "latest_entry_time_passed"}
         session = self.market.session(now)
         session_close = session.close if session is not None else None
@@ -1136,8 +1139,8 @@ class EngineCycleMixin:
                                 "degraded", **self._cycle_heartbeat_detail(
                                     run_id=self.run_id,
                                     reason="post_submit_durability_failure"))
-                        except Exception:  # noqa: BLE001
-                            pass
+                        except Exception as _suppressed:  # noqa: BLE001
+                            log.warning("suppressed %s: %r", "engine_cycle", _suppressed)
                         raise AlpacaError(
                             f"{self._preflight_error}: {exc}") from exc
                 except AlpacaError:

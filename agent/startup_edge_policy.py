@@ -15,6 +15,9 @@ from .execution_lifecycle import _value
 from .instruments import validate_asset_class, validate_instrument
 from .paper_trial import (REPLACEMENT_LOCAL_BOOK_ERROR,
                           replacement_local_book_is_flat)
+import logging
+
+log = logging.getLogger("engine")
 
 
 class StartupEdgePolicyMixin:
@@ -513,8 +516,8 @@ class StartupEdgePolicyMixin:
                          transition=(state.RUNNING, state.PAUSED))
             state.write_heartbeat("degraded", run_id=self.run_id,
                                   reason="intraday_cleanup_incomplete")
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _suppressed:  # noqa: BLE001
+            log.warning("suppressed %s: %r", "startup_edge_policy", _suppressed)
         detail = f": {cleanup_error}" if cleanup_error is not None else ""
         raise AlpacaError(
             f"outside-session cleanup incomplete; entries remain blocked{detail}")
@@ -577,8 +580,8 @@ class StartupEdgePolicyMixin:
                                 runtime["state"] = state.RUNNING
                             return runtime
                         self._runtime_state = state.update_state(resume)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as _suppressed:  # noqa: BLE001
+                        log.warning("suppressed %s: %r", "startup_edge_policy", _suppressed)
                     return True
                 self._edge_record = None
                 self._edge_records = []
@@ -598,15 +601,15 @@ class StartupEdgePolicyMixin:
                             runtime["state"] = state.PAUSED
                         return runtime
                     self._runtime_state = state.update_state(pause_trial)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as _suppressed:  # noqa: BLE001
+                    log.warning("suppressed %s: %r", "startup_edge_policy", _suppressed)
                 try:
                     state.write_heartbeat(
                         "paused", run_id=self.run_id,
                         reason=self._edge_error,
                         paper_selection=self._paper_selection_status())
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as _suppressed:  # noqa: BLE001
+                    log.warning("suppressed %s: %r", "startup_edge_policy", _suppressed)
                 return False
             except Exception as exc:  # noqa: BLE001
                 trial_runtime.error = f"paper_trial_refresh_failed:{exc}"
@@ -680,8 +683,8 @@ class StartupEdgePolicyMixin:
                                 self._paper_selection_status()
                         state.write_heartbeat(
                             "paused", **detail)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as _suppressed:  # noqa: BLE001
+                        log.warning("suppressed %s: %r", "startup_edge_policy", _suppressed)
                 return not self._edge_required
             prior_ids = [record.get("candidate_id") for record in self._edge_records]
             next_ids = [record.get("candidate_id") for record in records]
@@ -716,8 +719,8 @@ class StartupEdgePolicyMixin:
                         runtime["state"] = state.RUNNING
                     return runtime
                 state.update_state(resume)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _suppressed:  # noqa: BLE001
+                log.warning("suppressed %s: %r", "startup_edge_policy", _suppressed)
             return True
         except Exception as exc:  # noqa: BLE001
             self._edge_record = None
