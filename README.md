@@ -17,13 +17,16 @@ unsupported. No performance claim is made.
 - **Paper trading has not been running.** Seven independent gates in the code stop
   it; they are listed with file references in
   [findings section 9](docs/findings.md#9-why-paper-trading-has-not-been-running).
-- **The intraday discovery program cannot find an edge as configured.** It charges
-  17 bps a round trip, requires survival at 25 bps, trades only the 24 broad ETFs,
-  and learns only from its own forward IEX recordings
+- **The intraday discovery program could not find an edge as configured.** It charged
+  17 bps a round trip and required survival at 25 bps; since 9 November the
+  compose research and shadow services price with per-symbol costs (about 2 bps,
+  stressed at twice that). It still trades only the 24 broad ETFs and learns only
+  from its own forward IEX recordings
   ([findings section 10](docs/findings.md#10-the-intraday-discovery-program-read-from-its-code-by-a-day-trader)).
 - **The LLM** (`research/llm_strategy.py`) only proposes or tunes a `rule_spec`
   inside that closed grammar, at most 20% per field. It never sees market data, and
-  every proposal faces the same gates.
+  every proposal faces the same gates. Every call, its inputs and outputs, and which
+  variants were kept and tested are logged readably (`python -m research.llm_audit`).
 - **Every edge tested, with results:**
   - [edgefinder/results/all-edges.md](edgefinder/results/all-edges.md): 443 daily candidates;
   - [docs/intraday-arms.md](docs/intraday-arms.md): all 82 intraday arms;

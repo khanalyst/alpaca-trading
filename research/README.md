@@ -247,11 +247,17 @@ At the reference prices the `per_symbol_v2` round trip (marketable entry and
 exit from a bar) is 2.18 bps for SPY, 2.50 for QQQ, 2.49 for IWM and 2.49 for
 HYG; across the 24 symbols it runs from 1.75 (VB) to 4.07 (SLV).
 
-`per_symbol_v2` is the default of `research.cost_rerun` only, which
+`per_symbol_v2` is the default of `research.cost_rerun`, and the research lanes
+use it when `costs.research_model: per_symbol_v2` is set or
+`ALPACA_RESEARCH_COST_MODEL=per_symbol_v2` is exported (the compose research and
+shadow services do). It is applied where `research.py` and `deploy/shadow.py` load
+the configuration, before hashing, so candidate identities bind it; its rows carry
+`expected_round_trip_bps`, so gate protocol 2 stresses at twice that instead of the
+flat 25 bps. `research.cost_rerun`
 replays every variant under it (with each quoted symbol's measured median
 spread) next to the configured and measured arms, and reports its round trips.
-The strategy factory, `edge discover` and the gates still charge `static_v1`
-(17 bps a round trip) and require survival at a 25 bps stress, because switching
+Without that setting the strategy factory, `edge discover` and the gates charge
+`static_v1` (17 bps a round trip) and require survival at a 25 bps stress, because switching
 them changes every candidate identity, stored proof and sealed fixture; a
 lane opts in by passing `PerSymbolCostModel().resolver()` as the
 `cost_resolver` of `simulate_account`. Rows priced that way are recomputed

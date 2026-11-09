@@ -1,6 +1,9 @@
 # Findings and research results
 
-Updated 9 November 2026, data to 6 November 2026. This is the single findings document for the repository. It replaces the dated findings reports, which are listed with permanent links in [section 13](#13-removed-documents).
+Updated 9 November 2026, data to 6 November 2026.
+
+> **Correction, 9 November.** An earlier version of this page said that editing modules in the preregistered v2 instrument would make the v2 tests refuse their first look. That was wrong: a v2 decision is made from a checkout of its registration commit `4d82354` (`research/preregistered.py` `instrument_identity`), so the working tree may move on. Nine decision-machinery tests had silently assumed otherwise; they now stand in for that checkout explicitly.
+ This is the single findings document for the repository. It replaces the dated findings reports, which are listed with permanent links in [section 13](#13-removed-documents).
 
 ## 1. Bottom line
 
@@ -266,9 +269,9 @@ The VM was not reachable from this session. The last verified state is 11 Octobe
 | 2 | a crash or hang pauses too | `supervise` hands an unresponsive child (no heartbeat for 300 s) or a non-zero exit to `recover`, and returns with the pause kept; flatten and durability failures in `runtime_control.py` and `execution_lifecycle.py` commit the same pause | one incident stops trading until a manual resume | yes, by design |
 | 3 | no validated edge | `agent/engine.py` sets `_edge_required` from `research.require_validated_variant: true`; `_refresh_edge` in `startup_edge_policy.py` finds no proved ledger record | with the shipped `config.yaml`, every cycle writes a paused heartbeat with reason `validated_edge_required` and places nothing. No record can exist: the research found no edge, and a proof needs 100 recorded sessions and then a 150-trade live-shadow tail | yes |
 | 4 | the paper-trial identity covers the whole tree (review finding C1-03, unfixed) | `runtime_code_identity` in `agent/paper_trial.py` hashes every `.py` file in `agent/` and `research/`, plus `deploy/recorder.py` and `requirements.lock.txt`; `_same_incumbent` compares it | any change to those files after activation makes `refresh_state` raise `active paper trial identity/config changed`. The trial then cannot accrue or trade until it is cancelled (allowed only while it has no accepted sessions or outcomes) and a new one is activated on a flat book. Between the last verified image and `main`, 60 commits changed 43 of those files | yes, for any deploy after 11 October |
-| 5 | session acceptance accepts nothing (C2-02, unfixed) | `deploy/session_acceptance.py`: a session is accepted only when its list of reasons is empty (line 1112); a quote older than 30 s or one symbol's IEX bar published more than 30 s late in any 30-second sample adds a reason (lines 537 and 562) | IEX has empty minutes for thinner funds, so no session is accepted, and with fewer than 20 accepted sessions the trial can neither pass nor fail | yes. The same rule is enforced again in the frozen reader `agent/paper_trial.py` `_read_report`: an accepted report must show every sample healthy, no reason counts and every quote and bar within 30 s. A more tolerant producer would therefore be refused or would have to misstate the evidence, so this needs the frozen-module change in section 12 |
+| 5 | session acceptance accepts nothing (C2-02, unfixed) | `deploy/session_acceptance.py`: a session is accepted only when its list of reasons is empty (line 1112); a quote older than 30 s or one symbol's IEX bar published more than 30 s late in any 30-second sample adds a reason (lines 537 and 562) | IEX has empty minutes for thinner funds, so no session is accepted, and with fewer than 20 accepted sessions the trial can neither pass nor fail | yes. The trial reader `agent/paper_trial.py` `_read_report` enforces the same rule again: an accepted report must show every sample healthy, no reason counts and every quote and bar within 30 s. Gates 4 to 6 form one evidence chain with the live shadow; see section 12 for why the lane is retired rather than re-plumbed |
 | 6 | reports pin the first deployment | `_merge_reports` in `agent/paper_trial.py` records `report_deployment_drift` for any report from a later deployment | after a redeploy the refusal itself is a blocker, so entries stop | yes, after any redeploy |
-| 7 | a hung broker call can wedge start-up (B-10, C2-04, unfixed) | the REST layer of the pinned `alpaca-py==0.43.5` sets no timeout and the runtime adds none; the watchdog takes the run lock before un-timed reads | one hung call can hold the lock, so the next trader child exits and the supervisor pauses again | yes |
+| 7 | a hung broker call can wedge start-up (B-10, C2-04) | the REST layer of the pinned `alpaca-py==0.43.5` sets no timeout and the runtime added none; the watchdog takes the run lock before broker reads | one hung call could hold the lock, so the next trader child exits and the supervisor pauses again | **fixed** (9 November): every alpaca-py client gets a default `(5 s, 30 s)` timeout (`agent/alpaca_session.py` `with_http_timeout`, override `ALPACA_HTTP_TIMEOUT_SECONDS`); a timed-out order submission is classified as ambiguous and resolved by client id |
 
 What it would trade if every gate cleared: the opening-range breakout or fade incumbent in `deploy/paper-orb.config.json` or `paper-orf.config.json`. After realistic costs the breakout loses about 4 bps a trade (t -2.2), and the fade's in-sample lead reversed in the fresh window. Running it would measure execution, not make money.
 
@@ -301,8 +304,8 @@ The intraday program (`research/strategy_factory.py` and its helpers, driven nig
 | default geometry | stop 1 x the one-minute ATR(14) (about 4 bps on SPY), raised to the 30 bps stress floor; target 2R (60 bps); at most 90 minutes; one trade per symbol per session; entries 09:30 to 15:00, flat by 15:50 | `DEFAULT_RULE_SPEC`, `risk.stressed_cost_scenario_bps / max_stressed_cost_to_risk_ratio` |
 | data that can authorise | only `forward_observed` rows, the recorder's own live IEX capture; years of history are "diagnostic only" | `research/source_validation.py` |
 | split | chronological: 70% of the recorded sessions to fit, the rest held out, then a sealed qualification window, then a live-shadow tail | `_fit_partition`; floors of 100 trades and 30 sessions, then 150 trades and 30 sessions |
-| cost charged | `CostModel.from_config(static_cost_config(config))`: 4 bps spread, 6 bps slippage and 0.5 bps fee a side, which measures **17.0 bps a round trip** | `research.py` `cmd_factory_run` |
-| cost a pass must survive | a **25 bps** round-trip stress | `research/gates.py` `COST_STRESS_REQUIRED_BPS` |
+| cost charged | `CostModel.from_config(static_cost_config(config))`: 4 bps spread, 6 bps slippage and 0.5 bps fee a side, which measures **17.0 bps a round trip**. Since 9 November the research and shadow services set `ALPACA_RESEARCH_COST_MODEL=per_symbol_v2` (`compose.yaml`), so every research lane prices with per-symbol costs instead (about 2 to 4 bps); without the variable the old 17 bps still applies | `research.py` `cmd_factory_run`; `research/quote_costs.py` `cost_resolver_setup` |
+| cost a pass must survive | a **25 bps** round-trip stress, unless the rows carry their expected round trip; per-symbol rows now do (`expected_round_trip_bps`), so gate protocol 2 stresses at twice that instead | `research/gates.py` `COST_STRESS_REQUIRED_BPS`, `COST_STRESS_RELATIVE_MULTIPLE` |
 
 How the LLM is used (`research/llm_strategy.py`; `config.yaml` `research.strategy_llm`: OpenAI, model `gpt-5.6-terra`, temperature 0, up to 64 calls a cycle, 2 attempts, 30 s timeout):
 
@@ -311,6 +314,8 @@ How the LLM is used (`research/llm_strategy.py`; `config.yaml` `research.strateg
 | `discover` | the rules already tried, a short sanitised context | one `rule_spec` in one of the 12 families, plus a one-sentence thesis | rejected if it repeats a family before all 12 are tried, or is a near-duplicate; then the deterministic ladder seeds the slot instead |
 | `tune` | one root rule, its fit diagnosis, graded "lessons" from earlier attempts | the same rule with one field changed (or two, once each was measured), by at most 20% of its value | each variant is replayed through the same gates |
 | `propose` | the failed rule and an aggregate diagnosis of at most 8 KB | a replacement `rule_spec` | as above |
+
+Every call, and what the factory did with it, is now recorded in a readable append-only log (`research/llm_audit.py`; `runtime/research/llm-audit.jsonl`): the root rule, the refinement phase, the diagnosis and lessons it was given, the rule it returned, the fields it changed, its thesis or reasons, and which variants the factory kept and tested or rejected and why. `python -m research.llm_audit --out llm-audit.md` renders it; variant ids link each row to the factory report's gate results.
 
 The model never sees a price, a chart, a headline, a calendar or another market. The prompt forbids new signals, indicators and data sources, and the validator rejects any field outside the grammar. In effect it is a hill-climber that can move parameters a little within a fixed, closed set of ideas.
 
@@ -344,7 +349,7 @@ Not in this window: stocks in play did no better than random stocks or the ETFs,
 | --- | --- | --- |
 | A. stop the intraday factory | put the effort into daily-horizon edges (`edgefinder`), where the edge-to-cost ratio is favourable and decades of data exist | recommended |
 | B. rebuild intraday around stocks in play | a pre-market scan (gap, pre-market volume, relative volume, an LLM reading headlines for a real catalyst); SIP one-minute history from 2016; per-symbol costs; stops at market structure; walk-forward and multiple-testing control as in `edgefinder` | the only intraday route with published support; the 46-session test above says verify on years of data before building more |
-| C. keep the factory, remove its handicaps | `per_symbol_v2` costs; gate protocol 2 (2x expected cost instead of 25 bps); history allowed for development, forward data only to confirm; context features in the grammar | necessary for any intraday result, but the October replays at realistic cost suggest there is little to find on these ETFs |
+| C. keep the factory, remove its handicaps | `per_symbol_v2` costs and gate protocol 2's relative stress (**done 9 November**, via `ALPACA_RESEARCH_COST_MODEL`); history allowed for development, forward data only to confirm; context features in the grammar (not done) | necessary for any intraday result, but the October replays at realistic cost suggest there is little to find on these ETFs |
 
 ## 11. Code review of every file
 
@@ -370,7 +375,7 @@ The rest of `research/` was reviewed through those scans and through the finding
 | package | role | state |
 | --- | --- | --- |
 | `agent/` | configuration, Alpaca boundary, engine, execution lifecycle, risk, paper trial, state and journal | the safety design is careful and consistent (fail closed, idempotent ids, broker-truth reconciliation). Its costs are availability (gates 1 to 4 and 7) and 36 `except Exception: pass` blocks in its four core modules, which hide failed state and heartbeat writes |
-| `research/` | strategy factory, gates, edge ledger and proofs, live shadow, costs, statistics, cohorts, preregistration | 60% of all code, and it has produced no tradeable edge. 46 of its modules are frozen into the preregistered v2 instrument, so they cannot be fixed in place until the v2 looks conclude |
+| `research/` | strategy factory, gates, edge ledger and proofs, live shadow, costs, statistics, cohorts, preregistration | 60% of all code, and it has produced no tradeable edge. 46 of its modules form the preregistered v2 instrument, which is decided from a checkout of its registration commit (`4d82354`), so they can be fixed on the working tree |
 | `deploy/` | recorder, shadow service, scheduler, health, watchdog, supervisor, dashboard, research data plumbing | session acceptance (gate 5) is the main defect; `recorder.py` is 3,029 lines |
 | `studies/` | the liquid-ETF reversion study | clean, standard library only, never run at full scale |
 | `edgefinder/` | this change | pyflakes clean, 54 tests, outside every frozen identity |
@@ -379,8 +384,8 @@ Findings, most serious first:
 
 | severity | finding | location | action |
 | --- | --- | --- | --- |
-| high | `null_control_account` reads `signal.get("relative_volume")`, but no `signal` exists in that function or module. The block was copied from `factory_core.py`, where it does. Any v6 or v7 rule arm that reaches it raises `NameError`. It came in on 7 October (`bba52bb`), and no test exercises it | `research/edge_discovery_core.py:1539` | not fixed here: the module is part of the frozen v2 instrument, and editing it would make both v2 hypotheses refuse their first look. Fix it after the v2 decision, as a new version; it affects only diagnostic, non-authorising arms |
-| high | gates 3 to 6 above (gate 1 is now fixed, opt-in) | see section 9 | gates 4 to 6 edit frozen modules; owner decision (section 9, step 3) |
+| high | `null_control_account` read `signal.get("relative_volume")`, but no `signal` exists in that function or module. The block was copied from `factory_core.py`, where it does. Every v6 or v7 arm whose randomized null filled raised `NameError` (reproduced). It came in on 7 October (`bba52bb`) | `research/edge_discovery_core.py:1539` | **fixed** (9 November): a null has no rule signal, so `relative_volume` is `None`; `tests/research/test_null_control_v6.py` |
+| high | gates 3 to 6 above (gates 1 and 7 are now fixed) | see section 9 | gate 3 is policy; gates 4 to 6 belong to the retired intraday paper-trial lane (section 12) |
 | medium | no HTTP timeout on any broker call (B-10), and the watchdog holds the run lock across un-timed reads (C2-04) | `agent/alpaca_provider.py`; `alpaca-py` 0.43.5 `alpaca/common/rest.py`; `deploy/watchdog.py` | wrap the SDK session with a timeout, as a reviewed runtime change |
 | medium | 36 `except Exception: pass` blocks in the core runtime (11 in `engine_cycle.py`, 14 in `runtime_control.py`, 6 in `startup_edge_policy.py`, 5 in `execution_lifecycle.py`) | as listed | **fixed** (9 November): each now logs a warning with the module and the error, and behaviour is otherwise unchanged. Three one-line `except Exception: pass` forms remain on heartbeat writes |
 | medium | B-02 (bracket legs anchored to the signal close), B-07 (a restart flattens the whole book) and B-08 (entry limits never expire) are not among the fixed findings | `agent/market_entry_risk.py`, `agent/startup_edge_policy.py`, `agent/engine.py` | runtime changes, each with tests |
@@ -391,6 +396,7 @@ Findings, most serious first:
 
 ## 12. What to do next, in order
 
+0. **See what the LLM proposed:** after a research cycle on the VM, `python -m research.llm_audit --out llm-audit.md` inside the research container.
 0. **Find out what the VM is doing**: `bash deploy/vm-status.sh > vm-status.txt` on the VM, read-only. Then decide on the intraday paper trial as set out in section 9.
 1. **Put the overnight VTI hold live on a dedicated paper account.** Each step needs the owner's machine, the VM or the Alpaca dashboard:
    1. In the Alpaca dashboard, create a second paper account. The intraday account must not be shared: its force-flat at 15:50 and its watchdog would close the overnight position.
@@ -418,8 +424,9 @@ Open items carried from the 28 October gap closure:
 - factory replay has no prior-session context;
 - producers do not stamp `expected_round_trip_bps` or `comparison_id`;
 - the factory and gates default to `static_v1`;
-- frozen into the preregistered v2 instrument, so deferred until its looks conclude: broker-call timeouts (B-10, `agent/alpaca_provider.py`), the paper-trial identity over the whole tree (C1-03, `agent/paper_trial.py`), deployment pinning of session reports, the strict report reader behind gate 5, and the undefined name in `research/edge_discovery_core.py:1539`;
-- runtime defects outside the frozen set, not yet fixed: B-02, B-07 and B-08;
+- fixed on 9 November: broker-call timeouts (B-10), the null-control `NameError`, realistic research costs (`costs.research_model` / `ALPACA_RESEARCH_COST_MODEL=per_symbol_v2`, with gate protocol 2 stressing at twice the expected round trip), and a readable LLM audit log (`research/llm_audit.py`);
+- retired rather than re-plumbed: the intraday paper-trial lane (the ORB and ORF profiles). Its identity over the whole tree (C1-03), the deployment pinning of session reports and the zero-tolerance acceptance (gate 5) form one evidence chain through `agent/paper_trial.py`, `deploy/session_acceptance.py` and the 8,350-line `research/live_shadow.py`, and the lane exists only to accrue evidence for an opening-range rule that loses money after costs. The overnight trader replaces it as the paper vehicle
+- intraday runtime defects not fixed, for the same reason (no tradeable intraday strategy exists to run): B-02, B-07 and B-08;
 - LORD++ v7 does not unblock the first confirmatory tests;
 - the runtime does not journal the decision-time mid;
 - `research/ibr.py` compares a raw stop with a cent-rounded floor.
@@ -442,7 +449,7 @@ Two files were moved rather than removed:
 - `docs/audit-2026-09-21/spread-reference.json` is now `tests/research/fixtures/spread-reference.json`, because a cost test pins the reference spreads to it;
 - `docs/review-2026-10-15/core-design.md` is now [docs/core-design.md](core-design.md), because it is a design proposal, not a finding.
 
-Frozen strings inside registered research modules still name the old paths. They are left as they are because editing those modules would change the preregistered instrument digest; the links above resolve them.
+Strings inside registered research modules still name the old paths. They are left as they are because they are part of registered manifests and cohort texts; the links above resolve them.
 
 ## 14. Sources
 

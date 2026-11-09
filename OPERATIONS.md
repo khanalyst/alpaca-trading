@@ -33,6 +33,10 @@ For one read-only file with all of the above plus the runtime pause state, the
 paper-trial blockers, why recent sessions were rejected and the running code
 identity, run `bash deploy/vm-status.sh > vm-status.txt`.
 
+To see what the research LLM was given and proposed, and which variants the factory
+kept and tested: `docker compose exec -T research python -m research.llm_audit`
+(add `--out llm-audit.md` for a file).
+
 `main.py check` is authenticated by default and must report the configured
 mode endpoint, credentials, stock/options feeds, current market clock, and
 account state. Use `--offline` only for local configuration checks; it does not
