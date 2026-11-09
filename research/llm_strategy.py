@@ -9,6 +9,7 @@ SDKs are imported lazily so the research package remains usable offline.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import functools
 import hashlib
 import inspect
 import json
@@ -1039,6 +1040,32 @@ def _call_with_timeout(call: Callable[..., Any], timeout: float,
     raise value
 
 
+def _audited(kind: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Record a provider call in the readable audit log after it returns.
+
+    The audit is written after validation, from the call's arguments and its
+    validated result only; it is never read back, so it cannot steer research.
+    """
+    def wrap(method: Callable[..., Any]) -> Callable[..., Any]:
+        signature = inspect.signature(method)
+
+        @functools.wraps(method)
+        def inner(self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = method(self, *args, **kwargs)
+            try:
+                from . import llm_audit
+                bound = signature.bind(self, *args, **kwargs)
+                arguments = {k: v for k, v in bound.arguments.items() if k != "self"}
+                llm_audit.record_call(kind, provider=str(self.provider),
+                                      model=str(self._provider_model()),
+                                      arguments=arguments, result=result)
+            except Exception:  # noqa: BLE001 - auditing must never alter research
+                pass
+            return result
+        return inner
+    return wrap
+
+
 @dataclass(frozen=True)
 class ProposalResult:
     """Plain result returned by :meth:`RuleProposalAdapter.propose`."""
@@ -1638,6 +1665,7 @@ class RuleProposalAdapter:
         evidence["response_observed"] = True
         return PreflightResult(status="ready", evidence=evidence)
 
+    @_audited("proposal")
     def propose(self, vehicle: str, generation: int,
                 prior_validated_rule_spec: Mapping[str, Any],
                 diagnosis: Mapping[str, Any]) -> ProposalResult:
@@ -1738,6 +1766,7 @@ class RuleProposalAdapter:
                              value=safe_diagnosis)
         return ProposalResult(False, error="; ".join(errors), evidence=evidence)
 
+    @_audited("discovery")
     def discover(self, vehicle: str, slot: int,
                  context: Mapping[str, Any]) -> ProposalResult:
         """Request one bounded *new* edge hypothesis for a free research slot.
@@ -1841,6 +1870,7 @@ class RuleProposalAdapter:
         return self._provider_call(system_prompt, request, timeout,
                                    DISCOVERY_SCHEMA)
 
+    @_audited("tuning")
     def tune(self, vehicle: str, slot: int, rule_spec: Mapping[str, Any],
              diagnosis: Mapping[str, Any], *, count: int,
              lessons: Any = ()) -> ProposalResult:

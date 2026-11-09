@@ -1521,7 +1521,8 @@ def _record_llm_observation(observations: list[dict[str, Any]] | None,
                             kind: str,
                             proposal: ProposalResult | None,
                             *, accepted: bool | None = None,
-                            provider_success: bool | None = None) -> None:
+                            provider_success: bool | None = None,
+                            kept: Sequence[Mapping[str, Any]] = ()) -> None:
     """Capture every bounded provider result for cycle-level visibility.
 
     Deterministic fallback is intentionally allowed, but a cycle must still
@@ -1529,6 +1530,16 @@ def _record_llm_observation(observations: list[dict[str, Any]] | None,
     keeps injected test adapters and the real adapter on the same evidence
     path without making provider failures authorizing.
     """
+    if isinstance(proposal, ProposalResult):
+        # The readable audit log (research/llm_audit.py) records what the
+        # factory did with the model's output; it is never read back.
+        from . import llm_audit
+        audit_ok = (bool(proposal.success) if provider_success is None
+                    else bool(provider_success))
+        llm_audit.record_decision(
+            kind, accepted=(audit_ok if accepted is None else bool(accepted)),
+            provider_success=audit_ok, error=proposal.error,
+            evidence=proposal.evidence, kept=kept)
     if observations is None:
         return
     if isinstance(proposal, ProposalResult):
@@ -1959,7 +1970,10 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
         # stop_atr suggestion during execution-blocked steering).
         accepted=(any(item.source == "llm" for item in chosen) or
                   bool(proposal is not None and proposal.success and
-                       proposal.variants)))
+                       proposal.variants)),
+        kept=[{"variant_id": rule_variant_id(item.rule_spec), "source": item.source,
+               "reason": item.reason, "builds_on": item.builds_on}
+              for item in chosen])
     return chosen, proposal
 
 
