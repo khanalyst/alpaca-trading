@@ -298,6 +298,15 @@ class ScanTests(unittest.TestCase):
         self.assertIn("## Verdict", text)
         spec = report.strategy_spec(rounded)
         self.assertIn(spec["verdict"], ("confirmed", "weak", None))
+        every = report.render_all_edges(rounded)
+        self.assertIn("# Every edge tested", every)
+        for family in {c["family"] for c in rounded["candidates"]}:
+            self.assertIn(f"## {family} (", every)
+        rows = [line for line in every.splitlines() if line.startswith("| `")]
+        self.assertEqual(len(rows), len(rounded["candidates"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            report.write(rounded, Path(tmp))
+            self.assertTrue((Path(tmp) / "all-edges.md").exists())
 
 
 class LegDecompositionTests(unittest.TestCase):

@@ -325,10 +325,92 @@ STANDING_CAVEATS = (
 )
 
 
+def _flag(row: Mapping[str, Any], verdicts: Mapping[str, str]) -> str:
+    if row["id"] in verdicts:
+        return verdicts[row["id"]]
+    d, h = row["discovery"], row["holdout"]
+    if d.get("insufficient") or h.get("insufficient"):
+        return "short history"
+    if (d.get("alpha") or 0) > 0 and (h.get("alpha") or 0) > 0:
+        return "positive both windows"
+    if (h.get("alpha") or 0) > 0:
+        return "positive holdout only"
+    return "negative holdout"
+
+
+def render_all_edges(scan: Mapping[str, Any]) -> str:
+    """Every candidate, both windows, grouped by family and sorted by holdout alpha IR."""
+    rows = list(scan["candidates"])
+    verdicts = {c["id"]: c["verdict"] for c in scan.get("confirmations", [])}
+    holdout = [r for r in rows if not r["holdout"].get("insufficient")]
+    count = {
+        "holdout excess over bills above zero": sum((r["holdout"].get("ann_excess") or 0) > 0
+                                                     for r in holdout),
+        "holdout alpha above zero": sum((r["holdout"].get("alpha") or 0) > 0 for r in holdout),
+        "holdout alpha t at least 2": sum((r["holdout"].get("alpha_t") or 0) >= 2
+                                          for r in holdout),
+        "alpha above zero in both windows": sum(
+            (r["discovery"].get("alpha") or 0) > 0 and (r["holdout"].get("alpha") or 0) > 0
+            for r in holdout if not r["discovery"].get("insufficient")),
+        "confirmed (all five tests)": sum(v == "confirmed" for v in verdicts.values()),
+    }
+    lines = [f"# Every edge tested, data to {scan['data_last_date']}", "",
+             f"All {len(rows)} daily candidates from `scan.json`, generated with "
+             f"[report.md](report.md). Discovery runs to {scan['protocol']['discovery_end']}; "
+             f"the holdout is everything after it. Alpha is the yearly return beyond "
+             f"buy and hold of the same funds, net of costs and bills; t is its Newey-West "
+             f"t statistic. The verdict column is the five-test confirmation for the ten "
+             f"discovery leaders and a plain sign label for everything else.", "",
+             "| count | candidates |", "| --- | --- |"]
+    lines += [f"| {k} | {v} of {len(holdout)} |" for k, v in count.items()]
+    lines.append("")
+    lines.append("Excess over bills is mostly market exposure: a strategy that holds "
+                 "equities beat bills in a rising decade. Alpha is the edge.")
+    by_family: dict[str, list[Mapping[str, Any]]] = {}
+    for r in rows:
+        by_family.setdefault(r["family"], []).append(r)
+    order = sorted(by_family, key=lambda f: -max(
+        (r["holdout"].get("alpha_ir") or -9) for r in by_family[f]))
+    for family in order:
+        members = sorted(by_family[family],
+                         key=lambda r: -(r["holdout"].get("alpha_ir") or -9))
+        lines += ["", f"## {family} ({len(members)})", "",
+                  "| candidate | discovery alpha (t) | holdout alpha (t) | holdout alpha IR "
+                  "| holdout excess | holdout Sharpe | holdout max drawdown | trades a year "
+                  "| gross / cost | verdict |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+        for r in members:
+            d, h = r["discovery"], r["holdout"]
+            disc = ("n/a" if d.get("insufficient") else
+                    f"{_pct(d.get('alpha'))} ({_num(d.get('alpha_t'))})")
+            hold = ("n/a" if h.get("insufficient") else
+                    f"{_pct(h.get('alpha'))} ({_num(h.get('alpha_t'))})")
+            be = h.get("breakeven_cost_multiple")
+            lines.append(
+                f"| `{r['id']}` | {disc} | {hold} | {_num(h.get('alpha_ir'))} | "
+                f"{_pct(h.get('ann_excess'))} | {_num(h.get('sharpe'))} | "
+                f"{_pct(h.get('max_drawdown'))} | {_num(h.get('trades_per_year'), 0)} | "
+                f"{'n/a' if be is None else f'{be:.1f}x'} | {_flag(r, verdicts)} |")
+    hourly = scan.get("hourly")
+    if hourly:
+        lines += ["", f"## Hourly last-half-hour families ({len(hourly['candidates'])}, "
+                      f"{hourly['first']} to {hourly['last']})", "",
+                  "| candidate | first half: bps a day (t) | second half: bps a day (t) |",
+                  "| --- | --- | --- |"]
+        for r in sorted(hourly["candidates"], key=lambda r: -(r["holdout"].get("t") or -9)):
+            d, h = r["discovery"], r["holdout"]
+            lines.append(f"| `{r['id']}` | {_num(d.get('mean_bps_per_day'))} "
+                         f"({_num(d.get('t'))}) | {_num(h.get('mean_bps_per_day'))} "
+                         f"({_num(h.get('t'))}) |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def write(scan: Mapping[str, Any], out: Path) -> dict[str, Any]:
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.md").write_text(render(scan), encoding="utf-8")
+    (out / "all-edges.md").write_text(render_all_edges(scan), encoding="utf-8")
     spec = strategy_spec(scan)
     (out / "strategy.json").write_text(json.dumps(spec, indent=1) + "\n", encoding="utf-8")
     return spec
