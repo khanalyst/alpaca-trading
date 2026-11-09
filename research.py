@@ -443,7 +443,15 @@ def _db(args):
 def _agent_config(args: argparse.Namespace) -> dict:
     path = (getattr(args, "agent_config", None) or
             os.getenv("ALPACA_AGENT_CONFIG") or REPO / "config.yaml")
-    return load_agent_config(path)
+    from research.costs import apply_research_cost_model
+    return load_agent_config_with_research_costs(path, apply_research_cost_model)
+
+
+def load_agent_config_with_research_costs(path, apply_research_cost_model) -> dict:
+    """Load, apply ``ALPACA_RESEARCH_COST_MODEL``, and re-validate the result."""
+    config = apply_research_cost_model(load_agent_config(path))
+    from agent.config import validate_config
+    return validate_config(config)
 
 
 def _dataset_context(path: str | Path, *, now: datetime | None = None) -> dict[str, Any]:

@@ -32,7 +32,8 @@ from agent.contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
     quantize_equity_bracket,
 )
-from .costs import (BAR, QUOTE, RESTING_BRACKET,
+from .costs import (BAR, QUOTE, RESTING_BRACKET, COST_MODEL_PER_SYMBOL_V2,
+                    PerSymbolCostModel,
                     DIAGNOSTIC_BAR_FALLBACK,
                     DIAGNOSTIC_HISTORICAL_BACKFILL,
                     RESTING_BRACKET_FILL_SCHEMA, STRESSED_COST_BASIS,
@@ -1763,6 +1764,22 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             "entry_cost_model_slippage_bps": model.slippage_bps,
             "entry_cost_model_fee_bps": model.fee_bps,
         })
+        if str(model.provenance).startswith(COST_MODEL_PER_SYMBOL_V2):
+            # Gate protocol 2 stresses at twice this expected round trip
+            # instead of the flat 25 bps fallback (the gate floors it at the
+            # code-owned per_symbol_v2 figure, so a row cannot declare it away).
+            reference = next((float(value) for value in (
+                cost_context.get("entry_reference"), cost_context.get("entry_price"),
+                cost_context.get("underlying_entry"))
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(float(value)) and float(value) > 0), None)
+            if reference is not None and quantity:
+                try:
+                    sizing_telemetry["expected_round_trip_bps"] = float(
+                        PerSymbolCostModel().round_trip(
+                            symbol, reference, shares=float(quantity))["total_bps"])
+                except CostError:
+                    pass
         reject_reason = None
         reject_stage = None
         if (resolved_policy.max_concurrent_positions is not None and

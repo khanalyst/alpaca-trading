@@ -391,11 +391,21 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
                           if "costs" in cfg else None)
         model_costs = dict(raw_costs)
         measured_quote = model_costs.pop("measured_quote", None)
+        # Which model the research lanes (factory, discovery, shadow) price
+        # with. Absent means static_v1, byte for byte as before; it is kept in
+        # the normalized config only when set, so existing config hashes and
+        # candidate identities are unchanged.
+        from research.costs import RESEARCH_COST_MODELS, RESEARCH_MODEL_KEY
+        research_model = model_costs.pop(RESEARCH_MODEL_KEY, None)
+        if research_model is not None and research_model not in RESEARCH_COST_MODELS:
+            raise ConfigError(
+                f"costs.{RESEARCH_MODEL_KEY} must be one of {', '.join(RESEARCH_COST_MODELS)}")
         # Once an operator changes any cost input, the shipped schedule's
         # provenance label is no longer truthful unless they explicitly name
         # their replacement calibration/source.
         if (explicit_costs is not None and
-                any(key != "measured_quote" for key in explicit_costs) and
+                any(key not in ("measured_quote", RESEARCH_MODEL_KEY)
+                    for key in explicit_costs) and
                 "provenance" not in explicit_costs):
             model_costs["provenance"] = "config"
         try:
@@ -453,6 +463,8 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
             except QuoteCostError as exc:
                 raise ConfigError(f"costs.measured_quote: {exc}") from exc
             normalized_costs["measured_quote"] = measured_normalized
+        if research_model is not None:
+            normalized_costs[RESEARCH_MODEL_KEY] = research_model
         out["costs"] = normalized_costs
 
     llm = _map(out.get("llm"), "llm")

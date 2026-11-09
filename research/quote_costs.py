@@ -516,8 +516,18 @@ def cost_resolver_setup(config: Mapping[str, Any] | None, *,
               CostModel.from_config(_static_cost_config(config), vehicle=vehicle))
     block = ((config or {}).get("costs") if isinstance(config, Mapping) else None)
     measured_raw = block.get("measured_quote") if isinstance(block, Mapping) else None
-    if measured_raw is None:
-        return CostResolverSetup(model=static)
+    research_model = (block.get("research_model") if isinstance(block, Mapping) else None)
+    if measured_raw is None or not (isinstance(measured_raw, Mapping) and
+                                    measured_raw.get("enabled")):
+        if research_model == "per_symbol_v2" and vehicle == "equity":
+            # Realistic per-symbol economics for every research lane: one
+            # spread, slippage by order type, fees on the sell leg (about 2 to
+            # 4 bps a round trip on the shipped ETFs, against static_v1's 17).
+            # Measured quotes, when enabled, take precedence below.
+            from .costs import PerSymbolCostModel
+            return CostResolverSetup(model=static, resolver=PerSymbolCostModel().resolver())
+        if measured_raw is None:
+            return CostResolverSetup(model=static)
     broker = (config or {}).get("broker") if isinstance(config, Mapping) else None
     expected_feed = (broker.get("data_feed") if isinstance(broker, Mapping)
                      else None)

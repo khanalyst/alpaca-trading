@@ -194,6 +194,10 @@ services:
       - --script
       - deploy/research-cycle.sh
     environment:
+      # Research lanes price with per-symbol costs (about 2 bps a round trip)
+      # and gate protocol 2 stresses at twice that, not static_v1's 17 bps
+      # and a flat 25 bps. A new factory evidence epoch.
+      ALPACA_RESEARCH_COST_MODEL: ${ALPACA_RESEARCH_COST_MODEL:-per_symbol_v2}
       ALPACA_PAPER: "true"
       ALPACA_RESEARCH_LLM_SECRETS_FILE: /run/secrets/research_llm_credentials
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
@@ -339,6 +343,10 @@ services:
       - --retention-days
       - ${ALPACA_SHADOW_RETENTION_DAYS:-180}
     environment:
+      # Research lanes price with per-symbol costs (about 2 bps a round trip)
+      # and gate protocol 2 stresses at twice that, not static_v1's 17 bps
+      # and a flat 25 bps. A new factory evidence epoch.
+      ALPACA_RESEARCH_COST_MODEL: ${ALPACA_RESEARCH_COST_MODEL:-per_symbol_v2}
       ALPACA_PAPER: "true"
       ALPACA_LIVE_ENABLE: "false"
       ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}

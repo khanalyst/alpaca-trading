@@ -120,6 +120,35 @@ class CostError(ValueError):
     """Raised for a malformed or internally inconsistent cost model."""
 
 
+RESEARCH_MODEL_KEY = "research_model"
+RESEARCH_COST_MODELS = ("static_v1", "per_symbol_v2")
+RESEARCH_COST_MODEL_ENV = "ALPACA_RESEARCH_COST_MODEL"
+
+
+def apply_research_cost_model(config: Mapping[str, Any],
+                              environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Set ``costs.research_model`` from ``ALPACA_RESEARCH_COST_MODEL`` when unset.
+
+    Applied where the research and shadow processes load their configuration,
+    before anything is hashed, so candidate identities bind the cost model
+    and every lane in those processes prices the same way.  An explicit
+    ``costs.research_model`` in the file wins; tests and other callers that
+    do not set the variable see the configuration unchanged.
+    """
+    import os
+    value = str((os.environ if environ is None else environ).get(
+        RESEARCH_COST_MODEL_ENV, "")).strip()
+    if not value:
+        return dict(config)
+    if value not in RESEARCH_COST_MODELS:
+        raise CostError(f"{RESEARCH_COST_MODEL_ENV} must be one of {', '.join(RESEARCH_COST_MODELS)}")
+    out = dict(config)
+    block = dict(out.get(CONFIG_BLOCK) or {})
+    block.setdefault(RESEARCH_MODEL_KEY, value)
+    out[CONFIG_BLOCK] = block
+    return out
+
+
 def static_cost_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     """Project a runtime config onto the flat :class:`CostModel` schema.
 
@@ -128,19 +157,20 @@ def static_cost_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     metadata explicitly instead of teaching ``CostModel.from_config`` to
     ignore an enabled schedule silently.  The returned mapping is a copy.
     """
+    overlays = {"measured_quote", RESEARCH_MODEL_KEY}
     source = dict(config or {})
     raw = source.get(CONFIG_BLOCK)
-    if isinstance(raw, Mapping) and "measured_quote" in raw:
+    if isinstance(raw, Mapping) and overlays & set(raw):
         source[CONFIG_BLOCK] = {
             key: value for key, value in raw.items()
-            if key != "measured_quote"
+            if key not in overlays
         }
-    elif "measured_quote" in source:
+    elif overlays & set(source):
         # Compatibility APIs also accept a bare costs block. Preserve that
-        # public shape while removing only the separately validated overlay.
+        # public shape while removing only the separately validated overlays.
         source = {
             key: value for key, value in source.items()
-            if key != "measured_quote"
+            if key not in overlays
         }
     return source
 

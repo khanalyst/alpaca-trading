@@ -218,8 +218,12 @@ def main(argv: list[str] | None = None) -> int:
     args = argument_parser.parse_args(argv)
     if args.diagnostic_include_ibr and not args.diagnostic:
         argument_parser.error("--diagnostic-include-ibr requires diagnostic mode")
-    runtime_config = (load_runtime_config(args.config)
-                      if args.diagnostic else None)
+    runtime_config = None
+    if args.diagnostic:
+        from agent.config import validate_config
+        from research.costs import apply_research_cost_model
+        runtime_config = validate_config(
+            apply_research_cost_model(load_runtime_config(args.config)))
     config = ShadowConfig(
         corpus_path=args.corpus, edge_db=args.edge_db, shadow_db=args.shadow_db,
         max_candidates=args.max_candidates, max_events=args.max_events,
