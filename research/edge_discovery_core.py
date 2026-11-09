@@ -1536,7 +1536,11 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 "vwap_slope_window": spec.get("vwap_slope_window"),
                 "relative_volume_mode": spec.get("relative_volume_mode"),
                 "relative_volume_sessions": spec.get("relative_volume_sessions"),
-                "relative_volume": signal.get("relative_volume"),
+                # A null entry is drawn at random, so no rule signal and no
+                # relative volume exist for it.  (This line once read an
+                # undefined ``signal`` and raised NameError for every v6/v7
+                # arm whose null filled.)
+                "relative_volume": None,
             })
             if spec.get("schema") == RULE_SCHEMA_V7:
                 row["authored_stop_floor_bps"] = spec["min_stop_distance_bps"]
