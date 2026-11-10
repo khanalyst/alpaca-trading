@@ -43,10 +43,22 @@ zero open orders. Account identity, configuration, persisted state, trial,
 accepted-session and outcome counts, equity and complete order-history hash
 matched the pre-maintenance check. No broker mutation or trial action occurred.
 
-The frozen ORB trial still has zero accepted sessions and zero outcomes.
-Its frozen identity differs from the inspected current configuration. Do not
-resume or replace it without its account-scoped identity and flat-book
-preflight. No strategy is eligible for activation from this evidence.
+A follow-up check on 11 November (Dubai time) confirmed the direct runtime
+entry blocker: `state=PAUSED`, `operator_pause=true`, with heartbeat reason
+`operator_pause`. That flag predates this rollout and was preserved with the
+frozen baseline. The stored trial record still says `running`; it does not
+override the runtime pause. All six services are healthy, with zero broker
+positions and zero open orders.
+
+The frozen ORB trial has zero accepted sessions and zero outcomes. These are
+trial-evaluation progress counts, rather than the switch that set the operator
+pause. Its stored status alone reports entry eligibility, but comparing the
+current descriptor finds different candidate, incumbent, policy, code and
+cohort identities. The existing trial must not be silently rebound to those
+new identities. A resume requires resolving that mismatch and passing the
+account-scoped and flat-book preflight; research qualification remains subject
+to its existing evidence gates. No strategy is qualified for activation by the
+retrospective research in this report.
 
 ## Research and forward data
 
