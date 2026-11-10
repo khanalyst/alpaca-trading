@@ -154,9 +154,15 @@ Fresh checks after the runtime integration:
 - Explicit forward fixture and cross-sectional/control/risk checks: **24
   tests passed in 0.331 seconds**.
 
-The complete research/statistical checks are being reconciled separately;
-these overlapping focused counts are not a new complete-suite total. Some
-older synthetic forward fixtures lacked explicit source labels; those
+The complete local inventory then passed on source commit
+`78b93cd663412888330cb823096447d4052e6ff9`: **2,801 tests**, no failures or
+errors, with one expected research skip. Its disjoint shards were runtime
+1,124 (430.885 seconds), research 1,608 (1,141.789 seconds), edge discovery
+62 (1,350.038 seconds), and factory integration 7 (1,238.885 seconds).
+Private logs and a source/test manifest bind that run to its exact inputs.
+The focused counts above overlap these complete shards and must not be added.
+
+Some older synthetic forward fixtures lacked explicit source labels; those
 fixtures now declare their intended provenance. Negative tests retain missing,
 historical, conflicting and invalid source declarations. The production 5 GiB
 recorder reserve remains unchanged; test disk fixtures do not disable it.
@@ -171,3 +177,11 @@ volume, and unchanged paused/flat paper state, configuration, trial and order
 history. No broker mutation or trial transition was performed. This establishes
 storage recovery, not accepted forward market data or deployment of the new
 source. The detailed private receipts remain outside Git.
+
+
+The isolated production-image checks subsequently exposed a race in the
+snapshot-lock test: a fixed 150 ms delay did not establish that its helper
+had acquired the lock on the VM. The fixture now waits for the helper's
+explicit lock-acquired message and acknowledges it before measuring the
+snapshot operation. The original blocking-duration assertion is retained.
+This changes test synchronization only; production source is unchanged.

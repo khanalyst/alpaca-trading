@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
@@ -120,18 +121,33 @@ class ResearchSnapshotTests(unittest.TestCase):
                 "from pathlib import Path\n"
                 "from deploy.recorder import corpus_write_lock\n"
                 "with corpus_write_lock(Path(sys.argv[1])):\n"
+                "    print('locked', flush=True)\n"
+                "    sys.stdin.readline()\n"
                 "    time.sleep(1.0)\n"
             )
             process = subprocess.Popen(
                 [sys.executable, "-c", script, str(recorder_root / "market.csv")],
-                cwd=Path(__file__).parents[1])
+                cwd=Path(__file__).parents[1], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, text=True)
             try:
-                time.sleep(0.15)
+                ready, _, _ = select.select([process.stdout], [], [], 5)
+                self.assertTrue(ready, "recorder lock helper did not become ready")
+                self.assertEqual(process.stdout.readline().strip(), "locked")
                 started = time.monotonic()
+                process.stdin.write("measure\n")
+                process.stdin.flush()
                 create_snapshot(recorder_root, root / "snapshot", session_window=1)
                 self.assertGreaterEqual(time.monotonic() - started, 0.55)
             finally:
-                process.wait(timeout=5)
+                process.stdin.close()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                    raise
+                finally:
+                    process.stdout.close()
 
 
 if __name__ == "__main__":
