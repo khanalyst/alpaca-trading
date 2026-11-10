@@ -426,9 +426,9 @@ class StartupEdgePolicyMixin:
             raise AlpacaError(f"{self.mode} journal preflight write failed: {exc}") from exc
         return self._preflight
 
-    def _ensure_order_ready(self) -> bool:
-        # Set only when readiness failed on a broker read, so the cycle can
-        # count it towards the transient-failure limit.
+    def _ensure_authenticated_reconciled(self, *, allow_pause: bool,
+                                          startup_cleanup: bool) -> bool:
+        """Establish broker authentication and a fresh local-book boundary."""
         self._readiness_read_error = None
         if not self._state_ready:
             return False
@@ -438,9 +438,31 @@ class StartupEdgePolicyMixin:
             self._state_ready = False
             self._preflight_error = f"{self.mode} journal unavailable: {exc}"
             return False
-        runtime = state.load_state()
-        if (runtime.get("state") == state.KILLED or
-                runtime.get("operator_pause") is not False):
+        try:
+            runtime = state.load_state()
+        except Exception as exc:  # noqa: BLE001
+            self._preflight_error = f"{self.mode} runtime state unavailable: {exc}"
+            return False
+        if not isinstance(runtime, Mapping):
+            self._preflight_error = f"{self.mode} runtime state is malformed"
+            return False
+        if runtime.get("state") == state.KILLED:
+            self._preflight_error = runtime.get("kill_reason") or "operator_pause"
+            return False
+        operator_pause = runtime.get("operator_pause")
+        if allow_pause:
+            running_pause = (
+                runtime.get("state") == state.RUNNING and
+                getattr(self, "_persistent_lock", False) is True)
+            if (operator_pause is not True or
+                    (runtime.get("state") not in {state.PAUSED,
+                                                   state.DAY_STOPPED} and
+                     not running_pause)):
+                self._preflight_error = runtime.get("kill_reason") or (
+                    "operator_pause" if operator_pause is not False
+                    else self._preflight_error or "runtime_pause_required")
+                return False
+        elif operator_pause is not False:
             self._preflight_error = runtime.get("kill_reason") or "operator_pause"
             return False
         trial_runtime = getattr(self, "_paper_trial_runtime", None)
@@ -470,11 +492,9 @@ class StartupEdgePolicyMixin:
             self._preflight_error = (
                 "paper trial replacement cannot manage old exposure; restart "
                 "with the frozen incumbent until broker and local books are flat")
-            # Force a fresh broker snapshot on the next attempt so a newly
-            # flattened old book can complete the replacement safely.
             self._reconciled = False
             return False
-        if not self._startup_cleanup_checked:
+        if startup_cleanup and not self._startup_cleanup_checked:
             try:
                 self._enforce_intraday_cleanup(
                     self.market.clock(), reason="startup_reconciliation",
@@ -483,6 +503,16 @@ class StartupEdgePolicyMixin:
                 self._preflight_error = str(exc)
                 return False
         return True
+
+    def _ensure_order_ready(self) -> bool:
+        """Return whether the runtime is authorized to submit new orders."""
+        return self._ensure_authenticated_reconciled(
+            allow_pause=False, startup_cleanup=True)
+
+    def _ensure_protection_ready(self) -> bool:
+        """Authenticate/reconcile an exact paused runtime for protection only."""
+        return self._ensure_authenticated_reconciled(
+            allow_pause=True, startup_cleanup=False)
 
     def _inside_regular_session(self, clock: Any) -> bool:
         if _value(clock, "is_open", None) is not True:

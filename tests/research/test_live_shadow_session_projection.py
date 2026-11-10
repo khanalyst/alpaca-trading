@@ -63,7 +63,7 @@ class LiveShadowSessionProjectionTests(unittest.TestCase):
             "timestamp": stamp.isoformat(),
             "as_of": (stamp + timedelta(minutes=1)).isoformat(),
             "observed_at": (stamp + timedelta(minutes=2)).isoformat(),
-            "provider": "alpaca",
+            "source_mode": "forward_observed", "provider": "alpaca",
             "feed": "iex",
             "open": "100",
             "high": "103",
@@ -78,7 +78,7 @@ class LiveShadowSessionProjectionTests(unittest.TestCase):
         fields = [
             "event_key", "event_type", "symbol", "timestamp", "as_of",
             "observed_at", "provider", "feed", "open", "high", "low",
-            "close", "volume", "bid", "ask",
+            "close", "volume", "bid", "ask", "source_mode",
         ]
         with self.corpus.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)

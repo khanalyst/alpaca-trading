@@ -36,7 +36,9 @@ from agent.config import load_config as load_runtime_config
 from agent.contracts.ibr import generate_ibr_signal
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, cross_sectional_symbol_eligibility,
-    evaluate_rule_signal_trace, generate_rule_signal, rule_behavior_identity,
+    completed_bar_exit_transition, evaluate_rule_signal_trace,
+    exit_deadline, generate_rule_signal, initialize_exit_state,
+    rule_behavior_identity,
     rule_variant_id, rule_vehicle_executable, validate_rule_spec,
 )
 from agent.risk import RiskEngine
@@ -48,7 +50,7 @@ from deploy.recorder import (
 )
 from research.costs import (
     RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy, check_entry_slippage,
-    replay_policy_for_session,
+    quote_fill_record, replay_policy_for_session,
 )
 from research.diagnostic_shadow import (
     DIAGNOSTIC_ACTIVATION_SCHEMA, DIAGNOSTIC_CANDIDATE_PREFIX,
@@ -984,6 +986,15 @@ def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
     signal = payload.get("signal") if isinstance(payload.get("signal"), Mapping) else {}
     plan = payload.get("setup_plan") if isinstance(payload.get("setup_plan"), Mapping) else {}
     risk_plan = payload.get("risk_plan") if isinstance(payload.get("risk_plan"), Mapping) else {}
+    # RiskEngine normalizes the authored bracket onto broker price ticks.
+    # Replay exposes those admitted levels, so compare the same immutable
+    # geometry instead of falsely quarantining a fractional authored level.
+    # Older observations that lack a risk plan retain their recorded shape.
+    def admitted_geometry(field: str) -> Any:
+        if field in risk_plan:
+            return risk_plan[field]
+        return plan.get(field, signal.get(field))
+
     execution_profile = str(plan.get("execution_profile") or
                             risk_plan.get("execution_profile") or "shares").lower()
     snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), Mapping) else {}
@@ -1016,9 +1027,9 @@ def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
         "signal_ts": _iso_time(datetime.fromtimestamp(signal_ts, UTC).isoformat()) if signal_ts is not None else None,
         "decision_ts": _iso_time(decision_ts),
         "entry_ts": _iso_time(entry_ts),
-        "stop_price": _number_or_none(plan.get("stop_price", signal.get("stop_price"))),
-        "target_price": _number_or_none(plan.get("target_price", signal.get("target_price"))),
-        "stop_distance": _number_or_none(plan.get("stop_distance", signal.get("stop_distance"))),
+        "stop_price": _number_or_none(admitted_geometry("stop_price")),
+        "target_price": _number_or_none(admitted_geometry("target_price")),
+        "stop_distance": _number_or_none(admitted_geometry("stop_distance")),
         "range_high": _number_or_none(plan.get("range_high", signal.get("range_high"))),
         "range_low": _number_or_none(plan.get("range_low", signal.get("range_low"))),
         "target_r": _number_or_none(plan.get("target_r", signal.get("target_r"))),
@@ -1198,7 +1209,7 @@ def _read_corpus_append(source: Path, offset: int) -> tuple[list[dict], int]:
 
 
 def _recorded_partition_source_mode(source_path: str) -> str | None:
-    """Read one recorder partition's crash-safe historical source marker."""
+    """Read one recorder partition's explicit, crash-safe source declaration."""
     source = Path(str(source_path or ""))
     if not source.name.startswith("market-") or source.suffix != ".csv":
         return None
@@ -1213,9 +1224,67 @@ def _recorded_partition_source_mode(source_path: str) -> str | None:
     if (not isinstance(payload, Mapping) or
             payload.get("schema") != RECORDER_PARTITION_SOURCE_SCHEMA or
             payload.get("partition") != source.name or
-            payload.get("source_mode") != "historical_backfill"):
+            payload.get("source_mode") not in {
+                "forward_observed", "historical_backfill"}):
         raise ShadowError(f"invalid recorder partition source marker {marker}")
-    return "historical_backfill"
+    return str(payload["source_mode"])
+
+
+def _authorizing_projected_payload(
+        event: Mapping[str, Any],
+        source_modes: dict[str, str | None]) -> dict[str, Any] | None:
+    """Accept only explicitly forward rows, including durable declarations.
+
+    Normalization's legacy source default cannot establish provenance. A
+    historical partition marker always excludes the entire partition, even
+    when an individual row claims to be forward observed.
+    """
+    try:
+        payload = (json.loads(event["event_json"])
+                   if isinstance(event.get("event_json"), str) else
+                   event.get("event_json", event))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    source_path = str(event.get("source_path") or
+                      payload.get("_recorded_source_path") or "")
+    if source_path not in source_modes:
+        source_modes[source_path] = _recorded_partition_source_mode(source_path)
+    marker_mode = source_modes[source_path]
+    row_mode = str(payload.get("source_mode") or "").strip().lower()
+    if marker_mode == "historical_backfill":
+        return None
+    if row_mode != "forward_observed" and not (
+            marker_mode == "forward_observed" and not row_mode):
+        return None
+    body = dict(payload)
+    body["source_mode"] = "forward_observed"
+    if source_path:
+        body["_recorded_source_path"] = source_path
+    return body
+
+
+def _authorizing_projected_events(
+        events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    source_modes: dict[str, str | None] = {}
+    result = []
+    for event in events:
+        body = _authorizing_projected_payload(event, source_modes)
+        if body is not None:
+            result.append({**event, "event_json": _json(body)})
+    return result
+
+
+def _partition_source_identity(corpus_path: Path) -> list[dict[str, Any]]:
+    """Invalidate authorizing caches when a declaration changes off-WAL."""
+    result = []
+    for source in _corpus_sources(corpus_path):
+        marker = source.with_name(source.name + ".source.json")
+        result.append({"source_path": str(source),
+                       "marker_sha256": (hashlib.sha256(marker.read_bytes()).hexdigest()
+                                         if marker.exists() else None)})
+    return result
 
 
 def _diagnostic_projected_payload(
@@ -3335,6 +3404,29 @@ class ShadowStore:
                 (str(candidate_id), str(session_date))).fetchall()
         return [dict(row) for row in rows]
 
+    def opened_symbols_by_session(self, candidate_id: str) -> dict[str, set[str]]:
+        """Rebuild the durable one-entry-per-symbol/session ledger.
+
+        Legacy virtual books remain open until replay closes their session, so
+        an incremental poll cannot use the current open-book rows as the sole
+        signal ledger.  An admitted ``open_incomplete`` decision is immutable
+        evidence that runtime consumed that symbol's session opportunity,
+        even after its book is closed.  This read is intentionally scoped to
+        one candidate and returns only the bounded symbol/session keys.
+        """
+        with self._connection() as db:
+            rows = db.execute(
+                """SELECT session_date,symbol FROM decisions
+                   WHERE candidate_id=? AND kind='open_incomplete'
+                     AND session_date IS NOT NULL AND symbol IS NOT NULL
+                     AND symbol <> ''""",
+                (str(candidate_id),)).fetchall()
+        result: dict[str, set[str]] = {}
+        for row in rows:
+            result.setdefault(str(row["session_date"]), set()).add(
+                str(row["symbol"]))
+        return result
+
     def decision_rollup(self, candidate_ids: Sequence[str]) -> list[dict]:
         """Aggregate decision telemetry for an explicit bounded candidate set."""
         wanted = sorted({str(value) for value in candidate_ids
@@ -3994,6 +4086,7 @@ class ShadowRunner:
         }
         return _digest({
             "schema": "shadow-authorizing-event-cache.v1",
+            "partition_sources": _partition_source_identity(self.config.corpus_path),
             "replay_code_hash": _replay_code_hash(),
             "config": config_identity,
             "candidates": sorted(candidate_rows,
@@ -4074,6 +4167,7 @@ class ShadowRunner:
                 relevant_source_quarantine[str(key)] = detail
         return _digest({
             "schema": "shadow-authorizing-replay-memo.v1",
+            "partition_sources": _partition_source_identity(self.config.corpus_path),
             "candidate_id": str(candidate.get("candidate_id") or ""),
             "session_date": str(session),
             "candidate": {
@@ -5464,7 +5558,8 @@ class ShadowRunner:
 
     def _load_events(self) -> tuple[list[dict], dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
         floor = self.store.forward_event_floor() or 0.0
-        event_rows = self.store.events(inserted_after=floor)
+        event_rows = _authorizing_projected_events(
+            self.store.events(inserted_after=floor))
         bars, quotes, options = self._group_event_rows(event_rows)
         return event_rows, bars, quotes, options
 
@@ -5479,6 +5574,7 @@ class ShadowRunner:
         for session in normalized:
             event_rows.extend(self.store.events_for_sessions(
                 [session], max_events=self.config.replay_session_max_events))
+        event_rows = _authorizing_projected_events(event_rows)
         bars, quotes, options = self._group_event_rows(event_rows)
         return event_rows, bars, quotes, options
 
@@ -5622,6 +5718,8 @@ class ShadowRunner:
         # Legacy workers receive a WAL envelope; diagnostics receive its
         # payload. Provider, feed and observed_at live in event_json, not in
         # the envelope columns. Evaluate the same recorded payload in both.
+        diagnostic_candidate = is_diagnostic_candidate(candidate)
+        stored_event = event
         if "event_json" in event:
             try:
                 payload = json.loads(event["event_json"])
@@ -5632,8 +5730,20 @@ class ShadowRunner:
                 event = payload
             except (TypeError, ValueError, json.JSONDecodeError):
                 return "no_data", "invalid stored event payload", {}, None
+        if not diagnostic_candidate:
+            projected = _authorizing_projected_payload(stored_event, {})
+            if projected is None:
+                return ("no_data", "authorizing source provenance is not forward observed",
+                        {}, None)
+            event = projected
         symbol = str(event.get("symbol") or "")
-        diagnostic_candidate = is_diagnostic_candidate(candidate)
+        source_modes: dict[str, str | None] = {}
+
+        def source_acceptable(row: Mapping[str, Any]) -> bool:
+            if diagnostic_candidate:
+                return str(row.get("source_mode") or "forward_observed").strip().lower() == "forward_observed"
+            return _authorizing_projected_payload(row, source_modes) is not None
+
         cfg = self._shadow_candidate_config(_safe_config(candidate))
         strategy = cfg.get("strategy", {})
         event_at = _availability_time(event)
@@ -5732,9 +5842,7 @@ class ShadowRunner:
                           expected_equity_feed)
                       and (_canonical_equity_provider(row.get("provider")) ==
                            expected_equity_provider)
-                      and (not diagnostic_candidate or str(
-                          row.get("source_mode") or "forward_observed")
-                          .strip().lower() == "forward_observed")
+                      and source_acceptable(row)
                       and _row_visible(row, event_at)
                       and (close_at is None or (
                           (calendar_bounds is None or
@@ -5775,9 +5883,7 @@ class ShadowRunner:
                             expected_equity_feed)
                         and (_canonical_equity_provider(row.get("provider")) ==
                              expected_equity_provider)
-                        and (not diagnostic_candidate or str(
-                            row.get("source_mode") or "forward_observed")
-                            .strip().lower() == "forward_observed")
+                        and source_acceptable(row)
                         and _row_visible(row, event_at)
                         and (_event_end(row) or event_at) <= event_at
                         and ((_timestamp(row.get("timestamp")) or market_at)
@@ -5931,11 +6037,8 @@ class ShadowRunner:
             quote = prepared_view.get("quote")
         elif quote is None:
             quote_rows = quotes.get(symbol, ())
-            if diagnostic_candidate:
-                quote_rows = tuple(
-                    row for row in quote_rows
-                    if str(row.get("source_mode") or "forward_observed")
-                    .strip().lower() == "forward_observed")
+            quote_rows = tuple(row for row in quote_rows
+                               if source_acceptable(row))
             quote = self._latest_quote(
                 quote_rows, event_at,
                 expected_feed=expected_equity_feed,
@@ -5958,39 +6061,37 @@ class ShadowRunner:
                             quote_age_seconds=age,
                             stale=bool(age is None or age > policy.max_market_data_age_seconds),
                             quote_stale=bool(age is None or age > policy.max_market_data_age_seconds))
-                if diagnostic_candidate:
-                    snap.update(
-                        bid=bid, ask=ask, quote_as_of=quote.get("as_of"),
-                        quote_observed_at=quote.get("observed_at"),
-                        quote_feed=_canonical_equity_feed(quote.get("feed")),
-                        quote_provider=_canonical_equity_provider(
-                            quote.get("provider")),
-                        quote_source_mode=str(
-                            quote.get("source_mode") or
-                            "forward_observed").strip().lower())
+                snap.update(
+                    bid=bid, ask=ask, quote_as_of=quote.get("as_of"),
+                    quote_observed_at=quote.get("observed_at"),
+                    quote_feed=_canonical_equity_feed(quote.get("feed")),
+                    quote_provider=_canonical_equity_provider(
+                        quote.get("provider")),
+                    quote_source_mode=str(
+                        quote.get("source_mode") or
+                        "forward_observed").strip().lower())
         # The setup primitive consumes the exact signal geometry while the
         # quote fields above carry strict point-in-time freshness metadata.
         snap.update({key: value for key, value in signal.items()
                      if key not in {"symbol", "action"} and value is not None})
-        diagnostic_equity = bool(
-            diagnostic_candidate and
-            str(candidate.get("vehicle") or "equity") == "equity")
+        equity_candidate = str(candidate.get("vehicle") or "equity") == "equity"
         executable_entry_reference = None
         entry_slippage: dict[str, Any] | None = None
         entry_slippage_context: dict[str, Any] | None = None
         entry_slippage_reason: str | None = None
-        if diagnostic_equity:
+        if equity_candidate:
             direction = str(signal.get("direction") or "").strip().lower()
-            entry_side = ("buy" if direction == "long" else
-                          "sell" if direction == "short" else direction)
-            # Recorder JSON retains valid bid/ask values as numeric strings.
-            # Consume the finite, positive, non-crossed values already
-            # validated into the diagnostic snapshot instead of passing the
-            # raw serialized fields through the strict slippage boundary.
             executable_entry_reference = (
                 snap.get("ask") if direction == "long"
                 else snap.get("bid") if direction == "short"
                 else None)
+        if equity_candidate:
+            entry_side = ("buy" if direction == "long" else
+                          "sell" if direction == "short" else direction)
+            # Recorder JSON retains valid bid/ask values as numeric strings.
+            # Consume the finite, positive, non-crossed values already
+            # validated into the snapshot instead of passing the
+            # raw serialized fields through the strict slippage boundary.
             execution_cfg = cfg.get("execution")
             configured_slippage_cap = (
                 execution_cfg.get(
@@ -6017,16 +6118,16 @@ class ShadowRunner:
                 "entry_slippage": entry_slippage,
             }
             snap.update(entry_slippage_context)
-            # Keep rejection payloads JSON-safe even when a diagnostic signal
+            # Keep rejection payloads JSON-safe even when a signal
             # supplies a non-finite or otherwise malformed entry reference.
             persisted_signal = dict(signal)
             persisted_signal["entry_price"] = entry_slippage_context[
                 "authored_entry_reference"]
             base["signal"] = persisted_signal
-        if (diagnostic_equity and
+        if (equity_candidate and
                 _finite(snap.get("bid")) is not None and
                 _finite(snap.get("ask")) is not None):
-            # A diagnostic requested entry is priced from the executable side,
+            # A requested equity entry is priced from the executable side,
             # never the midpoint.  Both sides remain in the immutable snapshot
             # for later liquidation and spread audits.
             snap["price"] = (float(snap["ask"])
@@ -6067,7 +6168,7 @@ class ShadowRunner:
             return ("unpriced", "stale or unavailable quote",
                     base | {"snapshot": snap}, None)
         setup_snapshot = snap
-        if diagnostic_equity and strategy_id == "ibr":
+        if equity_candidate and strategy_id == "ibr":
             # Live IBR constructs its authored stop/target from the signal
             # close, then replaces only entry with the executable quote before
             # risk admission. Keep that ordering without changing rule arms.
@@ -6081,7 +6182,37 @@ class ShadowRunner:
         if plan is None:
             return "reject", why or "setup rejected", base | {"snapshot": snap}, None
         plan = dict(plan)
-        if diagnostic_equity and strategy_id == "ibr":
+        if (str(candidate.get("vehicle") or "equity") == "equity" and
+                executable_entry_reference is not None):
+            # Runtime _risk_order replaces the authored signal entry with the
+            # executable bid/ask before sizing.  Persist the same immutable
+            # provenance in authorizing shadow plans and recompute only the
+            # distance-dependent geometry; authored stop/target levels stay
+            # intact.  Older persisted plans without these fields remain on
+            # the conservative bar execution convention in worker pricing.
+            executable = float(executable_entry_reference)
+            plan["entry_price"] = executable
+            plan["entry_reference"] = executable
+            plan["authored_entry_reference"] = _finite(authored_entry_reference)
+            plan["executable_entry_reference"] = executable
+            plan["entry_fill_source"] = "quote"
+            plan["entry_slippage_reference"] = _finite(authored_entry_reference)
+            plan["entry_feed"] = snap.get("quote_feed") or expected_equity_feed
+            plan["entry_provider"] = (snap.get("quote_provider") or
+                                        expected_equity_provider)
+            stop = _finite(plan.get("stop_price"))
+            target = _finite(plan.get("target_price"))
+            if stop is not None and stop > 0:
+                distance = abs(executable - stop)
+                if distance <= 0:
+                    return ("reject", "executable entry stop distance is invalid",
+                            base | {"snapshot": snap, "setup_plan": plan}, None)
+                plan["stop_distance"] = distance
+                plan["stop_loss_pct"] = distance / executable * 100.0
+                plan["estimated_loss_pct"] = plan["stop_loss_pct"]
+            if target is not None and target > 0:
+                plan["take_profit_pct"] = abs(target - executable) / executable * 100.0
+        if equity_candidate and strategy_id == "ibr":
             executable = _finite(executable_entry_reference)
             if executable is None or executable <= 0:
                 return ("unpriced", "executable entry quote unavailable",
@@ -6116,6 +6247,16 @@ class ShadowRunner:
             return "reject", f"risk exception: {type(exc).__name__}", base, None
         if risk_plan is None:
             return "reject", why or "risk rejected", base | {"snapshot": snap}, None
+        if (str(candidate.get("vehicle") or "equity") == "equity" and
+                executable_entry_reference is not None):
+            risk_plan = dict(risk_plan)
+            for field in (
+                    "entry_reference", "authored_entry_reference",
+                    "executable_entry_reference", "entry_fill_source",
+                    "entry_slippage_reference", "entry_feed",
+                    "entry_provider"):
+                if field in plan:
+                    risk_plan[field] = plan[field]
         if entry_slippage_context is not None:
             plan.update(entry_slippage_context)
             risk_plan = dict(risk_plan)
@@ -6369,6 +6510,13 @@ class ShadowRunner:
                 details=details)
             return True
         try:
+            if not diagnostic:
+                source_modes: dict[str, str | None] = {}
+                if any(_authorizing_projected_payload(row, source_modes) is None
+                       for rows in (in_session_bars, in_session_quotes,
+                                    in_session_options) for row in rows):
+                    raise ShadowError(
+                        "authorizing replay requires explicit forward source provenance")
             if provider_mismatches:
                 raise ShadowError(
                     "equity provider mismatch: expected "
@@ -6641,6 +6789,738 @@ class ShadowRunner:
         active_trades[str(symbol)] = active
         return positions, active_trades, gross_notional + notional
 
+    @staticmethod
+    def _worker_plan_session(position: Mapping[str, Any]) -> str | None:
+        """Return the authored session for one legacy virtual position."""
+        session = str(position.get("session") or "").strip()
+        if session:
+            return session
+        entry_at = _timestamp(
+            position.get("entry_timestamp") or
+            position.get("decision_timestamp"))
+        if entry_at is None:
+            return None
+        return entry_at.astimezone(NEW_YORK).date().isoformat()
+
+    @staticmethod
+    def _worker_exit_state(position: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Build the shared rule exit state for one legacy plan.
+
+        Legacy shadow plans predate a durable exit-state field. Reconstructing
+        the canonical state from their authored bracket fields keeps this
+        projection identical to the factory and diagnostic account paths.
+        Invalid or incomplete historical plans return ``None`` so their
+        virtual books remain open and continue to block risk admission.
+        """
+        direction = str(position.get("direction") or "").lower()
+        entry = _finite(position.get("entry_price"))
+        stop = _finite(position.get("stop_price"))
+        target = _finite(position.get("target_price"))
+        if (direction not in {"long", "short"} or entry is None or
+                stop is None or target is None or entry <= 0 or stop <= 0 or
+                target <= 0):
+            return None
+        try:
+            return initialize_exit_state(
+                direction, entry, stop, target,
+                breakeven_r=position.get("breakeven_r"),
+                trailing_stop_r=position.get("trailing_stop_r"),
+                target_mode=str(position.get("target_mode") or "fixed_r"),
+                target_lookback=position.get("target_lookback"),
+                exit_before_ts=position.get("exit_before_ts"),
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _worker_timestamp(value: Any) -> datetime | None:
+        """Parse either an ISO timestamp or an authored epoch timestamp."""
+        parsed = _timestamp(value)
+        if parsed is not None:
+            return parsed
+        number = _finite(value)
+        if number is None:
+            return None
+        try:
+            return datetime.fromtimestamp(number, UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    @classmethod
+    def _worker_exit_deadline(
+            cls, position: Mapping[str, Any], entry_at: datetime,
+            spec: Mapping[str, Any] | None,
+            ) -> datetime | None:
+        """Resolve the shared bounded deadline without consuming future bars."""
+        candidates: list[tuple[datetime, int]] = []
+        force_flat = position.get("force_flat_ts")
+        if force_flat is None:
+            force_flat = position.get("force_flat_at")
+        try:
+            resolved = exit_deadline(
+                entry_at, spec if isinstance(spec, Mapping) else {},
+                force_flat_ts=force_flat)
+        except Exception:
+            resolved = None
+        if isinstance(resolved, Mapping):
+            timestamp = cls._worker_timestamp(resolved.get("timestamp"))
+            if timestamp is not None:
+                candidates.append((timestamp, 0))
+        # Legacy plans carry these explicit fields even when the authored
+        # strategy specification is unavailable to an older poll.  Include
+        # the ISO force-flat alias because older plans did not always retain
+        # the epoch form consumed by ``exit_deadline``.
+        for field, priority in (("force_flat_ts", 0),
+                                ("force_flat_at", 0),
+                                ("hold_deadline_ts", 2),
+                                ("exit_before_ts", 1)):
+            timestamp = cls._worker_timestamp(position.get(field))
+            if timestamp is not None:
+                candidates.append((timestamp, priority))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: (item[0], item[1]))[0]
+
+    @classmethod
+    def _worker_exit_quote(
+            cls, rows: Sequence[Mapping], *, symbol: str, at: datetime,
+            visible_by: datetime, direction: str,
+            policy: ReplayPolicy) -> tuple[Any, datetime] | None:
+        """Return an exact executable quote and its causal boundary.
+
+        Immediate quotes use the shared ``quote_fill_record`` resolver. A
+        market exit that became due before its quote was observed may use the
+        first later quote whose availability is visible by ``visible_by``;
+        this mirrors the diagnostic account's pending-exit transition.
+        """
+        expected_feed = _canonical_equity_feed(policy.equity_feed)
+        expected_provider = _canonical_equity_provider(policy.equity_provider)
+        normalized: list[Any] = []
+        for raw in rows:
+            if isinstance(raw, Mapping) and _authorizing_projected_payload(raw, {}) is None:
+                continue
+            try:
+                quote = (raw if hasattr(raw, "identity") else
+                         normalize_quote(raw))
+            except Exception:
+                continue
+            identity = getattr(quote, "identity", None)
+            if identity is None:
+                continue
+            source_mode = str(getattr(identity, "source_mode", "") or
+                              "forward_observed").strip().lower()
+            if source_mode != "forward_observed":
+                continue
+            if (expected_feed is not None and
+                    _canonical_equity_feed(getattr(identity, "feed", None)) !=
+                    expected_feed):
+                continue
+            if (expected_provider is not None and
+                    _canonical_equity_provider(
+                        getattr(identity, "provider", None)) !=
+                    expected_provider):
+                continue
+            timestamp = getattr(quote, "timestamp", None)
+            as_of = getattr(identity, "as_of", None)
+            observed = getattr(identity, "observed_at", None)
+            if not isinstance(timestamp, datetime) or as_of is None or observed is None:
+                continue
+            available = max(timestamp, as_of, observed)
+            if available <= visible_by:
+                normalized.append(quote)
+        if not normalized:
+            return None
+        normalized.sort(key=lambda quote: quote.timestamp)
+        side = "sell" if str(direction).lower() == "long" else "buy"
+        indexed = {str(symbol).upper(): normalized}
+        immediate = quote_fill_record(
+                indexed, symbol=symbol, at=at, side=side,
+                max_age_seconds=policy.max_market_data_age_seconds,
+                session_date=at.astimezone(NEW_YORK).date(),
+                allow_historical_backfill_diagnostics=False)
+        if immediate is not None:
+            return immediate, at
+        for quote in normalized:
+            timestamp = quote.timestamp
+            if timestamp < at:
+                continue
+            identity = quote.identity
+            available = max(timestamp, identity.as_of, identity.observed_at)
+            if available > visible_by:
+                continue
+            # A delayed quote becomes the causal boundary at its own
+            # availability instant.  Resolve through the shared fill helper
+            # there so freshness is measured against that boundary, matching
+            # DiagnosticAccountBook.first_executable_quote_after.
+            delayed = quote_fill_record(
+                    indexed, symbol=symbol, at=available, side=side,
+                    max_age_seconds=policy.max_market_data_age_seconds,
+                    session_date=available.astimezone(NEW_YORK).date(),
+                    allow_historical_backfill_diagnostics=False)
+            if delayed is not None:
+                return delayed, available
+        return None
+
+    @classmethod
+    def _worker_quote_available(
+            cls, rows: Sequence[Mapping], *, symbol: str, at: datetime,
+            visible_by: datetime, direction: str,
+            policy: ReplayPolicy) -> bool:
+        """Return whether an exact, fresh executable quote is causally visible."""
+        return cls._worker_exit_quote(
+            rows, symbol=symbol, at=at, visible_by=visible_by,
+            direction=direction, policy=policy) is not None
+
+    @staticmethod
+    def _worker_entry_source(position: Mapping[str, Any]) -> tuple[float | None, bool]:
+        """Return the authored entry reference and its immutable fill source.
+
+        Authorizing plans written before quote provenance was persisted contain
+        only ``entry_price``.  Those values are signal/bar references and must
+        retain the bar execution convention.  A quote execution is accepted
+        only when the plan carries the explicit source/reference fields used by
+        the runtime and factory journal.
+        """
+        source = str(position.get("entry_fill_source") or
+                      position.get("entry_source") or "").strip().lower()
+        executable = _finite(position.get("executable_entry_reference"))
+        reference = _finite(position.get("entry_reference"))
+        authored = _finite(position.get("authored_entry_reference"))
+        raw_entry = _finite(position.get("entry_price"))
+        quote_source = source in {"quote", "executable_quote"}
+        # Diagnostic shadow plans predate the explicit entry_fill_source field,
+        # but their separate executable reference is still immutable evidence.
+        # An unannotated legacy plan never takes this branch.
+        if not quote_source and source not in {"bar", "bar_open", "bar_close"}:
+            quote_source = executable is not None
+        if quote_source:
+            return executable if executable is not None else reference or raw_entry, True
+        return (reference if reference is not None else
+                authored if authored is not None else raw_entry), False
+
+    @staticmethod
+    def _worker_bar_mark(
+            rows: Sequence[Mapping], *, symbol: str, at: datetime,
+            policy: ReplayPolicy) -> tuple[float, datetime] | None:
+        """Select the exact visible bar mark used by factory replay.
+
+        An open is usable only at the bar timestamp.  A close is usable only
+        after the complete interval and at the interval boundary's
+        availability.  Feed/provider/source identity is checked before either
+        value is considered, so a delayed or foreign bar cannot become a mark
+        through a later poll.
+        """
+        expected_feed = _canonical_equity_feed(policy.equity_feed)
+        expected_provider = _canonical_equity_provider(policy.equity_provider)
+        selected: tuple[datetime, float, datetime] | None = None
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("symbol") or symbol).strip().upper() != str(symbol).upper():
+                continue
+            if str(row.get("event_type") or "bar_1m").strip().lower() not in {
+                    "bar", "bar_1m"}:
+                continue
+            if _authorizing_projected_payload(row, {}) is None:
+                continue
+            if (expected_feed is not None and
+                    _canonical_equity_feed(row.get("feed")) != expected_feed):
+                continue
+            if (expected_provider is not None and
+                    _canonical_equity_provider(row.get("provider")) != expected_provider):
+                continue
+            opened = _timestamp(row.get("timestamp"))
+            available = _availability_time(row)
+            if opened is None or available is None or available > at:
+                continue
+            interval = _finite(row.get("interval_seconds"))
+            if interval is None:
+                interval = 60.0
+            if interval is None or interval <= 0:
+                continue
+            ended = opened + timedelta(seconds=interval)
+            value = None
+            boundary = None
+            if opened == at:
+                value = _finite(row.get("open"))
+                boundary = opened
+            elif ended <= at and _row_visible(row, ended):
+                value = _finite(row.get("close"))
+                boundary = ended
+            if value is None or value <= 0 or boundary is None:
+                continue
+            candidate = (opened, value, boundary)
+            if selected is None or candidate[0] > selected[0]:
+                selected = candidate
+        if selected is None:
+            return None
+        return selected[1], selected[2]
+
+    @staticmethod
+    def _worker_entry_execution(
+            position: Mapping[str, Any], model: Any, direction: str,
+            ) -> float | None:
+        reference, executable_quote = ShadowRunner._worker_entry_source(position)
+        if reference is None or reference <= 0 or not hasattr(model, "execution_price"):
+            return None
+        try:
+            value = model.execution_price(
+                reference, direction, entry=True,
+                executable_quote=executable_quote)
+        except Exception:
+            return None
+        return float(value) if math.isfinite(float(value)) else None
+
+    @classmethod
+    def _worker_exit_pnl(
+            cls, position: Mapping[str, Any], resolved: Mapping[str, Any],
+            *, quote_rows: Sequence[Mapping], visible_by: datetime,
+            policy: ReplayPolicy, config: Mapping[str, Any] | None,
+            ) -> float | None:
+        """Price one causal equity exit with the shared cost model.
+
+        Resting stop/target exits use the canonical bar reference. Gap and
+        deadline exits require the exact quote returned by
+        ``_worker_exit_quote``. Missing quantity, cost configuration, or quote
+        evidence returns ``None`` so the caller retains the virtual position.
+        """
+        direction = str(position.get("direction") or "").lower()
+        entry = _finite(position.get("entry_price"))
+        quantity = _finite(position.get("shares"))
+        if quantity is None or quantity <= 0:
+            quantity = _finite(position.get("quantity"))
+        if quantity is None or quantity <= 0:
+            notional = _finite(position.get("notional"))
+            quantity = (notional / entry if notional is not None and
+                        entry is not None and entry > 0 else None)
+        if (direction not in {"long", "short"} or entry is None or
+                entry <= 0 or quantity is None or quantity <= 0):
+            return None
+        reason = str(resolved.get("reason") or "")
+        gapped = bool(resolved.get("gapped")) or reason in {
+            "time", "exit_before", "force_flat", "max_hold", "time_expiry"}
+        boundary = None
+        executable_quote = False
+        if gapped:
+            requested_epoch = _finite(
+                resolved.get("bar_start_epoch", resolved.get("requested_at")))
+            requested = (datetime.fromtimestamp(requested_epoch, UTC)
+                         if requested_epoch is not None else visible_by)
+            evidence = cls._worker_exit_quote(
+                quote_rows, symbol=str(position.get("symbol") or ""),
+                at=requested, visible_by=visible_by, direction=direction,
+                policy=policy)
+            if evidence is None:
+                return None
+            fill, boundary = evidence
+            reference = _finite(fill.price)
+            executable_quote = True
+        else:
+            reference = _finite(resolved.get("price"))
+            end_epoch = _finite(resolved.get("bar_end_epoch"))
+            boundary = (datetime.fromtimestamp(end_epoch, UTC)
+                        if end_epoch is not None else visible_by)
+        if reference is None or reference <= 0 or boundary is None:
+            return None
+        try:
+            setup = cost_resolver_setup(config, vehicle="equity")
+            context = {
+                "vehicle": "equity", "symbol": str(position.get("symbol") or ""),
+                "session_date": boundary.astimezone(NEW_YORK).date().isoformat(),
+                "cost_leg": "exit", "cost_timestamp": boundary.isoformat(),
+                "entry_timestamp": position.get("entry_timestamp"),
+                "exit_timestamp": boundary.isoformat(),
+                "quantity": quantity, "shares": quantity,
+                "contracts": None, "entry_notional": float(
+                    _finite(position.get("notional")) or entry * quantity),
+                "feed": (str(fill.feed) if executable_quote else
+                         str(position.get("equity_feed") or policy.equity_feed)),
+                "provider": (str(fill.provider) if executable_quote else
+                             str(position.get("equity_provider") or policy.equity_provider)),
+            }
+            model = (setup.resolver(context) if setup.resolver is not None
+                     else setup.model)
+            entry_context = {
+                **context, "cost_leg": "entry",
+                "cost_timestamp": position.get("entry_timestamp"),
+                "feed": (str(position.get("entry_feed") or
+                                position.get("equity_feed") or
+                                policy.equity_feed)),
+                "provider": (str(position.get("entry_provider") or
+                                   position.get("equity_provider") or
+                                   policy.equity_provider)),
+            }
+            entry_model = (setup.resolver(entry_context)
+                           if setup.resolver is not None else setup.model)
+            if not hasattr(model, "execution_price") or not hasattr(
+                    entry_model, "execution_price"):
+                return None
+            entry_exec = cls._worker_entry_execution(
+                position, entry_model, direction)
+            if entry_exec is None:
+                return None
+            exit_exec = model.execution_price(
+                reference, direction, entry=False,
+                executable_quote=executable_quote)
+            gross = ((exit_exec - entry_exec) if direction == "long" else
+                     (entry_exec - exit_exec)) * quantity
+            fees = (entry_model.fees(entry_exec, entry_exec, quantity,
+                                     vehicle="equity") / 2.0 +
+                    model.fees(exit_exec, exit_exec, quantity,
+                               vehicle="equity") / 2.0)
+            result = float(gross - fees)
+            return result if math.isfinite(result) else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _worker_mark_pnl(
+            cls, position: Mapping[str, Any], *, quote_rows: Sequence[Mapping],
+            at: datetime, policy: ReplayPolicy,
+            config: Mapping[str, Any] | None,
+            bar_rows: Sequence[Mapping] = ()) -> float | None:
+        """Return a causal mark unrealized P&L for one equity plan.
+
+        Fresh executable quotes take precedence.  The exact visible bar open
+        or last completed close is the same bounded fallback used by factory
+        replay; an unavailable mark remains unknown and therefore blocks risk
+        admission.
+        """
+        direction = str(position.get("direction") or "").lower()
+        entry = _finite(position.get("entry_price"))
+        quantity = _finite(position.get("shares"))
+        if quantity is None or quantity <= 0:
+            quantity = _finite(position.get("quantity"))
+        if quantity is None or quantity <= 0:
+            notional = _finite(position.get("notional"))
+            quantity = (notional / entry if notional is not None and
+                        entry is not None and entry > 0 else None)
+        if (direction not in {"long", "short"} or entry is None or
+                entry <= 0 or quantity is None or quantity <= 0):
+            return None
+        evidence = cls._worker_exit_quote(
+            quote_rows, symbol=str(position.get("symbol") or ""), at=at,
+            visible_by=at, direction=direction, policy=policy)
+        fill = None
+        boundary = at
+        if evidence is not None:
+            fill, boundary = evidence
+            mark = _finite(fill.price)
+            mark_feed = str(fill.feed)
+            mark_provider = str(fill.provider)
+        else:
+            bar_evidence = cls._worker_bar_mark(
+                bar_rows, symbol=str(position.get("symbol") or ""), at=at,
+                policy=policy)
+            if bar_evidence is None:
+                return None
+            mark, boundary = bar_evidence
+            mark_feed = str(position.get("equity_feed") or policy.equity_feed)
+            mark_provider = str(position.get("equity_provider") or
+                                policy.equity_provider)
+        try:
+            setup = cost_resolver_setup(config, vehicle="equity")
+            context = {
+                "vehicle": "equity", "symbol": str(position.get("symbol") or ""),
+                "session_date": boundary.astimezone(NEW_YORK).date().isoformat(),
+                "cost_leg": "entry", "cost_timestamp": position.get(
+                    "entry_timestamp"),
+                "entry_timestamp": position.get("entry_timestamp"),
+                "exit_timestamp": boundary.isoformat(),
+                "quantity": quantity, "shares": quantity, "contracts": None,
+                "entry_notional": float(
+                    _finite(position.get("notional")) or entry * quantity),
+                "feed": mark_feed, "provider": mark_provider,
+            }
+            entry_context = {
+                **context, "cost_leg": "entry",
+                "cost_timestamp": position.get("entry_timestamp"),
+                "feed": (str(position.get("entry_feed") or
+                                position.get("equity_feed") or
+                                policy.equity_feed)),
+                "provider": (str(position.get("entry_provider") or
+                                   position.get("equity_provider") or
+                                   policy.equity_provider)),
+            }
+            model = (setup.resolver(context) if setup.resolver is not None
+                     else setup.model)
+            entry_model = (setup.resolver(entry_context)
+                           if setup.resolver is not None else setup.model)
+            if not hasattr(model, "execution_price"):
+                return None
+            if not hasattr(entry_model, "execution_price"):
+                return None
+            entry_exec = cls._worker_entry_execution(
+                position, entry_model, direction)
+            if entry_exec is None:
+                return None
+            if mark is None or mark <= 0:
+                return None
+            gross = ((mark - entry_exec) if direction == "long" else
+                     (entry_exec - mark)) * quantity
+            entry_fee = entry_model.fees(
+                entry_exec, entry_exec, quantity, vehicle="equity") / 2.0
+            result = float(gross - entry_fee)
+            return result if math.isfinite(result) else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _causal_worker_state(
+            cls,
+            state: tuple[list[dict], dict[str, dict], float],
+            *,
+            event: Mapping[str, Any],
+            bars: Mapping[str, Sequence[Mapping]],
+            quotes: Mapping[str, Sequence[Mapping]] | None = None,
+            policy: ReplayPolicy,
+            spec: Mapping[str, Any] | None = None,
+            config: Mapping[str, Any] | None = None,
+            equity_state: dict[str, float] | None = None,
+            candidate_id: str | None = None,
+            vehicle: str | None = None,
+            cash_state: dict[str, float] | None = None,
+            marks_state: dict[str, dict[str, float]] | None = None,
+            ) -> tuple[list[dict], dict[str, dict], float]:
+        """Release only virtual positions with a causally visible bracket exit.
+
+        The legacy authorizing arm stores an immutable virtual book until the
+        session replay closes it. Its in-memory risk projection still needs
+        the same completed-bar transition as replay before a later event is
+        admitted. Rebuilding each position from its authored plan is
+        deterministic across polls/restarts and only consumes rows whose
+        provider/as-of/observed timestamps are visible by the current event.
+        Gap and deadline exits require a fresh exact executable quote visible
+        by the current event. Option positions remain open because this legacy
+        projection has no option-side exit contract; releasing them from an
+        underlying bracket would create a false admission.
+        """
+        cutoff = _availability_time(event)
+        if cutoff is None:
+            return state
+        expected_feed = _canonical_equity_feed(policy.equity_feed)
+        expected_provider = _canonical_equity_provider(policy.equity_provider)
+        positions, active_trades, gross_notional = state
+        quotes = quotes or {}
+        retained: list[dict] = []
+        released_notional = 0.0
+        for original in positions:
+            position = dict(original)
+            symbol = str(position.get("symbol") or "").strip()
+            entry_at = _timestamp(
+                position.get("entry_timestamp") or
+                position.get("decision_timestamp"))
+            exit_state = cls._worker_exit_state(position)
+            execution_profile = str(
+                position.get("execution_profile") or
+                position.get("profile") or "shares").lower()
+            option_markers = {
+                str(position.get("vehicle") or "").lower(),
+                str(position.get("vehicle_type") or "").lower(),
+                str(position.get("asset_class") or "").lower(),
+            }
+            if (not symbol or entry_at is None or exit_state is None or
+                    not math.isfinite(entry_at.timestamp()) or
+                    execution_profile in {"option", "options",
+                                          "defined_risk_options",
+                                          "options_defined_risk"} or
+                    str(vehicle or "").lower() in {"option", "options"} or
+                    option_markers & {"option", "options", "us_option"} or
+                    position.get("option_symbol") is not None or
+                    position.get("contract_symbol") is not None):
+                retained.append(position)
+                continue
+            deadline_at = cls._worker_exit_deadline(position, entry_at, spec)
+            rows = bars.get(symbol) or bars.get(symbol.upper())
+            if rows is None:
+                rows = next((value for key, value in bars.items()
+                             if str(key).strip().upper() == symbol.upper()),
+                            ())
+            visible_bars: list[Mapping[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, Mapping) or not _row_visible(row, cutoff):
+                    continue
+                if str(row.get("event_type") or "bar_1m").lower() \
+                        not in {"bar", "bar_1m"}:
+                    continue
+                if _authorizing_projected_payload(row, {}) is None:
+                    continue
+                if (expected_feed is not None and
+                        _canonical_equity_feed(row.get("feed")) != expected_feed):
+                    continue
+                if (expected_provider is not None and
+                        _canonical_equity_provider(row.get("provider")) !=
+                        expected_provider):
+                    continue
+                opened = _timestamp(row.get("timestamp"))
+                ended = _event_end(row)
+                if (opened is None or ended is None or opened < entry_at or
+                        ended > cutoff):
+                    continue
+                visible_bars.append(row)
+            visible_bars.sort(key=lambda row: (
+                _event_end(row) or datetime.max.replace(tzinfo=UTC),
+                _timestamp(row.get("timestamp")) or
+                datetime.max.replace(tzinfo=UTC),
+                str(row.get("event_key") or "")))
+            # A bracket or time exit is only authoritative after the complete
+            # post-entry bar prefix has been observed. Skipping an unavailable
+            # middle bar would let a later OHLC outcome release risk that the
+            # replay correctly treats as an unpriced data gap.
+            contiguous = bool(visible_bars)
+            previous_open: datetime | None = None
+            previous_interval = 60.0
+            for row in visible_bars:
+                opened = _timestamp(row.get("timestamp"))
+                interval = _finite(row.get("interval_seconds", 60))
+                if opened is None or interval is None or interval <= 0:
+                    contiguous = False
+                    break
+                if previous_open is None:
+                    if (opened - entry_at).total_seconds() > interval + 1e-6:
+                        contiguous = False
+                else:
+                    expected = previous_open + timedelta(seconds=previous_interval)
+                    if abs((opened - expected).total_seconds()) > 1e-6:
+                        contiguous = False
+                previous_open = opened
+                previous_interval = interval
+            resolved = None
+            pending_market_exit = False
+            try:
+                for row in visible_bars if contiguous else ():
+                    opened = _timestamp(row.get("timestamp"))
+                    ended = _event_end(row)
+                    if (deadline_at is not None and opened is not None and
+                            opened >= deadline_at):
+                        pending_market_exit = not cls._worker_quote_available(
+                            quotes.get(symbol) or quotes.get(symbol.upper()) or
+                            (), symbol=symbol, at=deadline_at,
+                            visible_by=cutoff,
+                            direction=str(position.get("direction") or ""),
+                            policy=policy)
+                        resolved = {"reason": "time", "gapped": True,
+                                    "requested_at": deadline_at.timestamp()}
+                        break
+                    transition = completed_bar_exit_transition(exit_state, row)
+                    exit_state = transition["state"]
+                    resolved = transition.get("exit")
+                    if resolved is not None:
+                        if bool(resolved.get("gapped")):
+                            pending_market_exit = not cls._worker_quote_available(
+                                quotes.get(symbol) or
+                                quotes.get(symbol.upper()) or (),
+                                symbol=symbol, at=opened or cutoff,
+                                visible_by=cutoff,
+                                direction=str(position.get("direction") or ""),
+                                policy=policy)
+                        break
+                    if (deadline_at is not None and ended is not None and
+                            ended >= deadline_at):
+                        pending_market_exit = not cls._worker_quote_available(
+                            quotes.get(symbol) or quotes.get(symbol.upper()) or
+                            (), symbol=symbol, at=deadline_at,
+                            visible_by=cutoff,
+                            direction=str(position.get("direction") or ""),
+                            policy=policy)
+                        resolved = {"reason": "time", "gapped": True,
+                                    "requested_at": deadline_at.timestamp()}
+                        break
+            except Exception:
+                # A malformed historical bracket/bar is never an authorizing
+                # exit. Keep the virtual position open and let replay surface
+                # the input problem through its existing quarantine path.
+                resolved = None
+            if (isinstance(resolved, Mapping) and
+                    str(resolved.get("reason") or "") in {"stop", "target"} and
+                    not bool(resolved.get("gapped")) and
+                    not bool(resolved.get("entry_gap"))):
+                notional = _finite(position.get("notional"))
+                pnl = cls._worker_exit_pnl(
+                    position, resolved,
+                    quote_rows=quotes.get(symbol) or quotes.get(symbol.upper()) or (),
+                    visible_by=cutoff, policy=policy, config=config)
+                if notional is not None and notional >= 0 and pnl is not None:
+                    if cash_state is not None and candidate_id is not None:
+                        cash_state[candidate_id] = (
+                            float(cash_state.get(candidate_id, 0.0)) + pnl)
+                    released_notional += notional
+                    continue
+            if (isinstance(resolved, Mapping) and
+                    str(resolved.get("reason") or "") in {
+                        "stop", "target", "time", "exit_before",
+                        "force_flat", "max_hold", "time_expiry"} and
+                    (bool(resolved.get("gapped")) or
+                     str(resolved.get("reason") or "") not in {
+                         "stop", "target"}) and not pending_market_exit):
+                notional = _finite(position.get("notional"))
+                pnl = cls._worker_exit_pnl(
+                    position, resolved,
+                    quote_rows=quotes.get(symbol) or quotes.get(symbol.upper()) or (),
+                    visible_by=cutoff, policy=policy, config=config)
+                if notional is not None and notional >= 0 and pnl is not None:
+                    if cash_state is not None and candidate_id is not None:
+                        cash_state[candidate_id] = (
+                            float(cash_state.get(candidate_id, 0.0)) + pnl)
+                    released_notional += notional
+                    continue
+            retained.append(position)
+        if (equity_state is not None and candidate_id is not None and
+                cash_state is not None and marks_state is not None):
+            new_marks: dict[str, float] = {}
+            mark_unpriced = False
+            for position in retained:
+                symbol = str(position.get("symbol") or "").strip()
+                profile = str(position.get("execution_profile") or
+                              position.get("profile") or "shares").lower()
+                markers = {
+                    str(position.get("vehicle") or "").lower(),
+                    str(position.get("vehicle_type") or "").lower(),
+                    str(position.get("asset_class") or "").lower(),
+                }
+                if (profile in {"option", "options", "defined_risk_options",
+                                "options_defined_risk"} or
+                        markers & {"option", "options", "us_option"} or
+                        position.get("option_symbol") is not None or
+                        position.get("contract_symbol") is not None):
+                    mark_unpriced = True
+                    continue
+                mark_rows = bars.get(symbol) or bars.get(symbol.upper())
+                if mark_rows is None:
+                    mark_rows = next((value for key, value in bars.items()
+                                      if str(key).strip().upper() == symbol.upper()),
+                                     ())
+                mark = cls._worker_mark_pnl(
+                    position,
+                    quote_rows=quotes.get(symbol) or
+                    quotes.get(symbol.upper()) or (), at=cutoff,
+                    policy=policy, config=config, bar_rows=mark_rows)
+                if mark is None:
+                    mark_unpriced = True
+                    continue
+                new_marks[symbol] = mark
+            marks_state[candidate_id] = new_marks
+            equity_state[candidate_id] = (
+                None if mark_unpriced else
+                float(cash_state.get(candidate_id, 0.0)) +
+                sum(new_marks.values()))
+        retained_symbols = {str(item.get("symbol") or "")
+                           for item in retained}
+        rebuilt_active = {
+            str(symbol): dict(value)
+            for symbol, value in active_trades.items()
+            if str(symbol) in retained_symbols and isinstance(value, Mapping)
+        }
+        for position in retained:
+            symbol = str(position.get("symbol") or "")
+            if symbol and symbol not in rebuilt_active:
+                active = dict(position)
+                active["risk_usd"] = _finite(
+                    position.get("risk_usd")) or 0.0
+                rebuilt_active[symbol] = active
+        return (retained, rebuilt_active,
+                max(0.0, float(gross_notional) - released_notional))
+
     def _evaluate_arm_snapshot(self, arm: Mapping[str, Any],
                                session_events: Mapping[str, Sequence[Mapping]],
                                session_inputs: Mapping[str, tuple[Sequence[Mapping],
@@ -6658,16 +7538,67 @@ class ShadowRunner:
                  float(initial_state[2]))
         decisions: list[dict[str, Any]] = []
         try:
+            cfg = self._shadow_candidate_config(_safe_config(arm))
+            strategy = cfg.get("strategy") if isinstance(
+                cfg.get("strategy"), Mapping) else {}
+            spec = strategy.get("rule_spec") if isinstance(
+                strategy, Mapping) else None
+            policy = self._shadow_policy(cfg)
             self._worker_state.portfolios = {candidate_id: state}
+            self._worker_state.equities = {
+                candidate_id: float(self.config.equity)}
+            self._worker_state.cash = {candidate_id: float(self.config.equity)}
+            self._worker_state.marks = {candidate_id: {}}
             self._worker_state.calendar_snapshot = (
                 calendar_snapshot if calendar_snapshot is not None else
                 _load_recorded_session_calendar(self.config.corpus_path))
+            durable_session_symbols = (
+                self.store.opened_symbols_by_session(candidate_id)
+                if self.store is not None else {})
+            persisted_session_events = (
+                self.store.decision_event_keys(
+                    [candidate_id], list(session_events))
+                if self.store is not None else {})
             for session in sorted(session_events):
+                # Preserve one-symbol-per-session after an earlier bracket
+                # exit removes the position from the live risk projection.
+                session_symbols = {
+                    str(position.get("symbol") or "")
+                    for position in state[0]
+                    if self._worker_plan_session(position) == session
+                }
+                current_event_keys = {
+                    str(event.get("event_key") or "")
+                    for event in session_events[session]
+                    if str(event.get("event_key") or "")
+                }
+                persisted_keys = persisted_session_events.get(
+                    (candidate_id, session), set())
+                # A complete historical replay must regenerate its prior
+                # opens so signatures remain comparable.  New incremental
+                # events still consult the durable session ledger, including
+                # when the prior book was already closed by replay.
+                replaying_existing_prefix = bool(
+                    current_event_keys and
+                    current_event_keys.intersection(persisted_keys))
+                if not replaying_existing_prefix:
+                    session_symbols.update(
+                        durable_session_symbols.get(session, set()))
                 for event in session_events[session]:
+                    if _authorizing_projected_payload(event, {}) is None:
+                        continue
                     symbol = str(event.get("symbol") or "")
                     event_key = str(event.get("event_key") or "")
-                    if any(str(row.get("symbol") or "") == symbol
-                           for row in state[0]):
+                    state = self._causal_worker_state(
+                        state, event=event, bars=bars, quotes=quotes,
+                        policy=policy, spec=spec, config=cfg,
+                        equity_state=getattr(self._worker_state, "equities", None),
+                        candidate_id=candidate_id,
+                        vehicle=str(arm.get("vehicle") or "equity"),
+                        cash_state=getattr(self._worker_state, "cash", None),
+                        marks_state=getattr(self._worker_state, "marks", None))
+                    self._worker_state.portfolios[candidate_id] = state
+                    if symbol in state[1] or symbol in session_symbols:
                         kind, reason, payload, plan = (
                             "no_trade", "virtual book has an incomplete open",
                             {"session_date": session,
@@ -6687,15 +7618,24 @@ class ShadowRunner:
                         "plan": plan,
                     })
                     if plan is not None:
+                        session_symbols.add(symbol)
                         state = self._append_worker_open(state, plan, symbol)
                         self._worker_state.portfolios[candidate_id] = state
                 state = ([], {}, 0.0)
+                # Legacy replay starts each isolated session from the same
+                # configured equity; do not leak an earlier session's mark
+                # into a fresh session's authorizing admission.
+                self._worker_state.equities[candidate_id] = float(
+                    self.config.equity)
+                self._worker_state.cash[candidate_id] = float(self.config.equity)
+                self._worker_state.marks[candidate_id] = {}
                 self._worker_state.portfolios[candidate_id] = state
         except Exception as exc:
             return {"candidate_id": candidate_id, "decisions": [],
                     "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
         finally:
-            for name in ("portfolios", "calendar_snapshot"):
+            for name in ("portfolios", "equities", "cash", "marks",
+                         "calendar_snapshot"):
                 try:
                     delattr(self._worker_state, name)
                 except AttributeError:

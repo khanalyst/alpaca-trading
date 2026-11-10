@@ -22,7 +22,7 @@ from research.live_shadow import ShadowConfig, ShadowRunner, ShadowStore
 FIELDS = [
     "event_key", "event_type", "symbol", "timestamp", "as_of",
     "observed_at", "provider", "feed", "open", "high", "low",
-    "close", "volume", "bid", "ask",
+    "close", "volume", "bid", "ask", "source_mode",
 ]
 
 
@@ -48,6 +48,7 @@ class ShadowPollMetricsTests(unittest.TestCase):
             "as_of": (stamp + timedelta(minutes=1)).isoformat(),
             "observed_at": (stamp + timedelta(minutes=2)).isoformat(),
             "provider": "alpaca", "feed": "iex", "open": value,
+            "source_mode": "forward_observed",
             "high": str(101 + index), "low": str(99 + index),
             "close": value, "volume": "1000", "bid": "", "ask": "",
         }

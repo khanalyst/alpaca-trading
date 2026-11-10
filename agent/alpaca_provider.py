@@ -8,9 +8,12 @@ clock checks.
 
 from __future__ import annotations
 
+from functools import wraps
 import json
+import logging
 import math
 import os
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -35,6 +38,56 @@ from .instruments import (reject_crypto, validate_asset_class,
 
 class IdempotencyConflict(AlpacaError):
     """A client order id already belongs to a different order request."""
+
+
+def _transient_read_error(error: Exception) -> bool:
+    """Recognize transport failures without retrying invalid broker data."""
+    try:
+        from requests.exceptions import ConnectionError as RequestsConnectionError
+        from requests.exceptions import Timeout as RequestsTimeout
+        transport_errors = (TimeoutError, ConnectionError,
+                            RequestsConnectionError, RequestsTimeout)
+    except ImportError:
+        transport_errors = (TimeoutError, ConnectionError)
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, (PaperModeError, CredentialsError,
+                              IdempotencyConflict, ValueError, ArithmeticError)):
+            return False
+        try:
+            status = getattr(error, "status_code", None)
+            if status is None:
+                status = getattr(getattr(error, "response", None), "status_code", None)
+        except Exception:
+            return False
+        if status is not None:
+            return (isinstance(status, int) and not isinstance(status, bool)
+                    and status in {408, 429, 500, 502, 503, 504})
+        if isinstance(error, transport_errors):
+            return True
+        error = error.__cause__
+    return False
+
+
+def _retry_transient_read(method):
+    """Retry one read before a temporary outage reaches portfolio cleanup.
+
+    Mutating endpoints deliberately do not use this wrapper: a failed write
+    can already have reached the broker and must use order reconciliation.
+    """
+    @wraps(method)
+    def read(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            if not _transient_read_error(exc):
+                raise
+            logging.getLogger(__name__).warning(
+                "temporary broker %s read failure; retrying once", method.__name__)
+            time.sleep(0.25)
+            return method(self, *args, **kwargs)
+    return read
 
 
 def _finite_decimal(value: Any, field: str, *, positive: bool = False) -> Decimal:
@@ -260,6 +313,7 @@ class AlpacaProvider(AlpacaMarketDataMixin):
     def paper(self) -> bool:
         return self.session.paper
 
+    @_retry_transient_read
     def clock(self) -> MarketClock:
         try:
             value = self.session.trading.get_clock()
@@ -275,6 +329,7 @@ class AlpacaProvider(AlpacaMarketDataMixin):
         except Exception as exc:  # noqa: BLE001
             raise AlpacaError(f"clock request failed: {exc}") from exc
 
+    @_retry_transient_read
     def calendar(self, start=None, end=None) -> list[CalendarDay]:
         try:
             from alpaca.trading.requests import GetCalendarRequest
@@ -302,6 +357,7 @@ class AlpacaProvider(AlpacaMarketDataMixin):
             raise AlpacaError(f"calendar request failed: {exc}") from exc
         return [normalize_calendar_day(row) for row in (rows or [])]
 
+    @_retry_transient_read
     def assets(self, *, asset_class: str = "us_equity", status: str = "active") -> list[Asset]:
         asset_class = validate_asset_class(asset_class)
         try:
@@ -321,6 +377,7 @@ class AlpacaProvider(AlpacaMarketDataMixin):
         return [Asset.from_sdk(row) for row in rows]
 
 
+    @_retry_transient_read
     def account(self) -> Account:
         try:
             value = self.session.trading.get_account()
@@ -349,6 +406,7 @@ class AlpacaProvider(AlpacaMarketDataMixin):
         except Exception as exc:  # noqa: BLE001
             raise AlpacaError(f"account request failed: {exc}") from exc
 
+    @_retry_transient_read
     def positions(self) -> list[Position]:
         try:
             rows = self.session.trading.get_all_positions()
@@ -378,6 +436,7 @@ class AlpacaProvider(AlpacaMarketDataMixin):
         except Exception as exc:  # noqa: BLE001
             raise AlpacaError(f"positions request failed: {exc}") from exc
 
+    @_retry_transient_read
     def orders(self, *, status: str | None = None, client_order_id: str | None = None) -> list[Order]:
         requested_status = _text(status).strip() if status is not None else None
         try:
@@ -724,6 +783,208 @@ class AlpacaProvider(AlpacaMarketDataMixin):
 
 
 
+
+    def restore_equity_stop(self, symbol: str,
+                            qty: Decimal | float | str,
+                            stop_price: Decimal | float | str,
+                            client_order_id: str | None = None, *,
+                            cid: str | None = None) -> Order:
+        """Restore one standalone day stop for an existing equity position.
+
+        This path deliberately bypasses :class:`OrderRequest`: normal entry
+        and close requests reject standalone stops, while a flatten failure
+        needs this narrow, equity-only recovery operation.  It performs one
+        exact client-id lookup and one fresh position/order reconciliation;
+        after that point the broker mutation is attempted at most once.
+        """
+        if client_order_id is None:
+            client_order_id = cid
+        elif cid is not None and str(cid) != str(client_order_id):
+            raise IdempotencyConflict("client_order_id and cid disagree")
+        client_order_id = str(client_order_id or "").strip()
+        if not client_order_id:
+            raise AlpacaError("equity stop client_order_id is required")
+        try:
+            wanted = validate_equity_symbol(symbol)
+        except ValueError as exc:
+            raise AlpacaError(str(exc)) from exc
+        try:
+            wanted_qty = _finite_decimal(qty, "equity stop qty", positive=True)
+            wanted_price = _finite_decimal(stop_price, "equity stop stop_price", positive=True)
+        except ValueError as exc:
+            raise AlpacaError(str(exc)) from exc
+
+        def restored_stop_price(order: Order) -> Decimal:
+            raw = order.raw or {}
+            value = _value(raw, "stop_price", None)
+            if value is None:
+                value = _value(order, "stop_price", None)
+            if value is None:
+                raise AlpacaError("broker stop response is missing stop_price")
+            try:
+                return _finite_decimal(value, "broker stop response stop_price", positive=True)
+            except ValueError as exc:
+                raise AlpacaError(str(exc)) from exc
+
+        # Only these broker states provide a trustworthy full protective
+        # reservation.  Pending cancel/replace (and every unknown SDK
+        # state) must remain a conflict instead of being mistaken for live
+        # protection.  A partial stop is also insufficient for the requested
+        # position quantity and is handled as an unsafe prior order below.
+        protective_live_statuses = frozenset({"accepted", "new", "held"})
+        partially_filled_status = "partially_filled"
+
+        def restored_stop_live(order: Order) -> bool:
+            return (_text(order.status).strip().lower()
+                    in protective_live_statuses)
+
+        def validate_restored_stop(order: Order, *, allow_filled: bool = False) -> Order:
+            status = _text(order.status).strip().lower()
+            if status in _TERMINAL_ORDER_STATUSES:
+                if not (allow_filled and status == "filled"):
+                    raise AlpacaError("restored equity stop is terminal")
+                if order.filled_qty <= 0 or order.filled_qty > wanted_qty:
+                    raise AlpacaError("filled restored equity stop has invalid filled_qty")
+                if order.filled_avg_price is None or order.filled_avg_price <= 0:
+                    raise AlpacaError(
+                        "filled restored equity stop is missing filled_avg_price")
+            elif status == partially_filled_status:
+                if not allow_filled:
+                    raise AlpacaError(
+                        "partially filled restored equity stop is not reusable")
+                if order.filled_qty <= 0 or order.filled_qty > wanted_qty:
+                    raise AlpacaError(
+                        "partially filled restored equity stop has invalid filled_qty")
+                if order.filled_avg_price is None or order.filled_avg_price <= 0:
+                    raise AlpacaError(
+                        "partially filled restored equity stop is missing filled_avg_price")
+            elif not restored_stop_live(order):
+                raise AlpacaError(
+                    "restored equity stop is not safely live")
+            if order.symbol != wanted or order.qty != wanted_qty:
+                raise AlpacaError("restored equity stop symbol or quantity does not match held position")
+            if order.side != exit_side:
+                raise AlpacaError("restored equity stop side does not close held position")
+            if order.type not in {"stop", "stop_limit"}:
+                raise AlpacaError("restored equity stop response is not a stop order")
+            if order.time_in_force != "day":
+                raise AlpacaError("restored equity stop time_in_force must be day")
+            if restored_stop_price(order) != wanted_price:
+                raise AlpacaError("restored equity stop price does not match requested stop")
+            if order.client_order_id != client_order_id:
+                raise IdempotencyConflict(
+                    "client_order_id belongs to a different broker order")
+            return order
+
+        # Exact lookup comes before any mutation. A terminal prior order is a
+        # hard refusal; callers must allocate a fresh CID instead of replaying.
+        prior = self.orders(client_order_id=client_order_id)
+        if prior:
+            if len(prior) != 1:
+                raise IdempotencyConflict(
+                    "client_order_id matched more than one broker order")
+            prior_order = prior[0]
+            prior_status = _text(prior_order.status).strip().lower()
+            if (prior_status not in protective_live_statuses and
+                    prior_status not in {"filled", partially_filled_status}):
+                raise IdempotencyConflict(
+                    "client_order_id already belongs to a non-reusable order; use a new client_order_id")
+        else:
+            prior_order = None
+
+        # Even an exact live order is valid only while the fresh position has
+        # the same side and quantity.
+        positions = self.positions()
+        held = [position for position in positions
+                if str(position.symbol).upper() == wanted]
+        if len(held) != 1:
+            raise AlpacaError("fresh equity position snapshot does not identify one held position")
+        position = held[0]
+        if position.qty != wanted_qty:
+            raise AlpacaError("fresh equity position quantity does not match stop quantity")
+        if position.side == "long":
+            exit_side = "sell"
+        elif position.side == "short":
+            exit_side = "buy"
+        else:
+            raise AlpacaError("fresh equity position side must be long or short")
+
+        if prior_order is not None:
+            return validate_restored_stop(prior_order, allow_filled=True)
+
+        # Reconcile every live order for this symbol before submitting. A
+        # matching stop under another CID is safe to reuse; every other live
+        # exit reserves or changes the same position and is a conflict.
+        broker_orders = self.orders(status="all")
+        for order in broker_orders:
+            if str(order.symbol).upper() != wanted:
+                continue
+            status = _text(order.status).strip().lower()
+            if status in _TERMINAL_ORDER_STATUSES:
+                continue
+            if order.side != exit_side:
+                continue
+            if status not in protective_live_statuses:
+                raise AlpacaError("conflicting live equity exit order exists")
+            if order.type in {"stop", "stop_limit"}:
+                order_price = restored_stop_price(order)
+                if order.qty == wanted_qty and order_price == wanted_price:
+                    # A different CID may already own the exact live stop.
+                    # Validate its economics while retaining that CID.
+                    if order.symbol != wanted or order.side != exit_side:
+                        raise AlpacaError("existing equity stop does not close held position")
+                    if order.time_in_force != "day":
+                        raise AlpacaError("existing equity stop time_in_force must be day")
+                    return order
+            raise AlpacaError("conflicting live equity exit order exists")
+        # A live bracket parent may carry still-live child legs even when the
+        # API does not return those children as standalone rows. Never stack a
+        # recovery stop underneath one of them.
+        for order in broker_orders:
+            if str(order.symbol).upper() != wanted:
+                continue
+            parent_status = _text(order.status).strip().lower()
+            if parent_status in _TERMINAL_ORDER_STATUSES:
+                continue
+            for leg in order.legs or ():
+                leg_status = _text(_value(leg, "status", "")).lower()
+                leg_side = _text(_value(leg, "side", "")).lower()
+                if (leg_side == exit_side and
+                        leg_status not in _TERMINAL_ORDER_STATUSES):
+                    raise AlpacaError("conflicting live bracket exit leg exists")
+
+        # Construct the official SDK request lazily. The fallback object is
+        # only for dependency-free injected fakes.
+        sdk_qty: int | float = (int(wanted_qty) if
+                                wanted_qty == wanted_qty.to_integral_value()
+                                else float(wanted_qty))
+        try:
+            from alpaca.trading.enums import OrderSide, TimeInForce
+            from alpaca.trading.requests import StopOrderRequest
+            sdk_side = getattr(OrderSide, exit_side.upper(), exit_side)
+            sdk_tif = getattr(TimeInForce, "DAY", "day")
+            sdk_request: Any = StopOrderRequest(
+                symbol=wanted, qty=sdk_qty, side=sdk_side,
+                time_in_force=sdk_tif, stop_price=float(wanted_price),
+                client_order_id=client_order_id)
+        except ImportError:
+            from types import SimpleNamespace
+            sdk_request = SimpleNamespace(
+                symbol=wanted, qty=sdk_qty, side=exit_side,
+                time_in_force="day", stop_price=float(wanted_price),
+                client_order_id=client_order_id, type="stop",
+                asset_class="us_equity")
+
+        try:
+            row = self.session.trading.submit_order(sdk_request)
+            result = row if isinstance(row, Order) else self._order(row)
+            return validate_restored_stop(result, allow_filled=True)
+        except (AlpacaError, IdempotencyConflict):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Deliberately do not retry: the request may have reached the
+            # broker even when the response was lost.
+            raise AlpacaError(f"restore equity stop submit failed: {exc}") from exc
 
     def close_position(self, symbol: str, qty: Decimal | float | None = None, *,
                        client_order_id: str | None = None,

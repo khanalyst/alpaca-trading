@@ -345,14 +345,25 @@ class ShadowEntrySlippageTests(unittest.TestCase):
         self.assertEqual(result[2]["snapshot"]["entry_slippage"]["reason"],
                          ENTRY_SLIPPAGE_REJECT_REASON)
 
-    def test_non_diagnostic_candidate_does_not_apply_shadow_slippage_gate(self):
+    def test_authorizing_candidate_applies_same_entry_slippage_gate(self):
         result, helper, setup_calls, *_ = self._evaluate_case(
             direction="long", reference=100.0, bid=100.99, ask=101.0,
             diagnostic=False)
+        self.assertEqual(result[:2], ("reject", ENTRY_SLIPPAGE_REJECT_REASON))
+        self.assertIsNone(result[3])
+        self.assertEqual(setup_calls[0][1]["entry_price"], 101.0)
+        helper.assert_called_once_with("buy", 100.0, 101.0, 50)
+
+    def test_authorizing_candidate_sizes_from_accepted_executable_quote(self):
+        result, helper, setup_calls, *_ = self._evaluate_case(
+            direction="long", reference=100.0, bid=100.19, ask=100.2,
+            diagnostic=False)
         self.assertEqual(result[0], "open_incomplete")
-        self.assertEqual(result[3]["entry_price"], 100.0)
-        self.assertEqual(setup_calls[0][1]["entry_price"], 100.0)
-        helper.assert_not_called()
+        self.assertEqual(result[3]["entry_price"], 100.2)
+        self.assertEqual(setup_calls[0][1]["entry_price"], 100.2)
+        self.assertEqual(result[3]["entry_fill_source"], "quote")
+        self.assertAlmostEqual(result[3]["stop_distance"], 2.2)
+        helper.assert_called_once_with("buy", 100.0, 100.2, 50)
 
     def test_refused_entry_persists_without_diagnostic_order_or_fill(self):
         candidate = deepcopy(self.arm)

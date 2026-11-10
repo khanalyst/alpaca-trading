@@ -875,6 +875,13 @@ class MarketEntryRiskMixin:
                                       for key, value in signal.items()))
             setup = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
         setup = str(setup)
+        # Lifecycle identities can be broker order ids or durable orphan
+        # markers.  Keep the action and symbol visible in the bounded broker
+        # id while hashing only an oversized setup token; otherwise the old
+        # tail truncation could erase the action/symbol and collapse distinct
+        # close domains.
+        if len(setup) > 16:
+            setup = hashlib.sha256(setup.encode("utf-8")).hexdigest()[:16]
         suffix = f"-{attempt}" if attempt else ""
         tail = f"-{action}-{str(signal.get('symbol', '')).lower()}-{setup}"
         # Alpaca caps client ids at 48 chars.  Truncate only the core so the

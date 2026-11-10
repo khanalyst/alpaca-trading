@@ -1519,13 +1519,32 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertFalse(state.HEARTBEAT_FILE.exists())
 
     def test_bounded_run_flattens_existing_positions_before_exit(self):
-        provider = FakeProvider()
+        from dataclasses import replace
+
+        class FilledCloseProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.history = []
+
+            def submit_order(self, request):
+                accepted = super().submit_order(request)
+                filled = replace(accepted, status="filled",
+                                 filled_qty=request.qty,
+                                 filled_avg_price=Decimal("100"))
+                self.history.append(filled)
+                return filled
+
+            def orders(self, **_):
+                return list(self.history)
+
+        provider = FilledCloseProvider()
         provider.positions_live = [Position("SPY", Decimal("2"), "long")]
         engine = Engine(_cfg(), provider=provider)
         engine.run(max_cycles=0)
         self.assertEqual(provider.positions_live, [])
         self.assertEqual(len(provider.orders_sent), 1)
         from agent import state
+        self.assertEqual(state.load_state()["active_trades"], {})
         self.assertEqual(state.load_state()["state"], state.PAUSED)
         self.assertIsNone(engine._lock_handle)
         heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())

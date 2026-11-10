@@ -158,6 +158,19 @@ def build_setup_plan(*args, **kwargs):
 
 
 class EngineCycleMixin:
+    def _pause_with_residual_risk(self, reason: str) -> None:
+        """Keep failed exits visible while the next cycle retries protection."""
+        try:
+            state.commit({"operator_pause": True},
+                         transition=(state.RUNNING, state.PAUSED))
+        except Exception:
+            pass
+        try:
+            state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
+                run_id=self.run_id, reason=reason, residual_risk=True, orders=0))
+        except Exception:
+            pass
+
     def _cycle_heartbeat_detail(self, **detail) -> dict[str, Any]:
         if self.mode == "paper":
             detail["paper_selection"] = self._paper_selection_status()
@@ -514,24 +527,42 @@ class EngineCycleMixin:
                 "transient": True, "consecutive_failures": count}
 
     def _run_once_impl(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:
+        protection_only = False
+        prior_preflight_error = getattr(self, "_preflight_error", None)
         if not self._ensure_order_ready():
-            reason = self._preflight_error or "startup_reconciliation_required"
-            read_error = getattr(self, "_readiness_read_error", None)
-            if read_error is not None:
-                # A reconciliation that keeps failing counts like any other
-                # failed broker read, so a persistent outage still fails
-                # closed instead of holding the book unmonitored all day.
-                return self._transient_or_fail_closed(
-                    "cycle_reconciliation_failed", read_error)
-            flattened = self._not_ready_force_flat(reason)
-            try:
-                state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
-                    run_id=self.run_id, reason=reason))
-            except Exception:
-                pass
-            if flattened is not None:
-                return flattened
-            return {"action": "hold", "reason": reason}
+            order_read_error = getattr(self, "_readiness_read_error", None)
+            # A durable operator pause blocks entries, but protection still
+            # needs authenticated broker reads and local-book reconciliation.
+            protection_only = self._ensure_protection_ready()
+            if protection_only and (
+                    not self._startup_cleanup_checked and
+                    str(prior_preflight_error or "").startswith(
+                        "outside-session cleanup incomplete")):
+                try:
+                    self._enforce_intraday_cleanup(
+                        self.market.clock(), reason="startup_reconciliation",
+                        force=True)
+                except Exception as exc:  # noqa: BLE001
+                    self._preflight_error = str(exc)
+                    protection_only = False
+            if protection_only:
+                self._preflight_error = None
+            if not protection_only:
+                reason = self._preflight_error or "startup_reconciliation_required"
+                read_error = (getattr(self, "_readiness_read_error", None)
+                              or order_read_error)
+                if read_error is not None:
+                    return self._transient_or_fail_closed(
+                        "cycle_reconciliation_failed", read_error)
+                flattened = self._not_ready_force_flat(reason)
+                try:
+                    state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
+                        run_id=self.run_id, reason=reason))
+                except Exception:
+                    pass
+                if flattened is not None:
+                    return flattened
+                return {"action": "hold", "reason": reason}
         try:
             calendar = self.market.refresh_calendar()
             clock = self.market.clock()
@@ -568,6 +599,14 @@ class EngineCycleMixin:
             # Edge eligibility is checked even when entries are closed.  A
             # missing required proof must publish the policy's paused state;
             # otherwise a premarket cycle leaves the startup heartbeat stale.
+            if protection_only:
+                try:
+                    state.write_heartbeat("paused", **self._cycle_heartbeat_detail(
+                        run_id=self.run_id, reason="operator_pause", orders=0))
+                except Exception:
+                    pass
+                return {"action": "force_flat", "reason": "outside_regular_session",
+                        "closed": True, "residual": _plain(self.provider.positions())}
             if not self._refresh_edge():
                 return {"action": "hold", "reason": self._edge_error or
                         "validated edge champion is required"}
@@ -582,9 +621,31 @@ class EngineCycleMixin:
                     "closed": True, "residual": _plain(self.provider.positions())}
         if self.market.should_force_flat(now):
             self._transient_failures = 0
-            closed = self.flatten_all("before_close")
+            try:
+                closed = self.flatten_all("before_close")
+                residual = _plain(self.provider.positions())
+                closed = bool(closed and not residual)
+            except Exception as exc:
+                self._event("force_flat_failed", {"error": str(exc)})
+                self._pause_with_residual_risk("force_flat_failed")
+                return {"action": "force_flat", "closed": False,
+                        "residual_unknown": True, "error": str(exc)}
+            if not closed:
+                self._pause_with_residual_risk("force_flat_incomplete")
+            else:
+                try:
+                    state.write_heartbeat(
+                        "paused" if protection_only else "running",
+                        **self._cycle_heartbeat_detail(
+                            run_id=self.run_id,
+                            reason=("operator_pause" if protection_only
+                                    else "before_close"),
+                            orders=0))
+                except Exception:
+                    pass
             return {"action": "force_flat", "closed": closed,
-                    "residual": _plain(self.provider.positions())}
+                    "residual": residual,
+                    **({"not_ready": True} if protection_only else {})}
         symbols = self._universe()
         # Existing positions need the same normalized market snapshot used by
         # entry evaluation.  Collect it once so local protection never fetches
@@ -601,7 +662,21 @@ class EngineCycleMixin:
                 rows = {}
                 self._event("protection_market_data_unavailable", {
                     "error": str(exc)})
-        monitored = self._monitor_positions(now, positions, market_rows=rows)
+        active_runtime = state.load_state().get("active_trades", {})
+        unknown_only = (
+            not active_runtime or
+            all(str(row.get("execution_profile", "")).lower() == "unknown"
+                for row in active_runtime.values()
+                if isinstance(row, Mapping)))
+        if (protection_only and positions and
+                not hasattr(self.provider, "data_feed") and unknown_only):
+            # A legacy/injected provider without feed identity cannot produce
+            # a trustworthy local protection observation for a broker-only
+            # position. Keep it paused and broker-resident until an
+            # authenticated provider snapshot supplies that boundary.
+            monitored = {"closed": [], "failed": []}
+        else:
+            monitored = self._monitor_positions(now, positions, market_rows=rows)
 
         # Account loss protection is a portfolio-wide guard, so it must run
         # on every regular-session cycle after position monitoring and before
@@ -622,11 +697,14 @@ class EngineCycleMixin:
             complete = self.flatten_all("daily_loss_limit")
             self._event("daily_loss_limit", {"daily_pnl": daily_pnl,
                                               "flatten_complete": complete})
-            try:
-                state.write_heartbeat("paused", **self._cycle_heartbeat_detail(
-                    run_id=self.run_id, reason="daily_loss_limit", orders=0))
-            except Exception:
-                pass
+            if not complete:
+                self._pause_with_residual_risk("daily_loss_flatten_incomplete")
+            else:
+                try:
+                    state.write_heartbeat("paused", **self._cycle_heartbeat_detail(
+                        run_id=self.run_id, reason="daily_loss_limit", orders=0))
+                except Exception:
+                    pass
             try:
                 residual = _plain(self.provider.positions())
             except Exception as exc:  # noqa: BLE001
@@ -635,22 +713,37 @@ class EngineCycleMixin:
                     "closed": complete, "residual": residual}
 
         if monitored.get("failed"):
+            self._pause_with_residual_risk("position_close_failed")
             return {"action": "hold", "reason": "position_close_failed", **monitored}
 
         if monitored.get("closed"):
             try:
                 self.reconcile()
             except Exception as exc:  # noqa: BLE001
+                self._pause_with_residual_risk("close_reconciliation_failed")
                 return {"action": "hold", "reason": "close_reconciliation_failed", "error": str(exc)}
             # A submitted close must be reconciled before any new exposure is
             # considered, even if the broker has not filled it yet.
             try:
-                state.write_heartbeat("running", **self._cycle_heartbeat_detail(
-                    run_id=self.run_id, reason="position_close_submitted",
-                    orders=0))
+                state.write_heartbeat(
+                    "paused" if protection_only else "running",
+                    **self._cycle_heartbeat_detail(
+                        run_id=self.run_id,
+                        reason=("operator_pause" if protection_only else
+                                "position_close_submitted"),
+                        orders=0))
             except Exception:
                 pass
             return {"action": "close", **monitored}
+
+        if protection_only:
+            try:
+                state.write_heartbeat("paused", **self._cycle_heartbeat_detail(
+                    run_id=self.run_id, reason="operator_pause", orders=0))
+            except Exception:
+                pass
+            return {"action": "hold", "reason": "operator_pause",
+                    "closed": False, "residual": _plain(self.provider.positions())}
 
         if not self._refresh_edge():
             try:

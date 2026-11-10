@@ -49,6 +49,7 @@ def mapping_bars(symbol: str, closes: list[float], *, day: int = 28) -> list[dic
             "observed_at": (stamp + timedelta(minutes=1)).isoformat(),
             "provider": "test",
             "feed": "iex",
+            "source_mode": "forward_observed",
             "open": previous,
             "high": max(previous, close) + 0.1,
             "low": min(previous, close) - 0.1,
@@ -419,7 +420,7 @@ class CrossSectionalIntegrationTests(unittest.TestCase):
         quotes = {"QQQ": [{
             "symbol": "QQQ", "timestamp": quote_at, "as_of": quote_at,
             "observed_at": quote_at, "provider": "test", "feed": "iex",
-            "bid": 100.9, "ask": 101.1,
+            "source_mode": "forward_observed", "bid": 100.9, "ask": 101.1,
         }]}
         plan = {"symbol": "QQQ", "direction": "long", "entry_price": 101.0,
                 "stop_price": 100.0, "target_price": 103.0,

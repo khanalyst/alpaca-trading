@@ -481,24 +481,44 @@ class IBRResult:
         }
 
 
-def _candidate_spread_bps(quotes, symbol: str, bar: UnderlyingBar) -> float | None:
-    """Quoted spread in bps at a candidate bar's close, or ``None``.
+def _candidate_spread_bps(
+        quotes, symbol: str, bar: UnderlyingBar,
+        policy: ReplayPolicy | None = None) -> float | None:
+    """Quoted spread in bps at a candidate's causal decision boundary.
 
     The runtime reads the spread off the candidate bar it is handed.  Replay
     has to recover the same observation from the recorded quote corpus, so it
-    takes the last quote at or before the bar's close.  ``None`` means the
-    corpus carries no quote for that instant, which the caller treats the way
-    the contract does: silence, not a rejection.
+    takes the last quote at or before the later of the bar's close and the
+    bar's own availability. ``None`` means the corpus carries no quote for
+    that instant, which the caller treats the way the contract does: silence,
+    not a rejection.
+
+    Availability is checked separately from market timestamp.  A quote can
+    describe a market instant before the bar close while arriving later, and
+    using it would let a replay reject a candidate on information the runtime
+    could not yet have observed.  The policy is threaded through so the
+    explicit historical diagnostic lane retains the same visibility exception
+    as boundary fills.
     """
     if not isinstance(quotes, Mapping):
         return None
     rows = quotes.get(str(symbol).upper()) or quotes.get(str(symbol))
     if not rows:
         return None
+    replay_policy = policy if policy is not None else ReplayPolicy()
+    decision_at = bar.end
+    available_at = _available(bar, replay_policy)
+    if available_at is not None and available_at > decision_at:
+        decision_at = available_at
     latest = None
     for quote in rows:
         stamp = getattr(quote, "timestamp", None)
-        if stamp is None or stamp > bar.end:
+        if stamp is None or stamp > decision_at:
+            continue
+        if not replay_record_is_available(
+                quote, decision_at,
+                allow_historical_backfill_diagnostics=(
+                    replay_policy.allow_historical_backfill_diagnostics)):
             continue
         if latest is None or stamp >= getattr(latest, "timestamp", stamp):
             latest = quote
@@ -1059,7 +1079,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                 admission_rejects["stale_candidate_bar"] += 1
                 return False
         if cfg.max_spread_bps < float("inf"):
-            spread = _candidate_spread_bps(quotes, symbol, bar)
+            spread = _candidate_spread_bps(
+                quotes, symbol, bar, policy=cfg.policy)
             if spread is not None and spread > cfg.max_spread_bps:
                 admission_rejects["spread_above_limit"] += 1
                 return False

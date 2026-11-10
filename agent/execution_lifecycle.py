@@ -40,11 +40,19 @@ _TERMINAL_ORDER_STATUSES = {
 _PROTECTIVE_TERMINAL_STATUSES = _TERMINAL_ORDER_STATUSES | {
     "done", "closed", "done_for_day",
 }
+_CONFIRMED_LIVE_ORDER_STATUSES = frozenset({
+    "accepted", "new", "held", "partially_filled",
+})
+_CONFIRMED_PROTECTIVE_LIVE_STATUSES = frozenset({"accepted", "new", "held"})
 _OPTION_PROFILES = frozenset({"option", "options"})
 _RULE_EXIT_SCHEMAS = frozenset({RULE_SCHEMA_V3, RULE_SCHEMA_V4, RULE_SCHEMA_V5})
 
 
 _EDGE_OUTBOX_WARN = 500
+
+
+class _CloseResponseUnconfirmed(AlpacaError):
+    """A close may exist at the broker but its response cannot prove it."""
 
 
 def _epoch_seconds(value: Any) -> float:
@@ -191,6 +199,17 @@ def _status_text(order: Any) -> str:
     return str(getattr(value, "value", value)).split(".")[-1].strip().lower()
 
 
+def _validated_close_response(order: Any) -> tuple[str, str]:
+    """Require broker identity and a known state before retiring an intent."""
+    order_id = str(_value(order, "id", "") or "").strip()
+    if not order_id:
+        raise _CloseResponseUnconfirmed("close response has no broker order; reconciliation required")
+    status = _status_text(order)
+    if status not in _CONFIRMED_LIVE_ORDER_STATUSES | _TERMINAL_ORDER_STATUSES:
+        raise _CloseResponseUnconfirmed("close response has unknown broker status; reconciliation required")
+    return order_id, status
+
+
 def _broker_protected(legs: list[dict]) -> bool:
     """Only a complete live pair is protection; a half-bracket is not."""
     return {"stop", "target"} <= {str(leg.get("role")) for leg in legs if _leg_live(leg)}
@@ -217,6 +236,17 @@ def _value(obj: Any, name: str, default=None):
     if isinstance(obj, Mapping):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def _trade_lifecycle_id(trade: Any, symbol: str = "") -> str:
+    if isinstance(trade, Mapping):
+        if trade.get("lifecycle_id"):
+            return str(trade["lifecycle_id"])
+        if trade.get("order_id"):
+            return f"entry:{trade['order_id']}"
+        if trade.get("opened_at") is not None:
+            return f"opened:{trade['opened_at']}"
+    return f"orphan:{str(symbol).upper()}"
 
 
 class ExecutionLifecycleMixin:
@@ -889,6 +919,9 @@ class ExecutionLifecycleMixin:
                                    else fill_anchor_ts),
             "setup_type": plan.get("setup_type", "ibr"),
             "setup_id": plan.get("setup_id"), "order_id": order_state.get("order_id"),
+            "lifecycle_id": _trade_lifecycle_id(
+                {"order_id": order_state.get("order_id"),
+                 "opened_at": existing.get("opened_at", entry_anchor_ts)}),
             "status": "open", "stop_price": plan.get("underlying_stop_price", plan.get("stop_price")),
             "target_price": plan.get("underlying_target_price", plan.get("target_price")),
             "force_flat_at": existing.get(
@@ -1119,7 +1152,8 @@ class ExecutionLifecycleMixin:
         if not isinstance(active, Mapping):
             return
         for symbol, trade in list(active.items()):
-            if not _option_trade(trade) or trade.get("closing_order_id"):
+            if (not _option_trade(trade) or trade.get("closing_order_id") or
+                    trade.get("close_intent_id")):
                 continue
             if str(trade.get("status", "open")).lower() != "open":
                 continue
@@ -1215,6 +1249,7 @@ class ExecutionLifecycleMixin:
                     result = close(symbol, qty=qty)
                 except TypeError:
                     result = close(symbol)
+            _validated_close_response(result)
             try:
                 state.log_order(result, None, action="close", reason=reason,
                                 symbol=symbol, qty=float(qty), runtime_mode=self.mode,
@@ -1235,6 +1270,7 @@ class ExecutionLifecycleMixin:
         request = OrderRequest(symbol, qty, side, type="market", time_in_force="day",
                                client_order_id=client_order_id)
         result = self.provider.submit_order(request)
+        _validated_close_response(result)
         try:
             state.log_order(result, request, action="close", reason=reason,
                             runtime_mode=self.mode, run_id=self.run_id)
@@ -1761,9 +1797,22 @@ class ExecutionLifecycleMixin:
                 self._event("protection_rearm_failed", {
                     "symbol": symbol, "reason": reason, "error": str(exc)})
                 return None
-            status = str(_value(order, "status", "accepted") or "accepted").lower()
-            if status not in _PROTECTIVE_TERMINAL_STATUSES:
+            status = _status_text(order)
+            broker_id = str(_value(order, "id", "") or "").strip()
+            if not broker_id or not status:
+                self._event("protection_rearm_failed", {
+                    "symbol": symbol, "reason": reason,
+                    "error": "stop response has no confirmed broker identity/status"})
+                return None
+            if status in _CONFIRMED_PROTECTIVE_LIVE_STATUSES:
                 break
+            if (status not in _PROTECTIVE_TERMINAL_STATUSES or status == "filled" or
+                    (self._number(_value(order, "filled_qty", 0)) or 0.0) > 0):
+                self._event("protection_rearm_failed", {
+                    "symbol": symbol, "reason": reason,
+                    "error": "stop response does not confirm live protection",
+                    "broker_status": status})
+                return None
             # A reused id returned an earlier, already-terminal re-arm.
             order = None
         if order is None:
@@ -1771,9 +1820,9 @@ class ExecutionLifecycleMixin:
                 "symbol": symbol, "reason": reason,
                 "error": "every re-arm attempt returned a terminal order"})
             return None
-        leg = {"order_id": str(_value(order, "id", "") or request.client_order_id),
+        leg = {"order_id": str(_value(order, "id", "")).strip(),
                "role": "stop",
-               "status": str(_value(order, "status", "accepted") or "accepted").lower(),
+               "status": _status_text(order),
                "price": float(price), "qty": float(held), "rearmed": True,
                "rearm_reason": str(reason), "rearm_attempt": attempt}
 
@@ -1965,6 +2014,80 @@ class ExecutionLifecycleMixin:
             "symbol": symbol, "old_order_id": old_id,
             "new_order_id": new_id, "stop_price": desired})
 
+    def _monitor_close_intent(self, symbol: str, trade: Mapping,
+                              position: Any, reason: str,
+                              exit_updates: Mapping) -> tuple[dict, dict]:
+        """Durably bind an exit before its first broker-side mutation."""
+        trade = dict(trade)
+        trade.setdefault("symbol", symbol)
+        trade.setdefault("opened_at", time.time())
+        trade.setdefault("qty", str(_value(position, "qty", 0)))
+        lifecycle = _trade_lifecycle_id(trade, symbol)
+        current = state.load_state()
+        old_key = str(trade.get("close_intent_id") or "")
+        old = current.get("orders", {}).get(old_key, {})
+        reusable = (isinstance(old, Mapping) and
+                    old.get("monitor_close_intent") is True and
+                    old.get("status") == "intent" and
+                    old.get("lifecycle_id") == lifecycle)
+        if reusable:
+            if (str(old.get("entry_order_id") or "") !=
+                    str(trade.get("order_id") or "") or
+                    self._number(old.get("qty")) !=
+                    abs(self._number(_value(position, "qty", 0)) or 0.0)):
+                raise AlpacaError("pending close quantity or exposure changed; reconcile first")
+            intent = dict(old)
+            reason = str(intent["reason"])
+        else:
+            previous = self._number(trade.get("closing_attempt"))
+            attempt = int(previous) + 1 if previous is not None else 0
+            client = self._exit_client_id(
+                "close", symbol, reason, trade=trade, position=position,
+                attempt=attempt)
+            intent = {
+                "order_id": f"monitor-close-intent:{client}",
+                "client_order_id": client, "symbol": symbol,
+                "entry_order_id": trade.get("order_id"),
+                "lifecycle_id": lifecycle, "action": "close", "status": "intent",
+                "monitor_close_intent": True, "reason": reason,
+                "exit_reason": canonical_exit_reason(reason),
+                "qty": str(abs(Decimal(str(_value(position, "qty", 0))))),
+                "side": ("sell" if str(_value(position, "side", "long")).lower()
+                         in {"long", "buy"} else "buy"),
+                "attempt": attempt, "closing_attempt": attempt,
+                "created_ts": time.time(), "updated_ts": time.time(),
+            }
+        updates = {**dict(exit_updates), "lifecycle_id": lifecycle,
+                   "close_intent_id": intent["order_id"],
+                   "close_intent_reason": reason,
+                   "closing_attempt": intent["attempt"], "status": "closing"}
+        trade.update(updates)
+
+        def persist(latest: dict) -> dict:
+            existing = latest.setdefault("active_trades", {}).get(symbol, {})
+            if (isinstance(existing, Mapping) and existing.get("order_id") and
+                    trade.get("order_id") and
+                    str(existing["order_id"]) != str(trade["order_id"])):
+                raise AlpacaError("close intent exposure changed")
+            latest["active_trades"][symbol] = deepcopy(trade)
+            latest.setdefault("orders", {})[intent["order_id"]] = dict(intent)
+            protection = latest.get("protection", {}).get(symbol)
+            if isinstance(protection, dict):
+                protection.update(updates)
+            return latest
+
+        state.update_state(persist)
+        return intent, updates
+
+    def _pause_failed_monitor_close(self) -> None:
+        self._reconciled = False
+        self._preflight_error = "close unresolved; protection-only reconciliation required"
+        try:
+            state.commit({"operator_pause": True},
+                         transition=(state.RUNNING, state.PAUSED))
+        except Exception:
+            pass
+
     def _monitor_positions(self, now: datetime, positions: list[Any], *,
                            market_rows: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Evaluate persisted protection on every cycle and close safely."""
@@ -1974,6 +2097,7 @@ class ExecutionLifecycleMixin:
         closed = []
         failed = []
         changed = False
+        retired_close_intents: set[str] = set()
         for position in positions:
             symbol = str(_value(position, "symbol", "")).upper()
             trade = active.get(symbol, {}) if isinstance(active, Mapping) else {}
@@ -1982,10 +2106,14 @@ class ExecutionLifecycleMixin:
                     str(trade.get("closing_order_id")), {})
                 saved_status = str(saved_order.get("status", "")).lower() \
                     if isinstance(saved_order, Mapping) else ""
+                if isinstance(saved_order, Mapping) and saved_order.get("action") == "flatten":
+                    continue
                 # Do not send another close while the prior one is live.  A
                 # rejected/cancelled/not-found/filled terminal order may be
                 # retried if the broker still reports residual quantity.
                 if saved_status and saved_status not in _TERMINAL_ORDER_STATUSES:
+                    continue
+                if saved_status == "filled":
                     continue
             legs = _leg_rows(trade)
             if any(str(leg.get("status", "")).lower() == "filled" for leg in legs):
@@ -2157,6 +2285,10 @@ class ExecutionLifecycleMixin:
                 # Missing local prices are only an emergency while the local
                 # poller is the protection.
                 reason = "protection_data_unavailable"
+            if trade.get("close_intent_id") and trade.get("close_intent_reason"):
+                reason = str(trade["close_intent_reason"])
+            elif trade.get("closing_order_id") and trade.get("closing_reason"):
+                reason = str(trade["closing_reason"])
             if reason:
                 exit_reason = canonical_exit_reason(reason)
                 # Measured before cancelling: the cancel marks legs terminal.
@@ -2164,29 +2296,34 @@ class ExecutionLifecycleMixin:
                 legs_cancelled = False
                 close_client_id = None
                 try:
+                    intent, intent_updates = self._monitor_close_intent(
+                        symbol, trade, position, reason, exit_updates)
+                    reason = str(intent["reason"])
+                    exit_reason = canonical_exit_reason(reason)
+                    trade = {**dict(trade), **intent_updates}
+                    trade.setdefault("symbol", symbol)
+                    trade.setdefault("opened_at", state.load_state()["active_trades"][symbol]["opened_at"])
+                    active[symbol] = trade
+                    runtime.setdefault("orders", {})[intent["order_id"]] = intent
+                    legs = _leg_rows(trade)
                     if not self._cancel_protective_legs(symbol, legs):
                         failed.append({"symbol": symbol, "reason": reason,
                                        "error": "protective legs could not be cancelled"})
+                        self._pause_failed_monitor_close()
                         continue
                     legs_cancelled = had_live_legs or _bracket_stripped(trade)
-                    prior_attempt = self._number(trade.get("closing_attempt")) \
-                        if isinstance(trade, Mapping) else None
-                    attempt = int(prior_attempt) + 1 if prior_attempt is not None else 0
-                    close_client_id = self._exit_client_id(
-                        "close", symbol, reason,
-                        trade=trade if isinstance(trade, Mapping) else None,
-                        position=position, attempt=attempt)
+                    attempt = int(intent["attempt"])
+                    close_client_id = str(intent["client_order_id"])
                     order = self._close_position(
                         position, reason, attempt=attempt,
                         client_order_id=close_client_id)
+                    _validated_close_response(order)
                     # Preserve the watchdog's historical response shape; the
                     # canonical cause is durable on the trade/order records.
-                    closed.append({"symbol": symbol, "reason": reason})
                     if isinstance(trade, dict):
                         trade.update(exit_updates)
-                        close_fill = self._number(getattr(order, "filled_avg_price", None))
-                        close_order_id = str(getattr(order, "id", None) or
-                                             close_client_id)
+                        close_fill = self._number(_value(order, "filled_avg_price", None))
+                        close_order_id = str(_value(order, "id"))
                         trade.update({"status": "closing", "closing_reason": reason,
                                       "closing_exit_reason": exit_reason,
                                       "canonical_exit_reason": exit_reason,
@@ -2197,27 +2334,51 @@ class ExecutionLifecycleMixin:
                                       "closing_attempt": attempt,
                                       "updated_ts": time.time()})
                         active[symbol] = trade
+                        trade.pop("close_intent_id", None)
+                        trade.pop("close_intent_reason", None)
+                        runtime["orders"].pop(intent["order_id"], None)
                         runtime.setdefault("orders", {})[close_order_id] = {
                             "order_id": close_order_id, "symbol": symbol,
                             "entry_order_id": trade.get("order_id"),
-                            "status": str(getattr(order, "status", "submitted") or
-                                          "submitted").lower(),
-                            "client_order_id": getattr(order, "client_order_id", None),
+                            "status": _status_text(order),
+                            "client_order_id": _value(order, "client_order_id", None) or close_client_id,
                             "qty": str(_value(position, "qty", 0)),
                             "side": "sell" if str(_value(position, "side", "long")).lower()
                             in {"long", "buy"} else "buy",
                             "action": "close", "reason": reason,
+                            "lifecycle_id": intent["lifecycle_id"],
                             "exit_reason": exit_reason,
                             "attempt": attempt, "closing_attempt": attempt,
                             "updated_ts": time.time(),
                         }
+                        row = dict(runtime["orders"][close_order_id])
+
+                        def promote(current: dict) -> dict:
+                            current["active_trades"][symbol] = deepcopy(trade)
+                            orders = current.setdefault("orders", {})
+                            orders.pop(intent["order_id"], None)
+                            orders[close_order_id] = dict(row)
+                            protection = current.get("protection", {}).get(symbol)
+                            if isinstance(protection, dict):
+                                protection.pop("close_intent_id", None)
+                                protection.pop("close_intent_reason", None)
+                            return current
+
+                        state.update_state(promote)
+                        retired_close_intents.add(intent["order_id"])
                         changed = True
+                        if (_status_text(order) in _TERMINAL_ORDER_STATUSES and
+                                _status_text(order) != "filled" and
+                                not (self._number(_value(order, "filled_qty", 0)) or 0.0)):
+                            raise AlpacaError("broker close was terminal without a fill")
+                    closed.append({"symbol": symbol, "reason": reason})
                 except Exception as exc:  # noqa: BLE001
                     failed.append({"symbol": symbol, "reason": reason,
                                    "error": str(exc)})
                     self._event("close_failed", {"symbol": symbol, "reason": reason,
                                                   "error": str(exc)})
-                    if legs_cancelled:
+                    self._pause_failed_monitor_close()
+                    if legs_cancelled and not isinstance(exc, _CloseResponseUnconfirmed):
                         # The bracket is gone and the close did not go
                         # through: restore a broker stop until the retry.
                         rearmed = self._rearm_protective_stop(
@@ -2260,8 +2421,10 @@ class ExecutionLifecycleMixin:
                     **current,
                     "active_trades": dict(active),
                     "protection": protection,
-                    "orders": {**current.get("orders", {}),
-                               **runtime.get("orders", {})},
+                    "orders": {key: row for key, row in
+                               {**current.get("orders", {}),
+                                **runtime.get("orders", {})}.items()
+                               if key not in retired_close_intents},
                 })
             except Exception as exc:  # noqa: BLE001
                 self._reconciled = False
@@ -2495,6 +2658,48 @@ class ExecutionLifecycleMixin:
                 continue
             broker_order = by_id.get(str(saved.get("order_id") or key)) or \
                 by_client.get(str(saved.get("client_order_id") or ""))
+            if saved.get("monitor_close_intent") is True:
+                if broker_order is None:
+                    # A local pre-submit marker is not a missing broker
+                    # order. Retry its exact client id after reconciliation.
+                    continue
+                actual_id = str(_value(broker_order, "id", "") or "")
+                if (not actual_id or
+                        str(_value(broker_order, "client_order_id", "") or "") !=
+                        str(saved.get("client_order_id") or "") or
+                        str(_value(broker_order, "symbol", "")).upper() !=
+                        str(saved.get("symbol", "")).upper() or
+                        str(_value(broker_order, "side", "")).lower() !=
+                        str(saved.get("side", "")).lower() or
+                        self._number(_value(broker_order, "qty", None)) !=
+                        self._number(saved.get("qty"))):
+                    raise AlpacaError("broker close disagrees with durable close intent")
+                saved.pop("monitor_close_intent", None)
+                saved["order_id"] = actual_id
+                order_state.pop(key, None)
+                order_state[actual_id] = saved
+                retired_keys.add(str(key))
+                for book in (previous, current.get("active_trades", {})):
+                    trade = book.get(str(saved.get("symbol", "")).upper())
+                    if not isinstance(trade, dict) or trade.get("close_intent_id") != key:
+                        continue
+                    if _trade_lifecycle_id(trade) != saved.get("lifecycle_id"):
+                        raise AlpacaError("close intent belongs to a different exposure")
+                    trade.update({
+                        "closing_order_id": actual_id,
+                        "closing_reason": saved.get("reason"),
+                        "closing_exit_reason": saved.get("exit_reason"),
+                        "canonical_exit_reason": saved.get("exit_reason"),
+                        "closing_attempt": saved.get("attempt", 0),
+                        "status": "closing",
+                    })
+                    trade.pop("close_intent_id", None)
+                    trade.pop("close_intent_reason", None)
+                protection = current.get("protection", {}).get(
+                    str(saved.get("symbol", "")).upper())
+                if isinstance(protection, dict):
+                    protection.pop("close_intent_id", None)
+                    protection.pop("close_intent_reason", None)
             if broker_order is not None and saved.get("submit_unresolved") is True:
                 broker_order = self._adopt_unresolved_entry(
                     order_state, str(key), saved, broker_order, retired_keys)
@@ -2653,7 +2858,8 @@ class ExecutionLifecycleMixin:
                 not refreshed_item.get("order_id") or
                 str(item.get("order_id")) == str(refreshed_item.get("order_id")))
             if isinstance(refreshed_item, Mapping) and same_exposure:
-                for key in ("protective_legs", "closing_order_id",
+                for key in ("protective_legs", "lifecycle_id", "closing_order_id",
+                            "close_intent_id", "close_intent_reason", "closing_attempt",
                             "closing_reason", "closing_exit_reason",
                             "canonical_exit_reason", "closing_price", "rule_schema",
                             "initial_stop_price", "active_stop_price",
@@ -2682,13 +2888,31 @@ class ExecutionLifecycleMixin:
             if not item:
                 # A broker position without local protection is reconciled as
                 # unprotected; the same cycle's monitor closes it fail-closed.
+                orphan_opened = time.time()
                 item = {"symbol": symbol, "underlying_symbol": symbol,
-                        "execution_profile": "unknown", "opened_at": time.time(),
+                        "execution_profile": "unknown", "opened_at": orphan_opened,
+                        "lifecycle_id": f"orphan:{symbol}:{orphan_opened:.6f}",
                         "status": "unprotected", "risk_usd": 0.0,
                         "intended_risk_usd": None,
                         "delivered_risk_usd": 0.0,
                         "risk_delivery_ratio": None,
                         "risk_shortfall_usd": None}
+                pending_flatten = [saved for saved in order_state.values()
+                    if isinstance(saved, Mapping) and
+                    str(saved.get("symbol", "")).upper() == symbol and
+                    saved.get("action") == "flatten" and saved.get("lifecycle_id") and
+                    (str(saved.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES or
+                     (saved.get("status") == "filled" and
+                      0 < (self._number(saved.get("filled_qty")) or 0) <
+                      (self._number(saved.get("qty")) or 0)))]
+                if pending_flatten:
+                    latest = max(pending_flatten, key=lambda row: (
+                        self._number(row.get("attempt")) or 0,
+                        self._number(row.get("updated_ts")) or 0))
+                    item.update({"lifecycle_id": latest["lifecycle_id"],
+                                 "status": "closing", "closing_reason": latest.get("reason"),
+                                 "closing_order_id": latest.get("order_id"),
+                                 "closing_attempt": latest.get("attempt", 0)})
                 prior_attempts = [
                     self._number(saved.get("attempt", saved.get("closing_attempt")))
                     for saved in order_state.values()
@@ -2711,6 +2935,7 @@ class ExecutionLifecycleMixin:
                                     "unprotected" if unprotected else "open"),
                          "position_confirmed": True,
                          "updated_ts": time.time()})
+            item.setdefault("lifecycle_id", _trade_lifecycle_id(item, symbol))
             active[symbol] = item
         # Include fill-first trades created earlier in this same reconcile.
         # Their explicit false marker is the only safe basis for retaining an

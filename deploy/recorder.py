@@ -456,9 +456,19 @@ def _save_partition_source(output: Path, day: date, source_mode: str) -> None:
     beside the partition prevents that rebuild from silently relabelling a
     historical backfill as forward-observed evidence.
     """
-    if source_mode != "historical_backfill":
+    if source_mode not in {"forward_observed", "historical_backfill"}:
         raise RuntimeError("unsupported recorder partition source mode")
     path = _partition_source_path(output, day)
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(existing, dict) or
+                existing.get("schema") != PARTITION_SOURCE_SCHEMA or
+                existing.get("partition") != _partition_path(output, day).name or
+                existing.get("source_mode") not in {
+                    "forward_observed", "historical_backfill"}):
+            raise RuntimeError(f"invalid recorder partition source marker {path}")
+        if existing["source_mode"] == "historical_backfill":
+            source_mode = "historical_backfill"
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -489,7 +499,7 @@ def _partition_sources_from_markers(output: Path) -> dict[str, dict[str, str]]:
                 payload.get("schema") != PARTITION_SOURCE_SCHEMA or
                 not isinstance(partition, str) or
                 path.name != partition + ".source.json" or
-                source_mode != "historical_backfill"):
+                source_mode not in {"forward_observed", "historical_backfill"}):
             raise RuntimeError(f"invalid recorder partition source marker {path}")
         # Marker-before-partition ordering prevents a backfilled CSV from ever
         # looking forward-observed. A crash in that narrow gap can leave a
@@ -2476,6 +2486,20 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
                     sources[_partition_path(output, day).name] = {
                         "source_mode": "historical_backfill",
                     }
+                # Declare forward provenance only before the first append to
+                # a new partition. Existing unmarked CSVs are unproven; adding
+                # new live rows must never relabel their historical contents.
+                forward_days = {_session_date(_timestamp(row["timestamp"]))
+                                for row in unique_rows} - historical_days
+                for day in sorted(forward_days):
+                    partition = _partition_path(output, day)
+                    marker = _partition_source_path(output, day)
+                    if not partition.exists():
+                        _save_partition_source(output, day, "forward_observed")
+                        sources[partition.name] = {
+                            "source_mode": json.loads(marker.read_text(
+                                encoding="utf-8"))["source_mode"],
+                        }
                 _append_partitions(
                     output, unique_rows, telemetry=telemetry)
                 # The corpus append happens first.  If the process dies before the

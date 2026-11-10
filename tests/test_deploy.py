@@ -379,6 +379,18 @@ class _StockDataFake:
 
 
 class DeployTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        # Recorder unit cases exercise migration/index/provider behavior, not
+        # the host's available bytes.  Keep those cases deterministic on
+        # smaller developer volumes; capacity-specific tests use their own
+        # nested disk-usage patch and therefore still assert fail-closed.
+        self._recorder_disk_usage = patch.object(
+            recorder.shutil, "disk_usage",
+            return_value=SimpleNamespace(free=10 * 1024 ** 3))
+        self._recorder_disk_usage.start()
+        self.addCleanup(self._recorder_disk_usage.stop)
+
     def test_container_context_excludes_private_backups_and_provider_secret(self):
         ignored = set(Path(".dockerignore").read_text().splitlines())
         self.assertTrue({"outputs", ".codex-work", "research-llm.env", ".env"}

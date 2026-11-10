@@ -14,11 +14,14 @@ from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
 from .contracts.rule import canonical_exit_reason
 from .execution_lifecycle import (
+    _CloseResponseUnconfirmed,
     _TERMINAL_ORDER_STATUSES,
     _bracket_stripped,
     _leg_live,
     _leg_rows,
     _plain,
+    _trade_lifecycle_id,
+    _validated_close_response,
     _value,
 )
 
@@ -102,7 +105,168 @@ class RuntimeControlMixin:
                 found[str(symbol).upper()] = live
         return found
 
+    @staticmethod
+    def _flatten_rows(runtime: Mapping[str, Any], symbol: str) -> list[dict]:
+        orders = runtime.get("orders", {}) if isinstance(runtime, Mapping) else {}
+        if not isinstance(orders, Mapping):
+            return []
+        rows = [dict(row) for row in orders.values()
+                if isinstance(row, Mapping) and
+                str(row.get("symbol", "")).upper() == symbol and
+                str(row.get("action", "")).lower() == "flatten"]
+        rows.sort(key=lambda row: (
+            int(row.get("attempt", 0) or 0),
+            float(row.get("updated_ts", 0) or 0),
+            str(row.get("order_id", ""))))
+        return rows
+
+    def _flatten_lifecycle_id(self, symbol: str, trade: Mapping | None,
+                              runtime: Mapping[str, Any]) -> str:
+        """Resolve or allocate a durable flatten identity for one position."""
+        if isinstance(trade, Mapping) and trade:
+            return _trade_lifecycle_id(trade, symbol)
+        rows = self._flatten_rows(runtime, symbol)
+        for row in reversed(rows):
+            lifecycle = row.get("lifecycle_id")
+            status = str(row.get("status", "")).lower()
+            if lifecycle and status not in _TERMINAL_ORDER_STATUSES:
+                return str(lifecycle)
+        return f"orphan:{symbol}:{time.time_ns()}"
+
+    def _persist_flatten_order(self, order_state: Mapping[str, Any], *,
+                               intent_id: str | None = None) -> dict:
+        """Promote a flatten intent/order and bind it to local exposure."""
+        row = dict(order_state)
+        order_id = str(row.get("order_id") or "")
+        symbol = str(row.get("symbol") or "").upper()
+
+        def record(current: dict) -> dict:
+            orders = {**current.get("orders", {})}
+            if intent_id:
+                orders.pop(intent_id, None)
+            orders[order_id] = row
+            active = {**current.get("active_trades", {})}
+            bound = active.get(symbol)
+            if isinstance(bound, Mapping):
+                bound = dict(bound)
+                exit_reason = canonical_exit_reason(row.get("reason"))
+                bound.update({
+                    "status": "closing",
+                    "closing_reason": row.get("reason"),
+                    "closing_exit_reason": exit_reason,
+                    "canonical_exit_reason": exit_reason,
+                    "closing_price": row.get("filled_avg_price"),
+                    "closing_order_id": order_id,
+                    "closing_attempt": row.get("attempt", 0),
+                    "updated_ts": time.time(),
+                })
+                active[symbol] = bound
+            return {**current, "orders": orders, "active_trades": active}
+
+        return state.update_state(record)
+
+    @staticmethod
+    def _persist_flatten_intent(intent_state: Mapping[str, Any]) -> dict:
+        """Durably reserve a symbol before its protective legs are cancelled."""
+        row = dict(intent_state)
+        intent_id = str(row.get("order_id") or "")
+        symbol = str(row.get("symbol") or "").upper()
+
+        def record(current: dict) -> dict:
+            orders = {**current.get("orders", {}), intent_id: row}
+            active = {**current.get("active_trades", {})}
+            bound = active.get(symbol)
+            if isinstance(bound, Mapping):
+                bound = dict(bound)
+                exit_reason = canonical_exit_reason(row.get("reason"))
+                bound.update({
+                    "status": "closing",
+                    "closing_reason": row.get("reason"),
+                    "closing_exit_reason": exit_reason,
+                    "canonical_exit_reason": exit_reason,
+                    "closing_order_id": intent_id,
+                    "closing_attempt": row.get("attempt", 0),
+                    "updated_ts": time.time(),
+                })
+                active[symbol] = bound
+            return {**current, "orders": orders, "active_trades": active}
+
+        return state.update_state(record)
+
+    def _promote_flatten_intents(self, broker_orders: list[Any] | None) -> bool:
+        """Recover broker orders submitted after a durable intent was written."""
+        runtime = state.load_state()
+        orders = runtime.get("orders", {}) if isinstance(runtime, Mapping) else {}
+        if not isinstance(orders, Mapping):
+            return False
+        promoted = False
+        for intent_id, intent in list(orders.items()):
+            if (not isinstance(intent, Mapping) or
+                    str(intent.get("action", "")).lower() != "flatten" or
+                    str(intent.get("status", "")).lower() != "intent"):
+                continue
+            client_order_id = str(intent.get("client_order_id") or "")
+            if not client_order_id:
+                continue
+            broker_order = next(
+                (order for order in (broker_orders or [])
+                 if str(_value(order, "client_order_id", "") or "") == client_order_id),
+                None,
+            )
+            if broker_order is None:
+                continue
+            try:
+                order_id, broker_status = _validated_close_response(broker_order)
+            except AlpacaError as exc:
+                self._event("flatten_intent_unresolved", {
+                    "client_order_id": client_order_id, "reason": str(exc)})
+                continue
+            row = dict(intent)
+            row.update({
+                "order_id": order_id,
+                "status": broker_status,
+                "filled_qty": float(_value(broker_order, "filled_qty", 0) or 0),
+                "filled_avg_price": _value(
+                    broker_order, "filled_avg_price", None),
+                "updated_ts": time.time(),
+            })
+            self._persist_flatten_order(row, intent_id=str(intent_id))
+            promoted = True
+        return promoted
+
+    def _recover_flatten_protection(self) -> dict:
+        """Restore confirmed equity stops only after fresh recovery reads."""
+        from .flatten_protection import restore_flatten_protection
+
+        try:
+            positions = self.provider.positions()
+        except Exception:
+            positions = None
+        try:
+            orders = self.provider.orders(status="all")
+        except Exception:
+            orders = None
+        try:
+            evidence = restore_flatten_protection(self, positions, orders)
+        except Exception as exc:
+            evidence = {"restored": [], "errors": [{"reason": str(exc)}],
+                        "skipped": []}
+        self._event("flatten_protection_recovery", evidence)
+        return evidence
+
     def _flatten_all_impl(self, reason: str = "operator") -> bool:
+        try:
+            complete = self._flatten_positions(reason)
+        except Exception:
+            self._recover_flatten_protection()
+            self._pause_with_residual_risk("flatten_failed")
+            raise
+        if not complete:
+            self._recover_flatten_protection()
+            self._pause_with_residual_risk("flatten_incomplete")
+        return complete
+
+    def _flatten_positions(self, reason: str = "operator") -> bool:
         def order_status(order: Any) -> str:
             value = _value(order, "status", "")
             return str(getattr(value, "value", value)).split(".")[-1].lower()
@@ -144,6 +308,7 @@ class RuntimeControlMixin:
         except Exception:  # noqa: BLE001
             pass
         failed_symbols: set[str] = set()
+        ambiguous_close_symbols: set[str] = set()
         # Client ids of every close this call submitted, per symbol.  The
         # end-of-call re-arm looks each up, so it never places a stop over a
         # close that reached the broker or has already filled.
@@ -169,6 +334,14 @@ class RuntimeControlMixin:
                 self._event("flatten_orders_error", {"reason": str(exc)})
                 loop_error = f"orders unavailable: {exc}"
                 break
+            try:
+                self._promote_flatten_intents(broker_orders)
+            except Exception as exc:  # noqa: BLE001
+                self._event("flatten_state_error", {
+                    "reason": "flatten_intent_recovery_failed",
+                    "error": str(exc),
+                })
+                return False
             working_orders = [
                 order for order in (broker_orders or [])
                 if order_status(order) not in _TERMINAL_ORDER_STATUSES
@@ -191,6 +364,25 @@ class RuntimeControlMixin:
                 except Exception as exc:  # noqa: BLE001
                     self._event("flatten_reconcile_error", {"reason": str(exc)})
                     return False
+                reconciled = state.load_state()
+                residual_active = reconciled.get("active_trades", {}) \
+                    if isinstance(reconciled, Mapping) else {}
+                residual_protection = reconciled.get("protection", {}) \
+                    if isinstance(reconciled, Mapping) else {}
+                if residual_active or residual_protection:
+                    # No broker positions or working orders is the
+                    # authoritative flat boundary.  Reconcile can retain a
+                    # local close-intent row when a protective child filled
+                    # during cancellation; clear only the local exposure
+                    # buckets while retaining all durable order evidence.
+                    try:
+                        state.update_state(lambda current: {
+                            **current, "active_trades": {}, "protection": {}})
+                    except Exception as exc:  # noqa: BLE001
+                        self._event("flatten_state_error", {
+                            "reason": "flat_local_cleanup_failed",
+                            "error": str(exc)})
+                        return False
                 self._event("flatten_confirmed", {"reason": reason, "poll": poll})
                 return True
             runtime_now = state.load_state()
@@ -218,22 +410,73 @@ class RuntimeControlMixin:
                     continue
                 symbol = str(_value(position, "symbol", "")).upper()
                 if symbol in failed_symbols:
-                    # Its close submission failed in this call.  The next
-                    # cycle retries; this one restores protection at the end.
-                    continue
+                    # A submit exception leaves a durable intent.  Re-enter
+                    # the bounded poll so the same CID can be retried after
+                    # broker lookup; it is never treated as a fresh close.
+                    failed_symbols.discard(symbol)
+                runtime_snapshot = state.load_state()
+                active_snapshot = runtime_snapshot.get("active_trades", {}) \
+                    if isinstance(runtime_snapshot, Mapping) else {}
+                durable_trade = (active_snapshot.get(symbol)
+                                 if isinstance(active_snapshot, Mapping) else None)
+                if isinstance(durable_trade, Mapping):
+                    pending_monitor_id = str(
+                        durable_trade.get("close_intent_id") or "")
+                    if pending_monitor_id:
+                        saved_orders = runtime_snapshot.get("orders", {})
+                        pending_monitor = (
+                            saved_orders.get(pending_monitor_id, {})
+                            if isinstance(saved_orders, Mapping) else {})
+                        if (isinstance(pending_monitor, Mapping) and
+                                str(pending_monitor.get("action", "")).lower() == "close" and
+                                str(pending_monitor.get("status", "")).lower() == "intent"):
+                            # The monitor owns this exact pre-submit close
+                            # domain. Never create a competing flatten CID.
+                            self._event("flatten_deferred_close_intent", {
+                                "symbol": symbol,
+                                "client_order_id": pending_monitor.get(
+                                    "client_order_id"),
+                            })
+                            continue
+                    existing_id = durable_trade.get("closing_order_id")
+                    if existing_id:
+                        saved_orders = runtime_snapshot.get("orders", {})
+                        existing_close = (saved_orders.get(str(existing_id), {})
+                                          if isinstance(saved_orders, Mapping) else {})
+                        existing_status = (
+                            str(existing_close.get("status", "")).lower()
+                            if isinstance(existing_close, Mapping) else "")
+                        own_leg_ids = {
+                            str(leg.get("order_id"))
+                            for leg in _leg_rows(durable_trade)}
+                        own_intent = (
+                            existing_status == "intent" and
+                            str(existing_close.get("action", "")).lower() == "flatten")
+                        if (not own_intent and
+                                str(existing_id) not in own_leg_ids and
+                                (not existing_status or
+                                 existing_status not in _TERMINAL_ORDER_STATUSES)):
+                            continue
                 trade = active_now.get(symbol)
                 trade = trade if isinstance(trade, Mapping) else None
+                if trade is None and isinstance(durable_trade, Mapping):
+                    trade = durable_trade
+                lifecycle_id = self._flatten_lifecycle_id(
+                    symbol, trade, runtime_snapshot)
                 prior = submitted.get(symbol)
                 if prior is not None:
                     saved = state.load_state().get("orders", {}).get(
                         str(prior.get("order_id")), {})
                     status = str(saved.get("status", prior.get("status", ""))).lower() \
                         if isinstance(saved, Mapping) else str(prior.get("status", "")).lower()
-                    # Never duplicate a live or filled close.  Only an
-                    # explicitly failed terminal order earns a new client id.
-                    if status not in retryable:
+                    # Never duplicate a live close. A durable pre-submit intent
+                    # remains the owner until broker lookup promotes or retries it.
+                    if status not in retryable and status != "intent":
                         continue
-                    close_attempt = int(prior.get("attempt", 0)) + 1
+                    close_attempt = int(prior.get("attempt", 0))
+                    if status in retryable and str(
+                            prior.get("status", "")).lower() != "intent":
+                        close_attempt += 1
                 else:
                     working_close = str((trade or {}).get("closing_order_id") or "")
                     own_legs = {str(leg.get("order_id")) for leg in _leg_rows(trade)}
@@ -245,7 +488,48 @@ class RuntimeControlMixin:
                         # partly filled bracket leg is not such an exit: it is
                         # cancelled below and the residual is closed.
                         continue
-                    close_attempt = 0
+                    durable_rows = [row for row in self._flatten_rows(
+                        runtime_snapshot, symbol)
+                                    if str(row.get("lifecycle_id", "")) == lifecycle_id]
+                    prior = durable_rows[-1] if durable_rows else None
+                    if prior is not None:
+                        prior_status = str(prior.get("status", "")).lower()
+                        if prior_status not in retryable and prior_status != "intent":
+                            continue
+                        close_attempt = (int(prior.get("attempt", 0))
+                                         if prior_status == "intent" else
+                                         int(prior.get("attempt", 0)) + 1)
+                    else:
+                        close_attempt = 0
+                close = getattr(self.provider, "close_position", None)
+                if isinstance(trade, Mapping) and trade.get("order_id"):
+                    client_order_id = self._exit_client_id(
+                        "flatten", symbol, reason, trade=trade, position=position,
+                        attempt=close_attempt)
+                else:
+                    # Broker-only generations have no entry order identity;
+                    # bind their flatten to the durable orphan lifecycle so a
+                    # later same-day position cannot inherit the old CID.
+                    client_order_id = self._client_id(
+                        "flatten", {"symbol": symbol, "setup_id": lifecycle_id},
+                        attempt=close_attempt)
+                intent_id = f"flatten-intent:{symbol}:{lifecycle_id}:{close_attempt}"
+                intent_state = {
+                    "order_id": intent_id, "symbol": symbol,
+                    "status": "intent", "client_order_id": client_order_id,
+                    "qty": str(qty), "action": "flatten", "reason": reason,
+                    "entry_order_id": (trade.get("order_id")
+                                        if isinstance(trade, Mapping) else None),
+                    "lifecycle_id": lifecycle_id, "attempt": close_attempt,
+                    "updated_ts": time.time(),
+                }
+                try:
+                    self._persist_flatten_intent(intent_state)
+                except Exception as exc:  # noqa: BLE001
+                    self._event("flatten_state_error", {
+                        "reason": "flatten_intent_durability_failed",
+                        "error": str(exc), "symbol": symbol})
+                    return False
                 legs = list(protected.get(symbol) or [])
                 if trade is not None:
                     # An own leg the broker still works is cancelled whatever
@@ -286,10 +570,6 @@ class RuntimeControlMixin:
                     # symbols go on.
                     continue
                 protected.pop(symbol, None)
-                close = getattr(self.provider, "close_position", None)
-                client_order_id = self._exit_client_id(
-                    "flatten", symbol, reason, trade=trade, position=position,
-                    attempt=close_attempt)
                 close_ids.setdefault(symbol, []).append(client_order_id)
                 request = None
                 try:
@@ -310,6 +590,8 @@ class RuntimeControlMixin:
                                                time_in_force="day",
                                                client_order_id=client_order_id)
                         order = self.provider.submit_order(request)
+                    order_id, status = _validated_close_response(order)
+                    ambiguous_close_symbols.discard(symbol)
                 except Exception as exc:  # noqa: BLE001
                     # An ambiguous failure may still have created the close at
                     # the broker.  Protection is restored below only from a
@@ -318,10 +600,15 @@ class RuntimeControlMixin:
                     self._event("flatten_close_failed", {
                         "symbol": symbol, "reason": reason,
                         "attempt": close_attempt, "error": str(exc)})
+                    submitted[symbol] = {
+                        "order_id": intent_id, "status": "intent",
+                        "attempt": close_attempt,
+                        "lifecycle_id": lifecycle_id,
+                    }
                     failed_symbols.add(symbol)
+                    if isinstance(exc, _CloseResponseUnconfirmed):
+                        ambiguous_close_symbols.add(symbol)
                     continue
-                order_id = str(getattr(order, "id", None) or client_order_id)
-                status = str(getattr(order, "status", "submitted") or "submitted").lower()
                 entry_order_id = (str(trade.get("order_id") or "")
                                   if trade is not None else "")
                 order_state = {
@@ -329,6 +616,10 @@ class RuntimeControlMixin:
                     "status": status,
                     "client_order_id": client_order_id,
                     "qty": str(qty), "action": "flatten", "reason": reason,
+                    "entry_order_id": entry_order_id or None,
+                    "lifecycle_id": lifecycle_id, "intent_id": intent_id,
+                    "filled_qty": float(_value(order, "filled_qty", 0) or 0),
+                    "filled_avg_price": _value(order, "filled_avg_price", None),
                     "attempt": close_attempt, "closing_attempt": close_attempt,
                     "updated_ts": time.time(),
                 }
@@ -364,8 +655,11 @@ class RuntimeControlMixin:
                         order, request,
                         action="flatten", reason=reason, symbol=symbol,
                         qty=float(qty), runtime_mode=self.mode,
-                        run_id=self.run_id)
-                    state.update_state(book_close)
+                        client_order_id=client_order_id,
+                        entry_order_id=entry_order_id or None,
+                        lifecycle_id=lifecycle_id, run_id=self.run_id)
+                    self._persist_flatten_order(
+                        order_state, intent_id=intent_id)
                 except Exception as exc:  # noqa: BLE001
                     self._reconciled = False
                     self._preflight_error = (
@@ -377,7 +671,8 @@ class RuntimeControlMixin:
                         pass
                     raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
                 submitted[symbol] = {"order_id": order_id, "status": status,
-                                     "attempt": close_attempt}
+                                     "attempt": close_attempt,
+                                     "lifecycle_id": lifecycle_id}
             try:
                 self.reconcile()
             except Exception as exc:  # noqa: BLE001
@@ -413,7 +708,8 @@ class RuntimeControlMixin:
                                for order in residual_working_orders}
             for position in residual_positions or []:
                 symbol = str(_value(position, "symbol", "")).upper()
-                if symbol in unprotected and symbol not in working_symbols:
+                if (symbol in unprotected and symbol not in working_symbols and
+                        symbol not in ambiguous_close_symbols):
                     trade, _ = unprotected.pop(symbol)
                     self._rearm_protective_stop(
                         symbol, trade, position, reason=reason,

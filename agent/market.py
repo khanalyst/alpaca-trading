@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 import math
 from typing import Any, Iterable, Mapping
 
 from .alpaca_domain import Asset, Bar, CalendarDay, MarketClock, OptionContract
-from .alpaca_session import NEW_YORK, SessionPolicy, session_for
+from .alpaca_session import NEW_YORK, SessionPolicy, as_new_york, session_for
 from .alpaca_provider import AlpacaError
 
 
@@ -104,6 +104,105 @@ def attach_atr(bars: Iterable[Any], period: int = 14) -> list[Any]:
     return output
 
 
+def _finite_aware_datetime(value: Any) -> datetime | None:
+    """Return an aware, finite datetime or reject untrusted boundary data."""
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    try:
+        if value.utcoffset() is None or not math.isfinite(value.timestamp()):
+            return None
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+    return value
+
+
+def _calendar_session_is_valid(session: CalendarDay | None,
+                               now: datetime) -> bool:
+    """Require a complete current-day broker calendar boundary."""
+    current = _finite_aware_datetime(as_new_york(now))
+    opening = _finite_aware_datetime(getattr(session, "open", None))
+    closing = _finite_aware_datetime(getattr(session, "close", None))
+    if current is None or opening is None or closing is None or session is None:
+        return False
+    local_open = opening.astimezone(NEW_YORK)
+    local_close = closing.astimezone(NEW_YORK)
+    return bool(getattr(session, "date", None) == current.date() and
+                local_open.date() == current.date() and
+                local_close.date() == current.date() and
+                local_open < local_close)
+
+
+def _clock_reports_closed_after_session(clock: Any, now: datetime) -> bool:
+    """Recognize a broker-confirmed closed session without inventing a close.
+
+    After a session, the clock is closed and both upcoming boundaries move to
+    a future New York date.  That is enough evidence to require flattening
+    residual exposure, while a premarket clock whose ``next_open`` is today
+    remains outside this degraded exit path.
+    """
+    if isinstance(clock, Mapping):
+        timestamp = clock.get("timestamp")
+        is_open = clock.get("is_open")
+        next_open = clock.get("next_open")
+        next_close = clock.get("next_close")
+    else:
+        timestamp = getattr(clock, "timestamp", None)
+        is_open = getattr(clock, "is_open", None)
+        next_open = getattr(clock, "next_open", None)
+        next_close = getattr(clock, "next_close", None)
+    current = _finite_aware_datetime(as_new_york(now))
+    broker_timestamp = _finite_aware_datetime(timestamp)
+    opening = _finite_aware_datetime(next_open)
+    closing = _finite_aware_datetime(next_close)
+    if (current is None or broker_timestamp is None or opening is None or
+            closing is None or is_open is not False):
+        return False
+    local_timestamp = broker_timestamp.astimezone(NEW_YORK)
+    local_open = opening.astimezone(NEW_YORK)
+    local_close = closing.astimezone(NEW_YORK)
+    return bool(local_timestamp.date() == current.date() and
+                local_open.date() > current.date() and
+                local_close.date() >= local_open.date() and
+                local_close > local_open)
+
+
+def _clock_boundary_is_valid(clock: Any, now: datetime) -> datetime | None:
+    """Validate a broker clock close usable for degraded exits.
+
+    ``next_close`` is only an exit authority while the broker says the market
+    is open and the clock's timestamp and close are on the current New York
+    date.  In particular, a next-session close on a holiday/weekend and a
+    premarket clock must not be mistaken for today's regular-session close.
+    """
+    if isinstance(clock, Mapping):
+        timestamp = clock.get("timestamp")
+        is_open = clock.get("is_open")
+        next_open = clock.get("next_open")
+        next_close = clock.get("next_close")
+    else:
+        timestamp = getattr(clock, "timestamp", None)
+        is_open = getattr(clock, "is_open", None)
+        next_open = getattr(clock, "next_open", None)
+        next_close = getattr(clock, "next_close", None)
+    current = _finite_aware_datetime(as_new_york(now))
+    broker_timestamp = _finite_aware_datetime(timestamp)
+    close = _finite_aware_datetime(next_close)
+    if (current is None or broker_timestamp is None or close is None or
+            is_open is not True):
+        return None
+    local_timestamp = broker_timestamp.astimezone(NEW_YORK)
+    local_close = close.astimezone(NEW_YORK)
+    if (local_timestamp.date() != current.date() or
+            local_close.date() != current.date() or
+            local_close <= local_timestamp):
+        return None
+    if next_open is not None:
+        opening = _finite_aware_datetime(next_open)
+        if opening is None or opening.astimezone(NEW_YORK) > local_timestamp:
+            return None
+    return local_close
+
+
 @dataclass
 class MarketData:
     provider: Any
@@ -160,11 +259,39 @@ class MarketData:
                     self.policy.exit_allowed(now or datetime.now(tz=NEW_YORK), self.session(now)))
 
     def should_force_flat(self, now: datetime | None = None) -> bool:
-        # Entries need a fresh calendar; the exit to flat must not.  A failed
-        # refresh leaves the last broker calendar in place, and today's close
-        # in it does not change, so the force flat still comes due on time.
-        return bool(self._calendar and self.policy.should_force_flat(
-            now or datetime.now(tz=NEW_YORK), self.session(now)))
+        """Return whether the broker-authorized exit cutoff has arrived.
+
+        A current-day calendar row remains valid for exits after a refresh
+        outage.  A stale row is never reused across a date rollover; when no
+        valid row exists, the broker clock may provide a degraded boundary
+        while it reports an open market and a same-day ``next_close``.  A
+        closed clock whose next open/close are both on a future New York date
+        is independently exit-due, because it proves today's session ended.
+        No weekday or standard-close guess is made here.
+        """
+        current = now or datetime.now(tz=NEW_YORK)
+        try:
+            session = self.session(current)
+        except Exception:  # noqa: BLE001
+            session = None
+        if _calendar_session_is_valid(session, current):
+            return self.policy.should_force_flat(current, session)
+
+        # Do not use a cached clock: degraded mode must obtain a fresh broker
+        # boundary, otherwise a prior-day next_close could survive another
+        # outage and suppress an emergency exit.
+        try:
+            clock = self.clock()
+        except Exception:  # noqa: BLE001
+            return False
+        if _clock_reports_closed_after_session(clock, current):
+            return True
+        close = _clock_boundary_is_valid(clock, current)
+        if close is None:
+            return False
+        local = as_new_york(current)
+        cutoff = close - timedelta(minutes=self.policy.force_flat_minutes_before_close)
+        return local >= cutoff
 
     def assets(self, *, include_options: bool = False) -> list[Asset | OptionContract]:
         rows: list[Asset | OptionContract] = list(self.provider.assets())

@@ -1,92 +1,85 @@
 # Current findings — verified 10 November 2026
 
-This is the authoritative operational snapshot for the repository as of 10
-November 2026. It records evidence and blockers; it is not a performance or
-profitability claim. The [documentation catalogue](README.md) explains which
-other files are current procedures, sealed protocols, historical reports, and
-source artifacts.
+This is the operational snapshot as of the 18:24 UTC verification on 10
+November. Evidence and remaining blockers are distinguished from modeled
+strategy performance. See the [full audit](deep-audit-2026-11-10/README.md)
+and [validation record](deep-audit-2026-11-10/validation.md).
 
-The [full 10 November audit](deep-audit-2026-11-10/README.md) contains the
-implementation, arm-level, and validation detail; this page is the concise
-operational snapshot.
+## VM and storage
 
-## Deployment and authority
+The six production services still run source commit
+`20da96612b21962091837a2efcba9180193b1cc0`. All six are healthy. Storage
+maintenance recovered the recorder without restarting it. This maintenance
+has not deployed the newer source or resumed trading.
 
-- The VM deployment still reports source commit
-  `20da96612b21962091837a2efcba9180193b1cc0` from 11 October. It is 60
-  commits behind current main, `21d97293455b42ac2ef7298bf814b09b68680200`
-  (28 October).
-- A live infrastructure recheck at `2026-11-10T07:27:25Z` found all six
-  containers on the `20da966` image. The recorder was unhealthy; the other
-  five containers were healthy.
-- The local root contains safety work that is not all upstream. This review has
-  not mutated the VM or resumed trading.
-- The 11 October mechanism-refresh receipt is now located at
-  `/datadrive/alpaca-backups/research-mechanism-refresh-20261011-20da96612b21/work/run-receipt.json`;
-  the recorded job completed with exit 0 at `2026-10-12T04:52:45Z`. It covers
-  17 sessions, 31 arms, and 24 signal reports: 26 negative-point arms, 3
-  positive IBR modeled rows, and 2 underpowered arms. All 12 rule parents were
-  negative, with no eligible edge, proof, or selection. These are small
-  retrospective modeled-account outcomes, not paper/live validation; the
-  receipt content hash is
-  `1febfcf19804b14cfc2c010364f76a317c384da68bc56b4ca852a530c122c85c`, and
-  the local aggregate is `outputs/deep-audit/vm/oct11-31-arm-summary.json`.
-  The earlier note that this receipt was unlocated is superseded.
+The data disk had fallen below its unchanged 5 GiB reserve. First, 126
+byte-identical inactive CSV exports were deduplicated, preserving every path
+and file's contents, ownership, permissions and modification time. Then the
+inactive historical archive tree was copied to the VM's existing persistent
+backup disk. All 412 files were verified before removing the original
+physical copy. The original archive path resolves to the retained copy;
+the backup disk is persistently mounted read-only. Existing backups and trial
+evidence remain intact. No Azure resource was added.
 
-## Data readiness blockers
+The final check measured 26,985,652,224 bytes free on the recorder's disk
+(about 25.1 GiB). The archive disk retained 34,503,524,352 bytes free.
+Private maintenance receipts, the complete file manifest and their hashes
+were also copied to the Mac and verified. They remain outside Git.
 
-- Recorder storage is below the reserve: 5,038,686,208 bytes free versus
-  5,368,709,120 bytes required. The data drive is approximately 97% full, and
-  there are no observations after 19 October.
-- The scheduler is waiting: 0 accepted sessions out of 23 complete partitions,
-  and all 24 acceptance reports are rejected. Lag and cadence failures were
-  already present during 12–16 October.
-- The 31 forward shadow books have 0 fills and 285,290 unpriced stale-quote
-  rows. The active ledger has 7 candidates but 0 runs and 0 qualifying
-  evidence.
+## Paper account and authority
 
-These are data and capacity failures, not negative strategy returns. Do not
-convert missing, stale, rejected, or unpriced rows into outcomes. See the
-[diagnostic protocol](edge-diagnostics.md), [research protocol](../research/protocol.md),
-and [operations runbook](../OPERATIONS.md).
+The final read-only broker check confirmed a paused, flat paper account with
+zero open orders. Account identity, configuration, persisted state, trial,
+accepted-session and outcome counts, equity and complete order-history hash
+matched the pre-maintenance check. No broker mutation or trial action occurred.
 
-## Broker and paper state
+The frozen ORB trial still has zero accepted sessions and zero outcomes.
+Its frozen identity differs from the inspected current configuration. Do not
+resume or replace it without its account-scoped identity and flat-book
+preflight. No strategy is eligible for activation from this evidence.
 
-- The following broker and paper observations were made at approximately
-  01:55–02:01 UTC; the 07:27 infrastructure recheck did not recheck broker
-  state. At that earlier check, the broker was paused and flat, with no orders.
-  The exact account balance is private aggregate evidence and is intentionally
-  not reproduced here.
-- The frozen paper ORB trial has 0 accepted sessions and 0 outcomes. Its frozen
-  identity does not match the currently inspected configuration. Do not resume
-  or replace it until the account-scoped preflight, identity check, and flat
-  book/no-working-orders checks pass.
-- No strategy is eligible for activation from this evidence. Paper shadows and
-  diagnostic accounts remain non-authorizing; they do not grant live permission.
+## Research and forward data
 
-## Research status
+The recorder resumed collecting observations after storage recovery. This
+does not recover the missed forward observations after its October 19 outage,
+or establish a newly accepted complete session. The latest acceptance census
+remains the morning measurement: zero accepted sessions from 23 complete
+partitions, with all 24 acceptance reports rejected. Earlier lag and cadence
+failures remain separate from the repaired storage failure.
 
-- The latest-main report records 2,675 tests with no failures and one skipped
-  test. This is a historical report from the 28 October release record, not a
-  newly run test claim in this snapshot; see
-  [the 28 October report](research-2026-10-28/README.md#7-tests). Fresh audit
-  validation is linked from the [full 10 November audit](deep-audit-2026-11-10/README.md).
-- The corrected `intraday-mechanisms.v3` cohort is net negative for all 12 arms
-  over its 30 public diagnostic sessions. The older 82-arm comparison found no
-  arm convincingly positive. These are public-bar research results, not live or
-  broker evidence; see the [corrected cohort report](research-2026-10-28/README.md#4-did-the-corrections-change-performance-the-v3-cohort)
-  and the [26 October refresh](research-2026-10-26/README.md).
-- The October public IBR refresh was negative across its tested arms. It does
-  not override the missing forward observations or authorize a paper trial.
-- The preregistered hypotheses and their manifests remain sealed source
-  artifacts. They must not be rewritten to make current results look better;
-  use [preregistered-hypotheses.md](preregistered-hypotheses.md) and the
-  [historical audit evidence](audit-2026-09-21/README.md).
+The October 11 mechanism-refresh job completed successfully on October 12.
+Its receipt, sealed inputs, all 31 arm components and 24 signal reports were
+reverified on November 10. Across 17 sessions, 26 arm point estimates were
+negative, three IBR modeled accounts were positive, and two children were
+underpowered. All 12 rule parents were negative; there were no eligible edges,
+proofs or selections. The result content hash is
+`1febfcf19804b14cfc2c010364f76a317c384da68bc56b4ca852a530c122c85c`.
+Positive IBR rows are separate modeled accounts and cannot be added together
+or treated as demonstrated profitability.
 
-## Decision and next action
+The corrected public `intraday-mechanisms.v3` comparison was negative for all
+12 families over 30 sessions. All seven public IBR comparisons were also
+negative. These are diagnostic results; they do not override rejected forward
+data or authorize the frozen paper trial. See the
+[October 28 report](research-2026-10-28/README.md).
 
-Treat the project as data-readiness blocked. The next work remains versioned
-fixes for storage/session readiness and a reviewed release, followed—only if
-separately reviewed—by an audited paper-trial replacement exception. The
-07:27 infrastructure check did not change or authorize broker state. No
-document here authorizes live trading or claims a profitable edge.
+## Source repairs and remaining release work
+
+The continuation branch integrates the preserved runtime safeguards with the
+newer main branch: monitoring while paused, durable close intent before
+canceling protection, recovery after ambiguous broker responses, conservative
+stop restoration and degraded-calendar force-flat handling. It also binds
+shadow position lifetimes and quote visibility to causal observations.
+
+Authorizing shadow inputs now require explicit forward provenance. Historical
+partition markers exclude their data even when a row claims otherwise;
+source-marker changes invalidate cached authorizing views and replay results.
+The recorder declares newly created forward partitions before appending data,
+without rewriting old CSV files or relabeling existing unmarked partitions.
+Legacy diagnostic data remains available for non-authorizing analysis.
+
+Local tests establish software behavior, not deployed behavior, market-data
+acceptance or a profitable edge. A reviewed VM release and a complete forward
+session that passes the existing lag, cadence, freshness and provenance checks
+remain necessary. Frozen registrations, statistical thresholds and protected
+trial evidence have not been rewritten.

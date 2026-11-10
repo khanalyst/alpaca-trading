@@ -827,8 +827,10 @@ class BrokerProtectionTests(ProtectionHarness):
             events.append(("close", symbol))
             result = ProtectionProvider.close_position(
                 self.provider, symbol, qty, **kwargs)
+            self.provider.set_order(result.id, status="filled",
+                                    filled_qty=result.qty, filled_avg_price=100)
             self.provider.positions_live = []
-            return result
+            return self.provider.orders_by_id[result.id]
 
         def cancel_order(order_id):
             events.append(("cancel", str(order_id)))
@@ -1015,9 +1017,14 @@ class WatchdogTests(ProtectionHarness):
         original = self.provider.close_position
 
         def close_position(symbol, qty=None, **kwargs):
+            held = next(item for item in self.provider.positions_live
+                        if item.symbol == symbol)
             result = original(symbol, qty, **kwargs)
+            self.provider.set_order(
+                result.id, status="filled", filled_qty=result.qty,
+                filled_avg_price=held.current_price or held.avg_entry_price or 1)
             self.provider.positions_live = []
-            return result
+            return self.provider.orders_by_id[result.id]
 
         def cancel_all_orders():
             self.provider.cancel_all_calls += 1

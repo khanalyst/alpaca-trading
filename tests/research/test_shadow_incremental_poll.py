@@ -22,7 +22,7 @@ SESSION = "2026-01-02"
 FIELDS = [
     "event_key", "event_type", "symbol", "timestamp", "as_of",
     "observed_at", "provider", "feed", "open", "high", "low",
-    "close", "volume", "bid", "ask",
+    "close", "volume", "bid", "ask", "source_mode",
 ]
 
 
@@ -59,6 +59,7 @@ class ShadowIncrementalPollTests(unittest.TestCase):
             "event_type": "bar_1m", "symbol": "SPY",
             "timestamp": timestamp, "as_of": as_of,
             "observed_at": as_of, "provider": "alpaca", "feed": "iex",
+            "source_mode": "forward_observed",
             "open": "100", "high": "101", "low": "99", "close": "100",
             "volume": "1000", "bid": "", "ask": "",
         }

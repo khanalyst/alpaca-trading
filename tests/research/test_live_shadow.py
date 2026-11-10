@@ -18,6 +18,7 @@ from unittest.mock import call, patch
 from deploy.recorder import INDEX_NAME, iter_corpus_rows
 from deploy.recorder_market import _event_key
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
+from agent.risk import RiskEngine
 from research.edge_ledger import EdgeLedger
 from research.factory_core import simulate_account as factory_simulate_account
 from research.live_shadow import (InputConflict, ShadowConfig, ShadowRunner,
@@ -158,7 +159,7 @@ class LiveShadowTests(unittest.TestCase):
         start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
         fields = ["event_key", "event_type", "symbol", "timestamp", "as_of",
                   "observed_at", "provider", "feed", "open", "high", "low",
-                  "close", "volume", "bid", "ask"]
+                  "close", "volume", "bid", "ask", "source_mode"]
         rows = []
         for i in range(3):
             stamp = start + timedelta(minutes=i)
@@ -186,13 +187,13 @@ class LiveShadowTests(unittest.TestCase):
         with self.corpus.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows({**row, "source_mode": "forward_observed"} for row in rows)
 
     def _write_session_closing_rows(self):
         """Write one completed bar in each of two sessions for batching tests."""
         fields = ["event_key", "event_type", "symbol", "timestamp", "as_of",
                   "observed_at", "provider", "feed", "open", "high", "low",
-                  "close", "volume", "bid", "ask"]
+                  "close", "volume", "bid", "ask", "source_mode"]
         rows = []
         for day in (2, 3):
             stamp = datetime(2026, 1, day, 20, 59, tzinfo=timezone.utc)
@@ -209,7 +210,7 @@ class LiveShadowTests(unittest.TestCase):
         with self.corpus.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows({**row, "source_mode": "forward_observed"} for row in rows)
 
     def _run(self, **kwargs):
         return run_shadow_once(ShadowConfig(self.corpus, self.edge, self.shadow, **kwargs))
@@ -879,6 +880,7 @@ class LiveShadowTests(unittest.TestCase):
             "event_key": _event_key("bar_1m", "SPY", timestamp),
             "event_type": "bar_1m", "symbol": "SPY", "timestamp": timestamp,
             "as_of": as_of, "observed_at": "2026-01-02T21:01:00+00:00",
+            "source_mode": "forward_observed",
             "provider": "alpaca", "feed": "iex", "open": "100",
             "high": "103", "low": "99", "close": "100", "volume": "1000",
         }
@@ -916,7 +918,7 @@ class LiveShadowTests(unittest.TestCase):
                  "as_of": event["observed_at"],
                  "observed_at": event["observed_at"],
                  "provider": equity_provider, "feed": equity_feed,
-                 "bid": "99.9", "ask": "100.1"}
+                 "source_mode": "forward_observed", "bid": "99.9", "ask": "100.1"}
         signal_ts = datetime.fromisoformat(event["timestamp"]).timestamp()
         signal = {"symbol": symbol, "direction": "long",
                   "setup_type": "ibr_breakout", "signal_ts": signal_ts,
@@ -1102,6 +1104,7 @@ class LiveShadowTests(unittest.TestCase):
             "multiplier": "100", "bid": "1.0", "ask": "1.1",
             "bid_size": "5", "ask_size": "5", "volume": "20",
             "open_interest": "100", "provider": "alpaca", "feed": "opra",
+            "source_mode": "forward_observed",
         }
         options = []
         for index, contract in enumerate(
@@ -1279,6 +1282,48 @@ class LiveShadowTests(unittest.TestCase):
         self.assertIsNone(legacy_replay["equity_provider"])
         self.assertEqual(_signature_diffs([legacy_runtime], [legacy_replay]), [])
         self.assertNotIn("benchmark_symbol", runtime)
+
+    def test_signature_compares_admitted_broker_tick_geometry(self):
+        authored = {
+            "symbol": "SPY", "direction": "long", "entry_price": 100.0,
+            "stop_price": 99.12345, "target_price": 101.7531,
+            "stop_distance": .87655, "target_r": 2.0,
+            "execution_profile": "shares", "signal_ts": 1767369600.0,
+            "setup_type": "rule_opening_range_breakout",
+            "decision_timestamp": "2026-01-02T16:01:00+00:00",
+            "entry_timestamp": "2026-01-02T16:01:00+00:00",
+        }
+        risk, why = RiskEngine({
+            "risk": {"risk_per_trade_pct": .5,
+                     "max_position_notional_pct": 25},
+            "execution": {}, "strategy": {},
+        }).vet_open(authored, 100_000.0, [], {
+            "SPY": {"stale": False, "quote_stale": False, "spread_bps": 0},
+        }, {}, 0.0, now=1767369660.0)
+        self.assertIsNone(why)
+        self.assertEqual(risk["stop_price"], 99.12)
+        payload = {"equity_feed": "iex", "equity_provider": "alpaca",
+                   "setup_plan": authored, "risk_plan": risk}
+        observed = _shadow_signature({
+            "kind": "open_incomplete", "symbol": "SPY",
+            "session_date": "2026-01-02", "payload_json": json.dumps(payload),
+        })
+        replay = _replay_signature({
+            **risk, "session_date": "2026-01-02",
+            "signal_timestamp": "2026-01-02T16:00:00+00:00",
+            "decision_timestamp": authored["decision_timestamp"],
+            "entry_timestamp": authored["entry_timestamp"],
+        }, vehicle="equity", strategy_id="rule", target_r=2.0,
+            setup_type=authored["setup_type"], equity_feed="iex",
+            equity_provider="alpaca")
+        self.assertEqual(_signature_diffs([observed], [replay]), [])
+        payload["risk_plan"] = {**risk, "stop_price": None}
+        corrupt = _shadow_signature({
+            "kind": "open_incomplete", "symbol": "SPY",
+            "session_date": "2026-01-02", "payload_json": json.dumps(payload),
+        })
+        self.assertIsNone(corrupt["stop_price"])
+        self.assertTrue(_signature_diffs([corrupt], [replay]))
 
     def test_cross_sectional_context_is_bound_in_signatures(self):
         eligibility = {

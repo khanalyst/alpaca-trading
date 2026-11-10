@@ -92,7 +92,7 @@ class LiveShadowControlTests(unittest.TestCase):
             stamp = "2026-01-02T20:59:00+00:00"
             fields = ["event_key", "event_type", "symbol", "timestamp", "as_of",
                       "observed_at", "provider", "feed", "open", "high", "low",
-                      "close", "volume"]
+                      "close", "volume", "source_mode"]
             with corpus_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fields)
                 writer.writeheader()
@@ -101,6 +101,7 @@ class LiveShadowControlTests(unittest.TestCase):
                     "event_type": "bar_1m", "symbol": "SPY", "timestamp": stamp,
                     "as_of": "2026-01-02T21:00:00+00:00",
                     "observed_at": "2026-01-02T21:01:00+00:00",
+                    "source_mode": "forward_observed",
                     "provider": "alpaca", "feed": "iex", "open": "100",
                     "high": "103", "low": "99", "close": "100", "volume": "1000",
                 })

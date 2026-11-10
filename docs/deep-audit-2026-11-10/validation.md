@@ -135,3 +135,39 @@ inventory. Compilation and whitespace checks cover the repaired source tree.
 All 59 Markdown files passed the relative-link check: 485 links, zero broken
 targets. The 94 distinct arm rows, 505 baseline file rows and 56 documentation
 classification rows were rechecked after final CSV normalization.
+
+
+## Continuation integration and VM recovery
+
+The preserved safety patch was integrated into the newer repair checkout;
+the older dirty root checkout remains untouched. A further independent review
+found missing-ID/unknown-status close responses, ambiguous legacy stop
+restoration, and an authorizing source-provenance gap. The continuation
+repairs these boundaries without changing frozen trial registrations.
+
+Fresh checks after the runtime integration:
+
+- Complete runtime shard: **1,124 tests passed in 430.885 seconds**.
+- Close/monitor/protection checks: **83 tests passed in 9.330 seconds**.
+- Authorizing provenance, recorder declarations, cache invalidation,
+  incremental/replay/session projection: **40 tests passed in 2.074 seconds**.
+- Explicit forward fixture and cross-sectional/control/risk checks: **24
+  tests passed in 0.331 seconds**.
+
+The complete research/statistical checks are being reconciled separately;
+these overlapping focused counts are not a new complete-suite total. Some
+older synthetic forward fixtures lacked explicit source labels; those
+fixtures now declare their intended provenance. Negative tests retain missing,
+historical, conflicting and invalid source declarations. The production 5 GiB
+recorder reserve remains unchanged; test disk fixtures do not disable it.
+
+The VM archive migration verified all 412 regular files, including hashes,
+owner, permissions and modification times, before reclaiming the original
+physical copy. Original paths resolve to the preserved archive on the existing
+persistent read-only backup disk. The private manifest and receipts were
+copied to the Mac and independently hash-verified. Final read-only verification
+confirmed all six services healthy, approximately 27 GB free on the recorder
+volume, and unchanged paused/flat paper state, configuration, trial and order
+history. No broker mutation or trial transition was performed. This establishes
+storage recovery, not accepted forward market data or deployment of the new
+source. The detailed private receipts remain outside Git.

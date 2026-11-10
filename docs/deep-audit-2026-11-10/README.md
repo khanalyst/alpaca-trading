@@ -189,32 +189,42 @@ and executed validation are recorded in [validation.md](validation.md).
 | Raw IBR stop compared with tick-rounded floor | Reproduced false refusal. Version the admission correction; changing the existing registered arm in place would rewrite results. |
 | Factory beta and shadow same-clock context are incomplete | Wire causal prior-session context with explicit data sufficiency; do not fabricate a baseline. |
 | Expected round-trip cost and comparison IDs lack producers | Wire and bind producers in a new cost/evidence epoch. Protocol-2's 25-bps fallback remains active when expected costs are absent. |
-| Additional unmerged runtime safeguards | Preserve and reconcile the existing safety patch against current main. The repair branch does not claim that the entire dirty patch has been integrated. |
+| Preserved runtime safeguards | Integrated into the continuation branch with fault-injection and restart checks. Deployment status remains separate from local verification. |
 
-### Remaining runtime safety blockers
+### Runtime safety integration and operational recovery
 
-The synthetic runtime probes found the following gaps despite the existing
-tests passing. These require implementation and fault-injection/restart
-verification before a paper release is described as ready:
+The continuation integrates the preserved protection-only lane while paused,
+requires both broker-flat and local-flat evidence, and persists close intent
+before canceling protective legs. Missing orders, missing broker IDs and
+unknown statuses retain the same durable client request for recovery. Legacy
+stop restoration accepts only a confirmed live broker stop; ambiguous close
+responses do not create a competing stop. Current-date and degraded-calendar
+force-flat boundaries have dedicated regressions. Options remain outside the
+shipped equity pilot; an equity recovery stop is not option protection.
 
-| gap | impact | existing dirty-patch coverage / remaining work |
-| --- | --- | --- |
-| Operator pause bypasses the normal-session protection monitor | An existing position can remain unmonitored while entries are paused. | Dirty protection-only lane exists; it still needs integration with current main. |
-| Flatten success can coexist with durable local exposure/protection | Broker-flat alone is reported as success even when local lifecycle state remains open. | Dirty flatten path adds a local-flat check; integrate and verify both books. |
-| Protective legs are canceled before a durable monitor-close intent exists | Process death can leave exposure without brackets or a recoverable close intent. | Dirty bulk flatten has an intent design; ordinary monitor close still needs a durable pre-cancel intent and restart recovery. |
-| Monitor treats `close_position() -> None` as submission success | A synthetic pending close can suppress later monitoring while exposure remains unprotected. | Requires real-order or freshly confirmed broker-flat evidence before success; unresolved responses must stay failed/degraded. |
-| Stale prior-day calendar can suppress degraded force-flat | A failed calendar refresh can turn the emergency close predicate false. | Provider retries do not solve it. Validate the current-date boundary and its degraded fallback. |
-| Option close failure can leave its target canceled | Software-only protection has a retry/crash interval after a failed close. | Requires durable close intent/recovery; equity stop restoration is not an option stop. Options remain outside the shipped equity pilot. |
+Authorizing shadow entry, context, portfolio marks and replay require explicit
+forward source provenance. Durable historical markers override row claims,
+and declaration changes invalidate event caches and replay memos. The recorder
+writes forward declarations only for new partitions, before their first append;
+old unmarked files are not relabeled. Diagnostic compatibility remains separate.
 
-The exact synthetic outputs, source regions, and comparison with the dirty
-patch are in `outputs/deep-audit/runtime/audit.md`. These are local fake-broker
-reproductions, not observations of incidents in the real paper account.
+The complete runtime shard passed 1,124 tests after integration. See
+[validation](validation.md) for the final research checks and their scope.
+These are synthetic broker tests, not reports of incidents in the real account.
 
-The VM also needs storage headroom and market-open cadence validation. Its
-recorder stopped on October 19 below the 5 GiB reserve; pre-outage sessions
-already failed lag/request checks. All 24 operational reports are rejected,
-the scheduler has zero accepted sessions, and the frozen ORB trial has an
-identity mismatch. Historical backfill cannot recreate missed forward days.
+VM storage recovery completed at 18:21 UTC. Deduplication preserved 126
+identical inactive export paths, and relocation preserved all 412 archived
+files on the existing persistent read-only backup disk. The final check
+measured 26,985,652,224 free data-disk bytes, all six services healthy, and
+unchanged paused/flat paper state and order history. The receipts and complete
+manifest were copied off the VM and hash-verified. No protected backup or
+trial evidence was discarded and no Azure resource was added.
+
+This repairs capacity, not the historical data gap. The morning census had
+zero accepted sessions and 24 rejected acceptance reports; lag and cadence
+failures preceded the October 19 storage stop. New complete forward-session
+acceptance and a reviewed VM source release remain outstanding. The frozen
+ORB trial identity mismatch remains a separate activation blocker.
 
 ## Profitability work that is justified
 
@@ -263,7 +273,7 @@ review floors, not prerequisites to the first experimental trade. They also
 do not themselves prove profitability.
 
 Before the first paper session: repair storage/cadence and validate a complete
-session; integrate the required safety work into one reviewed release; retire
+session; deploy the integrated safety work as a reviewed release; retire
 the stale trial through the audited operator path; freeze the replacement;
 and pass authenticated identity, freshness and flat-book preflight. A pilot
 with the existing ORF profile is an execution experiment only. None of these
