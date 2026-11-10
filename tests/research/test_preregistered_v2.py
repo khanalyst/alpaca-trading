@@ -103,11 +103,22 @@ def _metric(**over):
 
 
 def _small_manifest(hypothesis=prereg.VWAP_REVERSION_HYPOTHESIS_V2, **over):
-    """The registered manifest with a one-symbol universe, for light fixtures."""
+    """A current-instrument synthetic manifest with a one-symbol universe.
+
+    The real v2 registrations remain frozen below.  These light-weight unit
+    fixtures exercise the decision and look-record machinery in the checkout
+    under test, so they bind only their copied identity to the running
+    instrument.  Tests that need the sealed mismatch still override this
+    field explicitly (and the registration tests continue to inspect the real
+    frozen manifests).
+    """
     manifest = copy.deepcopy(prereg.preregistration(hypothesis))
     manifest["session_definition"].update(universe=["SPY"],
                                           min_covered_symbols=1)
     manifest.update(over)
+    if "instrument_identity" not in over:
+        manifest["instrument_identity"]["digest"] = (
+            prereg.instrument_identity()["digest"])
     return manifest
 
 

@@ -1,0 +1,57 @@
+path,category,disposition,evidence_role,review_status,notes
+ARCHITECTURE.md,protocol,retain-active,current architecture and safety reference,reviewed,procedural reference; not a dated finding
+AZURE_DEPLOYMENT.md,protocol,retain-active,current deployment reference,reviewed,procedural reference; not a dated finding
+OPERATIONS.md,protocol,retain-active,current operations runbook,reviewed,procedural reference; verify current findings before action
+README.md,current,retain-active,repository landing and navigation,reviewed,updated to point at documentation catalogue
+SETUP.md,protocol,retain-active,current setup reference,reviewed,procedural reference; not a dated finding
+deploy/README.md,protocol,retain-active,current deployment topology reference,reviewed,procedural reference; not a dated finding
+docs/audit-2026-09-21/FORWARD-2026-09-23.md,historical-evidence,retain-historical,dated forward audit narrative,reviewed,source evidence retained; not current performance
+docs/audit-2026-09-21/README.md,historical-evidence,retain-historical,dated audit index and evidence map,reviewed,source artifacts and manifests retained
+docs/audit-2026-09-21/SIGNAL-VALUE.md,historical-evidence,retain-historical,dated signal and cost audit narrative,reviewed,source evidence retained; later reports qualify conclusions
+docs/current-findings.md,current,retain-active,authoritative Nov 10 operational snapshot,reviewed,replaced stale Oct 11 snapshot; no profitability claim
+docs/edge-diagnostics.md,protocol,retain-active,non-authorizing diagnostic procedure,reviewed,still defines diagnostic lane and failure semantics
+docs/paper-shadow-trials.md,protocol,retain-active,guarded paper and shadow protocol,reviewed,retained because active runbooks link it; current state is separate
+docs/preregistered-hypotheses.md,protocol,retain-sealed,sealed hypotheses and manifests,reviewed,immutable source protocol; do not rewrite for later results
+docs/research-2026-10-26/README.md,historical-evidence,retain-historical,dated public-bar research report,reviewed,required comparison input for 28 Oct report
+docs/research-2026-10-26/results/appendix_all_arms.md,historical-evidence,retain-historical,dated all-arm result appendix,reviewed,source result artifact; diagnostic only
+docs/research-2026-10-26/results/liquid_smoke-1m/report.md,historical-smoke,retain-historical,dated one-minute smoke report,reviewed,explicitly not evidence
+docs/research-2026-10-26/results/liquid_smoke-5m/report.md,historical-smoke,retain-historical,dated five-minute smoke report,reviewed,explicitly not evidence
+docs/research-2026-10-28/README.md,historical-evidence,retain-historical,latest dated corrected-cohort report,reviewed,latest public-bar diagnostic; not live evidence
+docs/review-2026-10-15/README.md,historical-review,retain-historical,independent dated review report,reviewed,cited by later research reports
+docs/review-2026-10-15/core-design.md,historical-review,retain-historical,dated design and migration plan,reviewed,plan status is historical and not built by this cleanup
+docs/review-2026-10-15/research/README.md,historical-review,retain-historical,dated review reproduction protocol,reviewed,source methods and result index retained
+docs/review-2026-10-15/reviews/BRIEF.md,historical-review,retain-historical,review-agent protocol and coordinator facts,reviewed,review metadata; not active findings
+docs/review-2026-10-15/reviews/COVERAGE.md,historical-review,retain-historical,review coverage inventory,reviewed,completeness metadata; historical line counts remain historical
+docs/review-2026-10-15/reviews/handoff-A_signals.md,historical-review,retain-historical,dated signals handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-B_execution_broker.md,historical-review,retain-historical,dated execution and broker handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-C1_state_trial.md,historical-review,retain-historical,dated state and trial handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-C2_startup_acceptance_watchdog.md,historical-review,retain-historical,startup acceptance and watchdog handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-D1_stats_signal_prereg.md,historical-review,retain-historical,statistics and preregistration handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-D2_gates.md,historical-review,retain-historical,gates handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-E1_costs.md,historical-review,retain-historical,costs handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-E2_coordinator.md,historical-review,retain-historical,cost coordinator handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-F1a_coordinator.md,historical-review,retain-historical,factory coordinator handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-F1b_factory_core.md,historical-review,retain-historical,factory core handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-F2a_coordinator.md,historical-review,retain-historical,factory coordinator handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-F2b_coordinator.md,historical-review,retain-historical,factory coordinator handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-F3a_coordinator.md,historical-review,retain-historical,factory coordinator handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-F3b_coordinator.md,historical-review,retain-historical,factory coordinator handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-G1a_live_shadow_part1.md,historical-review,retain-historical,live shadow handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-G1b_live_shadow_part2.md,historical-review,retain-historical,live shadow handoff findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-G1c_coordinator.md,historical-review,retain-historical,live shadow coordinator findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-G2a_coordinator.md,historical-review,retain-historical,live shadow coordinator findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-G2b_coordinator.md,historical-review,retain-historical,live shadow coordinator findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-H1a_coordinator.md,historical-review,retain-historical,infrastructure coordinator findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-H1b_coordinator.md,historical-review,retain-historical,infrastructure coordinator findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-H2a_coordinator.md,historical-review,retain-historical,infrastructure coordinator findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-I1_H2b_coordinator.md,historical-review,retain-historical,documentation and infrastructure review findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-I2_audit_coordinator.md,historical-review,retain-historical,audit evidence coordinator findings,reviewed,source review evidence
+docs/review-2026-10-15/reviews/handoff-J_tests_coordinator.md,historical-review,retain-historical,test coverage coordinator findings,reviewed,source review evidence
+docs/rule_strategy_v3_exit_protocol.md,protocol,retain-active,versioned rule exit protocol,reviewed,operational protocol; not a dated result narrative
+docs/trader-research-v6.md,archive-redirect,redirect-archive,tracked redirect for superseded v6 narrative,reviewed,original bytes preserved in ignored archive and manifest
+research/README.md,protocol,retain-active,research operating guide,reviewed,current research procedure; not a dated finding
+research/protocol.md,protocol,retain-sealed,research evidence and authorization protocol,reviewed,protocol authority retained; not a result narrative
+studies/liquid_reversion/README.md,historical-evidence,retain-historical,dated study protocol and interpretation,reviewed,study source retained; smoke results are not evidence
+studies/liquid_reversion/results/smoke-1m/report.md,historical-smoke,retain-historical,liquid reversion one-minute smoke report,reviewed,explicitly smoke-only
+studies/liquid_reversion/results/smoke-5m/report.md,historical-smoke,retain-historical,liquid reversion five-minute smoke report,reviewed,explicitly smoke-only
+docs/README.md,current-index,retain-active,documentation catalogue,working-tree addition,added by docs cleanup; catalogs current protocol historical and archived material

@@ -503,7 +503,8 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.engine.market.should_force_flat = lambda now=None: False
         return self.engine
 
-    def _open_runtime_trade(self, bars, name, *, spec=SPEC, filled_at=None):
+    def _open_runtime_trade(self, bars, name, *, spec=SPEC, filled_at=None,
+                            force_flat_at=None):
         """Persist the same signal through plan, risk, and fill activation."""
         engine = self._engine(name)
         cfg = validate_config({"strategy": {
@@ -512,11 +513,13 @@ class ExitContractDifferentialTests(unittest.TestCase):
         signal = generate_rule_signal(
             "SPY", _payloads([bar.close for bar in bars[:4]]), config=cfg,
             now=datetime.now(timezone.utc))
+        force_flat_at = (force_flat_at if force_flat_at is not None else
+                         BASE + timedelta(hours=6))
         snapshot = {"price": signal["entry_price"], "signal_ts": signal["signal_ts"],
                     "session": signal["session"], "spread_bps": 1.0,
                     "stale": False, "quote_stale": False,
-                    "force_flat_at": (BASE + timedelta(hours=6)).isoformat(),
-                    "force_flat_ts": (BASE + timedelta(hours=6)).timestamp()}
+                    "force_flat_at": force_flat_at.isoformat(),
+                    "force_flat_ts": force_flat_at.timestamp()}
         plan, why = build_setup_plan(signal, snapshot, cfg)
         self.assertIsNone(why)
         risk_plan, why = engine.risk.vet_open(
@@ -769,7 +772,11 @@ class ExitContractDifferentialTests(unittest.TestCase):
         })
         bars = _bars(RISING + [100.8, 101.5, 101.5])
         engine, _ = self._open_runtime_trade(
-            bars, "runtime-after-thesis", spec=spec)
+            bars, "runtime-after-thesis", spec=spec,
+            # BASE is 09:30 New York.  Use the exact 15:50 force-flat for the
+            # regular 16:00 close so the configured ten-minute offset derives
+            # a real close and leaves the 09:35 thesis deadline after entry.
+            force_flat_at=BASE + timedelta(hours=6, minutes=20))
         result = engine._monitor_positions(
             bars[6].end, [self._position(bars[6].close)],
             market_rows={"SPY": {"bars": bars[4:7]}})

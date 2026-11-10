@@ -128,6 +128,133 @@ def _exact_force_flat(decision: Mapping, symbol_snapshot: Mapping,
     return normalized_at, parsed_ts, None
 
 
+def _session_close_epoch(entry_ts: float, value) -> float:
+    """Normalize one explicit US regular-session close without inventing one."""
+    zone = ZoneInfo("America/New_York")
+    try:
+        entry_ts = float(entry_ts)
+        local_entry = datetime.fromtimestamp(entry_ts, timezone.utc).astimezone(zone)
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise ValueError("entry timestamp is invalid") from exc
+    timestamp = None
+    if isinstance(value, dt_time):
+        if value.tzinfo is not None:
+            raise ValueError("session close time must not carry a timezone")
+        parsed = datetime.combine(local_entry.date(), value, tzinfo=zone)
+    elif isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("session close datetime must include a timezone")
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("session close is empty")
+        try:
+            number = float(text)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("session close is invalid") from exc
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("session close datetime must include a timezone")
+        else:
+            if not math.isfinite(number):
+                raise ValueError("session close is invalid")
+            timestamp = number
+    else:
+        if isinstance(value, bool):
+            raise ValueError("session close is invalid")
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("session close is invalid") from exc
+        if not math.isfinite(number):
+            raise ValueError("session close is invalid")
+        timestamp = number
+    if timestamp is None:
+        timestamp = parsed.timestamp()
+    try:
+        local_close = datetime.fromtimestamp(timestamp, timezone.utc).astimezone(zone)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("session close is invalid") from exc
+    if local_close.date() != local_entry.date():
+        raise ValueError("session close must be on the entry session date")
+    if timestamp <= entry_ts:
+        raise ValueError("session close must be after entry")
+    if local_close.time() < dt_time(9, 30):
+        raise ValueError("session close must be within US regular session")
+    if local_close.time() > dt_time(16, 0):
+        raise ValueError("session close must be at or before 16:00 New York")
+    return timestamp
+
+
+def _force_flat_offset(cfg: Mapping) -> tuple[float | None, str | None]:
+    strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
+    session_cfg = cfg.get("session", {}) if isinstance(cfg, Mapping) else {}
+    session_cfg = session_cfg if isinstance(session_cfg, Mapping) else {}
+    raw_minutes = strategy.get(
+        "force_flat_minutes_before_close",
+        session_cfg.get("force_flat_minutes_before_close"))
+    if (isinstance(raw_minutes, bool) or
+            not isinstance(raw_minutes, (int, float)) or
+            not math.isfinite(float(raw_minutes)) or float(raw_minutes) < 0):
+        return None, "force-flat offset is invalid"
+    return float(raw_minutes), None
+
+
+def _resolved_session_close(decision: Mapping, symbol_snapshot: Mapping,
+                            cfg: Mapping, entry_ts: float,
+                            force_flat_ts: float | None) -> tuple[float | None, str | None]:
+    """Resolve a broker close from explicit metadata or an exact force-flat.
+
+    The engine's live session boundary is already resolved from the broker
+    calendar before the signal reaches this module.  Its force-flat timestamp
+    is therefore a safe fallback *only when the caller supplied it*.  A
+    force-flat synthesized by ``_exact_force_flat`` when exact-calendar mode
+    is disabled is deliberately not used to infer a close.
+    """
+    explicit: list[float] = []
+    for source in (decision, symbol_snapshot):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("session_close_ts", "session_close"):
+            if key not in source or source.get(key) is None:
+                continue
+            try:
+                explicit.append(_session_close_epoch(entry_ts, source.get(key)))
+            except (TypeError, ValueError, OverflowError) as exc:
+                return None, f"session close metadata is invalid: {exc}"
+    if explicit:
+        if max(explicit) - min(explicit) > 1e-6:
+            return None, "session close metadata disagrees"
+        resolved = explicit[0]
+    else:
+        resolved = None
+
+    supplied_force_flat = any(
+        isinstance(source, Mapping) and
+        any(source.get(key) is not None for key in ("force_flat_ts", "force_flat_at"))
+        for source in (decision, symbol_snapshot))
+    if not supplied_force_flat:
+        return resolved, None
+    if force_flat_ts is None or not math.isfinite(force_flat_ts):
+        return None, "exact session close cannot be derived from force-flat"
+    offset, offset_error = _force_flat_offset(cfg)
+    if offset_error is not None:
+        return None, offset_error
+    try:
+        implied = _session_close_epoch(
+            entry_ts, force_flat_ts + float(offset) * 60.0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return None, f"derived session close is invalid: {exc}"
+    if resolved is not None:
+        if abs(resolved - implied) > 1e-6:
+            return None, "session close disagrees with force-flat"
+        return resolved, None
+    return implied, None
+
+
 def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
                            cfg: Mapping):
     """Validate a content-addressed autonomous rule signal for paper risk."""
@@ -180,13 +307,27 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
         decision, symbol_snapshot, cfg, signal_ts)
     if force_flat_error is not None:
         return None, force_flat_error
+    entry_ts = signal_ts + BAR_SECONDS
+    session_close_ts = None
+    if spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
+        session_close_ts, session_close_error = _resolved_session_close(
+            decision, symbol_snapshot, cfg, entry_ts, force_flat_ts)
+        if session_close_error is not None:
+            return None, session_close_error
+        if (spec.get("exit_before_minutes") is not None and
+                session_close_ts is None):
+            return None, "exact session close timestamp is unavailable"
     # The simulated entry is the bar after the signal bar; the runtime holds
     # for the same bounded number of bars beyond it.
     try:
-        deadline_ts = hold_deadline(signal_ts + BAR_SECONDS, spec,
-                                    force_flat_ts=force_flat_ts)
+        deadline_ts = hold_deadline(
+            entry_ts, spec, force_flat_ts=force_flat_ts,
+            session_close=session_close_ts)
     except RuleSpecError as exc:
         return None, f"hold deadline is unavailable: {exc}"
+    if (spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5} and
+            deadline_ts is not None and deadline_ts <= entry_ts):
+        return None, "rule exit deadline is at or before entry"
     distance = abs(entry - stop)
     plan = dict(decision)
     plan.update({
@@ -217,7 +358,10 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
             "breakeven_r": spec.get("breakeven_r"),
         })
     if spec["schema"] in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}:
-        entry_ts = signal_ts + BAR_SECONDS
+        exit_before_ts = thesis_exit_deadline(
+            entry_ts, spec, session_close=session_close_ts)
+        if exit_before_ts is not None and exit_before_ts <= entry_ts:
+            return None, "rule thesis deadline is at or before entry"
         plan.update({
             "rule_schema": spec["schema"],
             "target_mode": str(decision.get("target_mode") or
@@ -227,7 +371,8 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
                                             spec.get("target_lookback")),
             "trailing_stop_r": spec.get("trailing_stop_r"),
             "exit_before_minutes": spec.get("exit_before_minutes"),
-            "exit_before_ts": thesis_exit_deadline(entry_ts, spec),
+            "exit_before_ts": exit_before_ts,
+            "session_close_ts": session_close_ts,
         })
     return plan, None
 

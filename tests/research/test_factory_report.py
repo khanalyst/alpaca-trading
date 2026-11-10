@@ -121,6 +121,26 @@ def _run(directory, *, llm=True):
 
 
 class ReportContentTests(unittest.TestCase):
+    def test_minimum_p_value_is_not_reported_as_confidence(self):
+        payload = {"results": [
+            {"gate": {"test": {"mean_delta": .01, "p_value": value}}}
+            for value in (.2, .05, .001)
+        ]}
+        verdict = research_verdict(payload)
+        self.assertIsNone(verdict["confidence"])
+        self.assertEqual(verdict["p_value"], .001)
+        self.assertEqual(verdict["p_value_scope"],
+                         "minimum_reported_p_value_not_multiplicity_adjusted")
+        self.assertFalse(verdict["authorizing"])
+
+    def test_invalid_p_values_are_not_reported_as_evidence(self):
+        for value in (-.1, 1.1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                verdict = research_verdict({"results": [{"gate": {"test": {
+                    "mean_delta": .01, "p_value": value}}}]})
+                self.assertIsNone(verdict["confidence"])
+                self.assertIsNone(verdict["p_value"])
+
     def test_top_level_funnel_is_disjoint_and_verdict_is_non_authorizing(self):
         gate = {
             "fill_quality": {

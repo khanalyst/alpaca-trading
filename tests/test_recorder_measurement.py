@@ -341,7 +341,9 @@ class RecorderQuoteBoundaryTests(unittest.TestCase):
         self.assertEqual([row["event_type"] for row in rows], ["bar_1m"])
         self.assertEqual(events, ["bars", "callback", "quotes"])
 
-    def test_quote_failure_leaves_validated_bars_durable(self):
+    @patch.object(recorder.shutil, "disk_usage",
+                  return_value=SimpleNamespace(free=10 * 1024**3))
+    def test_quote_failure_leaves_validated_bars_durable(self, _disk_usage):
         fixed_now = datetime(2026, 9, 9, 14, 31, 10, tzinfo=timezone.utc)
         bar_stamp = fixed_now - timedelta(minutes=3)
         quote_stamp = bar_stamp + timedelta(seconds=1)
@@ -455,7 +457,9 @@ class RecorderQuoteBoundaryTests(unittest.TestCase):
             self.assertEqual(telemetry["storage_free_bytes"], 499)
             self.assertEqual(telemetry["storage_reserve_bytes"], 500)
 
-    def test_forward_quote_failure_is_retained_as_deferred_window(self):
+    @patch.object(recorder.shutil, "disk_usage",
+                  return_value=SimpleNamespace(free=10 * 1024**3))
+    def test_forward_quote_failure_is_retained_as_deferred_window(self, _disk_usage):
         first_now = datetime(2026, 9, 9, 14, 31, 10, tzinfo=timezone.utc)
         calls = []
 

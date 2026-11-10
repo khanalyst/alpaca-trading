@@ -3662,6 +3662,8 @@ def _run_diagnostic_factory(
             raise FactoryError("intraday mechanism cohort is equity-only")
         if cohort == "intraday-mechanisms.v2":
             from .mechanism_cohort_v2 import mechanism_cohort
+        elif cohort == "intraday-mechanisms.v3":
+            from .mechanism_cohort_v3 import mechanism_cohort
         else:
             from .mechanism_cohort import mechanism_cohort
         manifest = mechanism_cohort(cohort)
@@ -3813,7 +3815,15 @@ def _run_diagnostic_factory(
         }
         root_variant_id = rule_variant_id(hypothesis.rule_spec)
         if manifest is not None:
-            chosen = [TunedVariant(arm["rule_spec"], arm["reason"],
+            chosen = [TunedVariant(
+                                   arm["rule_spec"],
+                                   str(arm.get("reason") or (
+                                       "; ".join(
+                                           str(item.get("reason"))
+                                           for item in (arm.get("corrections") or ())
+                                           if isinstance(item, Mapping) and
+                                           item.get("reason")) or
+                                       "frozen diagnostic mechanism arm")),
                                    "frozen_mechanism_cohort", None)
                       for arm in manifest["families"][hypothesis.slot]["arms"]]
             tuning = None

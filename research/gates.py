@@ -1637,8 +1637,9 @@ def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
     is exercised by :func:`performance_floor`, which is a separate, mandatory
     gate check rather than a sample-size statement.
     """
+    raw_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
     materialized = _authorizing_rows(
-        rows, vehicle=vehicle, equity_feed=equity_feed,
+        raw_rows, vehicle=vehicle, equity_feed=equity_feed,
         equity_provider=equity_provider)
     report = AcceptanceFloor(
         min_trades=min_trades, min_sessions=min_sessions,
@@ -1651,7 +1652,7 @@ def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
     report["required"] = bool(required)
     report["adequate"] = bool(report["structural_passes"] if required else True)
     report["feasibility"] = floor_feasibility(
-        materialized, vehicle=vehicle, min_trades=min_trades,
+        raw_rows, vehicle=vehicle, min_trades=min_trades,
         min_sessions=min_sessions, min_clusters=min_clusters,
         available_sessions=available_sessions, universe_size=universe_size,
         signal_opportunities=signal_opportunities, target_total=target_total,
@@ -1676,18 +1677,36 @@ def floor_feasibility(rows: Iterable[Mapping], *, vehicle: str,
     from the full session/universe inventory.  This report is deliberately
     descriptive and never lowers a configured floor.
     """
+    raw_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
     materialized = _authorizing_rows(
-        rows, vehicle=vehicle, equity_feed=equity_feed,
+        raw_rows, vehicle=vehicle, equity_feed=equity_feed,
         equity_provider=equity_provider)
     materialized = [row for row in materialized if row.get("vehicle", vehicle) == vehicle]
     sessions = {str(_session_key(row)) for row in materialized if _session_key(row)}
     clusters = {str(row.get("cluster") or _session_key(row))
                 for row in materialized if row.get("cluster") or _session_key(row)}
     observed_trades = sum(1 for row in materialized if row.get("no_trade") is not True)
+    # Capacity is a raw opportunity denominator, not an observed-trade
+    # projection. Explicit refusals/no-trades are evidence that an opportunity
+    # was evaluated. Observed counts retain _authorizing_rows' legacy
+    # compatibility behavior; strict proof authorization is a separate gate.
+    capacity_rows = [
+        row for row in raw_rows
+        if row.get("vehicle", vehicle) == vehicle and
+        row.get("signal_opportunity") is not False
+    ]
+    capacity_sessions = {
+        str(_session_key(row)) for row in capacity_rows if _session_key(row)}
+    capacity_clusters = {
+        str(row.get("cluster") or _session_key(row))
+        for row in capacity_rows
+        if row.get("cluster") or _session_key(row)
+    }
     capacity_explicit = (available_sessions is not None or universe_size is not None or
                           signal_opportunities is not None or target_total is not None)
-    available = len(sessions) if available_sessions is None else max(0, int(available_sessions))
-    opportunities = (len(materialized) if signal_opportunities is None
+    available = (len(capacity_sessions) if available_sessions is None
+                 else max(0, int(available_sessions)))
+    opportunities = (len(capacity_rows) if signal_opportunities is None
                      else max(0, int(signal_opportunities)))
     if target_total is not None:
         opportunities = max(opportunities, int(target_total))
@@ -1698,7 +1717,8 @@ def floor_feasibility(rows: Iterable[Mapping], *, vehicle: str,
         impossible_reasons.append("available_sessions_below_minimum")
     if opportunities < int(min_trades):
         impossible_reasons.append("available_opportunities_below_minimum")
-    if min_clusters and len(clusters) < int(min_clusters) and available < int(min_clusters):
+    if (min_clusters and len(capacity_clusters) < int(min_clusters) and
+            available < int(min_clusters)):
         impossible_reasons.append("available_clusters_below_minimum")
     structural_pass = (observed_trades >= int(min_trades) and
                         len(sessions) >= int(min_sessions) and
@@ -1718,7 +1738,7 @@ def floor_feasibility(rows: Iterable[Mapping], *, vehicle: str,
         "observed": {"trades": observed_trades, "sessions": len(sessions),
                       "clusters": len(clusters)},
         "available": {"trades": opportunities, "sessions": available,
-                      "clusters": max(len(clusters), available)},
+                      "clusters": max(len(capacity_clusters), available)},
         "minimums": {"trades": int(min_trades), "sessions": int(min_sessions),
                      "clusters": int(min_clusters)},
         "shortfall": {"trades": max(0, int(min_trades) - observed_trades),

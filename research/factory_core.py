@@ -1439,6 +1439,26 @@ def _cost_coverage_refusal(*, vehicle: str, symbol: str, day: date,
             **telemetry}
 
 
+def _measured_schedule_identity(provenance: Any) -> tuple[str | None, str | None]:
+    """Read the measured schedule feed/provider from a model identity.
+
+    A bar-priced leg has no executable quote identity, but a measured cost
+    model still needs its schedule identity bound into the durable economics
+    claim.  The fill source and the underlying bar provenance remain separate;
+    this helper only projects the already-resolved model identity.
+    """
+    value = str(provenance or "").strip()
+    if not value.lower().startswith("measured:"):
+        return None, None
+    parts = value.split(":")
+    feed = next((part[5:] for part in parts if part.startswith("feed-")), None)
+    provider = next(
+        (part[9:] for part in parts if part.startswith("provider-")), None)
+    if not feed or not provider:
+        return None, None
+    return feed, provider
+
+
 def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSnapshot],
                      spec: Mapping[str, Any], *, vehicle: str, account_id: str,
                      starting_cash: float = 100_000.0, risk_pct: float = .5,
@@ -1981,12 +2001,35 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                 row["diagnostic_reason"] = "diagnostic_backfill_policy"
         else:
             row.setdefault("directional_authorizing", True)
+        # A non-quote fill has no executable quote identity in ``entry_feed`` /
+        # ``entry_provider``.  Measured row economics nevertheless bind those
+        # fields to the resolved schedule.  Keep the actual execution source
+        # and bar provenance unchanged so diagnostic bar fallback remains
+        # visibly non-authorizing; quote-priced rows retain their source
+        # identity exactly as recorded at the boundary.
+        for leg, leg_model in (("entry", model), ("exit", exit_model)):
+            if str(row.get(f"{leg}_fill_source") or "").strip().lower() == QUOTE:
+                continue
+            feed, provider = _measured_schedule_identity(
+                getattr(leg_model, "provenance", None))
+            if feed is None or provider is None:
+                continue
+            if row.get(f"{leg}_feed") in (None, ""):
+                row[f"{leg}_feed"] = feed
+            if row.get(f"{leg}_provider") in (None, ""):
+                row[f"{leg}_provider"] = provider
         # Persist the exact dynamic per-leg arithmetic alongside measured
         # model provenance. Static/legacy rows receive no row-specific block;
         # measured rows without this claim are rejected by gate recomputation.
         economics = row_cost_economics_claim(row, vehicle=vehicle)
         if economics is not None:
             row["cost_economics"] = economics
+            # The claim prices measured legs at their modeled execution
+            # references. Keep the duplicated risk telemetry on that same
+            # basis so strict recomputation can verify the whole row. Static
+            # and legacy rows never enter this path.
+            row["realized_risk_per_unit"] = economics["realized_risk_per_unit"]
+            row["risk_usd"] = economics["risk_usd"]
         rows.append(row)
         active.append(row)
     if active:

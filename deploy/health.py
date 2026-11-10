@@ -934,9 +934,11 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
     # describes residual exposure or a failed/degraded operation.  Degraded
     # is never healthy: it is the runtime's assertion that safety could not
     # be proven (most importantly, an incomplete flatten).
-    residual_risk = status == "degraded" or status == "failed" or any(
-        marker in reason.lower()
-        for marker in ("flatten", "residual", "incomplete", "failed", "error", "unavailable")
+    residual_risk = (
+        heartbeat.get("residual_risk", False) is not False
+        or status in {"degraded", "failed"}
+        or any(marker in reason.lower() for marker in (
+            "flatten", "residual", "incomplete", "failed", "error", "unavailable"))
     )
     edge_gate_pause = (
         status == "paused"

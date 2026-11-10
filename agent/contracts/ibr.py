@@ -1001,7 +1001,13 @@ def generate_ibr_signal(
                 if isinstance(session_state.get("signals"), set):
                     session_state["signals"].add((symbol, signal["session"]))
                 elif isinstance(session_state.get("signals"), list):
-                    session_state["signals"].append((symbol, signal["session"]))
+                    # The evaluator intentionally retains its public mutation
+                    # contract for direct callers.  When this wrapper invokes
+                    # it, the evaluator has already recorded the tuple; keep
+                    # list-backed state idempotent just as set-backed state is.
+                    emitted = (symbol, signal["session"])
+                    if emitted not in session_state["signals"]:
+                        session_state["signals"].append(emitted)
                 else:
                     session_state[(symbol, signal["session"])] = True
             return signal

@@ -36,6 +36,10 @@ def epoch(value):
 def _bar(row: Mapping, maximum_lag: float):
     if row.get("event_type") not in {"bar", "bar_1m"}:
         return None
+    source_mode = row.get("source_mode", "forward_observed")
+    if (not isinstance(source_mode, str) or
+            source_mode not in {"forward_observed", "historical_backfill"}):
+        raise ValueError("unsupported bar observation source mode")
     stamp, available, received = (epoch(row.get(key))
                                   for key in ("timestamp", "as_of", "observed_at"))
     if available < stamp + 60 or received < available:
@@ -53,12 +57,21 @@ def _bar(row: Mapping, maximum_lag: float):
         raise ValueError("bar provider, feed and symbol are required")
     payload = {**identity, "timestamp": stamp, "as_of": available, **values}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    mode = ("historical_backfill" if row.get("source_mode") == "historical_backfill"
+    mode = ("historical_backfill" if source_mode == "historical_backfill"
             or received - available > maximum_lag else "forward_observed")
     return payload, received, mode, encoded, hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def append_observations(path: Path, rows, *, maximum_lag_seconds=900.0) -> dict:
+    if isinstance(maximum_lag_seconds, bool):
+        raise ValueError("maximum observation lag must be finite and nonnegative")
+    try:
+        maximum_lag_seconds = float(maximum_lag_seconds)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "maximum observation lag must be finite and nonnegative") from exc
+    if not math.isfinite(maximum_lag_seconds) or maximum_lag_seconds < 0:
+        raise ValueError("maximum observation lag must be finite and nonnegative")
     bars = [value for row in rows if (value := _bar(row, maximum_lag_seconds))]
     if not bars:
         return {"schema": SCHEMA, "observations": 0, "revisions": 0}

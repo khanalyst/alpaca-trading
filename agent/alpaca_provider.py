@@ -334,8 +334,10 @@ class AlpacaProvider(AlpacaMarketDataMixin):
             return Account(
                 id=_value(value, "id"),
                 status=_text(_value(value, "status")),
-                equity=Decimal(str(_value(value, "equity", 0))),
-                cash=Decimal(str(_value(value, "cash", 0))),
+                equity=_finite_decimal(
+                    _value(value, "equity", 0), "account equity"),
+                cash=_finite_decimal(
+                    _value(value, "cash", 0), "account cash"),
                 buying_power=_finite_decimal(
                     _value(value, "buying_power", None),
                     "account buying_power"),

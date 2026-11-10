@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from agent import strategy
 from agent.config import validate_config
@@ -7,8 +8,11 @@ from agent.contracts.ibr import (build_ibr_range, evaluate_exit,
                                   evaluate_ibr_breakout, generate_ibr_signal,
                                   IBRConfig)
 from agent.contracts.rule import (MIN_STOP_DISTANCE_FRACTION,
+                                  RULE_SCHEMA_V4,
+                                  RULE_SCHEMA_V5,
                                   generate_rule_signal, rule_variant_id,
                                   validate_rule_spec)
+from agent.execution_lifecycle import ExecutionLifecycleMixin
 
 
 def bars(start, *, high=100.5, low=99.5, close=100.0, volume=10.0):
@@ -18,6 +22,17 @@ def bars(start, *, high=100.5, low=99.5, close=100.0, volume=10.0):
 
 
 class IBRContractTests(unittest.TestCase):
+    def test_generator_does_not_duplicate_list_backed_session_consumption(self):
+        start = datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc)
+        rows = bars(start)
+        rows.append({"timestamp": start + timedelta(minutes=15),
+                     "high": 102, "low": 100, "close": 101, "volume": 20})
+        session_state = {"signals": []}
+        signal = generate_ibr_signal(
+            "SPY", rows, session_state=session_state)
+        self.assertIsNotNone(signal)
+        self.assertEqual(session_state["signals"], [("SPY", "2024-03-11")])
+
     def test_direct_range_summary_rejects_malformed_metadata_and_intervals(self):
         start = datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc)
         opening = build_ibr_range(bars(start))
@@ -314,6 +329,361 @@ class IBRContractTests(unittest.TestCase):
         self.assertEqual(plan["variant_id"], variant_id)
         self.assertLess(plan["stop_price"], plan["entry_price"])
         self.assertGreater(plan["target_price"], plan["entry_price"])
+
+    def test_v4_thesis_deadline_uses_resolved_early_close(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-28"
+        close = datetime(2025, 11, 28, 13, 0, tzinfo=zone)
+        signal_ts = datetime(2025, 11, 28, 11, 59, tzinfo=zone).timestamp()
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V4, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 30,
+        })
+        cfg = validate_config({
+            "session": {"require_exact_calendar": False},
+            "strategy": {
+                "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+                "rule_spec": spec,
+            },
+        })
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": signal_ts, "session": session,
+            # Runtime engine supplies this from CalendarDay.close minus the
+            # configured ten-minute force-flat offset.
+            "force_flat_at": (close - timedelta(minutes=10)).isoformat(),
+            "force_flat_ts": (close - timedelta(minutes=10)).timestamp(),
+        }
+        snapshot = {
+            "price": 100.0, "spread_bps": 1.0, "stale": False,
+            "quote_stale": False, "session": session,
+        }
+        plan, reason = strategy.build_setup_plan(decision, snapshot, cfg)
+        self.assertIsNone(reason)
+        self.assertEqual(plan["session_close_ts"], close.timestamp())
+        self.assertEqual(
+            plan["exit_before_ts"],
+            (close - timedelta(minutes=30)).timestamp())
+        self.assertEqual(plan["hold_deadline_ts"], plan["exit_before_ts"])
+
+    def test_v4_invalid_explicit_session_close_fails_closed(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-28"
+        close = datetime(2025, 11, 28, 13, 0, tzinfo=zone)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V4, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 30,
+        })
+        cfg = validate_config({
+            "session": {"require_exact_calendar": False},
+            "strategy": {
+                "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+                "rule_spec": spec,
+            },
+        })
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": datetime(2025, 11, 28, 11, 59, tzinfo=zone).timestamp(),
+            "session": session,
+            "force_flat_at": (close - timedelta(minutes=10)).isoformat(),
+            "force_flat_ts": (close - timedelta(minutes=10)).timestamp(),
+        }
+        plan, reason = strategy.build_setup_plan(
+            decision, {"price": 100.0, "spread_bps": 1.0,
+                       "stale": False, "quote_stale": False,
+                       "session": session, "session_close": "not-a-close"}, cfg)
+        self.assertIsNone(plan)
+        self.assertIn("session close metadata is invalid", reason)
+
+    def test_v4_explicit_close_must_follow_entry_and_stay_within_rth(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-28"
+        entry = datetime(2025, 11, 28, 12, 0, tzinfo=zone)
+        close = datetime(2025, 11, 28, 13, 0, tzinfo=zone)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V4, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 30,
+        })
+        cfg = validate_config({
+            "session": {"require_exact_calendar": False},
+            "strategy": {
+                "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+                "rule_spec": spec,
+            },
+        })
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": (entry - timedelta(minutes=1)).timestamp(),
+            "session": session,
+        }
+        for supplied in (
+                entry - timedelta(minutes=30),
+                datetime(2025, 11, 28, 16, 30, tzinfo=zone)):
+            with self.subTest(supplied=supplied):
+                plan, reason = strategy.build_setup_plan(
+                    decision,
+                    {"price": 100.0, "spread_bps": 1.0,
+                     "stale": False, "quote_stale": False,
+                     "session": session, "session_close": supplied}, cfg)
+                self.assertIsNone(plan)
+                self.assertIn("session close", reason)
+
+    def test_v4_explicit_close_must_match_supplied_force_flat_offset(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-28"
+        close = datetime(2025, 11, 28, 13, 0, tzinfo=zone)
+        entry = datetime(2025, 11, 28, 12, 0, tzinfo=zone)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V4, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 30,
+        })
+        cfg = validate_config({"strategy": {
+            "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+            "rule_spec": spec,
+        }})
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": (entry - timedelta(minutes=1)).timestamp(),
+            "session": session,
+            # A ten-minute configured offset implies 12:50, not 12:40.
+            "force_flat_at": (close - timedelta(minutes=20)).isoformat(),
+            "force_flat_ts": (close - timedelta(minutes=20)).timestamp(),
+        }
+        plan, reason = strategy.build_setup_plan(
+            decision,
+            {"price": 100.0, "spread_bps": 1.0,
+             "stale": False, "quote_stale": False,
+             "session": session, "session_close": close}, cfg)
+        self.assertIsNone(plan)
+        self.assertEqual(reason, "session close disagrees with force-flat")
+
+    def test_v4_derived_close_obeys_entry_and_regular_session_boundaries(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-28"
+        entry = datetime(2025, 11, 28, 12, 0, tzinfo=zone)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V4, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 30,
+        })
+        cfg = validate_config({"strategy": {
+            "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+            "rule_spec": spec,
+        }})
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": (entry - timedelta(minutes=1)).timestamp(),
+            "session": session,
+        }
+        for force_flat in (
+                datetime(2025, 11, 28, 11, 49, tzinfo=zone),
+                datetime(2025, 11, 28, 16, 0, tzinfo=zone)):
+            with self.subTest(force_flat=force_flat):
+                plan, reason = strategy.build_setup_plan(
+                    {**decision, "force_flat_at": force_flat.isoformat(),
+                     "force_flat_ts": force_flat.timestamp()},
+                    {"price": 100.0, "spread_bps": 1.0,
+                     "stale": False, "quote_stale": False,
+                     "session": session}, cfg)
+                self.assertIsNone(plan)
+                self.assertIn("derived session close is invalid", reason)
+
+    def test_v4_explicit_close_without_force_flat_is_authoritative(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-28"
+        entry = datetime(2025, 11, 28, 12, 0, tzinfo=zone)
+        close = datetime(2025, 11, 28, 13, 0, tzinfo=zone)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V4, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 30,
+        })
+        cfg = validate_config({
+            "session": {"require_exact_calendar": False},
+            "strategy": {
+                "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+                "rule_spec": spec,
+            },
+        })
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": (entry - timedelta(minutes=1)).timestamp(),
+            "session": session,
+        }
+        snapshot = {
+            "price": 100.0, "spread_bps": 1.0,
+            "stale": False, "quote_stale": False, "session": session,
+            "session_close": close,
+        }
+        plan, reason = strategy.build_setup_plan(decision, snapshot, cfg)
+        self.assertIsNone(reason)
+        self.assertEqual(plan["session_close_ts"], close.timestamp())
+
+    def test_v4_rejects_thesis_deadline_that_expires_at_entry(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-28"
+        entry = datetime(2025, 11, 28, 12, 0, tzinfo=zone)
+        close = datetime(2025, 11, 28, 13, 0, tzinfo=zone)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V4, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 60,
+        })
+        cfg = validate_config({"strategy": {
+            "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+            "rule_spec": spec,
+        }})
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": (entry - timedelta(minutes=1)).timestamp(),
+            "session": session,
+        }
+        plan, reason = strategy.build_setup_plan(
+            decision,
+            {"price": 100.0, "spread_bps": 1.0,
+             "stale": False, "quote_stale": False,
+             "session": session, "session_close": close,
+             "force_flat_at": (close - timedelta(minutes=10)).isoformat(),
+             "force_flat_ts": (close - timedelta(minutes=10)).timestamp()}, cfg)
+        self.assertIsNone(plan)
+        self.assertIn("at or before entry", reason)
+
+    def test_v4_regular_day_deadline_remains_anchored_at_1600(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-26"
+        close = datetime(2025, 11, 26, 16, 0, tzinfo=zone)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V4, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 30,
+        })
+        cfg = validate_config({"strategy": {
+            "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+            "rule_spec": spec,
+        }})
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": datetime(2025, 11, 26, 11, 59, tzinfo=zone).timestamp(),
+            "session": session,
+            "force_flat_at": (close - timedelta(minutes=10)).isoformat(),
+            "force_flat_ts": (close - timedelta(minutes=10)).timestamp(),
+        }
+        plan, reason = strategy.build_setup_plan(
+            decision, {"price": 100.0, "spread_bps": 1.0,
+                       "stale": False, "quote_stale": False,
+                       "session": session}, cfg)
+        self.assertIsNone(reason)
+        self.assertEqual(plan["exit_before_ts"],
+                         (close - timedelta(minutes=30)).timestamp())
+
+
+class _ActivationProbe(ExecutionLifecycleMixin):
+    """Small fill-path seam; no broker or durable runtime is touched."""
+
+    cfg = {"strategy": {"id": "rule"}}
+    mode = "paper"
+    run_id = "strategy-repair-test"
+
+    @staticmethod
+    def _number(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if number == number and abs(number) != float("inf") else None
+
+
+class StrategyRuntimeRepairTests(unittest.TestCase):
+    def test_fill_recomputes_v4_thesis_deadline_from_persisted_close(self):
+        zone = ZoneInfo("America/New_York")
+        close = datetime(2025, 11, 28, 13, 0, tzinfo=zone)
+        signal = datetime(2025, 11, 28, 11, 59, tzinfo=zone)
+        plan = {
+            "symbol": "SPY", "underlying_symbol": "SPY", "direction": "long",
+            "setup_type": "rule_signal", "rule_schema": RULE_SCHEMA_V4,
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "underlying_stop_price": 99.0, "underlying_target_price": 102.0,
+            "signal_ts": signal.timestamp(), "force_flat_at": (
+                close - timedelta(minutes=10)).isoformat(),
+            "force_flat_ts": (close - timedelta(minutes=10)).timestamp(),
+            "session_close_ts": close.timestamp(), "max_hold_bars": 390,
+            "exit_before_minutes": 30,
+            # Deliberately stale regular-session value; fill activation must
+            # recompute from the persisted broker close.
+            "exit_before_ts": (datetime(2025, 11, 28, 15, 30,
+                                         tzinfo=zone)).timestamp(),
+            "risk_usd": 1.0, "notional": 100.0, "execution_profile": "shares",
+            "setup_id": "strategy-repair", "strategy_id": "rule",
+            "strategy_version": "v1",
+        }
+        order = {
+            "symbol": "SPY", "side": "buy", "order_id": "order-repair",
+            "qty": 1, "requested_qty": 1, "planned_qty": 1,
+            "filled_at_ts": (signal + timedelta(minutes=1)).timestamp(),
+            "risk_plan": plan, "fill_logged": True,
+            "logged_filled_qty": 1, "logged_filled_avg_price": 100.0,
+        }
+        current = {"active_trades": {}, "protection": {}}
+        trade = _ActivationProbe()._activate_filled_trade(
+            current, order, 1, 100.0)
+        self.assertEqual(trade["session_close_ts"], close.timestamp())
+        self.assertEqual(
+            trade["exit_before_ts"],
+            (close - timedelta(minutes=30)).timestamp())
+        self.assertEqual(
+            current["protection"]["SPY"]["session_close_ts"],
+            close.timestamp())
+
+    def test_v5_thesis_deadline_uses_the_same_early_close_resolution(self):
+        zone = ZoneInfo("America/New_York")
+        session = "2025-11-28"
+        close = datetime(2025, 11, 28, 13, 0, tzinfo=zone)
+        spec = validate_rule_spec({
+            "schema": RULE_SCHEMA_V5, "family": "momentum_continuation",
+            "lookback": 3, "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+            "max_hold_bars": 390, "exit_before_minutes": 30,
+        })
+        cfg = validate_config({"strategy": {
+            "id": "rule", "version": "v1", "variant_id": rule_variant_id(spec),
+            "rule_spec": spec,
+        }})
+        decision = {
+            "symbol": "SPY", "direction": "long", "setup_type": "rule_signal",
+            "entry_price": 100.0, "stop_price": 99.0, "target_price": 102.0,
+            "signal_ts": datetime(2025, 11, 28, 11, 59, tzinfo=zone).timestamp(),
+            "session": session,
+            "force_flat_at": (close - timedelta(minutes=10)).isoformat(),
+            "force_flat_ts": (close - timedelta(minutes=10)).timestamp(),
+        }
+        plan, reason = strategy.build_setup_plan(
+            decision, {"price": 100.0, "spread_bps": 1.0,
+                       "stale": False, "quote_stale": False,
+                       "session": session}, cfg)
+        self.assertIsNone(reason)
+        self.assertEqual(plan["session_close_ts"], close.timestamp())
+        self.assertEqual(plan["exit_before_ts"],
+                         (close - timedelta(minutes=30)).timestamp())
 
 
 if __name__ == "__main__":

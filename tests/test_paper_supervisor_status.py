@@ -57,6 +57,16 @@ class PaperSupervisorStatusTests(unittest.TestCase):
         state.configure_runtime("paper")
         self.directory.cleanup()
 
+    def test_paused_heartbeat_cannot_hide_explicit_residual_risk(self):
+        for residual_risk in (True, "true", None):
+            with self.subTest(residual_risk=residual_risk):
+                state.write_heartbeat("paused", reason="operator_pause",
+                                      residual_risk=residual_risk)
+                result = health.trader(state.HEARTBEAT_FILE, 300)
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["residual_risk"])
+                self.assertEqual(result["classification"], "degraded_residual_risk")
+
     def test_open_market_no_proof_heartbeat_retains_selection_status(self):
         cfg = deepcopy(DEFAULT_CONFIG)
         cfg["research"]["db_path"] = str(

@@ -843,6 +843,9 @@ class ExecutionLifecycleMixin:
             "hold_deadline_ts", existing.get("hold_deadline_ts"))
         resolved_exit_before = plan.get(
             "exit_before_ts", existing.get("exit_before_ts"))
+        session_close_ts = (plan.get("session_close_ts")
+                            if plan.get("session_close_ts") is not None else
+                            existing.get("session_close_ts"))
         if (str(plan.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS and
                 entry_anchor_ts is not None and not rule_exit_progressed):
             deadline_spec = {
@@ -852,11 +855,13 @@ class ExecutionLifecycleMixin:
             try:
                 resolved = exit_deadline(
                     entry_anchor_ts, deadline_spec,
-                    force_flat_ts=force_flat_ts)
+                    force_flat_ts=force_flat_ts,
+                    session_close=session_close_ts)
                 resolved_hold_deadline = (
                     resolved.get("timestamp") if resolved is not None else None)
                 resolved_exit_before = thesis_exit_deadline(
-                    entry_anchor_ts, deadline_spec)
+                    entry_anchor_ts, deadline_spec,
+                    session_close=session_close_ts)
             except RuleSpecError as exc:
                 raise AlpacaError(
                     f"filled rule deadline state is invalid: {exc}") from exc
@@ -937,6 +942,9 @@ class ExecutionLifecycleMixin:
             "exit_before_minutes": existing.get(
                 "exit_before_minutes", plan.get("exit_before_minutes")),
         }
+        if (str(plan.get("rule_schema") or "") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}
+                and session_close_ts is not None):
+            trade["session_close_ts"] = session_close_ts
         if str(plan.get("rule_schema") or "") in _RULE_EXIT_SCHEMAS:
             if rule_exit_progressed:
                 bounded_exit = {
@@ -1007,6 +1015,10 @@ class ExecutionLifecycleMixin:
                 "target_lookback", "exit_before_minutes",
                 "exit_before_ts")
         }
+        if (str(plan.get("rule_schema") or "") in {RULE_SCHEMA_V4, RULE_SCHEMA_V5}
+                and trade.get("session_close_ts") is not None):
+            current["protection"][symbol]["session_close_ts"] = trade[
+                "session_close_ts"]
         if incremental_qty > 0:
             incremental_notional, incremental_risk = economics(
                 incremental_qty, incremental_price)
@@ -2238,6 +2250,7 @@ class ExecutionLifecycleMixin:
                                 "hold_deadline_ts", "force_flat_at",
                                 "force_flat_ts", "entry_filled_at_ts",
                                 "exit_entry_bar_epoch",
+                                "session_close_ts",
                                 "desired_stop_price", "stop_replacement",
                                 "protective_legs"):
                         if key in trade:
@@ -2652,7 +2665,8 @@ class ExecutionLifecycleMixin:
                             "trailing_stop_r", "exit_before_minutes",
                             "exit_before_ts", "hold_deadline_ts",
                             "force_flat_at", "force_flat_ts",
-                            "entry_filled_at_ts", "exit_entry_bar_epoch"):
+                            "entry_filled_at_ts", "exit_entry_bar_epoch",
+                            "session_close_ts"):
                     if key in refreshed_item:
                         item[key] = deepcopy(refreshed_item[key])
             pending = next((row for row in pending_by_symbol.get(symbol, [])
@@ -3129,6 +3143,7 @@ class ExecutionLifecycleMixin:
                         "exit_before_ts", "hold_deadline_ts",
                         "force_flat_at", "force_flat_ts",
                         "entry_filled_at_ts", "exit_entry_bar_epoch",
+                        "session_close_ts",
                         "stop_replacement", "protective_legs"):
                 if key in trade:
                     row[key] = deepcopy(trade[key])

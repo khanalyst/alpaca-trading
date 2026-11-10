@@ -383,6 +383,8 @@ def research_verdict(payload: Mapping[str, Any] | None, *,
         "effect_unit": "delta_per_observation", "confidence_interval": None,
         "ci": None,
         "confidence": None, "p_value": None, "power": None, "mde": None,
+        "p_value_scope": "minimum_reported_p_value_not_multiplicity_adjusted",
+        "confidence_note": "one minus a p-value is not a confidence measure",
         "estimated_power": None, "minimum_detectable_effect": None,
         "power_status": "unavailable", "mde_status": "unavailable",
         "evidence_count": 0, "interpretation": "no effect evidence available",
@@ -412,7 +414,7 @@ def research_verdict(payload: Mapping[str, Any] | None, *,
                 if upper is not None:
                     uppers.append(upper)
                 p_value = _number(test.get("p_value"))
-                if p_value is not None:
+                if p_value is not None and 0.0 <= p_value <= 1.0:
                     p_values.append(p_value)
         diagnostic = record.get("fit_diagnostics") or record.get("diagnostic")
         if isinstance(diagnostic, Mapping):
@@ -467,7 +469,8 @@ def research_verdict(payload: Mapping[str, Any] | None, *,
         verdict["effect_estimate"] = sum(effects) / len(effects)
         verdict["effect"] = verdict["effect_estimate"]
         verdict["evidence_count"] = len(effects)
-        verdict["confidence"] = (1.0 - min(p_values) if p_values else None)
+        # Retain the compatibility key as unavailable. Selecting the smallest
+        # p-value across variants does not produce a confidence probability.
         verdict["p_value"] = min(p_values) if p_values else None
         if lowers or uppers:
             verdict["confidence_interval"] = {
