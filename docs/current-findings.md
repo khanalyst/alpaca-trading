@@ -1,16 +1,23 @@
 # Current findings — verified 10 November 2026
 
-This is the operational snapshot as of the 18:24 UTC verification on 10
+This is the operational snapshot as of the 19:44 UTC verification on 10
 November. Evidence and remaining blockers are distinguished from modeled
 strategy performance. See the [full audit](deep-audit-2026-11-10/README.md)
 and [validation record](deep-audit-2026-11-10/validation.md).
 
 ## VM and storage
 
-The six production services still run source commit
-`20da96612b21962091837a2efcba9180193b1cc0`. All six are healthy. Storage
-maintenance recovered the recorder without restarting it. This maintenance
-has not deployed the newer source or resumed trading.
+The tested source is published on GitHub main. The six production services
+were updated at 19:28 UTC to commit
+`41234e25c3a94575d52616f16d84c8a34e4b82dc`, image
+`sha256:2db17c78fe78e3b435943f81c114bdc4bf04fe84cae9fcc8c76f4d5f784a5d8c`.
+All six passed fresh health checks, and the recorder is recording without an
+error. The paper account remains paused and flat.
+
+Before activation, the 471,250,063-byte critical-state archive was copied to
+the Mac and SHA-256 verified. An isolated restore verified every one of its
+91 critical files, all five SQLite databases and the complete journal history.
+The backup and the prior deployed image remain available.
 
 The data disk had fallen below its unchanged 5 GiB reserve. First, 126
 byte-identical inactive CSV exports were deduplicated, preserving every path
@@ -21,10 +28,13 @@ physical copy. The original archive path resolves to the retained copy;
 the backup disk is persistently mounted read-only. Existing backups and trial
 evidence remain intact. No Azure resource was added.
 
-The final check measured 26,985,652,224 bytes free on the recorder's disk
-(about 25.1 GiB). The archive disk retained 34,503,524,352 bytes free.
-Private maintenance receipts, the complete file manifest and their hashes
-were also copied to the Mac and verified. They remain outside Git.
+After verification, temporary restore/transfer files, the superseded build
+checkout and its unactivated image were removed. Protected backups and trial
+evidence were retained. The 19:44 UTC check measured 25,981,181,952 bytes free on
+the recorder's disk (about 24.2 GiB). The archive disk retained
+34,503,524,352 bytes free. Private maintenance/release receipts, manifests,
+test logs and frozen configuration were copied to the Mac and verified;
+they remain outside Git.
 
 ## Paper account and authority
 
@@ -39,6 +49,18 @@ resume or replace it without its account-scoped identity and flat-book
 preflight. No strategy is eligible for activation from this evidence.
 
 ## Research and forward data
+
+A fresh VM research run started at 19:33 UTC on the deployed source. It
+covers all twelve mechanism families, their twelve direct-parent controls and
+seven IBR comparisons: 31 execution reports and 24 signal reports. Its new
+plan and registration are verified, and the job is running without an error
+or OOM. Results are pending.
+
+The run uses the previously examined 17-session sealed input. It recomputes
+results with the new code and does not reuse the prior result as its baseline.
+It is retrospective, non-authorizing research; it makes no untouched-holdout
+claim and cannot change the frozen paper trial. The plan hash is
+`9552d825ffae0f64b9f6cd3b75171179d38cc50ceb2ff415fe46ecb27f8d1f43`.
 
 The recorder resumed collecting observations after storage recovery. This
 does not recover the missed forward observations after its October 19 outage,
@@ -63,9 +85,9 @@ negative. These are diagnostic results; they do not override rejected forward
 data or authorize the frozen paper trial. See the
 [October 28 report](research-2026-10-28/README.md).
 
-## Source repairs and remaining release work
+## Deployed repairs and remaining data work
 
-The continuation branch integrates the preserved runtime safeguards with the
+The deployed release integrates the preserved runtime safeguards with the
 newer main branch: monitoring while paused, durable close intent before
 canceling protection, recovery after ambiguous broker responses, conservative
 stop restoration and degraded-calendar force-flat handling. It also binds
@@ -78,8 +100,14 @@ The recorder declares newly created forward partitions before appending data,
 without rewriting old CSV files or relabeling existing unmarked partitions.
 Legacy diagnostic data remains available for non-authorizing analysis.
 
-Local tests establish software behavior, not deployed behavior, market-data
-acceptance or a profitable edge. A reviewed VM release and a complete forward
-session that passes the existing lag, cadence, freshness and provenance checks
-remain necessary. Frozen registrations, statistical thresholds and protected
-trial evidence have not been rewritten.
+The complete local suite passed 2,801 tests with one expected skip. The full
+GitHub CI run on the executable fixes also passed; the subsequent lock-test
+synchronization change passed its focused suite and the deployed-image checks.
+The deployed image passed 1,124 runtime checks (one expected Docker Compose
+availability skip inside the image) and 102 shadow checks. See the
+[validation record](deep-audit-2026-11-10/validation.md) for exact source scopes.
+
+New complete forward sessions must still pass the existing lag, cadence,
+freshness, provenance, power, FDR and broker-equivalence requirements. The
+frozen trial identity remains a separate activation blocker. Registrations,
+statistical thresholds and protected trial evidence have not been rewritten.

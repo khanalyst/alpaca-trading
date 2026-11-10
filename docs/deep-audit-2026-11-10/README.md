@@ -1,9 +1,12 @@
 # Code, strategy and evidence audit — 10 November 2026
 
 This audit starts from GitHub main `21d97293455b42ac2ef7298bf814b09b68680200`.
-Changes are prepared in an isolated checkout on `codex/full-audit-20261110`;
+Changes were prepared in an isolated checkout on `codex/full-audit-20261110`;
 the older working copy and its uncommitted safety work are preserved.
-The VM remains on `20da96612b21962091837a2efcba9180193b1cc0`.
+The initial VM snapshot was on `20da96612b21962091837a2efcba9180193b1cc0`.
+The continuation published the fixes to main and deployed
+`41234e25c3a94575d52616f16d84c8a34e4b82dc`; current operational status is in
+[current findings](../current-findings.md).
 
 The earlier readiness answer was incomplete: it did not reconcile the local
 research archives, inspect all arm-level results, or independently test the
@@ -38,7 +41,9 @@ matched both stored identities. This document supersedes that uncertainty.
   12-family view. Source JSON remains under the dated research directories.
 - All **31 October VM arms** were inspected as aggregate results in place.
   The private aggregate, receipt hash and per-arm CSV are under
-  `outputs/deep-audit/vm/`. Raw trade rows remain on the VM.
+  `outputs/deep-audit/vm/`. Row-level research performance files were not
+  published by this audit; the approved protected-state backup was copied
+  privately during the continuation.
 - Implementation probes and component reviews are under
   `outputs/deep-audit/{strategy,research,runtime,verification}/`.
 
@@ -223,8 +228,19 @@ trial evidence was discarded and no Azure resource was added.
 This repairs capacity, not the historical data gap. The morning census had
 zero accepted sessions and 24 rejected acceptance reports; lag and cadence
 failures preceded the October 19 storage stop. New complete forward-session
-acceptance and a reviewed VM source release remain outstanding. The frozen
+acceptance remains outstanding. The reviewed VM source release was activated
+at 19:28 UTC as `41234e25c3a94575d52616f16d84c8a34e4b82dc`; all six services
+passed fresh health checks. Its off-VM backup and isolated restore verified
+91 critical files, five SQLite databases and the full journal history. The
+paper account, frozen trial and order history remain unchanged. The frozen
 ORB trial identity mismatch remains a separate activation blocker.
+
+The fresh 31-arm research job started at 19:33 UTC and has a new verified plan
+and registration. It covers all twelve children, twelve direct parents and
+seven IBR comparisons on the previously examined 17-session sealed input.
+Twenty-four signal reports are requested. The run is retrospective and
+non-authorizing, with results still pending. Current release and data status
+are maintained in [current findings](../current-findings.md).
 
 ## Profitability work that is justified
 

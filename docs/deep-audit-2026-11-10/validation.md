@@ -122,11 +122,12 @@ window. Synthetic unit fixtures are not registration evidence.
 
 ## Verification limits
 
-No multi-hour public-market replay, new sealed forward research, real-order
-test, deployment, resume or VM mutation was performed. Raw VM trade rows
-remained on the VM; the receipt content hash and bounded per-arm aggregates
-were checked in place. Broker state was inspected separately from local fake
-broker tests.
+The initial audit did not perform a replay, deployment, resume or VM mutation.
+The continuation below records the subsequent storage recovery, guarded
+deployment and fresh retrospective research start. No real-order test or
+trading resume occurred. No row-level research performance file was published;
+the approved protected-state backup was copied privately to the Mac. Broker
+state was inspected separately from local fake-broker tests.
 
 Baseline file coverage is an inventory and responsibility map, not a proof
 that every source line is correct. Historical performance numbers remain
@@ -185,3 +186,46 @@ had acquired the lock on the VM. The fixture now waits for the helper's
 explicit lock-acquired message and acknowledges it before measuring the
 snapshot operation. The original blocking-duration assertion is retained.
 This changes test synchronization only; production source is unchanged.
+
+
+## Deployed-image and release verification
+
+GitHub's complete CI run for the executable fixes at `78b93cd` passed all four
+test shards and the container job:
+[verified CI run](https://github.com/khanalyst/alpaca-trading/actions/runs/42877094735).
+The follow-up `41234e2` changes test synchronization and this validation record;
+all executable production-source hashes remain identical.
+
+The snapshot suite passed 6 tests in 1.102 seconds after the handshake fix.
+The rebuilt image at `41234e25c3a94575d52616f16d84c8a34e4b82dc` then passed:
+
+- The full 1,124-test runtime shard, with one expected skip because the Docker
+  Compose binary is not installed inside the production image. The exact
+  skipped Compose integration test is covered by the separate host/CI path.
+- All 102 selected shadow, portfolio, provenance, quote-causality and entry
+  slippage tests, without a skip.
+
+Image checks ran without network, credentials or production-data mounts, with
+a read-only root and an executable 8 GiB temporary workspace. The first image
+attempt's non-executable workspace and the former lock-fixture race were
+recorded as failures; they were not counted as passing validation. All 314
+source/test files were checked against the tested checkout. Release image:
+`sha256:2db17c78fe78e3b435943f81c114bdc4bf04fe84cae9fcc8c76f4d5f784a5d8c`.
+
+The stopped rollout created a fresh 471,250,063-byte archive, SHA-256
+`faa7e8330a905bbfd32cd6b7a3a78801579b50f4e6a6c0828b64ac1642030419`.
+The Mac copy matched exactly. Isolated restore checked all 91 critical files,
+all five SQLite databases and the complete journal history. Original data was
+not restored or deleted. Activation preserved the paused/flat paper account,
+configuration, frozen trial, outcome counts, equity and order-history hash.
+Fresh health checks passed for all six services on the new image. Temporary
+restore/transfer files and the superseded build were subsequently cleaned;
+protected backups, all trial evidence and the previous deployed image remain.
+
+A fresh research container started at 19:33 UTC with a sealed new 31-arm plan,
+24 requested signal reports and the unchanged 17-session retrospective input.
+It has no network, credentials or active data-volume mounts. It cannot write
+to the active paper or edge ledgers and cannot authorize activation. Its plan,
+registration, code and input hashes were verified; completion/results remain
+pending. Operator evidence and the protected backup remain private, outside
+Git.
