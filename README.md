@@ -766,8 +766,10 @@ session-close behaviour, tests, and operational controls.
 
 The [session-edge study](studies/session_edges/README.md) is separate from the
 trader and outside these boundaries by design: it tests published
-session-level rules on long history and records them forward in its own
-shadow runner, which sends no orders unless it is started by hand with
-`--paper-orders` while the trader is stopped. Its close-weakness leg then holds
-a paper position for up to five sessions. See the
+session-level rules on long history, searches a bounded grammar of further
+hypotheses, and records the resulting edge book forward in its own runner. The
+runner sends no orders unless it is started by hand with `--paper-orders`, or
+with `--mode live --live-orders --confirm LIVE` and a notional cap, while the
+trader is stopped; its close-weakness legs then hold a position for up to five
+sessions. See the
 [strategy audit](docs/strategy-audit-2026-11-11/README.md) for why it exists.

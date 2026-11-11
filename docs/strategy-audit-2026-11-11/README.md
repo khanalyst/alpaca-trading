@@ -27,9 +27,11 @@ the bets.
    buying index ETFs on a weak close (t between 4.5 and 5.7 on five ETFs since the 1990s, stronger
    since 2020), and intraday momentum outside a time-of-day noise band on the Nasdaq-100
    (t 3.6 over 16 years, weaker since 2024). Together: Sharpe about 1.1, 16 of 17 positive years.
-4. **These are now runnable.** The study, a forward shadow runner with optional paper orders,
-   47 tests and a deployment override are in the repository. They have not been run against the
-   broker or the VM: this session had no Alpaca or Azure credentials.
+4. **There is now a search that finds them, and a runner that trades them.** A discovery engine
+   tested 2,803 session-level hypotheses, took 114 to an untouched holdout and confirmed 9 under
+   a correction for everything it promoted (section 12). A forward runner takes the resulting
+   edge book through shadow, paper orders and live orders. 75 tests cover both. Neither has been
+   run against the broker or the VM: this session had no Alpaca or Azure credentials.
 
 ## 2. Why every strategy is still negative
 
@@ -94,7 +96,7 @@ stress scenarios, evidence floors, trial floors, polling interval, LLM provider 
 test counts.
 
 * They agree with the code on every one of those, apart from the `.env.example` count above.
-  The 2,801-test claim matches discovery (2,848 with the 47 new tests).
+  The 2,801-test claim matches discovery (2,876 with the 75 new tests).
 * They are accurate and not usable as a guide. About 400 KB of prose describes mechanisms; no
   page says in plain words that the search has found nothing and why. `current-findings.md` and
   the 10 November audit come closest.
@@ -189,9 +191,12 @@ buy-and-hold Sharpe was 0.79 with a -38.8% drawdown.
 | leg | instrument | rule | capital | status |
 | --- | --- | --- | --- | --- |
 | A | SPY | Weak-close reversion: at 15:50 buy if the price is in the bottom 20% of the day's range; sell at 15:50 on a later day once it is in the top half, or after 5 sessions | 25% of equity | trade on paper after confirmation |
-| B | QQQ | Noise-band momentum: decisions every 30 minutes from 10:00 to 15:30, flat at 15:58 | 50% of equity | trade on paper after confirmation |
+| B | QQQ | Noise-band momentum: decisions every 30 minutes from 10:00 to 15:30, flat at 15:58 | 25% of equity | trade on paper after confirmation |
 | C | QQQ | Weak-close reversion | none | shadow: enable as a traded leg in a symbol leg B does not use |
 | D | QQQ | 5-minute opening range breakout | none | shadow only |
+
+Section 12 replaces this table with the edge book the discovery engine writes; these four legs
+remain the runner's defaults when no book is given.
 
 Expected character on paper: leg A trades about 33 times a year and is in the market about a
 fifth of the time; leg B trades about 0.8 times a day. Neither uses the 30 bps stop floor, the 2R
@@ -230,8 +235,8 @@ Still needed, in order:
 
 | path | change |
 | --- | --- |
-| `studies/session_edges/` | The study: data loaders, fixed rules, statistics, runner, public-data fetcher, forward shadow with optional paper orders, README, committed results |
-| `tests/research/test_session_edges_study.py` | 47 offline tests, including one that proves the live runner takes exactly the simulator's decisions |
+| `studies/session_edges/` | Registered-rule study (`run.py`), discovery engine (`grammar.py`, `discover.py`, `propose.py`), forward runner with shadow, paper and live orders (`live.py`), public-data fetcher, README, committed results |
+| `tests/research/test_session_edges_study.py` | 75 offline tests, including live-versus-simulator decision parity, order confirmation, reconciliation, halt and flatten, live-flag guards and the search protocol |
 | `deploy/compose.session-edges.yaml` | Optional service for the shadow runner; validated with `docker compose config` against the base file |
 | `.env.example` | Family count corrected from 11 to 12 |
 | `docs/README.md` | This report and the study added to the catalogue |
@@ -239,6 +244,9 @@ Still needed, in order:
 
 Nothing in `agent/`, `research/` or the existing deployment was modified. The existing trader,
 its trial and its evidence are untouched.
+
+The trader's `README.md` and `ARCHITECTURE.md` say that the session-edge runner is a separate
+process that can hold a position across sessions when its orders are enabled.
 
 ## 10. Recommended decisions
 
@@ -262,3 +270,50 @@ its trial and its evidence are untouched.
 * Exploratory runs for rows 3 to 6, 9, 11, 12 and 15 to 17 used the same rule code on data that
   is not redistributed here; rows 1, 2, 7, 8, 10, 13 and 14 are reproduced by the committed study.
 * Past performance of a rule does not bind its future. Leg B in particular shows decay.
+
+## 12. Addendum: the discovery engine and the path to live
+
+Added the same day, in response to the request for a system that can find a positive edge and
+for live trading within two days.
+
+**The engine** ([study README](../../studies/session_edges/README.md)). Eleven families of
+session-level hypotheses, each with a stated mechanism and bounded parameters. Every hypothesis
+is screened on the design period only (before 2020); one champion per family and instrument is
+taken to the holdout; confirmation uses Holm at 5% across every champion ever promoted, a cost
+stress and a positive result since 2024. A ledger keeps the count, so searching again raises the
+bar. A language model can propose hypotheses inside the same grammar; it sees design statistics
+only and its proposals join the same correction.
+
+**What it found** on public data (47 ETFs of daily bars from the 1990s, two index minute
+proxies from 2010): 2,803 hypotheses tested, 114 promoted, 9 confirmed, 12 provisional, 93 not
+confirmed. All nine confirmed results are the same effect, buying a US equity index after
+short-term weakness: close-weakness reversion on SPY, XLK, IVW, SSO and SOXL, down-streak
+reversion on SPY, QQQ and IVW, and RSI reversion on IVW, with holdout t between 3.3 and 3.9.
+Nothing outside equities was confirmed. No intraday rule survived the correction; QQQ momentum
+enters the edge book only as a registered rule.
+
+**What that means.** The system can find a positive edge, and on this evidence there is one
+robust edge with several expressions, plus one weaker, uncorrelated intraday edge. That is a
+narrower book than "a few strategies" suggests: in a sharp sell-off every reversion leg is long
+at once. Position size, not the number of legs, is the risk control.
+
+**The edge book** from public data trades close-weakness reversion on SPY, XLK and IVW at
+16.7% of equity each and QQQ momentum at 25%; leveraged funds and duplicate underlyings are
+recorded only.
+
+**Live in two days.** The runner now has a live order mode behind four independent switches
+(`--mode live`, `--live-orders --confirm LIVE`, a `--max-notional` cap, and the provider's
+`ALPACA_LIVE_ENABLE=true` guard), a read-only preflight, broker reconciliation on every poll,
+fills confirmed by order lookup, a daily loss limit, and `halt` and `flatten` controls. The
+two-day sequence is in the study README: SIP confirmation, one full paper session, then live.
+
+My assessment of that timetable, stated plainly:
+
+* The statistical case does not depend on the two days. No forward window of practical length
+  can add to or subtract from 30 years of evidence.
+* The operational case does. The runner has been tested against a simulated broker only. One
+  paper session exercises a handful of real orders. That is thin for real money, so the first
+  live weeks should use the reversion legs only, a notional cap of about a tenth of the target
+  size, and the feed-appropriate symbols (SPY and QQQ on IEX).
+* If the SIP rerun does not reproduce the edge book, or the paper session leaves an unexplained
+  problem event, the correct decision is to wait, whatever the calendar says.

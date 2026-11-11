@@ -344,6 +344,197 @@ def simulate_opening_range(sessions: Sequence[Session],
 
 
 # --------------------------------------------------------------------------
+# Further session-level families searched by the discovery engine
+# --------------------------------------------------------------------------
+
+def _flat_exit(session: Session, flat_minute: int) -> tuple[int, float]:
+    if flat_minute >= MINUTES:
+        return MINUTES, session.close[-1]
+    return flat_minute, session.open[flat_minute]
+
+
+def simulate_last_hour(sessions: Sequence[Session], *, mode: str = "follow", threshold: float = 0.0,
+                       decision_minute: int = 330, lookback_sessions: int = 14,
+                       flat_minute: int = 388) -> list[DayResult]:
+    """Follow or fade the day's move so far at ``decision_minute`` and hold to the end of day.
+
+    ``threshold`` is in multiples of the usual absolute move from the open to
+    that time of day; zero trades every session.
+    """
+    if mode not in ("follow", "fade"):
+        raise ValueError("mode must be follow or fade")
+    out: list[DayResult] = []
+    for index, session in enumerate(sessions):
+        history = sessions[max(0, index - lookback_sessions):index]
+        sigma = noise_band_sigma(history, decision_minute, lookback_sessions)
+        move = session.close[decision_minute - 1] / session.open[0] - 1.0
+        if sigma is None or move == 0 or abs(move) <= threshold * sigma:
+            out.append(DayResult(session.day))
+            continue
+        side = (LONG if move > 0 else SHORT) * (1 if mode == "follow" else -1)
+        exit_minute, exit_price = _flat_exit(session, flat_minute)
+        fill = Fill(side, decision_minute, session.open[decision_minute], exit_minute, exit_price)
+        out.append(DayResult(session.day, fill.gross, 1, (fill,)))
+    return out
+
+
+def simulate_gap(sessions: Sequence[Session], *, mode: str = "fade", threshold: float = 1.0,
+                 exit_minute: int = 60, entry_minute: int = 1, lookback_sessions: int = 20) -> list[DayResult]:
+    """Follow or fade the overnight gap when it exceeds ``threshold`` standard deviations of recent gaps."""
+    if mode not in ("follow", "fade"):
+        raise ValueError("mode must be follow or fade")
+    out: list[DayResult] = []
+    gaps: list[float] = []
+    for index, session in enumerate(sessions):
+        prior = previous_close(sessions, index)
+        if prior is None:
+            out.append(DayResult(session.day))
+            continue
+        gap = session.open[0] / prior - 1.0
+        recent = gaps[-lookback_sessions:]
+        gaps.append(gap)
+        if len(recent) < lookback_sessions:
+            out.append(DayResult(session.day))
+            continue
+        mean = math.fsum(recent) / len(recent)
+        spread = math.sqrt(math.fsum((value - mean) ** 2 for value in recent) / (len(recent) - 1))
+        if not spread > 0 or abs(gap) <= threshold * spread:
+            out.append(DayResult(session.day))
+            continue
+        side = (LONG if gap > 0 else SHORT) * (1 if mode == "follow" else -1)
+        leave, price = _flat_exit(session, exit_minute)
+        fill = Fill(side, entry_minute, session.open[entry_minute], leave, price)
+        out.append(DayResult(session.day, fill.gross, 1, (fill,)))
+    return out
+
+
+def simulate_overnight_hold(sessions: Sequence[Session], *, condition: str = "any",
+                            strength_below: float = 0.20, enter_minute: int = 388,
+                            exit_minute: int = 1) -> list[DayResult]:
+    """Buy near the close and sell just after the next open, optionally only after a weak day.
+
+    ``condition`` is ``any``, ``weak_close`` (internal bar strength below
+    ``strength_below``) or ``down_day`` (price below the day's open), read at
+    the close of the bar before ``enter_minute``.
+    """
+    if condition not in ("any", "weak_close", "down_day"):
+        raise ValueError("unknown overnight condition")
+    out: list[DayResult] = []
+    holding = False
+    for index, session in enumerate(sessions):
+        gross = 0.0
+        trips = 0
+        if holding:
+            prior = previous_close(sessions, index)
+            if prior is not None:
+                gross += session.open[exit_minute] / prior - 1.0
+            trips = 1
+            holding = False
+        price = session.close[enter_minute - 1]
+        if condition == "any":
+            wanted = True
+        elif condition == "down_day":
+            wanted = price < session.open[0]
+        else:
+            wanted = internal_bar_strength(max(session.high[:enter_minute]), min(session.low[:enter_minute]),
+                                           price) < strength_below
+        if wanted:
+            gross += session.close[-1] / session.open[enter_minute] - 1.0
+            holding = True
+        out.append(DayResult(session.day, gross, trips))
+    return out
+
+
+def _wilder_rsi(closes: Sequence[float], period: int) -> list[float | None]:
+    out: list[float | None] = [None] * len(closes)
+    gain = loss = 0.0
+    for index in range(1, len(closes)):
+        change = closes[index] - closes[index - 1]
+        up, down = max(change, 0.0), max(-change, 0.0)
+        if index <= period:
+            gain += up / period
+            loss += down / period
+            if index < period:
+                continue
+        else:
+            gain = (gain * (period - 1) + up) / period
+            loss = (loss * (period - 1) + down) / period
+        out[index] = 100.0 if loss == 0 else 100.0 - 100.0 / (1.0 + gain / loss)
+    return out
+
+
+def simulate_rsi_reversion_daily(bars: Sequence[DailyBar], *, period: int = 2, enter_below: float = 10.0,
+                                 exit_above: float = 50.0, max_sessions: int = 5) -> list[DayResult]:
+    """Buy the close when a short RSI is oversold; sell on recovery or after ``max_sessions``."""
+    rsi = _wilder_rsi([bar.close for bar in bars], period)
+    out: list[DayResult] = []
+    in_position = False
+    held = 0
+    for index, bar in enumerate(bars):
+        gross = 0.0
+        trips = 0
+        value = rsi[index]
+        if in_position:
+            held += 1
+            gross = bar.close / bars[index - 1].close - 1.0
+            if (value is not None and value > exit_above) or held >= max_sessions:
+                in_position = False
+                trips = 1
+        elif value is not None and value < enter_below:
+            in_position = True
+            held = 0
+        out.append(DayResult(bar.day, gross, trips))
+    return out
+
+
+def simulate_down_streak_daily(bars: Sequence[DailyBar], *, streak: int = 3,
+                               max_sessions: int = 3) -> list[DayResult]:
+    """Buy the close after ``streak`` consecutive lower closes; sell on the first higher close or after ``max_sessions``."""
+    out: list[DayResult] = []
+    in_position = False
+    held = 0
+    run = 0
+    for index, bar in enumerate(bars):
+        gross = 0.0
+        trips = 0
+        change = bar.close - bars[index - 1].close if index else 0.0
+        run = run + 1 if change < 0 else 0
+        if in_position:
+            held += 1
+            gross = bar.close / bars[index - 1].close - 1.0
+            if change > 0 or held >= max_sessions:
+                in_position = False
+                trips = 1
+        elif run >= streak:
+            in_position = True
+            held = 0
+        out.append(DayResult(bar.day, gross, trips))
+    return out
+
+
+def simulate_turn_of_month_daily(bars: Sequence[DailyBar], *, enter_days_before: int = 1,
+                                 hold_days_after: int = 3) -> list[DayResult]:
+    """Long from the close of the ``enter_days_before``-th last session of a month to the close of the ``hold_days_after``-th session of the next."""
+    months: dict[tuple[int, int], list[int]] = {}
+    for index, bar in enumerate(bars):
+        months.setdefault((bar.day.year, bar.day.month), []).append(index)
+    held = [False] * len(bars)
+    entries = [0] * len(bars)
+    for members in months.values():
+        for position, index in enumerate(members):
+            from_end = len(members) - 1 - position
+            if position < hold_days_after or from_end < enter_days_before - 1:
+                held[index] = True
+            if from_end == enter_days_before - 1:
+                entries[index] = 1
+    out: list[DayResult] = []
+    for index, bar in enumerate(bars):
+        gross = bar.close / bars[index - 1].close - 1.0 if index and held[index] else 0.0
+        out.append(DayResult(bar.day, gross, entries[index]))
+    return out
+
+
+# --------------------------------------------------------------------------
 # Diagnostics: effects that were tested and are reported, not traded
 # --------------------------------------------------------------------------
 

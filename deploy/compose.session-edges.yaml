@@ -4,8 +4,9 @@
 #
 #   docker compose -f compose.yaml -f deploy/compose.session-edges.yaml up -d session-edges
 #
-# Paper orders are a separate, deliberate step: stop the trader first (both
-# take the same runtime lock) and run the module with --paper-orders by hand.
+# Orders are a separate, deliberate step: stop the trader first (both take
+# the same runtime lock) and run the module by hand with --paper-orders, or
+# with the live flags described in studies/session_edges/README.md.
 # YAML anchors do not cross files, so the base service settings are repeated.
 services:
   session-edges-init:

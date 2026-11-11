@@ -7,8 +7,9 @@ Options are single-leg long calls or puts only. Crypto, overnight positions,
 multi-leg options, naked options, and short-option exposure are rejected.
 The session-edge study under `studies/session_edges` is not one of these
 processes: its forward runner is shadow-only by default and takes the
-trader's runtime lock before it can send a paper order, and only there can a
-position (its close-weakness leg) be carried across sessions.
+trader's runtime lock before it can send a paper or live order, and only there
+can a position (its close-weakness legs) be carried across sessions. The
+watchdog does not supervise that runner.
 
 ## System boundaries
 
