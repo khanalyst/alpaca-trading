@@ -235,6 +235,7 @@ Still needed, in order:
 | `deploy/compose.session-edges.yaml` | Optional service for the shadow runner; validated with `docker compose config` against the base file |
 | `.env.example` | Family count corrected from 11 to 12 |
 | `docs/README.md` | This report and the study added to the catalogue |
+| `README.md`, `ARCHITECTURE.md` | The no-overnight statements now say they are the trader's rule, and point to the separate study runner |
 
 Nothing in `agent/`, `research/` or the existing deployment was modified. The existing trader,
 its trial and its evidence are untouched.
