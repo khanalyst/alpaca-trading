@@ -1,0 +1,2905 @@
+{
+ "combined_book": {
+  "all": {
+   "annual_return_pct": 14.534838,
+   "annual_volatility_pct": 13.31255,
+   "first": "2010-11-15",
+   "last": "2026-11-06",
+   "max_drawdown_pct": -21.859893,
+   "net_bps_per_session": 5.767793,
+   "sessions": 3822,
+   "share_of_active_sessions_positive": 0.465622,
+   "sharpe": 1.091815,
+   "t_newey_west": 4.65804
+  },
+  "bootstrap_sharpe": {
+   "high": 1.482915,
+   "low": 0.703238,
+   "p_not_positive": 0.0
+  },
+  "by_year_pct": {
+   "2010": -1.696766,
+   "2011": 8.081195,
+   "2012": 19.220852,
+   "2013": 9.417109,
+   "2014": 11.674363,
+   "2015": 0.985256,
+   "2016": 6.092311,
+   "2017": 11.546138,
+   "2018": 31.718209,
+   "2019": 8.514724,
+   "2020": 32.823055,
+   "2021": 11.455219,
+   "2022": 21.642597,
+   "2023": 12.818506,
+   "2024": 19.104217,
+   "2025": 8.235118,
+   "2026": 8.812936
+  },
+  "correlations": {
+   "close_weakness_reversion:QQQ (index proxy) ~ close_weakness_reversion:SPY (index proxy)": 0.754184,
+   "noise_band_momentum:QQQ (index proxy) ~ close_weakness_reversion:QQQ (index proxy)": 0.100353,
+   "noise_band_momentum:QQQ (index proxy) ~ close_weakness_reversion:SPY (index proxy)": 0.085793
+  },
+  "holdout": {
+   "annual_return_pct": 18.15216,
+   "annual_volatility_pct": 16.407341,
+   "first": "2020-01-02",
+   "last": "2026-11-06",
+   "max_drawdown_pct": -15.493582,
+   "net_bps_per_session": 7.203238,
+   "sessions": 1595,
+   "share_of_active_sessions_positive": 0.47603,
+   "sharpe": 1.106344,
+   "t_newey_west": 3.207753
+  },
+  "legs": [
+   "noise_band_momentum:QQQ (index proxy)",
+   "close_weakness_reversion:QQQ (index proxy)",
+   "close_weakness_reversion:SPY (index proxy)"
+  ],
+  "weights": "each rule at 100% of equity, split equally across its instruments"
+ },
+ "daily": {
+  "DIA": {
+   "close_weakness_reversion_at_close": {
+    "all": {
+     "annual_return_pct": 9.416148,
+     "annual_volatility_pct": 11.198051,
+     "first": "1998-01-20",
+     "gross_bps_per_round_trip": 26.768444,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -18.004981,
+     "net_bps_per_session": 3.736567,
+     "round_trips": 1051,
+     "round_trips_per_session": 0.145006,
+     "sessions": 7248,
+     "share_of_active_sessions_positive": 0.576093,
+     "sharpe": 0.840874,
+     "t_newey_west": 5.052443
+    },
+    "bootstrap_sharpe": {
+     "high": 1.136936,
+     "low": 0.539058,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "1998": 13.364149,
+     "1999": 4.675178,
+     "2000": -4.725235,
+     "2001": 0.569554,
+     "2002": 9.553641,
+     "2003": 14.438371,
+     "2004": 4.419621,
+     "2005": 3.930197,
+     "2006": 12.685781,
+     "2007": 13.28092,
+     "2008": 46.612574,
+     "2009": 18.611556,
+     "2010": 16.314711,
+     "2011": 9.607372,
+     "2012": 6.926391,
+     "2013": 3.141376,
+     "2014": 4.178024,
+     "2015": 5.157693,
+     "2016": 8.010062,
+     "2017": 4.618975,
+     "2018": -5.111921,
+     "2019": 2.049834,
+     "2020": 34.007186,
+     "2021": 3.432075,
+     "2022": 13.455663,
+     "2023": 5.763812,
+     "2024": 5.533444,
+     "2025": 3.59849,
+     "2026": 12.726851
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 8.772959,
+     "annual_volatility_pct": 10.977513,
+     "first": "1998-01-20",
+     "gross_bps_per_round_trip": 25.281417,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -18.004981,
+     "net_bps_per_session": 3.481333,
+     "round_trips": 792,
+     "round_trips_per_session": 0.143374,
+     "sessions": 5524,
+     "share_of_active_sessions_positive": 0.572581,
+     "sharpe": 0.799175,
+     "t_newey_west": 4.128857
+    },
+    "holdout": {
+     "annual_return_pct": 11.477039,
+     "annual_volatility_pct": 11.879541,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 31.315646,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -13.189746,
+     "net_bps_per_session": 4.554381,
+     "round_trips": 259,
+     "round_trips_per_session": 0.150232,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.586907,
+     "sharpe": 0.966118,
+     "t_newey_west": 2.961279
+    },
+    "positive_years": 27,
+    "recent": {
+     "annual_return_pct": 7.671886,
+     "annual_volatility_pct": 7.256996,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 22.642362,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -13.189746,
+     "net_bps_per_session": 3.044399,
+     "round_trips": 101,
+     "round_trips_per_session": 0.140669,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.594286,
+     "sharpe": 1.057171,
+     "t_newey_west": 1.917664
+    },
+    "sessions_to_confirm_forward": 2204,
+    "sign_flip_p": 0.0002,
+    "years": 29
+   },
+   "overnight_long": {
+    "all": {
+     "annual_return_pct": 5.254857,
+     "annual_volatility_pct": 10.616855,
+     "first": "1998-01-20",
+     "gross_bps_per_round_trip": 3.085548,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -42.286251,
+     "net_bps_per_session": 2.085261,
+     "round_trips": 7247,
+     "round_trips_per_session": 0.999862,
+     "sessions": 7248,
+     "share_of_active_sessions_positive": 0.536912,
+     "sharpe": 0.494954,
+     "t_newey_west": 2.906169
+    },
+    "bootstrap_sharpe": {
+     "high": 0.85802,
+     "low": 0.139858,
+     "p_not_positive": 0.001
+    },
+    "by_year_pct": {
+     "1998": 20.843873,
+     "1999": 31.976977,
+     "2000": 6.767772,
+     "2001": -19.417979,
+     "2002": -9.664266,
+     "2003": 1.562543,
+     "2004": 2.67064,
+     "2005": 11.57656,
+     "2006": 5.227313,
+     "2007": 9.646607,
+     "2008": -13.055077,
+     "2009": 3.344936,
+     "2010": 2.539952,
+     "2011": 5.217008,
+     "2012": 0.639521,
+     "2013": 9.830627,
+     "2014": 8.653138,
+     "2015": -0.235556,
+     "2016": -3.234178,
+     "2017": 17.557455,
+     "2018": 13.265396,
+     "2019": 9.513944,
+     "2020": 14.239745,
+     "2021": 12.214834,
+     "2022": -12.546096,
+     "2023": 2.52041,
+     "2024": 8.498342,
+     "2025": -1.674582,
+     "2026": 12.659835
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 5.256563,
+     "annual_volatility_pct": 9.82623,
+     "first": "1998-01-20",
+     "gross_bps_per_round_trip": 3.086316,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -42.286251,
+     "net_bps_per_session": 2.085938,
+     "round_trips": 5523,
+     "round_trips_per_session": 0.999819,
+     "sessions": 5524,
+     "share_of_active_sessions_positive": 0.537027,
+     "sharpe": 0.534952,
+     "t_newey_west": 2.874034
+    },
+    "holdout": {
+     "annual_return_pct": 5.249389,
+     "annual_volatility_pct": 12.82935,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 3.083091,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -32.252386,
+     "net_bps_per_session": 2.083091,
+     "round_trips": 1724,
+     "round_trips_per_session": 1.0,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.536543,
+     "sharpe": 0.40917,
+     "t_newey_west": 1.084321
+    },
+    "positive_years": 22,
+    "recent": {
+     "annual_return_pct": 6.838254,
+     "annual_volatility_pct": 8.906101,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 3.713593,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -16.409609,
+     "net_bps_per_session": 2.713593,
+     "round_trips": 718,
+     "round_trips_per_session": 1.0,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.551532,
+     "sharpe": 0.767817,
+     "t_newey_west": 1.250677
+    },
+    "sessions_to_confirm_forward": 6360,
+    "sign_flip_p": 0.003799,
+    "years": 29
+   },
+   "symbol": "DIA"
+  },
+  "IWM": {
+   "close_weakness_reversion_at_close": {
+    "all": {
+     "annual_return_pct": 10.760992,
+     "annual_volatility_pct": 13.607207,
+     "first": "2000-05-26",
+     "gross_bps_per_round_trip": 28.939178,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -23.011636,
+     "net_bps_per_session": 4.270235,
+     "round_trips": 1017,
+     "round_trips_per_session": 0.15284,
+     "sessions": 6654,
+     "share_of_active_sessions_positive": 0.539877,
+     "sharpe": 0.79083,
+     "t_newey_west": 4.479456
+    },
+    "bootstrap_sharpe": {
+     "high": 1.078403,
+     "low": 0.458246,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "2000": 10.154453,
+     "2001": 10.783316,
+     "2002": 6.15574,
+     "2003": 7.43159,
+     "2004": 7.8176,
+     "2005": -8.673605,
+     "2006": 11.792919,
+     "2007": 21.104717,
+     "2008": 36.994607,
+     "2009": 34.267259,
+     "2010": 26.00871,
+     "2011": 14.11579,
+     "2012": -0.236503,
+     "2013": 12.861842,
+     "2014": -1.101859,
+     "2015": -5.074806,
+     "2016": 15.526676,
+     "2017": 6.333402,
+     "2018": 1.053639,
+     "2019": 13.981808,
+     "2020": 24.884265,
+     "2021": 9.242671,
+     "2022": 14.464464,
+     "2023": -0.498313,
+     "2024": -3.081452,
+     "2025": 10.644285,
+     "2026": 7.188231
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 11.311748,
+     "annual_volatility_pct": 13.642016,
+     "first": "2000-05-26",
+     "gross_bps_per_round_trip": 30.118065,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -23.011636,
+     "net_bps_per_session": 4.488789,
+     "round_trips": 760,
+     "round_trips_per_session": 0.154158,
+     "sessions": 4930,
+     "share_of_active_sessions_positive": 0.545593,
+     "sharpe": 0.829185,
+     "t_newey_west": 4.050974
+    },
+    "holdout": {
+     "annual_return_pct": 9.186036,
+     "annual_volatility_pct": 13.51062,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 25.452977,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -16.160912,
+     "net_bps_per_session": 3.645252,
+     "round_trips": 257,
+     "round_trips_per_session": 0.149072,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.524109,
+     "sharpe": 0.679912,
+     "t_newey_west": 1.949817
+    },
+    "positive_years": 21,
+    "recent": {
+     "annual_return_pct": 5.177254,
+     "annual_volatility_pct": 11.564081,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 15.183715,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -16.160912,
+     "net_bps_per_session": 2.054466,
+     "round_trips": 104,
+     "round_trips_per_session": 0.144847,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.526596,
+     "sharpe": 0.447701,
+     "t_newey_west": 0.830749
+    },
+    "sessions_to_confirm_forward": 2492,
+    "sign_flip_p": 0.0002,
+    "years": 27
+   },
+   "overnight_long": {
+    "all": {
+     "annual_return_pct": 11.00514,
+     "annual_volatility_pct": 13.222019,
+     "first": "2000-05-26",
+     "gross_bps_per_round_trip": 5.367776,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -33.001557,
+     "net_bps_per_session": 4.367119,
+     "round_trips": 6653,
+     "round_trips_per_session": 0.99985,
+     "sessions": 6654,
+     "share_of_active_sessions_positive": 0.547723,
+     "sharpe": 0.832334,
+     "t_newey_west": 4.500526
+    },
+    "bootstrap_sharpe": {
+     "high": 1.208198,
+     "low": 0.445863,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "2000": 32.088688,
+     "2001": -8.914034,
+     "2002": 16.093837,
+     "2003": 21.630468,
+     "2004": 15.858017,
+     "2005": 17.111452,
+     "2006": 4.579005,
+     "2007": 15.125802,
+     "2008": -17.557428,
+     "2009": 12.628087,
+     "2010": 15.177432,
+     "2011": 3.147758,
+     "2012": 8.955078,
+     "2013": 15.604049,
+     "2014": 5.617186,
+     "2015": -4.626291,
+     "2016": -0.863145,
+     "2017": 12.112517,
+     "2018": 9.77002,
+     "2019": 14.895024,
+     "2020": 35.487396,
+     "2021": 29.131526,
+     "2022": -10.351887,
+     "2023": 8.104189,
+     "2024": 25.892526,
+     "2025": 2.274485,
+     "2026": 11.616353
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 9.631896,
+     "annual_volatility_pct": 11.773917,
+     "first": "2000-05-26",
+     "gross_bps_per_round_trip": 4.822956,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -33.001557,
+     "net_bps_per_session": 3.822181,
+     "round_trips": 4929,
+     "round_trips_per_session": 0.999797,
+     "sessions": 4930,
+     "share_of_active_sessions_positive": 0.545953,
+     "sharpe": 0.818071,
+     "t_newey_west": 3.966132
+    },
+    "holdout": {
+     "annual_return_pct": 14.932109,
+     "annual_volatility_pct": 16.684983,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 6.92544,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -32.387907,
+     "net_bps_per_session": 5.92544,
+     "round_trips": 1724,
+     "round_trips_per_session": 1.0,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.552784,
+     "sharpe": 0.894943,
+     "t_newey_west": 2.338749
+    },
+    "positive_years": 22,
+    "recent": {
+     "annual_return_pct": 13.962964,
+     "annual_volatility_pct": 14.075649,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 6.540859,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -21.394026,
+     "net_bps_per_session": 5.540859,
+     "round_trips": 718,
+     "round_trips_per_session": 1.0,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.55571,
+     "sharpe": 0.991994,
+     "t_newey_west": 1.588129
+    },
+    "sessions_to_confirm_forward": 2249,
+    "sign_flip_p": 0.0004,
+    "years": 27
+   },
+   "symbol": "IWM"
+  },
+  "QQQ": {
+   "close_weakness_reversion_at_close": {
+    "all": {
+     "annual_return_pct": 15.780007,
+     "annual_volatility_pct": 16.438673,
+     "first": "1999-03-10",
+     "gross_bps_per_round_trip": 43.532099,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -44.350864,
+     "net_bps_per_session": 6.261908,
+     "round_trips": 1025,
+     "round_trips_per_session": 0.147228,
+     "sessions": 6962,
+     "share_of_active_sessions_positive": 0.573363,
+     "sharpe": 0.959932,
+     "t_newey_west": 5.696853
+    },
+    "bootstrap_sharpe": {
+     "high": 1.307618,
+     "low": 0.640818,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "1999": 19.248673,
+     "2000": 14.097162,
+     "2001": 21.062452,
+     "2002": 13.598498,
+     "2003": 53.649792,
+     "2004": 16.221741,
+     "2005": -1.591179,
+     "2006": 5.268276,
+     "2007": 6.978315,
+     "2008": 23.67412,
+     "2009": 33.711869,
+     "2010": 17.914201,
+     "2011": 12.959773,
+     "2012": 4.595834,
+     "2013": 13.09563,
+     "2014": 9.289209,
+     "2015": 2.37459,
+     "2016": 14.117059,
+     "2017": 14.460369,
+     "2018": 11.933106,
+     "2019": 4.212536,
+     "2020": 54.95302,
+     "2021": 15.374305,
+     "2022": 4.417504,
+     "2023": 22.386381,
+     "2024": -2.519981,
+     "2025": 15.072351,
+     "2026": 15.39841
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 14.956043,
+     "annual_volatility_pct": 17.031109,
+     "first": "1999-03-10",
+     "gross_bps_per_round_trip": 41.11252,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -44.350864,
+     "net_bps_per_session": 5.934938,
+     "round_trips": 775,
+     "round_trips_per_session": 0.147957,
+     "sessions": 5238,
+     "share_of_active_sessions_positive": 0.570475,
+     "sharpe": 0.87816,
+     "t_newey_west": 4.598341
+    },
+    "holdout": {
+     "annual_return_pct": 18.283446,
+     "annual_volatility_pct": 14.494312,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 51.032796,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -18.785126,
+     "net_bps_per_session": 7.255336,
+     "round_trips": 250,
+     "round_trips_per_session": 0.145012,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.582547,
+     "sharpe": 1.261422,
+     "t_newey_west": 3.490239
+    },
+    "positive_years": 26,
+    "recent": {
+     "annual_return_pct": 9.810023,
+     "annual_volatility_pct": 13.325307,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 32.056422,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -9.747299,
+     "net_bps_per_session": 3.892866,
+     "round_trips": 90,
+     "round_trips_per_session": 0.125348,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.584337,
+     "sharpe": 0.736195,
+     "t_newey_west": 1.569035
+    },
+    "sessions_to_confirm_forward": 1691,
+    "sign_flip_p": 0.0002,
+    "years": 28
+   },
+   "overnight_long": {
+    "all": {
+     "annual_return_pct": 11.37507,
+     "annual_volatility_pct": 14.278975,
+     "first": "1999-03-10",
+     "gross_bps_per_round_trip": 5.514565,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -41.222254,
+     "net_bps_per_session": 4.513917,
+     "round_trips": 6961,
+     "round_trips_per_session": 0.999856,
+     "sessions": 6962,
+     "share_of_active_sessions_positive": 0.550927,
+     "sharpe": 0.796631,
+     "t_newey_west": 4.566235
+    },
+    "bootstrap_sharpe": {
+     "high": 1.164573,
+     "low": 0.435675,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "1999": 64.935721,
+     "2000": 37.694268,
+     "2001": -4.437995,
+     "2002": -16.612818,
+     "2003": 21.429707,
+     "2004": 12.546851,
+     "2005": 13.445809,
+     "2006": 4.552412,
+     "2007": 16.07778,
+     "2008": -17.077789,
+     "2009": 10.205171,
+     "2010": 14.154775,
+     "2011": 0.735941,
+     "2012": 10.517472,
+     "2013": 15.859318,
+     "2014": 13.881333,
+     "2015": 9.814219,
+     "2016": -2.578728,
+     "2017": 16.322035,
+     "2018": 12.460128,
+     "2019": 12.363179,
+     "2020": 23.637166,
+     "2021": 13.075237,
+     "2022": -24.399455,
+     "2023": 8.909278,
+     "2024": 26.023262,
+     "2025": 13.513812,
+     "2026": 7.210793
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 11.848945,
+     "annual_volatility_pct": 13.857633,
+     "first": "1999-03-10",
+     "gross_bps_per_round_trip": 5.70286,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -41.222254,
+     "net_bps_per_session": 4.701962,
+     "round_trips": 5237,
+     "round_trips_per_session": 0.999809,
+     "sessions": 5238,
+     "share_of_active_sessions_positive": 0.550315,
+     "sharpe": 0.855048,
+     "t_newey_west": 4.28913
+    },
+    "holdout": {
+     "annual_return_pct": 9.935304,
+     "annual_volatility_pct": 15.492895,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 4.942581,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -32.04918,
+     "net_bps_per_session": 3.942581,
+     "round_trips": 1724,
+     "round_trips_per_session": 1.0,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.552784,
+     "sharpe": 0.641281,
+     "t_newey_west": 1.792216
+    },
+    "positive_years": 23,
+    "recent": {
+     "annual_return_pct": 16.40733,
+     "annual_volatility_pct": 13.507632,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 7.510845,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -19.432371,
+     "net_bps_per_session": 6.510845,
+     "round_trips": 718,
+     "round_trips_per_session": 1.0,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.575209,
+     "sharpe": 1.214671,
+     "t_newey_west": 2.189393
+    },
+    "sessions_to_confirm_forward": 2456,
+    "sign_flip_p": 0.0002,
+    "years": 28
+   },
+   "symbol": "QQQ"
+  },
+  "SPY": {
+   "close_weakness_reversion_at_close": {
+    "all": {
+     "annual_return_pct": 9.48141,
+     "annual_volatility_pct": 10.966537,
+     "first": "1993-01-29",
+     "gross_bps_per_round_trip": 27.076606,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -21.337386,
+     "net_bps_per_session": 3.762464,
+     "round_trips": 1227,
+     "round_trips_per_session": 0.144285,
+     "sessions": 8504,
+     "share_of_active_sessions_positive": 0.575167,
+     "sharpe": 0.864576,
+     "t_newey_west": 5.493014
+    },
+    "bootstrap_sharpe": {
+     "high": 1.163774,
+     "low": 0.578284,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "1993": 3.397547,
+     "1994": -4.919367,
+     "1995": 6.252905,
+     "1996": 2.757838,
+     "1997": 22.669872,
+     "1998": 10.622092,
+     "1999": 2.1804,
+     "2000": 14.420228,
+     "2001": -2.129473,
+     "2002": 2.631038,
+     "2003": 18.62558,
+     "2004": 3.732491,
+     "2005": 4.990828,
+     "2006": 12.242805,
+     "2007": 15.698914,
+     "2008": 28.868778,
+     "2009": 25.337971,
+     "2010": 14.014242,
+     "2011": 12.33581,
+     "2012": 3.156259,
+     "2013": 7.359005,
+     "2014": 7.779316,
+     "2015": 3.13512,
+     "2016": 8.471806,
+     "2017": 6.563613,
+     "2018": -10.193964,
+     "2019": 4.522563,
+     "2020": 43.059228,
+     "2021": 9.75866,
+     "2022": 13.524231,
+     "2023": 9.884951,
+     "2024": 14.34519,
+     "2025": 5.295454,
+     "2026": -0.431977
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 8.345148,
+     "annual_volatility_pct": 10.83064,
+     "first": "1993-01-29",
+     "gross_bps_per_round_trip": 23.910634,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -21.337386,
+     "net_bps_per_session": 3.311567,
+     "round_trips": 980,
+     "round_trips_per_session": 0.144543,
+     "sessions": 6780,
+     "share_of_active_sessions_positive": 0.571769,
+     "sharpe": 0.770513,
+     "t_newey_west": 4.504776
+    },
+    "holdout": {
+     "annual_return_pct": 13.950003,
+     "annual_volatility_pct": 11.484326,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 39.63795,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -12.120915,
+     "net_bps_per_session": 5.535716,
+     "round_trips": 247,
+     "round_trips_per_session": 0.143271,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.588652,
+     "sharpe": 1.214699,
+     "t_newey_west": 3.17292
+    },
+    "positive_years": 30,
+    "recent": {
+     "annual_return_pct": 6.741761,
+     "annual_volatility_pct": 8.160301,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 23.335659,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -12.120915,
+     "net_bps_per_session": 2.675302,
+     "round_trips": 86,
+     "round_trips_per_session": 0.119777,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.597484,
+     "sharpe": 0.826166,
+     "t_newey_west": 1.622887
+    },
+    "sessions_to_confirm_forward": 2085,
+    "sign_flip_p": 0.0002,
+    "years": 34
+   },
+   "overnight_long": {
+    "all": {
+     "annual_return_pct": 7.627201,
+     "annual_volatility_pct": 10.570311,
+     "first": "1993-01-29",
+     "gross_bps_per_round_trip": 4.027023,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -42.95649,
+     "net_bps_per_session": 3.026667,
+     "round_trips": 8503,
+     "round_trips_per_session": 0.999882,
+     "sessions": 8504,
+     "share_of_active_sessions_positive": 0.550747,
+     "sharpe": 0.721568,
+     "t_newey_west": 4.551998
+    },
+    "bootstrap_sharpe": {
+     "high": 1.09889,
+     "low": 0.375568,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "1993": 10.623888,
+     "1994": 6.07523,
+     "1995": 4.686667,
+     "1996": 15.740562,
+     "1997": 26.986256,
+     "1998": 22.950477,
+     "1999": 35.385836,
+     "2000": 21.679736,
+     "2001": -16.468635,
+     "2002": -12.040901,
+     "2003": 4.710972,
+     "2004": 3.867115,
+     "2005": 12.414525,
+     "2006": 7.246705,
+     "2007": 12.042337,
+     "2008": -14.850227,
+     "2009": 5.78328,
+     "2010": 5.39513,
+     "2011": 3.309753,
+     "2012": 3.578827,
+     "2013": 11.063713,
+     "2014": 8.083391,
+     "2015": 0.307489,
+     "2016": -5.437255,
+     "2017": 11.656153,
+     "2018": 11.527191,
+     "2019": 11.745251,
+     "2020": 14.1285,
+     "2021": 13.941607,
+     "2022": -15.894495,
+     "2023": 3.486246,
+     "2024": 19.214293,
+     "2025": 6.183426,
+     "2026": 8.264711
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 7.733332,
+     "annual_volatility_pct": 9.808678,
+     "first": "1993-01-29",
+     "gross_bps_per_round_trip": 4.069235,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -42.95649,
+     "net_bps_per_session": 3.068783,
+     "round_trips": 6779,
+     "round_trips_per_session": 0.999853,
+     "sessions": 6780,
+     "share_of_active_sessions_positive": 0.548754,
+     "sharpe": 0.788417,
+     "t_newey_west": 4.578622
+    },
+    "holdout": {
+     "annual_return_pct": 7.209815,
+     "annual_volatility_pct": 13.147727,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 3.861038,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -33.219537,
+     "net_bps_per_session": 2.861038,
+     "round_trips": 1724,
+     "round_trips_per_session": 1.0,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.558585,
+     "sharpe": 0.54837,
+     "t_newey_west": 1.466052
+    },
+    "positive_years": 29,
+    "recent": {
+     "annual_return_pct": 11.814669,
+     "annual_volatility_pct": 9.775979,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 5.688361,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -17.536261,
+     "net_bps_per_session": 4.688361,
+     "round_trips": 718,
+     "round_trips_per_session": 1.0,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.589136,
+     "sharpe": 1.208541,
+     "t_newey_west": 2.057035
+    },
+    "sessions_to_confirm_forward": 2993,
+    "sign_flip_p": 0.0002,
+    "years": 34
+   },
+   "symbol": "SPY"
+  },
+  "VTI": {
+   "close_weakness_reversion_at_close": {
+    "all": {
+     "annual_return_pct": 9.836052,
+     "annual_volatility_pct": 10.853692,
+     "first": "2001-06-15",
+     "gross_bps_per_round_trip": 27.614209,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -29.314006,
+     "net_bps_per_session": 3.903195,
+     "round_trips": 937,
+     "round_trips_per_session": 0.146658,
+     "sessions": 6389,
+     "share_of_active_sessions_positive": 0.570269,
+     "sharpe": 0.90624,
+     "t_newey_west": 4.717464
+    },
+    "bootstrap_sharpe": {
+     "high": 1.243007,
+     "low": 0.520668,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "2001": 0.426722,
+     "2002": -3.904355,
+     "2003": 20.939052,
+     "2004": 14.242941,
+     "2005": 4.943088,
+     "2006": 4.927157,
+     "2007": 14.340703,
+     "2008": 16.047329,
+     "2009": 20.278215,
+     "2010": 16.278946,
+     "2011": 15.712055,
+     "2012": 9.397458,
+     "2013": 8.618959,
+     "2014": 6.882859,
+     "2015": 1.475027,
+     "2016": 6.983942,
+     "2017": 6.955453,
+     "2018": -8.465161,
+     "2019": 5.518406,
+     "2020": 44.341339,
+     "2021": 5.109838,
+     "2022": 11.696838,
+     "2023": 7.512443,
+     "2024": 12.798711,
+     "2025": 0.483859,
+     "2026": 5.833318
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 8.729453,
+     "annual_volatility_pct": 10.581306,
+     "first": "2001-06-15",
+     "gross_bps_per_round_trip": 24.556675,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -29.314006,
+     "net_bps_per_session": 3.464068,
+     "round_trips": 686,
+     "round_trips_per_session": 0.147053,
+     "sessions": 4665,
+     "share_of_active_sessions_positive": 0.572526,
+     "sharpe": 0.824988,
+     "t_newey_west": 3.721625
+    },
+    "holdout": {
+     "annual_return_pct": 12.830417,
+     "annual_volatility_pct": 11.559705,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 35.970656,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -12.360357,
+     "net_bps_per_session": 5.091435,
+     "round_trips": 251,
+     "round_trips_per_session": 0.145592,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.564103,
+     "sharpe": 1.109926,
+     "t_newey_west": 2.914414
+    },
+    "positive_years": 24,
+    "recent": {
+     "annual_return_pct": 6.709197,
+     "annual_volatility_pct": 7.948095,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 21.554718,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -12.360357,
+     "net_bps_per_session": 2.66238,
+     "round_trips": 93,
+     "round_trips_per_session": 0.129526,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.563953,
+     "sharpe": 0.844127,
+     "t_newey_west": 1.535232
+    },
+    "sessions_to_confirm_forward": 1898,
+    "sign_flip_p": 0.0002,
+    "years": 26
+   },
+   "overnight_long": {
+    "all": {
+     "annual_return_pct": 12.59212,
+     "annual_volatility_pct": 11.43846,
+     "first": "2001-06-15",
+     "gross_bps_per_round_trip": 5.997655,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -34.995654,
+     "net_bps_per_session": 4.996873,
+     "round_trips": 6388,
+     "round_trips_per_session": 0.999843,
+     "sessions": 6389,
+     "share_of_active_sessions_positive": 0.567627,
+     "sharpe": 1.100858,
+     "t_newey_west": 5.981697
+    },
+    "bootstrap_sharpe": {
+     "high": 1.554789,
+     "low": 0.684158,
+     "p_not_positive": 0.0
+    },
+    "by_year_pct": {
+     "2001": 2.173543,
+     "2002": 17.306405,
+     "2003": 30.625694,
+     "2004": 16.009625,
+     "2005": 18.671834,
+     "2006": 19.680069,
+     "2007": 26.35385,
+     "2008": -7.174537,
+     "2009": 9.905643,
+     "2010": 10.55728,
+     "2011": 4.970006,
+     "2012": 6.730124,
+     "2013": 17.40758,
+     "2014": 14.12791,
+     "2015": 10.350275,
+     "2016": 1.420492,
+     "2017": 14.657406,
+     "2018": 12.359493,
+     "2019": 12.392343,
+     "2020": 19.350382,
+     "2021": 23.093619,
+     "2022": -10.547061,
+     "2023": 3.439102,
+     "2024": 23.841784,
+     "2025": 8.526508,
+     "2026": 13.020845
+    },
+    "cost_bps_per_round_trip": 1.0,
+    "design": {
+     "annual_return_pct": 12.884954,
+     "annual_volatility_pct": 10.608688,
+     "first": "2001-06-15",
+     "gross_bps_per_round_trip": 6.114173,
+     "last": "2019-12-31",
+     "max_drawdown_pct": -21.858589,
+     "net_bps_per_session": 5.113077,
+     "round_trips": 4664,
+     "round_trips_per_session": 0.999786,
+     "sessions": 4665,
+     "share_of_active_sessions_positive": 0.566038,
+     "sharpe": 1.214566,
+     "t_newey_west": 5.895364
+    },
+    "holdout": {
+     "annual_return_pct": 11.799736,
+     "annual_volatility_pct": 13.432474,
+     "first": "2020-01-02",
+     "gross_bps_per_round_trip": 5.682435,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -34.995654,
+     "net_bps_per_session": 4.682435,
+     "round_trips": 1724,
+     "round_trips_per_session": 1.0,
+     "sessions": 1724,
+     "share_of_active_sessions_positive": 0.571926,
+     "sharpe": 0.878448,
+     "t_newey_west": 2.319505
+    },
+    "positive_years": 24,
+    "recent": {
+     "annual_return_pct": 15.930449,
+     "annual_volatility_pct": 10.083993,
+     "first": "2024-01-02",
+     "gross_bps_per_round_trip": 7.321607,
+     "last": "2026-11-10",
+     "max_drawdown_pct": -18.037239,
+     "net_bps_per_session": 6.321607,
+     "round_trips": 718,
+     "round_trips_per_session": 1.0,
+     "sessions": 718,
+     "share_of_active_sessions_positive": 0.607242,
+     "sharpe": 1.579776,
+     "t_newey_west": 2.640236
+    },
+    "sessions_to_confirm_forward": 1286,
+    "sign_flip_p": 0.0002,
+    "years": 26
+   },
+   "symbol": "VTI"
+  }
+ },
+ "minute": {
+  "QQQ (index proxy)": {
+   "close_weakness_reversion": {
+    "cost_ladder": {
+     "0": {
+      "net_bps_per_session": 3.620835,
+      "sharpe": 0.789568
+     },
+     "0.5": {
+      "net_bps_per_session": 3.554229,
+      "sharpe": 0.775842
+     },
+     "1": {
+      "net_bps_per_session": 3.487623,
+      "sharpe": 0.762083
+     },
+     "2": {
+      "net_bps_per_session": 3.35441,
+      "sharpe": 0.734472
+     },
+     "3": {
+      "net_bps_per_session": 3.221198,
+      "sharpe": 0.706735
+     },
+     "5": {
+      "net_bps_per_session": 2.954772,
+      "sharpe": 0.650887
+     }
+    },
+    "evidence": {
+     "all": {
+      "annual_return_pct": 8.78881,
+      "annual_volatility_pct": 11.53261,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 27.180873,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -24.026032,
+      "net_bps_per_session": 3.487623,
+      "round_trips": 515,
+      "round_trips_per_session": 0.133213,
+      "sessions": 3866,
+      "share_of_active_sessions_positive": 0.541973,
+      "sharpe": 0.762083,
+      "t_newey_west": 3.217509
+     },
+     "bootstrap_sharpe": {
+      "high": 1.192352,
+      "low": 0.367399,
+      "p_not_positive": 0.0
+     },
+     "by_year_pct": {
+      "2010": -0.644804,
+      "2011": -0.843284,
+      "2012": 7.534846,
+      "2013": 11.151951,
+      "2014": 8.701593,
+      "2015": -5.252149,
+      "2016": 6.477286,
+      "2017": 13.569334,
+      "2018": 9.927977,
+      "2019": 8.424632,
+      "2020": 32.27467,
+      "2021": 4.440295,
+      "2022": -2.717988,
+      "2023": 9.240086,
+      "2024": 10.890342,
+      "2025": 8.705279,
+      "2026": 12.951433
+     },
+     "cost_bps_per_round_trip": 1.0,
+     "deflated_sharpe": 0.995404,
+     "design": {
+      "annual_return_pct": 6.557929,
+      "annual_volatility_pct": 8.798332,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 22.163936,
+      "last": "2019-12-31",
+      "max_drawdown_pct": -16.94554,
+      "net_bps_per_session": 2.602353,
+      "round_trips": 279,
+      "round_trips_per_session": 0.122962,
+      "sessions": 2269,
+      "share_of_active_sessions_positive": 0.547651,
+      "sharpe": 0.74536,
+      "t_newey_west": 2.444712
+     },
+     "holdout": {
+      "annual_return_pct": 11.95842,
+      "annual_volatility_pct": 14.560681,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 33.111914,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -24.026032,
+      "net_bps_per_session": 4.745405,
+      "round_trips": 236,
+      "round_trips_per_session": 0.147777,
+      "sessions": 1597,
+      "share_of_active_sessions_positive": 0.535073,
+      "sharpe": 0.821282,
+      "t_newey_west": 2.21538
+     },
+     "positive_years": 13,
+     "recent": {
+      "annual_return_pct": 11.617362,
+      "annual_volatility_pct": 12.735036,
+      "first": "2024-01-02",
+      "gross_bps_per_round_trip": 36.377232,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -14.899963,
+      "net_bps_per_session": 4.610064,
+      "round_trips": 92,
+      "round_trips_per_session": 0.130312,
+      "sessions": 706,
+      "share_of_active_sessions_positive": 0.533333,
+      "sharpe": 0.912236,
+      "t_newey_west": 1.984109
+     },
+     "sessions_to_confirm_forward": 2683,
+     "sign_flip_p": 0.0014,
+     "trials": 11,
+     "years": 17
+    },
+    "failed_checks": [],
+    "forward_bands_pct": {
+     "120": {
+      "p01": -12.244531,
+      "p05": -8.129221,
+      "p50": 4.607202
+     },
+     "20": {
+      "p01": -8.373813,
+      "p05": -3.193915,
+      "p50": 0.782531
+     },
+     "250": {
+      "p01": -17.472488,
+      "p05": -6.354632,
+      "p50": 9.067381
+     },
+     "60": {
+      "p01": -12.038594,
+      "p05": -5.202977,
+      "p50": 2.22755
+     }
+    },
+    "neighbours": {
+     "decision_minute=360": {
+      "net_bps_holdout": 5.622337,
+      "sharpe_all": 0.701805,
+      "sharpe_holdout": 0.964914,
+      "t_all": 3.010985
+     },
+     "decision_minute=385": {
+      "net_bps_holdout": 5.924923,
+      "sharpe_all": 0.927311,
+      "sharpe_holdout": 1.015129,
+      "t_all": 3.83358
+     },
+     "enter_below=0.1": {
+      "net_bps_holdout": 3.437816,
+      "sharpe_all": 0.666343,
+      "sharpe_holdout": 0.740113,
+      "t_all": 2.87176
+     },
+     "enter_below=0.15": {
+      "net_bps_holdout": 4.232349,
+      "sharpe_all": 0.802113,
+      "sharpe_holdout": 0.801841,
+      "t_all": 3.498907
+     },
+     "enter_below=0.25": {
+      "net_bps_holdout": 4.441586,
+      "sharpe_all": 0.681778,
+      "sharpe_holdout": 0.733841,
+      "t_all": 2.919391
+     },
+     "enter_below=0.3": {
+      "net_bps_holdout": 4.83861,
+      "sharpe_all": 0.781795,
+      "sharpe_holdout": 0.766912,
+      "t_all": 3.302124
+     },
+     "exit_above=0.4": {
+      "net_bps_holdout": 5.361298,
+      "sharpe_all": 0.846852,
+      "sharpe_holdout": 0.956672,
+      "t_all": 3.511857
+     },
+     "exit_above=0.6": {
+      "net_bps_holdout": 5.106498,
+      "sharpe_all": 0.77466,
+      "sharpe_holdout": 0.84518,
+      "t_all": 3.36532
+     },
+     "max_sessions=10": {
+      "net_bps_holdout": 5.021632,
+      "sharpe_all": 0.784023,
+      "sharpe_holdout": 0.865692,
+      "t_all": 3.3403
+     },
+     "max_sessions=3": {
+      "net_bps_holdout": 3.749567,
+      "sharpe_all": 0.742231,
+      "sharpe_holdout": 0.700442,
+      "t_all": 2.966111
+     }
+    },
+    "neighbours_positive_in_holdout": 1.0,
+    "rule": "close_weakness_reversion",
+    "stressed_cost": {
+     "all": {
+      "annual_return_pct": 8.453114,
+      "annual_volatility_pct": 11.5091,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 27.180873,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -24.356032,
+      "net_bps_per_session": 3.35441,
+      "round_trips": 515,
+      "round_trips_per_session": 0.133213,
+      "sessions": 3866,
+      "share_of_active_sessions_positive": 0.541237,
+      "sharpe": 0.734472,
+      "t_newey_west": 3.097981
+     },
+     "holdout": {
+      "annual_return_pct": 11.586022,
+      "annual_volatility_pct": 14.535773,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 33.111914,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -24.356032,
+      "net_bps_per_session": 4.597628,
+      "round_trips": 236,
+      "round_trips_per_session": 0.147777,
+      "sessions": 1597,
+      "share_of_active_sessions_positive": 0.535073,
+      "sharpe": 0.79707,
+      "t_newey_west": 2.148202
+     }
+    },
+    "verdict": "paper_candidate"
+   },
+   "first_last_half_hour": {
+    "cost_ladder": {
+     "0": {
+      "net_bps_per_session": -0.213718,
+      "sharpe": -0.120498
+     },
+     "0.5": {
+      "net_bps_per_session": -0.712036,
+      "sharpe": -0.401459
+     },
+     "1": {
+      "net_bps_per_session": -1.210355,
+      "sharpe": -0.682418
+     },
+     "2": {
+      "net_bps_per_session": -2.206993,
+      "sharpe": -1.244329
+     },
+     "3": {
+      "net_bps_per_session": -3.20363,
+      "sharpe": -1.806225
+     },
+     "5": {
+      "net_bps_per_session": -5.196905,
+      "sharpe": -2.929941
+     }
+    },
+    "evidence": {
+     "all": {
+      "annual_return_pct": -3.050095,
+      "annual_volatility_pct": 4.46954,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": -0.214439,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -56.776825,
+      "net_bps_per_session": -1.210355,
+      "round_trips": 3853,
+      "round_trips_per_session": 0.996637,
+      "sessions": 3866,
+      "share_of_active_sessions_positive": 0.466649,
+      "sharpe": -0.682418,
+      "t_newey_west": -2.67626
+     },
+     "bootstrap_sharpe": {
+      "high": -0.157186,
+      "low": -1.166125,
+      "p_not_positive": 0.9955
+     },
+     "by_year_pct": {
+      "2010": 0.391196,
+      "2011": 2.288682,
+      "2012": 0.741214,
+      "2013": 0.149176,
+      "2014": -0.519351,
+      "2015": -2.297556,
+      "2016": -3.510033,
+      "2017": -3.888876,
+      "2018": 0.630321,
+      "2019": -4.790972,
+      "2020": -2.189586,
+      "2021": -13.379388,
+      "2022": -14.086197,
+      "2023": 0.020689,
+      "2024": -2.034525,
+      "2025": -4.286483,
+      "2026": -0.030641
+     },
+     "cost_bps_per_round_trip": 1.0,
+     "design": {
+      "annual_return_pct": -1.20016,
+      "annual_volatility_pct": 4.035278,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 0.521002,
+      "last": "2019-12-31",
+      "max_drawdown_pct": -17.793402,
+      "net_bps_per_session": -0.476254,
+      "round_trips": 2256,
+      "round_trips_per_session": 0.994271,
+      "sessions": 2269,
+      "share_of_active_sessions_positive": 0.486702,
+      "sharpe": -0.297417,
+      "t_newey_west": -0.85775
+     },
+     "holdout": {
+      "annual_return_pct": -5.678463,
+      "annual_volatility_pct": 5.019061,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": -1.253358,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -43.739777,
+      "net_bps_per_session": -2.253358,
+      "round_trips": 1597,
+      "round_trips_per_session": 1.0,
+      "sessions": 1597,
+      "share_of_active_sessions_positive": 0.438322,
+      "sharpe": -1.131379,
+      "t_newey_west": -2.987879
+     },
+     "positive_years": 6,
+     "recent": {
+      "annual_return_pct": -2.267161,
+      "annual_volatility_pct": 4.138845,
+      "first": "2024-01-02",
+      "gross_bps_per_round_trip": 0.100333,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -10.262011,
+      "net_bps_per_session": -0.899667,
+      "round_trips": 706,
+      "round_trips_per_session": 1.0,
+      "sessions": 706,
+      "share_of_active_sessions_positive": 0.433428,
+      "sharpe": -0.547776,
+      "t_newey_west": -0.959225
+     },
+     "sessions_to_confirm_forward": null,
+     "sign_flip_p": 0.996001,
+     "years": 17
+    },
+    "failed_checks": [
+     "all-period t below 3.0",
+     "holdout t below 2.0",
+     "not positive at 2x cost",
+     "fewer than 70% of neighbours positive in the holdout",
+     "deflated Sharpe below 0.95"
+    ],
+    "forward_bands_pct": {
+     "120": {
+      "p01": -10.600526,
+      "p05": -7.855226,
+      "p50": -1.121817
+     },
+     "20": {
+      "p01": -3.798671,
+      "p05": -2.239229,
+      "p50": -0.246533
+     },
+     "250": {
+      "p01": -19.073052,
+      "p05": -15.596448,
+      "p50": -2.564883
+     },
+     "60": {
+      "p01": -6.512241,
+      "p05": -4.204862,
+      "p50": -0.682283
+     }
+    },
+    "neighbours": {},
+    "neighbours_positive_in_holdout": null,
+    "rule": "first_last_half_hour",
+    "stressed_cost": {
+     "all": {
+      "annual_return_pct": -5.561621,
+      "annual_volatility_pct": 4.469573,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": -0.214439,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -92.165251,
+      "net_bps_per_session": -2.206993,
+      "round_trips": 3853,
+      "round_trips_per_session": 0.996637,
+      "sessions": 3866,
+      "share_of_active_sessions_positive": 0.442253,
+      "sharpe": -1.244329,
+      "t_newey_west": -4.879771
+     },
+     "holdout": {
+      "annual_return_pct": -8.198463,
+      "annual_volatility_pct": 5.019061,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": -1.253358,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -57.673493,
+      "net_bps_per_session": -3.253358,
+      "round_trips": 1597,
+      "round_trips_per_session": 1.0,
+      "sessions": 1597,
+      "share_of_active_sessions_positive": 0.417658,
+      "sharpe": -1.633465,
+      "t_newey_west": -4.313846
+     }
+    },
+    "verdict": "rejected"
+   },
+   "noise_band_momentum": {
+    "cost_ladder": {
+     "0": {
+      "net_bps_per_session": 3.375949,
+      "sharpe": 1.077732
+     },
+     "0.5": {
+      "net_bps_per_session": 2.958852,
+      "sharpe": 0.943877
+     },
+     "1": {
+      "net_bps_per_session": 2.541754,
+      "sharpe": 0.810163
+     },
+     "2": {
+      "net_bps_per_session": 1.707558,
+      "sharpe": 0.54327
+     },
+     "3": {
+      "net_bps_per_session": 0.873363,
+      "sharpe": 0.277277
+     },
+     "5": {
+      "net_bps_per_session": -0.795028,
+      "sharpe": -0.25113
+     }
+    },
+    "evidence": {
+     "all": {
+      "annual_return_pct": 6.40522,
+      "annual_volatility_pct": 7.906085,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 4.046952,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -9.741741,
+      "net_bps_per_session": 2.541754,
+      "round_trips": 3225,
+      "round_trips_per_session": 0.834196,
+      "sessions": 3866,
+      "share_of_active_sessions_positive": 0.423227,
+      "sharpe": 0.810163,
+      "t_newey_west": 3.619138
+     },
+     "bootstrap_sharpe": {
+      "high": 1.246639,
+      "low": 0.411418,
+      "p_not_positive": 0.0
+     },
+     "by_year_pct": {
+      "2010": -1.281368,
+      "2011": 6.839748,
+      "2012": 11.593245,
+      "2013": -0.181284,
+      "2014": 4.658812,
+      "2015": 2.750192,
+      "2016": -0.44344,
+      "2017": 1.668162,
+      "2018": 27.426518,
+      "2019": 0.86414,
+      "2020": 2.192217,
+      "2021": 6.903272,
+      "2022": 18.222074,
+      "2023": 6.069452,
+      "2024": 8.308523,
+      "2025": 1.241159,
+      "2026": 1.432783
+     },
+     "cost_bps_per_round_trip": 1.0,
+     "deflated_sharpe": 0.99238,
+     "design": {
+      "annual_return_pct": 5.985664,
+      "annual_volatility_pct": 6.939479,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 3.875919,
+      "last": "2019-12-31",
+      "max_drawdown_pct": -8.147634,
+      "net_bps_per_session": 2.375263,
+      "round_trips": 1874,
+      "round_trips_per_session": 0.825914,
+      "sessions": 2269,
+      "share_of_active_sessions_positive": 0.41369,
+      "sharpe": 0.862552,
+      "t_newey_west": 2.729336
+     },
+     "holdout": {
+      "annual_return_pct": 7.001321,
+      "annual_volatility_pct": 9.106853,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 4.284195,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -9.741741,
+      "net_bps_per_session": 2.778302,
+      "round_trips": 1351,
+      "round_trips_per_session": 0.845961,
+      "sessions": 1597,
+      "share_of_active_sessions_positive": 0.436649,
+      "sharpe": 0.768797,
+      "t_newey_west": 2.381255
+     },
+     "positive_years": 14,
+     "recent": {
+      "annual_return_pct": 3.920087,
+      "annual_volatility_pct": 9.040176,
+      "first": "2024-01-02",
+      "gross_bps_per_round_trip": 2.916661,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -9.741741,
+      "net_bps_per_session": 1.55559,
+      "round_trips": 573,
+      "round_trips_per_session": 0.811615,
+      "sessions": 706,
+      "share_of_active_sessions_positive": 0.423645,
+      "sharpe": 0.433629,
+      "t_newey_west": 0.88082
+     },
+     "sessions_to_confirm_forward": 2374,
+     "sign_flip_p": 0.0008,
+     "trials": 14,
+     "years": 17
+    },
+    "failed_checks": [],
+    "forward_bands_pct": {
+     "120": {
+      "p01": -4.970461,
+      "p05": -2.733627,
+      "p50": 2.376618
+     },
+     "20": {
+      "p01": -3.555165,
+      "p05": -2.183139,
+      "p50": 0.319037
+     },
+     "250": {
+      "p01": -5.480049,
+      "p05": -2.524488,
+      "p50": 4.621459
+     },
+     "60": {
+      "p01": -4.901888,
+      "p05": -3.232937,
+      "p50": 1.102128
+     }
+    },
+    "neighbours": {
+     "band=0.75": {
+      "net_bps_holdout": 2.548523,
+      "sharpe_all": 0.554624,
+      "sharpe_holdout": 0.605326,
+      "t_all": 2.479845
+     },
+     "band=1.25": {
+      "net_bps_holdout": 2.76565,
+      "sharpe_all": 0.770039,
+      "sharpe_holdout": 0.836084,
+      "t_all": 3.327856
+     },
+     "band=1.5": {
+      "net_bps_holdout": 1.597315,
+      "sharpe_all": 0.621469,
+      "sharpe_holdout": 0.549045,
+      "t_all": 2.546078
+     },
+     "flat_at_15:58": {
+      "net_bps_holdout": 2.813642,
+      "sharpe_all": 0.794402,
+      "sharpe_holdout": 0.784747,
+      "t_all": 3.55206
+     },
+     "long_only": {
+      "net_bps_holdout": 1.745039,
+      "sharpe_all": 0.760027,
+      "sharpe_holdout": 0.701539,
+      "t_all": 3.319075
+     },
+     "lookback=10": {
+      "net_bps_holdout": 2.908741,
+      "sharpe_all": 0.738434,
+      "sharpe_holdout": 0.799476,
+      "t_all": 3.243531
+     },
+     "lookback=20": {
+      "net_bps_holdout": 2.671048,
+      "sharpe_all": 0.81203,
+      "sharpe_holdout": 0.719854,
+      "t_all": 3.623939
+     },
+     "lookback=30": {
+      "net_bps_holdout": 2.090186,
+      "sharpe_all": 0.74432,
+      "sharpe_holdout": 0.547803,
+      "t_all": 3.310768
+     },
+     "lookback=7": {
+      "net_bps_holdout": 3.237718,
+      "sharpe_all": 0.821292,
+      "sharpe_holdout": 0.870995,
+      "t_all": 3.446097
+     },
+     "no_gap_reference": {
+      "net_bps_holdout": 2.817137,
+      "sharpe_all": 0.655521,
+      "sharpe_holdout": 0.624731,
+      "t_all": 2.718384
+     },
+     "short_only": {
+      "net_bps_holdout": 1.033263,
+      "sharpe_all": 0.418949,
+      "sharpe_holdout": 0.39112,
+      "t_all": 1.801461
+     },
+     "step=15": {
+      "net_bps_holdout": 1.405757,
+      "sharpe_all": 0.519465,
+      "sharpe_holdout": 0.370791,
+      "t_all": 2.308131
+     },
+     "step=60": {
+      "net_bps_holdout": 3.732175,
+      "sharpe_all": 0.820434,
+      "sharpe_holdout": 1.095674,
+      "t_all": 3.411479
+     }
+    },
+    "neighbours_positive_in_holdout": 1.0,
+    "rule": "noise_band_momentum",
+    "stressed_cost": {
+     "all": {
+      "annual_return_pct": 4.303047,
+      "annual_volatility_pct": 7.920646,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 4.046952,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -12.195534,
+      "net_bps_per_session": 1.707558,
+      "round_trips": 3225,
+      "round_trips_per_session": 0.834196,
+      "sessions": 3866,
+      "share_of_active_sessions_positive": 0.410613,
+      "sharpe": 0.54327,
+      "t_newey_west": 2.425868
+     },
+     "holdout": {
+      "annual_return_pct": 4.869498,
+      "annual_volatility_pct": 9.117871,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 4.284195,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -12.195534,
+      "net_bps_per_session": 1.932341,
+      "round_trips": 1351,
+      "round_trips_per_session": 0.845961,
+      "sessions": 1597,
+      "share_of_active_sessions_positive": 0.425131,
+      "sharpe": 0.534061,
+      "t_newey_west": 1.65289
+     }
+    },
+    "verdict": "paper_candidate"
+   },
+   "opening_range_breakout": {
+    "cost_ladder": {
+     "0": {
+      "net_bps_per_session": 3.041182,
+      "sharpe": 0.856321
+     },
+     "0.5": {
+      "net_bps_per_session": 2.547908,
+      "sharpe": 0.717431
+     },
+     "1": {
+      "net_bps_per_session": 2.054633,
+      "sharpe": 0.578539
+     },
+     "2": {
+      "net_bps_per_session": 1.068083,
+      "sharpe": 0.300751
+     },
+     "3": {
+      "net_bps_per_session": 0.081534,
+      "sharpe": 0.022958
+     },
+     "5": {
+      "net_bps_per_session": -1.891565,
+      "sharpe": -0.532624
+     }
+    },
+    "evidence": {
+     "all": {
+      "annual_return_pct": 5.177675,
+      "annual_volatility_pct": 8.949563,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 3.082646,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -14.031603,
+      "net_bps_per_session": 2.054633,
+      "round_trips": 3814,
+      "round_trips_per_session": 0.986549,
+      "sessions": 3866,
+      "share_of_active_sessions_positive": 0.22968,
+      "sharpe": 0.578539,
+      "t_newey_west": 2.401048
+     },
+     "bootstrap_sharpe": {
+      "high": 1.004868,
+      "low": 0.107114,
+      "p_not_positive": 0.0095
+     },
+     "by_year_pct": {
+      "2010": 0.220524,
+      "2011": 2.242613,
+      "2012": 1.843079,
+      "2013": 5.931489,
+      "2014": 6.86838,
+      "2015": -8.358092,
+      "2016": 13.41207,
+      "2017": -1.979216,
+      "2018": 17.418873,
+      "2019": 5.070707,
+      "2020": 7.410165,
+      "2021": 4.759429,
+      "2022": 18.542401,
+      "2023": -0.144793,
+      "2024": 5.847236,
+      "2025": 0.450707,
+      "2026": -0.103464
+     },
+     "cost_bps_per_round_trip": 1.0,
+     "deflated_sharpe": 0.948363,
+     "design": {
+      "annual_return_pct": 4.739069,
+      "annual_volatility_pct": 7.450908,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 2.923824,
+      "last": "2019-12-31",
+      "max_drawdown_pct": -14.031603,
+      "net_bps_per_session": 1.880583,
+      "round_trips": 2218,
+      "round_trips_per_session": 0.977523,
+      "sessions": 2269,
+      "share_of_active_sessions_positive": 0.221371,
+      "sharpe": 0.636039,
+      "t_newey_west": 1.956523
+     },
+     "holdout": {
+      "annual_return_pct": 5.800841,
+      "annual_volatility_pct": 10.727059,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 3.303364,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -11.723845,
+      "net_bps_per_session": 2.301921,
+      "round_trips": 1596,
+      "round_trips_per_session": 0.999374,
+      "sessions": 1597,
+      "share_of_active_sessions_positive": 0.241228,
+      "sharpe": 0.540767,
+      "t_newey_west": 1.478034
+     },
+     "positive_years": 13,
+     "recent": {
+      "annual_return_pct": 2.211061,
+      "annual_volatility_pct": 8.505499,
+      "first": "2024-01-02",
+      "gross_bps_per_round_trip": 1.87865,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -11.426272,
+      "net_bps_per_session": 0.877405,
+      "round_trips": 705,
+      "round_trips_per_session": 0.998584,
+      "sessions": 706,
+      "share_of_active_sessions_positive": 0.243972,
+      "sharpe": 0.259957,
+      "t_newey_west": 0.492891
+     },
+     "sessions_to_confirm_forward": 4655,
+     "sign_flip_p": 0.011598,
+     "trials": 4,
+     "years": 17
+    },
+    "failed_checks": [
+     "all-period t below 3.0",
+     "holdout t below 2.0",
+     "deflated Sharpe below 0.95"
+    ],
+    "forward_bands_pct": {
+     "120": {
+      "p01": -8.464005,
+      "p05": -5.862221,
+      "p50": 1.925621
+     },
+     "20": {
+      "p01": -4.67408,
+      "p05": -3.013229,
+      "p50": 0.206203
+     },
+     "250": {
+      "p01": -10.369054,
+      "p05": -5.467096,
+      "p50": 4.290615
+     },
+     "60": {
+      "p01": -7.382329,
+      "p05": -4.963734,
+      "p50": 0.960064
+     }
+    },
+    "neighbours": {
+     "minutes=15": {
+      "net_bps_holdout": 2.195153,
+      "sharpe_all": 0.182332,
+      "sharpe_holdout": 0.453461,
+      "t_all": 0.726056
+     },
+     "minutes=30": {
+      "net_bps_holdout": 3.186593,
+      "sharpe_all": 0.399943,
+      "sharpe_holdout": 0.627919,
+      "t_all": 1.684615
+     },
+     "no_target": {
+      "net_bps_holdout": 2.081656,
+      "sharpe_all": 0.517866,
+      "sharpe_holdout": 0.461753,
+      "t_all": 2.11418
+     }
+    },
+    "neighbours_positive_in_holdout": 1.0,
+    "rule": "opening_range_breakout",
+    "stressed_cost": {
+     "all": {
+      "annual_return_pct": 2.69157,
+      "annual_volatility_pct": 8.949504,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 3.082646,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -17.150913,
+      "net_bps_per_session": 1.068083,
+      "round_trips": 3814,
+      "round_trips_per_session": 0.986549,
+      "sessions": 3866,
+      "share_of_active_sessions_positive": 0.228107,
+      "sharpe": 0.300751,
+      "t_newey_west": 1.248204
+     },
+     "holdout": {
+      "annual_return_pct": 3.282419,
+      "annual_volatility_pct": 10.727056,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 3.303364,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -14.898449,
+      "net_bps_per_session": 1.302547,
+      "round_trips": 1596,
+      "round_trips_per_session": 0.999374,
+      "sessions": 1597,
+      "share_of_active_sessions_positive": 0.238722,
+      "sharpe": 0.305994,
+      "t_newey_west": 0.836308
+     }
+    },
+    "verdict": "shadow_only"
+   }
+  },
+  "SPY (index proxy)": {
+   "close_weakness_reversion": {
+    "cost_ladder": {
+     "0": {
+      "net_bps_per_session": 3.063527,
+      "sharpe": 0.803169
+     },
+     "0.5": {
+      "net_bps_per_session": 2.998446,
+      "sharpe": 0.787017
+     },
+     "1": {
+      "net_bps_per_session": 2.933365,
+      "sharpe": 0.770822
+     },
+     "2": {
+      "net_bps_per_session": 2.803203,
+      "sharpe": 0.738306
+     },
+     "3": {
+      "net_bps_per_session": 2.673041,
+      "sharpe": 0.705621
+     },
+     "5": {
+      "net_bps_per_session": 2.412717,
+      "sharpe": 0.639756
+     }
+    },
+    "evidence": {
+     "all": {
+      "annual_return_pct": 7.39208,
+      "annual_volatility_pct": 9.589867,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 23.536255,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -16.454077,
+      "net_bps_per_session": 2.933365,
+      "round_trips": 498,
+      "round_trips_per_session": 0.130162,
+      "sessions": 3826,
+      "share_of_active_sessions_positive": 0.54236,
+      "sharpe": 0.770822,
+      "t_newey_west": 3.210943
+     },
+     "bootstrap_sharpe": {
+      "high": 1.180351,
+      "low": 0.35694,
+      "p_not_positive": 0.0
+     },
+     "by_year_pct": {
+      "2010": -1.287612,
+      "2011": 3.195226,
+      "2012": 8.863392,
+      "2013": 7.848323,
+      "2014": 5.064321,
+      "2015": 1.722276,
+      "2016": 5.60147,
+      "2017": 6.355019,
+      "2018": -1.344594,
+      "2019": 6.876535,
+      "2020": 28.987007,
+      "2021": 4.6636,
+      "2022": 9.559033,
+      "2023": 4.258022,
+      "2024": 14.777023,
+      "2025": 5.282638,
+      "2026": 1.808873
+     },
+     "cost_bps_per_round_trip": 1.0,
+     "deflated_sharpe": 0.99483,
+     "design": {
+      "annual_return_pct": 4.853784,
+      "annual_volatility_pct": 7.557391,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 17.247862,
+      "last": "2019-12-31",
+      "max_drawdown_pct": -16.454077,
+      "net_bps_per_session": 1.926105,
+      "round_trips": 264,
+      "round_trips_per_session": 0.118545,
+      "sessions": 2227,
+      "share_of_active_sessions_positive": 0.532578,
+      "sharpe": 0.642257,
+      "t_newey_west": 1.964039
+     },
+     "holdout": {
+      "annual_return_pct": 10.92728,
+      "annual_volatility_pct": 11.85266,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 30.630853,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -11.888682,
+      "net_bps_per_session": 4.336222,
+      "round_trips": 234,
+      "round_trips_per_session": 0.146341,
+      "sessions": 1599,
+      "share_of_active_sessions_positive": 0.553571,
+      "sharpe": 0.921926,
+      "t_newey_west": 2.546197
+     },
+     "positive_years": 15,
+     "recent": {
+      "annual_return_pct": 7.783715,
+      "annual_volatility_pct": 9.672246,
+      "first": "2024-01-02",
+      "gross_bps_per_round_trip": 25.298371,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -10.843288,
+      "net_bps_per_session": 3.088776,
+      "round_trips": 90,
+      "round_trips_per_session": 0.127119,
+      "sessions": 708,
+      "share_of_active_sessions_positive": 0.563786,
+      "sharpe": 0.804747,
+      "t_newey_west": 1.710156
+     },
+     "sessions_to_confirm_forward": 2623,
+     "sign_flip_p": 0.0004,
+     "trials": 11,
+     "years": 17
+    },
+    "failed_checks": [],
+    "forward_bands_pct": {
+     "120": {
+      "p01": -7.718938,
+      "p05": -3.745815,
+      "p50": 3.04902
+     },
+     "20": {
+      "p01": -7.084634,
+      "p05": -2.795469,
+      "p50": 0.567127
+     },
+     "250": {
+      "p01": -5.340241,
+      "p05": -1.471121,
+      "p50": 6.310295
+     },
+     "60": {
+      "p01": -8.251333,
+      "p05": -3.877028,
+      "p50": 1.641119
+     }
+    },
+    "neighbours": {
+     "decision_minute=360": {
+      "net_bps_holdout": 3.644959,
+      "sharpe_all": 0.498801,
+      "sharpe_holdout": 0.773211,
+      "t_all": 2.108639
+     },
+     "decision_minute=385": {
+      "net_bps_holdout": 4.410331,
+      "sharpe_all": 0.802003,
+      "sharpe_holdout": 0.943532,
+      "t_all": 3.262499
+     },
+     "enter_below=0.1": {
+      "net_bps_holdout": 3.041241,
+      "sharpe_all": 0.641934,
+      "sharpe_holdout": 0.836244,
+      "t_all": 2.780144
+     },
+     "enter_below=0.15": {
+      "net_bps_holdout": 4.063819,
+      "sharpe_all": 0.693213,
+      "sharpe_holdout": 0.910962,
+      "t_all": 2.928517
+     },
+     "enter_below=0.25": {
+      "net_bps_holdout": 4.492066,
+      "sharpe_all": 0.780415,
+      "sharpe_holdout": 0.900102,
+      "t_all": 3.262944
+     },
+     "enter_below=0.3": {
+      "net_bps_holdout": 4.357619,
+      "sharpe_all": 0.727747,
+      "sharpe_holdout": 0.835001,
+      "t_all": 3.024677
+     },
+     "exit_above=0.4": {
+      "net_bps_holdout": 3.835619,
+      "sharpe_all": 0.7829,
+      "sharpe_holdout": 0.895882,
+      "t_all": 3.245453
+     },
+     "exit_above=0.6": {
+      "net_bps_holdout": 4.189046,
+      "sharpe_all": 0.788426,
+      "sharpe_holdout": 0.855293,
+      "t_all": 3.447965
+     },
+     "max_sessions=10": {
+      "net_bps_holdout": 4.531677,
+      "sharpe_all": 0.776115,
+      "sharpe_holdout": 0.958997,
+      "t_all": 3.247274
+     },
+     "max_sessions=3": {
+      "net_bps_holdout": 3.925578,
+      "sharpe_all": 0.751709,
+      "sharpe_holdout": 0.848038,
+      "t_all": 3.064181
+     }
+    },
+    "neighbours_positive_in_holdout": 1.0,
+    "rule": "close_weakness_reversion",
+    "stressed_cost": {
+     "all": {
+      "annual_return_pct": 7.064072,
+      "annual_volatility_pct": 9.567952,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 23.536255,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -16.474077,
+      "net_bps_per_session": 2.803203,
+      "round_trips": 498,
+      "round_trips_per_session": 0.130162,
+      "sessions": 3826,
+      "share_of_active_sessions_positive": 0.541604,
+      "sharpe": 0.738306,
+      "t_newey_west": 3.072162
+     },
+     "holdout": {
+      "annual_return_pct": 10.5585,
+      "annual_volatility_pct": 11.829324,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 30.630853,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -12.168682,
+      "net_bps_per_session": 4.189881,
+      "round_trips": 234,
+      "round_trips_per_session": 0.146341,
+      "sessions": 1599,
+      "share_of_active_sessions_positive": 0.553571,
+      "sharpe": 0.89257,
+      "t_newey_west": 2.462722
+     }
+    },
+    "verdict": "paper_candidate"
+   },
+   "first_last_half_hour": {
+    "cost_ladder": {
+     "0": {
+      "net_bps_per_session": -0.537527,
+      "sharpe": -0.332003
+     },
+     "0.5": {
+      "net_bps_per_session": -1.034391,
+      "sharpe": -0.638888
+     },
+     "1": {
+      "net_bps_per_session": -1.531254,
+      "sharpe": -0.945768
+     },
+     "2": {
+      "net_bps_per_session": -2.524982,
+      "sharpe": -1.559506
+     },
+     "3": {
+      "net_bps_per_session": -3.518709,
+      "sharpe": -2.1732
+     },
+     "5": {
+      "net_bps_per_session": -5.506163,
+      "sharpe": -3.400387
+     }
+    },
+    "evidence": {
+     "all": {
+      "annual_return_pct": -3.858761,
+      "annual_volatility_pct": 4.080029,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": -0.54092,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -64.205978,
+      "net_bps_per_session": -1.531254,
+      "round_trips": 3802,
+      "round_trips_per_session": 0.993727,
+      "sessions": 3826,
+      "share_of_active_sessions_positive": 0.456602,
+      "sharpe": -0.945768,
+      "t_newey_west": -3.608923
+     },
+     "bootstrap_sharpe": {
+      "high": -0.406967,
+      "low": -1.484394,
+      "p_not_positive": 0.999
+     },
+     "by_year_pct": {
+      "2010": -0.442895,
+      "2011": -0.674551,
+      "2012": 0.290306,
+      "2013": 4.747096,
+      "2014": -1.315848,
+      "2015": -2.532632,
+      "2016": -4.689382,
+      "2017": -4.230143,
+      "2018": -7.052626,
+      "2019": -4.592696,
+      "2020": -7.821426,
+      "2021": -10.885715,
+      "2022": -11.161926,
+      "2023": -0.35219,
+      "2024": -2.054335,
+      "2025": -2.553912,
+      "2026": -3.26292
+     },
+     "cost_bps_per_round_trip": 1.0,
+     "design": {
+      "annual_return_pct": -2.318963,
+      "annual_volatility_pct": 3.864393,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 0.069752,
+      "last": "2019-12-31",
+      "max_drawdown_pct": -26.094431,
+      "net_bps_per_session": -0.920223,
+      "round_trips": 2203,
+      "round_trips_per_session": 0.989223,
+      "sessions": 2227,
+      "share_of_active_sessions_positive": 0.479346,
+      "sharpe": -0.600085,
+      "t_newey_west": -1.687359
+     },
+     "holdout": {
+      "annual_return_pct": -6.003309,
+      "annual_volatility_pct": 4.360277,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": -1.382265,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -40.541964,
+      "net_bps_per_session": -2.382265,
+      "round_trips": 1599,
+      "round_trips_per_session": 1.0,
+      "sessions": 1599,
+      "share_of_active_sessions_positive": 0.425266,
+      "sharpe": -1.376818,
+      "t_newey_west": -3.556928
+     },
+     "positive_years": 2,
+     "recent": {
+      "annual_return_pct": -2.801602,
+      "annual_volatility_pct": 3.304979,
+      "first": "2024-01-02",
+      "gross_bps_per_round_trip": -0.111747,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -10.058888,
+      "net_bps_per_session": -1.111747,
+      "round_trips": 708,
+      "round_trips_per_session": 1.0,
+      "sessions": 708,
+      "share_of_active_sessions_positive": 0.432203,
+      "sharpe": -0.847691,
+      "t_newey_west": -1.34299
+     },
+     "sessions_to_confirm_forward": null,
+     "sign_flip_p": 1.0,
+     "years": 17
+    },
+    "failed_checks": [
+     "all-period t below 3.0",
+     "holdout t below 2.0",
+     "not positive at 2x cost",
+     "fewer than 70% of neighbours positive in the holdout",
+     "deflated Sharpe below 0.95"
+    ],
+    "forward_bands_pct": {
+     "120": {
+      "p01": -9.69028,
+      "p05": -6.916536,
+      "p50": -1.578014
+     },
+     "20": {
+      "p01": -3.91495,
+      "p05": -2.302556,
+      "p50": -0.298436
+     },
+     "250": {
+      "p01": -15.605097,
+      "p05": -13.018216,
+      "p50": -3.452989
+     },
+     "60": {
+      "p01": -6.027215,
+      "p05": -4.522769,
+      "p50": -0.730297
+     }
+    },
+    "neighbours": {},
+    "neighbours_positive_in_holdout": null,
+    "rule": "first_last_half_hour",
+    "stressed_cost": {
+     "all": {
+      "annual_return_pct": -6.362954,
+      "annual_volatility_pct": 4.080107,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": -0.54092,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -99.903764,
+      "net_bps_per_session": -2.524982,
+      "round_trips": 3802,
+      "round_trips_per_session": 0.993727,
+      "sessions": 3826,
+      "share_of_active_sessions_positive": 0.425565,
+      "sharpe": -1.559506,
+      "t_newey_west": -5.950857
+     },
+     "holdout": {
+      "annual_return_pct": -8.523309,
+      "annual_volatility_pct": 4.360277,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": -1.382265,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -55.639749,
+      "net_bps_per_session": -3.382265,
+      "round_trips": 1599,
+      "round_trips_per_session": 1.0,
+      "sessions": 1599,
+      "share_of_active_sessions_positive": 0.401501,
+      "sharpe": -1.954763,
+      "t_newey_west": -5.050014
+     }
+    },
+    "verdict": "rejected"
+   },
+   "noise_band_momentum": {
+    "cost_ladder": {
+     "0": {
+      "net_bps_per_session": 1.820412,
+      "sharpe": 0.727473
+     },
+     "0.5": {
+      "net_bps_per_session": 1.379743,
+      "sharpe": 0.550615
+     },
+     "1": {
+      "net_bps_per_session": 0.939074,
+      "sharpe": 0.374198
+     },
+     "2": {
+      "net_bps_per_session": 0.057736,
+      "sharpe": 0.02293
+     },
+     "3": {
+      "net_bps_per_session": -0.823602,
+      "sharpe": -0.325857
+     },
+     "5": {
+      "net_bps_per_session": -2.586279,
+      "sharpe": -1.014196
+     }
+    },
+    "evidence": {
+     "all": {
+      "annual_return_pct": 2.366466,
+      "annual_volatility_pct": 6.324105,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 2.065509,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -15.032415,
+      "net_bps_per_session": 0.939074,
+      "round_trips": 3372,
+      "round_trips_per_session": 0.881338,
+      "sessions": 3826,
+      "share_of_active_sessions_positive": 0.407313,
+      "sharpe": 0.374198,
+      "t_newey_west": 1.575613
+     },
+     "bootstrap_sharpe": {
+      "high": 0.804986,
+      "low": -0.116584,
+      "p_not_positive": 0.061
+     },
+     "by_year_pct": {
+      "2010": -0.629012,
+      "2011": 10.551225,
+      "2012": 4.418943,
+      "2013": 1.1103,
+      "2014": 0.788693,
+      "2015": 3.619544,
+      "2016": -7.479729,
+      "2017": -4.812585,
+      "2018": 13.283945,
+      "2019": 0.156286,
+      "2020": -7.528183,
+      "2021": 7.670406,
+      "2022": 17.527494,
+      "2023": 3.616639,
+      "2024": -0.177577,
+      "2025": -0.67364,
+      "2026": -5.513775
+     },
+     "cost_bps_per_round_trip": 1.0,
+     "deflated_sharpe": 0.790553,
+     "design": {
+      "annual_return_pct": 2.377152,
+      "annual_volatility_pct": 5.965276,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 2.057253,
+      "last": "2019-12-31",
+      "max_drawdown_pct": -14.126551,
+      "net_bps_per_session": 0.943314,
+      "round_trips": 1987,
+      "round_trips_per_session": 0.892232,
+      "sessions": 2227,
+      "share_of_active_sessions_positive": 0.386182,
+      "sharpe": 0.398498,
+      "t_newey_west": 1.340362
+     },
+     "holdout": {
+      "annual_return_pct": 2.351584,
+      "annual_volatility_pct": 6.794273,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 2.077355,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -15.032415,
+      "net_bps_per_session": 0.933168,
+      "round_trips": 1385,
+      "round_trips_per_session": 0.866166,
+      "sessions": 1599,
+      "share_of_active_sessions_positive": 0.437052,
+      "sharpe": 0.346113,
+      "t_newey_west": 0.900873
+     },
+     "positive_years": 10,
+     "recent": {
+      "annual_return_pct": -2.265506,
+      "annual_volatility_pct": 5.677571,
+      "first": "2024-01-02",
+      "gross_bps_per_round_trip": 0.000786,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -13.236922,
+      "net_bps_per_session": -0.89901,
+      "round_trips": 637,
+      "round_trips_per_session": 0.899718,
+      "sessions": 708,
+      "share_of_active_sessions_positive": 0.3918,
+      "sharpe": -0.399027,
+      "t_newey_west": -0.73057
+     },
+     "sessions_to_confirm_forward": 11127,
+     "sign_flip_p": 0.067986,
+     "trials": 14,
+     "years": 17
+    },
+    "failed_checks": [
+     "all-period t below 3.0",
+     "holdout t below 2.0",
+     "deflated Sharpe below 0.95"
+    ],
+    "forward_bands_pct": {
+     "120": {
+      "p01": -9.918876,
+      "p05": -4.673056,
+      "p50": 0.936608
+     },
+     "20": {
+      "p01": -3.348509,
+      "p05": -1.938977,
+      "p50": 0.048892
+     },
+     "250": {
+      "p01": -9.444269,
+      "p05": -7.147791,
+      "p50": 2.372983
+     },
+     "60": {
+      "p01": -8.719695,
+      "p05": -3.228487,
+      "p50": 0.347924
+     }
+    },
+    "neighbours": {
+     "band=0.75": {
+      "net_bps_holdout": 0.676748,
+      "sharpe_all": 0.304043,
+      "sharpe_holdout": 0.210335,
+      "t_all": 1.307566
+     },
+     "band=1.25": {
+      "net_bps_holdout": 0.179171,
+      "sharpe_all": 0.393587,
+      "sharpe_holdout": 0.072673,
+      "t_all": 1.619066
+     },
+     "band=1.5": {
+      "net_bps_holdout": 0.712448,
+      "sharpe_all": 0.449193,
+      "sharpe_holdout": 0.332269,
+      "t_all": 1.874009
+     },
+     "flat_at_15:58": {
+      "net_bps_holdout": 0.988826,
+      "sharpe_all": 0.306702,
+      "sharpe_holdout": 0.369529,
+      "t_all": 1.295912
+     },
+     "long_only": {
+      "net_bps_holdout": 0.465453,
+      "sharpe_all": 0.336535,
+      "sharpe_holdout": 0.28246,
+      "t_all": 1.390662
+     },
+     "lookback=10": {
+      "net_bps_holdout": 0.190367,
+      "sharpe_all": 0.18584,
+      "sharpe_holdout": 0.071058,
+      "t_all": 0.792729
+     },
+     "lookback=20": {
+      "net_bps_holdout": 0.627494,
+      "sharpe_all": 0.39362,
+      "sharpe_holdout": 0.21403,
+      "t_all": 1.638221
+     },
+     "lookback=30": {
+      "net_bps_holdout": 0.836434,
+      "sharpe_all": 0.46229,
+      "sharpe_holdout": 0.282797,
+      "t_all": 1.951779
+     },
+     "lookback=7": {
+      "net_bps_holdout": 1.193853,
+      "sharpe_all": 0.46556,
+      "sharpe_holdout": 0.443073,
+      "t_all": 1.965633
+     },
+     "no_gap_reference": {
+      "net_bps_holdout": 1.382067,
+      "sharpe_all": 0.375635,
+      "sharpe_holdout": 0.381432,
+      "t_all": 1.390723
+     },
+     "short_only": {
+      "net_bps_holdout": 0.467716,
+      "sharpe_all": 0.21916,
+      "sharpe_holdout": 0.214856,
+      "t_all": 0.937532
+     },
+     "step=15": {
+      "net_bps_holdout": 0.84738,
+      "sharpe_all": 0.178164,
+      "sharpe_holdout": 0.284897,
+      "t_all": 0.769968
+     },
+     "step=60": {
+      "net_bps_holdout": 1.032573,
+      "sharpe_all": 0.420876,
+      "sharpe_holdout": 0.397084,
+      "t_all": 1.7733
+     }
+    },
+    "neighbours_positive_in_holdout": 1.0,
+    "rule": "noise_band_momentum",
+    "stressed_cost": {
+     "all": {
+      "annual_return_pct": 0.145494,
+      "annual_volatility_pct": 6.345214,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 2.065509,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -23.383306,
+      "net_bps_per_session": 0.057736,
+      "round_trips": 3372,
+      "round_trips_per_session": 0.881338,
+      "sessions": 3826,
+      "share_of_active_sessions_positive": 0.38733,
+      "sharpe": 0.02293,
+      "t_newey_west": 0.096529
+     },
+     "holdout": {
+      "annual_return_pct": 0.168845,
+      "annual_volatility_pct": 6.81336,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 2.077355,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -16.636922,
+      "net_bps_per_session": 0.067002,
+      "round_trips": 1385,
+      "round_trips_per_session": 0.866166,
+      "sessions": 1599,
+      "share_of_active_sessions_positive": 0.415558,
+      "sharpe": 0.024782,
+      "t_newey_west": 0.064422
+     }
+    },
+    "verdict": "rejected"
+   },
+   "opening_range_breakout": {
+    "cost_ladder": {
+     "0": {
+      "net_bps_per_session": 1.570268,
+      "sharpe": 0.607721
+     },
+     "0.5": {
+      "net_bps_per_session": 1.085428,
+      "sharpe": 0.420084
+     },
+     "1": {
+      "net_bps_per_session": 0.600587,
+      "sharpe": 0.232442
+     },
+     "2": {
+      "net_bps_per_session": -0.369094,
+      "sharpe": -0.142849
+     },
+     "3": {
+      "net_bps_per_session": -1.338775,
+      "sharpe": -0.518132
+     },
+     "5": {
+      "net_bps_per_session": -3.278137,
+      "sharpe": -1.268598
+     }
+    },
+    "evidence": {
+     "all": {
+      "annual_return_pct": 1.51348,
+      "annual_volatility_pct": 6.51121,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 1.619366,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -14.454475,
+      "net_bps_per_session": 0.600587,
+      "round_trips": 3710,
+      "round_trips_per_session": 0.969681,
+      "sessions": 3826,
+      "share_of_active_sessions_positive": 0.197574,
+      "sharpe": 0.232442,
+      "t_newey_west": 0.959278
+     },
+     "bootstrap_sharpe": {
+      "high": 0.64959,
+      "low": -0.276902,
+      "p_not_positive": 0.194
+     },
+     "by_year_pct": {
+      "2010": 1.183977,
+      "2011": 0.320113,
+      "2012": 0.406316,
+      "2013": -1.710459,
+      "2014": 6.935316,
+      "2015": 4.006992,
+      "2016": 0.848835,
+      "2017": -2.971321,
+      "2018": 4.232471,
+      "2019": 5.748437,
+      "2020": -8.835972,
+      "2021": 4.620145,
+      "2022": 9.029707,
+      "2023": -2.22165,
+      "2024": -1.174551,
+      "2025": 0.33627,
+      "2026": 2.22384
+     },
+     "cost_bps_per_round_trip": 1.0,
+     "deflated_sharpe": 0.574763,
+     "design": {
+      "annual_return_pct": 2.150054,
+      "annual_volatility_pct": 5.768675,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 1.899653,
+      "last": "2019-12-31",
+      "max_drawdown_pct": -11.851498,
+      "net_bps_per_session": 0.853196,
+      "round_trips": 2112,
+      "round_trips_per_session": 0.948361,
+      "sessions": 2227,
+      "share_of_active_sessions_positive": 0.19839,
+      "sharpe": 0.372712,
+      "t_newey_west": 1.109833
+     },
+     "holdout": {
+      "annual_return_pct": 0.626894,
+      "annual_volatility_pct": 7.424195,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 1.248923,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -14.454475,
+      "net_bps_per_session": 0.248767,
+      "round_trips": 1598,
+      "round_trips_per_session": 0.999375,
+      "sessions": 1599,
+      "share_of_active_sessions_positive": 0.196496,
+      "sharpe": 0.084439,
+      "t_newey_west": 0.237672
+     },
+     "positive_years": 12,
+     "recent": {
+      "annual_return_pct": 0.493165,
+      "annual_volatility_pct": 5.795978,
+      "first": "2024-01-02",
+      "gross_bps_per_round_trip": 1.195977,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -6.888537,
+      "net_bps_per_session": 0.1957,
+      "round_trips": 707,
+      "round_trips_per_session": 0.998588,
+      "sessions": 708,
+      "share_of_active_sessions_positive": 0.192362,
+      "sharpe": 0.085087,
+      "t_newey_west": 0.158362
+     },
+     "sessions_to_confirm_forward": 28837,
+     "sign_flip_p": 0.182963,
+     "trials": 4,
+     "years": 17
+    },
+    "failed_checks": [
+     "all-period t below 3.0",
+     "holdout t below 2.0",
+     "not positive at 2x cost",
+     "fewer than 70% of neighbours positive in the holdout",
+     "deflated Sharpe below 0.95"
+    ],
+    "forward_bands_pct": {
+     "120": {
+      "p01": -6.732879,
+      "p05": -4.526863,
+      "p50": 0.358448
+     },
+     "20": {
+      "p01": -3.856711,
+      "p05": -2.144709,
+      "p50": 0.019133
+     },
+     "250": {
+      "p01": -8.861142,
+      "p05": -6.609918,
+      "p50": 0.876763
+     },
+     "60": {
+      "p01": -5.497128,
+      "p05": -3.416023,
+      "p50": 0.183172
+     }
+    },
+    "neighbours": {
+     "minutes=15": {
+      "net_bps_holdout": -0.114824,
+      "sharpe_all": -0.165262,
+      "sharpe_holdout": -0.034738,
+      "t_all": -0.67367
+     },
+     "minutes=30": {
+      "net_bps_holdout": -0.205686,
+      "sharpe_all": -0.075286,
+      "sharpe_holdout": -0.056934,
+      "t_all": -0.298914
+     },
+     "no_target": {
+      "net_bps_holdout": -0.398462,
+      "sharpe_all": 0.086956,
+      "sharpe_holdout": -0.138799,
+      "t_all": 0.354083
+     }
+    },
+    "neighbours_positive_in_holdout": 0.0,
+    "rule": "opening_range_breakout",
+    "stressed_cost": {
+     "all": {
+      "annual_return_pct": -0.930117,
+      "annual_volatility_pct": 6.511196,
+      "first": "2010-11-15",
+      "gross_bps_per_round_trip": 1.619366,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -23.79328,
+      "net_bps_per_session": -0.369094,
+      "round_trips": 3710,
+      "round_trips_per_session": 0.969681,
+      "sessions": 3826,
+      "share_of_active_sessions_positive": 0.196765,
+      "sharpe": -0.142849,
+      "t_newey_west": -0.58956
+     },
+     "holdout": {
+      "annual_return_pct": -1.89153,
+      "annual_volatility_pct": 7.424195,
+      "first": "2020-01-02",
+      "gross_bps_per_round_trip": 1.248923,
+      "last": "2026-11-06",
+      "max_drawdown_pct": -20.845122,
+      "net_bps_per_session": -0.750607,
+      "round_trips": 1598,
+      "round_trips_per_session": 0.999375,
+      "sessions": 1599,
+      "share_of_active_sessions_positive": 0.19587,
+      "sharpe": -0.254779,
+      "t_newey_west": -0.717132
+     }
+    },
+    "verdict": "rejected"
+   }
+  }
+ },
+ "registration": {
+  "base_cost_bps": 1.0,
+  "holdout_start": "2020-01-01",
+  "min_deflated_sharpe": 0.95,
+  "min_neighbour_share": 0.7,
+  "min_t_all": 3.0,
+  "min_t_holdout": 2.0,
+  "stress_multiple": 2.0
+ },
+ "schema": "session-edges-study.v1",
+ "source": "public index one-minute archives (diagnostic proxy, no volume); public adjusted daily bars"
+}

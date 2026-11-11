@@ -1,0 +1,82 @@
+# Optional override: the forward shadow of the session-edge study
+# (studies/session_edges). It reads market data and the broker clock and
+# records decisions; it sends no orders. Enable it next to the base file:
+#
+#   docker compose -f compose.yaml -f deploy/compose.session-edges.yaml up -d session-edges
+#
+# Paper orders are a separate, deliberate step: stop the trader first (both
+# take the same runtime lock) and run the module with --paper-orders by hand.
+# YAML anchors do not cross files, so the base service settings are repeated.
+services:
+  session-edges-init:
+    image: alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}
+    container_name: alpaca-session-edges-init
+    # Short-lived: gives the unprivileged application user its journal volume.
+    user: "0:0"
+    working_dir: /app
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    network_mode: none
+    restart: "no"
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /app/session-edges
+        chown 10001:10001 /app/session-edges
+        chmod 0770 /app/session-edges
+    volumes:
+      - session-edges-data:/app/session-edges
+
+  session-edges:
+    image: alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}
+    container_name: alpaca-session-edges
+    user: "10001:10001"
+    working_dir: /app
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    depends_on:
+      session-edges-init:
+        condition: service_completed_successfully
+    command: ["python", "-m", "studies.session_edges.live", "run", "--dir", "/app/session-edges",
+              "--interval", "${ALPACA_SESSION_EDGES_INTERVAL_SECONDS:-10}"]
+    environment:
+      ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
+      ALPACA_PAPER: "true"
+      ALPACA_LIVE_ENABLE: "false"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+    secrets:
+      - source: agent_credentials
+        target: agent_credentials
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    configs:
+      - source: agent_config
+        target: /app/config.yaml
+        mode: 0444
+    volumes:
+      - session-edges-data:/app/session-edges
+    cpus: "0.50"
+    mem_limit: 512m
+    pids_limit: 64
+    stop_grace_period: 30s
+
+volumes:
+  session-edges-data:
