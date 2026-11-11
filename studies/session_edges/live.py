@@ -51,6 +51,7 @@ FLAT_MINUTE = 388                # 15:58 New York: intraday legs leave with a ma
 GRACE_SECONDS = 4.0              # wait this long after a boundary for the completed bar
 LATE_BAR_SECONDS = 45.0          # then accept the last traded price for a quiet minute
 MAX_DELAY_SECONDS = 240.0        # a decision this late is skipped, never acted on stale
+QUOTE_FIRST_WINDOW_SECONDS = 5.0
 QUOTE_MAX_AGE_SECONDS = 30.0
 HISTORY_CALENDAR_DAYS = 35
 DAILY_LOSS_LIMIT = 0.02          # paper orders: no new entries after this fall in equity today
@@ -190,15 +191,18 @@ class ShadowRunner:
 
     def _quote(self, symbol: str, now: datetime, side: int, fallback: float) -> tuple[float, str]:
         """The price a marketable order would pay now: the ask to buy, the bid to sell."""
-        try:
-            rows = self.provider.quotes([symbol], start=now - timedelta(seconds=QUOTE_MAX_AGE_SECONDS),
-                                        end=now).get(symbol, [])
-        except Exception:  # noqa: BLE001 - a missing quote must not stop the session
-            rows = []
-        for quote in reversed(rows):
-            price = quote.ask if side == LONG else quote.bid
-            if price is not None and float(price) > 0:
-                return float(price), "quote"
+        # A liquid ETF prints many quotes a second, so ask for a short window
+        # first and widen it only when that window is empty.
+        for window in (QUOTE_FIRST_WINDOW_SECONDS, QUOTE_MAX_AGE_SECONDS):
+            try:
+                rows = self.provider.quotes([symbol], start=now - timedelta(seconds=window),
+                                            end=now).get(symbol, [])
+            except Exception:  # noqa: BLE001 - a missing quote must not stop the session
+                rows = []
+            for quote in reversed(rows):
+                price = quote.ask if side == LONG else quote.bid
+                if price is not None and float(price) > 0:
+                    return float(price), "quote"
         return fallback, "bar_fallback"
 
     # ---- paper orders ----------------------------------------------------
