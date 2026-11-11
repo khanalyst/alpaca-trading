@@ -82,8 +82,9 @@ MAX_ENTRY_ATTEMPTS = 3           # orders that open or add to a position, per de
 MAX_FLATTEN_ATTEMPTS = 5         # orders that reduce a position, per decision
 ORDER_PREFIX = "sedge"
 HALT_FILE, FLATTEN_FILE = "HALT", "FLATTEN"
-_FINAL_UNFILLED = frozenset({"canceled", "cancelled", "expired", "rejected", "done_for_day", "replaced",
-                             "stopped", "suspended"})
+# States after which an order can no longer fill. "stopped" and "suspended" are
+# not final at the broker, so they run into the timeout and are cancelled.
+_FINAL_UNFILLED = frozenset({"canceled", "cancelled", "expired", "rejected", "done_for_day", "replaced"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +194,13 @@ def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def orphaned_shares(state: Mapping[str, Any], legs: Sequence[Leg]) -> dict[str, int]:
+    """Shares the runner bought for legs that the current book no longer trades."""
+    traded = {leg.key for leg in legs if leg.trade}
+    return {key: int(book.get("shares", 0)) for key, book in (state.get("orders") or {}).items()
+            if int(book.get("shares", 0)) != 0 and key not in traded}
+
+
 class ShadowRunner:
     """One poll at a time; all state lives in ``directory`` so a restart resumes the session."""
 
@@ -232,6 +240,11 @@ class ShadowRunner:
         self.state_path = self.directory / "state.json"
         self.journal_path = self.directory / "journal.jsonl"
         self.state = self._load_state()
+        orphans = orphaned_shares(self.state, self.legs) if orders != ORDERS_NONE else {}
+        if orphans:
+            raise RuntimeError(
+                f"the state holds shares for legs this book does not trade: {orphans}; "
+                "run with the previous book and flatten them, or keep those legs traded")
         self.history: dict[str, list[Session]] = {}
         self._history_day: date | None = None
 
@@ -922,6 +935,9 @@ def preflight(provider: Any, legs: Sequence[Leg], *, orders: str, directory: str
         stored = json.loads(state_path.read_text(encoding="utf-8"))
         if stored.get("schema") == SCHEMA:
             own = {key: int(book.get("shares", 0)) for key, book in (stored.get("orders") or {}).items()}
+            if orders != ORDERS_NONE:
+                orphans = orphaned_shares(stored, legs)
+                check("no_shares_in_untraded_legs", not orphans, orphans or "none")
     if traded:
         try:
             held = {str(position.symbol).upper():

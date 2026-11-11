@@ -753,6 +753,21 @@ class ShadowRunnerTests(unittest.TestCase):
         self.assertEqual(self.sent(provider), [("buy", 495), ("sell", 495)])
         self.assertEqual(provider.held["QQQ"], 0)
 
+    def test_a_book_that_drops_a_leg_holding_shares_is_refused(self):
+        provider = FakeProvider({"SPY": self.sessions, "QQQ": self.sessions})
+        swing = live.Leg(live.REVERSION, "SPY", 0.25, True)
+        runner = self.runner([swing], provider, orders="paper")
+        run_session(runner, provider, self.days[-2])               # ends the day long SPY
+        self.assertEqual(provider.held["SPY"], 249)
+        other = [live.Leg(live.NOISE, "QQQ", 0.25, True), replace(swing, trade=False)]
+        with self.assertRaises(RuntimeError):
+            self.runner(other, provider, orders="paper")
+        provider.set(self.days[-1], 5)
+        result = live.preflight(provider, other, orders="paper", directory=self.folder.name, allow_short=False)
+        self.assertIn("no_shares_in_untraded_legs", {item["name"] for item in result["checks"] if not item["ok"]})
+        self.assertEqual(self.runner(other, provider).orders, "none")   # shadow mode is unaffected
+        self.assertEqual(self.runner([swing], provider, orders="paper").orders, "paper")
+
     def test_restart_resumes_without_repeating_a_decision(self):
         provider = FakeProvider({"QQQ": self.sessions})
         legs = [live.Leg(live.NOISE, "QQQ", 0.5, True)]

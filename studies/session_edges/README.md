@@ -11,7 +11,7 @@ Status on 11 November 2026. This folder holds three things that work together:
    orders with the same decision code the simulators use.
 
 On public data the engine tested 2,803 hypotheses, took 114 to the holdout and confirmed 9. The
-edge book that results trades four legs. Everything here has passed 75 offline tests; **nothing
+edge book that results trades four legs. Everything here has passed 76 offline tests; **nothing
 has yet been run against Alpaca or on SIP bars**, and those are the first two steps below.
 
 No result here is a promise. An edge with a Sharpe ratio near 1 has losing months and losing
@@ -200,7 +200,9 @@ With orders enabled it follows the shadow book through a small state machine:
   file or a `FLATTEN` request;
 * an order that fails is retried three times to open and five times to close, then the leg
   stops and says so in the journal;
-* intraday legs are closed at 15:58, and again at the next open if anything was left behind.
+* intraday legs are closed at 15:58, and again at the next open if anything was left behind;
+* a new edge book that no longer trades a leg which still holds shares is refused at start-up,
+  so a position is never orphaned. Flatten with the previous book first.
 
 Operator controls, none of which needs broker access:
 
@@ -353,7 +355,7 @@ maximum, is the signal to halt and review. Scale size only while results stay in
 | `fetch_public.py` | download the public diagnostic data |
 | `live.py` | the forward runner: shadow, paper orders, live orders, preflight, controls, report |
 | `results/` | committed runs on public data |
-| `tests/research/test_session_edges_study.py` | 75 offline tests (in the repository's test tree) |
+| `tests/research/test_session_edges_study.py` | 76 offline tests (in the repository's test tree) |
 
 Nothing in `agent/` or `research/` imports this folder. The study and the engine need only the
 Python standard library; the runner reuses `agent.alpaca_provider` and the runtime lock.

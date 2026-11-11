@@ -30,7 +30,7 @@ the bets.
 4. **There is now a search that finds them, and a runner that trades them.** A discovery engine
    tested 2,803 session-level hypotheses, took 114 to an untouched holdout and confirmed 9 under
    a correction for everything it promoted (section 12). A forward runner takes the resulting
-   edge book through shadow, paper orders and live orders. 75 tests cover both. Neither has been
+   edge book through shadow, paper orders and live orders. 76 tests cover both. Neither has been
    run against the broker or the VM: this session had no Alpaca or Azure credentials.
 
 ## 2. Why every strategy is still negative
@@ -96,7 +96,7 @@ stress scenarios, evidence floors, trial floors, polling interval, LLM provider 
 test counts.
 
 * They agree with the code on every one of those, apart from the `.env.example` count above.
-  The 2,801-test claim matches discovery (2,876 with the 75 new tests).
+  The 2,801-test claim matches discovery (2,877 with the 76 new tests).
 * They are accurate and not usable as a guide. About 400 KB of prose describes mechanisms; no
   page says in plain words that the search has found nothing and why. `current-findings.md` and
   the 10 November audit come closest.
@@ -236,7 +236,7 @@ Still needed, in order:
 | path | change |
 | --- | --- |
 | `studies/session_edges/` | Registered-rule study (`run.py`), discovery engine (`grammar.py`, `discover.py`, `propose.py`), forward runner with shadow, paper and live orders (`live.py`), public-data fetcher, README, committed results |
-| `tests/research/test_session_edges_study.py` | 75 offline tests, including live-versus-simulator decision parity, order confirmation, reconciliation, halt and flatten, live-flag guards and the search protocol |
+| `tests/research/test_session_edges_study.py` | 76 offline tests, including live-versus-simulator decision parity, order confirmation, reconciliation, halt and flatten, live-flag guards and the search protocol |
 | `deploy/compose.session-edges.yaml` | Optional service for the shadow runner; validated with `docker compose config` against the base file |
 | `.env.example` | Family count corrected from 11 to 12 |
 | `docs/README.md` | This report and the study added to the catalogue |
