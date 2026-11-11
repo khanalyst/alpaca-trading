@@ -1,6 +1,6 @@
 # Session-edge study
 
-Status on 11 November 2026: built, unit-tested (46 offline tests) and run on 16 years of public
+Status on 11 November 2026: built, unit-tested (47 offline tests) and run on 16 years of public
 index one-minute data and up to 34 years of adjusted daily data. Three rule/instrument pairs meet
 every registered check and are **paper candidates**; one is **shadow only**; the rest are
 **rejected**. The evidence is retrospective and on public diagnostic data. It must be reproduced
@@ -122,7 +122,7 @@ are nearly uncorrelated (0.10).
 | `fetch_public.py` | command line: download the public diagnostic data |
 | `live.py` | command line: forward shadow, optional paper orders, forward report |
 | `results/public-2026-11-10/` | the run reported above, including the forward review bands |
-| `tests/research/test_session_edges_study.py` | 46 offline unit tests (in the repository's test tree) |
+| `tests/research/test_session_edges_study.py` | 47 offline unit tests (in the repository's test tree) |
 
 ## Reproduce
 

@@ -28,7 +28,7 @@ the bets.
    since 2020), and intraday momentum outside a time-of-day noise band on the Nasdaq-100
    (t 3.6 over 16 years, weaker since 2024). Together: Sharpe about 1.1, 16 of 17 positive years.
 4. **These are now runnable.** The study, a forward shadow runner with optional paper orders,
-   46 tests and a deployment override are in the repository. They have not been run against the
+   47 tests and a deployment override are in the repository. They have not been run against the
    broker or the VM: this session had no Alpaca or Azure credentials.
 
 ## 2. Why every strategy is still negative
@@ -94,7 +94,7 @@ stress scenarios, evidence floors, trial floors, polling interval, LLM provider 
 test counts.
 
 * They agree with the code on every one of those, apart from the `.env.example` count above.
-  The 2,801-test claim matches discovery (2,847 with the 46 new tests).
+  The 2,801-test claim matches discovery (2,848 with the 47 new tests).
 * They are accurate and not usable as a guide. About 400 KB of prose describes mechanisms; no
   page says in plain words that the search has found nothing and why. `current-findings.md` and
   the 10 November audit come closest.
@@ -231,7 +231,7 @@ Still needed, in order:
 | path | change |
 | --- | --- |
 | `studies/session_edges/` | The study: data loaders, fixed rules, statistics, runner, public-data fetcher, forward shadow with optional paper orders, README, committed results |
-| `tests/research/test_session_edges_study.py` | 46 offline tests, including one that proves the live runner takes exactly the simulator's decisions |
+| `tests/research/test_session_edges_study.py` | 47 offline tests, including one that proves the live runner takes exactly the simulator's decisions |
 | `deploy/compose.session-edges.yaml` | Optional service for the shadow runner; validated with `docker compose config` against the base file |
 | `.env.example` | Family count corrected from 11 to 12 |
 | `docs/README.md` | This report and the study added to the catalogue |

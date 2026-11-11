@@ -8,6 +8,7 @@ runner talks to a fake provider. Run from the repository root with::
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
 import json
@@ -102,6 +103,41 @@ class DataTests(unittest.TestCase):
         self.assertEqual(sessions[0].day, date(2026, 7, 15))
         self.assertEqual(sessions[0].observed, MINUTES)
         self.assertEqual(sessions[0].open[0], 100.0)
+
+    def test_sip_month_files_load_as_sessions_and_run_end_to_end(self):
+        import csv
+        from studies.liquid_reversion.bars import ALPACA_CSV_COLUMNS, month_file_name
+        days = [date(2026, 9, 29), date(2026, 9, 30), date(2026, 10, 1)]
+        with tempfile.TemporaryDirectory() as folder:
+            for month in ("2026-09", "2026-10"):
+                path = Path(folder) / month_file_name("QQQ", "1Min", month)
+                with gzip.open(path, "wt", encoding="utf-8", newline="") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(ALPACA_CSV_COLUMNS)
+                    for day in days:
+                        if f"{day:%Y-%m}" != month:
+                            continue
+                        opened = datetime.combine(day, time(9, 30), NEW_YORK)
+                        for minute in range(-5, MINUTES + 5):       # pre- and post-market rows are ignored
+                            stamp = (opened + timedelta(minutes=minute)).astimezone(timezone.utc)
+                            price = 400.0 + minute * 0.01
+                            writer.writerow(["QQQ", stamp.strftime("%Y-%m-%dT%H:%M:%SZ"), price, price + 0.05,
+                                             price - 0.05, price + 0.01, 1000, 10, price])
+            sessions = session_data.load_alpaca_sessions(folder, "QQQ")
+            self.assertEqual([session.day for session in sessions], days)
+            self.assertEqual(sessions[0].observed, MINUTES)
+            self.assertAlmostEqual(sessions[0].open[0], 400.0)
+            self.assertAlmostEqual(sessions[0].close[-1], 400.0 + 389 * 0.01 + 0.01)
+            out = Path(folder) / "out"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = run.main(["--alpaca-dir", folder, "--symbols", "QQQ", "--out", str(out), "--draws", "10"])
+            self.assertEqual(code, 0)
+            results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+            self.assertEqual(results["schema"], run.SCHEMA)
+            self.assertEqual({block["verdict"] for block in results["minute"]["QQQ"].values()}, {run.REJECT})
+            self.assertIn("Session-edge study", (out / "report.md").read_text(encoding="utf-8"))
+            with self.assertRaises(FileNotFoundError):
+                session_data.load_alpaca_sessions(folder, "ZZZZ")
 
     def test_daily_chart_is_adjusted(self):
         stamps = [int(datetime(2026, 3, d, 14, 30, tzinfo=timezone.utc).timestamp()) for d in (2, 3)]
