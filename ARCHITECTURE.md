@@ -5,6 +5,10 @@ platform as implemented. It is an engineering map, not a performance claim.
 The supported trading scope is US-listed equities/ETFs and listed OCC options.
 Options are single-leg long calls or puts only. Crypto, overnight positions,
 multi-leg options, naked options, and short-option exposure are rejected.
+The session-edge study under `studies/session_edges` is not one of these
+processes: its forward runner is shadow-only by default and takes the
+trader's runtime lock before it can send a paper order, and only there can a
+position (its close-weakness leg) be carried across sessions.
 
 ## System boundaries
 
@@ -870,7 +874,7 @@ gets a dashboard.
   blocks entries and pauses safely.
 - A durable operator pause survives restart until authenticated flat-only
   resume succeeds.
-- No position is intentionally held overnight.
+- No position is intentionally held overnight by the trader.
 - Research has no broker mutation path, and runtime has no proof-generation
   path.
 - Runtime decisions require a vehicle-compatible re-verified proved edge.

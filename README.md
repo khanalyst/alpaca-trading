@@ -754,7 +754,7 @@ release blocker. Root discovery includes the deployment and research suites.
 
 ## What is deliberately not included
 
-There is no overnight strategy, withdrawal flow, default unattended live
+The trader has no overnight strategy, withdrawal flow, default unattended live
 deployment, multi-leg/naked option path, crypto path, partial-exit workflow, or
 assertion that any generated signal has positive expectancy. Multi-symbol
 expansion is not an automatic remedy: it requires a separate approved
@@ -763,3 +763,11 @@ epoch. Partial exits remain unimplemented because broker lifecycle and position
 reconciliation would otherwise be unsafe. Any live launch requires a separate
 reviewed config/runtime scope, provider guard, named edge, risk policy,
 session-close behaviour, tests, and operational controls.
+
+The [session-edge study](studies/session_edges/README.md) is separate from the
+trader and outside these boundaries by design: it tests published
+session-level rules on long history and records them forward in its own
+shadow runner, which sends no orders unless it is started by hand with
+`--paper-orders` while the trader is stopped. Its close-weakness leg then holds
+a paper position for up to five sessions. See the
+[strategy audit](docs/strategy-audit-2026-11-11/README.md) for why it exists.
