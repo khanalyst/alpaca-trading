@@ -595,6 +595,9 @@ class ShadowRunner:
             upper, lower = noise_band_bounds(session.open[0], prior, sigma, rules.band_multiple)
             price = session.close[minute - 1]
             target = noise_band_target(int(book["position"]), price, upper, lower, rules.sides)
+            if target == int(book["position"]):     # nothing to do; keep what the decision saw
+                self._record("decision_unchanged", now, leg=leg.key, minute=minute, position=target,
+                             price=price, lower=lower, upper=upper)
             self._fill(leg, now, day, minute, target, price,
                        f"price {price:.4f} band [{lower:.4f}, {upper:.4f}]")
 

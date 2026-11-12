@@ -546,6 +546,14 @@ class ShadowRunnerTests(unittest.TestCase):
         decisions = [event for event in self.events("decision") if event["target"] != FLAT]
         self.assertEqual((decisions[0]["minute"], decisions[0]["target"], decisions[0]["price_source"]),
                          (60, LONG, "quote"))
+        # A decision that changes nothing still leaves what it saw in the journal.
+        unchanged = self.events("decision_unchanged")
+        self.assertEqual((unchanged[0]["minute"], unchanged[0]["position"]), (30, FLAT))
+        self.assertTrue(unchanged[0]["lower"] <= unchanged[0]["price"] <= unchanged[0]["upper"])
+        changed = {event["minute"] for event in self.events("decision")}
+        quiet = {event["minute"] for event in unchanged}
+        self.assertFalse(changed & quiet)
+        self.assertTrue(set(range(30, 361, 30)) <= changed | quiet)
 
     def test_close_reversion_enters_then_exits_across_sessions(self):
         provider = FakeProvider({"SPY": self.sessions})
