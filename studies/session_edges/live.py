@@ -44,7 +44,9 @@ import fcntl
 import json
 import math
 import os
+import signal
 import sys
+import threading
 import time as time_module
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -1024,22 +1026,24 @@ def build_provider(mode: str, feed: str) -> Any:
 
 def run_loop(runner: ShadowRunner, *, interval: float, once: bool = False,
              sleep: Callable[[float], None] = time_module.sleep) -> int:
-    while True:
-        try:
-            status = runner.step()
-        except KeyboardInterrupt:
-            return 0
-        except Exception as exc:  # noqa: BLE001 - a transient data error must not end the session
-            detail = (str(exc).strip().splitlines() or [type(exc).__name__])[0][:200]
-            print(f"step failed: {detail}", file=sys.stderr, flush=True)
-            status = "error"
-        if once:
-            print(status)
-            return 0 if status != "error" else 1
-        if status in ("open", "skipped"):
-            sleep(interval)
-        else:
-            sleep(max(interval, 30.0 if status == "error" else 60.0))
+    try:
+        while True:
+            try:
+                status = runner.step()
+            except Exception as exc:  # noqa: BLE001 - a transient data error must not end the session
+                detail = (str(exc).strip().splitlines() or [type(exc).__name__])[0][:200]
+                print(f"step failed: {detail}", file=sys.stderr, flush=True)
+                status = "error"
+            if once:
+                print(status)
+                return 0 if status != "error" else 1
+            if status in ("open", "skipped"):
+                sleep(interval)
+            else:
+                sleep(max(interval, 30.0 if status == "error" else 60.0))
+    except KeyboardInterrupt:           # Ctrl-C, or a stop signal: state is saved after every step
+        print("stopped", file=sys.stderr, flush=True)
+        return 0
 
 
 def restrict_trading(legs: Sequence[Leg], only: str) -> tuple[Leg, ...]:
@@ -1167,6 +1171,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         runner = ShadowRunner(provider, directory=directory, legs=legs, orders=orders,
                               max_notional=args.max_notional, allow_short=allow_short,
                               daily_loss_limit=args.daily_loss_limit)
+        if threading.current_thread() is threading.main_thread():
+            # ``docker stop`` sends SIGTERM: end the loop the way Ctrl-C does, releasing the lock.
+            signal.signal(signal.SIGTERM, signal.default_int_handler)
         return run_loop(runner, interval=max(2.0, args.interval), once=args.once)
     except (RuntimeError, ValueError) as exc:
         print(f"refused: {exc}", file=sys.stderr)

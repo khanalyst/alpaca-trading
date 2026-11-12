@@ -1327,6 +1327,41 @@ class ProposalTests(unittest.TestCase):
         self.assertEqual([message["role"] for message in seen["messages"]], ["system", "user"])
 
 
+class RunLoopTests(unittest.TestCase):
+    def test_a_stop_signal_between_polls_ends_the_loop_cleanly(self):
+        class Quiet:
+            steps = 0
+
+            def step(self):
+                self.steps += 1
+                return "closed"
+
+        def interrupted(seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        runner = Quiet()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(live.run_loop(runner, interval=5.0, sleep=interrupted), 0)
+        self.assertEqual((runner.steps, errors.getvalue().strip()), (1, "stopped"))
+
+    def test_a_failing_poll_is_reported_and_the_loop_goes_on(self):
+        class Flaky:
+            calls = 0
+
+            def step(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("feed down\nsecond line")
+                raise KeyboardInterrupt
+
+        waits: list[float] = []
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(live.run_loop(Flaky(), interval=5.0, sleep=waits.append), 0)
+        self.assertEqual(waits, [30.0])
+        self.assertIn("step failed: feed down", errors.getvalue())
+        self.assertNotIn("second line", errors.getvalue())
+
+
 class DeploymentOverrideTests(unittest.TestCase):
     def test_override_runs_the_shadow_without_orders(self):
         try:

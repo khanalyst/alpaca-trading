@@ -14,7 +14,7 @@ The engine searches 16 edges (signals) with 204 variants (parameter settings) pe
 seven from the day-trading desk, six swing and three from the options desk
 ([EDGES.md](EDGES.md) lists the premise of each). On public data it tested 3,861 hypotheses,
 has taken 124 to the holdout and confirms 9. The edge book that results trades four legs.
-Everything here has passed 86 offline tests, and the runner's preflight has passed against the
+Everything here has passed 88 offline tests, and the runner's preflight has passed against the
 Alpaca paper account. **Nothing has yet been confirmed on SIP bars**; that is the first step
 below.
 
@@ -391,7 +391,7 @@ maximum, is the signal to halt and review. Scale size only while results stay in
 | `fetch_public.py` | download the public diagnostic data |
 | `live.py` | the forward runner: shadow, paper orders, live orders, preflight, controls, report |
 | `results/` | committed runs on public data |
-| `tests/research/test_session_edges_study.py` | 86 offline tests (in the repository's test tree) |
+| `tests/research/test_session_edges_study.py` | 88 offline tests (in the repository's test tree) |
 
 Nothing in `agent/` or `research/` imports this folder. The study and the engine need only the
 Python standard library; the runner reuses `agent.alpaca_provider` and the runtime lock.
