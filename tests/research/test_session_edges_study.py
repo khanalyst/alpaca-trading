@@ -32,10 +32,13 @@ from studies.session_edges.strategies import (CLOSE_REVERSION, ENTER, EXIT, FLAT
                                               noise_band_bounds, noise_band_sigma, noise_band_target,
                                               simulate_close_reversion, simulate_close_reversion_daily,
                                               simulate_down_streak_daily, simulate_first_last,
+                                              is_expiration_week, simulate_expiration_week_daily,
                                               simulate_gap, simulate_last_hour, simulate_noise_band,
                                               simulate_opening_range, simulate_overnight,
-                                              simulate_overnight_hold, simulate_rsi_reversion_daily,
-                                              simulate_turn_of_month_daily)
+                                              simulate_overnight_hold, simulate_prior_day_break,
+                                              simulate_rsi_reversion_daily, simulate_turn_of_month_daily,
+                                              simulate_vix_spike_daily, simulate_vix_term_structure_daily,
+                                              simulate_vwap_trend)
 
 BASE = date(2026, 3, 2)  # a Monday
 
@@ -882,6 +885,17 @@ def drifting(index: int, previous: float) -> tuple[float, float, float, float]:
     return previous, max(previous, close) * 1.002, min(previous, close) * 0.998, close
 
 
+def rising(index: int, previous: float) -> tuple[float, float, float, float]:
+    """Opens at the previous close and closes 1% higher, every day."""
+    return previous, previous * 1.01, previous, previous * 1.01
+
+
+def trending(index: int, previous: float) -> tuple[float, float, float, float]:
+    """A noisy uptrend with no pattern in it: up 1.2%, down 1.0%, alternately."""
+    close = previous * (1.012 if index % 2 else 0.990)
+    return previous, max(previous, close), min(previous, close), close
+
+
 class GrammarTests(unittest.TestCase):
     def test_specs_are_validated_typed_and_content_addressed(self):
         spec = {"family": "noise_band_momentum", "symbol": "QQQ", "params": {"band_multiple": 1.1}}
@@ -924,14 +938,40 @@ class GrammarTests(unittest.TestCase):
         sessions = [wiggle_session(day) if i % 3 else flat_session(day, 100.2, {45: 101.0, 300: 99.0})
                     for i, day in enumerate(days)]
         bars = daily_bars(300, BASE, reverting)
+        context = {"VIX": {bar.day: 18.0 + index % 7 for index, bar in enumerate(bars)},
+                   "VIX3M": {bar.day: 20.0 for bar in bars}}
         for family in grammar.FAMILIES.values():
             data = sessions if family.data == grammar.MINUTE else bars
-            results = grammar.simulator(next(iter(grammar.enumerate_family(family, "X"))))(data)
+            spec = next(iter(grammar.enumerate_family(family, "X")))
+            results = grammar.simulator(spec, context)(data)
             self.assertEqual(len(results), len(data), family.name)
             self.assertEqual(family.executable, family.runner_rule is not None, family.name)
+            self.assertIn(family.desk, (grammar.DAY_TRADER, grammar.SWING_TRADER, grammar.OPTIONS_TRADER))
+            self.assertTrue(family.signal and family.thesis, family.name)
+            if family.needs:
+                with self.assertRaises(grammar.SpecError):
+                    grammar.simulator(spec)                         # the series it reads must be supplied
         described = grammar.describe()
         self.assertEqual(set(described), set(grammar.FAMILIES))
         json.dumps(described)
+
+    def test_catalogue_counts_edges_and_variants(self):
+        self.assertEqual(len(grammar.FAMILIES), 16)
+        counts = {name: grammar.variant_count(family) for name, family in grammar.FAMILIES.items()}
+        self.assertEqual(sum(counts.values()), 204)
+        self.assertEqual((counts["noise_band_momentum"], counts["vix_spike_daily"]), (36, 12))
+        for family in grammar.FAMILIES.values():
+            self.assertEqual(len(list(grammar.enumerate_family(family, "X"))), counts[family.name])
+        desks: dict[str, int] = {}
+        for family in grammar.FAMILIES.values():
+            desks[family.desk] = desks.get(family.desk, 0) + 1
+        self.assertEqual(desks, {grammar.DAY_TRADER: 7, grammar.SWING_TRADER: 6, grammar.OPTIONS_TRADER: 3})
+        text = grammar.catalogue_markdown()
+        for name in grammar.FAMILIES:
+            self.assertIn(f"`{name}`", text)
+        self.assertIn("16 edges, 204 variants", text)
+        committed = Path(grammar.__file__).with_name("EDGES.md").read_text(encoding="utf-8")
+        self.assertEqual(committed, grammar.catalogue_document())   # regenerate: python -m studies.session_edges.grammar
 
 
 class FamilyTests(unittest.TestCase):
@@ -980,8 +1020,143 @@ class FamilyTests(unittest.TestCase):
         self.assertEqual(sum(1 for row in month if row.gross != 0.0), 8)
 
 
+    def test_prior_day_break_follows_or_fades_the_first_close_beyond_yesterdays_range(self):
+        days = trading_days(3)
+        wide = flat_session(days[0], 100.0, {10: 102.0, 20: 100.0})      # range 100 to 102
+        narrow = flat_session(days[1], 100.5, {10: 101.0, 20: 100.5})    # range 100.5 to 101
+        up = flat_session(days[2], 100.8, {50: 101.5, 200: 102.5})       # closes above 101 in minute 50
+        follow = simulate_prior_day_break([wide, narrow, up])[-1]
+        self.assertEqual((follow.fills[0].side, follow.fills[0].entry_minute, follow.fills[0].entry),
+                         (LONG, 51, 101.5))
+        self.assertAlmostEqual(follow.gross, 102.5 / 101.5 - 1.0)
+        fade = simulate_prior_day_break([wide, narrow, up], mode="fade")[-1]
+        self.assertAlmostEqual(fade.gross, -(102.5 / 101.5 - 1.0))
+        # The setup filter: yesterday must be the narrowest of the last two sessions.
+        self.assertEqual(simulate_prior_day_break([wide, narrow, up], narrow_days=2)[-1].round_trips, 1)
+        self.assertEqual(simulate_prior_day_break([narrow, wide, up], narrow_days=2)[-1].round_trips, 0)
+        down = flat_session(days[2], 100.8, {50: 100.0})
+        self.assertEqual(simulate_prior_day_break([wide, narrow, down], sides=("long",))[-1].round_trips, 0)
+        self.assertEqual(simulate_prior_day_break([wide, narrow, down])[-1].fills[0].side, SHORT)
+        self.assertEqual(simulate_prior_day_break([wide])[0].round_trips, 0)       # no yesterday
+
+    def test_vwap_trend_needs_volume_and_follows_price_across_the_average(self):
+        day = trading_days(1)[0]
+        session = flat_session(day, 100.0, {40: 101.0, 200: 99.0})
+        both = simulate_vwap_trend([session], step=30)[0]
+        self.assertEqual([(fill.side, fill.entry_minute, fill.exit_minute) for fill in both.fills],
+                         [(LONG, 60, 210), (SHORT, 210, 388)])
+        self.assertAlmostEqual(both.gross, 99.0 / 101.0 - 1.0)       # long 101 to 99, then short at 99, flat
+        long_only = simulate_vwap_trend([session], step=30, sides=("long",))[0]
+        self.assertEqual(long_only.round_trips, 1)
+        silent = build_session(day, [(minute, 100.0, 100.0, 100.0, 100.0 + minute * 0.01, 0.0)
+                                     for minute in range(MINUTES)])
+        self.assertEqual(simulate_vwap_trend([silent])[0].round_trips, 0)
+
+    def test_volatility_spike_is_bought_at_the_next_open_and_sold_when_it_fades(self):
+        bars = daily_bars(30, BASE, rising)
+        vix = {bar.day: 20.0 for bar in bars}
+        vix[bars[15].day], vix[bars[16].day], vix[bars[17].day] = 26.0, 25.0, 19.0
+        results = simulate_vix_spike_daily(bars, vix, spike=0.15, average_days=10, max_sessions=5)
+        self.assertEqual([index for index, row in enumerate(results) if row.gross], [16, 17])
+        self.assertAlmostEqual(sum(row.gross for row in results), 0.02)
+        self.assertEqual((sum(row.round_trips for row in results), results[18].round_trips), (1, 1))
+        self.assertEqual(sum(row.round_trips for row in simulate_vix_spike_daily(bars, {})), 0)
+        calm = simulate_vix_spike_daily(bars, vix, spike=0.40)
+        self.assertEqual(sum(1 for row in calm if row.gross), 0)     # 26 is not 40% above 20
+
+    def test_term_structure_buys_inversion_or_holds_the_normal_slope(self):
+        bars = daily_bars(12, BASE, rising)
+        vix = {bar.day: 20.0 for bar in bars}
+        far = {bar.day: 22.0 for bar in bars}
+        vix[bars[3].day], vix[bars[4].day] = 24.0, 23.0              # inverted on two closes
+        stress = simulate_vix_term_structure_daily(bars, vix, far, mode="buy_backwardation")
+        self.assertEqual([index for index, row in enumerate(stress) if row.gross], [4, 5])
+        self.assertEqual(sum(row.round_trips for row in stress), 1)
+        carry = simulate_vix_term_structure_daily(bars, vix, far, mode="hold_contango")
+        self.assertEqual([index for index, row in enumerate(carry) if row.gross], [1, 2, 3, 6, 7, 8, 9, 10, 11])
+        self.assertAlmostEqual(sum(row.gross for row in carry), 0.09)
+        with self.assertRaises(ValueError):
+            simulate_vix_term_structure_daily(bars, vix, far, mode="sell_everything")
+
+    def test_expiration_week_is_the_week_of_the_third_friday(self):
+        self.assertTrue(is_expiration_week(date(2026, 3, 16)))
+        self.assertTrue(is_expiration_week(date(2026, 3, 20)))       # the third Friday of March 2026
+        self.assertFalse(is_expiration_week(date(2026, 3, 13)))
+        self.assertFalse(is_expiration_week(date(2026, 3, 21)))      # a Saturday
+        self.assertFalse(is_expiration_week(date(2026, 3, 23)))
+        bars = daily_bars(20, BASE, rising)                          # 2 to 27 March 2026
+        whole = simulate_expiration_week_daily(bars)
+        self.assertEqual([bars[i].day.day for i, row in enumerate(whole) if row.gross], [16, 17, 18, 19, 20])
+        self.assertEqual(sum(row.round_trips for row in whole), 1)
+        inner = simulate_expiration_week_daily(bars, enter="monday", leave="thursday")
+        self.assertAlmostEqual(sum(row.gross for row in inner), 0.03)
+
+
 class DiscoveryTests(unittest.TestCase):
     START = date(2012, 1, 2)
+
+    def test_alpha_is_what_is_left_after_exposure_to_the_instrument(self):
+        days = trading_days(300)
+        market = {day: (0.02 if index % 2 else -0.01) for index, day in enumerate(days)}
+        extra = (0.002, 0.0, 0.001)                                  # uncorrelated with the market by design
+        net = [0.5 * market[day] + extra[index % 3] for index, day in enumerate(days)]
+        found = discover.beyond_holding(days, net, market)
+        self.assertAlmostEqual(found["beta"], 0.5)
+        self.assertAlmostEqual(found["alpha_bps_per_session"], 10.0)
+        self.assertGreater(found["alpha_t"], 10.0)
+        only_market = discover.beyond_holding(days, [market[day] for day in days], market)
+        self.assertAlmostEqual(only_market["beta"], 1.0)
+        self.assertIsNone(only_market["alpha_t"])                    # holding the market is not an edge
+        self.assertIsNone(discover.beyond_holding(days[:30], net[:30], market)["alpha_t"])
+        bars = daily_bars(4, BASE, rising)
+        self.assertEqual(list(discover.benchmark_returns(grammar.DAILY, bars)), [bar.day for bar in bars[1:]])
+        sessions = [flat_session(days[0], 100.0), flat_session(days[1], 101.0)]
+        self.assertAlmostEqual(discover.benchmark_returns(grammar.MINUTE, sessions)[days[1]], 0.01)
+
+    def test_a_rule_that_only_holds_the_market_is_screened_out(self):
+        bars = daily_bars(3600, self.START, trending)
+        context = {"VIX": {bar.day: 15.0 for bar in bars}, "VIX3M": {bar.day: 20.0 for bar in bars}}
+        record = discover.discover(minute={}, daily={"UP": bars}, context=context,
+                                   families=["vix_term_structure_daily"])
+        self.assertEqual(record["promoted"], {})
+        held = [row for row in record["design_leaderboard"] if row["spec"]["params"]["mode"] == "hold_contango"]
+        self.assertTrue(held and all(row["design_t"] > discover.MIN_DESIGN_T for row in held))
+        self.assertTrue(all("no return beyond holding the instrument" in row["screen_failures"] for row in held))
+
+    def test_families_without_their_context_or_volume_are_skipped_and_reported(self):
+        bars = daily_bars(3600, self.START, reverting)
+        record = discover.discover(minute={}, daily={"REAL": bars},
+                                   families=["vix_spike_daily", "vix_term_structure_daily"],
+                                   proposals=[{"family": "vix_spike_daily", "symbol": "REAL", "params": {}}])
+        self.assertEqual(record["hypotheses_tested"], 0)
+        self.assertEqual(record["skipped_families"],
+                         {"vix_spike_daily": "context series not loaded: VIX",
+                          "vix_term_structure_daily": "context series not loaded: VIX, VIX3M"})
+        self.assertEqual(len(record["rejected_proposals"]), 1)
+        days = trading_days(40)
+        silent = [build_session(day, [(minute, 100.0, 100.0, 100.0, 100.0, 0.0) for minute in range(MINUTES)])
+                  for day in days]
+        quiet = discover.discover(minute={"IDX": silent}, daily={}, families=["vwap_trend"])
+        self.assertEqual((quiet["hypotheses_tested"], quiet["skipped_families"]),
+                         (0, {"vwap_trend": "needs traded volume"}))
+        with_volume = discover.discover(minute={"ETF": [wiggle_session(day) for day in days]}, daily={},
+                                        families=["vwap_trend"])
+        self.assertEqual(with_volume["funnel"]["vwap_trend"]["tested"], 6)
+
+    def test_a_champion_promoted_before_the_exposure_check_gets_it(self):
+        daily = {"REAL": daily_bars(3600, self.START, reverting)}
+        ledger = discover.load_ledger(None)
+        discover.discover(minute={}, daily=daily, ledger=ledger, families=["close_weakness_reversion_daily"])
+        (key, row), = ledger["promoted"].items()
+        recorded = dict(row["holdout"])
+        for window in ("design", "holdout", "recent"):
+            for name in ("beta", "alpha_bps_per_session", "alpha_t"):
+                del row[window][name]                                # as an older ledger stored it
+        again = discover.discover(minute={}, daily=daily, ledger=ledger,
+                                  families=["close_weakness_reversion_daily"])
+        self.assertEqual(again["promoted"][key]["holdout"], recorded)
+        self.assertTrue(again["promoted"][key]["checks"]["beyond_holding_the_instrument"])
+        self.assertEqual(again["promoted"][key]["tier"], discover.CONFIRMED)
 
     def test_corrections(self):
         p_values = {"a": 0.001, "b": 0.012, "c": 0.04, "d": 0.5}
@@ -1077,11 +1252,21 @@ class DiscoveryTests(unittest.TestCase):
                     columns[key].append(value)
             with gzip.open(Path(folder) / "REAL.json.gz", "wt", encoding="utf-8") as handle:
                 json.dump({"t": stamps, **columns, "adj": columns["c"]}, handle)
+            with gzip.open(Path(folder) / "FEAR.json.gz", "wt", encoding="utf-8") as handle:
+                json.dump({"t": stamps, "c": [20.0 + index % 5 for index in range(len(stamps))]}, handle)
+            self.assertEqual(len(session_data.load_daily_closes(Path(folder) / "FEAR.json.gz")), 3600)
             out = Path(folder) / "out"
             with contextlib.redirect_stdout(io.StringIO()):
                 code = discover.main(["--daily-dir", folder, "--daily", "REAL", "--out", str(out),
-                                      "--families", "close_weakness_reversion_daily"])
+                                      "--context", "VIX=FEAR",
+                                      "--families", "close_weakness_reversion_daily,vix_spike_daily"])
             self.assertEqual(code, 0)
+            record = json.loads((out / "discovery.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["context_series"], ["VIX"])
+            self.assertEqual(record["funnel"]["vix_spike_daily"]["tested"], 12)
+            with self.assertRaises(FileNotFoundError), contextlib.redirect_stdout(io.StringIO()):
+                discover.main(["--daily-dir", folder, "--daily", "REAL", "--out", str(out),
+                               "--context", "VIX=ABSENT"])
             self.assertEqual({path.name for path in out.iterdir()},
                              {"discovery.json", "discovery.md", "edge_book.json", "ledger.json"})
             book = json.loads((out / "edge_book.json").read_text(encoding="utf-8"))

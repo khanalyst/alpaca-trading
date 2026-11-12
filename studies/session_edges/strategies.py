@@ -22,7 +22,7 @@ Decisions read completed bars only and fill at the open of the next bar.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -531,6 +531,221 @@ def simulate_turn_of_month_daily(bars: Sequence[DailyBar], *, enter_days_before:
     for index, bar in enumerate(bars):
         gross = bar.close / bars[index - 1].close - 1.0 if index and held[index] else 0.0
         out.append(DayResult(bar.day, gross, entries[index]))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Day-trader families: yesterday's levels and the session VWAP
+# --------------------------------------------------------------------------
+
+def simulate_prior_day_break(sessions: Sequence[Session], *, mode: str = "follow", narrow_days: int = 0,
+                             sides: Sequence[str] = BOTH_SIDES, start_minute: int = 5,
+                             last_entry_minute: int = 360, flat_minute: int = 388) -> list[DayResult]:
+    """Trade the first one-minute close beyond yesterday's high or low, once per session.
+
+    ``mode`` follows the break or fades it (the failed-breakout trade).
+    ``narrow_days`` above zero trades only after a session whose range was the
+    narrowest of that many sessions, the volatility-contraction setup. The
+    first break uses up the session even when its side is not allowed.
+    """
+    if mode not in ("follow", "fade"):
+        raise ValueError("mode must be follow or fade")
+    highs = [max(session.high) for session in sessions]
+    lows = [min(session.low) for session in sessions]
+    out: list[DayResult] = []
+    for index, session in enumerate(sessions):
+        if previous_close(sessions, index) is None:
+            out.append(DayResult(session.day))
+            continue
+        level_high, level_low = highs[index - 1], lows[index - 1]
+        if narrow_days > 0:
+            if index < narrow_days:
+                out.append(DayResult(session.day))
+                continue
+            widths = [highs[i] / lows[i] - 1.0 for i in range(index - narrow_days, index)]
+            if widths[-1] > min(widths):
+                out.append(DayResult(session.day))
+                continue
+        result = DayResult(session.day)
+        for minute in range(start_minute, last_entry_minute + 1):
+            price = session.close[minute - 1]
+            if price > level_high:
+                side = LONG
+            elif price < level_low:
+                side = SHORT
+            else:
+                continue
+            if mode == "fade":
+                side = -side
+            if ("long" if side == LONG else "short") in sides:
+                exit_minute, exit_price = _flat_exit(session, flat_minute)
+                fill = Fill(side, minute, session.open[minute], exit_minute, exit_price)
+                result = DayResult(session.day, fill.gross, 1, (fill,))
+            break
+        out.append(result)
+    return out
+
+
+def simulate_vwap_trend(sessions: Sequence[Session], *, step: int = 30, sides: Sequence[str] = BOTH_SIDES,
+                        flat_minute: int = 388) -> list[DayResult]:
+    """Long above the session VWAP, short below, re-checked every ``step`` minutes; flat at the end of day.
+
+    Needs traded volume: a session without any is not traded, so data with no
+    volume (an index proxy) produces no trades at all rather than a wrong VWAP.
+    """
+    out: list[DayResult] = []
+    for session in sessions:
+        if not math.fsum(session.volume) > 0:
+            out.append(DayResult(session.day))
+            continue
+        position = FLAT
+        entry = 0.0
+        entry_minute = 0
+        fills: list[Fill] = []
+        weighted = volume = 0.0
+        done = 0
+        for minute in range(step, flat_minute, step):
+            for bar in range(done, minute):
+                size = session.volume[bar]
+                weighted += (session.high[bar] + session.low[bar] + session.close[bar]) / 3.0 * size
+                volume += size
+            done = minute
+            if not volume > 0:
+                continue
+            price, vwap = session.close[minute - 1], weighted / volume
+            target = LONG if price > vwap else SHORT if price < vwap else position
+            if ("long" if target == LONG else "short") not in sides and target != FLAT:
+                target = FLAT
+            if target == position:
+                continue
+            fill = session.open[minute]
+            if position != FLAT:
+                fills.append(Fill(position, entry_minute, entry, minute, fill))
+            position, entry, entry_minute = target, fill, minute
+        if position != FLAT:
+            exit_minute, exit_price = _flat_exit(session, flat_minute)
+            fills.append(Fill(position, entry_minute, entry, exit_minute, exit_price))
+        out.append(DayResult(session.day, math.fsum(fill.gross for fill in fills), len(fills), tuple(fills)))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Options-trader families: implied volatility and the expiration calendar,
+# traded in the underlying. Signals read at a close are acted on at the next
+# open, because the volatility indices settle after the equity close.
+# --------------------------------------------------------------------------
+
+def _next_open_results(bars: Sequence[DailyBar], wanted: Sequence[bool]) -> list[DayResult]:
+    """Daily results of being long from the open after ``wanted`` turns true to the open after it turns false."""
+    out: list[DayResult] = []
+    holding = False
+    for index, bar in enumerate(bars):
+        gross = 0.0
+        trips = 0
+        target = wanted[index - 1] if index else False
+        if holding and not target:
+            gross = bar.open / bars[index - 1].close - 1.0
+            trips = 1
+            holding = False
+        elif holding:
+            gross = bar.close / bars[index - 1].close - 1.0
+        elif target:
+            gross = bar.close / bar.open - 1.0
+            holding = True
+        out.append(DayResult(bar.day, gross, trips))
+    return out
+
+
+def simulate_vix_spike_daily(bars: Sequence[DailyBar], vix: Mapping[date, float], *, spike: float = 0.15,
+                             average_days: int = 10, max_sessions: int = 5) -> list[DayResult]:
+    """Buy after the VIX closes ``spike`` above its average of the prior ``average_days`` closes.
+
+    The position is closed once the VIX is back below that average, or after
+    ``max_sessions`` sessions.
+    """
+    wanted: list[bool] = []
+    recent: list[float] = []
+    holding = False
+    held = 0
+    for bar in bars:
+        level = vix.get(bar.day)
+        if level is None or len(recent) < average_days:
+            if level is not None:
+                recent.append(level)
+            holding = False
+            wanted.append(False)
+            continue
+        average = math.fsum(recent[-average_days:]) / average_days
+        recent.append(level)
+        if holding:
+            held += 1
+            if level < average or held >= max_sessions:
+                holding = False
+        elif level >= average * (1.0 + spike):
+            holding = True
+            held = 0
+        wanted.append(holding)
+    return _next_open_results(bars, wanted)
+
+
+def simulate_vix_term_structure_daily(bars: Sequence[DailyBar], vix: Mapping[date, float],
+                                      vix_3m: Mapping[date, float], *, mode: str = "buy_backwardation",
+                                      threshold: float = 1.0, max_sessions: int = 10) -> list[DayResult]:
+    """Trade the ratio of one-month to three-month implied volatility.
+
+    ``buy_backwardation`` buys when the ratio closes above ``threshold``
+    (acute stress) and sells when it is back below 1 or after ``max_sessions``.
+    ``hold_contango`` is long whenever the ratio is below ``threshold``.
+    """
+    if mode not in ("buy_backwardation", "hold_contango"):
+        raise ValueError("unknown term-structure mode")
+    wanted: list[bool] = []
+    holding = False
+    held = 0
+    for bar in bars:
+        near, far = vix.get(bar.day), vix_3m.get(bar.day)
+        if near is None or far is None or not far > 0:
+            holding = False
+            wanted.append(False)
+            continue
+        ratio = near / far
+        if mode == "hold_contango":
+            holding = ratio < threshold
+        elif holding:
+            held += 1
+            if ratio < 1.0 or held >= max_sessions:
+                holding = False
+        elif ratio > threshold:
+            holding = True
+            held = 0
+        wanted.append(holding)
+    return _next_open_results(bars, wanted)
+
+
+def is_expiration_week(day: date) -> bool:
+    """Whether ``day`` is in the week of the monthly option expiration (the third Friday)."""
+    friday = day.toordinal() + (4 - day.weekday())
+    return day.weekday() < 5 and 15 <= date.fromordinal(friday).day <= 21
+
+
+def simulate_expiration_week_daily(bars: Sequence[DailyBar], *, enter: str = "prior_friday",
+                                   leave: str = "friday") -> list[DayResult]:
+    """Long through the monthly option-expiration week, close to close.
+
+    ``enter`` is the close before the week (``prior_friday``) or Monday's
+    close; ``leave`` is Thursday's or Friday's close.
+    """
+    if enter not in ("prior_friday", "monday") or leave not in ("thursday", "friday"):
+        raise ValueError("unknown expiration-week timing")
+    first = 0 if enter == "prior_friday" else 1
+    last = 3 if leave == "thursday" else 4
+    out: list[DayResult] = []
+    in_week = False
+    for index, bar in enumerate(bars):
+        held = index > 0 and is_expiration_week(bar.day) and first <= bar.day.weekday() <= last
+        gross = bar.close / bars[index - 1].close - 1.0 if held else 0.0
+        out.append(DayResult(bar.day, gross, 1 if held and not in_week else 0))
+        in_week = held
     return out
 
 

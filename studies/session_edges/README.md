@@ -1,6 +1,6 @@
 # Session edges: discovery, evidence and the forward runner
 
-Status on 11 November 2026. This folder holds three things that work together:
+Status on 12 November 2026. This folder holds three things that work together:
 
 1. **A registered-rule study** (`run.py`): published session-level rules, parameters fixed in
    advance, judged on 16 years of minute data and up to 34 years of daily data.
@@ -10,9 +10,13 @@ Status on 11 November 2026. This folder holds three things that work together:
 3. **A forward runner** (`live.py`): takes the edge book through shadow, paper orders and live
    orders with the same decision code the simulators use.
 
-On public data the engine tested 2,803 hypotheses, took 114 to the holdout and confirmed 9. The
-edge book that results trades four legs. Everything here has passed 76 offline tests; **nothing
-has yet been run against Alpaca or on SIP bars**, and those are the first two steps below.
+The engine searches 16 edges (signals) with 204 variants (parameter settings) per instrument:
+seven from the day-trading desk, six swing and three from the options desk
+([EDGES.md](EDGES.md) lists the premise of each). On public data it tested 3,861 hypotheses,
+has taken 124 to the holdout and confirms 9. The edge book that results trades four legs.
+Everything here has passed 86 offline tests, and the runner's preflight has passed against the
+Alpaca paper account. **Nothing has yet been confirmed on SIP bars**; that is the first step
+below.
 
 No result here is a promise. An edge with a Sharpe ratio near 1 has losing months and losing
 years; the numbers that matter for sizing are the drawdowns and the review bands, not the mean.
@@ -27,84 +31,115 @@ changes both: the hypotheses have a reason to work, and the evidence is years lo
 
 ## The discovery engine
 
-A hypothesis is data: `{"family": ..., "symbol": ..., "params": {...}}`. `grammar.py` defines
-eleven families, each a session-level effect with a published or structural reason to exist:
+A hypothesis is data: `{"family": ..., "symbol": ..., "params": {...}}`. An **edge** (a family
+in `grammar.py`) is one signal with a published or structural reason to exist; a **variant** is
+that signal with different values. Every edge is traded in shares of the instrument, including
+the ones that read the options market.
 
-| family | data | the runner can trade it | idea |
-| --- | --- | --- | --- |
-| `noise_band_momentum` | minute | yes | follow a move outside the time-of-day noise band, checked every 30 or 60 minutes |
-| `midday_trend` | minute | yes | one midday check of the same band, held to the end of day |
-| `close_weakness_reversion` | minute | yes | buy a close near the day's low at 15:50, sell the recovery |
-| `close_weakness_reversion_daily` | daily | yes, as the 15:50 rule | the same, decided at the close on daily bars |
-| `opening_range_breakout` | minute | recorded only | direction of the first candle, stop at its far side |
-| `last_hour` | minute | no | follow or fade the day's move into the close |
-| `gap_open` | minute | no | follow or fade a large overnight gap |
-| `overnight_hold` | minute | no | hold from the close to the next open |
-| `rsi_reversion_daily` | daily | no | buy a short-period oversold reading |
-| `down_streak_daily` | daily | no | buy after consecutive lower closes |
-| `turn_of_month_daily` | daily | no | hold across the month end |
+| edge | desk | data | signal | variants | the runner can trade it |
+| --- | --- | --- | --- | ---: | --- |
+| `noise_band_momentum` | day trader | minute | price outside its usual move for the time of day, checked every 30 or 60 minutes | 36 | yes |
+| `midday_trend` | day trader | minute | one midday check of the same band, held to the end of day | 12 | yes |
+| `opening_range_breakout` | day trader | minute | direction of the first 5, 15 or 30 minutes, stop at the far side | 12 | recorded only |
+| `prior_day_break` | day trader | minute | first close beyond yesterday's high or low, followed or faded, optionally only after a narrow day | 12 | no |
+| `gap_open` | day trader | minute | follow or fade a large overnight gap | 12 | no |
+| `vwap_trend` | day trader | minute, needs volume | long above the session VWAP, short below | 6 | no |
+| `last_hour` | day trader | minute | follow or fade the day's move into the close | 4 | no |
+| `close_weakness_reversion` | swing | minute | buy a close near the day's low at 15:50, sell the recovery | 30 | yes |
+| `close_weakness_reversion_daily` | swing | daily | the same, decided at the close on daily bars | 30 | yes, as the 15:50 rule |
+| `rsi_reversion_daily` | swing | daily | buy a 2- or 3-day oversold reading | 12 | no |
+| `down_streak_daily` | swing | daily | buy after 2, 3 or 4 lower closes | 9 | no |
+| `overnight_hold` | swing | minute | hold from 15:58 to 09:31 | 3 | no |
+| `turn_of_month_daily` | swing | daily | hold across the month end | 4 | no |
+| `vix_spike_daily` | options | daily, needs VIX | buy after implied volatility jumps above its 10-day average | 12 | no |
+| `vix_term_structure_daily` | options | daily, needs VIX and VIX3M | buy an inverted volatility curve, or hold only while it slopes up | 6 | no |
+| `expiration_week_daily` | options | daily | long through the week of the monthly option expiration | 4 | no |
 
-The search may combine families, parameters and instruments freely. What it may conclude is
+[EDGES.md](EDGES.md) gives the premise and the exact values of every variant; it is generated
+from the code (`python -m studies.session_edges.grammar`) and a test keeps it in step.
+
+The search may combine edges, parameters and instruments freely. What it may conclude is
 fixed in `discover.py`:
 
 1. **Screen on the design period only** (before 2020-01-01): Newey-West t of at least 2.0 net
-   of costs, positive at twice the cost, at least 40 round trips, and at least 70% of one-step
-   parameter neighbours positive.
-2. **One champion per family and instrument** goes forward: the screened hypothesis with the
+   of costs, positive at twice the cost, at least 40 round trips, at least 70% of one-step
+   parameter neighbours positive, and an **alpha t of at least 2.0** against the instrument's
+   own daily return. The last check removes exposure: a rule that is simply long the market on
+   most days earns the market's drift and is not an edge.
+2. **One champion per edge and instrument** goes forward: the screened hypothesis with the
    highest design t. Nothing else ever touches the holdout.
 3. **Confirm on the holdout** (2020 onwards). `confirmed` needs Holm at 5% across every champion
-   ever promoted, a positive holdout at twice the cost, and a positive result since 2024.
-   `provisional` needs Benjamini-Yekutieli at 10% and the cost stress.
+   ever promoted, a positive holdout at twice the cost, a positive result since 2024 and a
+   holdout alpha t of at least 2.0. `provisional` needs Benjamini-Yekutieli at 10%, the cost
+   stress and a positive holdout alpha.
 4. **The ledger remembers.** Every promoted hypothesis stays in the correction, so searching
-   again, or adding proposals, raises the bar.
+   again, adding an edge, or adding proposals raises the bar.
 
 Costs are per round trip and per instrument (1 bp for SPY, QQQ and IWM; 1.5 for DIA and VTI;
-3 for anything else unless `--cost-bps` says otherwise).
+3 for anything else unless `--cost-bps` says otherwise). An edge whose context series is not
+loaded (`--context VIX,VIX3M`), or which needs traded volume on data that has none, is skipped
+and named in the report.
 
 ### What it found on public data
 
-Full record: [results/discovery-public-2026-11-11/discovery.md](results/discovery-public-2026-11-11/discovery.md).
+Full record: [results/discovery-public-2026-11-12/discovery.md](results/discovery-public-2026-11-12/discovery.md)
+(47 ETFs of daily history, two index minute archives from 2010, VIX and VIX3M). The ledger of
+that run is committed beside it; pass it with `--ledger` so that a later run keeps counting.
 
-| family | tested | passed the design screen | champions | confirmed |
+| edge | tested | passed the design screen | champions this run | confirmed |
 | --- | ---: | ---: | ---: | ---: |
-| close_weakness_reversion_daily (47 ETFs) | 1,410 | 708 | 37 | 5 |
-| down_streak_daily | 423 | 87 | 27 | 3 |
-| rsi_reversion_daily | 564 | 142 | 34 | 1 |
-| turn_of_month_daily | 188 | 24 | 9 | 0 |
-| noise_band_momentum (QQQ, SPY minute proxies) | 72 | 29 | 2 | 0 |
-| close_weakness_reversion (minute) | 60 | 29 | 2 | 0 |
-| midday_trend | 24 | 2 | 2 | 0 |
-| overnight_hold | 6 | 1 | 1 | 0 |
-| gap_open, last_hour, opening_range_breakout | 56 | 0 | 0 | 0 |
+| close_weakness_reversion_daily (47 ETFs) | 1,410 | 367 | 25 | 5 |
+| down_streak_daily | 423 | 28 | 10 | 3 |
+| rsi_reversion_daily | 564 | 42 | 14 | 1 |
+| vix_term_structure_daily | 282 | 11 | 7 | 0 |
+| noise_band_momentum (QQQ, SPY minute proxies) | 72 | 18 | 2 | 0 |
+| turn_of_month_daily | 188 | 2 | 1 | 0 |
+| vix_spike_daily | 564 | 1 | 1 | 0 |
+| expiration_week_daily | 188 | 1 | 1 | 0 |
+| close_weakness_reversion (minute proxies) | 60 | 0 | 0 | 0 |
+| prior_day_break, midday_trend, gap_open, opening_range_breakout, last_hour, overnight_hold | 110 | 0 | 0 | 0 |
+| vwap_trend | not searched: the index proxies carry no volume | | | |
 
-The nine confirmed hypotheses (holdout 2020 to 2026, net of costs):
+The nine confirmed hypotheses (holdout 2020 to 2026, net of costs). Beta is the rule's exposure
+to the instrument; the alpha t tests what is left after that exposure is removed:
 
-| family | instrument | holdout t | holdout Sharpe | bps per session |
-| --- | --- | ---: | ---: | ---: |
-| close_weakness_reversion_daily | SOXL | 3.88 | 1.34 | 37.6 |
-| close_weakness_reversion_daily | SPY | 3.76 | 1.30 | 5.5 |
-| close_weakness_reversion_daily | XLK | 3.70 | 1.25 | 7.2 |
-| close_weakness_reversion_daily | SSO | 3.69 | 1.33 | 13.1 |
-| rsi_reversion_daily | IVW | 3.66 | 1.27 | 6.3 |
-| down_streak_daily | SPY | 3.65 | 1.18 | 3.5 |
-| down_streak_daily | QQQ | 3.61 | 1.33 | 3.4 |
-| close_weakness_reversion_daily | IVW | 3.53 | 1.33 | 7.0 |
-| down_streak_daily | IVW | 3.34 | 1.20 | 3.2 |
+| edge | instrument | holdout t | holdout Sharpe | bps per session | beta | alpha t |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| close_weakness_reversion_daily | SOXL | 3.88 | 1.34 | 37.6 | 0.37 | 2.93 |
+| close_weakness_reversion_daily | SPY | 3.76 | 1.30 | 5.5 | 0.28 | 2.60 |
+| close_weakness_reversion_daily | XLK | 3.70 | 1.25 | 7.2 | 0.27 | 2.47 |
+| close_weakness_reversion_daily | SSO | 3.69 | 1.33 | 13.1 | 0.39 | 2.50 |
+| rsi_reversion_daily | IVW | 3.66 | 1.27 | 6.3 | 0.28 | 2.48 |
+| down_streak_daily | SPY | 3.65 | 1.18 | 3.5 | 0.13 | 2.68 |
+| down_streak_daily | QQQ | 3.61 | 1.33 | 3.4 | 0.07 | 3.03 |
+| close_weakness_reversion_daily | IVW | 3.53 | 1.33 | 7.0 | 0.32 | 2.54 |
+| down_streak_daily | IVW | 3.34 | 1.20 | 3.2 | 0.08 | 2.70 |
 
 Read this carefully:
 
 * **It is one idea, found nine times.** Every confirmed hypothesis buys a US equity index after
   short-term weakness. That is strong evidence the effect is real and no evidence of
   diversification: the legs fall together in a crash.
+* **It is not market exposure in disguise.** The confirmed rules carry a beta of 0.07 to 0.39
+  and keep an alpha t of 2.5 to 3.0 once that exposure is removed. Roughly a third of each
+  rule's return is the market's drift; the rest is timing.
+* **The options-desk edges did not confirm.** Holding only while the volatility curve slopes up
+  reached the holdout on seven instruments with a holdout t of 1.4 to 2.2, but its beta is 0.55
+  to 0.77 and its alpha t is below 1: it is mostly the market. Buying a VIX spike and holding
+  through expiration week each produced one champion, and both lost money in the holdout.
+* **The new day-trading edges did not pass the design screen.** Breaks of yesterday's range,
+  followed or faded, with or without a narrow-day setup, show nothing on the index proxies.
 * **Nothing confirmed outside equities.** Treasury and corporate bond funds reached the holdout
   and failed; gold, silver, oil and high-yield bonds did not pass the design screen. That is what
   a real, equity-specific effect looks like.
 * **Intraday rules do not survive the search correction.** QQQ momentum has a holdout p of
-  about 0.02; among 114 champions that is not enough. It is in the edge book only as a
+  about 0.02; among 124 champions that is not enough. It is in the edge book only as a
   registered rule (below), and it is the weaker leg.
-* **Daily evidence is slightly optimistic.** Daily rules decide at the close; the runner decides
-  at 15:50. Where both forms were measured, deciding ten minutes early cost between a tenth and
-  a third of the Sharpe ratio (S&P 500: 0.87 to 0.77; VTI: 0.96 to 0.75; Nasdaq-100: 1.10 to 0.76).
+* **The 15:50 form is weaker than the daily form.** Daily rules decide at the close; the runner
+  decides at 15:50. Where both forms were measured, deciding ten minutes early cost between a
+  tenth and a third of the Sharpe ratio (S&P 500: 0.87 to 0.77; VTI: 0.96 to 0.75; Nasdaq-100:
+  1.10 to 0.76), and on the ten design years of the minute proxies the 15:50 form does not
+  reach an alpha t of 2 by itself. The daily history is what carries the evidence.
 
 ### The edge book
 
@@ -114,7 +149,7 @@ leg owns one symbol, one traded leg stands for each underlying index, and a leve
 never traded (it repeats its index's edge with more risk per dollar). The swing sleeve may use
 half the account across at most four legs; the intraday sleeve one leg at 25%.
 
-The book from public data ([edge_book.json](results/discovery-public-2026-11-11/edge_book.json)):
+The book from public data ([edge_book.json](results/discovery-public-2026-11-12/edge_book.json)), unchanged by the wider search:
 
 | trade | weight | tier | rule | symbol | parameters |
 | --- | ---: | --- | --- | --- | --- |
@@ -246,7 +281,7 @@ python -I studies/liquid_reversion/fetch_sip.py --out /app/runtime/session_edges
 ```
 
 ```bash
-python -I studies/session_edges/fetch_public.py --out /app/runtime/session_edges/public --pairs "" --daily SPY,QQQ,IWM,DIA,VTI,XLK,IVW,SMH
+python -I studies/session_edges/fetch_public.py --out /app/runtime/session_edges/public --pairs "" --daily SPY,QQQ,IWM,DIA,VTI,XLK,IVW,SMH --context VIX,VIX3M
 ```
 
 ```bash
@@ -254,7 +289,7 @@ python -I studies/session_edges/run.py --alpaca-dir /app/runtime/session_edges/s
 ```
 
 ```bash
-python -I studies/session_edges/discover.py --alpaca-dir /app/runtime/session_edges/sip --symbols QQQ,SPY,XLK,IVW --calendar /app/runtime/session_edges/sip/calendar.json --daily-dir /app/runtime/session_edges/public/daily --daily SPY,QQQ,IWM,DIA,VTI,XLK,IVW,SMH --registered /app/runtime/session_edges/registered/results.json --out /app/runtime/session_edges/discovery
+python -I studies/session_edges/discover.py --alpaca-dir /app/runtime/session_edges/sip --symbols QQQ,SPY,XLK,IVW --calendar /app/runtime/session_edges/sip/calendar.json --daily-dir /app/runtime/session_edges/public/daily --daily SPY,QQQ,IWM,DIA,VTI,XLK,IVW,SMH --context VIX,VIX3M --registered /app/runtime/session_edges/registered/results.json --out /app/runtime/session_edges/discovery
 ```
 
 *Stop if* the legs you intend to trade are not in the new
@@ -347,7 +382,8 @@ maximum, is the signal to halt and review. Scale size only while results stay in
 | --- | --- |
 | `data.py` | session matrices; loaders for SIP month files, public index archives and adjusted daily bars |
 | `strategies.py` | the rules, their decision functions and simulators |
-| `grammar.py` | the hypothesis grammar: families, parameter bounds, grids, neighbours, ids |
+| `grammar.py` | the hypothesis grammar: edges, parameter bounds, grids, neighbours, ids |
+| `EDGES.md` | the catalogue of every edge, its premise and its variants (generated from `grammar.py`) |
 | `discover.py` | the search protocol, the ledger, the edge book and the discovery report |
 | `propose.py` | prompt, provider call and validation for model-proposed hypotheses |
 | `stats.py` | per-session statistics: Newey-West t, sign-flip p, block bootstrap, deflated Sharpe, power, review bands |
@@ -355,7 +391,7 @@ maximum, is the signal to halt and review. Scale size only while results stay in
 | `fetch_public.py` | download the public diagnostic data |
 | `live.py` | the forward runner: shadow, paper orders, live orders, preflight, controls, report |
 | `results/` | committed runs on public data |
-| `tests/research/test_session_edges_study.py` | 76 offline tests (in the repository's test tree) |
+| `tests/research/test_session_edges_study.py` | 86 offline tests (in the repository's test tree) |
 
 Nothing in `agent/` or `research/` imports this folder. The study and the engine need only the
 Python standard library; the runner reuses `agent.alpaca_provider` and the runtime lock.

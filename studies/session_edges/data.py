@@ -228,6 +228,26 @@ def load_daily_chart(path: str | Path) -> list[DailyBar]:
     return out
 
 
+def load_daily_closes(path: str | Path) -> dict[date, float]:
+    """Unadjusted daily closes of a context series (an index such as the VIX), keyed by New York date.
+
+    Reads the same file format as :func:`load_daily_chart`. An index has no
+    dividends or splits, so nothing is adjusted.
+    """
+    source = Path(path)
+    opener = gzip.open if source.suffix == ".gz" else open
+    with opener(source, "rt", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{source.name}: expected an object")
+    out: dict[date, float] = {}
+    for stamp, close in zip(data.get("t") or [], data.get("c") or []):
+        if close is None or not close > 0:
+            continue
+        out[datetime.fromtimestamp(int(stamp), NEW_YORK).date()] = float(close)
+    return out
+
+
 def minute_of(clock: time) -> int:
     """Minutes from the 09:30 open to a New York wall-clock time."""
     return clock.hour * 60 + clock.minute - OPEN_MINUTE_OF_DAY

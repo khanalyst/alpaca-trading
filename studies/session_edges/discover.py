@@ -14,14 +14,19 @@ The search is free to try every family, parameter and instrument in
 
 1. **Screen on the design period only** (sessions before the holdout date).
    A hypothesis must have a Newey-West t of at least ``MIN_DESIGN_T`` net of
-   costs, stay positive at twice the cost, trade often enough, and have most
-   of its one-step parameter neighbours positive too.
+   costs, stay positive at twice the cost, trade often enough, have most of
+   its one-step parameter neighbours positive too, and earn more than its
+   exposure to the instrument explains (an alpha t of at least
+   ``MIN_ALPHA_T`` against the instrument's own daily return), so that a rule
+   which is merely long the market most days is not mistaken for an edge.
 2. **One champion per family and instrument** goes forward: the screened
    hypothesis with the highest design t. Nothing else touches the holdout.
 3. **Confirm on the holdout** with a correction for every champion ever
    promoted. Holm at 5% makes a hypothesis ``confirmed``; Benjamini-Yekutieli
    at 10% makes it ``provisional``; both also need a positive holdout at twice
-   the cost, and ``confirmed`` needs a positive result since ``RECENT_START``.
+   the cost. ``confirmed`` also needs a positive result since ``RECENT_START``
+   and a holdout alpha t of at least ``MIN_ALPHA_T``; ``provisional`` needs a
+   positive holdout alpha.
 4. **The ledger remembers.** Every promoted hypothesis stays in the count, so
    searching again, or adding proposals, raises the bar instead of lowering it.
 
@@ -47,7 +52,7 @@ from typing import Any  # noqa: E402
 
 from studies.session_edges import grammar, stats  # noqa: E402
 from studies.session_edges.data import (DailyBar, Session, load_alpaca_sessions,  # noqa: E402
-                                        load_daily_chart, load_index_minute_archives)
+                                        load_daily_chart, load_daily_closes, load_index_minute_archives)
 from studies.session_edges.run import HOLDOUT_START, RECENT_START, STRESS_MULTIPLE  # noqa: E402
 from studies.session_edges.strategies import DayResult  # noqa: E402
 
@@ -64,6 +69,8 @@ MIN_DESIGN_SESSIONS = 750
 MIN_DESIGN_ROUND_TRIPS = 40
 MIN_DESIGN_T = 2.0
 MIN_NEIGHBOUR_SHARE = 0.70
+MIN_ALPHA_T = 2.0            # t of the return left after removing exposure to the instrument itself
+MIN_ALPHA_SESSIONS = 60
 MIN_HOLDOUT_SESSIONS = 500
 FAMILYWISE_ALPHA = 0.05
 FALSE_DISCOVERY_RATE = 0.10
@@ -92,20 +99,60 @@ def cost_for(label: str, overrides: Mapping[str, float] | None = None) -> float:
     return COST_BPS.get(symbol, DEFAULT_COST_BPS)
 
 
+def benchmark_returns(kind: str, data: Sequence[Any]) -> dict[date, float]:
+    """What simply holding the instrument earned on each session, close to close."""
+    out: dict[date, float] = {}
+    previous = 0.0
+    for item in data:
+        close = item.close[-1] if kind == grammar.MINUTE else item.close
+        if previous > 0:
+            out[item.day] = close / previous - 1.0
+        previous = close
+    return out
+
+
+def beyond_holding(days: Sequence[date], net: Sequence[float],
+                   benchmark: Mapping[date, float]) -> dict[str, float | None]:
+    """Regress a net daily series on the instrument's own return: its beta and the alpha left over.
+
+    A rule that is long the instrument on most days earns the instrument's
+    drift without any skill. The alpha is the mean return after that exposure
+    is removed, and its t uses the same Newey-West error as every other test.
+    """
+    pairs = [(value, benchmark[day]) for day, value in zip(days, net) if day in benchmark]
+    if len(pairs) < MIN_ALPHA_SESSIONS:
+        return {"beta": None, "alpha_bps_per_session": None, "alpha_t": None}
+    mean_y = fmean(pair[0] for pair in pairs)
+    mean_x = fmean(pair[1] for pair in pairs)
+    spread = math.fsum((x - mean_x) ** 2 for _, x in pairs)
+    beta = math.fsum((x - mean_x) * (y - mean_y) for y, x in pairs) / spread if spread > 0 else 0.0
+    left = [y - beta * x for y, x in pairs]
+    if max(abs(value) for value in left) < 1e-10:      # the series is the instrument itself, scaled
+        return {"beta": beta, "alpha_bps_per_session": 0.0, "alpha_t": None}
+    return {"beta": beta, "alpha_bps_per_session": fmean(left) * 1e4, "alpha_t": stats.newey_west_t(left)}
+
+
 def window_stats(results: Sequence[DayResult], cost_bps: float, *, start: date | None = None,
-                 end: date | None = None) -> dict[str, Any]:
-    """Net statistics of the sessions in ``[start, end)`` at ``cost_bps`` and at the stressed cost."""
+                 end: date | None = None, benchmark: Mapping[date, float] | None = None) -> dict[str, Any]:
+    """Net statistics of the sessions in ``[start, end)`` at ``cost_bps`` and at the stressed cost.
+
+    With ``benchmark`` (the instrument's own daily returns) the statistics
+    also say how much of the result is left once that exposure is removed.
+    """
     chosen = [result for result in results
               if (start is None or result.day >= start) and (end is None or result.day < end)]
     net = stats.net_series(chosen, cost_bps)
     stressed = stats.net_series(chosen, cost_bps * STRESS_MULTIPLE)
     trips = sum(result.round_trips for result in chosen)
     t_value = stats.newey_west_t(net)
-    return {"sessions": len(chosen), "round_trips": trips,
-            "net_bps_per_session": fmean(net) * 1e4 if net else None,
-            "stressed_bps_per_session": fmean(stressed) * 1e4 if stressed else None,
-            "t": t_value, "sharpe": stats.annualised_sharpe(net),
-            "p_one_sided": None if t_value is None else 1.0 - _NORMAL.cdf(t_value)}
+    out = {"sessions": len(chosen), "round_trips": trips,
+           "net_bps_per_session": fmean(net) * 1e4 if net else None,
+           "stressed_bps_per_session": fmean(stressed) * 1e4 if stressed else None,
+           "t": t_value, "sharpe": stats.annualised_sharpe(net),
+           "p_one_sided": None if t_value is None else 1.0 - _NORMAL.cdf(t_value)}
+    if benchmark is not None:
+        out.update(beyond_holding([result.day for result in chosen], net, benchmark))
+    return out
 
 
 def passes_screen(design: Mapping[str, Any], neighbour_share: float | None) -> tuple[bool, list[str]]:
@@ -121,6 +168,8 @@ def passes_screen(design: Mapping[str, Any], neighbour_share: float | None) -> t
         failed.append("not positive at the stressed cost")
     if neighbour_share is not None and neighbour_share < MIN_NEIGHBOUR_SHARE:
         failed.append("parameter neighbours are not positive")
+    if "alpha_t" in design and (design["alpha_t"] is None or design["alpha_t"] < MIN_ALPHA_T):
+        failed.append("no return beyond holding the instrument")
     return not failed, failed
 
 
@@ -160,15 +209,33 @@ def load_ledger(path: Path | None) -> dict[str, Any]:
 def discover(*, minute: Mapping[str, Sequence[Session]], daily: Mapping[str, Sequence[DailyBar]],
              proposals: Sequence[Mapping[str, Any]] = (), ledger: dict[str, Any] | None = None,
              costs: Mapping[str, float] | None = None, families: Sequence[str] | None = None,
-             progress: Any = None) -> dict[str, Any]:
-    """Run the whole protocol on loaded data and return the discovery record."""
+             context: grammar.Context | None = None, progress: Any = None) -> dict[str, Any]:
+    """Run the whole protocol on loaded data and return the discovery record.
+
+    ``context`` holds the named daily series some families read, such as
+    ``{"VIX": {date: close}}``. A family whose series is missing, or which
+    needs traded volume on data that has none, is skipped and reported.
+    """
     ledger = ledger if ledger is not None else load_ledger(None)
+    context = context or {}
     datasets: dict[tuple[str, str], Sequence[Any]] = {}
     for label, sessions in minute.items():
         datasets[(grammar.MINUTE, label)] = sessions
     for symbol, bars in daily.items():
         datasets[(grammar.DAILY, symbol)] = bars
+    benchmarks = {slot: benchmark_returns(slot[0], data) for slot, data in datasets.items()}
     wanted = set(families) if families else set(grammar.FAMILIES)
+    skipped: dict[str, str] = {}
+
+    def usable(family: grammar.Family, slot: tuple[str, str]) -> bool:
+        missing = [name for name in family.needs if name not in context]
+        if missing:
+            skipped[family.name] = f"context series not loaded: {', '.join(missing)}"
+            return False
+        if family.volume and not _has_volume(datasets[slot]):
+            skipped.setdefault(family.name, "needs traded volume")
+            return False
+        return True
 
     # ---- stage 1: every hypothesis, design period only ------------------
     candidates: dict[str, dict[str, Any]] = {}
@@ -177,20 +244,21 @@ def discover(*, minute: Mapping[str, Sequence[Session]], daily: Mapping[str, Seq
     def evaluate(spec: Mapping[str, Any], source: str) -> dict[str, Any] | None:
         canonical = grammar.normalise(spec)
         family = grammar.FAMILIES[canonical["family"]]
-        data = datasets.get((family.data, canonical["symbol"]))
-        if data is None:
+        slot = (family.data, canonical["symbol"])
+        if slot not in datasets or not usable(family, slot):
             return None
         key = grammar.spec_id(canonical)
         if key not in candidates:
-            results = grammar.simulator(canonical)(data)
+            results = grammar.simulator(canonical, context)(datasets[slot])
             cost = cost_for(canonical["symbol"], costs)
             candidates[key] = {"id": key, "spec": canonical, "source": source, "cost_bps": cost,
-                               "design": window_stats(results, cost, end=HOLDOUT_START)}
+                               "design": window_stats(results, cost, end=HOLDOUT_START,
+                                                      benchmark=benchmarks[slot])}
         return candidates[key]
 
     for (kind, label) in datasets:
         for family in grammar.FAMILIES.values():
-            if family.data != kind or family.name not in wanted:
+            if family.data != kind or family.name not in wanted or not usable(family, (kind, label)):
                 continue
             for spec in grammar.enumerate_family(family, label):
                 evaluate(spec, "grid")
@@ -199,7 +267,8 @@ def discover(*, minute: Mapping[str, Sequence[Session]], daily: Mapping[str, Seq
     for proposal in proposals:
         try:
             if evaluate(proposal, "proposal") is None:
-                rejected_proposals.append({"spec": dict(proposal), "reason": "no data for that family and symbol"})
+                rejected_proposals.append({"spec": dict(proposal),
+                                           "reason": "no usable data for that family and symbol"})
         except grammar.SpecError as error:
             rejected_proposals.append({"spec": dict(proposal), "reason": str(error)})
 
@@ -233,17 +302,32 @@ def discover(*, minute: Mapping[str, Sequence[Session]], daily: Mapping[str, Seq
         if candidate["id"] in promoted:
             continue
         family = grammar.FAMILIES[candidate["spec"]["family"]]
-        data = datasets[(family.data, candidate["spec"]["symbol"])]
-        results = grammar.simulator(candidate["spec"])(data)
+        slot = (family.data, candidate["spec"]["symbol"])
+        results = grammar.simulator(candidate["spec"], context)(datasets[slot])
         promoted[candidate["id"]] = {
             "spec": candidate["spec"], "source": candidate["source"], "cost_bps": candidate["cost_bps"],
             "design": candidate["design"], "neighbour_share": candidate["neighbour_share"],
-            "holdout": window_stats(results, candidate["cost_bps"], start=HOLDOUT_START),
-            "recent": window_stats(results, candidate["cost_bps"], start=RECENT_START),
+            "holdout": window_stats(results, candidate["cost_bps"], start=HOLDOUT_START,
+                                    benchmark=benchmarks[slot]),
+            "recent": window_stats(results, candidate["cost_bps"], start=RECENT_START,
+                                   benchmark=benchmarks[slot]),
             "data_last_session": results[-1].day.isoformat() if results else None,
             "promoted_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         if progress:
             progress(f"holdout {candidate['spec']['symbol']} {candidate['spec']['family']}")
+
+    # A hypothesis promoted before the exposure check existed gets it now. Its
+    # other holdout numbers are left exactly as they were first recorded.
+    for row in promoted.values():
+        family = grammar.FAMILIES.get(row["spec"]["family"])
+        slot = (family.data, row["spec"]["symbol"]) if family else None
+        if "alpha_t" in row["holdout"] or slot not in datasets or not usable(family, slot):
+            continue
+        results = grammar.simulator(row["spec"], context)(datasets[slot])
+        for window, bounds in (("design", {"end": HOLDOUT_START}), ("holdout", {"start": HOLDOUT_START}),
+                               ("recent", {"start": RECENT_START})):
+            fresh = window_stats(results, row["cost_bps"], benchmark=benchmarks[slot], **bounds)
+            row[window].update({name: fresh[name] for name in ("beta", "alpha_bps_per_session", "alpha_t")})
 
     testable = {key: row["holdout"]["p_one_sided"] for key, row in promoted.items()
                 if row["holdout"]["p_one_sided"] is not None
@@ -254,15 +338,17 @@ def discover(*, minute: Mapping[str, Sequence[Session]], daily: Mapping[str, Seq
         holdout, recent = row["holdout"], row["recent"]
         survives_cost = (holdout["stressed_bps_per_session"] or 0) > 0
         recent_positive = (recent["net_bps_per_session"] or 0) > 0
-        if key in family_wise and survives_cost and recent_positive:
+        beyond = (holdout.get("alpha_t") or 0) >= MIN_ALPHA_T
+        some_alpha = (holdout.get("alpha_bps_per_session") or 0) > 0
+        if key in family_wise and survives_cost and recent_positive and beyond:
             row["tier"] = CONFIRMED
-        elif key in discoveries and survives_cost:
+        elif key in discoveries and survives_cost and some_alpha:
             row["tier"] = PROVISIONAL
         else:
             row["tier"] = UNCONFIRMED
         row["checks"] = {"holm": key in family_wise, "false_discovery": key in discoveries,
                          "positive_at_stressed_cost": survives_cost, "positive_recently": recent_positive,
-                         "holdout_long_enough": key in testable}
+                         "holdout_long_enough": key in testable, "beyond_holding_the_instrument": beyond}
 
     funnel: dict[str, dict[str, int]] = {}
     for candidate in candidates.values():
@@ -274,13 +360,21 @@ def discover(*, minute: Mapping[str, Sequence[Session]], daily: Mapping[str, Seq
     return {"schema": SCHEMA, "holdout_start": HOLDOUT_START.isoformat(),
             "recent_start": RECENT_START.isoformat(),
             "thresholds": {"min_design_t": MIN_DESIGN_T, "min_neighbour_share": MIN_NEIGHBOUR_SHARE,
+                           "min_alpha_t": MIN_ALPHA_T,
                            "stress_multiple": STRESS_MULTIPLE, "familywise_alpha": FAMILYWISE_ALPHA,
                            "false_discovery_rate": FALSE_DISCOVERY_RATE},
             "datasets": {f"{kind}:{label}": len(data) for (kind, label), data in datasets.items()},
             "hypotheses_tested": len(candidates), "champions_this_run": len(champions),
             "promoted_ever": len(promoted), "funnel": funnel, "promoted": promoted,
+            "context_series": sorted(context), "skipped_families": skipped,
             "rejected_proposals": rejected_proposals,
             "design_leaderboard": design_leaderboard(candidates)}
+
+
+def _has_volume(data: Sequence[Any]) -> bool:
+    """Whether minute data carries traded volume (an index proxy does not)."""
+    sample = list(data[:20]) + list(data[-20:])
+    return any(math.fsum(session.volume) > 0 for session in sample)
 
 
 def design_leaderboard(candidates: Mapping[str, Mapping[str, Any]], limit: int = 40) -> list[dict[str, Any]]:
@@ -324,7 +418,8 @@ def build_book(record: Mapping[str, Any], registered: Mapping[str, Any] | None =
         legs.append({"id": key, "rule": family.runner_rule, "symbol": base_symbol(row["spec"]["symbol"]),
                      "params": _runner_params(family, row["spec"]["params"]), "tier": row["tier"],
                      "family": family.name, "evidence": row["spec"]["symbol"],
-                     "holdout_t": row["holdout"]["t"], "holdout_sharpe": row["holdout"]["sharpe"]})
+                     "holdout_t": row["holdout"]["t"], "holdout_sharpe": row["holdout"]["sharpe"],
+                     "holdout_alpha_t": row["holdout"].get("alpha_t"), "holdout_beta": row["holdout"].get("beta")})
     for label, verdicts in ((registered or {}).get("minute") or {}).items():
         for name, block in verdicts.items():
             family = grammar.FAMILIES.get(name)
@@ -390,7 +485,8 @@ def render_report(record: Mapping[str, Any], book: Mapping[str, Any]) -> str:
         lines.append(f"| {name} | {row['tested']} | {row['screened']} | {row['champions']} |")
     lines += ["", "## Holdout results of every promoted hypothesis", "",
               "| tier | family | instrument | parameters | design t | holdout t | holdout Sharpe | "
-              "holdout bps/session | since recent start bps/session |", "|---|---|---|---|---|---|---|---|---|"]
+              "holdout bps/session | holdout beta | holdout alpha t | since recent start bps/session |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
     order = {CONFIRMED: 0, PROVISIONAL: 1, UNCONFIRMED: 2}
     for row in sorted(record["promoted"].values(),
                       key=lambda item: (order[item["tier"]], -(item["holdout"]["t"] or -99))):
@@ -399,6 +495,7 @@ def render_report(record: Mapping[str, Any], book: Mapping[str, Any]) -> str:
         lines.append(f"| {row['tier']} | {spec['family']} | {spec['symbol']} | {params} | "
                      f"{_cell(row['design']['t'])} | {_cell(row['holdout']['t'])} | "
                      f"{_cell(row['holdout']['sharpe'])} | {_cell(row['holdout']['net_bps_per_session'])} | "
+                     f"{_cell(row['holdout'].get('beta'))} | {_cell(row['holdout'].get('alpha_t'))} | "
                      f"{_cell(row['recent']['net_bps_per_session'])} |")
     lines += ["", "## Edge book", "",
               "| trade | weight | tier | rule | symbol | parameters | evidence | note |",
@@ -409,9 +506,16 @@ def render_report(record: Mapping[str, Any], book: Mapping[str, Any]) -> str:
                      f"{leg['rule']} | {leg['symbol']} | {params} | {leg['family']} on {leg['evidence']} | "
                      f"{leg['note']} |")
     lines += ["", "`confirmed` passed Holm at 5% across every promoted hypothesis, stayed positive at twice "
-              "the cost and has been positive since the recent start. `provisional` passed "
-              "Benjamini-Yekutieli at 10% and the cost stress. `registered` is a paper candidate of the "
-              "fixed-rule study. Only `confirmed` and `registered` legs trade.", ""]
+              "the cost, has been positive since the recent start, and keeps a holdout alpha t of at least "
+              f"{MIN_ALPHA_T:g} once its exposure to the instrument is removed. `provisional` passed "
+              "Benjamini-Yekutieli at 10% and the cost stress with a positive alpha. `registered` is a "
+              "paper candidate of the fixed-rule study. Only `confirmed` and `registered` legs trade.", "",
+              "Beta is the slope of the rule's daily return on the instrument's own daily return; the "
+              "alpha t tests what is left, so a rule that only holds the market scores near zero.", ""]
+    if record.get("skipped_families"):
+        lines += ["## Families not searched in this run", ""]
+        lines += [f"* `{name}`: {reason}" for name, reason in sorted(record["skipped_families"].items())]
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -443,6 +547,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--pairs", default="nsxusd=QQQ,spxusd=SPY")
     parser.add_argument("--daily-dir", help="adjusted daily chart files (fetch_public)")
     parser.add_argument("--daily", default="SPY,QQQ,IWM,DIA")
+    parser.add_argument("--context-dir", help="daily files of context series; defaults to --daily-dir")
+    parser.add_argument("--context", default="",
+                        help="context series as NAME=FILE_STEM, e.g. VIX=VIX,VIX3M=VIX3M (fetch_public --context)")
     parser.add_argument("--proposals", help="JSON file: a list of hypotheses to test alongside the grid")
     parser.add_argument("--registered", help="results.json of run.py, to add its paper candidates to the book")
     parser.add_argument("--ledger", help="ledger file; defaults to OUT/ledger.json")
@@ -467,6 +574,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     break
             else:
                 raise FileNotFoundError(f"no daily chart file for {symbol} in {args.daily_dir}")
+    context: dict[str, dict[date, float]] = {}
+    for name, stem in _pairs(args.context).items():
+        folder = Path(args.context_dir or args.daily_dir or ".")
+        for suffix in (".json.gz", ".json"):
+            if (folder / f"{stem}{suffix}").is_file():
+                context[name.upper()] = load_daily_closes(folder / f"{stem}{suffix}")
+                break
+        else:
+            raise FileNotFoundError(f"no context file for {name} ({stem}) in {folder}")
     if not minute and not daily:
         parser.error("give --alpaca-dir, --index-dir or --daily-dir")
     proposals = json.loads(Path(args.proposals).read_text(encoding="utf-8")) if args.proposals else []
@@ -480,7 +596,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ledger = load_ledger(ledger_path)
     record = discover(minute=minute, daily=daily, proposals=proposals, ledger=ledger, costs=costs,
                       families=[item.strip() for item in args.families.split(",")] if args.families else None,
-                      progress=lambda text: print(text, flush=True))
+                      context=context, progress=lambda text: print(text, flush=True))
     book = build_book(record, registered)
     ledger_path.write_text(json.dumps(_round(ledger), indent=1, sort_keys=True) + "\n", encoding="utf-8")
     (out / "discovery.json").write_text(json.dumps(_round(record), indent=1, sort_keys=True) + "\n",

@@ -3,11 +3,14 @@
 Usage, from the repository root::
 
     python -I studies/session_edges/fetch_public.py --out DIR \\
-        --pairs nsxusd,spxusd --from-year 2010 --daily SPY,QQQ,IWM,DIA,VTI
+        --pairs nsxusd,spxusd --from-year 2010 --daily SPY,QQQ,IWM,DIA,VTI --context VIX,VIX3M
 
 * ``DIR/index``: index CFD one-minute archives, one zip per pair and year
   (one per month for the current year). Price only, no traded volume.
 * ``DIR/daily``: adjusted daily bars, one ``<SYMBOL>.json.gz`` per symbol.
+* ``DIR/daily``: the context series the options-desk families read, one
+  ``<NAME>.json.gz`` per volatility index (``--context VIX,VIX3M``), so that
+  ``discover.py --daily-dir DIR/daily --context VIX,VIX3M`` finds them.
 
 This is free, unauthenticated, diagnostic data. It is good enough to test a
 price rule over many years, and it is not the deployment's feed: confirm any
@@ -77,11 +80,12 @@ def fetch_archive(out: Path, pair: str, year: int, month: int | None = None) -> 
     return f"{len(body)} bytes"
 
 
-def fetch_daily(out: Path, symbol: str) -> str:
-    """Download one symbol's adjusted daily history."""
+def fetch_daily(out: Path, symbol: str, *, index: bool = False) -> str:
+    """Download one symbol's adjusted daily history; ``index`` fetches a volatility index by name."""
     if not SYMBOL_PATTERN.fullmatch(symbol):
         raise ValueError(f"unexpected symbol {symbol!r}")
-    url = DAILY_URL.format(symbol=urllib.parse.quote(symbol), end=int(time.time()))
+    ticker = f"^{symbol}" if index else symbol
+    url = DAILY_URL.format(symbol=urllib.parse.quote(ticker), end=int(time.time()))
     result = (json.loads(_get(url, timeout=60.0)).get("chart") or {}).get("result") or []
     if not result:
         return "no data"
@@ -101,6 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--pairs", default="nsxusd,spxusd", help="index archive prefixes; empty to skip")
     parser.add_argument("--from-year", type=int, default=2010)
     parser.add_argument("--daily", default="SPY,QQQ,IWM,DIA,VTI", help="daily symbols; empty to skip")
+    parser.add_argument("--context", default="VIX,VIX3M", help="volatility indices; empty to skip")
     args = parser.parse_args(argv)
     root = Path(args.out)
     today = date.today()
@@ -115,6 +120,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     for symbol in [item.strip().upper() for item in args.daily.split(",") if item.strip()]:
         daily_dir.mkdir(parents=True, exist_ok=True)
         print(symbol, fetch_daily(daily_dir, symbol), flush=True)
+        time.sleep(PAUSE_SECONDS)
+    for name in [item.strip().upper() for item in args.context.split(",") if item.strip()]:
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        print(name, "(index)", fetch_daily(daily_dir, name, index=True), flush=True)
         time.sleep(PAUSE_SECONDS)
     return 0
 

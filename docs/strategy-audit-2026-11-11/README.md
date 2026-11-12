@@ -317,3 +317,39 @@ My assessment of that timetable, stated plainly:
   size, and the feed-appropriate symbols (SPY and QQQ on IEX).
 * If the SIP rerun does not reproduce the edge book, or the paper session leaves an unexplained
   problem event, the correct decision is to wait, whatever the calendar says.
+
+## 13. Addendum, 12 November: a wider search, an exposure check, and the paper account
+
+**Edges and variants.** The engine now searches 16 edges (signals) with 204 variants (parameter
+settings) per instrument, grouped by the desk each signal comes from: seven day-trading edges,
+six swing edges and three options-desk edges that read implied volatility and the expiration
+calendar and trade the underlying. `studies/session_edges/EDGES.md` gives the premise and every
+variant of each; it is generated from the code.
+
+**A check that separates timing from exposure.** A rule that is long an index on most days earns
+the index's drift and passes a plain "is the mean positive" test without any skill. Every
+hypothesis is now also regressed on its instrument's own daily return, and must keep an alpha t
+of at least 2 on the design period to be promoted and on the holdout to be confirmed. This
+check was added because the options-desk regime rules are exactly the kind that would pass on
+exposure alone.
+
+**Result on public data** (`studies/session_edges/results/discovery-public-2026-11-12/`):
+3,861 hypotheses tested, 124 champions ever taken to the holdout, 9 confirmed, 11 provisional.
+
+* The nine confirmed edges are the same nine as before and all pass the exposure check: beta
+  0.07 to 0.39, alpha t 2.5 to 3.0. About a third of their return is market drift and the rest
+  is timing.
+* None of the new edges confirmed. Holding only while the volatility curve slopes up reached the
+  holdout on seven instruments and is mostly market exposure (beta 0.55 to 0.77, alpha t below
+  1). Buying a VIX spike and holding through expiration week each lost money in the holdout.
+  Breaks of the prior day's range did not pass the design screen in either direction.
+* The stricter screen halved the number of hypotheses that pass the design period, which is the
+  intended effect: fewer weak champions reach the holdout, so the correction costs less.
+* The edge book is unchanged: close-weakness reversion on SPY, XLK and IVW at 16.7% each, QQQ
+  momentum at 25% as a registered rule.
+
+**What was and was not run on Alpaca.** The repository's own provider reads the paper account,
+the clock, positions and orders, and the runner's preflight passes in paper-order mode. The
+market-data host could not be reached from the audit environment, so the SIP confirmation in
+the two-day runbook is still outstanding and remains the first step on the VM. The VWAP edge
+needs traded volume and is searched only once SIP bars are available.
