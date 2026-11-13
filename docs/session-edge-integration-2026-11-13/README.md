@@ -53,10 +53,11 @@ labelled grid-generated. This does not establish the absence of an effect and
 does not replay new timing, fills, prices or costs.
 
 The complete original public/SIP market datasets are not checked into the
-repository. A fresh raw-data research run needs those inputs. The current
-cloud workspace has neither the VM SSH connection nor its data/credentials;
-the Mac's SSH file is outside its filesystem. VM rollout and research on the
-VM are therefore unverified until that execution connection is available.
+repository. A fresh raw-data research run needs those inputs. The supplied SSH
+key was loaded outside the repository with restricted permissions, but the
+previously recorded VM endpoint refused port-22 connections both inside and
+outside the sandbox, before authentication. VM rollout and research on the VM
+remain unverified until connectivity is restored or the endpoint is corrected.
 Public data retrieval was also denied by this workspace's network policy.
 
 The last recorded VM/account state remains the dated
@@ -67,10 +68,15 @@ it must not resume or rebind the trial or enable session-runner entries.
 
 ## Validation and rerun
 
-The validation receipt records completed checks and the exact source hashes.
-The initial runtime shard passed 1,124 tests. The corrected session tests and
-main-candidate checks passed in the focused run; the remaining full-suite
-shards and container validation are recorded in the receipt when complete.
+The [validation receipt](validation.json) records completed checks and exact
+source hashes. All four local shards passed: 1,124 runtime, 62 edge, seven
+factory and 1,745 research tests (one expected research skip). The final
+Python 3.13 validation image passed 139 focused tests. All five GitHub jobs
+passed for integration commit `53de464`, including the production Dockerfile.
+A subsequent review tightened overlapping qualification windows and froze the
+simulation version explicitly in experiment manifests. Imports cannot relabel
+old evidence with a current kernel. All 29 bridge, qualification and discovery
+regressions passed; the receipt distinguishes these verification scopes.
 
 ```bash
 python -m compileall -q agent research deploy studies main.py report.py research.py

@@ -354,6 +354,7 @@ def experiment_manifest(datasets: Mapping[tuple[str, str], Sequence[Any]], *,
               "simulation_version": getattr(grammar, "SIMULATION_VERSION", "unversioned")}
     effective_costs = {label: cost_for(label, costs) for _, label in datasets}
     return {"schema": "session-edges-experiment.v2", "input_digests": inputs,
+            "simulation_version": grammar.SIMULATION_VERSION,
             "source_provenance": dict(source_provenance or {"mode": "unspecified_diagnostic"}),
             "dataset_digest": _digest(inputs), "context_digest": _digest(context),
             "code_digest": _digest(code), "code_files": code,

@@ -85,6 +85,9 @@ def candidate_request(row: Mapping[str, Any], experiment: Mapping[str, Any]) -> 
     experiment_id = _digest(row.get("experiment_id"), "experiment_id")
     if experiment.get("id") != experiment_id or _hash(manifest) != experiment_id:
         raise CandidateReviewError("candidate experiment identity mismatch")
+    simulation_version = manifest.get("simulation_version")
+    if not isinstance(simulation_version, str) or simulation_version != grammar.SIMULATION_VERSION:
+        raise CandidateReviewError("frozen simulation version is missing or incompatible; replay under an explicit new experiment")
     if row.get("evidence_digest") != _hash({key: row.get(key) for key in _EVIDENCE_FIELDS}):
         raise CandidateReviewError("candidate source evidence digest mismatch")
     for name in _REQUIRED_DIGESTS:
@@ -101,7 +104,7 @@ def candidate_request(row: Mapping[str, Any], experiment: Mapping[str, Any]) -> 
     if not isinstance(code_files, Mapping) or _hash(code_files) != manifest["code_digest"]:
         raise CandidateReviewError("experiment code digest mismatch")
     kernel = {"family": family.name, "data": family.data,
-              "simulation_version": getattr(grammar, "SIMULATION_VERSION", "unversioned"),
+              "simulation_version": simulation_version,
               "code_digest": manifest["code_digest"],
               "source_code_files": dict(code_files),
               "execution_form": ("completed-daily-signal-next-session-open" if family.data == grammar.DAILY
@@ -132,6 +135,7 @@ def _validate_request(request: Mapping[str, Any]) -> None:
     kernel = request.get("kernel") or {}
     if (spec != request["spec"] or kernel.get("family") != spec["family"] or
             kernel.get("data") != grammar.FAMILIES[spec["family"]].data or
+            kernel.get("simulation_version") != grammar.SIMULATION_VERSION or
             kernel.get("runner_translation_permitted") is not False or
             request.get("execution_identity") != _hash({"spec": spec, "kernel": kernel})):
         raise CandidateReviewError("candidate execution identity mismatch")
@@ -209,9 +213,11 @@ def review_execution_evidence(request: Mapping[str, Any], evidence: Mapping[str,
             raise CandidateReviewError("qualification observations are outside the sealed sessions")
         seal = _hash(sessions)
         if used_seals is not None:
-            if seal in used_seals:
-                raise CandidateReviewError("qualification seal already consumed by another reviewed candidate")
+            session_keys = {f"session:{session}" for session in sessions}
+            if seal in used_seals or session_keys.intersection(used_seals):
+                raise CandidateReviewError("qualification seal already consumed or overlaps another reviewed candidate")
             used_seals.add(seal)
+            used_seals.update(session_keys)
     feed = str(evidence.get("equity_feed") or "sip")
     projection = {name: gates.authorization_projection(rows, vehicle="equity", strict=True,
                                                         equity_feed=feed, equity_provider="alpaca")

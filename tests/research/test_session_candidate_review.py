@@ -3,6 +3,9 @@
 from copy import deepcopy
 from datetime import date, timedelta
 import unittest
+from unittest.mock import patch
+
+from studies.session_edges import grammar
 
 from research.session_candidate_review import (
     CandidateReviewError, EVIDENCE_SCHEMA, _hash, candidate_request,
@@ -14,6 +17,7 @@ def experiment():
     inputs = {"minute:SPY": "1" * 64, "daily:SPY": "2" * 64}
     code = {"strategies.py": "3" * 64, "grammar.py": "4" * 64}
     manifest = {"schema": "session-edges-experiment.v2", "input_digests": inputs,
+                "simulation_version": grammar.SIMULATION_VERSION,
                 "source_provenance": {"mode": "historical_backfill"},
                 "dataset_digest": _hash(inputs), "context_digest": "5" * 64,
                 "code_digest": _hash(code), "code_files": code,
@@ -71,6 +75,16 @@ def execution_evidence(request, *, sessions=100, qualification=False):
 
 
 class SessionCandidateReviewTests(unittest.TestCase):
+    def test_current_kernel_version_cannot_relabel_frozen_historical_evidence(self):
+        row, frozen = promoted(), experiment()
+        request = candidate_request(row, frozen)
+        self.assertEqual(request["kernel"]["simulation_version"], frozen["manifest"]["simulation_version"])
+        with patch.object(grammar, "SIMULATION_VERSION", "future-kernel"):
+            with self.assertRaisesRegex(CandidateReviewError, "simulation version"):
+                candidate_request(row, frozen)
+            with self.assertRaisesRegex(CandidateReviewError, "execution identity"):
+                review_execution_evidence(request)
+
     def test_daily_and_minute_reversion_have_different_exact_execution_identity(self):
         minute = candidate_request(promoted(), experiment())
         daily = candidate_request(promoted("close_weakness_reversion_daily"), experiment())
@@ -133,6 +147,20 @@ class SessionCandidateReviewTests(unittest.TestCase):
         used = {_hash(payload["qualification_sessions"])}
         with self.assertRaisesRegex(CandidateReviewError, "already consumed"):
             review_execution_evidence(request, payload, used_seals=used)
+
+    def test_partially_overlapping_seals_cannot_be_reused_with_a_different_hash(self):
+        request = candidate_request(promoted(), experiment())
+        first = execution_evidence(request, sessions=1, qualification=True)
+        used = set()
+        review_execution_evidence(request, first, used_seals=used)
+        second = deepcopy(first)
+        second["qualification_sessions"] = first["qualification_sessions"][1:]
+        for key in ("qualification_rows", "qualification_baseline_rows"):
+            second[key] = [row for row in first[key]
+                           if row["session_date"] in second["qualification_sessions"]]
+        self.assertNotEqual(_hash(first["qualification_sessions"]), _hash(second["qualification_sessions"]))
+        with self.assertRaisesRegex(CandidateReviewError, "overlaps"):
+            review_execution_evidence(request, second, used_seals=used)
 
     def test_mismatched_manifest_and_counterfeit_authority_are_refused(self):
         row = promoted()

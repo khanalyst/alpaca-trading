@@ -4,18 +4,20 @@
   "broker_operations": 0,
   "checks": {
     "edge": {
-      "log_complete": false,
-      "log_sha256": "d37273857bfb0a941e72f164239ebce466d355fde8375309a5c1323b517229eb",
-      "seconds": null,
-      "status": "running",
-      "tests": null
+      "log_complete": true,
+      "log_sha256": "dad6859600d3b7c1bcca71118456c80d6006859fbda058c9a586c8e1e156f881",
+      "seconds": 2559.971,
+      "status": "passed",
+      "summary": "OK",
+      "tests": 62
     },
     "factory": {
-      "log_complete": false,
-      "log_sha256": "c225dc1142acbde6fca0f81ace06fccc3286fcc9f36d00da5c6c0b1ae2700518",
-      "seconds": null,
-      "status": "running",
-      "tests": null
+      "log_complete": true,
+      "log_sha256": "742f58d1541d979ac4a4f18b3a5cf651d197f844a5eb70a451d53c80eb2d2f35",
+      "seconds": 2440.274,
+      "status": "passed",
+      "summary": "OK",
+      "tests": 7
     },
     "final_causality_host": {
       "log_complete": true,
@@ -38,18 +40,36 @@
       "status": "passed",
       "tests": 138
     },
+    "followup_identity_container": {
+      "log_complete": true,
+      "log_sha256": "b77382ca7bbdbd9e30f6e620c0c13ea2a80dda7bd59c05cabacfcc79bafe4fe2",
+      "seconds": 5.059,
+      "status": "passed",
+      "summary": "OK",
+      "tests": 29
+    },
+    "followup_identity_host": {
+      "log_complete": true,
+      "log_sha256": "fac71dd05344f5ff1522795d94672cdb4f097e862b7679bd91ee4b5d9cd2d5d0",
+      "seconds": 3.948,
+      "status": "passed",
+      "summary": "OK",
+      "tests": 29
+    },
     "research": {
-      "log_complete": false,
-      "log_sha256": "659210854677a96d52126b4de350c141c7b7f395ccb4999e06d8f750ff427f3e",
-      "seconds": null,
-      "status": "running",
-      "tests": null
+      "log_complete": true,
+      "log_sha256": "a90d5ede43ce91a5aca5dce7f26e2d858472ef5237e1ddede787fc0f8f9617a7",
+      "seconds": 1978.438,
+      "status": "passed",
+      "summary": "OK (skipped=1)",
+      "tests": 1745
     },
     "runtime": {
       "log_complete": true,
       "log_sha256": "fa5070189ab66df8cd47d088df12785a3e4d0f302621cdf06967d054056b1c1a",
       "seconds": 550.837,
       "status": "passed",
+      "summary": "OK",
       "tests": 1124
     }
   },
@@ -61,23 +81,36 @@
   },
   "container_build": {
     "build_ca": "session CA supplied through temporary BuildKit secret; repository Dockerfile unchanged",
-    "image_id": "sha256:f51052a6d20c3a33314a01d7f388f6cfdc6ef4049f86613c0fabde85830820c3",
+    "image_id": "sha256:a02e8a4e5a9fbc3acc46007f1b961af79340586b65551eae8e792f7a5c16b28e",
     "scope": "local validation image; not deployed",
     "status": "passed"
   },
-  "full_suite_final_source_test_count": 2940,
+  "followup_scope": "Frozen simulation-version import and partially overlapping qualification windows; 29 targeted tests passed on host and final Python 3.13 image. Existing main implementation unchanged.",
+  "full_suite_final_source_test_count": 2942,
+  "github_actions": {
+    "code_commit": "53de4646cfe62bbffec4b0aabd695fd75d15d13e",
+    "jobs": {
+      "container": "success",
+      "edge": "success",
+      "factory": "success",
+      "research": "success",
+      "runtime": "success"
+    },
+    "run_id": 43375154971,
+    "url": "https://github.com/khanalyst/alpaca-trading/actions/runs/43375154971"
+  },
   "imported_branch_commit": "ee3f592d2756d879f3b3ffb0f03af471852b5a0e",
   "provider_calls": 0,
-  "raw_market_data_research_rerun": "blocked_missing_vm_corpus_and_network_access",
+  "raw_market_data_research_rerun": "blocked_vm_connection_and_missing_local_corpus",
   "saved_artifact_audit": "saved-artifact-audit.json",
   "schema": "session-integration-validation.v1",
   "source_sha256": {
     "research/session_artifact_audit.py": "f0cfc01b768117d7dcea3450a841407f2e679e5a36f5a4feff1a8d7288d04b7c",
-    "research/session_candidate_review.py": "2e5d6581d0529da9cf9b058e84ec153d06da0e61bf8f1c383a300a4c38efcc34",
+    "research/session_candidate_review.py": "788a6248d1097a32c5ce14b3ef138ecb6a99f025d5f556c8d12e6b56fdfa6ef4",
     "research/session_model_experiment.py": "a15291e168fe617dc39c6cb221fccf52a1465a3634a6e61fbbddf580ed3478b3",
     "studies/session_edges/__init__.py": "3f3934ea7a936ee7c609729833c3e1f72629ad92ee0098962491c9c1dad1ade0",
     "studies/session_edges/data.py": "e3b23fd9cd82ee92e1b5411b6a9319c1e6674341ac75b9b790ff89891be6ad05",
-    "studies/session_edges/discover.py": "4fddd6dd58ae2a13501dcd4fabf4b21722b0c2022333c3135192390a23437bd4",
+    "studies/session_edges/discover.py": "059d22564e2da0bd291340cb882214179e1c6bba8c1766595fa401af166b595d",
     "studies/session_edges/fetch_public.py": "4b18601c29aa0a860f30a52c788ea01517b41bd4138422e819d1c58b2ab86236",
     "studies/session_edges/grammar.py": "c8ee231f1a555cf194f0413e76880160bffa30947fe3c71cd1ecf233f81c3d84",
     "studies/session_edges/live.py": "d3aa29daddeb9c748085937704777717e0e340ce68d0ef612dcaf3e0e8d50dd9",
@@ -86,12 +119,14 @@
     "studies/session_edges/stats.py": "984e88706d08fd7c1275b5cfba021d4eb64a573c9efab9e10bf5005751fcdb62",
     "studies/session_edges/strategies.py": "5422b711d07dbce274d1577f1b1501a4fa30f0f2da05e3739446372123d29e64",
     "tests/research/test_session_artifact_audit.py": "b41a0f34e6eeedc3d8d5c27673877ca06eac8c31a5d39527d104a4fa6618337c",
-    "tests/research/test_session_candidate_review.py": "1af25087c875d0bca5d87ca393c0c5555999e81d04cb11671a87d68b45805ff8",
+    "tests/research/test_session_candidate_review.py": "b6aea6238eac0ab17ba3d6f09229513c3f810b36bbd131273b75ab032859327d",
     "tests/research/test_session_edges_causality.py": "228b1401f7709b5299d6a269027639cb4eb2ffaf930ff7c1d39d0b59fb683ebb",
     "tests/research/test_session_edges_model_experiment.py": "7ec0fb68e0f0411c5911b2f23b6ea9b6db03bbef20f7ad64b1ece9a20a42c5ff",
     "tests/research/test_session_edges_qualification.py": "434d59b35d8bb46540aea4b5d29d523d1106e2f11257318c2b96f7e5197b982d",
     "tests/research/test_session_edges_recovery.py": "cb002f9e0e0561d1bfa7704747cc2b155a1191ac97800079ccd07adb082762eb",
     "tests/research/test_session_edges_study.py": "48d3f77d18811afc7d79a4562f06a34ec2ed33656fffe038e95e48183edc88e2"
   },
-  "vm_deployment": "blocked_missing_cloud_ssh_connection"
+  "ssh_key_loaded_outside_repository": true,
+  "vm_deployment": "blocked_ssh_connection_refused_before_authentication",
+  "vm_state_mutations": 0
 }
