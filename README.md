@@ -754,7 +754,7 @@ release blocker. Root discovery includes the deployment and research suites.
 
 ## What is deliberately not included
 
-There is no overnight strategy, withdrawal flow, default unattended live
+The trader has no overnight strategy, withdrawal flow, default unattended live
 deployment, multi-leg/naked option path, crypto path, partial-exit workflow, or
 assertion that any generated signal has positive expectancy. Multi-symbol
 expansion is not an automatic remedy: it requires a separate approved
@@ -763,3 +763,12 @@ epoch. Partial exits remain unimplemented because broker lifecycle and position
 reconciliation would otherwise be unsafe. Any live launch requires a separate
 reviewed config/runtime scope, provider guard, named edge, risk policy,
 session-close behaviour, tests, and operational controls.
+
+The [session-edge study](studies/session_edges/README.md) supplies additional
+bounded session and swing mechanisms for research on long history. Its books
+are shadow-only; historical support never replaces main's exact-rule
+qualification, provenance and newer parity-shadow proof. The separate runner
+cannot open paper or live positions. Explicit owned-position recovery can
+only reconcile and reduce positions retained from an earlier release. See the
+[integration record](docs/session-edge-integration-2026-11-13/README.md) for the
+corrected timing, alpha tests, experiment identities and validation boundary.

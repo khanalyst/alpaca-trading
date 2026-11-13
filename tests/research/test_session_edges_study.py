@@ -1,0 +1,1290 @@
+"""Tests for the session-edge study and its forward shadow in ``studies/session_edges``.
+
+Fast, offline and deterministic: every bar is synthetic and the forward
+runner talks to a fake provider. Run from the repository root with::
+
+    python -I -m unittest discover -s tests/research -t . -p test_session_edges_study.py -v
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import gzip
+import io
+import json
+import tempfile
+import unittest
+import zipfile
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
+
+from studies.liquid_reversion.bars import NEW_YORK
+from studies.session_edges import discover, grammar, live, propose, run, stats
+from studies.session_edges import data as session_data
+from studies.session_edges.data import MINUTES, DailyBar, Session, build_session
+from studies.session_edges.strategies import (CLOSE_REVERSION, ENTER, EXIT, FLAT, HOLD, LONG, NOISE_BAND,
+                                              SHORT, STAND_ASIDE, DayResult, NoiseBandRules,
+                                              close_reversion_action, internal_bar_strength,
+                                              noise_band_bounds, noise_band_sigma, noise_band_target,
+                                              simulate_close_reversion, simulate_close_reversion_daily,
+                                              simulate_down_streak_daily, simulate_first_last,
+                                              is_expiration_week, simulate_expiration_week_daily,
+                                              simulate_gap, simulate_last_hour, simulate_noise_band,
+                                              simulate_opening_range, simulate_overnight,
+                                              simulate_overnight_hold, simulate_prior_day_break,
+                                              simulate_rsi_reversion_daily, simulate_turn_of_month_daily,
+                                              simulate_vix_spike_daily, simulate_vix_term_structure_daily,
+                                              simulate_vwap_trend)
+
+BASE = date(2026, 3, 2)  # a Monday
+
+
+def trading_days(count: int, start: date = BASE) -> list[date]:
+    out: list[date] = []
+    day = start
+    while len(out) < count:
+        if day.weekday() < 5:
+            out.append(day)
+        day += timedelta(days=1)
+    return out
+
+
+def flat_session(day: date, level: float = 100.0, moves: dict[int, float] | None = None) -> Session:
+    """A session that sits at ``level`` and steps to a new level from each minute in ``moves``."""
+    moves = moves or {}
+    rows = []
+    price = level
+    for minute in range(MINUTES):
+        opened = price
+        if minute in moves:
+            price = moves[minute]
+        rows.append((minute, opened, max(opened, price), min(opened, price), price, 1000.0))
+    session = build_session(day, rows)
+    assert session is not None
+    return session
+
+
+def wiggle_session(day: date, level: float = 100.0, swing: float = 0.002) -> Session:
+    """A session whose close at every minute is ``level * (1 + swing)``: a constant noise band."""
+    return flat_session(day, level, {1: level * (1 + swing)})
+
+
+class DataTests(unittest.TestCase):
+    def test_missing_minutes_repeat_the_last_close(self):
+        rows = [(m, 10.0, 10.5, 9.5, 10.2, 5.0) for m in range(MINUTES) if m not in (3, 4)]
+        session = build_session(BASE, rows)
+        self.assertEqual(session.observed, MINUTES - 2)
+        self.assertEqual((session.open[3], session.high[3], session.low[3], session.close[4]),
+                         (10.2, 10.2, 10.2, 10.2))
+        self.assertEqual(session.volume[3], 0.0)
+
+    def test_thin_sessions_are_dropped(self):
+        rows = [(m, 10.0, 10.0, 10.0, 10.0, 1.0) for m in range(210)]  # a half day
+        self.assertIsNone(build_session(BASE, rows))
+        self.assertIsNotNone(build_session(BASE, rows, min_observed=200))
+
+    def test_previous_close_needs_adjacent_sessions(self):
+        days = trading_days(2)
+        near = [flat_session(days[0], 100.0), flat_session(days[1], 101.0)]
+        self.assertEqual(session_data.previous_close(near, 1), 100.0)
+        far = [flat_session(days[0], 100.0), flat_session(days[0] + timedelta(days=9), 101.0)]
+        self.assertIsNone(session_data.previous_close(far, 1))
+        self.assertIsNone(session_data.previous_close(near, 0))
+
+    def test_index_archive_stamps_are_new_york_wall_clock(self):
+        lines = []
+        for minute in range(MINUTES):
+            total = 570 + minute
+            lines.append(f"20260715 {total // 60:02d}{total % 60:02d}00;100.0;100.5;99.5;100.2;0")
+        lines.append("20260715 080000;90;90;90;90;0")      # before the open: ignored
+        lines.append("20260715 160000;95;95;95;95;0")      # at the close: ignored
+        with tempfile.TemporaryDirectory() as folder:
+            with zipfile.ZipFile(Path(folder) / "nsxusd_2026.zip", "w") as archive:
+                archive.writestr("DAT_ASCII_NSXUSD_M1_2026.csv", "\n".join(lines))
+            sessions = session_data.load_index_minute_archives(folder, "nsxusd")
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].day, date(2026, 7, 15))
+        self.assertEqual(sessions[0].observed, MINUTES)
+        self.assertEqual(sessions[0].open[0], 100.0)
+
+    def test_sip_month_files_load_as_sessions_and_run_end_to_end(self):
+        import csv
+        from studies.liquid_reversion.bars import ALPACA_CSV_COLUMNS, month_file_name
+        days = [date(2026, 9, 29), date(2026, 9, 30), date(2026, 10, 1)]
+        with tempfile.TemporaryDirectory() as folder:
+            for month in ("2026-09", "2026-10"):
+                path = Path(folder) / month_file_name("QQQ", "1Min", month)
+                with gzip.open(path, "wt", encoding="utf-8", newline="") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(ALPACA_CSV_COLUMNS)
+                    for day in days:
+                        if f"{day:%Y-%m}" != month:
+                            continue
+                        opened = datetime.combine(day, time(9, 30), NEW_YORK)
+                        for minute in range(-5, MINUTES + 5):       # pre- and post-market rows are ignored
+                            stamp = (opened + timedelta(minutes=minute)).astimezone(timezone.utc)
+                            price = 400.0 + minute * 0.01
+                            writer.writerow(["QQQ", stamp.strftime("%Y-%m-%dT%H:%M:%SZ"), price, price + 0.05,
+                                             price - 0.05, price + 0.01, 1000, 10, price])
+            sessions = session_data.load_alpaca_sessions(folder, "QQQ")
+            self.assertEqual([session.day for session in sessions], days)
+            self.assertEqual(sessions[0].observed, MINUTES)
+            self.assertAlmostEqual(sessions[0].open[0], 400.0)
+            self.assertAlmostEqual(sessions[0].close[-1], 400.0 + 389 * 0.01 + 0.01)
+            out = Path(folder) / "out"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = run.main(["--alpaca-dir", folder, "--symbols", "QQQ", "--out", str(out), "--draws", "10"])
+            self.assertEqual(code, 0)
+            results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+            self.assertEqual(results["schema"], run.SCHEMA)
+            self.assertEqual({block["verdict"] for block in results["minute"]["QQQ"].values()}, {run.REJECT})
+            self.assertIn("Session-edge study", (out / "report.md").read_text(encoding="utf-8"))
+            with self.assertRaises(FileNotFoundError):
+                session_data.load_alpaca_sessions(folder, "ZZZZ")
+
+    def test_daily_chart_is_adjusted(self):
+        stamps = [int(datetime(2026, 3, d, 14, 30, tzinfo=timezone.utc).timestamp()) for d in (2, 3)]
+        payload = {"t": stamps, "o": [100.0, 102.0], "h": [101.0, 103.0], "l": [99.0, 101.0],
+                   "c": [100.0, 102.0], "adj": [50.0, 102.0]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "SPY.json.gz"
+            with gzip.open(path, "wt", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            bars = session_data.load_daily_chart(path)
+        self.assertEqual([bar.day for bar in bars], [date(2026, 3, 2), date(2026, 3, 3)])
+        self.assertEqual((bars[0].open, bars[0].close, bars[1].close), (50.0, 50.0, 102.0))
+
+
+class NoiseBandTests(unittest.TestCase):
+    def test_sigma_is_the_mean_absolute_move_from_the_open(self):
+        history = [wiggle_session(day, swing=s) for day, s in zip(trading_days(2), (0.002, 0.004))]
+        self.assertAlmostEqual(noise_band_sigma(history, 30, 2), 0.003)
+        self.assertIsNone(noise_band_sigma(history, 30, 3))
+
+    def test_a_gap_widens_the_band_on_its_own_side(self):
+        upper, lower = noise_band_bounds(100.0, 101.0, 0.01)
+        self.assertAlmostEqual(upper, 101.0 * 1.01)
+        self.assertAlmostEqual(lower, 100.0 * 0.99)
+        self.assertEqual(noise_band_bounds(100.0, None, 0.01), (101.0, 99.0))
+
+    def test_target_follows_a_break_and_leaves_on_a_return(self):
+        self.assertEqual(noise_band_target(FLAT, 102.0, 101.0, 99.0), LONG)
+        self.assertEqual(noise_band_target(FLAT, 98.0, 101.0, 99.0), SHORT)
+        self.assertEqual(noise_band_target(FLAT, 100.0, 101.0, 99.0), FLAT)
+        self.assertEqual(noise_band_target(LONG, 100.5, 101.0, 99.0), FLAT)
+        self.assertEqual(noise_band_target(SHORT, 99.5, 101.0, 99.0), FLAT)
+        self.assertEqual(noise_band_target(LONG, 98.0, 101.0, 99.0), SHORT)
+        self.assertEqual(noise_band_target(FLAT, 102.0, 101.0, 99.0, sides=("short",)), FLAT)
+
+    def test_simulator_enters_at_the_next_open_and_exits_before_the_close(self):
+        days = trading_days(NOISE_BAND.lookback_sessions + 1)
+        history = [wiggle_session(day) for day in days[:-1]]           # band is 0.2% wide
+        today = flat_session(days[-1], 100.2, {45: 101.0, 200: 102.0})  # breaks out before 10:30
+        results = simulate_noise_band([*history, today])
+        self.assertTrue(all(result.round_trips == 0 for result in results[:-1]))
+        last = results[-1]
+        self.assertEqual(last.round_trips, 1)
+        fill = last.fills[0]
+        self.assertEqual((fill.side, fill.entry_minute, fill.entry, fill.exit_minute, fill.exit),
+                         (LONG, 60, 101.0, 388, 102.0))
+        self.assertAlmostEqual(last.gross, 102.0 / 101.0 - 1.0)
+
+    def test_a_return_inside_the_band_closes_the_position(self):
+        days = trading_days(NOISE_BAND.lookback_sessions + 1)
+        history = [wiggle_session(day) for day in days[:-1]]
+        today = flat_session(days[-1], 100.2, {45: 101.0, 100: 100.2})
+        fills = simulate_noise_band([*history, today])[-1].fills
+        self.assertEqual([(fill.entry_minute, fill.exit_minute) for fill in fills], [(60, 120)])
+        self.assertLess(fills[0].gross, 0)
+
+    def test_no_decision_without_the_full_lookback(self):
+        days = trading_days(5)
+        sessions = [flat_session(day, 100.0, {45: 105.0}) for day in days]
+        self.assertTrue(all(result.round_trips == 0 for result in simulate_noise_band(sessions)))
+
+    def test_early_flat_minute_exits_at_that_open(self):
+        days = trading_days(NOISE_BAND.lookback_sessions + 1)
+        history = [wiggle_session(day) for day in days[:-1]]
+        today = flat_session(days[-1], 100.2, {45: 101.0, 389: 110.0})
+        rules = NoiseBandRules(flat_minute=388)
+        fill = simulate_noise_band([*history, today], rules)[-1].fills[0]
+        self.assertEqual((fill.exit_minute, fill.exit), (388, 101.0))
+
+
+class CloseReversionTests(unittest.TestCase):
+    def test_internal_bar_strength(self):
+        self.assertEqual(internal_bar_strength(110.0, 100.0, 100.0), 0.0)
+        self.assertEqual(internal_bar_strength(110.0, 100.0, 110.0), 1.0)
+        self.assertAlmostEqual(internal_bar_strength(110.0, 100.0, 102.0), 0.2)
+        self.assertEqual(internal_bar_strength(100.0, 100.0, 100.0), 0.5)
+
+    def test_action_table(self):
+        self.assertEqual(close_reversion_action(False, 0, 0.19), ENTER)
+        self.assertEqual(close_reversion_action(False, 0, 0.20), STAND_ASIDE)
+        self.assertEqual(close_reversion_action(True, 1, 0.50), HOLD)
+        self.assertEqual(close_reversion_action(True, 1, 0.51), EXIT)
+        self.assertEqual(close_reversion_action(True, CLOSE_REVERSION.max_sessions, 0.10), EXIT)
+
+    def test_minute_simulator_buys_a_weak_close_and_sells_the_recovery(self):
+        days = trading_days(3)
+        weak = flat_session(days[0], 100.0, {300: 98.0})            # closes at the low of the day
+        strong = flat_session(days[1], 98.0, {300: 100.0})          # recovers to the high of the day
+        quiet = flat_session(days[2], 100.0)
+        results = simulate_close_reversion([weak, strong, quiet])
+        self.assertAlmostEqual(results[0].gross, 0.0)               # bought at 98, closed at 98
+        self.assertEqual(results[0].round_trips, 0)
+        self.assertAlmostEqual(results[1].gross, 100.0 / 98.0 - 1.0)
+        self.assertEqual(results[1].round_trips, 1)
+        self.assertEqual((results[2].gross, results[2].round_trips), (0.0, 0))
+
+    def test_missing_sessions_cannot_erase_an_owned_position(self):
+        days = trading_days(1)
+        weak = flat_session(days[0], 100.0, {300: 98.0})
+        later = flat_session(days[0] + timedelta(days=20), 120.0, {300: 121.0})
+        with self.assertRaisesRegex(ValueError, "cannot erase exposure"):
+            simulate_close_reversion([weak, later])
+
+    def test_daily_simulator_holds_at_most_the_registered_sessions(self):
+        days = trading_days(8)
+        bars = [DailyBar(days[0], 100.0, 101.0, 99.0, 99.1)]         # weak close: enter
+        closes = (98.9, 98.8, 98.7, 98.6, 98.5, 98.45, 98.42)        # never recovers, never weak enough
+        bars += [DailyBar(day, 99.0, 100.0, 98.0, close) for day, close in zip(days[1:], closes)]
+        results = simulate_close_reversion_daily(bars)
+        self.assertEqual(sum(result.round_trips for result in results), 1)
+        # A completed weak close queues entry for the next open. Five held
+        # sessions queue an exit at the sixth following open, including its gap.
+        self.assertEqual(results[0].gross, 0.0)
+        self.assertAlmostEqual(results[1].gross, 98.9 / 99.0 - 1.0)
+        self.assertEqual([i for i, row in enumerate(results) if row.round_trips], [6])
+        self.assertAlmostEqual(results[6].gross, 99.0 / 98.5 - 1.0)
+        self.assertEqual(results[7].gross, 0.0)
+
+    def test_overnight_is_prior_close_to_open(self):
+        days = trading_days(2)
+        results = simulate_overnight([DailyBar(days[0], 100, 101, 99, 100.0),
+                                      DailyBar(days[1], 101.0, 102, 100, 100.5)])
+        self.assertEqual(results[0].round_trips, 0)
+        self.assertAlmostEqual(results[1].gross, 0.01)
+
+
+class OpeningRangeTests(unittest.TestCase):
+    def test_long_is_stopped_at_the_range_low(self):
+        session = flat_session(BASE, 100.0, {2: 100.5, 60: 99.0})
+        result = simulate_opening_range([session])[0]
+        fill = result.fills[0]
+        self.assertEqual((fill.side, fill.entry_minute, fill.entry), (LONG, 5, 100.5))
+        self.assertEqual((fill.exit_minute, fill.exit), (60, 100.0))
+
+    def test_short_runs_to_the_close(self):
+        session = flat_session(BASE, 100.0, {2: 99.5, 200: 98.0})
+        fill = simulate_opening_range([session])[0].fills[0]
+        self.assertEqual((fill.side, fill.exit_minute, fill.exit), (SHORT, MINUTES, 98.0))
+        self.assertAlmostEqual(fill.gross, -(98.0 / 99.5 - 1.0))
+
+    def test_flat_first_candle_is_no_trade(self):
+        self.assertEqual(simulate_opening_range([flat_session(BASE)])[0].round_trips, 0)
+
+    def test_first_last_trades_the_sign_of_the_first_half_hour(self):
+        days = trading_days(2)
+        sessions = [flat_session(days[0]), flat_session(days[1], 100.0, {10: 101.0, 370: 102.0})]
+        result = simulate_first_last(sessions)[1]
+        self.assertEqual(result.fills[0].side, LONG)
+        self.assertAlmostEqual(result.gross, 102.0 / 101.0 - 1.0)
+
+
+class StatsTests(unittest.TestCase):
+    def test_costs_are_charged_per_round_trip(self):
+        results = [DayResult(BASE, 0.001, 2), DayResult(BASE + timedelta(days=1), 0.0, 0)]
+        self.assertEqual(stats.net_series(results, 1.0), [0.001 - 0.0002, 0.0])
+
+    def test_max_drawdown_is_additive(self):
+        self.assertAlmostEqual(stats.max_drawdown([0.01, -0.02, -0.01, 0.05]), -0.03)
+        self.assertEqual(stats.max_drawdown([0.01, 0.02]), 0.0)
+
+    def test_newey_west_matches_the_plain_t_for_independent_noise(self):
+        series = [0.001 if i % 2 else -0.0005 for i in range(400)]
+        value = stats.newey_west_t(series, lags=0)
+        mean = sum(series) / 400
+        deviation = (sum((x - mean) ** 2 for x in series) / 400) ** 0.5
+        self.assertAlmostEqual(value, mean / (deviation / 400 ** 0.5))
+        self.assertIsNone(stats.newey_west_t([0.0] * 100))
+
+    def test_sessions_for_power(self):
+        self.assertEqual(stats.sessions_for_power(1.0, 10.0), 619)
+        self.assertIsNone(stats.sessions_for_power(-1.0, 10.0))
+
+    def test_rolling_sum_quantiles_are_window_totals_in_percent(self):
+        series = [0.01, -0.01] * 20
+        bands = stats.rolling_sum_quantiles(series, 3)
+        self.assertEqual({key: round(value, 6) for key, value in bands.items()},
+                         {"p01": -1.0, "p05": -1.0, "p50": 1.0})
+        self.assertIsNone(stats.rolling_sum_quantiles(series, 30))
+
+    def test_combine_uses_shared_sessions(self):
+        days = trading_days(3)
+        merged_days, merged = stats.combine([(days, [0.01, 0.02, 0.03], 1.0), (days[1:], [0.10, 0.20], 0.5)])
+        self.assertEqual(merged_days, days[1:])
+        self.assertEqual([round(value, 6) for value in merged], [0.07, 0.13])
+
+    def test_evaluate_splits_design_and_holdout(self):
+        days = trading_days(60)
+        results = [DayResult(day, 0.001 if i % 3 else -0.001, 1) for i, day in enumerate(days)]
+        block = stats.evaluate(results, cost_bps=0.0, split=days[30], draws=200)
+        self.assertEqual(block["design"]["sessions"], 30)
+        self.assertEqual(block["holdout"]["sessions"], 30)
+        self.assertEqual(block["all"]["round_trips"], 60)
+        self.assertLess(block["sign_flip_p"], 0.05)
+
+
+class VerdictTests(unittest.TestCase):
+    @staticmethod
+    def block(t_all, t_holdout, mean=1.0, deflated=0.99):
+        return {"all": {"t_newey_west": t_all, "net_bps_per_session": mean},
+                "holdout": {"t_newey_west": t_holdout, "net_bps_per_session": mean},
+                "deflated_sharpe": deflated}
+
+    def test_every_check_must_pass_for_a_paper_candidate(self):
+        good = self.block(3.5, 2.5)
+        self.assertEqual(run.verdict(good, good, 1.0), (run.PAPER, []))
+        tier, failed = run.verdict(self.block(2.5, 2.5), good, 1.0)
+        self.assertEqual(tier, run.SHADOW)
+        self.assertEqual(len(failed), 1)
+
+    def test_cost_stress_and_neighbours_are_vetoes(self):
+        good = self.block(3.5, 2.5)
+        stressed_out = self.block(3.5, 2.5, mean=-0.1)
+        self.assertEqual(run.verdict(good, stressed_out, 1.0)[0], run.SHADOW)
+        self.assertEqual(run.verdict(good, good, 0.5)[0], run.SHADOW)
+        self.assertEqual(run.verdict(good, good, None)[0], run.SHADOW)
+
+    def test_a_negative_holdout_is_rejected(self):
+        bad = self.block(3.5, -1.0, mean=-1.0)
+        self.assertEqual(run.verdict(bad, bad, 1.0)[0], run.REJECT)
+
+    def test_study_runs_end_to_end_on_synthetic_sessions(self):
+        days = trading_days(60)
+        sessions = [wiggle_session(day) if i % 4 else flat_session(day, 100.2, {45: 101.0, 300: 102.0})
+                    for i, day in enumerate(days)]
+        results = run.run(minute={"TEST": sessions}, daily={}, source="synthetic", draws=50)
+        self.assertEqual(set(results["minute"]["TEST"]), set(run.RULES))
+        text = run.render_report(results)
+        self.assertIn("noise_band_momentum", text)
+        json.dumps(run._strip(results))          # the record must be serialisable
+
+
+# ---------------------------------------------------------------------------
+# Forward shadow
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FakeBar:
+    timestamp: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal = Decimal("1000")
+
+
+class FakeProvider:
+    """A broker stub whose clock the test moves; bars are visible once complete.
+
+    A submitted market order fills at once at the current quote unless the
+    test says otherwise, and the stub keeps the positions that result.
+    """
+
+    mode = "paper"
+    paper = True
+    session = None
+
+    def __init__(self, sessions: dict[str, list[Session]], *, early_close: bool = False) -> None:
+        self.sessions = sessions
+        self.now = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        self.early_close = early_close
+        self.sent: list = []
+        self.records: dict[str, SimpleNamespace] = {}
+        self.held: dict[str, int] = {}
+        self.cancelled: list[str] = []
+        self.equity = Decimal("100000")
+        self.fail_orders = False
+        self.fill_orders = True
+        self.status = "active"
+
+    @staticmethod
+    def open_at(day: date) -> datetime:
+        return datetime.combine(day, time(9, 30), NEW_YORK)
+
+    def set(self, day: date, minute: float) -> None:
+        self.now = (self.open_at(day) + timedelta(minutes=minute)).astimezone(timezone.utc)
+
+    def clock(self):
+        local = self.now.astimezone(NEW_YORK)
+        days = {session.day for rows in self.sessions.values() for session in rows}
+        minute = local.hour * 60 + local.minute - 570
+        is_open = local.date() in days and 0 <= minute < MINUTES
+        close = datetime.combine(local.date(), time(13, 0) if self.early_close else time(16, 0), NEW_YORK)
+        return SimpleNamespace(timestamp=self.now, is_open=is_open, next_open=None, next_close=close)
+
+    def bars(self, symbols, timeframe="1Min", start=None, end=None, feed=None):
+        out = {}
+        for symbol in symbols:
+            rows = []
+            for session in self.sessions.get(symbol, []):
+                opened = self.open_at(session.day)
+                if opened > end or opened + timedelta(minutes=MINUTES) < start:
+                    continue
+                for minute in range(MINUTES):
+                    stamp = opened + timedelta(minutes=minute)
+                    if stamp + timedelta(minutes=1) > min(end, self.now) or stamp < start:
+                        continue
+                    rows.append(FakeBar(stamp, *(Decimal(str(value)) for value in (
+                        session.open[minute], session.high[minute], session.low[minute],
+                        session.close[minute]))))
+            out[symbol] = rows
+        return out
+
+    def _price(self, symbol: str) -> Decimal | None:
+        local = self.now.astimezone(NEW_YORK)
+        minute = local.hour * 60 + local.minute - 570
+        for session in self.sessions.get(symbol, []):
+            if session.day == local.date() and 0 <= minute < MINUTES:
+                return Decimal(str(session.open[minute]))
+        return None
+
+    def quotes(self, symbols, start=None, end=None, feed=None):
+        """The quote is the open of the minute the clock is in, with no spread."""
+        out = {}
+        for symbol in symbols:
+            price = self._price(symbol)
+            out[symbol] = [] if price is None else [SimpleNamespace(bid=price, ask=price, timestamp=self.now)]
+        return out
+
+    def account(self):
+        return SimpleNamespace(equity=self.equity, status=self.status)
+
+    def positions(self):
+        return [SimpleNamespace(symbol=symbol, qty=Decimal(abs(quantity)), side="long" if quantity > 0 else "short")
+                for symbol, quantity in self.held.items() if quantity]
+
+    def submit_order(self, request):
+        if self.fail_orders:
+            raise RuntimeError("rejected")
+        self.sent.append(request)
+        signed = int(request.qty) * (1 if request.side == "buy" else -1)
+        record = SimpleNamespace(id=f"order-{len(self.sent)}", symbol=request.symbol, status="accepted",
+                                 filled_qty=Decimal(0), filled_avg_price=None,
+                                 client_order_id=request.client_order_id, signed=signed)
+        if self.fill_orders:
+            record.status, record.filled_qty = "filled", Decimal(abs(signed))
+            record.filled_avg_price = self._price(request.symbol)
+            self.held[request.symbol] = self.held.get(request.symbol, 0) + signed
+        self.records[request.client_order_id] = record
+        return record
+
+    def orders(self, *, status=None, client_order_id=None):
+        if client_order_id is not None:
+            record = self.records.get(client_order_id)
+            return [] if record is None else [record]
+        return [record for record in self.records.values()
+                if status != "open" or record.status in ("accepted", "new", "partially_filled")]
+
+    def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
+        for record in self.records.values():
+            if record.id == order_id and record.status != "filled":
+                record.status = "canceled"
+
+
+def run_session(runner: live.ShadowRunner, provider: FakeProvider, day: date, *, step: float = 0.5,
+                until: float = MINUTES, each=None) -> None:
+    minute = 0.1
+    while minute < until:
+        provider.set(day, minute)
+        if each is not None:
+            each(minute)
+        runner.step()
+        minute += step
+    if until >= MINUTES:
+        provider.set(day, MINUTES + 5)
+        runner.step()
+
+
+class ShadowRunnerTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.days = trading_days(NOISE_BAND.lookback_sessions + 2)
+        self.history = [wiggle_session(day) for day in self.days[:-2]]
+        self.breakout = flat_session(self.days[-2], 100.2, {45: 101.0, 200: 102.0, 370: 100.3})
+        self.quiet = flat_session(self.days[-1], 100.3, {300: 101.5})
+        self.sessions = [*self.history, self.breakout, self.quiet]
+
+    def runner(self, legs, provider, **kwargs) -> live.ShadowRunner:
+        return live.ShadowRunner(provider, directory=self.folder.name, legs=legs, **kwargs)
+
+    def events(self, kind: str) -> list[dict]:
+        return [event for event in live.read_journal(Path(self.folder.name) / "journal.jsonl")
+                if event["kind"] == kind]
+
+    def sent(self, provider: FakeProvider) -> list[tuple[str, int]]:
+        return [(order.side, int(order.qty)) for order in provider.sent]
+
+    def control(self, command: str) -> int:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return live.main([command, "--dir", self.folder.name])
+
+    # ---- shadow ----------------------------------------------------------
+    def test_noise_band_shadow_matches_the_simulator(self):
+        provider = FakeProvider({"QQQ": self.sessions})
+        runner = self.runner([live.Leg(live.NOISE, "QQQ")], provider)
+        run_session(runner, provider, self.days[-2])
+        summary = self.events("session_summary")[-1]["legs"]["noise_band_momentum:QQQ"]
+        expected = simulate_noise_band(self.sessions[:-1], replace(NOISE_BAND, flat_minute=live.FLAT_MINUTE))[-1]
+        self.assertEqual(summary["shadow_round_trips"], expected.round_trips)
+        self.assertAlmostEqual(summary["shadow_gross"], expected.gross, places=12)
+        self.assertAlmostEqual(summary["replay_gross"], expected.gross, places=12)
+        self.assertFalse(provider.sent)                            # shadow mode never sends an order
+        decisions = [event for event in self.events("decision") if event["target"] != FLAT]
+        self.assertEqual((decisions[0]["minute"], decisions[0]["target"], decisions[0]["price_source"]),
+                         (60, LONG, "quote"))
+        # A decision that changes nothing still leaves what it saw in the journal.
+        unchanged = self.events("decision_unchanged")
+        self.assertEqual((unchanged[0]["minute"], unchanged[0]["position"]), (30, FLAT))
+        self.assertTrue(unchanged[0]["lower"] <= unchanged[0]["price"] <= unchanged[0]["upper"])
+        changed = {event["minute"] for event in self.events("decision")}
+        quiet = {event["minute"] for event in unchanged}
+        self.assertFalse(changed & quiet)
+        self.assertTrue(set(range(30, 361, 30)) <= changed | quiet)
+
+    def test_close_reversion_enters_then_exits_across_sessions(self):
+        provider = FakeProvider({"SPY": self.sessions})
+        runner = self.runner([live.Leg(live.REVERSION, "SPY")], provider)
+        run_session(runner, provider, self.days[-2])               # closes near its low: enter
+        self.assertTrue(runner.state["carry"]["close_weakness_reversion:SPY"]["in_position"])
+        run_session(runner, provider, self.days[-1])               # closes at its high: exit
+        trips = self.events("round_trip")
+        self.assertEqual(len(trips), 1)
+        self.assertAlmostEqual(trips[0]["gross"], 101.5 / 100.3 - 1.0)
+        self.assertEqual(trips[0]["sessions_held"], 1)
+        report = live.forward_report(live.read_journal(Path(self.folder.name) / "journal.jsonl"))
+        self.assertEqual(report["legs"]["close_weakness_reversion:SPY"]["closed_round_trips"], 1)
+
+    def test_book_parameters_drive_the_leg(self):
+        book = {"schema": live.BOOK_SCHEMA, "legs": [
+            {"rule": live.NOISE, "symbol": "qqq", "weight": 0.25, "trade": True, "tier": "confirmed",
+             "params": {"band_multiple": 20.0, "sides": ["long"], "lookback_sessions": 7,
+                        "decision_step_minutes": 60, "first_decision_minute": 60, "last_decision_minute": 360}},
+            {"rule": live.REVERSION, "symbol": "SPY", "weight": 0.0, "trade": True, "tier": "provisional",
+             "params": {"enter_below": 0.1, "exit_above": 0.6, "max_sessions": 3, "decision_minute": 380}}]}
+        path = Path(self.folder.name) / "edge_book.json"
+        path.write_text(json.dumps(book), encoding="utf-8")
+        legs = live.load_book(path)
+        self.assertEqual([(leg.symbol, leg.trade) for leg in legs], [("QQQ", False), ("SPY", False)])
+        rules = legs[0].noise_rules()
+        self.assertEqual((rules.band_multiple, rules.sides, rules.decision_minutes()[0], rules.flat_minute),
+                         (20.0, ("long",), 60, live.FLAT_MINUTE))
+        self.assertEqual(legs[1].reversion_rules().max_sessions, 3)
+        provider = FakeProvider({"QQQ": self.sessions, "SPY": self.sessions})
+        runner = self.runner(legs, provider)
+        run_session(runner, provider, self.days[-2])               # a band twenty times wider is never broken
+        self.assertEqual(self.events("session_summary")[-1]["legs"]["noise_band_momentum:QQQ"]
+                         ["shadow_round_trips"], 0)
+        path.write_text(json.dumps({"schema": live.BOOK_SCHEMA, "legs": [{"rule": "opening_range_breakout",
+                                                                         "symbol": "QQQ"}]}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            live.load_book(path)
+
+    def test_late_start_skips_stale_decisions(self):
+        provider = FakeProvider({"QQQ": self.sessions})
+        runner = self.runner([live.Leg(live.NOISE, "QQQ")], provider)
+        provider.set(self.days[-2], 122)                           # started after the 10:30 breakout
+        runner.step()
+        skipped = [event["minute"] for event in self.events("decision_skipped")]
+        self.assertEqual(skipped, [30, 60, 90])
+        self.assertEqual([event["minute"] for event in self.events("decision")], [120])
+
+    def test_half_day_is_not_traded(self):
+        provider = FakeProvider({"QQQ": self.sessions}, early_close=True)
+        runner = self.runner([live.Leg(live.NOISE, "QQQ")], provider)
+        provider.set(self.days[-2], 70)
+        self.assertEqual(runner.step(), "skipped")
+        self.assertFalse(self.events("decision"))
+
+    def test_opening_range_shadow_enters_and_stops(self):
+        session = flat_session(self.days[-1], 100.0, {2: 100.5, 60: 99.0})
+        provider = FakeProvider({"QQQ": [session]})
+        runner = self.runner([live.Leg(live.OPENING, "QQQ")], provider)
+        run_session(runner, provider, self.days[-1])
+        summary = self.events("session_summary")[-1]["legs"]["opening_range_breakout:QQQ"]
+        self.assertEqual(summary["shadow_round_trips"], 1)
+        self.assertLess(summary["shadow_gross"], 0)
+        self.assertAlmostEqual(summary["replay_gross"], 100.0 / 100.5 - 1.0)
+
+    # ---- shadow authority and lifecycle ----------------------------------
+    def test_serialized_trade_intent_does_not_send_orders_in_shadow(self):
+        provider = FakeProvider({"QQQ": self.sessions})
+        provider.held["QQQ"] = 40
+        runner = self.runner([live.Leg(live.NOISE, "QQQ", 0.5, True)], provider)
+        run_session(runner, provider, self.days[-2])
+        summary = self.events("session_summary")[-1]["legs"]["noise_band_momentum:QQQ"]
+        self.assertEqual(summary["shadow_round_trips"], 1)
+        self.assertFalse(provider.sent)
+        self.assertFalse(provider.cancelled)
+        self.assertEqual(provider.held, {"QQQ": 40})
+        report = live.forward_report(live.read_journal(Path(self.folder.name) / "journal.jsonl"))
+        self.assertFalse(report["authorizing"])
+        self.assertEqual(report["legs"]["noise_band_momentum:QQQ"]["round_trips"], 1)
+
+    def test_order_modes_require_authority_even_with_a_trade_flag(self):
+        provider = FakeProvider({"QQQ": self.sessions})
+        legs = [live.Leg(live.NOISE, "QQQ", 0.5, True)]
+        for mode in ("paper", "live"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(RuntimeError, "proof/parity"):
+                self.runner(legs, provider, orders=mode, max_notional=2000.0)
+        self.assertFalse(provider.sent)
+        self.assertFalse((Path(self.folder.name) / "state.json").exists())
+
+    def test_operator_controls_create_and_remove_requests_without_broker_orders(self):
+        self.assertEqual(self.control("halt"), 0)
+        self.assertTrue((Path(self.folder.name) / live.HALT_FILE).exists())
+        self.assertEqual(self.control("flatten"), 0)
+        self.assertTrue((Path(self.folder.name) / live.FLATTEN_FILE).exists())
+        self.assertEqual(self.control("resume"), 0)
+        self.assertFalse((Path(self.folder.name) / live.HALT_FILE).exists())
+        self.assertFalse((Path(self.folder.name) / live.FLATTEN_FILE).exists())
+
+    def test_restart_resumes_shadow_without_repeating_a_decision(self):
+        provider = FakeProvider({"QQQ": self.sessions})
+        legs = [live.Leg(live.NOISE, "QQQ", 0.5, True)]
+        runner = self.runner(legs, provider)
+        for minute in (30.2, 60.2):
+            provider.set(self.days[-2], minute)
+            runner.step()
+        decisions = len(self.events("decision"))
+        again = self.runner(legs, provider)
+        provider.set(self.days[-2], 61.0)
+        again.step()
+        self.assertEqual(len(self.events("decision")), decisions)
+        self.assertEqual(again.state["legs"]["noise_band_momentum:QQQ"]["position"], LONG)
+        self.assertFalse(provider.sent)
+
+    # ---- guards ----------------------------------------------------------
+    def test_configuration_guards(self):
+        provider = FakeProvider({})
+        momentum = live.Leg(live.NOISE, "QQQ", 0.5, True)
+        for legs in ((momentum, momentum),
+                     (momentum, live.Leg(live.REVERSION, "QQQ", 0.2, True)),
+                     (live.Leg(live.OPENING, "QQQ", 0.1, True),)):
+            with self.subTest(legs=legs), self.assertRaises(ValueError):
+                self.runner(legs, provider)
+        with self.assertRaises(ValueError):
+            self.runner([momentum], provider, orders="invalid")
+        with self.assertRaises(ValueError):
+            self.runner([momentum], provider, recovery_only=True)
+        provider.mode, provider.paper = "live", False
+        self.assertEqual(self.runner([momentum], provider).orders, "none")
+
+    def test_live_orders_need_every_flag_and_are_recovery_only(self):
+        def mode(*flags: str) -> str:
+            parser = argparse.ArgumentParser()
+            live._account_arguments(parser, Path(self.folder.name))
+            return live.order_mode(parser.parse_args(list(flags)))
+
+        self.assertEqual(mode(), "none")
+        self.assertEqual(mode("--paper-orders", "--recover-owned"), "paper")
+        self.assertEqual(mode("--mode", "live", "--live-orders", "--confirm", "LIVE",
+                              "--max-notional", "500", "--recover-owned"), "live")
+        for flags in (("--paper-orders",), ("--recover-owned",), ("--live-orders",),
+                      ("--mode", "live", "--live-orders", "--recover-owned"),
+                      ("--mode", "live", "--live-orders", "--confirm", "LIVE", "--recover-owned"),
+                      ("--mode", "live", "--live-orders", "--confirm", "yes", "--max-notional", "500",
+                       "--recover-owned"),
+                      ("--mode", "live", "--live-orders", "--confirm", "LIVE", "--max-notional", "500"),
+                      ("--mode", "live", "--paper-orders", "--recover-owned"),
+                      ("--paper-orders", "--live-orders", "--recover-owned")):
+            with self.subTest(flags=flags), self.assertRaises(ValueError):
+                mode(*flags)
+
+    def test_preflight_checks_shadow_data_but_never_authorizes_entry_orders(self):
+        provider = FakeProvider({"QQQ": self.sessions, "SPY": self.sessions})
+        provider.set(self.days[-1], 100)
+        legs = [live.Leg(live.NOISE, "QQQ"), live.Leg(live.REVERSION, "SPY")]
+        clean = live.preflight(provider, legs, orders="none", directory=self.folder.name)
+        self.assertTrue(clean["ok"], [item for item in clean["checks"] if not item["ok"]])
+        provider.status = "account_updated"
+        (Path(self.folder.name) / live.HALT_FILE).write_text("x", encoding="utf-8")
+        result = live.preflight(provider, legs, orders="none", directory=self.folder.name)
+        failed = {item["name"] for item in result["checks"] if not item["ok"]}
+        self.assertEqual(failed, {"account_active", "no_halt_file"})
+        blocked = live.preflight(provider, legs, orders="paper", directory=self.folder.name)
+        self.assertFalse(blocked["ok"])
+        self.assertIn("order_scope_is_recovery_only",
+                      {item["name"] for item in blocked["checks"] if not item["ok"]})
+        self.assertFalse(provider.sent)
+
+    def test_trade_only_can_restrict_but_cannot_enable_a_shadow_leg(self):
+        shadow = live.restrict_trading(live.DEFAULT_LEGS, "close_weakness_reversion")
+        self.assertFalse(any(leg.trade for leg in shadow))
+        requested = tuple(replace(leg, trade=leg.rule != live.OPENING) for leg in live.DEFAULT_LEGS)
+        restricted = live.restrict_trading(requested, "noise_band_momentum:QQQ")
+        self.assertEqual({leg.key for leg in restricted if leg.trade}, {"noise_band_momentum:QQQ"})
+        self.assertEqual(live.restrict_trading(live.DEFAULT_LEGS, ""), live.DEFAULT_LEGS)
+        with self.assertRaises(ValueError):
+            live.restrict_trading(live.DEFAULT_LEGS, "momentum")
+
+    def test_default_legs_are_diagnostic_only(self):
+        self.assertFalse(any(leg.trade for leg in live.DEFAULT_LEGS))
+        self.assertIn("noise_band_momentum:QQQ", {leg.key for leg in live.DEFAULT_LEGS})
+        self.assertIn("close_weakness_reversion:SPY", {leg.key for leg in live.DEFAULT_LEGS})
+
+def daily_bars(count: int, start: date, pattern, *, level: float = 100.0) -> list[DailyBar]:
+    """Daily bars built by ``pattern(index, previous_close) -> (open, high, low, close)``."""
+    bars: list[DailyBar] = []
+    close = level
+    for index, day in enumerate(trading_days(count, start)):
+        o, h, l, close = pattern(index, close)
+        bars.append(DailyBar(day, o, h, l, close))
+    return bars
+
+
+def reverting(index: int, previous: float) -> tuple[float, float, float, float]:
+    """Every third day closes on its low, down 1%; the next day recovers it and a little more."""
+    phase = index % 3
+    if phase == 0:
+        close = previous * 0.99
+        return previous, previous, close, close
+    if phase == 1:
+        close = previous * 1.0125
+        return previous, close, previous, close
+    close = previous * 0.9995
+    return previous, previous * 1.001, previous * 0.998, close
+
+
+def drifting(index: int, previous: float) -> tuple[float, float, float, float]:
+    """No pattern: alternating small moves that always close mid-range."""
+    close = previous * (1.001 if index % 2 else 0.999)
+    return previous, max(previous, close) * 1.002, min(previous, close) * 0.998, close
+
+
+def rising(index: int, previous: float) -> tuple[float, float, float, float]:
+    """Opens at the previous close and closes 1% higher, every day."""
+    return previous, previous * 1.01, previous, previous * 1.01
+
+
+def trending(index: int, previous: float) -> tuple[float, float, float, float]:
+    """A noisy uptrend with no pattern in it: up 1.2%, down 1.0%, alternately."""
+    close = previous * (1.012 if index % 2 else 0.990)
+    return previous, max(previous, close), min(previous, close), close
+
+
+class GrammarTests(unittest.TestCase):
+    def test_specs_are_validated_typed_and_content_addressed(self):
+        spec = {"family": "noise_band_momentum", "symbol": "QQQ", "params": {"band_multiple": 1.1}}
+        canonical = grammar.normalise(spec)
+        self.assertEqual(canonical["params"], {"band_multiple": 1.1, "decision_step_minutes": 30,
+                                               "lookback_sessions": 14, "sides": "both"})
+        self.assertEqual(grammar.spec_id(spec), grammar.spec_id(canonical))
+        ten = {"family": "opening_range_breakout", "symbol": "QQQ", "params": {"target_r": 10}}
+        self.assertEqual(grammar.spec_id(ten), grammar.spec_id({**ten, "params": {"target_r": 10.0}}))
+        for bad in ({"family": "martingale", "symbol": "QQQ"},
+                    {"family": "noise_band_momentum", "symbol": "QQQ", "params": {"band_multiple": 9}},
+                    {"family": "noise_band_momentum", "symbol": "QQQ", "params": {"leverage": 4}},
+                    {"family": "noise_band_momentum", "symbol": "QQQ", "params": {"sides": "short"}},
+                    {"family": "close_weakness_reversion", "symbol": "SPY", "params": {"max_sessions": 2.5}},
+                    {"family": "close_weakness_reversion", "symbol": "", "params": {}},
+                    {"family": "close_weakness_reversion", "symbol": "SPY", "code": "import os"}):
+            with self.assertRaises(grammar.SpecError):
+                grammar.normalise(bad)
+
+    def test_grid_and_neighbours(self):
+        family = grammar.FAMILIES["close_weakness_reversion"]
+        specs = list(grammar.enumerate_family(family, "SPY"))
+        self.assertEqual(len(specs), 30)
+        self.assertEqual(len({grammar.spec_id(spec) for spec in specs}), 30)
+        near = grammar.neighbours({"family": "close_weakness_reversion", "symbol": "SPY",
+                                   "params": {"enter_below": 0.2, "exit_above": 0.5, "max_sessions": 3}})
+        changed = sorted((name, spec["params"][name]) for spec in near
+                         for name in spec["params"] if spec["params"][name] != {"enter_below": 0.2,
+                                                                               "exit_above": 0.5,
+                                                                               "max_sessions": 3}[name])
+        self.assertEqual(changed, [("enter_below", 0.15), ("enter_below", 0.25), ("exit_above", 0.6),
+                                   ("max_sessions", 1), ("max_sessions", 5)])
+        off_grid = grammar.neighbours({"family": "close_weakness_reversion", "symbol": "SPY",
+                                       "params": {"enter_below": 0.22}})
+        self.assertIn(0.20, [spec["params"]["enter_below"] for spec in off_grid])
+        self.assertIn(0.25, [spec["params"]["enter_below"] for spec in off_grid])
+
+    def test_every_family_runs_and_says_whether_the_runner_can_trade_it(self):
+        days = trading_days(40)
+        sessions = [wiggle_session(day) if i % 3 else flat_session(day, 100.2, {45: 101.0, 300: 99.0})
+                    for i, day in enumerate(days)]
+        bars = daily_bars(300, BASE, reverting)
+        context = {"VIX": {bar.day: 18.0 + index % 7 for index, bar in enumerate(bars)},
+                   "VIX3M": {bar.day: 20.0 for bar in bars},
+                   "NYSE_CALENDAR": {day: 1.0 for day in trading_days(350)}}
+        for family in grammar.FAMILIES.values():
+            data = sessions if family.data == grammar.MINUTE else bars
+            spec = next(iter(grammar.enumerate_family(family, "X")))
+            results = grammar.simulator(spec, context)(data)
+            self.assertEqual(len(results), len(data), family.name)
+            self.assertEqual(family.executable, family.runner_rule is not None, family.name)
+            self.assertIn(family.desk, (grammar.DAY_TRADER, grammar.SWING_TRADER, grammar.OPTIONS_TRADER))
+            self.assertTrue(family.signal and family.thesis, family.name)
+            if family.needs:
+                with self.assertRaises(grammar.SpecError):
+                    grammar.simulator(spec)                         # the series it reads must be supplied
+        described = grammar.describe()
+        self.assertEqual(set(described), set(grammar.FAMILIES))
+        json.dumps(described)
+
+    def test_catalogue_counts_edges_and_variants(self):
+        self.assertEqual(len(grammar.FAMILIES), 16)
+        counts = {name: grammar.variant_count(family) for name, family in grammar.FAMILIES.items()}
+        self.assertEqual(sum(counts.values()), 204)
+        self.assertEqual((counts["noise_band_momentum"], counts["vix_spike_daily"]), (36, 12))
+        for family in grammar.FAMILIES.values():
+            self.assertEqual(len(list(grammar.enumerate_family(family, "X"))), counts[family.name])
+        desks: dict[str, int] = {}
+        for family in grammar.FAMILIES.values():
+            desks[family.desk] = desks.get(family.desk, 0) + 1
+        self.assertEqual(desks, {grammar.DAY_TRADER: 7, grammar.SWING_TRADER: 6, grammar.OPTIONS_TRADER: 3})
+        text = grammar.catalogue_markdown()
+        for name in grammar.FAMILIES:
+            self.assertIn(f"`{name}`", text)
+        self.assertIn("16 edges, 204 variants", text)
+        committed = Path(grammar.__file__).with_name("EDGES.md").read_text(encoding="utf-8")
+        self.assertEqual(committed, grammar.catalogue_document())   # regenerate: python -m studies.session_edges.grammar
+
+
+class FamilyTests(unittest.TestCase):
+    def test_last_hour_follows_or_fades_the_days_move(self):
+        days = trading_days(15)
+        history = [wiggle_session(day) for day in days[:-1]]
+        up = flat_session(days[-1], 100.0, {100: 101.0, 380: 102.0})
+        follow = simulate_last_hour([*history, up], mode="follow")[-1]
+        fade = simulate_last_hour([*history, up], mode="fade")[-1]
+        self.assertEqual((follow.fills[0].side, follow.fills[0].entry_minute), (LONG, 330))
+        self.assertAlmostEqual(follow.gross, 102.0 / 101.0 - 1.0)
+        self.assertAlmostEqual(fade.gross, -(102.0 / 101.0 - 1.0))
+        self.assertEqual(simulate_last_hour([*history, up], threshold=50.0)[-1].round_trips, 0)
+
+    def test_gap_is_faded_only_when_it_is_unusual(self):
+        days = trading_days(23)
+        closes = [100.0 + 0.1 * (i % 2) for i in range(22)]
+        quiet = [flat_session(day, level) for day, level in zip(days[:-1], closes)]
+        gapped = flat_session(days[-1], 103.0, {30: 102.0})         # opens 3% up, slips back
+        result = simulate_gap([*quiet, gapped], mode="fade", threshold=1.0, exit_minute=60)[-1]
+        self.assertEqual(result.fills[0].side, SHORT)
+        self.assertAlmostEqual(result.gross, -(102.0 / 103.0 - 1.0))
+        self.assertTrue(all(row.round_trips == 0 for row in simulate_gap(quiet, threshold=3.0)))
+
+    def test_overnight_hold_earns_close_to_next_open(self):
+        days = trading_days(2)
+        sessions = [flat_session(days[0], 100.0), flat_session(days[1], 101.0)]
+        results = simulate_overnight_hold(sessions, condition="any")
+        self.assertEqual((results[0].gross, results[0].round_trips), (0.0, 0))
+        self.assertAlmostEqual(results[1].gross, 0.01)
+        self.assertEqual(results[1].round_trips, 1)
+        weak_only = simulate_overnight_hold(sessions, condition="weak_close")
+        self.assertEqual(sum(row.round_trips for row in weak_only), 0)   # a flat day is not a weak close
+
+    def test_daily_families(self):
+        bars = daily_bars(60, BASE, reverting)
+        streak = simulate_down_streak_daily(bars, streak=2, max_sessions=1)   # two lower closes, then the bounce
+        self.assertAlmostEqual(sum(row.gross for row in streak), 19 * 0.0125)
+        self.assertEqual(sum(row.round_trips for row in streak), 19)
+        rsi = simulate_rsi_reversion_daily(bars, period=2, enter_below=40.0, exit_above=50.0)
+        self.assertGreater(sum(row.round_trips for row in rsi), 5)
+        month = simulate_turn_of_month_daily(daily_bars(64, date(2026, 3, 2), drifting),
+                                             enter_days_before=1, hold_days_after=3,
+                                             calendar=trading_days(100, date(2026, 2, 2)))
+        # The archive ends May 28. Only March/April month-end signals execute
+        # and close in this window; truncation must not invent a May month end.
+        self.assertEqual(sum(row.round_trips for row in month), 2)
+        self.assertEqual(sum(1 for row in month if row.gross != 0.0), 6)
+
+
+    def test_prior_day_break_follows_or_fades_the_first_close_beyond_yesterdays_range(self):
+        days = trading_days(3)
+        wide = flat_session(days[0], 100.0, {10: 102.0, 20: 100.0})      # range 100 to 102
+        narrow = flat_session(days[1], 100.5, {10: 101.0, 20: 100.5})    # range 100.5 to 101
+        up = flat_session(days[2], 100.8, {50: 101.5, 200: 102.5})       # closes above 101 in minute 50
+        follow = simulate_prior_day_break([wide, narrow, up])[-1]
+        self.assertEqual((follow.fills[0].side, follow.fills[0].entry_minute, follow.fills[0].entry),
+                         (LONG, 51, 101.5))
+        self.assertAlmostEqual(follow.gross, 102.5 / 101.5 - 1.0)
+        fade = simulate_prior_day_break([wide, narrow, up], mode="fade")[-1]
+        self.assertAlmostEqual(fade.gross, -(102.5 / 101.5 - 1.0))
+        # The setup filter: yesterday must be the narrowest of the last two sessions.
+        self.assertEqual(simulate_prior_day_break([wide, narrow, up], narrow_days=2)[-1].round_trips, 1)
+        self.assertEqual(simulate_prior_day_break([narrow, wide, up], narrow_days=2)[-1].round_trips, 0)
+        down = flat_session(days[2], 100.8, {50: 100.0})
+        self.assertEqual(simulate_prior_day_break([wide, narrow, down], sides=("long",))[-1].round_trips, 0)
+        self.assertEqual(simulate_prior_day_break([wide, narrow, down])[-1].fills[0].side, SHORT)
+        self.assertEqual(simulate_prior_day_break([wide])[0].round_trips, 0)       # no yesterday
+
+    def test_vwap_trend_needs_volume_and_follows_price_across_the_average(self):
+        day = trading_days(1)[0]
+        session = flat_session(day, 100.0, {40: 101.0, 200: 99.0})
+        both = simulate_vwap_trend([session], step=30)[0]
+        self.assertEqual([(fill.side, fill.entry_minute, fill.exit_minute) for fill in both.fills],
+                         [(LONG, 60, 210), (SHORT, 210, 388)])
+        self.assertAlmostEqual(both.gross, 99.0 / 101.0 - 1.0)       # long 101 to 99, then short at 99, flat
+        long_only = simulate_vwap_trend([session], step=30, sides=("long",))[0]
+        self.assertEqual(long_only.round_trips, 1)
+        silent = build_session(day, [(minute, 100.0, 100.0, 100.0, 100.0 + minute * 0.01, 0.0)
+                                     for minute in range(MINUTES)])
+        self.assertEqual(simulate_vwap_trend([silent])[0].round_trips, 0)
+
+    def test_volatility_spike_is_bought_at_the_next_open_and_sold_when_it_fades(self):
+        bars = daily_bars(30, BASE, rising)
+        vix = {bar.day: 20.0 for bar in bars}
+        vix[bars[15].day], vix[bars[16].day], vix[bars[17].day] = 26.0, 25.0, 19.0
+        results = simulate_vix_spike_daily(bars, vix, spike=0.15, average_days=10, max_sessions=5)
+        self.assertEqual([index for index, row in enumerate(results) if row.gross], [16, 17])
+        self.assertAlmostEqual(sum(row.gross for row in results), 0.02)
+        self.assertEqual((sum(row.round_trips for row in results), results[18].round_trips), (1, 1))
+        self.assertEqual(sum(row.round_trips for row in simulate_vix_spike_daily(bars, {})), 0)
+        calm = simulate_vix_spike_daily(bars, vix, spike=0.40)
+        self.assertEqual(sum(1 for row in calm if row.gross), 0)     # 26 is not 40% above 20
+
+    def test_term_structure_buys_inversion_or_holds_the_normal_slope(self):
+        bars = daily_bars(12, BASE, rising)
+        vix = {bar.day: 20.0 for bar in bars}
+        far = {bar.day: 22.0 for bar in bars}
+        vix[bars[3].day], vix[bars[4].day] = 24.0, 23.0              # inverted on two closes
+        stress = simulate_vix_term_structure_daily(bars, vix, far, mode="buy_backwardation")
+        self.assertEqual([index for index, row in enumerate(stress) if row.gross], [4, 5])
+        self.assertEqual(sum(row.round_trips for row in stress), 1)
+        carry = simulate_vix_term_structure_daily(bars, vix, far, mode="hold_contango")
+        self.assertEqual([index for index, row in enumerate(carry) if row.gross], [1, 2, 3, 6, 7, 8, 9, 10, 11])
+        self.assertAlmostEqual(sum(row.gross for row in carry), 0.09)
+        with self.assertRaises(ValueError):
+            simulate_vix_term_structure_daily(bars, vix, far, mode="sell_everything")
+
+    def test_expiration_week_is_the_week_of_the_third_friday(self):
+        self.assertTrue(is_expiration_week(date(2026, 3, 16)))
+        self.assertTrue(is_expiration_week(date(2026, 3, 20)))       # the third Friday of March 2026
+        self.assertFalse(is_expiration_week(date(2026, 3, 13)))
+        self.assertFalse(is_expiration_week(date(2026, 3, 21)))      # a Saturday
+        self.assertFalse(is_expiration_week(date(2026, 3, 23)))
+        bars = daily_bars(20, BASE, rising)                          # 2 to 27 March 2026
+        whole = simulate_expiration_week_daily(bars)
+        self.assertEqual([bars[i].day.day for i, row in enumerate(whole) if row.gross], [16, 17, 18, 19, 20])
+        self.assertEqual(sum(row.round_trips for row in whole), 1)
+        inner = simulate_expiration_week_daily(bars, enter="monday", leave="thursday")
+        self.assertAlmostEqual(sum(row.gross for row in inner), 0.03)
+
+
+class DiscoveryTests(unittest.TestCase):
+    START = date(2012, 1, 2)
+
+    def test_alpha_is_what_is_left_after_exposure_to_the_instrument(self):
+        days = trading_days(300)
+        market = {day: (0.02 if index % 2 else -0.01) for index, day in enumerate(days)}
+        extra = (0.002, 0.0, 0.001)                                  # uncorrelated with the market by design
+        net = [0.5 * market[day] + extra[index % 3] for index, day in enumerate(days)]
+        found = discover.beyond_holding(days, net, market)
+        self.assertAlmostEqual(found["beta"], 0.5)
+        self.assertAlmostEqual(found["alpha_bps_per_session"], 10.0)
+        self.assertGreater(found["alpha_t"], 10.0)
+        only_market = discover.beyond_holding(days, [market[day] for day in days], market)
+        self.assertAlmostEqual(only_market["beta"], 1.0)
+        self.assertIsNone(only_market["alpha_t"])                    # holding the market is not an edge
+        self.assertIsNone(discover.beyond_holding(days[:30], net[:30], market)["alpha_t"])
+        bars = daily_bars(4, BASE, rising)
+        self.assertEqual(list(discover.benchmark_returns(grammar.DAILY, bars)), [bar.day for bar in bars[1:]])
+        sessions = [flat_session(days[0], 100.0), flat_session(days[1], 101.0)]
+        self.assertAlmostEqual(discover.benchmark_returns(grammar.MINUTE, sessions)[days[1]], 0.01)
+
+    def test_a_rule_that_only_holds_the_market_is_screened_out(self):
+        bars = daily_bars(3600, self.START, trending)
+        context = {"VIX": {bar.day: 15.0 for bar in bars}, "VIX3M": {bar.day: 20.0 for bar in bars}}
+        record = discover.discover(minute={}, daily={"UP": bars}, context=context,
+                                   families=["vix_term_structure_daily"])
+        self.assertEqual(record["promoted"], {})
+        held = [row for row in record["design_leaderboard"] if row["spec"]["params"]["mode"] == "hold_contango"]
+        self.assertTrue(held and all(row["design_t"] > discover.MIN_DESIGN_T for row in held))
+        self.assertTrue(all("no return beyond holding the instrument" in row["screen_failures"] for row in held))
+
+    def test_families_without_their_context_or_volume_are_skipped_and_reported(self):
+        bars = daily_bars(3600, self.START, reverting)
+        record = discover.discover(minute={}, daily={"REAL": bars},
+                                   families=["vix_spike_daily", "vix_term_structure_daily"],
+                                   proposals=[{"family": "vix_spike_daily", "symbol": "REAL", "params": {}}])
+        self.assertEqual(record["hypotheses_tested"], 0)
+        self.assertEqual(record["skipped_families"],
+                         {"vix_spike_daily": "context series not loaded: VIX",
+                          "vix_term_structure_daily": "context series not loaded: VIX, VIX3M"})
+        self.assertEqual(len(record["rejected_proposals"]), 1)
+        days = trading_days(40)
+        silent = [build_session(day, [(minute, 100.0, 100.0, 100.0, 100.0, 0.0) for minute in range(MINUTES)])
+                  for day in days]
+        quiet = discover.discover(minute={"IDX": silent}, daily={}, families=["vwap_trend"])
+        self.assertEqual((quiet["hypotheses_tested"], quiet["skipped_families"]),
+                         (0, {"vwap_trend": "needs traded volume"}))
+        with_volume = discover.discover(minute={"ETF": [wiggle_session(day) for day in days]}, daily={},
+                                        families=["vwap_trend"])
+        self.assertEqual(with_volume["funnel"]["vwap_trend"]["tested"], 6)
+
+    def test_a_recorded_champion_is_reused_but_tampered_history_is_refused(self):
+        daily = {"REAL": daily_bars(3600, self.START, reverting)}
+        ledger = discover.load_ledger(None)
+        first = discover.discover(minute={}, daily=daily, ledger=ledger,
+                                  families=["close_weakness_reversion_daily"])
+        (key, row), = ledger["promoted"].items()
+        recorded = dict(row["holdout"])
+        again = discover.discover(minute={}, daily=daily, ledger=ledger,
+                                  families=["close_weakness_reversion_daily"])
+        self.assertEqual(again["promoted"][key]["holdout"], recorded)
+        self.assertEqual(first["experiment_id"], again["experiment_id"])
+        self.assertTrue(again["promoted"][key]["checks"]["beyond_holding_the_instrument"])
+        row = ledger["promoted"][key]  # the second run atomically replaces the ledger view
+        for window in ("design", "holdout", "recent"):
+            for name in ("beta", "alpha_bps_per_session", "alpha_t"):
+                del row[window][name]
+        with self.assertRaisesRegex(discover.LedgerError, "integrity"):
+            discover.discover(minute={}, daily=daily, ledger=ledger,
+                              families=["close_weakness_reversion_daily"])
+
+    def test_corrections(self):
+        p_values = {"a": 0.001, "b": 0.012, "c": 0.04, "d": 0.5}
+        self.assertEqual(discover.holm(p_values), {"a", "b"})
+        self.assertEqual(discover.holm({"a": 0.03, "b": 0.04}), set())
+        self.assertEqual(discover.benjamini_yekutieli({"a": 0.0001, "b": 0.5}), {"a"})
+        self.assertEqual(discover.benjamini_yekutieli({}), set())
+
+    def test_a_real_effect_has_historical_support_but_no_order_authority(self):
+        daily = {"REAL": daily_bars(3600, self.START, reverting), "NOISE": daily_bars(3600, self.START, drifting)}
+        record = discover.discover(minute={}, daily=daily,
+                                   families=["close_weakness_reversion_daily", "down_streak_daily"])
+        by_symbol: dict[str, set[str]] = {}
+        for row in record["promoted"].values():
+            by_symbol.setdefault(row["spec"]["symbol"], set()).add(row["tier"])
+        self.assertIn(discover.CONFIRMED, by_symbol["REAL"])
+        self.assertNotIn("NOISE", by_symbol)                        # never passed the design screen
+        self.assertEqual(record["funnel"]["close_weakness_reversion_daily"]["tested"], 60)
+        self.assertNotIn("holdout", json.dumps(record["design_leaderboard"]))
+        book = discover.build_book(record)
+        self.assertFalse(book["authorizing"])
+        self.assertFalse(any(leg["trade"] for leg in book["legs"]))
+        supported = [candidate for candidate in book["candidates"]
+                     if candidate["tier"] == discover.CONFIRMED]
+        self.assertTrue(supported)
+        self.assertTrue(all(candidate["spec"]["symbol"] == "REAL" for candidate in supported))
+        self.assertTrue(all(candidate["data_kind"] == grammar.DAILY for candidate in supported))
+        self.assertTrue(all(candidate["requires_main_qualification"] for candidate in supported))
+        # Full-day observations cannot silently become the runner's 15:50 signal.
+        self.assertFalse(book["legs"])
+        text = discover.render_report(record, book)
+        self.assertIn(discover.CONFIRMED, text)
+
+    def test_the_ledger_only_grows_and_proposals_are_bounded(self):
+        daily = {"REAL": daily_bars(3600, self.START, reverting)}
+        ledger = discover.load_ledger(None)
+        first = discover.discover(minute={}, daily=daily, ledger=ledger,
+                                  families=["close_weakness_reversion_daily"])
+        self.assertEqual(first["promoted_ever"], 1)
+        proposals = [{"family": "close_weakness_reversion_daily", "symbol": "REAL",
+                      "params": {"enter_below": 0.22}},
+                     {"family": "close_weakness_reversion_daily", "symbol": "REAL", "params": {"enter_below": 5}},
+                     {"family": "close_weakness_reversion_daily", "symbol": "ABSENT", "params": {}},
+                     {"family": "print_money", "symbol": "REAL"}]
+        second = discover.discover(minute={}, daily=daily, ledger=ledger, proposals=proposals,
+                                   families=["down_streak_daily"])
+        self.assertGreaterEqual(second["promoted_ever"], 2)        # the first champion is still counted
+        self.assertTrue(set(first["promoted"]) <= set(second["promoted"]))
+        self.assertEqual(len(second["rejected_proposals"]), 3)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ledger.json"
+            path.write_text(json.dumps(ledger), encoding="utf-8")
+            self.assertEqual(set(discover.load_ledger(path)["promoted"]), set(second["promoted"]))
+            path.write_text(json.dumps({"schema": "other"}), encoding="utf-8")
+            with self.assertRaises(discover.LedgerError):
+                discover.load_ledger(path)
+
+    def test_daily_candidates_and_registered_minute_legs_remain_diagnostic(self):
+        def promoted(symbol: str, t_value: float, tier: str) -> dict:
+            return {"spec": {"family": "close_weakness_reversion_daily", "symbol": symbol,
+                             "params": {"enter_below": 0.2, "exit_above": 0.5, "max_sessions": 5}},
+                    "experiment_id": "synthetic-experiment", "evidence_digest": "synthetic-evidence",
+                    "tier": tier, "holdout": {"t": t_value, "sharpe": 1.0}}
+
+        record = {"schema": discover.SCHEMA, "authorizing": False,
+                  "experiment_id": "synthetic-experiment", "holdout_start": "2020-01-01",
+                  "promoted_ever": 6, "promoted": {
+            "a": promoted("SOXL", 3.9, discover.CONFIRMED), "b": promoted("SPY", 3.8, discover.CONFIRMED),
+            "c": promoted("VOO", 3.7, discover.CONFIRMED), "d": promoted("XLK", 3.6, discover.CONFIRMED),
+            "e": promoted("DIA", 2.9, discover.PROVISIONAL), "f": promoted("TLT", 0.2, discover.UNCONFIRMED)}}
+        registered = {"schema": run.SCHEMA, "minute": {"QQQ (index proxy)": {
+            "noise_band_momentum": {"verdict": run.PAPER, "evidence": {"holdout": {"t_newey_west": 2.4}}},
+            "close_weakness_reversion": {"verdict": run.PAPER,
+                                         "evidence": {"holdout": {"t_newey_west": 2.2}}},
+            "opening_range_breakout": {"verdict": run.SHADOW, "evidence": {}}}}}
+        book = discover.build_book(record, registered)
+        self.assertEqual({row["spec"]["symbol"] for row in book["candidates"]},
+                         {"SOXL", "SPY", "VOO", "XLK", "DIA", "TLT"})
+        self.assertEqual({(leg["rule"], leg["symbol"]) for leg in book["legs"]},
+                         {("close_weakness_reversion", "QQQ"), ("noise_band_momentum", "QQQ")})
+        self.assertTrue(all(leg["tier"] == discover.REGISTERED for leg in book["legs"]))
+        self.assertTrue(all(not leg["trade"] and leg["weight"] == 0.0 for leg in book["legs"]))
+        self.assertFalse(book["authorizing"])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "edge_book.json"
+            path.write_text(json.dumps(book), encoding="utf-8")
+            legs = live.load_book(path)
+        self.assertFalse(any(leg.trade for leg in legs))
+
+    def test_command_line_writes_the_record_the_book_and_the_report(self):
+        with tempfile.TemporaryDirectory() as folder:
+            stamps = []
+            columns: dict[str, list[float]] = {"o": [], "h": [], "l": [], "c": []}
+            for bar in daily_bars(3600, self.START, reverting):
+                stamps.append(int(datetime.combine(bar.day, time(14, 30), timezone.utc).timestamp()))
+                for key, value in zip("ohlc", (bar.open, bar.high, bar.low, bar.close)):
+                    columns[key].append(value)
+            with gzip.open(Path(folder) / "REAL.json.gz", "wt", encoding="utf-8") as handle:
+                json.dump({"t": stamps, **columns, "adj": columns["c"]}, handle)
+            with gzip.open(Path(folder) / "FEAR.json.gz", "wt", encoding="utf-8") as handle:
+                json.dump({"t": stamps, "c": [20.0 + index % 5 for index in range(len(stamps))]}, handle)
+            self.assertEqual(len(session_data.load_daily_closes(Path(folder) / "FEAR.json.gz")), 3600)
+            out = Path(folder) / "out"
+            ledger = Path(folder) / "global-ledger.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = discover.main(["--daily-dir", folder, "--daily", "REAL", "--out", str(out),
+                                      "--context", "VIX=FEAR", "--ledger", str(ledger),
+                                      "--experiment", "synthetic-test", "--initialize-ledger",
+                                      "--families", "close_weakness_reversion_daily,vix_spike_daily"])
+            self.assertEqual(code, 0)
+            record = json.loads((out / "discovery.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["context_series"], ["VIX"])
+            self.assertEqual(record["funnel"]["vix_spike_daily"]["tested"], 12)
+            with self.assertRaises(FileNotFoundError), contextlib.redirect_stdout(io.StringIO()):
+                discover.main(["--daily-dir", folder, "--daily", "REAL", "--out", str(out),
+                               "--context", "VIX=ABSENT", "--ledger", str(ledger),
+                               "--experiment", "synthetic-test"])
+            self.assertEqual({path.name for path in out.iterdir()},
+                             {"discovery.json", "discovery.md", "edge_book.json", "main_candidate_review.json"})
+            self.assertTrue(ledger.is_file())
+            book = json.loads((out / "edge_book.json").read_text(encoding="utf-8"))
+            self.assertEqual(book["schema"], live.BOOK_SCHEMA)
+            self.assertFalse(book["authorizing"])
+            self.assertFalse(any(leg["trade"] for leg in book["legs"]))
+            self.assertTrue(book["candidates"])
+
+
+class ProposalTests(unittest.TestCase):
+    RECORD = {"design_leaderboard": [{"spec": {"family": "close_weakness_reversion_daily", "symbol": "SPY",
+                                               "params": {}}, "design_t": 4.2}],
+              "promoted": {"abc": {"spec": {"family": "down_streak_daily", "symbol": "QQQ", "params": {}},
+                                   "design": {"t": 3.1}, "holdout": {"t": 9.9, "sharpe": 7.7},
+                                   "tier": "confirmed"}}}
+
+    def test_prompt_carries_the_grammar_and_no_holdout_result(self):
+        prompt = propose.build_prompt(self.RECORD, ["SPY", "QQQ"], count=500)
+        payload = json.loads(prompt["user"])
+        self.assertEqual(set(payload["grammar"]), set(grammar.FAMILIES))
+        self.assertEqual(payload["wanted"], propose.MAX_PROPOSALS)
+        self.assertEqual(payload["already_promoted"],
+                         [{"spec": self.RECORD["promoted"]["abc"]["spec"], "design_t": 3.1}])
+        for leak in ("holdout", "9.9", "7.7", "confirmed"):
+            self.assertNotIn(leak, prompt["user"])
+
+    def test_reply_is_bounded_by_the_grammar(self):
+        reply = "```json\n" + json.dumps({"hypotheses": [
+            {"family": "close_weakness_reversion", "symbol": "SPY", "params": {"enter_below": 0.18},
+             "thesis": "Late-day forced selling by volatility-targeting funds overshoots and is bought back."},
+            {"family": "close_weakness_reversion", "symbol": "SPY", "params": {"enter_below": 0.18},
+             "thesis": "The same idea again."},
+            {"family": "close_weakness_reversion", "symbol": "TSLA", "params": {}, "thesis": "Not allowed."},
+            {"family": "close_weakness_reversion", "symbol": "SPY", "params": {"enter_below": 0.9},
+             "thesis": "Out of range."},
+            {"family": "noise_band_momentum", "symbol": "QQQ", "params": {}},
+            {"family": "noise_band_momentum", "symbol": "QQQ", "params": {}, "thesis": "x", "code": "rm -rf /"},
+        ]}) + "\n```"
+        valid, rejected = propose.parse_reply(reply, symbols=["SPY", "QQQ"])
+        self.assertEqual([(row["family"], row["params"]["enter_below"]) for row in valid],
+                         [("close_weakness_reversion", 0.18)])
+        self.assertEqual(len(rejected), 5)
+        self.assertEqual(propose.parse_reply("I think you should buy more.")[0], [])
+        self.assertEqual(propose.parse_reply(json.dumps({"ideas": 1}))[1][0]["reason"],
+                         "reply has no list of hypotheses")
+        grammar.normalise(valid[0])                                 # what is written can be read back
+
+    def test_ask_sends_both_messages_and_returns_the_text(self):
+        seen = {}
+
+        class Completions:
+            def create(self, **kwargs):
+                seen.update(kwargs)
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))])
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        prompt = propose.build_prompt(None, ["SPY"])
+        self.assertEqual(propose.ask("some-model", prompt, client=client), "[]")
+        self.assertEqual(seen["model"], "some-model")
+        self.assertEqual([message["role"] for message in seen["messages"]], ["system", "user"])
+
+
+class RunLoopTests(unittest.TestCase):
+    def test_a_stop_signal_between_polls_ends_the_loop_cleanly(self):
+        class Quiet:
+            steps = 0
+
+            def step(self):
+                self.steps += 1
+                return "closed"
+
+        def interrupted(seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        runner = Quiet()
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(live.run_loop(runner, interval=5.0, sleep=interrupted), 0)
+        self.assertEqual((runner.steps, errors.getvalue().strip()), (1, "stopped"))
+
+    def test_a_failing_poll_is_reported_and_the_loop_goes_on(self):
+        class Flaky:
+            calls = 0
+
+            def step(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("feed down\nsecond line")
+                raise KeyboardInterrupt
+
+        waits: list[float] = []
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(live.run_loop(Flaky(), interval=5.0, sleep=waits.append), 0)
+        self.assertEqual(waits, [30.0])
+        self.assertIn("step failed: feed down", errors.getvalue())
+        self.assertNotIn("second line", errors.getvalue())
+
+
+class DeploymentOverrideTests(unittest.TestCase):
+    def test_override_runs_the_shadow_without_orders(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML is not installed")
+        root = Path(__file__).resolve().parents[2]
+        override = yaml.safe_load((root / "deploy" / "compose.session-edges.yaml").read_text(encoding="utf-8"))
+        service = override["services"]["session-edges"]
+        self.assertEqual(service["command"][:4], ["python", "-m", "studies.session_edges.live", "run"])
+        self.assertNotIn("--paper-orders", service["command"])
+        self.assertEqual(service["environment"]["ALPACA_PAPER"], "true")
+        self.assertEqual(service["environment"]["ALPACA_LIVE_ENABLE"], "false")
+        self.assertIs(service["read_only"], True)
+        self.assertEqual(service["user"], "10001:10001")
+        base = yaml.safe_load((root / "compose.yaml").read_text(encoding="utf-8"))
+        self.assertIn(service["secrets"][0]["source"], base["secrets"])
+        self.assertIn(service["configs"][0]["source"], base["configs"])
+        self.assertNotIn("session-edges", base["services"])
+
+
+if __name__ == "__main__":
+    unittest.main()

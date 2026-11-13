@@ -1,0 +1,61 @@
+{
+  "alpha_by": [],
+  "alpha_holm": [],
+  "authorizing": false,
+  "holm_first_threshold": 0.0004032258064516129,
+  "hypotheses_tested": 3861,
+  "limitations": [
+    "recomputes correction from saved approximate statistics only",
+    "does not validate causal timing, fills, costs, factor model or raw data",
+    "requires a new exact-rule raw-data replay and main qualification",
+    "legacy simulator and ledger identities cannot qualify the corrected implementation"
+  ],
+  "minimum_alpha_p": 0.00123065421274543,
+  "promoted_count": 124,
+  "raw_market_data_replayed": false,
+  "recorded_sources": {
+    "grid": 124
+  },
+  "recorded_tiers": {
+    "confirmed": 9,
+    "provisional": 11,
+    "unconfirmed": 104
+  },
+  "schema": "session-edge-artifact-audit.v1",
+  "source": "studies/session_edges/results/discovery-public-2026-11-12/discovery.json",
+  "source_schema": "session-edges-discovery.v1",
+  "source_sha256": "0ceae6736c7d7f15b4d3bce7b5a5a221dc932793dc7711ac40c441a3bffb39ae",
+  "total_return_by": [
+    "0479bdef997e7513",
+    "0c90a10e5f2c2046",
+    "1a7596e6f08742b4",
+    "1ebd246165b8ec9a",
+    "27b5f338961806ee",
+    "4e24b28e5956a688",
+    "82b2a7f9055454dd",
+    "927faff2747470b5",
+    "9386a6ba23eaa786",
+    "a6c38b3848d72602",
+    "ad46aeed22e17240",
+    "adef593f31f663d4",
+    "b095a965e1689106",
+    "b553bb52b1cb19c6",
+    "b9fba84e389782f8",
+    "c6c56307c72946fd",
+    "d963395d529e9400",
+    "d997877bbcd2a356",
+    "e4a09344c3c26eb7",
+    "ece30706455e5a71"
+  ],
+  "total_return_holm": [
+    "27b5f338961806ee",
+    "4e24b28e5956a688",
+    "a6c38b3848d72602",
+    "ad46aeed22e17240",
+    "b095a965e1689106",
+    "b553bb52b1cb19c6",
+    "b9fba84e389782f8",
+    "d997877bbcd2a356",
+    "e4a09344c3c26eb7"
+  ]
+}

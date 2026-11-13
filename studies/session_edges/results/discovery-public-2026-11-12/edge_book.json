@@ -1,0 +1,361 @@
+{
+ "created": "2026-11-12T13:08:35+00:00",
+ "holdout_start": "2020-01-01",
+ "legs": [
+  {
+   "evidence": "SOXL",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.930063,
+   "holdout_beta": 0.365748,
+   "holdout_sharpe": 1.344018,
+   "holdout_t": 3.875186,
+   "id": "b553bb52b1cb19c6",
+   "note": "leveraged fund: recorded only",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.25,
+    "exit_above": 0.5,
+    "max_sessions": 3
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "SOXL",
+   "tier": "confirmed",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "SPY",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.601152,
+   "holdout_beta": 0.282665,
+   "holdout_sharpe": 1.298595,
+   "holdout_t": 3.76139,
+   "id": "27b5f338961806ee",
+   "note": "",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.1,
+    "exit_above": 0.6,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "SPY",
+   "tier": "confirmed",
+   "trade": true,
+   "weight": 0.1667
+  },
+  {
+   "evidence": "XLK",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.471604,
+   "holdout_beta": 0.267796,
+   "holdout_sharpe": 1.249729,
+   "holdout_t": 3.69729,
+   "id": "b9fba84e389782f8",
+   "note": "",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.1,
+    "exit_above": 0.6,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "XLK",
+   "tier": "confirmed",
+   "trade": true,
+   "weight": 0.1667
+  },
+  {
+   "evidence": "SSO",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.50276,
+   "holdout_beta": 0.387147,
+   "holdout_sharpe": 1.330559,
+   "holdout_t": 3.688582,
+   "id": "d997877bbcd2a356",
+   "note": "leveraged fund: recorded only",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.2,
+    "exit_above": 0.6,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "SSO",
+   "tier": "confirmed",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "IVW",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.54106,
+   "holdout_beta": 0.317604,
+   "holdout_sharpe": 1.328118,
+   "holdout_t": 3.532603,
+   "id": "a6c38b3848d72602",
+   "note": "",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.2,
+    "exit_above": 0.6,
+    "max_sessions": 3
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "IVW",
+   "tier": "confirmed",
+   "trade": true,
+   "weight": 0.1667
+  },
+  {
+   "evidence": "QQQ (index proxy)",
+   "family": "noise_band_momentum",
+   "holdout_sharpe": 0.768797,
+   "holdout_t": 2.381255,
+   "id": "registered:noise_band_momentum:QQQ",
+   "note": "",
+   "params": {
+    "band_multiple": 1.0,
+    "decision_step_minutes": 30,
+    "first_decision_minute": 30,
+    "last_decision_minute": 360,
+    "lookback_sessions": 14,
+    "sides": [
+     "long",
+     "short"
+    ]
+   },
+   "rule": "noise_band_momentum",
+   "sleeve": "intraday",
+   "symbol": "QQQ",
+   "tier": "registered",
+   "trade": true,
+   "weight": 0.25
+  },
+  {
+   "evidence": "QQQ (index proxy)",
+   "family": "close_weakness_reversion",
+   "holdout_sharpe": 0.821282,
+   "holdout_t": 2.21538,
+   "id": "registered:close_weakness_reversion:QQQ",
+   "note": "symbol already owned by a stronger leg",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.2,
+    "exit_above": 0.5,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "QQQ",
+   "tier": "registered",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "SMH",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 1.790451,
+   "holdout_beta": 0.347167,
+   "holdout_sharpe": 1.116026,
+   "holdout_t": 3.194417,
+   "id": "0c90a10e5f2c2046",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.25,
+    "exit_above": 0.6,
+    "max_sessions": 3
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "SMH",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "UPRO",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.27266,
+   "holdout_beta": 0.273019,
+   "holdout_sharpe": 1.22836,
+   "holdout_t": 3.162025,
+   "id": "0479bdef997e7513",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.15,
+    "exit_above": 0.5,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "UPRO",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "QLD",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.223748,
+   "holdout_beta": 0.242436,
+   "holdout_sharpe": 1.206153,
+   "holdout_t": 3.10602,
+   "id": "1ebd246165b8ec9a",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.15,
+    "exit_above": 0.5,
+    "max_sessions": 3
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "QLD",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "VB",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.539223,
+   "holdout_beta": 0.264492,
+   "holdout_sharpe": 1.037097,
+   "holdout_t": 3.020726,
+   "id": "c6c56307c72946fd",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.15,
+    "exit_above": 0.6,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "VB",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "GDX",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.388993,
+   "holdout_beta": 0.406252,
+   "holdout_sharpe": 1.070139,
+   "holdout_t": 2.933485,
+   "id": "9386a6ba23eaa786",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.3,
+    "exit_above": 0.5,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "GDX",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "DIA",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 1.972944,
+   "holdout_beta": 0.295659,
+   "holdout_sharpe": 1.065985,
+   "holdout_t": 2.929678,
+   "id": "adef593f31f663d4",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.15,
+    "exit_above": 0.5,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "DIA",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "VTI",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 1.779152,
+   "holdout_beta": 0.318401,
+   "holdout_sharpe": 1.095295,
+   "holdout_t": 2.874349,
+   "id": "ece30706455e5a71",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.2,
+    "exit_above": 0.5,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "VTI",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "EEM",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 2.430444,
+   "holdout_beta": 0.3274,
+   "holdout_sharpe": 0.970614,
+   "holdout_t": 2.8207,
+   "id": "1a7596e6f08742b4",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.2,
+    "exit_above": 0.6,
+    "max_sessions": 5
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "EEM",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  },
+  {
+   "evidence": "TQQQ",
+   "family": "close_weakness_reversion_daily",
+   "holdout_alpha_t": 1.98409,
+   "holdout_beta": 0.229738,
+   "holdout_sharpe": 1.08711,
+   "holdout_t": 2.819277,
+   "id": "d963395d529e9400",
+   "note": "evidence tier does not trade",
+   "params": {
+    "decision_minute": 380,
+    "enter_below": 0.15,
+    "exit_above": 0.5,
+    "max_sessions": 3
+   },
+   "rule": "close_weakness_reversion",
+   "sleeve": "swing",
+   "symbol": "TQQQ",
+   "tier": "provisional",
+   "trade": false,
+   "weight": 0.0
+  }
+ ],
+ "promoted_ever": 124,
+ "schema": "session-edges-book.v1"
+}

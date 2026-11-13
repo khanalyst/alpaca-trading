@@ -11,7 +11,10 @@ dated file.
 | file | role | use |
 | --- | --- | --- |
 | [current-findings.md](current-findings.md) | authoritative status snapshot | blockers, broker state, evidence status, and next authorized action |
+| [session-edge-integration-2026-11-13/README.md](session-edge-integration-2026-11-13/README.md) | session mechanism integration and validation | corrected alpha, causal timing, immutable experiment history, recovery and main qualification boundary |
 | [deep-audit-2026-11-10/README.md](deep-audit-2026-11-10/README.md) | complete current audit | implementation, arm-level evidence, live recheck, and fresh validation detail |
+| [strategy-audit-2026-11-11/README.md](strategy-audit-2026-11-11/README.md) | strategy audit and independent research | why the registered arms have no edge, long-history tests of published rules, and the candidates for paper trading; retrospective, non-authorizing for the frozen trial |
+| [../studies/session_edges/README.md](../studies/session_edges/README.md) | session-edge study, discovery engine and forward runner | hypothesis grammar, search protocol, edge book, SIP confirmation, and the shadow, paper and live procedure |
 | [edge-diagnostics.md](edge-diagnostics.md) | diagnostic procedure | measure without opening an account or authorizing a strategy |
 | [paper-shadow-trials.md](paper-shadow-trials.md) | guarded paper/shadow protocol | identity, flat-book, acceptance, and replacement controls; check current findings first |
 | [preregistered-hypotheses.md](preregistered-hypotheses.md) | sealed protocol and hypotheses | preserve manifests and sealed windows; do not rewrite for later results |
