@@ -1481,6 +1481,89 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(heartbeat["status"], "stopped")
         self.assertEqual(heartbeat["reason"], "operator request")
 
+    def test_request_shutdown_persists_provenance_before_flatten(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        state.update_state(lambda current: {**current, "state": state.RUNNING,
+                                            "operator_pause": False})
+        self.assertTrue(engine._acquire_lock(persistent=True))
+        engine.running = True
+
+        engine.request_shutdown(
+            "SIGTERM", source="main_signal_handler", signal_name="SIGTERM",
+            signal_number=15)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            row = db.execute(
+                "SELECT kind, payload, run_id, runtime_mode FROM events "
+                "WHERE kind = 'shutdown_requested' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        kind, payload, run_id, runtime_mode = row
+        receipt = json.loads(payload)
+        self.assertEqual(kind, "shutdown_requested")
+        self.assertEqual(receipt["source"], "main_signal_handler")
+        self.assertEqual(receipt["signal_name"], "SIGTERM")
+        self.assertEqual(receipt["signal_number"], 15)
+        self.assertEqual(receipt["run_id"], run_id)
+        self.assertEqual(receipt["runtime_mode"], runtime_mode)
+        self.assertEqual(receipt["pid"], os.getpid())
+        self.assertEqual(receipt["ppid"], os.getppid())
+        self.assertIsInstance(receipt["receipt_ts"], float)
+
+        observed = []
+        def flatten(reason):
+            with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+                observed.append(db.execute(
+                    "SELECT count(*) FROM events "
+                    "WHERE kind = 'shutdown_requested'"
+                ).fetchone()[0])
+            return True
+        with patch.object(engine, "_flatten_all_impl", side_effect=flatten):
+            engine._flatten_all_impl("SIGTERM")
+        self.assertEqual(observed, [1])
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "pausing")
+        self.assertEqual(heartbeat["source"], "main_signal_handler")
+        self.assertEqual(heartbeat["signal_number"], 15)
+        self.assertEqual(heartbeat["shutdown_provenance"], receipt)
+        engine.close()
+
+    def test_shutdown_audit_failure_still_pauses_and_stops(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        state.update_state(lambda current: {**current, "state": state.RUNNING,
+                                            "operator_pause": False})
+        self.assertTrue(engine._acquire_lock(persistent=True))
+        engine.running = True
+        with patch.object(state, "log_event",
+                          side_effect=OSError("journal unavailable")):
+            engine.request_shutdown("SIGTERM", source="main_signal_handler",
+                                    signal_name="SIGTERM", signal_number=15)
+        self.assertFalse(engine.running)
+        self.assertTrue(state.load_state()["operator_pause"])
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "pausing")
+        self.assertEqual(heartbeat["source"], "main_signal_handler")
+        engine.close()
+
+    def test_shutdown_provenance_failure_still_persists_pause_and_stops_loop(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        state.update_state(lambda current: {**current, "state": state.RUNNING,
+                                            "operator_pause": False})
+        self.assertTrue(engine._acquire_lock(persistent=True))
+        engine.running = True
+        with patch.object(engine, "_shutdown_provenance",
+                          side_effect=RuntimeError("metadata exploded")):
+            engine.request_shutdown("SIGTERM", source="main_signal_handler",
+                                    signal_name="SIGTERM", signal_number=15)
+        self.assertFalse(engine.running)
+        self.assertTrue(state.load_state()["operator_pause"])
+        self.assertEqual(engine.shutdown_provenance["source"],
+                         "main_signal_handler")
+        self.assertEqual(engine.shutdown_provenance["reason"], "SIGTERM")
+        engine.close()
+
     def test_readiness_false_rolls_back_running_state_and_releases_lock(self):
         from agent import state
         engine = Engine(_cfg(), light=True, provider=FakeProvider())

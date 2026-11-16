@@ -1,6 +1,8 @@
 """Process ownership and emergency handoff regressions; no broker access."""
+from contextlib import closing
 import json
 from pathlib import Path
+import signal
 import subprocess
 import sqlite3
 import sys
@@ -143,7 +145,8 @@ class SupervisorTests(unittest.TestCase):
                  patch.object(supervisor, "write_status"), \
                  patch.object(supervisor, "monitor", return_value="unresponsive"), \
                  patch.object(supervisor, "terminate_child", side_effect=terminate), \
-                 patch.object(supervisor, "recover", side_effect=recover):
+                 patch.object(supervisor, "recover", side_effect=recover), \
+                 patch.object(supervisor.state, "log_event"):
                 self.assertEqual(supervisor.supervise("test.json"), 1)
             if reaped:
                 self.assertEqual(order, ["waited", "recover"])
@@ -183,6 +186,107 @@ class SupervisorTests(unittest.TestCase):
              patch.object(supervisor, "recover", side_effect=lambda *a: order.append("recovery") or {}):
             self.assertEqual(supervisor.supervise("test.json"), 1)
         self.assertEqual(order, ["reaped", "recovery"])
+
+    def test_unresponsive_reap_receipt_survives_status_rewrite(self):
+        from agent import state
+        child = Mock(pid=27, returncode=-9)
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            status_path = Path(directory) / "supervisor.json"
+            old_paths = state.RUNTIME, state.RUNTIME_SCOPE
+            state._set_paths(runtime, "paper")
+            state.ensure_ready()
+            try:
+                with patch("main.load_cfg", return_value={"mode": "paper"}), \
+                     patch.object(supervisor.state, "configure_runtime"), \
+                     patch.object(supervisor, "wait_until_resumed", return_value=True), \
+                     patch.object(supervisor.subprocess, "Popen", return_value=child), \
+                     patch.object(supervisor, "monitor", return_value="unresponsive"), \
+                     patch.object(supervisor, "terminate_child", return_value=True), \
+                     patch.object(supervisor, "recover",
+                                  return_value={"flattened": True}), \
+                     patch.object(supervisor.signal, "signal", return_value=object()):
+                    self.assertEqual(supervisor.supervise(
+                        "test.json", status_path=status_path), 1)
+                supervisor.write_status(status_path, "watching", child_pid=27)
+                with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+                    row = db.execute(
+                        "SELECT kind, payload FROM events "
+                        "WHERE kind = 'supervisor_child_stopped' "
+                        "ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row[0], "supervisor_child_stopped")
+                payload = json.loads(row[1])
+                self.assertEqual(payload["trigger"], "unresponsive")
+                self.assertEqual(payload["monitor_result"], "unresponsive")
+                self.assertEqual(payload["child_pid"], 27)
+                self.assertEqual(payload["child_exit_code"], -9)
+                self.assertEqual(payload["recovery_ok"], True)
+                self.assertEqual(payload["runtime_mode"], "paper")
+            finally:
+                state._set_paths(*old_paths)
+
+    def test_reap_audit_failure_still_recovers_without_relaunch(self):
+        order = []
+        child = Mock(pid=27, returncode=-9)
+
+        def terminate(*args, **kwargs):
+            order.append("reaped")
+            return True
+
+        def recover(*args):
+            order.append("recovery")
+            return {"flattened": True}
+
+        with patch("main.load_cfg", return_value={"mode": "paper"}), \
+             patch.object(supervisor.state, "configure_runtime"), \
+             patch.object(supervisor, "wait_until_resumed", return_value=True), \
+             patch.object(supervisor.subprocess, "Popen", return_value=child) as launch, \
+             patch.object(supervisor, "write_status"), \
+             patch.object(supervisor, "monitor", return_value="unresponsive"), \
+             patch.object(supervisor, "terminate_child", side_effect=terminate), \
+             patch.object(supervisor, "recover", side_effect=recover), \
+             patch.object(supervisor.state, "log_event",
+                          side_effect=OSError("journal unavailable")):
+            self.assertEqual(supervisor.supervise("test.json"), 1)
+        self.assertEqual(order, ["reaped", "recovery"])
+        self.assertEqual(launch.call_count, 1)
+
+    def test_received_signal_metadata_is_retained_in_final_status(self):
+        child = Mock(pid=27, returncode=0)
+        child.wait.return_value = 0
+        callbacks = {}
+        statuses = []
+
+        def install(signum, handler):
+            callbacks[signum] = handler
+            return signal_handler_previous
+
+        signal_handler_previous = object()
+
+        def record_status(_path, status, **detail):
+            statuses.append((status, detail))
+
+        with patch("main.load_cfg", return_value={"mode": "paper"}), \
+             patch.object(supervisor.state, "configure_runtime"), \
+             patch.object(supervisor, "wait_until_resumed", return_value=True), \
+             patch.object(supervisor.subprocess, "Popen", return_value=child), \
+             patch.object(supervisor, "write_status", side_effect=record_status), \
+             patch.object(supervisor.signal, "signal", side_effect=install), \
+             patch.object(supervisor, "monitor", side_effect=lambda *args, **kwargs: (
+                 callbacks[signal.SIGTERM](signal.SIGTERM, None) or "exit")):
+            self.assertEqual(supervisor.supervise("test.json"), 0)
+
+        self.assertEqual(statuses[-1][0], "stopped")
+        received = statuses[-1][1]["received_signal"]
+        self.assertEqual(received["source"],
+                         "trader_supervisor_signal_handler")
+        self.assertEqual(received["signal_name"], "SIGTERM")
+        self.assertEqual(received["signal_number"], signal.SIGTERM)
+        self.assertEqual(received["pid"], supervisor.os.getpid())
+        self.assertEqual(received["ppid"], supervisor.os.getppid())
+        self.assertEqual(statuses[-1][1]["signal_source"], received["source"])
 
 
 if __name__ == "__main__":

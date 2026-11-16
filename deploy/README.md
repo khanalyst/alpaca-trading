@@ -156,6 +156,21 @@ An incomplete or mismatched shadow session is quarantined. Correct the source
 or identity, then rerun the bounded cycle; do not skip the session or rebind a
 frozen identity to make ingestion advance.
 
+`ALPACA_RESEARCH_ACCEPTANCE_ROOT` selects the acceptance directory for both the
+shadow writer and research reader. An explicitly enabled paper trial must name
+the same directory in `accepted_session_report_root`. Use a new directory for
+an audited new trial/evidence epoch; preserve the prior reports. Changing this
+path does not migrate old reports or make them count for the new identity.
+
+Authorizing replay uses `--authorizing-event-budget` and
+`--authorizing-decision-budget` to bound each poll. Its durable cursor is
+scoped to the candidate and evidence/code identity. `backlog_deferred` means
+work remains; incomplete sessions cannot become complete replay evidence.
+An already capped legacy WAL records a migration baseline before allowing
+bounded forward continuation. The ordinary `--max-decisions` storage guard
+remains fail-closed. Preserve old rows and inspect progress/capacity rather
+than deleting history to clear a limit.
+
 ## Deployment updates
 
 Use `update-compose.sh` on the Linux VM:

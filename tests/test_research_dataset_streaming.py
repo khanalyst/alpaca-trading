@@ -84,7 +84,7 @@ class ResearchDatasetStreamingTests(unittest.TestCase):
             self.assertIsNone(historical_source_fingerprint(
                 partition_root=sessions, recorded_root=root))
 
-    def test_trusted_recorder_unmarked_partition_gets_explicit_forward_mode(self):
+    def test_trusted_recorder_forward_marker_gets_explicit_forward_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sessions = root / "sessions"
@@ -97,6 +97,12 @@ class ResearchDatasetStreamingTests(unittest.TestCase):
                 "open": 100, "high": 101, "low": 99, "close": 100,
                 "volume": 10,
             }])
+            partition.with_name(partition.name + ".source.json").write_text(
+                json.dumps({
+                    "schema": "recorder-partition-source.v1",
+                    "partition": partition.name,
+                    "source_mode": "forward_observed",
+                }), encoding="utf-8")
             outputs = _outputs(root)
 
             build_views(
@@ -108,6 +114,91 @@ class ResearchDatasetStreamingTests(unittest.TestCase):
             rows = [json.loads(line) for line in outputs["normalized"].read_text(
                 encoding="utf-8").splitlines()]
             self.assertEqual(rows[0]["source_mode"], "forward_observed")
+            self.assertEqual(rows[0]["provider"], "alpaca")
+            self.assertEqual(rows[0]["feed"], "iex")
+            self.assertEqual(rows[0]["observed_at"], stamp)
+            self.assertEqual(rows[0]["as_of"], stamp)
+
+    def test_trusted_recorder_unmarked_partition_gets_explicit_forward_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99,
+                "close": 100, "volume": 10,
+            }])
+            outputs = _outputs(root)
+
+            build_views(
+                partition_root=sessions, input_format="csv",
+                normalized=outputs["normalized"], bars=outputs["bars"],
+                quotes=outputs["quotes"], options=outputs["options"],
+                replay=outputs["replay"], from_recorder=True)
+
+            row = json.loads(outputs["normalized"].read_text(
+                encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["source_mode"], "forward_observed")
+
+    def test_forward_marker_rejects_historical_row_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            partition.parent.mkdir(parents=True, exist_ok=True)
+            partition.write_text(
+                "event_type,provider,feed,symbol,timestamp,observed_at,as_of,"
+                "open,high,low,close,volume,source_mode\n"
+                f"bar_1m,alpaca,iex,SPY,{stamp},{stamp},{stamp},"
+                "100,101,99,100,10,historical_backfill\n",
+                encoding="utf-8")
+            partition.with_name(partition.name + ".source.json").write_text(
+                json.dumps({
+                    "schema": "recorder-partition-source.v1",
+                    "partition": partition.name,
+                    "source_mode": "forward_observed",
+                }), encoding="utf-8")
+            outputs = _outputs(root)
+
+            with self.assertRaisesRegex(ValueError, "conflicts with recorder source"):
+                build_views(
+                    partition_root=sessions, input_format="csv",
+                    normalized=outputs["normalized"], bars=outputs["bars"],
+                    quotes=outputs["quotes"], options=outputs["options"],
+                    replay=outputs["replay"], from_recorder=True)
+
+    def test_malformed_source_marker_refuses_before_view_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            partition = sessions / "market-2026-01-05.csv"
+            stamp = "2026-01-05T14:30:00+00:00"
+            _write_partition(partition, [{
+                "event_type": "bar_1m", "provider": "alpaca", "feed": "iex",
+                "symbol": "SPY", "timestamp": stamp,
+                "observed_at": stamp, "as_of": stamp,
+                "open": 100, "high": 101, "low": 99,
+                "close": 100, "volume": 10,
+            }])
+            partition.with_name(partition.name + ".source.json").write_text(
+                json.dumps({
+                    "schema": "recorder-partition-source.v1",
+                    "partition": partition.name,
+                    "source_mode": "implicit",
+                }), encoding="utf-8")
+            outputs = _outputs(root)
+
+            with self.assertRaisesRegex(ValueError, "invalid source provenance sidecar"):
+                build_views(
+                    partition_root=sessions, input_format="csv",
+                    normalized=outputs["normalized"], bars=outputs["bars"],
+                    quotes=outputs["quotes"], options=outputs["options"],
+                    replay=outputs["replay"], from_recorder=True)
 
     def test_crash_safe_historical_source_sidecar_overrides_stale_index(self):
         with tempfile.TemporaryDirectory() as directory:

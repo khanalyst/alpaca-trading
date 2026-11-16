@@ -18,6 +18,8 @@ if str(ROOT) not in sys.path:
 
 from research.live_shadow import (DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS,
                                   DEFAULT_REPLAY_SESSION_MAX_EVENTS,
+                                  DEFAULT_AUTHORIZING_EVENT_BUDGET,
+                                  DEFAULT_AUTHORIZING_DECISION_BUDGET,
                                   DEFAULT_MAX_WORKERS, DEFAULT_RETENTION_DAYS,
                                   ShadowConfig, ShadowRunner,
                                   _next_shadow_cadence_deadline)  # noqa: E402
@@ -70,6 +72,12 @@ def parser() -> argparse.ArgumentParser:
                    default=DEFAULT_REPLAY_SESSION_MAX_EVENTS,
                    help="bounded complete-session replay, separate from poll ingestion")
     p.add_argument("--max-decisions", type=int, default=100_000)
+    p.add_argument("--authorizing-event-budget", type=int,
+                   default=DEFAULT_AUTHORIZING_EVENT_BUDGET,
+                   help="bounded authorizing events evaluated per poll")
+    p.add_argument("--authorizing-decision-budget", type=int,
+                   default=DEFAULT_AUTHORIZING_DECISION_BUDGET,
+                   help="bounded new authorizing decisions written per poll")
     p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                    help="bounded parallel candidate evaluators (default: %(default)s)")
     p.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
@@ -183,6 +191,7 @@ def _run_shadow_loop(args: argparse.Namespace, runner: ShadowRunner,
                 "stress_calibration", "stale_tail", "diagnostic_shadow",
                 "authorizing_candidates", "diagnostic_candidates",
                 "authorizing_event_cache_hit",
+                "authorizing_progress",
                 "poll_duration_seconds", "source_lag_seconds",
                 "poll_phase_metrics")
                 if key in result}
@@ -224,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
         corpus_path=args.corpus, edge_db=args.edge_db, shadow_db=args.shadow_db,
         max_candidates=args.max_candidates, max_events=args.max_events,
         max_decisions=args.max_decisions,
+        authorizing_event_budget=args.authorizing_event_budget,
+        authorizing_decision_budget=args.authorizing_decision_budget,
         diagnostic_session_max_events=args.diagnostic_session_max_events,
         replay_session_max_events=args.replay_session_max_events,
         max_workers=args.max_workers,

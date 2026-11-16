@@ -652,7 +652,7 @@ class LiveShadowTests(unittest.TestCase):
                    "observed_at": "2026-01-02T14:30:09+00:00"}
         self.assertEqual(ShadowRunner._latest_quote([visible], at), visible)
 
-    def test_saturated_legacy_wal_baselines_then_ingests_only_appends(self):
+    def test_saturated_legacy_wal_reconciles_unknown_rows_then_ingests_appends(self):
         self._candidate()
         self._write_rows()
         original = list(iter_corpus_rows(self.corpus))
@@ -660,7 +660,7 @@ class LiveShadowTests(unittest.TestCase):
         for row in original[:2]:
             store.ingest_event(row, max_events=2)
         first = self._run(max_events=2)
-        self.assertEqual(first["ingested_events"], 0)
+        self.assertEqual(first["ingested_events"], 1)
         appended = dict(original[-1])
         stamp = datetime.fromisoformat(appended["timestamp"]) + timedelta(minutes=1)
         appended["timestamp"] = stamp.isoformat()

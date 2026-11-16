@@ -92,6 +92,14 @@ DEFAULT_EQUITY = 100_000.0
 DEFAULT_MAX_CANDIDATES = 32
 DEFAULT_MAX_EVENTS = 20_000
 DEFAULT_MAX_DECISIONS = 100_000
+# Authorizing evaluation is deliberately paged independently from recorder
+# ingestion.  The default preserves the historical one-poll behavior while
+# allowing operators to choose a smaller forward budget when a legacy WAL has
+# accumulated a large immutable history.
+DEFAULT_AUTHORIZING_EVENT_BUDGET = DEFAULT_MAX_EVENTS
+DEFAULT_AUTHORIZING_DECISION_BUDGET = DEFAULT_MAX_DECISIONS
+MAX_AUTHORIZING_EVENT_BUDGET = 1_000_000
+MAX_AUTHORIZING_DECISION_BUDGET = 1_000_000
 DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS = 200_000
 MAX_DIAGNOSTIC_SESSION_MAX_EVENTS = 1_000_000
 # Replay correction is loaded one recorder session at a time.  This bound is
@@ -108,6 +116,9 @@ MAX_MAX_WORKERS = 32
 # Keep this as the single source of truth for the library and operations CLI.
 DEFAULT_RETENTION_DAYS = 180
 MAX_PENDING_CORPUS_BYTES = 64 * 1024 * 1024
+# Legacy WALs without recorder offsets are reconciled incrementally. Keep one
+# source's first-upgrade scan bounded even when the mounted corpus is huge.
+MAX_LEGACY_RECONCILIATION_BYTES = 16 * 1024 * 1024
 MAX_QUARANTINE_EVENTS = 1024
 QUARANTINE_OVERFLOW_KEY = "__quarantine_overflow__"
 # Provider mismatches are a fail-closed replay condition.  Keep the persisted
@@ -1167,8 +1178,11 @@ def _corpus_sources(path: Path) -> list[Path]:
     return sources
 
 
-def _read_corpus_append(source: Path, offset: int) -> tuple[list[dict], int]:
-    """Read only complete CSV rows appended after a durable byte offset."""
+def _read_corpus_append(source: Path, offset: int, *,
+                        row_filter: Any | None = None,
+                        max_bytes: int | None = None
+                        ) -> tuple[list[dict], int]:
+    """Read complete CSV rows after a durable offset and optional byte budget."""
     size = source.stat().st_size
     if size < offset:
         raise ShadowError(f"shadow corpus source shrank: {source}")
@@ -1181,7 +1195,12 @@ def _read_corpus_append(source: Path, offset: int) -> tuple[list[dict], int]:
         except (csv.Error, StopIteration) as exc:
             raise ShadowError(f"shadow corpus source has invalid header: {source}") from exc
         handle.seek(offset)
-        payload = handle.read(size - offset)
+        read_size = size - offset
+        if max_bytes is not None:
+            if isinstance(max_bytes, bool) or int(max_bytes) <= 0:
+                raise ShadowError("shadow corpus read budget is invalid")
+            read_size = min(read_size, int(max_bytes))
+        payload = handle.read(read_size)
     if payload and not payload.endswith(b"\n"):
         boundary = payload.rfind(b"\n")
         if boundary < 0:
@@ -1204,7 +1223,8 @@ def _read_corpus_append(source: Path, offset: int) -> tuple[list[dict], int]:
     for row in reader:
         if None in row:
             raise ShadowError(f"shadow corpus source has malformed CSV: {source}")
-        rows.append(row)
+        if row_filter is None or row_filter(row):
+            rows.append(row)
     return rows, consumed
 
 
@@ -1415,11 +1435,17 @@ class ShadowConfig:
     diagnostic_include_ibr: bool = False
     # Appended after every existing field to preserve positional callers.
     replay_session_max_events: int = DEFAULT_REPLAY_SESSION_MAX_EVENTS
+    # Appended fields preserve the historical positional constructor contract.
+    # These budgets apply to one authorizing poll, not to immutable WAL
+    # lifetime evidence.  The latter remains governed by max_decisions.
+    authorizing_event_budget: int = DEFAULT_AUTHORIZING_EVENT_BUDGET
+    authorizing_decision_budget: int = DEFAULT_AUTHORIZING_DECISION_BUDGET
 
     def __post_init__(self) -> None:
         for name in ("max_candidates", "max_events", "max_decisions",
                      "diagnostic_session_max_events", "max_workers",
-                     "retention_days", "replay_session_max_events"):
+                     "retention_days", "replay_session_max_events",
+                     "authorizing_event_budget", "authorizing_decision_budget"):
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value or int(value) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -1434,6 +1460,14 @@ class ShadowConfig:
             raise ValueError(
                 "replay_session_max_events must be <= "
                 f"{MAX_REPLAY_SESSION_MAX_EVENTS}")
+        if int(self.authorizing_event_budget) > MAX_AUTHORIZING_EVENT_BUDGET:
+            raise ValueError(
+                "authorizing_event_budget must be <= "
+                f"{MAX_AUTHORIZING_EVENT_BUDGET}")
+        if int(self.authorizing_decision_budget) > MAX_AUTHORIZING_DECISION_BUDGET:
+            raise ValueError(
+                "authorizing_decision_budget must be <= "
+                f"{MAX_AUTHORIZING_DECISION_BUDGET}")
         if _finite(self.equity) is None or float(self.equity) <= 0:
             raise ValueError("equity must be positive and finite")
         object.__setattr__(self, "poll_seconds",
@@ -1603,6 +1637,18 @@ class ShadowStore:
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(cohort_identity,candidate_id)
                 );
+                CREATE TABLE IF NOT EXISTS authorizing_progress (
+                    candidate_id TEXT NOT NULL,
+                    epoch_identity TEXT NOT NULL,
+                    last_inserted_at REAL NOT NULL,
+                    last_event_key TEXT NOT NULL,
+                    processed_events INTEGER NOT NULL,
+                    deferred_events INTEGER NOT NULL,
+                    deferred_sessions_json TEXT NOT NULL,
+                    last_manifest_digest TEXT,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(candidate_id,epoch_identity)
+                );
                 CREATE TABLE IF NOT EXISTS diagnostic_accounts (
                     cohort_identity TEXT NOT NULL,
                     candidate_id TEXT NOT NULL,
@@ -1722,6 +1768,8 @@ class ShadowStore:
                   ON diagnostic_orders(cohort_identity,candidate_id,created_at);
                 CREATE INDEX IF NOT EXISTS diagnostic_fills_candidate_idx
                   ON diagnostic_fills(cohort_identity,candidate_id,created_at);
+                CREATE INDEX IF NOT EXISTS authorizing_progress_candidate_idx
+                  ON authorizing_progress(candidate_id,updated_at);
             """)
             event_columns = {
                 str(row["name"]) for row in db.execute(
@@ -1813,6 +1861,14 @@ class ShadowStore:
         with self._connection() as db:
             return int(db.execute("SELECT count(*) FROM events").fetchone()[0])
 
+    def event_digest(self, event_key: str) -> str | None:
+        """Return the immutable digest for one event key, if it is known."""
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT digest FROM events WHERE event_key=?",
+                (str(event_key),)).fetchone()
+        return str(row["digest"]) if row is not None else None
+
     def source_offsets(self) -> dict[str, int] | None:
         with self._connection() as db:
             row = db.execute("SELECT value FROM meta WHERE key='corpus_source_offsets'").fetchone()
@@ -1828,6 +1884,70 @@ class ShadowStore:
                 for key, offset in value.items()):
             raise ShadowError("shadow corpus offsets are invalid")
         return value
+
+    def inferred_source_offsets(self) -> dict[str, int]:
+        """Recover committed recorder ends for pre-progress WALs."""
+        with self._connection() as db:
+            rows = db.execute("""SELECT source_path,MAX(source_offset_end)
+                AS source_offset_end FROM events
+                WHERE source_path IS NOT NULL AND source_offset_end IS NOT NULL
+                GROUP BY source_path""").fetchall()
+        return {str(row["source_path"]): int(row["source_offset_end"])
+                for row in rows if row["source_path"] and
+                row["source_offset_end"] is not None}
+
+    def legacy_reconciliation_offsets(self) -> dict[str, int]:
+        """Read bounded scan cursors for a no-provenance WAL migration."""
+        key = "legacy_reconciliation_offsets.v1"
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("legacy reconciliation offsets are invalid") from exc
+        if (not isinstance(value, dict) or any(
+                not isinstance(path, str) or isinstance(offset, bool) or
+                not isinstance(offset, int) or offset < 0
+                for path, offset in value.items())):
+            raise ShadowError("legacy reconciliation offsets are invalid")
+        return {str(path): int(offset) for path, offset in value.items()}
+
+    def save_legacy_reconciliation_offsets(
+            self, offsets: Mapping[str, int]) -> None:
+        """Persist only safe complete-row scan boundaries for migration."""
+        payload = {str(path): int(offset) for path, offset in offsets.items()}
+        if any(isinstance(offset, bool) or offset < 0
+               for offset in payload.values()):
+            raise ShadowError("legacy reconciliation offsets are invalid")
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value) VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                       ("legacy_reconciliation_offsets.v1", _json(payload)))
+
+    def legacy_reconciliation_complete(self) -> bool:
+        """Return whether the no-provenance migration reached every source."""
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='legacy_reconciliation_complete.v1'"
+            ).fetchone()
+        if row is None:
+            return False
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("legacy reconciliation completion is invalid") from exc
+        return bool(isinstance(value, Mapping) and value.get("complete") is True)
+
+    def mark_legacy_reconciliation_complete(self) -> None:
+        """Record completion only after source offsets are durably committed."""
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value) VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                       ("legacy_reconciliation_complete.v1",
+                        _json({"schema": "legacy-reconciliation.v1",
+                               "complete": True, "updated_at": time.time()})))
 
     def save_source_offsets(self, offsets: Mapping[str, int]) -> None:
         payload = _json({str(key): int(value) for key, value in offsets.items()})
@@ -3059,9 +3179,190 @@ class ShadowStore:
                     str(candidate.get("strategy_id") or ""), str(candidate.get("vehicle") or ""),
                     str(candidate.get("status") or ""), _json(config), _json(proof), time.time()))
 
+    @staticmethod
+    def authorizing_epoch_identity(
+            candidate: Mapping[str, Any], *,
+            replay_code_hash: str | None = None) -> str:
+        """Return the stable identity for one authorizing cursor epoch."""
+        return _digest({
+            "schema": "shadow-authorizing-progress.v1",
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "config_digest": _digest(_safe_config(candidate)),
+            "proof_digest": _digest({key: candidate.get(key) for key in (
+                "dataset_hash", "config_hash", "code_hash",
+                "provenance_hash", "status")}),
+            "replay_code_hash": str(replay_code_hash or _replay_code_hash()),
+        })
+
+    def authorizing_progress(
+            self, candidates: Sequence[Mapping[str, Any]], *,
+            initial_cursor: tuple[float, str] = (0.0, "")
+            ) -> dict[str, dict[str, Any]]:
+        """Read durable per-candidate authorizing cursors."""
+        normalized = sorted({
+            (str(candidate.get("candidate_id") or ""),
+             self.authorizing_epoch_identity(candidate))
+            for candidate in candidates
+            if str(candidate.get("candidate_id") or "").strip()
+        })
+        if not normalized:
+            return {}
+        initial_at = _finite(initial_cursor[0])
+        if initial_at is None or initial_at < 0:
+            raise ShadowError("authorizing progress cursor is invalid")
+        initial_key = str(initial_cursor[1] or "")
+        result: dict[str, dict[str, Any]] = {
+            candidate_id: {
+                "candidate_id": candidate_id,
+                "epoch_identity": epoch_identity,
+                "last_inserted_at": float(initial_at),
+                "last_event_key": initial_key,
+                "processed_events": 0,
+                "deferred_events": 0,
+                "deferred_sessions": [],
+                "last_manifest_digest": None,
+            }
+            for candidate_id, epoch_identity in normalized
+        }
+        with self._connection() as db:
+            for candidate_id, epoch_identity in normalized:
+                row = db.execute("""SELECT * FROM authorizing_progress
+                    WHERE candidate_id=? AND epoch_identity=?""",
+                    (candidate_id, epoch_identity)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    deferred = json.loads(row["deferred_sessions_json"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ShadowError("authorizing progress is invalid") from exc
+                if (not isinstance(deferred, list) or
+                        any(not isinstance(value, str) for value in deferred)):
+                    raise ShadowError("authorizing progress is invalid")
+                cursor_at = _finite(row["last_inserted_at"])
+                if cursor_at is None or cursor_at < 0:
+                    raise ShadowError("authorizing progress cursor is invalid")
+                result[candidate_id] = {
+                    "candidate_id": candidate_id,
+                    "epoch_identity": epoch_identity,
+                    "last_inserted_at": float(cursor_at),
+                    "last_event_key": str(row["last_event_key"]),
+                    "processed_events": int(row["processed_events"]),
+                    "deferred_events": int(row["deferred_events"]),
+                    "deferred_sessions": sorted(set(deferred)),
+                    "last_manifest_digest": (
+                        str(row["last_manifest_digest"])
+                        if row["last_manifest_digest"] is not None else None),
+                }
+        return result
+
+    def save_authorizing_progress(
+            self, *, candidate_id: str, epoch_identity: str,
+            cursor_inserted_at: float, cursor_event_key: str,
+            processed_events: int, deferred_events: int,
+            deferred_sessions: Sequence[str],
+            manifest_digest: str | None = None) -> None:
+        """Commit one monotonic cursor and bounded backlog summary."""
+        if self.readonly:
+            raise ShadowError(
+                "cannot update authorizing progress on a read-only WAL")
+        cursor_at = _finite(cursor_inserted_at)
+        if cursor_at is None or cursor_at < 0:
+            raise ShadowError("authorizing progress cursor is invalid")
+        next_cursor = (float(cursor_at), str(cursor_event_key or ""))
+        pending = sorted({str(value) for value in deferred_sessions if str(value)})
+        with self._connection() as db:
+            prior = db.execute("""SELECT last_inserted_at,last_event_key,
+                    processed_events FROM authorizing_progress
+                    WHERE candidate_id=? AND epoch_identity=?""",
+                (str(candidate_id), str(epoch_identity))).fetchone()
+            previous = (0.0, "")
+            previous_processed = 0
+            if prior is not None:
+                previous = (float(prior["last_inserted_at"]),
+                            str(prior["last_event_key"]))
+                previous_processed = int(prior["processed_events"])
+            if next_cursor < previous:
+                raise ShadowError("authorizing cursor cannot move backwards")
+            # ``processed_events`` is a delta for a forward cursor interval,
+            # not a page-size snapshot.  A sibling arm may retry the same
+            # page after its first attempt failed; metadata can be refreshed
+            # at that cursor, but the immutable event interval must contribute
+            # zero a second time.
+            processed_delta = (max(0, int(processed_events))
+                               if next_cursor > previous else 0)
+            db.execute("""INSERT INTO authorizing_progress
+                (candidate_id,epoch_identity,last_inserted_at,last_event_key,
+                 processed_events,deferred_events,deferred_sessions_json,
+                 last_manifest_digest,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(candidate_id,epoch_identity) DO UPDATE SET
+                  last_inserted_at=excluded.last_inserted_at,
+                  last_event_key=excluded.last_event_key,
+                  processed_events=excluded.processed_events,
+                  deferred_events=excluded.deferred_events,
+                  deferred_sessions_json=excluded.deferred_sessions_json,
+                  last_manifest_digest=excluded.last_manifest_digest,
+                  updated_at=excluded.updated_at""",
+                (str(candidate_id), str(epoch_identity), next_cursor[0],
+                 next_cursor[1], previous_processed + processed_delta,
+                 max(0, int(deferred_events)), _json(pending),
+                 (str(manifest_digest) if manifest_digest else None), time.time()))
+
+    def authorizing_progress_projection(
+            self, candidates: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Return a stable projection suitable for event-cache identities."""
+        progress = self.authorizing_progress(candidates)
+        return [dict(progress[key]) for key in sorted(progress)]
+
+    def initialize_authorizing_legacy_overflow(
+            self, *, max_decisions: int, baseline_cursor: tuple[float, str]
+            ) -> bool:
+        """Record a one-time marker for a legacy WAL already at the cap."""
+        key = "authorizing_legacy_overflow.v1"
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            if row is not None:
+                try:
+                    value = json.loads(row["value"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ShadowError("authorizing legacy marker is invalid") from exc
+                return bool(isinstance(value, Mapping) and value.get("enabled"))
+            count_row = db.execute("""SELECT count(*) FROM decisions d
+                LEFT JOIN candidates c ON c.candidate_id=d.candidate_id
+                WHERE d.candidate_id NOT LIKE ?
+                  AND COALESCE(c.proof_json,'') NOT LIKE '%\"diagnostic_only\":true%'
+                  AND COALESCE(c.config_json,'') NOT LIKE '%\"diagnostic_only\":true%'""",
+                (f"{DIAGNOSTIC_CANDIDATE_PREFIX}%",)).fetchone()
+            count = int(count_row[0]) if count_row is not None else 0
+            enabled = count >= int(max_decisions)
+            value = {
+                "schema": "shadow-authorizing-legacy-overflow.v1",
+                "enabled": bool(enabled), "decision_count": count,
+                "baseline_cursor": [float(baseline_cursor[0]),
+                                     str(baseline_cursor[1] or "")],
+                "created_at": time.time(),
+            }
+            db.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                       (key, _json(value)))
+            return bool(enabled)
+
+    def authorizing_legacy_overflow_enabled(self) -> bool:
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='authorizing_legacy_overflow.v1'"
+            ).fetchone()
+        if row is None:
+            return False
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("authorizing legacy marker is invalid") from exc
+        return bool(isinstance(value, Mapping) and value.get("enabled") is True)
+
     def decision(self, *, candidate_id: str, event_key: str, session_date: str,
                  symbol: str, kind: str, reason: str | None, payload: Mapping,
-                 max_decisions: int) -> bool:
+                 max_decisions: int,
+                 allow_legacy_overflow: bool = False) -> bool:
         decision_id = _digest({"candidate_id": candidate_id, "event_key": event_key})
         diagnostic = self.candidate_is_diagnostic(str(candidate_id))
         with self._connection() as db:
@@ -3085,7 +3386,7 @@ class ShadowStore:
                       AND COALESCE(c.proof_json,'') NOT LIKE '%\"diagnostic_only\":true%'
                       AND COALESCE(c.config_json,'') NOT LIKE '%\"diagnostic_only\":true%'""",
                     (f"{DIAGNOSTIC_CANDIDATE_PREFIX}%",)).fetchone()[0])
-            if count >= int(max_decisions):
+            if count >= int(max_decisions) and not allow_legacy_overflow:
                 lane = "diagnostic shadow" if diagnostic else "shadow"
                 raise ShadowError(f"{lane} decision bound {max_decisions} exceeded")
             db.execute("""INSERT INTO decisions
@@ -3301,6 +3602,39 @@ class ShadowStore:
                 (float(inserted_at), float(inserted_at), str(event_key),
                  int(max_events))).fetchall()
         return [dict(row) for row in rows]
+
+    def events_after_cursor_count(self, *, inserted_at: float,
+                                  event_key: str) -> int:
+        """Return the scalar backlog after an insertion/event-key cursor."""
+        with self._connection() as db:
+            row = db.execute("""SELECT count(*) FROM events
+                WHERE inserted_at>? OR (inserted_at=? AND event_key>?)""",
+                (float(inserted_at), float(inserted_at), str(event_key))).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def events_between_cursors_count(
+            self, *, after_inserted_at: float, after_event_key: str,
+            through_inserted_at: float, through_event_key: str) -> int:
+        """Count one strict cursor interval without recounting overlap.
+
+        The lower bound is exclusive and the upper bound is inclusive.  This
+        is deliberately expressed in the same ``(inserted_at,event_key)``
+        ordering as the durable authorizing cursor so a retry of an already
+        committed page contributes zero new events.
+        """
+        after = (float(after_inserted_at), str(after_event_key or ""))
+        through = (float(through_inserted_at), str(through_event_key or ""))
+        if through <= after:
+            return 0
+        with self._connection() as db:
+            row = db.execute("""SELECT count(*) FROM events
+                WHERE (inserted_at>? OR
+                       (inserted_at=? AND event_key>?))
+                  AND (inserted_at<? OR
+                       (inserted_at=? AND event_key<=?))""",
+                (after[0], after[0], after[1], through[0], through[0],
+                 through[1])).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def diagnostic_events_page(
             self, *, inserted_at: float, event_key: str,
@@ -4035,6 +4369,18 @@ class ShadowRunner:
         # semantic replay/account state, so a new day does not force every
         # already-closed session through the expensive legacy evaluator.
         self._authorizing_replay_memo: dict[tuple[str, str], dict[str, Any]] = {}
+        # The durable authorizing page cursor is projected into this process
+        # state only for the current immutable poll snapshot.  It is cleared
+        # before each snapshot load so patched/private callers retain the
+        # historical no-argument _load_events contract.
+        self._authorizing_progress_candidates: tuple[dict[str, Any], ...] = ()
+        self._authorizing_page_meta: dict[str, Any] = {
+            "backlog_deferred": False, "last_cursor": None,
+            "decision_budget_deferred": False,
+            "deferred_context_retry": False,
+            "minimum_cursor": None, "count": 0,
+        }
+        self._authorizing_legacy_overflow = False
 
     @staticmethod
     def _calendar_snapshot_identity(
@@ -4053,7 +4399,8 @@ class ShadowRunner:
             quarantine: Mapping[str, Any],
             replay_quarantine: Mapping[str, Any],
             replay_state: Mapping[str, Any],
-            virtual_book_state: Sequence[Mapping[str, Any]]) -> str:
+            virtual_book_state: Sequence[Mapping[str, Any]],
+            authorizing_progress: Sequence[Mapping[str, Any]] = ()) -> str:
         """Bind cached event decoding to the complete current input epoch."""
         candidate_rows: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -4078,6 +4425,9 @@ class ShadowRunner:
             "max_candidates": int(self.config.max_candidates),
             "max_events": int(self.config.max_events),
             "max_decisions": int(self.config.max_decisions),
+            "authorizing_event_budget": int(self.config.authorizing_event_budget),
+            "authorizing_decision_budget": int(
+                self.config.authorizing_decision_budget),
             "replay_session_max_events": int(self.config.replay_session_max_events),
             "equity": float(self.config.equity),
             "diagnostic": bool(self.config.diagnostic),
@@ -4103,6 +4453,7 @@ class ShadowRunner:
                 replay_quarantine),
             "replay_state": dict(replay_state),
             "virtual_book_state": [dict(row) for row in virtual_book_state],
+            "authorizing_progress": [dict(row) for row in authorizing_progress],
         })
 
     @staticmethod
@@ -5558,9 +5909,103 @@ class ShadowRunner:
 
     def _load_events(self) -> tuple[list[dict], dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
         floor = self.store.forward_event_floor() or 0.0
-        event_rows = _authorizing_projected_events(
-            self.store.events(inserted_after=floor))
-        bars, quotes, options = self._group_event_rows(event_rows)
+        candidates = self._authorizing_progress_candidates
+        if not candidates:
+            event_rows = _authorizing_projected_events(
+                self.store.events(inserted_after=floor))
+            bars, quotes, options = self._group_event_rows(event_rows)
+            self._authorizing_page_meta = {
+                "backlog_deferred": False,
+                "decision_budget_deferred": False,
+                "deferred_context_retry": False,
+                "last_cursor": ((float(event_rows[-1].get("inserted_at")),
+                                 str(event_rows[-1].get("event_key") or ""))
+                                if event_rows and
+                                _finite(event_rows[-1].get("inserted_at")) is not None
+                                else None),
+                "minimum_cursor": (float(floor), ""),
+                "count": len(event_rows),
+                "session_last_cursors": {},
+            }
+            return event_rows, bars, quotes, options
+
+        progress = self.store.authorizing_progress(
+            candidates, initial_cursor=(float(floor), ""))
+        pending_sessions = {
+            str(session)
+            for item in progress.values()
+            for session in (item.get("deferred_sessions") or ())
+            if str(session)
+        }
+        cursors = [
+            (float(item["last_inserted_at"]), str(item["last_event_key"]))
+            for item in progress.values()
+        ]
+        minimum = min(cursors) if cursors else (float(floor), "")
+        budget = int(self.config.authorizing_event_budget)
+        raw_rows = self.store.events_after_cursor(
+            inserted_at=minimum[0], event_key=minimum[1],
+            max_events=budget + 1)
+        backlog = len(raw_rows) > budget
+        page_rows = raw_rows[:budget]
+        last_cursor = ((float(page_rows[-1]["inserted_at"]),
+                        str(page_rows[-1].get("event_key") or ""))
+                       if page_rows else None)
+        event_rows = _authorizing_projected_events(page_rows)
+
+        # A page may end in the middle of a session.  Build decision context
+        # from the complete bounded session, while retaining only page rows as
+        # the work list.  This preserves causal bars/quotes without allowing
+        # a large immutable history to become a per-poll allocation.
+        sessions: set[str] = set()
+        for raw in page_rows:
+            stamp = _timestamp(raw.get("as_of") or raw.get("timestamp"))
+            if stamp is not None:
+                sessions.add(stamp.astimezone(NEW_YORK).date().isoformat())
+        context_rows: list[dict] = []
+        if sessions or pending_sessions:
+            sessions.update(pending_sessions)
+            context_rows = _authorizing_projected_events(
+                self.store.events_for_sessions(
+                    sorted(sessions),
+                    max_events=self.config.replay_session_max_events))
+        if not page_rows and pending_sessions:
+            pending_rows: list[dict] = []
+            for row in context_rows:
+                stamp = _timestamp(row.get("as_of") or row.get("timestamp"))
+                if (stamp is not None and
+                        stamp.astimezone(NEW_YORK).date().isoformat()
+                        in pending_sessions):
+                    pending_rows.append(row)
+            event_rows = pending_rows
+        combined: dict[str, dict] = {}
+        for row in (*context_rows, *event_rows):
+            key = str(row.get("event_key") or "")
+            if key:
+                combined[key] = row
+        context = list(combined.values())
+        bars, quotes, options = self._group_event_rows(context)
+        session_last_cursors: dict[str, tuple[float, str]] = {}
+        for row in context:
+            stamp = _timestamp(row.get("as_of") or row.get("timestamp"))
+            inserted_at = _finite(row.get("inserted_at"))
+            event_key = str(row.get("event_key") or "")
+            if stamp is None or inserted_at is None or not event_key:
+                continue
+            session = stamp.astimezone(NEW_YORK).date().isoformat()
+            session_last_cursors[session] = max(
+                session_last_cursors.get(session, (0.0, "")),
+                (float(inserted_at), event_key))
+        self._authorizing_page_meta = {
+            "backlog_deferred": bool(backlog),
+            "decision_budget_deferred": False,
+            "deferred_context_retry": bool(not page_rows and pending_sessions),
+            "last_cursor": last_cursor,
+            "minimum_cursor": minimum,
+            "count": len(event_rows),
+            "raw_count": len(raw_rows),
+            "session_last_cursors": session_last_cursors,
+        }
         return event_rows, bars, quotes, options
 
     def _load_events_for_sessions(self, sessions: Sequence[str]) -> tuple[
@@ -7885,6 +8330,13 @@ class ShadowRunner:
         phase_started = time.monotonic()
         sources = _corpus_sources(self.config.corpus_path)
         offsets = self.store.source_offsets()
+        # A pre-progress WAL may have event rows without recorder byte
+        # provenance. In that case a file-size baseline is not a durable
+        # boundary: unknown bytes must be reconciled from byte zero. Keep a
+        # separate durable scan cursor so this migration remains bounded.
+        legacy_scan_offsets = self.store.legacy_reconciliation_offsets()
+        legacy_reconciliation_sources: set[str] = set(legacy_scan_offsets)
+        legacy_source_reconciliation = bool(legacy_reconciliation_sources)
         forward_floor = self.store.forward_event_floor()
         if forward_floor is None:
             # feaca71 established source offsets before filtering the legacy
@@ -7899,21 +8351,58 @@ class ShadowRunner:
             self.store.save_forward_event_floor(forward_floor)
         if offsets is None:
             # A pre-upgrade WAL already at the old total-event ceiling has
-            # consumed historical evidence. Baseline at the current committed
-            # ends instead of replaying a multi-million-row recorder catch-up.
-            offsets = ({str(source.resolve()): source.stat().st_size
-                        for source in sources}
-                       if self.store.event_count() >= self.config.max_events
-                       else {})
+            # consumed historical evidence. Prefer the exact source ends
+            # persisted on event rows; unlike a file-size baseline this keeps
+            # bytes appended since the old process stopped visible.
+            if self.store.event_count() >= self.config.max_events:
+                offsets = dict(self.store.inferred_source_offsets())
+                # Every source absent from event provenance is unknown at the
+                # byte level. Start a durable bounded scan at zero; do not
+                # infer a boundary from mtime or file size.
+                for source in sources:
+                    key = str(source.resolve())
+                    if key not in offsets:
+                        offsets[key] = 0
+                        legacy_scan_offsets.setdefault(key, 0)
+                        legacy_reconciliation_sources.add(key)
+                legacy_source_reconciliation = bool(
+                    legacy_reconciliation_sources)
+            else:
+                offsets = {}
+            self.store.save_legacy_reconciliation_offsets(legacy_scan_offsets)
             self.store.save_source_offsets(offsets)
+        elif (self.store.event_count() >= self.config.max_events and
+              not legacy_source_reconciliation and
+              not self.store.inferred_source_offsets() and
+              not self.store.legacy_reconciliation_complete()):
+            # A prior interrupted migration may have persisted an empty
+            # source-offset map before its scan marker. Recreate the marker
+            # rather than treating the current file end as consumed.
+            offsets = dict(offsets)
+            for source in sources:
+                key = str(source.resolve())
+                offsets[key] = 0
+                legacy_scan_offsets[key] = 0
+                legacy_reconciliation_sources.add(key)
+            legacy_source_reconciliation = bool(legacy_reconciliation_sources)
+            self.store.save_legacy_reconciliation_offsets(legacy_scan_offsets)
+            self.store.save_source_offsets(offsets)
+        elif legacy_source_reconciliation:
+            # Continue a previously bounded migration even though ordinary
+            # source offsets are already present in metadata.
+            offsets = dict(offsets)
+            for key in legacy_reconciliation_sources:
+                offsets[key] = 0
         pending: list[dict] = []
         next_offsets = dict(offsets)
         source_consumed: dict[str, int] = {}
         source_for_event: dict[str, tuple[str, int, int]] = {}
+        source_by_key = {str(source.resolve()): source for source in sources}
         pending_bytes = sum(max(0, source.stat().st_size - offsets.get(
             str(source.resolve()), 0)) for source in sources)
         skipped_recovery_bytes = 0
-        if pending_bytes > MAX_PENDING_CORPUS_BYTES:
+        if (pending_bytes > MAX_PENDING_CORPUS_BYTES and
+                not legacy_source_reconciliation):
             # A failed pre-offset consumer may leave hundreds of megabytes of
             # raw quotes pending. Do not materialize that range merely to
             # compact it. Baseline it explicitly and quarantine the current
@@ -7927,10 +8416,38 @@ class ShadowRunner:
             self.store.save_quarantine_through_session(
                 datetime.now(UTC).astimezone(NEW_YORK).date().isoformat())
         else:
+            legacy_read_budget_remaining = MAX_LEGACY_RECONCILIATION_BYTES
             for source in sources:
                 key = str(source.resolve())
-                source_start = int(offsets.get(key, 0))
-                rows, consumed = _read_corpus_append(source, source_start)
+                source_start = int(legacy_scan_offsets.get(
+                    key, offsets.get(key, 0)))
+                row_filter = None
+                read_budget = None
+                if (legacy_source_reconciliation and key in
+                        legacy_reconciliation_sources):
+                    def reconcile_row(row: Mapping[str, Any]) -> bool:
+                        event_key = str(row.get("event_key") or "").strip()
+                        if not event_key:
+                            return True
+                        digest = _digest(_row_payload(row))
+                        existing = self.store.event_digest(event_key)
+                        if existing is None:
+                            return True
+                        if existing != digest:
+                            raise InputConflict(
+                                f"event_key {event_key} changed content")
+                        return False
+                    row_filter = reconcile_row
+                    available = max(0, source.stat().st_size - source_start)
+                    read_budget = min(legacy_read_budget_remaining, available)
+                    if read_budget <= 0:
+                        source_consumed[key] = source_start
+                        continue
+                rows, consumed = _read_corpus_append(
+                    source, source_start, row_filter=row_filter,
+                    max_bytes=read_budget)
+                if read_budget is not None:
+                    legacy_read_budget_remaining -= int(read_budget)
                 pending.extend(rows)
                 source_consumed[key] = consumed
                 for row in rows:
@@ -8023,8 +8540,22 @@ class ShadowRunner:
         # Only commit offsets for sources whose complete forward batch was
         # normalized.  Other sources remain at their previous boundary and
         # are retried after correction; already-ingested rows are idempotent.
+        next_legacy_scan_offsets = dict(legacy_scan_offsets)
         for key, consumed in source_consumed.items():
-            if key not in invalid_sources:
+            if key in legacy_reconciliation_sources:
+                if key in invalid_sources:
+                    continue
+                source = source_by_key[key]
+                # A source may grow while it is being scanned. Keep the
+                # migration marker until the safe cursor reaches the current
+                # complete-row tail; the next poll then continues from there.
+                if consumed >= source.stat().st_size:
+                    next_legacy_scan_offsets.pop(key, None)
+                    next_offsets[key] = consumed
+                else:
+                    next_legacy_scan_offsets[key] = consumed
+                    next_offsets[key] = 0
+            elif key not in invalid_sources:
                 next_offsets[key] = consumed
         for event_key in resolved_quarantine:
             quarantine.pop(event_key, None)
@@ -8032,7 +8563,11 @@ class ShadowRunner:
         # corrected bytes normalize; direct operator writes default to a
         # monotonic merge so unrelated quarantine evidence is preserved.
         self.store.save_quarantine_events(quarantine, replace=True)
+        self.store.save_legacy_reconciliation_offsets(
+            next_legacy_scan_offsets)
         self.store.save_source_offsets(next_offsets)
+        if legacy_source_reconciliation and not next_legacy_scan_offsets:
+            self.store.mark_legacy_reconciliation_complete()
         poll_phases["ingest_seconds"] = max(
             0.0, time.monotonic() - phase_started)
         # Recompute the durable block after resolving corrected rows.  A
@@ -8242,6 +8777,26 @@ class ShadowRunner:
             result["poll_phase_metrics"] = _finish_poll_phase_metrics(
                 poll_phases, poll_started)
             return result
+        # Freeze arm definitions before loading a bounded authorizing page.
+        # The cursor is per arm so one failed candidate cannot cause another
+        # arm's durable progress to be silently skipped.
+        arms: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if str(candidate.get("vehicle") or "equity") not in {"equity", "option"}:
+                continue
+            arms.append(dict(candidate))
+            root_control = self._rule_root_control(candidate)
+            if root_control is not None:
+                arms.append(dict(root_control))
+        arms.sort(key=lambda item: str(item.get("candidate_id") or ""))
+        for arm in arms:
+            self.store.upsert_candidate(arm)
+        self._authorizing_progress_candidates = tuple(arms)
+        initial_progress_cursor = (float(forward_floor or 0.0), "")
+        self._authorizing_legacy_overflow = (
+            self.store.initialize_authorizing_legacy_overflow(
+                max_decisions=self.config.max_decisions,
+                baseline_cursor=initial_progress_cursor))
         # Build a complete cache fingerprint before decoding the authorizing
         # event WAL. A changed head, floor, candidate/config/code epoch,
         # calendar, quarantine, or replay/book projection forces a fresh
@@ -8261,6 +8816,8 @@ class ShadowRunner:
                 cache_candidate_ids),
         }
         cache_event_watermark = self.store.event_watermark()
+        cache_progress = self.store.authorizing_progress(
+            arms, initial_cursor=initial_progress_cursor)
         cache_fingerprint = self._authorizing_event_fingerprint(
             candidates=candidates, diagnostic_arms=diagnostic_arms,
             calendar_snapshot=calendar_snapshot,
@@ -8271,9 +8828,16 @@ class ShadowRunner:
             replay_quarantine=self.store.replay_quarantine(),
             replay_state=cache_replay_state,
             virtual_book_state=self.store.virtual_book_state(
-                cache_candidate_ids))
+                cache_candidate_ids),
+            authorizing_progress=[cache_progress[key]
+                                  for key in sorted(cache_progress)])
         cached_event_views = self._cached_authorizing_event_views(
             cache_fingerprint)
+        # The migration cursor advances even when a bounded scan finds only
+        # already-known immutable rows; do not reuse a page cache that omits
+        # that durable progress.
+        if legacy_source_reconciliation:
+            cached_event_views = None
         authorizing_event_cache_hit = cached_event_views is not None
         phase_started = time.monotonic()
         if cached_event_views is not None:
@@ -8282,6 +8846,9 @@ class ShadowRunner:
             events, bars, quotes, options = self._load_events()
             self._save_authorizing_event_views(
                 cache_fingerprint, events, bars, quotes, options)
+        # Cache hits reuse immutable rows but not the previous poll's
+        # decision-budget outcome.
+        self._authorizing_page_meta["decision_budget_deferred"] = False
         poll_phases["authorizing_snapshot_seconds"] = max(
             0.0, time.monotonic() - phase_started)
         # Persist only exact recorder/Alpaca calendar sessions.  This catalog
@@ -8364,21 +8931,6 @@ class ShadowRunner:
                 quotes_by_session.get(session, []),
                 options_by_session.get(session, []),
             )
-
-        # Freeze both arm definitions and event inputs before dispatch.  A
-        # research poll that registers a candidate or appends a recorder row
-        # while workers run therefore affects only the next poll.
-        arms: list[dict[str, Any]] = []
-        for candidate in candidates:
-            if str(candidate.get("vehicle") or "equity") not in {"equity", "option"}:
-                continue
-            arms.append(dict(candidate))
-            root_control = self._rule_root_control(candidate)
-            if root_control is not None:
-                arms.append(dict(root_control))
-        arms.sort(key=lambda item: str(item.get("candidate_id") or ""))
-        for arm in arms:
-            self.store.upsert_candidate(arm)
 
         # A strict forward floor intentionally excludes already-consumed
         # source rows. Revalidate only sessions that currently contribute
@@ -8613,6 +9165,16 @@ class ShadowRunner:
                                          replay_only_sessions),
             "replay_validation_sessions": sorted(replay_only_sessions),
             "max_workers": int(self.config.max_workers),
+            "authorizing_progress": {
+                "event_budget": int(self.config.authorizing_event_budget),
+                "decision_budget": int(self.config.authorizing_decision_budget),
+                "backlog_deferred": bool(self._authorizing_page_meta.get(
+                    "backlog_deferred") or self._authorizing_page_meta.get(
+                    "decision_budget_deferred")),
+                "minimum_cursor": self._authorizing_page_meta.get(
+                    "minimum_cursor"),
+                "last_cursor": self._authorizing_page_meta.get("last_cursor"),
+            },
             "diagnostic_shadow": ({
                 "diagnostic_only": True,
                 "authorizing": False,
@@ -8681,6 +9243,7 @@ class ShadowRunner:
         authorizing_errors: dict[str, str] = {}
         failed_arms: set[str] = set()
         replay_blocked = bool(replay_memo_blocked)
+        authorizing_new_decisions = 0
         # Historical quote context is reduced to a point-in-time skyline as
         # replay sessions advance.  This preserves the old cross-session
         # quote lookup without retaining every prior session row.  Option
@@ -8691,6 +9254,7 @@ class ShadowRunner:
         memo_replay_contexts: dict[
             tuple[str, str], tuple[dict[str, Any], dict[str, Any], list[dict]]
         ] = {}
+        completed_authorizing_sessions: set[str] = set()
         authorizing_evaluation_started = time.monotonic()
         for session in sorted(set(frozen_session_events) | replay_only_sessions):
             is_replay_only = session in replay_only_sessions
@@ -8903,6 +9467,16 @@ class ShadowRunner:
                     str(item.get("session_date") or ""),
                     str(item.get("symbol") or "")))
                 for decision in decisions:
+                    if (authorizing_new_decisions >=
+                            int(self.config.authorizing_decision_budget)):
+                        self._authorizing_page_meta[
+                            "decision_budget_deferred"] = True
+                        message = "authorizing decision budget deferred"
+                        candidate_errors[candidate_id] = message
+                        authorizing_errors[candidate_id] = message
+                        failed_arms.add(candidate_id)
+                        session_success = False
+                        break
                     payload = decision.get("payload") or {}
                     inserted = self.store.decision(
                         candidate_id=candidate_id,
@@ -8912,7 +9486,10 @@ class ShadowRunner:
                         kind=str(decision.get("kind") or "no_data"),
                         reason=decision.get("reason"),
                         payload=payload,
-                        max_decisions=self.config.max_decisions)
+                        max_decisions=self.config.max_decisions,
+                        allow_legacy_overflow=self._authorizing_legacy_overflow)
+                    if inserted:
+                        authorizing_new_decisions += 1
                     if inserted and decision.get("plan") is not None:
                         self.store.virtual_open(
                             candidate_id=candidate_id,
@@ -8921,8 +9498,9 @@ class ShadowRunner:
                                 "event_key": str(decision.get("event_key") or "")}),
                             symbol=str(decision.get("symbol") or ""),
                             plan=decision["plan"])
-                successful_evaluations.add(candidate_id)
-                if is_replay_only:
+                if candidate_id not in failed_arms:
+                    successful_evaluations.add(candidate_id)
+                if is_replay_only and candidate_id not in failed_arms:
                     replay_decisions[candidate_id] = decisions
 
             # Replay is parent-only and runs before the next session barrier.
@@ -8946,7 +9524,19 @@ class ShadowRunner:
                         arm_by_id[candidate_id], session, session_bars,
                         session_quotes, session_options,
                         calendar_snapshot=calendar_snapshot)
-                if not is_replay_only and not replay_window["complete"]:
+                page_session_cursor = self._authorizing_page_meta.get(
+                    "last_cursor")
+                required_session_cursor = self._authorizing_page_meta.get(
+                    "session_last_cursors", {}).get(session)
+                page_has_complete_session = bool(
+                    self._authorizing_page_meta.get("deferred_context_retry") or
+                    required_session_cursor is None or
+                    (page_session_cursor is not None and
+                     tuple(page_session_cursor) >=
+                     tuple(required_session_cursor)))
+                if (not is_replay_only and
+                        (not replay_window["complete"] or
+                         not page_has_complete_session)):
                     session_success = False
                     continue
                 try:
@@ -8992,6 +9582,8 @@ class ShadowRunner:
                     session_success = False
             if not session_success:
                 replay_blocked = True
+            elif not is_replay_only:
+                completed_authorizing_sessions.add(session)
         # Refresh all replay identities in one bounded query after slow-path
         # replays have committed their immutable diff/account rows.  Warm
         # memo hits never enter this projection a second time.
@@ -9049,6 +9641,77 @@ class ShadowRunner:
                         next(iter(self._authorizing_replay_memo)))
                 if not parity:
                     replay_blocked = True
+        # Persist the bounded forward cursor only after every candidate that
+        # participated in this page has durably written its idempotent
+        # decisions. A failed arm remains at its prior cursor and therefore
+        # retries the same page; successful siblings may advance independently.
+        page_cursor = self._authorizing_page_meta.get("last_cursor")
+        page_sessions = set(frozen_session_events)
+        current_deferred = page_sessions - completed_authorizing_sessions
+        for arm in arms:
+            candidate_id = str(arm.get("candidate_id") or "")
+            if (candidate_id in failed_arms or
+                    candidate_id in authorizing_errors):
+                continue
+            prior = cache_progress.get(candidate_id, {})
+            prior_deferred = {
+                str(session) for session in
+                (prior.get("deferred_sessions") or ()) if str(session)
+            }
+            deferred_sessions = sorted(
+                (prior_deferred | current_deferred) -
+                completed_authorizing_sessions)
+            # When no later page exists, retain the prior cursor for an
+            # incomplete session. This lets a corrected calendar/session
+            # boundary re-run the same durable rows on the next poll. If a
+            # genuine backlog exists, advance safely and retain every prior
+            # deferred session while later rows are paged.
+            prior_cursor = (
+                float(prior.get("last_inserted_at") or
+                      initial_progress_cursor[0]),
+                str(prior.get("last_event_key") or
+                    initial_progress_cursor[1] or ""))
+            if (page_cursor is not None and frozen_events and
+                    (not current_deferred or self._authorizing_page_meta.get(
+                        "backlog_deferred"))):
+                cursor = (float(page_cursor[0]), str(page_cursor[1]))
+                # Another arm may already be ahead of this shared minimum
+                # page.  Leave its cursor (and counters) untouched rather
+                # than attempting a backwards metadata write.
+                if cursor < prior_cursor:
+                    continue
+                processed_events = self.store.events_between_cursors_count(
+                    after_inserted_at=prior_cursor[0],
+                    after_event_key=prior_cursor[1],
+                    through_inserted_at=cursor[0],
+                    through_event_key=cursor[1])
+            elif (page_cursor is None and prior_deferred and
+                  completed_authorizing_sessions):
+                cursor = (float(prior.get("last_inserted_at") or 0.0),
+                          str(prior.get("last_event_key") or ""))
+                processed_events = 0
+            else:
+                continue
+            deferred_events = self.store.events_after_cursor_count(
+                inserted_at=cursor[0], event_key=cursor[1])
+            self.store.save_authorizing_progress(
+                candidate_id=candidate_id,
+                epoch_identity=self.store.authorizing_epoch_identity(arm),
+                cursor_inserted_at=cursor[0], cursor_event_key=cursor[1],
+                processed_events=processed_events,
+                deferred_events=deferred_events,
+                deferred_sessions=deferred_sessions,
+                manifest_digest=manifest_digest)
+        progress_after = self.store.authorizing_progress(
+            arms, initial_cursor=initial_progress_cursor)
+        unresolved_deferred_sessions = {
+            str(session)
+            for item in progress_after.values()
+            for session in (item.get("deferred_sessions") or ())
+            if str(session)
+        }
+        if unresolved_deferred_sessions:
+            replay_blocked = True
         poll_phases["authorizing_evaluation_seconds"] = max(
             0.0, authorizing_preparation_seconds +
             time.monotonic() - authorizing_evaluation_started)
@@ -9075,7 +9738,7 @@ class ShadowRunner:
             not replay_blocked and
             not authorizing_errors and not failed_arms and
             not invalid_sessions and not unknown_quarantine and
-            not pending_repairs)
+            not pending_repairs and not next_legacy_scan_offsets)
         if floor_eligible:
             loaded_sessions = {row_session(row) for row in events}
             processed_sessions = set(frozen_session_events)
@@ -9100,7 +9763,8 @@ class ShadowRunner:
         catalog = self.store.session_catalog()
         stale_tail = {
             "status": "blocked" if (
-                invalid_sessions or unknown_quarantine or pending_repairs) else "clear",
+                invalid_sessions or unknown_quarantine or pending_repairs or
+                unresolved_deferred_sessions) else "clear",
             "sessions": sorted(invalid_sessions),
             "unknown_events": bool(unknown_quarantine),
             "quarantine_overflow": bool(quarantine_overflow),
@@ -9110,6 +9774,8 @@ class ShadowRunner:
                 str(item.get("session_date")) for item in pending_repairs
                 if item.get("session_date")}),
             "replay_quarantine": pending_repairs[-64:],
+            "authorizing_deferred_sessions": sorted(
+                unresolved_deferred_sessions)[-64:],
             "authoritative_catalog_sessions": sorted(
                 str(session) for session, detail in catalog.items()
                 if isinstance(detail, Mapping)
@@ -9156,6 +9822,26 @@ class ShadowRunner:
             })
         capacity = sorted(capacity, key=lambda item: (
             item["candidate_id"], item["session_date"]))[-64:]
+        final_progress = self.store.authorizing_progress(
+            arms, initial_cursor=initial_progress_cursor)
+        authorizing_progress = {
+            "schema": "shadow-authorizing-progress.v1",
+            "event_budget": int(self.config.authorizing_event_budget),
+            "decision_budget": int(self.config.authorizing_decision_budget),
+            "this_poll_decisions": int(authorizing_new_decisions),
+            "backlog_deferred": bool(self._authorizing_page_meta.get(
+                "backlog_deferred") or self._authorizing_page_meta.get(
+                "decision_budget_deferred") or any(
+                    int(item.get("deferred_events") or 0) > 0
+                    for item in final_progress.values()) or
+                unresolved_deferred_sessions),
+            "deferred_sessions": sorted(unresolved_deferred_sessions),
+            "minimum_cursor": self._authorizing_page_meta.get(
+                "minimum_cursor"),
+            "last_cursor": self._authorizing_page_meta.get("last_cursor"),
+            "cursors": [final_progress[key] for key in sorted(final_progress)],
+            "legacy_overflow": bool(self._authorizing_legacy_overflow),
+        }
         decision_count = self.store.decision_count()
         poll_phases["finalization_seconds"] = max(
             0.0, time.monotonic() - phase_started)
@@ -9198,6 +9884,7 @@ class ShadowRunner:
                 "opportunity_capacity": capacity,
                 "signal_dispositions": signal_dispositions,
                 "stress_calibration": calibration_status,
+                "authorizing_progress": authorizing_progress,
                 "diagnostic_shadow": diagnostic_coverage,
                 "authorizing_event_cache_hit": bool(authorizing_event_cache_hit),
                 "poll_duration_seconds": poll_duration_seconds,
@@ -9233,6 +9920,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--replay-session-max-events", type=int,
         default=DEFAULT_REPLAY_SESSION_MAX_EVENTS)
+    parser.add_argument(
+        "--authorizing-event-budget", type=int,
+        default=DEFAULT_AUTHORIZING_EVENT_BUDGET)
+    parser.add_argument(
+        "--authorizing-decision-budget", type=int,
+        default=DEFAULT_AUTHORIZING_DECISION_BUDGET)
     return parser
 
 
@@ -9246,6 +9939,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                        diagnostic_session_max_events=(
                            args.diagnostic_session_max_events),
                        replay_session_max_events=args.replay_session_max_events,
+                       authorizing_event_budget=args.authorizing_event_budget,
+                       authorizing_decision_budget=args.authorizing_decision_budget,
                        diagnostic=args.diagnostic,
                        diagnostic_include_ibr=args.diagnostic_include_ibr,
                        runtime_config=runtime_config,
@@ -9277,6 +9972,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "DEFAULT_DIAGNOSTIC_SESSION_MAX_EVENTS", "DEFAULT_EQUITY",
     "DEFAULT_REPLAY_SESSION_MAX_EVENTS", "MAX_REPLAY_SESSION_MAX_EVENTS",
+    "DEFAULT_AUTHORIZING_EVENT_BUDGET", "DEFAULT_AUTHORIZING_DECISION_BUDGET",
     "DEFAULT_MAX_WORKERS", "DEFAULT_RETENTION_DAYS", "InputConflict",
     "_opportunity_capacity", "_signal_dispositions", "REPLAY_QUARANTINE_META_KEY",
     "SESSION_CATALOG_META_KEY", "REPLAY_QUARANTINE_OVERFLOW_KEY",

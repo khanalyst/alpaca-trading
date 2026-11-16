@@ -473,10 +473,12 @@ def _aggregate_metadata(paths: Sequence[Path], recorded_root: Path | None,
             continue
         value = raw_sources[name]
         if (not isinstance(value, Mapping) or
-                value.get("source_mode") != "historical_backfill"):
+                not isinstance(value.get("source_mode"), str) or
+                value.get("source_mode") not in {
+                    "forward_observed", "historical_backfill"}):
             raise CensusError(
                 f"recorder index source metadata is malformed for {name}")
-        sources[name] = {"source_mode": "historical_backfill"}
+        sources[name] = {"source_mode": value["source_mode"]}
     return calendar, sources
 
 
@@ -494,11 +496,15 @@ def _source_for_partition(name: str, marker: Mapping[str, object] | None,
         raise CensusError(f"conflicting source metadata for {name}")
     value = marker if marker is not None else aggregate
     if value is None:
+        # A trusted recorder is an established explicit attestation for legacy
+        # partitions written before durable per-partition markers existed.
         return "forward_observed"
     if (not isinstance(value, Mapping) or
-            value.get("source_mode") != "historical_backfill"):
+            not isinstance(value.get("source_mode"), str) or
+            value.get("source_mode") not in {
+                "forward_observed", "historical_backfill"}):
         raise CensusError(f"source metadata is malformed for {name}")
-    return "historical_backfill"
+    return str(value["source_mode"])
 
 
 def _acceptance_for_partition(root: Path, day: str,
@@ -778,12 +784,19 @@ def census(source: Path | Sequence[Path] | Iterable[Path] | None = None, *,
     epoch_context_reason = (_context_reason(epoch_context, now=current)
                             if acceptance_path is not None else None)
 
-    _check_metadata_files(paths, recorded_root)
-    marker_calendar = _partition_calendar_sidecars(paths, recorded_root) or {}
-    marker_sources = _partition_source_sidecars(paths, recorded_root) or {}
-    days = {(_PARTITION_NAME.fullmatch(path.name)).group(1) for path in paths}
-    aggregate_calendar, aggregate_sources = _aggregate_metadata(
-        paths, recorded_root, days)
+    try:
+        _check_metadata_files(paths, recorded_root)
+        marker_calendar = _partition_calendar_sidecars(paths, recorded_root) or {}
+        marker_sources = _partition_source_sidecars(paths, recorded_root) or {}
+        days = {(_PARTITION_NAME.fullmatch(path.name)).group(1) for path in paths}
+        aggregate_calendar, aggregate_sources = _aggregate_metadata(
+            paths, recorded_root, days)
+    except CensusError:
+        raise
+    except ValueError as exc:
+        # The shared dataset loader reports malformed sidecars as ValueError;
+        # keep the census API/CLI fail-closed and preserve its precise reason.
+        raise CensusError(str(exc)) from exc
 
     records: list[dict] = []
     counts = {

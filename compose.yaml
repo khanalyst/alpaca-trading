@@ -330,7 +330,7 @@ services:
       - --interval
       - ${ALPACA_SHADOW_INTERVAL_SECONDS:-30}
       - --acceptance-root
-      - /app/shadow/session-acceptance
+      - ${ALPACA_RESEARCH_ACCEPTANCE_ROOT:-/app/shadow/session-acceptance}
       - --max-workers
       - ${ALPACA_SHADOW_MAX_WORKERS:-4}
       - --retention-days

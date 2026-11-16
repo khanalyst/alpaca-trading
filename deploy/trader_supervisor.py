@@ -10,6 +10,7 @@ concurrently. The separate watchdog container still handles supervisor death.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from pathlib import Path
@@ -27,6 +28,25 @@ if str(ROOT) not in sys.path:
 from agent import state
 from deploy.health import _read_json
 from deploy.watchdog import run_once, write_status
+
+
+def _signal_status_detail(received_signal: dict | None) -> dict:
+    """Return additive, JSON-safe signal receipt metadata for final status."""
+    if not received_signal:
+        return {}
+    detail = dict(received_signal)
+    # Keep a nested record for consumers that want one provenance object and
+    # flat aliases for the existing status/history readers.
+    return {
+        "received_signal": detail,
+        "signal_source": detail.get("source"),
+        "signal_name": detail.get("signal_name"),
+        "signal_number": detail.get("signal_number"),
+        "signal_received_ts": detail.get("receipt_ts"),
+        "signal_received_at": detail.get("receipt_ts"),
+        "signal_pid": detail.get("pid"),
+        "signal_ppid": detail.get("ppid"),
+    }
 
 
 def _open_journal_wal_anchor(path: Path) -> sqlite3.Connection:
@@ -134,28 +154,114 @@ def supervise(config_path: str, *, max_age: float = 300.0,
     cfg = load_cfg(config_path)
     state.configure_runtime(str(cfg.get("mode", "paper")))
     stopping = False
+    received_signal: dict | None = None
 
     def stop(_signum, _frame):
-        nonlocal stopping
+        nonlocal stopping, received_signal
         stopping = True
+        try:
+            try:
+                signal_name = signal.Signals(_signum).name
+            except (TypeError, ValueError):
+                signal_name = f"signal_{_signum}"
+            receipt_ts = time.time()
+            received_signal = {
+                "source": "trader_supervisor_signal_handler",
+                "signal_name": str(signal_name)[:64],
+                "signal_number": int(_signum),
+                "receipt_ts": receipt_ts,
+                "received_ts": receipt_ts,
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+            }
+        except BaseException:
+            # ``stopping`` is intentionally set before metadata collection:
+            # provenance must never make a signal callback fail to stop us.
+            received_signal = {
+                "source": "trader_supervisor_signal_handler",
+                "signal_name": "unknown",
+                "signal_number": (_signum if type(_signum) is int else None),
+                "receipt_ts": None,
+                "received_ts": None,
+                "pid": None,
+                "ppid": None,
+            }
+
+    def status_detail() -> dict:
+        return _signal_status_detail(received_signal)
+
+    child_stop_event_attempted = False
+
+    def record_child_stopped(trigger: str, child_obj, exit_code=None,
+                             verdict: dict | None = None) -> None:
+        """Best-effort receipt after a confirmed child reap/recovery attempt."""
+        nonlocal child_stop_event_attempted
+        if child_stop_event_attempted or trigger not in {"shutdown", "unresponsive"}:
+            return
+        child_stop_event_attempted = True
+        try:
+            if not Path(state.JOURNAL_FILE).is_file():
+                return
+            code = exit_code if type(exit_code) is int else (
+                child_obj.returncode if type(child_obj.returncode) is int else None)
+            mode = cfg.get("mode", "paper")
+            mode = mode[:32] if type(mode) is str else "unknown"
+            recovery_ok = None
+            recovery_reason = None
+            if isinstance(verdict, dict):
+                recovery_ok = (
+                    verdict.get("flattened") is True or
+                    verdict.get("reason") == "no_open_positions")
+                if type(verdict.get("reason")) is str:
+                    recovery_reason = verdict["reason"][:160]
+            payload = {
+                "trigger": trigger,
+                "monitor_result": trigger,
+                "parent_pid": os.getpid(),
+                "parent_ppid": os.getppid(),
+                "supervisor_pid": os.getpid(),
+                "child_pid": child_obj.pid if type(child_obj.pid) is int else None,
+                "child_exit_code": code,
+                "max_age": float(max_age),
+                "started_ts": started,
+                "receipt_ts": time.time(),
+                "runtime_mode": mode,
+                "mode": mode,
+                "received_signal": (dict(received_signal)
+                                    if isinstance(received_signal, dict) else None),
+                "recovery_attempted": verdict is not None,
+                "recovery_ok": recovery_ok,
+                "recovery_reason": recovery_reason,
+            }
+            state.log_event(
+                "supervisor_child_stopped",
+                json.dumps(payload, sort_keys=True, allow_nan=False),
+                runtime_mode=mode,
+            )
+        except BaseException:
+            # Recovery and the terminal status must never depend on audit I/O.
+            return
 
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
     child = None
     reaped = False
     recovery_attempted = False
     started = time.time()
+    result = None
     try:
         if not wait_until_resumed(status_path, interval=interval,
                                   stop_requested=lambda: stopping):
             write_status(status_path, "stopped", reason="shutdown_while_paused",
-                         operator_pause=True, trader_child_running=False)
+                         operator_pause=True, trader_child_running=False,
+                         **status_detail())
             return 0
         started = time.time()
         child = subprocess.Popen(
             [sys.executable, str(ROOT / "main.py"), "--config", config_path, "run"],
             cwd=ROOT, start_new_session=True, close_fds=True)
         write_status(status_path, "watching", child_pid=child.pid,
-                     max_heartbeat_age=max_age, started_ts=started)
+                     max_heartbeat_age=max_age, started_ts=started,
+                     **status_detail())
         result = monitor(child, state.HEARTBEAT_FILE, max_age=max_age,
                          interval=interval, started_wall=started,
                          stop_requested=lambda: stopping)
@@ -163,25 +269,31 @@ def supervise(config_path: str, *, max_age: float = 300.0,
             code = child.wait()
             reaped = True
             if code == 0:
-                write_status(status_path, "stopped", child_pid=child.pid, exit_code=code)
+                write_status(status_path, "stopped", child_pid=child.pid,
+                             exit_code=code, **status_detail())
                 return 0
         else:
             reaped = terminate_child(child, grace=grace)
             if not reaped:
                 write_status(status_path, "failed", child_pid=child.pid,
-                             reason="child_exit_unconfirmed", residual_risk=True)
+                             reason="child_exit_unconfirmed", residual_risk=True,
+                             **status_detail())
                 return 1
             # A cooperative normal shutdown already completed the trader's
             # own flatten path; otherwise independently reconcile recovery.
             if result == "shutdown" and child.returncode == 0:
-                write_status(status_path, "stopped", child_pid=child.pid, exit_code=0)
+                record_child_stopped(result, child, 0)
+                write_status(status_path, "stopped", child_pid=child.pid,
+                             exit_code=0, **status_detail())
                 return 0
         recovery_attempted = True
         verdict = recover(config_path)
         ok = verdict.get("flattened") is True or verdict.get("reason") == "no_open_positions"
+        record_child_stopped(result, child, child.returncode, verdict)
         write_status(status_path, "recovered" if ok else "failed",
                      child_pid=child.pid, reason=result, recovery=verdict,
-                     operator_pause=True, residual_risk=not ok)
+                     operator_pause=True, residual_risk=not ok,
+                     **status_detail())
         # Never relaunch entries here. A later restart retains operator pause.
         return 1
     except Exception as exc:
@@ -192,12 +304,16 @@ def supervise(config_path: str, *, max_age: float = 300.0,
             reaped = terminate_child(child, grace=grace)
         if reaped and not recovery_attempted:
             recovery_attempted = True
+            verdict = None
             try:
-                recover(config_path)
+                verdict = recover(config_path)
             except Exception:
                 pass  # the separate watchdog retains its recovery path
+            record_child_stopped(result, child, getattr(child, "returncode", None),
+                                 verdict)
         try:
-            write_status(status_path, "failed", reason=str(exc), residual_risk=True)
+            write_status(status_path, "failed", reason=str(exc), residual_risk=True,
+                         **status_detail())
         except OSError:
             pass
         return 1
@@ -206,7 +322,9 @@ def supervise(config_path: str, *, max_age: float = 300.0,
         # that an external restart could race. The watchdog recovers after its
         # stale deadline if recovery itself was unavailable.
         if child is not None and not reaped:
-            terminate_child(child, grace=grace)
+            reaped = terminate_child(child, grace=grace)
+        if reaped:
+            record_child_stopped(result, child, getattr(child, "returncode", None))
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 

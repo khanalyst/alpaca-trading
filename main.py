@@ -251,7 +251,26 @@ def cmd_run(args, cfg) -> int:
     engine = _engine(cfg)
     previous = {}
     def _stop(signum, _frame):
-        engine.request_shutdown(signal.Signals(signum).name)
+        # Signal callbacks run on the interpreter's main thread.  Keep the
+        # callback itself non-throwing so a malformed/unknown signal cannot
+        # skip the engine's sticky pause and finally/flatten path.
+        try:
+            # Set the in-memory loop gate before any provenance/audit work;
+            # request_shutdown remains responsible for durable pause state.
+            engine.running = False
+            try:
+                signal_name = signal.Signals(signum).name
+            except (TypeError, ValueError):
+                signal_name = f"signal_{signum}"
+            engine.request_shutdown(
+                signal_name,
+                source="main_signal_handler",
+                signal_name=signal_name,
+                signal_number=signum,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "shutdown signal handling degraded: %s", exc)
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous[signum] = signal.signal(signum, _stop)
     try:

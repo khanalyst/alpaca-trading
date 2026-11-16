@@ -338,6 +338,89 @@ class ResearchCensusTests(unittest.TestCase):
         self.assertEqual(result["eligible_historical_partition_count"], 1)
         self.assertTrue(result["structurally_underpowered"])
 
+    def test_explicit_forward_marker_counts_as_forward_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorded = root / "recorded"
+            partition = _partition(recorded, "2026-09-08")
+            partition.with_name(partition.name + ".source.json").write_text(
+                json.dumps({
+                    "schema": "recorder-partition-source.v1",
+                    "partition": partition.name,
+                    "source_mode": "forward_observed",
+                }), encoding="utf-8")
+
+            result = census(
+                partition_root=recorded / "sessions", recorded_root=recorded,
+                trusted_recorder=True, now=NOW, backtest_minimum_sessions=1)
+
+        self.assertEqual(result["forward_partition_count"], 1)
+        self.assertEqual(result["complete_forward_partition_count"], 1)
+        self.assertEqual(result["partitions"][0]["source_mode"],
+                         "forward_observed")
+
+    def test_legacy_unmarked_and_new_forward_marked_partitions_count_forward(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorded = root / "recorded"
+            _partition(recorded, "2026-09-07")
+            marked = _partition(recorded, "2026-09-08")
+            marked.with_name(marked.name + ".source.json").write_text(
+                json.dumps({
+                    "schema": "recorder-partition-source.v1",
+                    "partition": marked.name,
+                    "source_mode": "forward_observed",
+                }), encoding="utf-8")
+
+            result = census(
+                partition_root=recorded / "sessions", recorded_root=recorded,
+                trusted_recorder=True, now=NOW, backtest_minimum_sessions=1)
+
+        self.assertEqual(result["forward_partition_count"], 2)
+        self.assertEqual(result["complete_forward_partition_count"], 2)
+
+    def test_malformed_source_marker_is_a_census_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorded = root / "recorded"
+            partition = _partition(recorded, "2026-09-08")
+            marker = partition.with_name(partition.name + ".source.json")
+            marker.write_text(json.dumps({
+                "schema": "recorder-partition-source.v1",
+                "partition": partition.name,
+                "source_mode": "implicit",
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(CensusError,
+                                       "invalid source provenance sidecar"):
+                census(
+                    partition_root=recorded / "sessions",
+                    recorded_root=recorded, trusted_recorder=True, now=NOW)
+
+    def test_forward_marker_cannot_disagree_with_historical_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorded = root / "recorded"
+            partition = _partition(recorded, "2026-09-08")
+            partition.with_name(partition.name + ".source.json").write_text(
+                json.dumps({
+                    "schema": "recorder-partition-source.v1",
+                    "partition": partition.name,
+                    "source_mode": "forward_observed",
+                }), encoding="utf-8")
+            (recorded / ".recorder-index.json").write_text(json.dumps({
+                "schema": "recorder-index.v1",
+                "partition_sources": {
+                    partition.name: {"source_mode": "historical_backfill"},
+                },
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(CensusError,
+                                       "conflicting source metadata"):
+                census(
+                    partition_root=recorded / "sessions",
+                    recorded_root=recorded, trusted_recorder=True, now=NOW)
+
     def test_missing_and_rejected_reports_are_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

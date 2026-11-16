@@ -41,7 +41,14 @@ def apply_partition_source(payload: dict, session_day: str,
                            partition_sources: Mapping[str, object] | None,
                            *, row_number: int | None = None,
                            trusted_recorder: bool = False) -> dict:
-    """Annotate a temporary view from recorder sidecar source metadata."""
+    """Apply an explicit recorder source declaration to one normalized row.
+
+    A durable partition marker may supply the source mode for legacy CSV rows
+    that predate the per-row ``source_mode`` column.  It must never rewrite a
+    conflicting row claim.  For a trusted legacy recorder without a marker,
+    the established recorder attestation supplies forward provenance; explicit
+    historical claims still require their durable marker.
+    """
     label = f"row {row_number}" if row_number is not None else "row"
     row_mode = str(payload.get("source_mode") or "").strip().lower()
     source = (partition_sources.get(f"market-{session_day}.csv")
@@ -50,7 +57,7 @@ def apply_partition_source(payload: dict, session_day: str,
         if not isinstance(source, Mapping):
             raise ValueError(f"source metadata for {session_day} is malformed")
         source_mode = str(source.get("source_mode") or "").strip().lower()
-        if source_mode != "historical_backfill":
+        if source_mode not in {"forward_observed", "historical_backfill"}:
             raise ValueError(f"source metadata for {session_day} is unsupported")
         if row_mode and row_mode != source_mode:
             raise ValueError(
@@ -58,12 +65,10 @@ def apply_partition_source(payload: dict, session_day: str,
         payload["source_mode"] = source_mode
         return payload
 
-    # Recorder CSV rows predate the source_mode field.  Once the crash-safe
-    # historical sidecar has been consulted, an unmarked trusted partition is
-    # explicitly forward-observed so scheduled authorizing research never
-    # falls back to an ambiguous implicit mode.  A row that claims historical
-    # provenance without its durable marker is rejected rather than silently
-    # relabelled.
+    # Recorder CSV rows predate the source_mode field.  The explicit
+    # trusted-recorder attestation preserves the established legacy behavior:
+    # an unmarked row is forward observed, while historical/unknown claims
+    # cannot be upgraded without a durable declaration.
     if trusted_recorder:
         if row_mode == "historical_backfill":
             raise ValueError(
@@ -331,7 +336,7 @@ def _partition_calendar_sidecars(source_paths: Sequence[Path],
 
 def _partition_source_sidecars(source_paths: Sequence[Path],
                                recorded_root: Path | None) -> dict | None:
-    """Load crash-safe historical provenance markers for selected partitions.
+    """Load crash-safe provenance markers for selected partitions.
 
     The aggregate recorder index can lag a durable CSV after a crash.  Source
     markers are therefore authoritative for the selected partitions and are
@@ -366,7 +371,8 @@ def _partition_source_sidecars(source_paths: Sequence[Path],
                 payload.get("schema") != "recorder-partition-source.v1" or
                 not isinstance(partition, str) or
                 path.name != partition + ".source.json" or
-                source_mode != "historical_backfill"):
+                not isinstance(source_mode, str) or
+                source_mode not in {"forward_observed", "historical_backfill"}):
             raise ValueError(f"invalid source provenance sidecar {path}")
         # Marker-before-partition ordering leaves a harmless orphan after a
         # crash; never let that orphan classify a replacement future partition.

@@ -27,6 +27,33 @@ from .execution_lifecycle import (
 
 log = logging.getLogger("engine")
 
+_SHUTDOWN_TEXT_LIMIT = 160
+
+
+def _bounded_shutdown_text(value: Any, fallback: str) -> str:
+    """Return printable, bounded shutdown metadata for durable diagnostics.
+
+    Shutdown reasons are operator-facing diagnostics, not an error transport.
+    Keep control characters and unbounded exception text out of the durable
+    journal/heartbeat while preserving the existing human-readable reasons.
+    """
+    text = str(value if value is not None else fallback).strip()
+    if not text:
+        text = fallback
+    text = " ".join(text.split())
+    return "".join(char for char in text if char.isprintable())[:_SHUTDOWN_TEXT_LIMIT]
+
+
+def _shutdown_signal_number(value: Any) -> int | None:
+    """Normalize an optional signal number without trusting arbitrary input."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 0 < number < 256 else None
+
 
 class _ResumeBlocked(AlpacaError):
     """Authorization failed after the resume command acquired its lock."""
@@ -944,14 +971,151 @@ class RuntimeControlMixin:
         finally:
             self._release_lock()
 
-    def request_shutdown(self, reason: str = "shutdown") -> None:
-        self.shutdown_reason = reason
-        self.running = False
+    def _shutdown_provenance(self, reason: Any, *, source: Any,
+                             signal_name: Any = None,
+                             signal_number: Any = None,
+                             receipt_ts: Any = None) -> dict[str, Any]:
+        """Build the non-secret identity of one shutdown receipt."""
+        bounded_reason = _bounded_shutdown_text(reason, "shutdown")
+        bounded_source = _bounded_shutdown_text(source, "runtime_control")
+        bounded_signal_name = None
+        if signal_name is not None:
+            bounded_signal_name = _bounded_shutdown_text(signal_name, "signal")
         try:
-            state.commit({"operator_pause": True}, transition=(state.RUNNING, state.PAUSED))
-            state.write_heartbeat("pausing", run_id=self.run_id, reason=reason)
-        except Exception:
-            pass
+            received = float(receipt_ts if receipt_ts is not None else time.time())
+        except (TypeError, ValueError):
+            received = time.time()
+        if not received == received or received in (float("inf"), float("-inf")):
+            received = time.time()
+        return {
+            "reason": bounded_reason,
+            "source": bounded_source,
+            "signal_name": bounded_signal_name,
+            "signal_number": _shutdown_signal_number(signal_number),
+            "receipt_ts": received,
+            "received_ts": received,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "run_id": _bounded_shutdown_text(getattr(self, "run_id", None), "unknown"),
+            "runtime_mode": _bounded_shutdown_text(
+                getattr(self, "mode", None), "unknown"),
+            "mode": _bounded_shutdown_text(getattr(self, "mode", None), "unknown"),
+        }
+
+    def _shutdown_provenance_fallback(self, reason: Any, *, source: Any,
+                                      signal_name: Any = None,
+                                      signal_number: Any = None) -> dict[str, Any]:
+        """Build a primitive-only receipt when normal metadata construction fails."""
+        bounded_reason = "shutdown"
+        if type(reason) is str:
+            try:
+                candidate = " ".join(reason.split())
+                candidate = "".join(char for char in candidate
+                                     if char.isprintable())[:_SHUTDOWN_TEXT_LIMIT]
+                if candidate:
+                    bounded_reason = candidate
+            except BaseException:
+                pass
+        bounded_signal_name = signal_name if type(signal_name) is str else None
+        if bounded_signal_name is not None:
+            try:
+                bounded_signal_name = bounded_signal_name[:_SHUTDOWN_TEXT_LIMIT]
+            except BaseException:
+                bounded_signal_name = None
+        bounded_signal_number = (
+            signal_number if type(signal_number) is int and
+            0 < signal_number < 256 else None)
+        bounded_source = "runtime_control"
+        if type(source) is str:
+            try:
+                candidate = " ".join(source.split())
+                candidate = "".join(char for char in candidate
+                                     if char.isprintable())[:_SHUTDOWN_TEXT_LIMIT]
+                if candidate:
+                    bounded_source = candidate
+            except BaseException:
+                pass
+        try:
+            received = float(time.time())
+        except BaseException:
+            received = 0.0
+        try:
+            pid = os.getpid()
+        except BaseException:
+            pid = None
+        try:
+            ppid = os.getppid()
+        except BaseException:
+            ppid = None
+        return {
+            "reason": bounded_reason,
+            "source": bounded_source,
+            "signal_name": bounded_signal_name,
+            "signal_number": bounded_signal_number,
+            "receipt_ts": received,
+            "received_ts": received,
+            "pid": pid,
+            "ppid": ppid,
+            "run_id": "unknown",
+            "runtime_mode": "unknown",
+            "mode": "unknown",
+        }
+
+    @staticmethod
+    def _shutdown_heartbeat_detail(provenance: Mapping[str, Any]) -> dict[str, Any]:
+        """Expose identical provenance fields in the pausing heartbeat."""
+        detail = dict(provenance)
+        detail["shutdown_provenance"] = dict(provenance)
+        detail["shutdown_requested_ts"] = provenance.get("receipt_ts")
+        return detail
+
+    def request_shutdown(self, reason: str = "shutdown", *,
+                         source: str = "runtime_control",
+                         signal_name: str | None = None,
+                         signal_number: int | None = None,
+                         receipt_ts: float | None = None) -> None:
+        """Request a sticky pause and record who received the shutdown.
+
+        This method is called from a Python signal handler, so every write is
+        best effort.  The pause mutation is attempted independently before
+        audit/heartbeat writes; an audit outage must never prevent the normal
+        flatten/finalization path from running.
+        """
+        self.running = False
+
+        try:
+            state.commit({"operator_pause": True},
+                         transition=(state.RUNNING, state.PAUSED))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shutdown pause persistence unavailable: %s", exc)
+
+        try:
+            provenance = self._shutdown_provenance(
+                reason, source=source, signal_name=signal_name,
+                signal_number=signal_number, receipt_ts=receipt_ts)
+        except BaseException as exc:  # noqa: BLE001
+            log.warning("shutdown provenance construction unavailable: %s", exc)
+            provenance = self._shutdown_provenance_fallback(
+                reason, source=source, signal_name=signal_name,
+                signal_number=signal_number)
+        self.shutdown_reason = provenance["reason"]
+        self.shutdown_provenance = provenance
+
+        try:
+            state.log_event(
+                "shutdown_requested",
+                json.dumps(provenance, sort_keys=True, default=str),
+                run_id=provenance["run_id"],
+                runtime_mode=provenance["runtime_mode"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shutdown audit unavailable: %s", exc)
+
+        try:
+            state.write_heartbeat(
+                "pausing", **self._shutdown_heartbeat_detail(provenance))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shutdown heartbeat unavailable: %s", exc)
 
     def close(self) -> None:
         """Release the process lock and leave a truthful terminal heartbeat."""
@@ -975,8 +1139,16 @@ class RuntimeControlMixin:
                             "degraded", run_id=self.run_id,
                             reason="config_audit_unavailable")
                     else:
-                        state.write_heartbeat("stopped", run_id=self.run_id,
-                                              reason=self.shutdown_reason or "closed")
+                        detail = {}
+                        provenance = getattr(self, "shutdown_provenance", None)
+                        if isinstance(provenance, Mapping):
+                            detail = self._shutdown_heartbeat_detail(provenance)
+                        if detail:
+                            state.write_heartbeat("stopped", **detail)
+                        else:
+                            state.write_heartbeat(
+                                "stopped", run_id=self.run_id,
+                                reason=self.shutdown_reason or "closed")
                 except Exception:
                     pass
         finally:

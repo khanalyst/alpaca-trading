@@ -51,6 +51,15 @@ An orderly SIGTERM/SIGINT shutdown persists the pause before releasing the
 runtime lock. A supervisor restart does not automatically resume entries.
 Verify broker positions and working orders rather than trusting local state.
 
+The shutdown path records a `shutdown_requested` journal event with the signal,
+receiving code path, receipt time, PID/PPID, run ID, and mode. Correlate it with
+the supervisor's `supervisor_child_stopped` event, signal metadata, and host
+logs. The supervisor records its stop/timeout trigger after reaping and any
+required recovery. Signal receipt fields identify the receiver; they do not
+identify the external signal sender. Force-flat and idle
+cycles must continue advancing their heartbeat so the supervisor does not
+mistake a safe, active process for an unresponsive one.
+
 For deliberate cleanup:
 
     docker compose run --rm --no-deps trader python main.py flatten --reason operator
@@ -89,11 +98,15 @@ resume requires PAUSED state with operator_pause=true, no kill reason/daily
 stop, empty local trades/protection, terminal local orders, authenticated
 preflight, no broker positions, no non-terminal broker orders, a final flat
 broker confirmation, and the unchanged account fingerprint. The preflight and
-entry paths also reject a frozen paper-trial identity/config mismatch; resume
-does not clear that blocker. Activation/replacement checks are account-scoped:
-the local book and the authenticated broker book must both be flat. resume
+entry paths reject changes to a running frozen paper trial. An evidence-empty
+incumbent can first be cancelled with `deploy/cancel_paper_trial.py`, using its
+frozen profile and exact trial/identity confirmations. Preserve that cancellation
+audit. A different trial can then activate only after the incumbent is terminal
+and the local and authenticated broker books are flat; reconciliation journals
+the terminal snapshot before installing the replacement. `resume` applies those
+same activation checks and authorizes the operator pause separately. It
 never cancels, submits, or flattens. Preserve failure reasons; do not clear
-flags, rewrite fingerprints, or replace frozen trials.
+flags, rewrite fingerprints, or rebind an existing frozen trial.
 
 ## Paused and degraded recovery limits
 
