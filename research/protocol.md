@@ -1,923 +1,209 @@
 # Research protocol
 
-The research boundary is normalized, point-in-time market data for US-listed
-equities/ETFs and listed OCC options only. Provider
-payloads are converted to `research.market_data` records before feature
-calculation or replay. Required records become actionable only at the maximum
-of their market event timestamp, `as_of`, and `observed_at` timestamps. A
-delayed recorder bar can therefore signal when observed; execution enters at
-that decision/observation time using fresh exact IEX or SIP (equity) or OPRA (option)
-evidence. Delayed full OHLC never backfills an earlier entry, and partial
-pre-entry bar ranges are excluded. `as_of` may never be later than
-`observed_at`. Records retain provider/feed identity and the New York session
-date used for grouping. Feed provenance is request-bound: an explicit
-provider-row feed label is retained when present; otherwise the
-configured/requested feed label is used, not an independent venue attestation.
+This is the normative contract for the research modules. Code and registered
+manifests are authoritative; this document names their current boundaries and
+versioned behavior. A new result must carry its source, configuration, code,
+replay, gate, and (where applicable) instrument identities.
 
-The shipped paper deployment uses the free Basic IEX equity feed and does not
-acquire options (`universe.asset_classes=["us_equity"]`). `indicative` is the
-safe options-feed default and is non-executable. Equity authorization requires
-the exact configured IEX or SIP feed; `delayed_sip` is diagnostic only, and a
-partial or mixed feed cannot satisfy a research proof. IEX is a limited venue
-view rather than the consolidated SIP tape, so coverage can be sparse and its
-evidence is not interchangeable with a paid-feed corpus. A feed change requires
-collecting the new corpus and re-deriving research/shadow proofs. The trader remains paper-only with live
-trading disabled and uses the `shares` runtime execution profile. Scheduled
-research follows the equity lane by default (`ALPACA_RESEARCH_VEHICLES=equity`);
-`option` or `all` is an explicit operator selection that requires changing the
-universe and configuring OPRA. Option research is evidence generation only and
-does not authorize options live execution.
-Selecting the separate `options` execution profile is an explicit paper
-runtime decision after OPRA evidence and controls are reviewed.
+## 1. Source and time
 
-The immutable authorizing floors are: 100 trades plus 30 complete
-sessions/clusters for backtest/factory windows; 100 trades plus 30 complete
-sessions/clusters for the sealed qualification window; and 150 trades plus 30
-complete sessions for the parity-matched live-shadow tail. Replay epoch 6
-retains the epoch-5 point-in-time, executable-row, vehicle-cost,
-raw-confirmatory-p, and stressed-cost boundaries and additionally seals paired
-synthetic root-control shadow decisions/replays, diagnostic-only historical-
-backfill provenance with exact calendar metadata, durable live-shadow FDR
-allocation binding, chronological paired inference, finite BY input
-validation, and conservative broker-tick equity rounding. Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. Epoch-5 and epoch-6 proofs remain readable for audit but are quarantined and cannot validate, champion, or authorize the paper trader until re-derived under epoch 7.
+Provider payloads are normalized through `research.market_data` before feature
+calculation. A bar, quote, or option snapshot retains provider/feed, market
+timestamp, `as_of`, `observed_at`, calendar/session metadata, and `source_mode`.
+Required records are available no earlier than
+`max(timestamp, as_of, observed_at)`. `as_of <= observed_at` is mandatory. A
+late recorder event may signal only when it is observed; it may not recreate an
+earlier entry.
 
-The finite rule grammar contains twelve families. The twelfth,
-`cross_sectional_residual`, is shares-only, benchmarks SPY, and requires
-synchronized one-minute context. It is an additional bounded hypothesis path,
-not a replacement for the shipped 24-ETF universe; future family or universe
-changes require a separately approved scope, exact symbol/feed coverage,
-screen evidence, and a new identity/proof epoch.
+`forward_observed` is the sole authorizing source mode. `historical_backfill`,
+mixed or implicit modes, delayed feeds, missing provenance, and partial feeds
+are diagnostic-only. `research.source_validation.validate_source` is run before
+opening an authorizing ledger. Diagnostic mode is an explicit policy, not a
+weaker parser: malformed records, unsupported modes, future observations, feed
+contradictions, and source mutation between passes still fail closed.
 
-Production replay requires exact Alpaca calendar metadata for every session,
-including early closes. Missing metadata is a refusal; no fixed 16:00 close is
-promoted as a fallback.
+Equity evidence must match the configured provider and exact `iex` or `sip`
+feed. Option evidence must match `opra`; option and equity books are separate.
+The exact Alpaca calendar is required for every session, including early-close
+metadata. A missing calendar boundary is a refusal. Session grouping uses
+`America/New_York`.
 
-The recorder samples on a fixed 30-second cadence and durably tracks a quote
-watermark and a completed-bar watermark for every symbol. Full-session
-acceptance requires quote age no greater than 30 seconds and completed-bar
-publication-deadline lag no greater than 30 seconds. Raw bar age remains
-visible; re-fetching an old bar cannot refresh its completion watermark.
-Neither observation substitutes for the other, and runtime entry freshness
-limits are unchanged. Alpaca calendar metadata records holidays as explicit
-closed sessions.
-Scheduler liveness is a separate operational dimension from research evidence
-and readiness.
+## 2. Causal replay invariants
 
-Historical backfill preserves that exact calendar metadata in the recorder
-sidecar and labels rows `source_mode: historical_backfill`. Its truthful
-fetch-time `observed_at` is retained. Only an explicit diagnostic replay policy
-may inspect those rows at their provider `as_of` boundary; resulting evidence is
-marked `diagnostic_historical_backfill`, excluded from authorizing statistics,
-and cannot authorize a proof or live deployment.
+Every replay implementation must preserve these invariants:
 
-Source mode is decided before any authorizing ledger is opened. Historical or
-mixed inputs fail closed instead of being evaluated under the forward policy;
-the operator must explicitly select diagnostic mode.
-Every authorizing row must explicitly declare `source_mode: forward_observed`;
-trusted recorder projections add the label, while unlabelled compatibility
-data remains diagnostic-only. Diagnostic mode is not a
-weaker integrity parser: malformed records, unsupported labels, future
-observation times, and a source that changes after preflight are rejected in
-all modes. Every diagnostic result carries `authorizing: false`, writes no edge
-or shadow proof, and preserves the source-mode counts used to route it.
+1. Signals use completed bars and the exact causal maturity/continuity window
+   of the normalized rule. Session-anchored families use the observed session
+   prefix; bounded families require adjacency only over the bars their feature
+   actually reads.
+2. A missing immediate entry bar is no trade. A gap through a level fills at the
+   gap open. An intrabar stop/target tie resolves to the stop. A signal bar does
+   not retrospectively close a newly opened position.
+3. Strict boundary fills require a fresh executable quote. A bar fallback is
+   explicitly diagnostic and cannot enter an authorizing projection.
+4. All lanes use `research.costs` for spread, slippage, fee, stress, and
+   realized-risk arithmetic. An entry slippage cap is shared by runtime,
+   factory, IBR, and randomized-null quote entries; malformed or over-cap
+   quotes fail closed with their stable refusal reasons.
+5. Equity legs require exact IEX/SIP quote provenance; option legs require OPRA.
+   Provider, feed, quote timestamp/age, and fill source are persisted per leg.
+   A missing/stale/bar-only leg is diagnostic.
+6. Positions use the calendar-derived configured force-flat timestamp, normally
+   ten minutes before the exact close. Strict equity lanes refuse a missing
+   exit quote rather than manufacture P&L. The rule deadline
+   contract orders equal timestamps as session force-flat, thesis deadline, then
+   maximum hold.
+7. Research and runtime may retain operational aliases, but every exit row also
+   carries the canonical cause: `stop`, `target`, `max_hold`,
+   `thesis_deadline`, `session_force_flat`, `data_discontinuity`, or `unknown`.
+8. No lane pools equity with option P&L, independent arms with one another, or
+   diagnostic observations with authorizing observations.
 
-## Replay gates
+The v3–v7 exit and rule grammar extensions are validated by
+`agent/contracts/rule.py`. V4 targets are frozen from the completed signal
+prefix; breakeven/trailing amendments apply only to later bars; V5/V6/V7
+context, mechanism, geometry, and correction fields are opt-in and
+family-scoped. See [`docs/rule_strategy_v3_exit_protocol.md`](../docs/rule_strategy_v3_exit_protocol.md).
 
-Every replay must establish the following invariants:
+## 3. Costs and risk geometry
 
-- range features use completed bars only;
-- entries occur on the next bar, never on the signal bar;
-- an early, reversed, or duplicate bar fails closed;
-- bar adjacency is required exactly where a missing minute changes an outcome,
-  and nowhere else: over the bars a signal is computed from
-  (`agent/contracts/rule.py::feature_window_bars`, which is the whole session
-  prefix for the session-accumulating VWAP families), between a signal and its
-  entry, and across a hold — a hold walk stops at a discontinuity and resolves
-  the position on the last observed bar rather than treating the next recorded
-  minute as adjacent. A gap after a position is resolved does not delete the
-  observation: rejecting a whole symbol-session for one missing low-volume
-  minute discards a large, non-random share of a real corpus;
-- same-bar stop/target ties resolve to the stop;
-- a gap through a level, on entry or exit, fills at the gap open;
-- a fill landing on a bar boundary uses fresh executable quote evidence at the
-  causal decision/observation time when strict; a delayed full OHLC record never
-  backfills an earlier entry, and any bar fallback is explicitly diagnostic;
-- quote entries use one pure entry-slippage cap shared by runtime, factory,
-  explicit IBR replay, and randomized-null controls. Malformed inputs fail
-  closed as `entry_slippage_invalid`; an over-cap quote is a no-trade/refusal
-  with `entry_slippage_exceeds_limit`;
-- spread, slippage, and both-side fees are charged from one shared model;
-- an option leg is priced only from a quote no older than the strict 30-second
-  freshness bound at the instant being priced; a signal whose contract has no such quote
-  is recorded as an explicit unpriced row, never dropped and never filled from
-  the contract's last quote of the morning;
-- authorizing equity fills require exact IEX or SIP quote provenance on both
-  entry and exit legs; `delayed_sip` remains diagnostic only. Authorizing option
-  fills require OPRA quote provenance on both legs. Provider, feed, quote age,
-  and fill source are retained for each leg, and any leg older than 30 seconds,
-  bar-only, partial-feed, or missing remains diagnostic;
-- positions are force-flat before the session close; strict equity replay
-  requires a fresh executable quote at that boundary and refuses the row rather
-  than manufacturing force-flat P&L;
-- a bounded rule position carries one shared deadline contract
-  (`agent/contracts/rule.py::exit_deadline`) covering `max_hold_bars`, the v4
-  thesis deadline, and session force-flat. Equal timestamps use runtime order:
-  session force-flat, thesis deadline, then maximum hold;
-- research and runtime retain their historical reason aliases but also persist
-  `canonical_exit_reason` as `stop`, `target`, `max_hold`,
-  `thesis_deadline`, `session_force_flat`, `data_discontinuity`, or `unknown`;
-  unrecognized operational causes map to `unknown` rather than extending the
-  canonical vocabulary;
-- equity and single-leg long-option books have separate samples, costs, and
-  P&L; multi-leg and short option structures are outside the protocol.
+The compatibility cost model (`static_v1`) is 4 bps spread, 6 bps adverse
+slippage, and 0.5 bps per-side notional fee, with a 0.65 currency-unit option
+fee per contract per side. The stress ladder is 9/15/25/50 bps, each an all-in
+round-trip charge against entry notional. `per_symbol_v2` is a separate
+order-type-aware resolver used only when explicitly selected and provenance is
+present. A measured quote schedule is frozen by feed/provider, coverage
+policy, percentiles, quote floor, and content hash; missing cells fail closed.
 
-`research/costs.py` owns the single expected-cost model and the fill
-arithmetic every lane spends it through; no lane carries its own
-spread/slippage/fee numbers. `cost_model_for_vehicle` selects an explicit
-`costs.vehicles.equity` or `.option` override when configured and records its
-provenance; otherwise the shipped schedule is 4 bps spread, 6 bps adverse
-slippage, 0.5 bps per-side notional fee, and a 0.65 currency-unit option fee
-per contract per side. The runtime's `execution.max_slippage_bps`
-and `max_spread_bps` are rejection caps, not expectations: they bound the
-model, and a model expecting a cost the runtime would refuse to submit fails
-closed. The pure entry-slippage check applies that cap to quote-versus-reference
-prices in every quote-entry lane and keeps the stable invalid and over-cap
-reasons above. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps,
-persisted with every proof. Under gate protocol 1, 25 bps on fit plus held-out
-rows is the authorization requirement; gate protocol 2 replaces it with a
-veto relative to the expected per-symbol round trip whenever one is supplied
-(see "Proof gate protocol" below) and keeps 25 bps only as the fallback.
-For equity proofs, an explicitly enabled `costs.measured_quote` block replaces
-the flat spread/slippage assumption with one frozen per-symbol, per-half-hour
-schedule. Its verified content hash, feed/provider identity, spread/depth
-percentiles, quote-count floor, and strict coverage policy are proof
-assumptions. Candidate, control, randomized-null, qualification, and
-live-shadow legs use the same entry/exit resolver; missing or under-covered
-cells fail closed. The checked-in block is disabled until a corpus-specific
-schedule is deliberately fitted and frozen.
-Stress bps are charged against entry notional, with listed-option round-trip
-fees added for both per-contract sides; they are not per-side bps. The shipped
-admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. The proof-time stress in `research/gates.py` is described under "Proof gate protocol" below.
-For equity geometry, a broker-normalized authored stop below
-`max(30 bps, scenario / max-cost-to-risk ratio)` is likewise refused as
-`stressed_cost_risk_limit` before sizing or fill. The stop is never widened and
-a fixed-R target is never recomputed; explicitly wide authored brackets pass
-unchanged. The floor and binding decision remain in refusal/trade telemetry.
-For equity orders, bracket legs and limit prices are rounded toward the entry
-to Alpaca's valid price ticks (`$0.01` at or above `$1`, `$0.0001` below) before
-risk sizing and submission; a rounded bracket that no longer straddles entry is
+Runtime spread and slippage values are rejection limits, not expected costs.
+The stressed cost/risk check rejects an authored stop below the configured
+geometry requirement before sizing or fill. It never widens the stop or moves a
+fixed-R target. Equity prices are rounded toward the entry to valid broker
+ticks before sizing; a rounded bracket that no longer straddles entry is
 rejected.
-`research/calibration.py` is a read-only authorization check stratified by
-runtime mode, vehicle, execution profile, and both entry and exit when
-references are present. Partial fills use plan/reference fields. Missing,
-stale, or insufficient calibration, an optimistic cost verdict, a terminal fill
-below 80% of requested quantity, or a partial-cancel rate above 20% returns a
-veto and non-zero status. Offline diagnostics may still run, but shadow
-authorization remains blocked. In-flight orders are excluded, and the model is
-never adjusted automatically.
-Staleness is measured only when asked for (review finding D1-12):
-`calibrate(..., as_of=, max_age_days=)`, or `--max-age-days` on the command
-line, vetoes (`veto_stale_calibration`) unless at least 20 scored orders were
-filled within that many days before `as_of` (default now); fills dated after
-`as_of` do not count. Without a maximum age no age is checked, so an
-authorization caller must pass one.
 
-For equity entries this check cannot veto on cost (review finding D1-06): the
-journal reference is the limit price, the IEX ask or bid, a DAY limit fills at
-or better than it, so every entry scores zero or less against a model figure
-that includes the half spread, and unfilled entries are never scored.
-`research/entry_calibration.py` scores like with like: each filled entry
-order against the decision-time mid (spread included) and the signal bar's
-close, and every entry order that ended unfilled as a missed fill, with its
-opportunity cost when the mid at expiry is recorded; more than 20% missed
-entries is a veto. It reads `decision_mid` (or `decision_bid` and
-`decision_ask`, or the existing `mid_price`), `signal_close` and `expiry_mid`
-from the journal, which the runtime does not yet write for shares, so it
-reports `insufficient_data` and fails closed until it does. It is not yet
-part of `calibrate`'s authorization; wiring it in, and journalling those
-fields from `agent/market_entry_risk.py` and `agent/execution_lifecycle.py`
-(with columns in `agent/journal.py`), are the remaining steps.
-
-The scheduled calibration-only pass measures per-symbol/session stress on the
-9/15/25/50-bps ladder and is disabled by default. Runtime use requires an
-explicit operator-enabled path and an artifact with exact provider/feed
-identity, a content hash, sufficient disjoint chronological held-out sessions,
-and one artifact-wide effective-after boundary. A missing or unusable cell
-uses the configured scalar fallback; calibration is diagnostic unless that
-operator path is enabled and never self-authorizes.
-
-`ReplayPolicy.from_config` is the runtime policy source for replay. The shipped
-`execution.strict_market_data` default is `true`; direct replay APIs are strict
-as well. The policy carries
-the strict 30-second market-data age, option DTE (default 7–60), option spread
-and liquidity checks, latest-entry and force-flat times, and portfolio limits
-(concurrent positions, position notional, gross exposure, open risk, and daily
-loss). Research cannot relax these option, timing, or risk constraints while
-simulating.
-
-Serial inference is deterministic: day/session-cluster deltas use a seeded
-moving-block cluster bootstrap with persisted draw count, seed, and block
-length. Effective breadth is persisted and re-verified as a matched
-symbol-by-session correlation/eigenvalue diagnostic only; it never increases N
-or replaces independent session clusters. Authorizing dependence is separate:
-before each factory cycle, completed prior-cycle family deltas are frozen into a
-hash-verified map. Strong family groups receive an additional cluster-level BY
-veto, while runtime `all_proved` admits at most one strongest edge per verified
-frozen cluster. An unavailable or unknown assignment uses the safe fallback and
-never implies independence.
-
-The IBR implementation in `research/ibr.py` provides these invariants. A
-missing or partial opening range is `no trade`, not an imputed range. When the
-signal is actionable at the next-bar boundary, a missing immediate next bar is
-`no trade`; when recorder delay makes the signal actionable later, entry may
-move to the first complete bar at/after that decision time and requires fresh
-quote evidence. Stale signals are never carried across an outage.
-
-Market-data strictness is lane-specific. The validated research-only setting
-`research.backtest_bar_fallback` defaults to `true`: historical backtest lanes
-may price a missing equity quote at a bar boundary from the bar, using the
-shared conservative spread/slippage/fee model, and record `quote` versus `bar`
-as the fill source. Forward-shadow, live-shadow, and paper lanes remain strict
-and require a fresh executable quote. Direct replay APIs default to strict;
-only a lane orchestrator or the standalone `backtest-ibr` command opts into
-historical fallback. A passing backtest is evidence for the next gate, never
-authorization to trade paper.
-
-## Proof gate protocol
-
-`research/gates.py` builds and re-verifies the content-hashed gate envelope
-behind every proof. Its decision semantics are versioned by
-`gate_protocol_version`, separately from the envelope schema string
-(`verified-research-gate.v3`), which the proof ledger keys its current-epoch
-rule on. An envelope without the field was produced under protocol 1 and is
-re-verified under exactly those semantics: the protocol-1 builder reproduces a
-stored envelope byte for byte, and
-`tests/research/fixtures/gate_envelope_protocol_v1.json.gz` (written by the
-pre-versioning code) must keep verifying. Protocol 1 is never written
-explicitly, and an unknown version fails verification. New envelopes are
-protocol 2, introduced after the October 2026 review (findings D2-01 to D2-09):
-
-- **Cost stress (D2-01).** Protocol 1 charged 25 bps of entry notional on fit
-  plus held-out rows and required a positive sum, which needs about 25 bps of
-  gross edge per trade whatever an ETF's real spread. Protocol 2 accepts an
-  expected round trip (complete round trip, fees included, in bps of entry
-  notional) either as `expected_round_trip_bps` on each row (the cost model's
-  output in the evidence) or as a builder parameter, keyed by symbol or as one
-  scalar. Each executed held-out and sealed-qualification row (never a fit
-  row) is then charged `max(recorded round trip, 2 x expected round trip)`,
-  and the veto requires a positive 95% moving-block session-bootstrap lower
-  bound of the mean stressed P&L per trade, not a positive sum. A row without
-  a resolvable round trip fails the veto closed. When no round trip is
-  supplied at all, the 25 bps protocol-1 veto applies unchanged. The 9, 15, 25
-  and 50 bps scenarios stay persisted as diagnostics either way. The declared
-  round trip is part of the verified evidence; because the stress never falls
-  below what a row already paid, an understated round trip can at most reduce
-  the veto to a lower bound on net P&L.
-- **Held-out drawdown (D2-07).** `max_drawdown_supported` was a presence check
-  (`max_drawdown_of` always returns a finite number). Under protocol 2 it also
-  requires the held-out drawdown to stay within 10R, R being the median
-  `risk_usd` of the executed held-out rows: the rule the sealed qualification
-  window already applies when it has no explicit currency limit. This is a
-  real veto with a power cost: in a simulation of 180 held-out trades with
-  full -1R stops, a 45% win rate and +0.1R expectancy, a 10R limit held in
-  about 29% of worlds (13% at zero edge). Trades that exit on time rather than
-  at the stop have smaller dispersion and pass more often.
-- **Pairing keys (D2-06).** Paired statistics key rows by `comparison_id` when
-  a producer supplies one, otherwise by `vehicle:symbol:session_date`. A key
-  seen twice in an arm is ambiguous and is dropped from every pairing while
-  the coverage denominator still counts the rows. Protocol 1 dropped such
-  rows silently; protocol 2 fails `comparison_keys_unique` and lists the
-  keys in `pairing_integrity`. Factory and IBR replay emit at most one row
-  per symbol-session, so the default key is exact there; any lane whose rule
-  can re-enter a symbol within a session must stamp candidate and control rows
-  with `opportunity_comparison_id` (symbol plus signal bar).
-- **Bounded parameters (D2-09).** Re-verification recomputes every statistic
-  from parameters the envelope declares. A passing protocol-2 envelope must
-  therefore declare a required held-out floor (and a required fit floor in the
-  backtest lane), walk-forward parameters at or above
-  `protocol_walk_forward_minimums(lane)` (3 folds; a 30-session aggregate
-  floor; 9 test sessions, and 16 backtest or 25 shadow trades, per fold;
-  80% coverage), and a paired control that carries its deltas and was drawn
-  with the preregistered seed and at least 20,000 draws. The
-  `protocol_parameters_bound` check records this and verification rejects a
-  passing envelope that fails it.
-- **Monte Carlo resolution (D2-05).** A Monte Carlo sign-flip p-value is
-  `(e+1)/(N+1)`; with 20,000 draws and no extreme draw it is pinned at
-  `5.0e-05`, which makes a lone Benjamini-Yekutieli discovery impossible once
-  a batch reaches 175 candidates. When no null draw reaches the observed
-  statistic, protocol 2 reports the smaller of that floor and Hoeffding's
-  bound on the exact sign-flip tail, `exp(-t^2/(2*sum c_i^2))` over session
-  contributions `c_i`. The result is still a valid p-value: at levels at or
-  above `1/(N+1)` it rejects exactly when the Monte Carlo p-value does, and
-  below that level only when the bound, which is never smaller than the exact
-  permutation p-value, does. Re-verification repeats the persisted draw count
-  and seed in every protocol (D2-03).
-- **Power (D2-04).** The floors (backtest 100 trades/30 sessions/30 clusters,
-  shadow 150/30/30, qualification 100/30/30) were set as sample-size
-  minimums; they were not sized to any target effect. `protocol_power_report`
-  publishes, for the protocol's actual parameters, the per-trade minimum
-  detectable effect at 80% power from a normal approximation on session-level
-  P&L, and every protocol-2 envelope carries the same report as a
-  non-authorizing `power` diagnostic, estimated from its own held-out matched
-  deltas. For a per-trade standard deviation of 40 bps, uncorrelated trades
-  and the shipped floors:
-
-  | trades per session | window sessions | held-out or qualification test | lone BY discovery, batch of 48 | first live-shadow LORD++ test (alpha 0.0125) |
-  |---|---|---|---|---|
-  | 1 | 100 (backtest), 150 (shadow) | 9.95 / 8.12 bps | 17.36 / 14.18 bps | 12.33 / 10.07 bps |
-  | 5 | 30 | 8.12 bps | 14.18 bps | 10.07 bps |
-  | 10 | 30 | 5.74 bps | 10.02 bps | 7.12 bps |
-
-  A within-session correlation of 0.2 raises the 5-trade figure from 8.12 to
-  10.90 bps. Under protocol 1 a lone discovery in a batch of 175 or more is
-  unattainable; under protocol 2 the 5-trade figure is 17.29 bps at 175 and
-  17.56 bps at 240. `lane_minimums_for_target_mde` is the opt-in way to size a
-  lane from a target effect: it returns trade and session floors that detect
-  the target at 80% power and never fall below the protocol, so the sized
-  floors verify unchanged (40 bps per trade, 5 trades per session: 80 sessions
-  for 5 bps, 495 for 2 bps).
-- **Check classification (D2-08).** `gate_check_classification` and every
-  protocol-2 envelope's `check_classification` state, for each check, whether
-  it is independent (can bind on its own), implied (by the named checks, for
-  the evidence shipped producers emit) or diagnostic (vacuous or near-vacuous
-  for production evidence). No check is removed. Of protocol 1's 31 required
-  checks, 16 are independent, 11 implied and 4 diagnostic; protocol 2 has 33
-  required checks, of which 19 are independent, 11 implied and 3 diagnostic.
-
-  | class | checks |
-  |---|---|
-  | independent | `actual_control_available`, `heldout_delta_lcb_positive`, `heldout_net_pnl_positive`, `separated`, `walk_forward_adequate`, `null_control_delta_positive` (repeats the held-out test for root hypotheses, whose null is the actual control), `fit_floor_adequate`, `heldout_floor_adequate`, `global_fdr_significant`, `multiple_testing_batch_bound`, `cumulative_fdr_significant`, `qualification_net_positive`, `qualification_floor_adequate`, `qualification_confidence_supported`, `risk_unit_adequate`, `cost_stress_adequate`; protocol 2 adds `max_drawdown_supported`, `comparison_keys_unique`, `protocol_parameters_bound` |
-  | implied | `actual_control_adequate` (by `actual_control_available`), `heldout_delta_positive` (by the lower bound), `heldout_p_significant` (a BY q is never below its raw p), `heldout_expectancy_positive` (by net P&L), `falsification` (reuses the held-out p), `walk_forward_available`, `null_control_available`, `family_fdr_significant` (by global BY for a lone signal), `qualification_available`, `qualification_delta_positive` (by its lower bound), `qualification_drawdown_supported` (inside the qualification floor) |
-  | diagnostic | `fit_delta_positive` (fit-derived proposals), `walk_forward_majority_positive` (passes about 99.9% of the time once the held-out test passes), `fill_quality_adequate` (the projection already admits only quote-priced rows), and under protocol 1 `max_drawdown_supported` |
-
-Factory forward ("shadow") workers take their trade and session floors from
-`protocol_minimums("shadow")`, so a forward envelope declares at least 150
-trades; the factory refuses to start if a lane cannot meet its protocol
-(D2-02).
-
-## Evidence
-
-An evidence package should include the normalized input digest, event count,
-provider/feed/schema identities, timezone/session policy, as-of cutoff,
-configuration, code fingerprint, cost model, risk/`ReplayPolicy`, gate
-assumptions, and deterministic fixture result. The experiment identity binds
-dataset, configuration, code, cost, risk, gates, and provenance hashes. Results
-without this provenance are descriptive only and cannot pass a qualification
-gate. Walk-forward and held-out checks must be chronological. Paired baseline,
-placebo, and acceptance-floor checks are evaluated independently for each
-vehicle and may not pool option and underlying returns.
-
-Remaining extension boundaries are explicit. Universe expansion requires an
-operator-approved exact symbol list, recorder coverage for that list, and a new
-identity/proof. Event conditioning requires a point-in-time event source with
-provider, `as_of`, and observation provenance. Prior-session, true
-multi-timeframe, and cross-sectional features require explicit replay context;
-missing or ambiguous context fails closed. Shadow quarantine is not an auto-skip:
-an unresolved session blocks watermark/FDR advancement until source correction
-and a bounded parity replay complete.
-
-## Isolated paper-research epochs
-
-A paper-research experiment is operational instrumentation, not a deployment
-state and not alpha evidence. It freezes one primary and one or more broker-free
-shadow siblings on the same realtime-stream, data-window, config, code, cost,
-and risk digests. Creation requires non-secret attestations proving that the
-primary Alpaca paper account and runtime differ from the deployed trader, and
-the epoch writes a separate append-only outcome store. Runtime LLM adaptation
-is false. Complete paired batches measure fills, slippage, rejections, and
-operational parity; paper success has zero promotion authority, while an
-operational mismatch may stop the epoch.
-
-Lessons may be sealed only after the epoch is terminal and are invisible to
-that epoch. Only its immediate successor may read them, after attesting a clean
-runtime restart and a different unseen data window. The successor restarts
-confirmation from the beginning. No paper observation can be copied into a
-held-out, shadow, FDR, or proof statistic.
-
-The read-only `paper-epoch export` operation is an operational handoff format,
-not a full observer/signal feed. It serializes only the currently stored epoch
-manifest/cohort digests, status and policy, operational summary, outcome rows,
-and integrity/audit head as canonical JSONL. It must not invent session dates,
-signal times, symbols, sides, stop/target brackets, quote provenance, exits,
-or R fields; account/runtime fingerprints and local store paths are excluded
-from public metadata. Artifacts are content-addressed and atomically created
-with no-overwrite byte checks. The export has zero alpha evidence and zero
-promotion authority, regardless of paper outcome or operational parity.
-
-## Deployment states
-
-Four states, one of which no automatic process may enter.
-
-*Research* and *proved* are the lanes above: gates decide, and they may move a
-candidate in either direction on evidence. Offline historical and forward
-replay may persist a passing `lane=shadow` proof, but that status is stability
-evidence only and never authorizes runtime entries.
-
-*Trial* is a proved, unpinned edge trading the paper account. Its live outcomes
-are append-only evidence attributed to the exact passing shadow proof that
-authorized entry. After a configured window of sessions and trades it is
-judged against an explicit floor. An edge below the floor is demoted and the
-result is recorded as a graded lesson sourced from live paper, which later
-proposals may read. An edge above it keeps trading and is reported as
-promotable. If a demoted candidate later earns a newer passing shadow proof, it
-may re-prove; the new trial begins a new proof epoch and cannot inherit the
-earlier epoch's wins or losses.
-Underpowered windows and outcomes without a usable risk reference are never
-treated as failure; a failed or unverifiable latest shadow proof quarantines
-history rather than falling back to lifetime aggregation.
-The default (v1) verdict re-tests a 1,000-draw, five-session-block bootstrap
-bound at every review and dashboard render, which under zero edge lets about
-18% of candidates read "passed" at some point (review finding D1-07); its
-[5th, 95th] percentile pair is a 90% two-sided interval. It is kept so existing
-verdicts reproduce. `research.trial.verdict_version: v2` selects a verdict
-decided once, on the shortest prefix of sessions meeting both the session and
-trade floors (so where it falls depends on counts, not outcomes), by a CR1
-session-clustered t with G - 1 degrees of freedom and a one-sided session
-sign-flip test (exact up to 16 sessions) against the mean-R floor at
-`alpha_one_sided` (default 0.05). Both must pass, with positive total and
-mean R; failing mirrors it. Neither is terminal `not_established`. The first
-terminal verdict is appended to the edge ledger as a `paper_trial_verdict`
-event and every later review returns it instead of deciding again.
-
-*Pinned* is an operator-declared promotion: an entry in `strategy.pinned`
-carrying an operator-assigned id, an exact `variant_id`, and a vehicle.
-Pinning is a selection, not an authorization — a pinned entry still resolves
-through the same evidence gate and a pin that does not resolve trades nothing
-rather than being substituted. It is the preferred live route because the
-operator-assigned id makes the promotion explicit and auditable; the legacy
-`selection_mode: specific` route remains supported for one exact proved
-variant. A pinned candidate is not exempt from automatic lifecycle stops: the
-sequential drift test and trial review still evaluate it and an authoritative
-breach parks or demotes it. The overlapping rolling-R calculation remains an
-advisory monitor and cannot itself change lifecycle state. The operator-assigned
-pin identity and promotion fields are carried into any transition as audit
-context, while runtime risk limits remain independent safety controls.
-
-No automatic process may add, remove, or rewrite the operator's configuration
-pin. Lifecycle guards may nevertheless demote a pinned candidate and remove it
-from runtime eligibility; the pin entry and its context remain audit metadata.
-
-## Configuration provenance
-
-Every distinct configuration a runtime operates under is content-addressed and
-recorded append-only with a version id, the previous version, and a diff naming
-each field that changed. Secret-bearing fields are redacted before hashing, so
-the trail records that such a field changed and never what it changed to, and a
-change confined to redacted values is therefore not distinguishable as a new
-version. Records are immutable. Failure to write this audit row does not stop a
-runtime that may own exposure; it produces a sticky degraded heartbeat with
-reason `config_audit_unavailable` until a successful audit clears it.
-
-## Autonomous edge lane
-
-The bounded registry in `research/variants.yaml` remains the complete proposal
-surface for the explicit IBR baseline. Autonomous multi-strategy research uses
-the finite, validated data-only grammar in `agent/contracts/rule.py`; generated
-variant ids are content hashes of those specifications. Arbitrary source code
-or unbounded fields are rejected. `agent.edge` resolves only a SQLite candidate
-whose status is `validated` or `champion` for the configured strategy/vehicle
-and whose latest shadow proof carries the parity-matched live-ingestion marker.
-Candidate registration and every proof run share one canonical assumptions
-hash covering feeds, session/calendar, strategy, risk, execution, and costs.
-The runtime reapplies the candidate and recomputes that hash before selection;
-legacy evidence or any assumption drift fails closed and must be re-researched.
-Paper defaults to `selection_mode: specific` with `variant_id: auto`, resolving
-exactly one globally strongest passing validated/champion variant through the
-ledger's conservative champion ranking. `selection_mode: all_proved` remains an
-explicit paper option and may run one strongest passing variant per verified
-frozen dependence cluster under one global risk book. Families without
-a verified assignment use the held-out correlation-safe fallback. Live mode resolves exactly one
-proved record: preferably one `selection_mode: pinned` entry, or one legacy
-`selection_mode: specific` variant. It never substitutes a different
-candidate when the requested proof/configuration no longer re-verifies.
-
-Backtests and forward-shadow runs are persisted with immutable hashes and
-trade/evidence rows. The autonomous lane first evaluates the initial corpus as
-a backtest, then accepts only a later, unseen session tail for offline
-forward-shadow evidence. Passing gates advance `candidate` ->
-`backtest_passed` -> `shadow` only; runtime entries stay blocked because
-backtest or offline forward-shadow evidence cannot authorize paper deployment.
-Concurrent shadow workers bind each poll to a content-addressed manifest, and
-every reader re-verifies the manifest digest before consuming it. A missing,
-unreadable, or mismatched manifest is quarantined and cannot advance a shadow
-watermark or FDR boundary.
-The broker-free ShadowRunner
-evaluates eligible candidates in isolated virtual books from recorder events,
-creates exact-session candidate, paired synthetic root-control, and
-randomized-null replays, and quarantines mismatch/incomplete rows. A tuned rule
-descendant's root-control arm consumes the same event stream in its own virtual
-book and remains isolated from EdgeLedger lifecycle state. Research-side
-`edge ingest-shadow` opens
-the shadow WAL read-only, requires strictly newer complete parity-matched rows,
-prior qualification, source/config/code/provenance/replay/gate hashes, family
-and global BY plus the frozen-cluster veto and durable online FDR, then appends
-the immutable `lane=shadow`
-proof and live marker; only then can the candidate become `validated`/`champion`.
-A semantic or mid-tail incomplete session remains fail-closed until source
-correction and a bounded complete parity replay records its repair; quarantine
-is recoverable rather than permanent loss. There is no unsafe auto-skip: an
-unresolved quarantine blocks the watermark and FDR boundary.
-A candidate cannot skip the lifecycle or silently move backwards. Paper
-outcomes are append-only, proof-epoch scoped, and may demote a deployed edge.
-Normal operation needs no manual promotion. Explicit `edge promote` is
-supported only as an audited control subject to lifecycle/evidence rules and
-cannot bypass the live marker. Legacy validated/champion rows without that
-marker can be evaluated/migrated but remain ineligible until a new authorized
-live proof.
-Backward rollback is rejected; explicit demotion is the operator safety
-action.
-
-Factory mutations may inspect only the chronological fit partition. Held-out
-and later-forward sessions must not influence hypothesis or parameter
-generation. This binds the bounded LLM tuning lane exactly as it binds the
-deterministic mutation table: a tuning request is given the fit-partition
-diagnosis and the graded outcomes of *already completed* proposals, never a
-held-out, sealed, or later-forward observation. Each variant is evaluated in an
-isolated simulated account.
-
-Before variant replay, the factory records compact fit-only diagnostics: the
-eligible-prefix and first-signal rates, ATR-in-basis-points and 30-bps-floor
-binding, signal-anchored planned stop/target/hold distributions, gross/net/
-fees/slippage and configured/stressed cost-to-risk (9/15/25/50 bps) summaries,
-configured pre-cap versus fill-delivered risk, per-leg provider/feed provenance,
-realized exit reasons/ties/gaps, and a diagnostic clustered MDE/power report
-whose effect and cluster units are explicit. It also records entry-pricing
-source, configured limits, and
-pass/fail/unknown row counts. The current fixed exit grammar is machine-readable
-as `fixed-atr-floor-bracket-r-target-bar-cap.v1`; its only supported modes are
-the parity-verified ATR-floor bracket, configured R target, and configured bar
-cap. `executable_exit_templates_added` remains `false` and
-`requires_operator_review` remains `true`. An attempted trailing, partial, or
-other unsupported exit field is flagged as
-`rejected_unsupported_exit_grammar` before research and cannot be treated as a
-research result. Planned signal/exit geometry may be counted even when
-executable quote pricing is absent, but is marked quote-required and remains
-non-authorizing.
-
-The pre-replay signal screen records forward-return/control rows and emits
-explicit `p=1` placeholders when a comparison is unavailable. A terminal
-current-hypothesis no-edge result is reported as such and reseeds when the
-corpus changes. Target/hold path telemetry measures reachability from the
-actual entry through the bounded hold; lower-target and hold proposals remain
-on a finite ladder and cannot authorize a candidate.
-
-The factory persists one `bar-coverage.v1` record per input corpus rather than
-recomputing it per variant. It reports per-symbol/session observed minutes,
-exact-calendar expected minutes when available, early-close caveats, internal
-gaps, and bounded gap samples. A hold that terminates at an internal gap or at
-the end of observed data is distinguished from ordinary configured time
-expiry. Coverage and discontinuity are censoring telemetry only; the protocol
-does not infer the sign or magnitude of their effect on R without a separate
-matched analysis.
-
-The execution-rejection portion of fit diagnostics exposes only aggregate
-counts and reason labels to proposal generation; it remains diagnostic and
-non-authorizing. If
-every fit opportunity is explicitly rejected at execution, the fit is classified
-as `execution_blocked`, distinct from sparse or otherwise underpowered data. It
-may close after the bounded attempt budget only to progress and observe search
-exhaustion; it is not a powered negative edge conclusion.
-
-The standalone `research.py factory run`/`factory-run` preflight requires
-explicit row provenance and exact IEX or SIP for the equity lane. `delayed_sip`
-and other incomplete/non-exact inputs are diagnostic-only; `--diagnostic-only`
-is an explicit non-authorizing mode and emits no proofs.
-
-The first-signal planned vectors also produce deterministic entry and full
-behavior fingerprints. When the fit contains a signal, full behavioral aliases
-produce a deterministic canonicalization proposal for operator review; all
-intended variants remain in worker replay and BY until that review. Zero-signal
-aliases remain visible, and the proposed alias/parameter-collapse summary is
-persisted without raw rows. These are diagnostics only and cannot authorize a
-candidate or read held-out/sealed sessions.
-
-No lane may extend the signal vocabulary. The families, confirmation filters,
-sides, permitted fields, and numeric bounds in `agent/contracts/rule.py` are
-closed sets, and the feature computation itself is code that research never
-generates or rewrites. A proposal naming an unknown family, filter, field, or
-data source is rejected at the boundary. Tuning is bounded further: a tuned
-variant must preserve both its root's `family` and its root's grammar
-`schema`, so it may change only the values of fields the root already carries.
-Selecting a different family, or a wider grammar version, is a discovery
-decision and follows the discovery path with its own gates.
-Equity provider guidance and schemas accept `rule-strategy.v3` with nullable
-numeric `breakeven_r` and `rule-strategy.v4` with frozen `session_vwap` or
-`rolling_mean` targets, bounded trailing stops, and thesis deadlines; options
-remain on executable v1/v2 schemas. A root stays on its declared schema during
-tuning.
-
-The three LLM request contracts use strict full-schema structured output with
-`additionalProperties: false`; tuning must echo the complete normalized root
-specification. The adapter enforces a per-run total-call budget, bounded
-attempts/time/response bytes, and an authentication circuit. Each result keeps
-schema/grammar hashes, call counts, circuit state, and per-attempt hashes or
-errors as evidence.
-
-Every proposal — deterministic or model-authored — records a stated reason
-before the gate that judges it is computed, and that reason is graded against
-fit-derived evidence afterwards. Both records are append-only and the grade is
-written once. Proposal verdicts and shared learning use fit results only;
-underpowered attempts, including `execution_blocked`, do not count as family or
-parameter successes or failures. Held-out, sealed, and qualification evidence
-is retained for audit but is unavailable to proposal generation. A
-model-authored proposal made against a non-empty history must additionally cite
-the graded lesson it reasoned from; the citation is resolved against the ledger
-and stored, and an unresolvable one is refused. A parameter set is closed only
-when a graded lesson records a powered upper-bound rejection of the minimum
-useful edge; an underpowered or adequate-but-inconclusive result is not such a
-record. The graded pairs may be fed back into later proposals; because they
-describe only completed, already-corrected evaluations, doing so adds no
-information about unseen data.
-Multiple-test correction is what prices the search, so a tuned variant counts
-against the same family-local and cycle-global false-discovery budget as a
-mutated one.
-
-Variant identity is de-duplicated by a family-specific executable semantic
-signature, including v1/v2/v3/v4 no-op aliases. Continuous numeric axes use
-relative/local scaling for semantic novelty, while integer/topology axes use
-their grammar spans; exact signatures and validation remain unchanged. A graded
-`adequate_negative_rejection` suppresses only that exact failed variant id;
-underpowered and inconclusive outcomes do not suppress a future attempt and do
-not close the family.
-
-The tuning lane allows at most eight model-authored novel numeric values per
-lineage/family. The allowance is recorded in the factory ledger across parent
-hypotheses and cycles, so a short prompt history or restart cannot reset it;
-deterministic grid values do not spend this allowance.
-
-Refinement follows a fixed sequence. Coordinate phase changes exactly one
-executable field per child. Interaction phase begins only after every bounded
-coordinate point is closed and combines exactly two of the strongest measured
-one-field values. A final unchanged replay confirms the conclusion before a
-replacement is allowed. Model tuning is schema-validated against the same
-one-field/two-field rule; it cannot hide a bundle of changes inside a reason.
-New equity roots retain neutral v4 defaults and stable content identities. One
-family-specific exit coordinate is promoted early without adding a Cartesian
-dimension: breakout/trend families try a trailing ratchet, while reversion
-families try a frozen fair-value target. The neutral root and other fixed-R
-candidates remain in the default first batch, and family-aware target/hold
-ladders remain bounded. For
-v2/v3/v4 roots with measured `min_atr_bps` and `stop_atr` coordinate lessons, an
-`execution_blocked` fit diagnosis makes coordinate exhaustion schedule exactly
-one bounded measured interaction. It uses configured stress geometry when
-available, never invents missing values, changes no risk constants, and does not
-claim the pair will trade.
-Multiple-test correction covers every variant evaluated in the cycle, including
-the frozen-dependence-cluster veto in addition to the family-local and
-cycle-global budgets. A
-replacement hypothesis may be generated only after the root family has at
-least 100 executed trades in each fit/held-out partition, at least 30 held-out
-sessions, a 95% clustered upper bound no greater than the 0.05R minimum useful
-edge, and at least two adequate negative forward windows for every bounded
-point; underpowered or inconclusive data must not cause autonomous hypothesis
-churn.
-
-Each transition requires a chronological fit/held-out boundary, fit and
-held-out structural floors for trades/sessions/clusters, matched baseline
-deltas, cluster-level sign randomisation, and family-local, frozen-dependence-
-cluster, and cycle-global false-discovery correction. Selection compares
-candidates across families, so the q-value that authorizes a champion is the
-global one, subject to the additional cluster veto. Because
-Benjamini-Yekutieli is monotone in the number of tests, cycle-global q is never
-less conservative than family q; a family pass/global fail is therefore a
-normal result for a marginal candidate, and proof verification must compare
-each decision flag with its own q-value.
-
-Current v3 proofs retain the complete raw p-value maps and recomputed BY
-results for every family, the cycle-global scope, and any frozen-dependence
-cluster. Verification rebuilds those corrections and binds a cluster batch to
-the persisted dependence-policy hash; a caller-supplied scalar q-value is not
-sufficient evidence. Historical v2 proofs predate this batch record and remain
-audit-readable only under their quarantined replay epoch.
-
-The post-selection test also consumes a durable cumulative online-FDR
-allocation. The active `shadow-confirmation-v6` scope uses the standard LORD++
-construction of [Ramdas, Yang, Wainwright, and Jordan (2017)](https://proceedings.neurips.cc/paper_files/paper/2017/hash/7f018eb7b301a66658931cb8a93fd6e8-Abstract.html), with
-an explicit initial wealth `W0` and the balanced sequence
-`gamma_k = 1/(k*(k+1))` for `k >= 1`. If `tau_j` is the test index of the
-`j`-th previous discovery, test `t` receives
-
-`alpha_t = W0*gamma_t + (alpha-W0)*gamma_(t-tau_1) +
-alpha*sum_(j>=2, tau_j<t) gamma_(t-tau_j)`,
-
-where the first reward term is included only when `tau_1 < t` (and each
-`gamma` index is therefore positive). This v6 deployment preregisters
-`W0=alpha/2` (`0.025` at the default level): before a discovery
-`alpha_t=(alpha/2)*gamma_t`, the first-discovery reward is explicitly
-`alpha-W0=alpha/2`, and every later discovery starts an `alpha` reward stream.
-The state is append-only per scope and persists across cycles; v2/v3/v4 rows
-retain their legacy method identifiers, while v5 rows retain LORD++ with
-`W0=alpha`; none are reused to seed v6. LORD++ receives the raw confirmatory p-value;
-family/global BY and the frozen-cluster veto select or reject the candidate but
-are not spent as online p-values.
-
-The v6 guarantee is scope-local. Legacy epochs (including v5) remain auditable
-but their discoveries and v6 discoveries must not be pooled and described as one
-cumulative LORD++ guarantee.
-
-The balanced sequence front-loads its wealth (review finding D1-08): before a
-discovery, test `t` in the shared v6 scope receives `0.025/(t(t+1))`, falling as
-`1/t^2`, so a realistic intraday edge cannot pass after a few tests. A
-`shadow-confirmation-v7` scope is therefore registered with the same
-`W0=alpha/2` and rewards but the slowly decaying sequence of Javanmard and
-Montanari (2018), `gamma_j = log(max(j,2)) / (j*exp(sqrt(log j))) / S` with
-`S = 12.64510787288` (the series sum, rounded up so the sequence sums to less
-than one; `research/factory_ledger.py::FDR_JM_GAMMA_SERIES_SUM`). v7 is
-selected only by its scope prefix: `CONFIRMATORY_SCOPE_VERSION` remains v6, so
-every existing v6 decision, and every live-shadow proof bound to the v6 scope,
-reproduces. Switching the live lane to v7 is an explicit operator change of
-that constant, and it also needs `research/edge_ledger_proof.py` (which today
-verifies a run only against the single active scope) to verify each run
-against the scope version recorded in its own online-FDR envelope; until then
-a v7 test cannot authorize.
-
-One-sided z required before any discovery at `alpha=0.05` (`W0=0.025`), from
-`NormalDist().inv_cdf(1 - alpha_t)`:
-
-| test `t` | v6 `alpha_t` | v6 z | v7 `alpha_t` | v7 z |
-| --- | --- | --- | --- | --- |
-| 1 | 1.25e-2 | 2.24 | 1.37e-3 | 3.00 |
-| 2 | 4.17e-3 | 2.64 | 2.98e-4 | 3.43 |
-| 3 | 2.08e-3 | 2.87 | 2.54e-4 | 3.48 |
-| 5 | 8.33e-4 | 3.14 | 1.79e-4 | 3.57 |
-| 10 | 2.27e-4 | 3.51 | 9.98e-5 | 3.72 |
-| 20 | 5.95e-5 | 3.85 | 5.25e-5 | 3.88 |
-| 30 | 2.69e-5 | 4.04 | 3.55e-5 | 3.97 |
-| 50 | 9.80e-6 | 4.27 | 2.14e-5 | 4.09 |
-| 100 | 2.48e-6 | 4.57 | 1.07e-5 | 4.25 |
-| 200 | 6.22e-7 | 4.85 | 5.24e-6 | 4.41 |
-| 500 | 9.98e-8 | 5.20 | 2.03e-6 | 4.61 |
-| 1000 | 2.50e-8 | 5.45 | 9.86e-7 | 4.76 |
-
-v7 is stricter than v6 for the first 22 tests and more lenient from test 23
-on. It keeps a long-running scope open; it does not make the first tests
-easier. With roughly 30 confirmatory sessions a z of 3 still needs a
-per-session Sharpe of about 0.55. If the lane will run only a handful of
-confirmatory tests per epoch, a Bonferroni split of alpha over a
-preregistered, bounded test count is the stronger choice for those tests.
-
-The cited LORD++ result controls mFDR when null p-values are conditionally
-super-uniform given the online history. Its full FDR guarantee additionally
-requires independent null p-values and predictable test levels that are
-monotone in prior discoveries. The implementation fixes and tests that
-predictable monotone schedule; it cannot establish a distributional property
-of market-data p-values. A chronological split into disjoint sessions prevents
-reuse of adaptive selection observations, but it does not, by itself, prove
-conditional super-uniformity or independence. The p-value construction,
-session dependence policy, and source provenance must therefore identify
-which guarantee is claimed and support its assumptions.
-
-Live-shadow ingestion establishes the intended temporal boundary
-chronologically. The `shadow-confirmation-v6` scope handles each complete new
-tail by splitting it deterministically into an older selection window and a
-newer, disjoint confirmatory window; both windows must independently meet the
-configured trade/session floors before any online allocation is spent.
-Family/global BY and the frozen-cluster veto use only the selection-window raw
-p-values. At most the selected, preflight-ready candidate is recomputed on the
-confirmatory window, and only that gate's raw p is sent to LORD++. The source
-and provenance persist both session lists, their digests, the disjointness
-marker, and the confirmatory p-value source. Legacy same-tail v3 and v4 records
-(`lord_balanced_raw_p_v3`) and v2 records (`lord_balanced_v2`), as well as v5
-LORD++ rows, remain auditable but cannot authorize under epoch 6 or later. The persisted
-live proof
-must match the durable FDR allocation for its vehicle scope and test id;
-caller-supplied p/alpha/allocation fields are not authority.
-
-Beating a control is necessary but never sufficient. A variant must also show
-absolute after-cost profitability on unseen data (positive net P&L and
-positive per-trade expectancy), a positive lower confidence bound on the mean
-held-out delta, a positive delta against a randomized-entry null control that
-shares the candidate's session/symbol/direction distribution and exit rules,
-and a majority of positive fixed-rule rolling-origin forward-stability folds.
-The same rule is evaluated in every fold.
-
-The falsification check is a seeded permutation test: at least ten thousand
-cluster-level sign-flip draws form an explicit null distribution, and the
-authorizing decision uses the preregistered paired-test p-value. A second,
-separately seeded draw stream is persisted and rechecked as computational
-replication/integrity evidence only. It is not an independent market sample,
-does not count as additional N, and does not impose a second significance
-hurdle. Both draw counts, seeds, and assignment hashes are persisted.
-
-The last sessions of every evaluation corpus are sealed into a final
-qualification window before any worker is scheduled. Selection, mutation and
-diagnosis never receive them. Development evidence is ranked and corrected
-first; one preselected candidate alone releases and consumes the sealed window
-exactly once for the last go/no-go. Other variants remain diagnostic and cannot
-authorize a proof. Sealed sessions are scored, never split,
-so they enter no fit/held-out run, trade row, or family correction. The verified
-gate does retain a bounded copy of the candidate and baseline qualification
-observations, the exact declared session set, and content digests. Verification
-recomputes the qualification report and rejects a row from an undeclared
-session, a missing declared session, digest tampering, excessive row count, or
-an oversized envelope.
-
-Each verified gate envelope also carries per-arm candidate, baseline, and
-randomized-null evidence: raw/executed/eligible counts, fill sources,
-entry/exit quote-age summaries, gross/cost/net economics, matched and dropped
-match keys, and directional/pair coverage. Quote density may change the
-eligible or paired null/control evidence even when the candidate count is
-unchanged.
-
-Both research lanes are held to this standard. The explicit IBR lane and the
-autonomous factory lane share one randomized-entry null control and one sealed
-final window rather than each carrying its own; a corpus too thin to seal a
-window or to support rolling-origin folds is underpowered, not failed.
-
-The held-out trade floor is evidence, not a tuning knob. The shipped default
-universe is a fixed 24-symbol ETF list spanning broad-market, size, sector,
-international,
-rates/credit, metals, and semiconductor exposures (the exact list is in
-`config.yaml`). This configuration does not establish measured opportunity
-capacity. Diagnose exact symbol/feed coverage and collect valid forward
-observations; historical backfill remains diagnostic, not accepted forward
-proof. Replay allows at most one trade per symbol-session; floor feasibility
-fails closed when 100 held-out trades cannot be supported. A universe expansion
-requires a separate approved scope, exact coverage, and a new identity/proof
-epoch. Never lower the floor to admit an underpowered sample.
-
-The complete gate is durably persisted and re-verified before validation or
-champion selection. Re-verification recomputes the analysis — matched deltas,
-p-value, lower bound, falsification, absolute profitability — from the stored
-source rows and compares it against the recorded decision, rather than only
-re-checking hashes. Champions are ranked by the lower confidence bound, not
-the raw held-out delta.
-
-Every run also records the replay generation it was measured under
-(`research/edge_ledger_store.py::REPLAY_ENGINE_EPOCH`), assigned by the ledger
-and never accepted from a caller. The current generation is **epoch 7**; what it changed follows the epoch-6 description below. Epoch
-6 retains the epoch-5 point-in-time availability, executable-row-only
-statistics, vehicle-specific cost provenance, raw confirmatory p accounting,
-and stressed-cost abstention boundary. It additionally seals paired synthetic
-root-control shadow decisions/replays, marks historical backfill as diagnostic
-non-authorizing evidence with exact calendar metadata, binds live-shadow
-authorization to the durable FDR allocation, orders paired inference
-chronologically, validates finite BY inputs (alpha in `(0,1]`, p-values in
-`[0,1]`), requires adequately powered paired actual-control evidence and a
-separately seeded, reproducible placebo-null calculation, and rounds
-broker-bound equity prices conservatively to valid ticks before sizing.
-
-Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. This is the case the next paragraph describes: a digest check cannot catch it, because an epoch-6 run still re-hashes and recomputes exactly what the epoch-6 evaluator produced.
-
-A run from a superseded generation cannot authorize `validated`, `champion`, or
-runtime eligibility, and `EdgeLedger.eligibility` names that quarantine rather
-than reporting a bare ineligibility. This is deliberately not a digest check:
-evidence measured under a replay engine that has since been corrected still
-re-hashes and still recomputes, because the recorded rows are exactly what that
-engine produced. Quarantine is not deletion — the rows stay readable and the
-lifecycle history stays intact — so epoch-5 and epoch-6 proofs remain audit-readable but must be re-derived under epoch 7 to authorize. Authorization requires exact equality with current epoch 7; future as well as stale epochs remain audit-only.
-Each current-epoch run seals one immutable verified gate proof; re-derivation
-appends a new proof rather than rewriting history. The constant is raised
-whenever a replay or gate change invalidates evidence recorded before it.
-Underpowered or inconclusive data is not failure. Retirement is permitted only
-after every bounded point and the confirmation carry a powered upper-bound
-rejection across multiple negative windows; an enabled LLM lane must first
-register a valid bounded replacement. A demoted candidate
-may re-prove on a newer shadow run, starting a new evidence epoch. Drawdown is
-persisted and used to rank otherwise qualified champions conservatively.
-
-The offline forward-shadow boundary advances only from a durable,
-re-verifying passing replay proof. Diagnostic account rows never advance it. If
-even one intended variant in a worker lacks the required trade/session floors,
-that worker persists no shadow proof, transition, or reseed, and the complete
-tail remains eligible for reconsideration on the next cycle. Offline shadow
-status never authorizes runtime. The live ShadowRunner consumes recorder
-events in candidate-isolated virtual books and creates exact-session candidate,
-paired synthetic root-control, and randomized-null replays; mismatched/incomplete rows are
-quarantined. `edge ingest-shadow` is the sole authorization boundary: it opens
-the WAL read-only, requires strictly newer complete parity-matched rows, prior
-qualification, source/config/code/provenance/replay/gate hashes, family/global
-BY plus the frozen-cluster veto, and durable online FDR before appending
-immutable `lane=shadow` proof and
-the live-ingestion marker.
-
-The live-shadow Compose service is broker-free and starts with the plain
-supported deployment: it reads recorder rows
-and EdgeLedger candidates through read-only connections, evaluates isolated
-virtual books, and writes only its own WAL SQLite database. It has no broker
-credentials or broker/runtime mutation path. The scheduled research cycle
-invokes `edge ingest-shadow` by default when enabled; a missing shadow DB is a
-no-op. It compares runtime shadow semantic signatures with factory/IBR replay
-signatures for parity; only the research consumer can append the authorization
-marker.
-
-The checked research config enables the bounded strategy LLM with model
-`gpt-5.6-terra`. The OpenAI path uses the Responses API structured-output request.
-Prompt, request, schema, configuration (including the effective sampling
-setting), and received-response hashes make the evidence reproducible for the
-exact invocation, but model output is not guaranteed bit-for-bit identical on a
-later call. OpenAI requests send `temperature: 0` when supported; when the
-configured model or deployment is exactly `gpt-5.6-terra`, the adapter omits
-that unsupported parameter and records `temperature: null` in configuration
-evidence. Anthropic requests keep `temperature` at `0`; the hashes preserve the
-actual request and response.
-Compose requires the host override
-`ALPACA_RESEARCH_LLM_SECRET_FILE` and mounts that separate readable provider
-dotenv as `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing, unreadable, or keyless
-credentials fail the cycle closed before discovery. Invalid model output leaves
-a pending replacement and cannot trigger premature retirement. Good edges
-produce content-addressed edge proof reports under
-`research/results/edges/`, with an optional HTTPS webhook notification.
-Scheduled cycles report
-`completed`, `completed_no_edge`, `no_data`, or `failed`; no status bypasses the
-runtime edge gate.
+## 4. Evidence lanes and authority
+
+The lanes are deliberately ordered:
+
+```text
+source preflight
+    -> causal fit replay and diagnostics
+    -> chronological held-out controls
+    -> sealed qualification
+    -> parity-matched live shadow
+    -> verified proof and durable FDR
+    -> explicit paper/runtime selection
+```
+
+The current gate constants in `research.gates` require, by lane, 100 trades,
+30 sessions, and 30 clusters for backtest and qualification; the parity-matched
+shadow tail requires 150 trades and 30 sessions/clusters. These are evidence
+floors, not tuning knobs. If a corpus cannot support a floor, the result is
+underpowered or unavailable, not a negative expectancy claim.
+
+Fit diagnostics, signal-quality studies, mechanism comparisons, historical
+backfills, candidate leaderboards, and paper-trial verdicts are non-authorizing.
+They may record isolated candidate or trial history and identify or falsify a
+hypothesis, but they cannot by themselves produce a verified proof, consume a
+confirmatory FDR allocation, select an entry, or override a runtime pause. The
+source-gated factory/qualification/shadow path is the path that may populate
+authorizing EdgeLedger and FDR evidence, and only after the current replay,
+gate, provenance, and operational checks pass. The paper-incumbent exception
+keeps its separate account and identity controls and deliberately has no
+normal EdgeLedger proof authority. Only fresh source-gated parity evidence plus
+actual execution/operational controls can advance deployment authority.
+
+## 5. Versioned gate and replay contracts
+
+`research.gates` writes `verified-research-gate.v3` envelopes. The envelope's
+`gate_protocol_version` is currently 2; version 1 remains supported solely to
+re-verify stored legacy envelopes under its original semantics. Protocol 2
+binds expected round-trip cost, actual/null controls, qualification evidence,
+finite multiple-test inputs, and durable online-FDR metadata.
+
+The current replay generation is `REPLAY_ENGINE_EPOCH = 7`. Stored runs from
+older epochs remain readable for audit but do not validate, champion, or
+authorize until recomputed under epoch 7. The active confirmatory FDR scope is
+`shadow-confirmation-v6` and uses the v6 durable method. v5 and legacy scopes
+remain separate; v7 constants are versioned for explicit future adoption but
+are not activated by documentation.
+
+Proof verification recomputes stored source rows and gate decisions, not merely
+hashes supplied by a caller. It checks source/config/code/replay epochs,
+matched controls, raw p-values and corrections, qualification session sets,
+quote provenance, cost stress, randomized-null evidence, and the durable FDR
+allocation. A caller-supplied scalar q-value, p-value, alpha, or allocation is
+not authority.
+
+The current lifecycle is monotonic: discovery can create a candidate,
+backtest evidence can advance it to a backtest-passed state, and an eligible
+parity-matched shadow proof can validate/champion it. Runtime refuses stale or
+unverified identities. Explicit demotion is a safety action; there is no
+backward rollback that bypasses evidence.
+
+## 6. Search and mutation constraints
+
+The strategy factory evaluates each variant in an isolated simulated account.
+Proposal generation sees fit diagnostics and graded completed fit lessons only;
+it does not see held-out, sealed, or later-forward observations. Every proposal
+echoes a complete normalized root spec and changes only bounded fields in the
+root's family and grammar. Unknown fields, families, filters, data sources,
+unbounded values, unsupported exit templates, and hidden multi-field changes
+are refused.
+
+Multiple-test correction applies to every evaluated variant, including tuned
+variants and dependence-cluster checks. Underpowered, execution-blocked, and
+inconclusive outcomes do not become positive or negative lessons. Diagnostic
+fit/power reports may describe why a search is blocked; they are not powered
+negative edge conclusions.
+
+## 7. Shadow, paper, and epoch isolation
+
+The broker-free shadow reuses runtime signal/setup/risk/exit/cost code in
+isolated virtual books. It persists a manifest, event cursor, source offsets,
+health heartbeat, candidate rows, paired baseline/null rows, and acceptance
+reports. A source/config/code/cohort identity change starts a new evidence epoch;
+rows are not merged across epochs. Missing progress, stale symbols, unresolved
+quarantine, incomplete calendar coverage, or an unchanged cursor prevents
+session acceptance.
+
+The paper-incumbent trial selects one exact fixed diagnostic arm and persists
+its account/cohort/code/policy identity. It is paper-only and always carries
+`authorizing: false` and `proof_authority: false`. The trial's sample/verdict
+state is independent of EdgeLedger proof authority. A trial pause, operator
+pause, account identity mismatch, or replacement blocker remains active even if
+its point estimate is favorable.
+
+`research.paper_epoch` is a separate append-only SQLite control-plane store for
+an isolated paper primary and shadows. Its schema and lifecycle are managed by
+`research.py paper-epoch`; it must not share an EdgeLedger database.
+
+## 8. Reproducibility and preregistration
+
+Preregistered hypotheses live in `research/preregistered.py`. A manifest hash
+alone is not the full instrument: v2 also pins the measurement-instrument
+identity, session-quality rules, source/feed, look records, anchors, and
+append-only decision record. A manifest or instrument change is a new version;
+existing frozen versions are never silently rewritten. A registered pass earns
+entry to the existing proof pipeline; it never authorizes trading or changes a
+runtime configuration.
+
+Use the exact preregistration CLI:
+
+```bash
+.venv/bin/python -m research.preregistered \
+  --data DATA.jsonl --out NEW_REPORT.json \
+  --hypothesis vwap-reversion-control-adjusted.v2 \
+  --look-records LOOK_RECORDS.jsonl \
+  --as-of AS_OF_UTC
+```
+
+The output path must not already exist. V2 hypotheses require
+`--look-records`; each look is decided once under an exclusive lock and later
+runs reproduce the recorded session list, instrument digest, and result.
+When supplied, `AS_OF_UTC` must be an ISO 8601 timestamp with a UTC offset.
+Historical v1 manifests remain available for reproducibility but are not a
+route to current confirmatory authority. See
+[`docs/preregistered-hypotheses.md`](../docs/preregistered-hypotheses.md) for
+the frozen manifest fields and ids.

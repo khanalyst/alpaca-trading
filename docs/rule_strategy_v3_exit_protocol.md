@@ -1,83 +1,125 @@
-# Rule strategy v3/v4 exit protocol
+# Rule strategy v3–v7 exit protocol
 
-This filename is retained for existing links. The current bounded equity exit
-contract spans `rule-strategy.v3` and `rule-strategy.v4`.
+This filename is retained for existing links. The executable grammar and
+transition implementation are `agent/contracts/rule.py`; this page summarizes
+the versioned contract and does not define a second strategy language.
 
-V3 adds nullable `breakeven_r`. A completed close that reaches the configured
-multiple of initial fill-to-stop risk arms a move to the actual fill price for
-the next bar. `null` preserves the original fixed-stop behavior.
+## Schema versions
 
-V4 retains v2 entry predicates and v3 breakeven behavior, then adds:
+The validator accepts `rule-strategy.v1` through `rule-strategy.v7`. Each
+version is explicit in the normalized specification and contributes to its
+content identity, while no-op extensions may share a semantic identity:
 
-- `target_mode`: `fixed_r`, `session_vwap`, or `rolling_mean`;
-- `target_lookback`: the bounded completed-bar lookback for `rolling_mean`;
-- `trailing_stop_r`: a nullable completed-close trailing distance;
-- `exit_before_minutes`: a nullable thesis deadline before the New York close.
+* V1 is the original bounded signal grammar.
+* V2 adds bounded entry predicates: extra confirmations, entry windows, and
+  ATR bands. It does not change sizing, exits, or order placement.
+* V3 adds nullable `breakeven_r`. A completed close reaching that multiple of
+  the initial fill-to-stop risk arms a move to the broker-valid actual fill
+  price for the next bar. `null` preserves fixed-stop behavior.
+* V4 adds equity-only exit policy fields: `target_mode` (`fixed_r`,
+  `session_vwap`, or `rolling_mean`), bounded `target_lookback`, nullable
+  `trailing_stop_r`, and nullable `exit_before_minutes`.
+* V5 adds opt-in regime and reclaim entry context (`regime_mode`, timeframe,
+  lookback, efficiency threshold, `entry_trigger`, and `pullback_bars`).
+* V6 adds family-scoped mechanism fields: ATR/range compression, opening hold,
+  range-expansion body/close geometry, VWAP slope mode, and relative-volume
+  mode. V6 is diagnostic grammar only: `rule_vehicle_executable` rejects V6
+  and V7 for promotion or runtime execution.
+* V7 adds the authored `min_stop_distance_bps` floor and opt-in correction
+  fields (`signal_event`, `stop_mode`, `residual_mode`,
+  `volume_confirmation_mode`, `session_gap_mode`, `range_multiplier`, and
+  `residual_beta_sessions`). V7 is also diagnostic grammar only; a corrected
+  specification is a new registration and identity.
 
-Options remain on executable v1/v2 schemas. V3/v4 are equity-share only because
-the supported option path has no parity-safe stop-amendment lifecycle.
+Options remain on the executable v1/v2 path. V3–V5 exit/context extensions are
+not executable for options; V6/V7 are not executable for any vehicle. A
+diagnostic replay of a non-executable schema must stay labelled
+`authorizing: false` and cannot produce a deployable proof.
 
-## Frozen target contract
+All families, fields, numeric bounds, confirmations, sides, and family-scoped
+extensions are closed sets in the validator. Unknown fields and cross-family
+mechanism fields fail closed. A tuned child preserves its root family and
+schema; changing either is a new discovery decision.
 
-Non-fixed targets are computed once from the completed signal prefix. Session
-VWAP resets on the bars' New York session date; rolling mean uses exactly the
-configured completed-close lookback. The raw reference is persisted as
-`target_reference`; the broker-valid rounded level is `target_price`. Neither
-research nor runtime recalculates the target after entry.
+## Frozen exit target
+
+For V4 and later, non-fixed targets are computed once from the completed signal
+prefix. `session_vwap` resets on the bars' New York session date;
+`rolling_mean` uses exactly the configured completed-close lookback. The raw
+reference is persisted as `target_reference`, and the broker-valid rounded
+level as `target_price`. Neither research nor runtime recalculates the target
+after entry.
 
 A missing, non-finite, non-positive, or wrong-side reference rejects the signal
-with `target_reference_unavailable_or_wrong_side`. It never falls back to an R
-target. Entry gaps that place the executable fill beyond the frozen target fail
-the ordinary bracket-geometry check rather than silently moving the target.
+as `target_reference_unavailable_or_wrong_side`. There is no fallback to an R
+target. If an entry gap lands beyond the frozen target, ordinary bracket
+geometry rejects the trade rather than moving the target.
 
-## Deterministic transition
+The initial risk unit is always derived from the actual fill and initial stop.
+Breakeven and trailing amendments do not rewrite that risk unit. A trailing
+stop is derived from a completed close, rounded toward the entry to a valid
+equity tick, ratchets monotonically, never crosses the frozen target, and takes
+effect only on the next bar.
 
-Research replay, randomized controls, and runtime use the same pure completed-
-bar transition:
+## Deterministic completed-bar transition
 
-1. Resolve an entry fill already beyond the stop or target at the fill anchor.
-2. Resolve a later opening gap at that open.
-3. Resolve intrabar touches, with the stop winning an unknowable two-sided path.
-4. If still open, arm breakeven and trailing amendments from the completed close;
-   those stop changes apply only to the next bar and ratchet monotonically.
-5. If no protective exit fired, apply deadline precedence: session force-flat,
+`completed_bar_exit_transition` is pure and shared by research and runtime. For
+each completed OHLC bar it:
+
+1. resolves an entry fill already beyond the stop or target;
+2. resolves an opening gap at that open;
+3. resolves intrabar touches, with the stop winning an unknowable two-sided
+   path;
+4. if still open, arms breakeven and/or a monotone trailing amendment from the
+   completed close for the next bar; and
+5. leaves deadline precedence to the shared contract: session force-flat, then
    thesis deadline, then maximum hold when timestamps tie.
 
-The initial risk unit and frozen target never change. Durable state retains the
-initial and active stops, target policy/reference, amendment epochs, and last
-completed bar.
+Duplicate completed bars are idempotent; out-of-order bars and invalid OHLC or
+geometry fail closed. State retains entry, initial and active stops, frozen
+target, target mode/reference, amendment epochs, and the last completed bar.
 
-## Canonical reasons and compatibility
+The canonical cross-lane exit causes are:
 
-Research and runtime publish `canonical_exit_reason` from one vocabulary:
-`stop`, `target`, `max_hold`, `thesis_deadline`, `session_force_flat`, and
-`data_discontinuity`; unrecognized operational causes map to `unknown` rather
-than extending the canonical vocabulary. Runtime keeps operational `reason`
-aliases such as
-`before_close`, `max_hold`, and `exit_before`; research keeps the historical
-`exit_reason` values `time` and `exit_before`. Those compatibility fields are
-not the cross-lane comparison key.
+`stop`, `target`, `max_hold`, `thesis_deadline`, `session_force_flat`,
+`data_discontinuity`, and `unknown`.
 
-Force-flat replay uses the exact session boundary and, in strict equity lanes,
-requires a fresh executable exit quote. Missing quotes refuse the observation;
-permissive diagnostic lanes may use the bar reference and still apply the shared
-cost model. P&L is always calculated from the selected executable entry and exit
-prices, quantity, multiplier, and fees.
+Runtime may retain aliases such as `before_close`, `max_hold`, or
+`exit_before`; research may retain historical `time` and `exit_before`. Those
+aliases are compatibility fields, not comparison keys.
 
-## Family hypotheses and bounded search
+## Entry and session boundaries
 
-New equity roots retain neutral v4 defaults and their stable content identities.
-The coordinate pool promotes one auditable family-specific hypothesis early:
-breakout/trend families try a completed-close trailing ratchet, while reversion
-families try a frozen `rolling_mean` or `session_vwap` target. The neutral root
-and other fixed-R candidates remain in the first batch, so an unavailable fair-
-value reference cannot block the whole batch. Family-aware target and hold
-ladders remain bounded, and discovery keeps its existing attempt cap.
+Signals use completed bars only and enter at the causal next-bar boundary. The
+causal maturity and continuity windows are family-specific. Session-anchored
+families (`vwap_reversion`, `vwap_trend`, and opening families) cannot treat a
+late or missing early bar as a continuous prefix. V7's explicit
+`session_gap_mode: zero_volume` narrows the adjacency requirement only as
+defined by the validator; it does not permit a session to begin after the
+bell.
+
+The safety force-flat timestamp is the exact calendar close minus the
+configured `force_flat_minutes_before_close` offset (ten minutes by default).
+`exit_before_minutes` is measured before that session close, not after the
+open. A thesis deadline is separate
+from the safety force-flat timestamp even when they coincide. Missing strict
+exit quotes refuse the observation; permissive historical diagnostic lanes may
+use a bar reference but retain the diagnostic provenance.
 
 ## Broker amendment and recovery
 
 For protected equity positions, runtime persists amendment intent before asking
-the broker to replace the live stop. It advances the active stop only after the
-successor response is validated. Reconciliation follows replacement links after
-a process failure. If either stop fills during the race, that broker leg is the
-close; runtime must not submit a duplicate market order.
+the broker to replace a live stop. It advances the durable active stop only
+after validating the successor response. Reconciliation follows replacement
+links after a process failure. If a stop fills during the replacement race,
+that broker leg is the close and runtime does not submit a duplicate market
+order.
+
+## Authority
+
+An exit protocol match is necessary for replay parity, not sufficient for an
+entry. Diagnostic geometry, target reachability, and paper-trial observations
+cannot authorize an entry or override an operator pause. Authorizing evidence
+still requires source validation, current replay/gate epochs, executable quote
+provenance, qualification, parity-matched shadow evidence, and explicit
+deployment selection.

@@ -1,19 +1,30 @@
 # Paper incumbent and persistent diagnostic shadows
 
-This is an experiment workflow, not evidence that a profitable strategy exists.
-It adds no services and no broker accounts. The existing trader manages one
-Alpaca paper incumbent; the existing shadow service maintains independent
-modeled books in its SQLite database.
+This is an experiment and operations workflow, not evidence that a profitable
+strategy exists. The paper incumbent uses the normal paper broker/runtime
+controls while the diagnostic shadow uses independent modeled books. Neither
+lane is an authorizing proof path.
+
+Diagnostic studies, shadow candidates, and paper-trial verdicts cannot
+authorize an entry or override an operator/runtime pause. A pause, stale source,
+account identity mismatch, or replacement blocker remains independent of
+statistical counts.
 
 ## One frozen paper incumbent
 
-`research.paper_trial` is disabled in the shipped configuration. Enabling it
-requires an explicit `trial_id` and one exact `variant_id` from the fixed
-diagnostic catalog. `auto`, arbitrary specs, runtime LLM decisions, options,
-delayed feeds, and live mode cannot use this exception. The normal validated
-edge gate must remain enabled.
+`research.paper_trial` is disabled in the shipped `config.yaml`. Enabling it
+requires all of the following:
 
-The minimal configuration shape is:
+* `enabled: true`, a non-empty explicit `trial_id`, and exactly one
+  `variant_id` from the fixed diagnostic catalog;
+* paper mode, `research.require_validated_variant: true` retained as a
+  configuration guard, and the configured `shares` execution path; and
+* an account-bound activation with a confirmed flat local and broker book.
+
+The runtime rejects `auto`, arbitrary rule specs, runtime LLM selection,
+options, delayed feeds, and live mode for this exception. This block shows the
+shipped disabled baseline, not an enabled profile. Enabling a trial requires
+the explicit IDs and activation checks above:
 
 ```json
 {
@@ -36,206 +47,164 @@ The minimal configuration shape is:
 }
 ```
 
-## Separate opt-in paper profile
+The main runtime pause is durable. Its orderly `SIGTERM`/`SIGINT`
+`request_shutdown` path persists `operator_pause=true`; this is not limited to
+manual pauses, and a restart does not clear it. A paper-trial record that still
+says `running`, or a newly written trial report, does not clear the runtime
+pause. Clearing it requires the authenticated flat-book control path, for
+example `python main.py resume`; failed journal, preflight, reconciliation, or
+flat-book checks leave the pause set.
 
-The shipped `config.yaml` remains unchanged: `research.paper_trial` is disabled
-with empty `trial_id` and `variant_id`. The separate
-`deploy/paper-orb.config.json` profile differs only in
-`research.paper_trial.enabled`, `.trial_id`, and `.variant_id`. It names
-`trial_id: paper-orb-baseline-20260914-v1` and the exact
-catalog variant `rule.opening-range-breakout.0eb200d3136d80ee`; the normal
-`strategy.variant_id: auto` remains, but `PaperTrialRuntime` overrides it with
-that one catalog spec and does not select an adaptive winner.
+At activation, `PaperTrialRuntime` freezes the rule spec, variant/candidate
+identity, feed/provider, universe, risk, execution/cost/session policy, code
+identity, shadow cohort identity, and acceptance-report root. Restart does not
+choose a new winner. A configuration or incumbent identity change is refused.
+Outcomes are appended atomically with closes and carry
+`authorizing: false` and `proof_authority: false`; they never enter the
+authorizing EdgeLedger/FDR outbox.
 
-Compose reads `${ALPACA_AGENT_CONFIG_FILE:-./config.yaml}` for all services. An
-operator may explicitly select the profile with
-`export ALPACA_AGENT_CONFIG_FILE=./deploy/paper-orb.config.json`; this document
-records the current release and account-bound activation in the
-[September 15 paper activation receipt](paper-activation-2026-09-15.json),
-without claiming a profitability result. Before any operator
-`resume`, run the authenticated preflight and reconcile both the broker and
-local book to a confirmed flat state with no working orders.
+The retained `require_validated_variant` setting is a configuration invariant,
+not ordinary EdgeLedger proof authority for this exception. When the explicit
+paper-trial block is enabled, `Engine` sets its normal edge requirement aside
+and runs only the frozen catalog arm. The separate account identity, flat-book
+activation, frozen policy, and non-authorizing outcome checks remain mandatory.
 
-Compose defaults `ALPACA_SHADOW_INCLUDE_IBR=1` and passes the same strict `0`/`1`
-mode through the trader, watchdog, research, and shadow services; an operator
-may explicitly use `0` for the 24-rule catalog. Direct CLI use defaults to `0`;
-export `ALPACA_SHADOW_INCLUDE_IBR=1` when it must match Compose's default
-31-arm catalog.
+The trial policy counts only accepted complete sessions and closed parent
+outcomes. It does not manufacture observations on quiet days. The verdict
+implementation in `research.trial` requires finite R values and a usable 95%
+session-cluster interval before a terminal decision:
 
-Keep `enabled: false` until an exact arm is selected and the account-scoped
-preflight and flat-book checks pass. Do not reset the paper account or delete
-runtime state to change variants. List the exact catalog identities locally:
+* `running` means configured session/trade floors are not both met;
+* `passed` requires positive total and mean R plus a lower bound above the
+  configured mean-R floor;
+* `failed` requires nonpositive total and mean R plus an upper bound below the
+  configured floor; and
+* `inconclusive` covers unusable R, inadequate or overlapping uncertainty, and
+  all other cases that establish neither side.
 
-```bash
-python -c 'from research.diagnostic_shadow import _logical_arms; print("\n".join(a["variant_id"] for a in _logical_arms()))'
-```
+At `max_review_sessions` the lifecycle becomes `review_required` unless it has
+already failed. This is a review pause, not a negative strategy verdict. Daily
+loss, exposure, spread, stale-data, calendar, protection, shutdown, and kill
+controls remain independent; tenure never forces an entry or prevents a safety
+exit.
 
-The incumbent identity freezes the rule, universe, feed/provider, risk,
-execution/cost/session policy, stopping thresholds, and code identity. Restart
-does not choose a new leaderboard winner. An active identity/configuration
-change is refused. First activation requires an account-bound, reconciled flat
-broker and local book. Replacement requires a terminal trial and another
-confirmed flat book, including no pending orders. Before replacement, the
-existing account-scoped journal receives a `paper_trial_terminal_snapshot`
-containing the old identity, verdict, accepted sessions, and outcomes. A failed
-audit write blocks replacement; the old experiment is not silently discarded.
-
-The default minimum is **20 accepted market sessions and 20 closed parent
-outcomes**. A session is counted only after a matching full-session operational
-report exists. Activation-day warmup, partial days, rejected/missing reports,
-and historical backfills do not count. A quiet but healthy day can advance
-session tenure; it does not manufacture trades or confidence observations.
-
-After the minimum sample:
-
-- Positive point estimates and a session-cluster lower bound above the mean-R
-  floor produce `passed`. The incumbent may continue; this does not grant proof,
-  live permission, or automatic promotion.
-- Nonpositive point estimates and an upper bound below the mean-R floor
-  produce `failed`.
-- Missing, malformed, underpowered, or overlapping uncertainty remains
-  `inconclusive`, including a small negative point estimate.
-- At 60 accepted sessions, the trial pauses as `review_required` if it has not
-  already failed. A review pause is not a negative strategy verdict.
-
-The interval requires at least 95% session-cluster confidence and the configured
-usable observation/day-cluster floors. It is a pointwise bootstrap interval,
-not an anytime-valid profitability guarantee. Market dependence and repeated
-research remain reasons not to treat a paper pass as live authorization.
-
-Daily loss, exposure, spread, stressed cost, fresh data, exact calendar,
-position protection, shutdown, and operator kill controls remain independent.
-No tenure rule forces an entry or prevents a safety exit. Experimental parent
-outcomes are persisted atomically with closes in the existing paper state;
-they never enter the authorizing EdgeLedger/FDR outbox.
-
-## Replacing the ORB incumbent with opening-range fade
-
-`deploy/paper-orf.config.json` names a new incumbent,
-`rule.opening-range-fade.d5785d9e70b56def`, under trial
-`paper-orf-baseline-20260923-v1`. It is the subject of the preregistered
-`opening-range-fade-control-adjusted.v1` (see
-[preregistered-hypotheses.md](preregistered-hypotheses.md)); the paper trial
-adds real fills and trade-level outcomes, and neither decides the other.
-
-The old trial `paper-orb-baseline-20260914-v1` is paused with zero accepted
-sessions and zero outcomes. The
-[activation receipt](paper-activation-2026-09-15.json) records its incumbent
-identity as
-`2f02fc0ec886e893e12f65767186670138b63f093dd7a547a4469eaf8a3f9508`; confirm it
-against the persisted state before using it. On the VM, from the application
-directory:
+List the exact catalog ids before selecting one:
 
 ```bash
-# 1. Stop the trader, back up runtime state, and confirm the book is flat.
-docker compose stop trader
-docker compose run --rm --no-deps trader python main.py status
-
-# 2. Read the persisted trial identity (read-only).
-docker compose run --rm --no-deps trader python -c 'from agent import state; state.configure_runtime("paper"); t = state.load_state().get("paper_trial") or {}; print(t.get("trial_id"), t.get("incumbent_identity"), t.get("state"))'
-
-# 3. Retire it through the audited path, with the values printed above.
-docker compose run --rm --no-deps trader python deploy/cancel_paper_trial.py \
-  --config /app/config.yaml \
-  --confirm-trial-id "paper-orb-baseline-20260914-v1" \
-  --confirm-incumbent-identity "2f02fc0ec886e893e12f65767186670138b63f093dd7a547a4469eaf8a3f9508" \
-  --reason "Replace ORB incumbent with preregistered opening-range fade"
-
-# 4. Deploy current main with the new profile.
-git pull --ff-only
-export ALPACA_AGENT_CONFIG_FILE=./deploy/paper-orf.config.json
-deploy/update-compose.sh
-docker compose run --rm trader python main.py check
-
-# 5. Clear the operator pause (flat-only) and start trading on paper.
-docker compose run --rm trader python main.py resume
-docker compose start trader
+.venv/bin/python -c \
+  'from research.diagnostic_shadow import _logical_arms; print("\n".join(a["variant_id"] for a in _logical_arms()))'
 ```
 
-Persist `ALPACA_AGENT_CONFIG_FILE` wherever the VM sets Compose's environment
-so a reboot keeps the same profile. After the first market session, confirm on
-the dashboard that the paper trial reports the new trial id and that
-`main.py status` shows no error. The operator pause, daily loss limit, position
-caps, spread and stale-data checks all still apply; the trial pauses itself as
-`review_required` at 60 accepted sessions.
+The checked-in `deploy/paper-orb.config.json` and
+`deploy/paper-orf.config.json` are explicit profile examples. They are not a
+current account status or a result claim. Read the selected profile and the
+persisted runtime identity before any activation; do not reset runtime state to
+change an incumbent.
 
-## Parallel shadow books
+## Activation and replacement safety
 
-Each arm of the configured diagnostic cohort has its own persistent cash,
-positions, modeled orders, fills, and net P&L. Compose defaults
-`ALPACA_SHADOW_INCLUDE_IBR=1`, producing 31 arms (24 rule arms plus seven IBR
-arms); explicit `0` selects the 24-rule catalog. State and the consumed-event
-cursor commit together, so retries cannot credit a close twice. Cash carries
-across sessions and restarts. The activation session remains warmup-only.
-Deployment-specific cohort and release status is tracked in the [current
-findings](current-findings.md) and the [September 15 paper activation
-receipt](paper-activation-2026-09-15.json).
+Before enabling a profile, stop the trader, run the authenticated readiness
+check, and verify both local and broker positions/orders are flat. Persist the
+`ALPACA_AGENT_CONFIG_FILE` choice wherever Compose obtains its environment so a
+restart cannot silently select a different policy.
 
-Entries and market exits use causal, exact-feed/provider forward quotes:
-buys use the ask, sells use the bid, with modeled slippage and fees. Resting
-stop/target events use the shared completed-bar exit rules; the entry signal
-bar cannot retrospectively close its new position. An entirely post-deadline
-bar cannot earn a target fill. Missing executable deadline quotes leave the
-position open, unpriced, and flagged until the first later executable quote.
+To cancel an evidence-empty incumbent, use the audited operator command with
+the exact values read from the persisted state:
 
-The exact broker calendar supplies the force-flat deadline, including early
-closes. The strategy's `force_flat_minutes_before_close` overrides the session
-default, matching the broker runtime. Both deadline representations survive
-setup and risk sizing so the persistent book clamps its maximum hold to the
-same session boundary. Missing required calendar metadata prevents entry.
+```bash
+.venv/bin/python deploy/cancel_paper_trial.py \
+  --config config.yaml \
+  --confirm-trial-id TRIAL_ID \
+  --confirm-incumbent-identity INCUMBENT_IDENTITY \
+  --reason "bounded operator reason"
+```
 
-`diagnostic_shadow.forward_accounts` exposes the summary and `by_candidate`
-rows, including `last_event_at`. Unknown marks stay unknown. Each row is an
-independent simulated account, not a portion of an actual Alpaca account;
-pooling their balances or returns is misleading. All broker/qualification/FDR
-authority remains false. Existing authorizing replay and parity gates are
-unchanged.
+The command above is a host-repository example. If it is run inside Compose,
+use the container interpreter and /app/config.yaml together; do not mix a
+host .venv/bin/python with a container-only path. Select the actual frozen
+profile and persisted identity before substituting these values.
+
+The command requires paper mode, `operator_pause=true`, an existing running or
+already-cancelled evidence-empty trial, a flat local book, and a broker GET
+snapshot showing zero positions and zero open orders. It writes an immutable
+operator-cancellation audit before changing lifecycle state. The cancellation
+path cannot delete outcomes or bypass the incumbent identity check. Replacing a
+terminal trial likewise requires an audited terminal snapshot and another
+confirmed flat book.
+
+## Persistent shadow books
+
+`deploy/shadow.py` and `research.live_shadow` maintain independent virtual
+accounts. Every arm has its own cash, positions, modeled orders, fills, event
+cursor, and diagnostic P&L. State and the consumed-event cursor commit
+together, so a retry cannot credit a close twice. Pooling arm balances or
+returns is not a portfolio result.
+
+Entries and market exits use causal exact-feed/provider quotes (ask for buys,
+bid for sells) with the shared cost model. Completed-bar stop/target handling,
+gap behavior, thesis deadlines, and force-flat use the shared rule transition.
+Missing executable boundary quotes remain unpriced/refused in strict lanes;
+diagnostic bar fallback is labelled and cannot become proof evidence. Broker
+shortability, buying power, pending orders, and actual fills are not modeled
+broker authority.
+
+The direct shadow CLI defaults to the 24-rule cohort. Compose may set
+`ALPACA_SHADOW_INCLUDE_IBR=1`; direct use can pass `--diagnostic-include-ibr`
+to add seven registered IBR arms. The environment value must be exactly `0` or
+`1`, and `--diagnostic-include-ibr` requires diagnostic mode.
+
+```bash
+ALPACA_SHADOW_INCLUDE_IBR=1 .venv/bin/python deploy/shadow.py \
+  --corpus runtime/research/recorded/market.csv \
+  --edge-db runtime/research/diagnostic-edge-lab.sqlite3 \
+  --shadow-db runtime/research/diagnostic-shadow.sqlite3 \
+  --config config.yaml \
+  --health-file runtime/research/diagnostic-shadow-health.json \
+  --acceptance-root runtime/research/diagnostic-shadow-acceptance \
+  --acceptance-recorder-root runtime/research/recorded \
+  --diagnostic --diagnostic-include-ibr --once
+```
+
+The paths above are intentionally isolated for a one-off diagnostic. Stop any
+existing shadow writer before retrying with a path it already owns, or choose
+new database, health, and acceptance paths; never run two writers against the
+same shadow store.
+
+The other bounded flags include `--health-file`, `--acceptance-root`,
+`--acceptance-recorder-root`, `--acceptance-gap-tolerance`, `--interval`,
+`--max-candidates`, `--max-events`, `--diagnostic-session-max-events`,
+`--replay-session-max-events`, `--max-decisions`, `--max-workers`, and
+`--retention-days`.
 
 ## Full-session operational evidence
 
-The existing shadow loop samples after publishing its atomic health heartbeat.
-It writes bounded append-only samples and atomic
-`session-YYYY-MM-DD.report.json` reports under
-`/app/shadow/session-acceptance`. No separate monitoring daemon is added.
+Each shadow poll writes a health heartbeat and bounded acceptance samples under
+the configured acceptance root. A complete session requires exact calendar
+coverage, stable deployment/code/cohort/activation identities, all active arms,
+genuine post-activation event progress, and current symbol observations. A
+heartbeat that is unchanged, stale, or missing does not count. Quote age and
+completed-bar publication lag remain bounded; re-fetching an old bar cannot
+refresh its completion watermark.
 
-Acceptance requires full exact-calendar coverage, stable deployment/code/cohort/
-activation identities, all arms in the active catalog (31 in default Compose;
-24 when `ALPACA_SHADOW_INCLUDE_IBR=0`), genuine post-activation event progress,
-and current symbol observations. An unchanged heartbeat or cursor is not a
-completed day. Warmup must precede the counted session.
+The scheduler may run a metadata-only acceptance census before expensive
+provider/research work. Insufficient accepted forward history reports
+`waiting_for_forward_sessions`; it does not create accepted sessions or turn a
+historical corpus into forward evidence.
 
-Quote age and shadow source lag remain capped at 30 seconds. Completed one-minute
-bars are checked against their next publication deadline with at most 30 seconds
-of publication tolerance, rather than an impossible continuous 30-second raw bar
-age. Before the first session bar is due, a premarket bar is not required. The
-immutable bar completion timestamp drives this check: re-fetching an old bar
-cannot make it current. Raw bar age remains visible, and execution freshness
-checks are unchanged.
+## Paper epoch store
 
-Recorder and shadow examples both poll every 30 seconds. Poll-gap tolerance
-follows the configured interval; it does not relax market-observation limits.
-Missing samples, identity changes, stale symbols, or missing boundaries cannot
-silently become a complete accepted day. Sparse quotes can still prevent a day
-from qualifying; this change does not manufacture feed coverage.
+For a separately isolated paper-primary/shadow control-plane epoch, use
+`research.py paper-epoch` with a dedicated SQLite path. The store is append-only
+and integrity-checked; it must not share tables with EdgeLedger:
 
-`ALPACA_RESEARCH_ACCEPTANCE_ROOT` makes scheduled recorder research run a
-metadata-only census before expensive preprocessing or provider research calls.
-Insufficient accepted history yields `waiting_for_forward_sessions`, not a
-failed strategy. Explicit external datasets retain precedence and their existing
-validation path. Once history is sufficient, input-size/storage/snapshot gates
-still apply. This does not solve the future capacity requirement of replaying
-many multi-gigabyte sessions; the limits are not raised to hide that issue.
+```bash
+.venv/bin/python research.py paper-epoch status --db PATH
+.venv/bin/python research.py paper-epoch verify --db PATH
+.venv/bin/python research.py paper-epoch export \
+  --db PATH --epoch EPOCH_ID --output-root research/results/paper-epochs
+```
 
-## Recorder cache and rollout
-
-The recent-key cache uses an ordinary rowid table while retaining exact text
-keys/timestamps, a 64 MiB cache, and DELETE/FULL durability. A verified v1 cache
-is migrated by streaming only the recent window into an atomic replacement.
-Corrupt caches and interrupted publication use the existing authoritative-corpus
-recovery path. Market partitions and provenance are never rewritten by this
-migration. Local synthetic timing is not a production-latency guarantee.
-
-Deploy one tested image/config identity, verify account scope and readiness,
-then collect complete future sessions. Do not relabel earlier incomplete days
-as accepted evidence. The dashboard separates the frozen paper experiment,
-persistent modeled shadow books/refusals, and qualified-edge proof reviews.
+Lifecycle operations are `create`, `start`, `record`, `stop`, `complete`, and
+`seal`; each requires its bounded JSON schema. The export is immutable and
+content-addressed. A paper epoch is operational evidence and remains separate
+from authorizing candidate proofs.

@@ -1,1126 +1,299 @@
-# Alpaca intraday research
+# Research guide
 
-This directory contains offline replay and bounded research utilities for
-US-listed equities/ETFs and listed OCC options; crypto is outside scope.
-Options are single-leg long calls or puts only; multi-leg, naked, and short
-structures are not supported. Data adapters
-normalize their payloads through `research.market_data` before any analysis.
-Every normalized event
-records its provider, feed, schema, session date/timezone, observation time,
-and the as-of timestamp used by the analysis. Availability is bounded by the
-latest of event timestamp, `as_of`, and `observed_at`; `as_of > observed_at`,
-naive timestamps, future values, invalid quotes, and malformed OHLC values fail
-closed. Feed provenance is request-bound: retain an explicit provider-row feed
-label when present, otherwise use the configured/requested feed label; it is
-not an independent venue attestation.
+This directory contains the market-data normalizers, replay engines, bounded
+strategy grammar, evidence gates, diagnostic shadow, and paper-only research
+stores. The implementation is the authority. This guide describes the current
+interfaces; it is not a results report.
 
-The shipped paper deployment defaults to the free Basic IEX equity feed and an
-equity-only universe; it does not acquire options. `indicative` is the safe
-options-feed default and is non-executable. Authorizing equity evidence must
-use the exact IEX or SIP feed; `delayed_sip` is diagnostic only. The trader's
-runtime execution profile remains `shares`, with live
-trading disabled. Scheduled research follows the deployed equity/shares lane by
-default (`ALPACA_RESEARCH_VEHICLES=equity`). Set the variable to `option` or
-`all` only after explicitly adding an option universe and configuring OPRA;
-option research is evidence generation, not permission to execute options.
-Compose starts the recorder, scheduled research, broker-free shadow, watchdog,
-trader, and dashboard with one plain `docker compose up -d` command; systemd
-uses the same defaults.
+## Authority boundary
 
-The recorder samples on a fixed 30-second cadence and keeps durable per-symbol
-quote and completed-bar watermarks. Research readiness requires quote age no
-older than 30 seconds and completed bars no more than 30 seconds past their next
-publication deadline for each required symbol; a quote watermark cannot stand
-in for a bar watermark. Raw bar age remains telemetry. Exact Alpaca calendar
-metadata records holidays and early closes. Scheduler liveness is reported
-separately from research evidence/readiness, so an alive scheduler is not
-evidence of a ready corpus or a validated edge.
+Research has two deliberately separate lanes:
 
-## Normalized data
+* An authorizing lane may create a content-addressed candidate proof only from
+  source-gated, forward-observed evidence and the current replay/gate epochs.
+* A diagnostic lane may inspect historical, sparse, delayed, bar-fallback, or
+  otherwise non-authorizing data. Its rows and reports must carry
+  `diagnostic_only: true` and `authorizing: false`.
 
-`UnderlyingBar` is a one-minute OHLCV record. `QuoteSnapshot` is a timestamped
-bid/ask record. `OptionContract` and `OptionSnapshot` carry the contract
-identity and multiplier separately from the quote. Use
-`normalize_underlying_bar`, `normalize_quote`, and
-`normalize_option_snapshot` at provider boundaries; replay code does not
-accept raw provider dictionaries.
+Diagnostic studies, candidate rankings, fit measurements, and paper-trial
+verdicts cannot authorize an entry, change sizing, promote a candidate, or
+enable live trading. A current proof requires fresh source validation, parity
+replay, the versioned gates, and the explicit deployment controls. A pause or a
+trial/configuration identity mismatch is an independent operational blocker; it
+is not repaired or overridden by a favorable statistic.
 
-The deployment recorder writes bars, quotes, and option snapshots to one mixed
-corpus, appended into one partition per New York session date under
-`sessions/` with a sidecar index. `deploy/research-cycle.sh` concatenates those
-partitions in session order (`ALPACA_RESEARCH_SESSION_WINDOW` limits it to the
-most recent N), validates the result, and routes the vehicle-local discovery
-lanes from it.
-It also invokes `research.strategy_factory`, which evaluates twelve logical
-strategy slots over the finite catalog of twelve rule families by default.
-Slot count and worker capacity are independent controls. Each generated
-variant owns an isolated simulated account processed by one bounded worker; no
-capital or P&L is shared between arms.
-The shipped paper runtime defaults to `selection_mode: specific` with
-`variant_id: auto`, which resolves exactly one globally strongest validated or
-champion variant after the evidence gate. `selection_mode: all_proved` remains
-an explicit paper option: it keeps one strongest proven variant per verified
-frozen prior-cycle dependence cluster under one global risk book. Families
-without a verified cluster assignment use the held-out correlation-safe
-fallback; symbol breadth is not an independence license.
+The finite rule grammar is implemented in `agent/contracts/rule.py`. Research
+may propose bounded values in that grammar, but it cannot generate Python
+source, add a signal family, or widen a schema implicitly. Variant ids are
+content identities; semantic de-duplication is separate from storage identity.
+The supported rule schemas are `rule-strategy.v1` through `v7`. Equity-only
+exit extensions and their transition contract are described in
+[`docs/rule_strategy_v3_exit_protocol.md`](../docs/rule_strategy_v3_exit_protocol.md).
 
-Historical `deploy/backfill.py` partitions retain the recorder schema but carry
-`source_mode: historical_backfill` and exact Alpaca session open/close metadata,
-including early closes. Their fetch-time `observed_at` is retained rather than
-backdated. An explicit diagnostic replay policy may inspect these rows and
-labels resulting trades `diagnostic_historical_backfill`; they are excluded from
-authorizing statistics and can never authorize a live-shadow proof.
+## Input and provenance
 
-Every factory, discovery, validation, and standalone replay entry point runs a
-source-mode preflight before opening an authorizing ledger or constructing
-trades. Historical or mixed partitions fail the authorizing path with an
-explicit provenance error and must be requested through `--diagnostic-only`.
-Every authorizing row must explicitly carry `source_mode: forward_observed`;
-trusted recorder projections add that label, while unlabelled compatibility
-data remains diagnostic-only.
-Diagnostic mode still rejects malformed rows, unsupported source labels,
-future observation timestamps, and source changes during the run; its result is
-explicitly marked `authorizing: false` and cannot emit a proof. Forward rows
-observed materially after their market timestamp must be labelled
-`historical_backfill`, preventing a late corpus from silently inheriting the
-forward-observed policy.
+Normalize provider payloads to the records in `research.market_data`: one-minute
+underlying bars, executable quotes, and (when explicitly researching options)
+option snapshots. Every row must retain its provider, feed, timestamps, and
+`source_mode`.
 
-The authorizing evidence floors are immutable: backtest/factory windows require
-100 trades, 30 complete sessions, and 30 session clusters; qualification
-requires 100 trades and 30 complete sessions/clusters; the parity-matched
-live-shadow tail requires 150 trades and 30 complete sessions. These are
-evidence floors, not tuning knobs. The shipped default universe is a fixed
-24-symbol ETF list spanning broad-market, size, sector, international,
-rates/credit, metals, and semiconductor exposures (the exact list is in
-`config.yaml`). This is a configuration fact, not a measured capacity claim.
-Real signal rates and floor feasibility still require valid observations.
-Diagnose symbol/feed coverage and collect valid forward-observed evidence;
-historical backfill can support diagnostics but cannot count as accepted forward
-proof. Replay allows at most one trade per symbol-session; floor feasibility
-fails closed when a required floor cannot be supported. A symbol expansion is
-not an automatic remedy: it requires a separate approved universe/feed scope,
-exact list, recorder coverage, and a new identity/proof epoch. Never lower a
-floor.
+`source_mode: forward_observed` is the only authorizing mode. A row is
+actionable no earlier than the maximum of its market timestamp, `as_of`, and
+`observed_at`; `as_of` may not be later than `observed_at`. Historical rows use
+`source_mode: historical_backfill` and remain diagnostic even when their
+calendar metadata is exact. Missing or implicit provenance is not silently
+upgraded by a CLI flag.
 
-Qualification is powered at a minimum of 100 trades, 30 complete sessions, and
-30 session-level clusters. Replay epoch 6 retains the epoch-5 point-in-time,
-executable-row, vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries,
-and additionally seals paired synthetic root-control shadow decisions/replays,
-diagnostic-only historical-backfill provenance with exact calendar metadata,
-durable live-shadow FDR allocation binding, chronological paired inference,
-finite BY input validation, and conservative broker-tick equity rounding. Epoch 7 retains all of that and changes signal semantics under unchanged variant ids: the `volatility` confirmation measures the prior-window range width its bound was written for, the `trend_pullback` proximity band is the authored threshold, the IBR width band divides by a horizon-scaled ATR, and IBR replay applies all eight runtime admission filters. Epoch-5 and epoch-6 proofs remain readable for audit but are quarantined and cannot validate, champion, or authorize the paper trader until re-derived under epoch 7. Authorization requires exact epoch equality with current epoch 7; future epochs
-are audit-only as well. A verified current-epoch gate is sealed immutably per
-run, and re-derivation appends a new proof instead of rewriting prior evidence.
+For equity, authorizing data must use the configured exact `iex` or `sip` feed
+and provider. `delayed_sip`, mixed feeds, bar-only boundary prices, stale
+quotes, and partial feeds are diagnostic-only. Option authorization requires
+`opra` and keeps an independent option result book. A feed, provider, universe,
+calendar, cost schedule, or execution-policy change creates a new evidence
+identity and must not be merged with prior evidence.
 
-The default session timezone is `America/New_York`. Production replay requires
-the exact Alpaca calendar session bounds for every session, including early
-closes; it never promotes a missing calendar day to a fixed 16:00 close.
-Session dates are derived after timezone conversion, so the daylight-saving
-transitions in March and November do not shift a bar into a neighboring session.
-A source `as_of` timestamp may not be later than its observation/ingestion
-timestamp.
+The exact Alpaca session calendar supplies session open/close and early-close
+metadata. A missing calendar boundary is a refusal, not a fixed 16:00 fallback.
+Sessions are grouped in `America/New_York`; daylight-saving transitions do not
+change the grouping contract.
 
-## IBR replay
-
-`research.ibr.replay_ibr` implements the initial-balance-range path:
-
-1. Require a complete, contiguous range of completed one-minute bars from the
-   configured US session open.
-2. Detect a breakout only after a range bar has closed.
-3. Make the signal actionable at the maximum availability time of the required
-   records (`timestamp`, `as_of`, and `observed_at`). A delayed recorder bar
-   may signal when observed; enter at that decision/observation time using a
-   fresh exact IEX or SIP quote (equity) or OPRA quote (option). Delayed full OHLC never backfills an earlier entry, and
-   partial pre-entry ranges are excluded.
-4. Apply gap-aware fills and stop-first ties when a candle touches both stop
-   and target. A bar that opens beyond the stop or target fills at that open,
-   on exit as well as on entry, not at a level the market never traded again.
-5. Price a fill landing on a bar boundary from a recorded quote at that
-   instant when one exists, and record on the trade whether the quote or the
-   bar was used. A level triggered inside a bar has no such instant and keeps
-   the level.
-6. Apply spread, adverse slippage, and per-side fees to both executions
-   through the one shared model in `research.costs`.
-7. Force-flat at the configured pre-close boundary; no position crosses a
-   session boundary.
-
-Equity and single-leg long-option vehicles are independent result books. Call
-`replay_ibr_vehicles` for a mapping of separate results; it intentionally has
-no pooled P&L field. Option replay requires timestamped option snapshots and
-uses their contract multiplier.
-
-Market-data strictness is lane-specific. The shipped
-`execution.strict_market_data` default is `true`; direct replay APIs default to
-strict `ReplayPolicy` behavior and require a fresh executable equity quote at each
-boundary that needs one. Historical backtest lanes use the validated,
-research-only `research.backtest_bar_fallback` setting (default `true`): when a
-boundary has no equity quote, the bar may supply the reference, the shared
-conservative spread/slippage/fee model still prices the fill, and the result
-records whether `quote` or `bar` supplied it. Forward-shadow, broker-free
-live-shadow, and paper remain strict and require fresh executable quotes.
-Backtest evidence never authorizes paper.
-
-Authorizing fill-quality evidence is stricter than a diagnostic backtest:
-equity entry and exit legs must carry exact IEX or SIP quote provenance, and
-option entry and exit legs must carry OPRA quote provenance. `delayed_sip` is
-diagnostic only. Every leg records provider, feed, quote timestamp/age, and
-fill source; both legs must be executable and no older than 30 seconds.
-Bar-only, missing, partial-feed, or stale legs remain
-diagnostic and cannot authorize a proof. Fit diagnostics may count planned
-signal/exit geometry as a quote-required, non-authorizing measurement when
-executable pricing is absent.
-
-The command-line surface is intentionally small:
+Validate a normalized corpus before replay:
 
 ```bash
-python research.py validate-data bars.jsonl --provider alpaca --feed iex
-python research.py backtest-ibr bars.jsonl --vehicle equity
-python research.py backtest-ibr bars.jsonl --vehicle equity --strict-market-data
-python3 research.py llm-preflight --agent-config config.yaml
+.venv/bin/python research.py validate-data DATA.jsonl \
+  --provider alpaca --feed iex
 ```
 
-`backtest-ibr` defaults to historical bar fallback; `--strict-market-data`
-opts into strict diagnostics. `validate-data` and `backtest-ibr` are offline and
-read JSONL only. They never download data, call an exchange, place orders, or
-modify trading state. `llm-preflight` is the provider-network exception described
-below; it does not load market data or touch trading state.
-
-### Provider preflight
-
-`llm-preflight` makes one bounded, non-authorizing provider call and does not
-load a dataset or write standalone artifacts. Run it after changing the
-research endpoint or model and before an expensive cycle. The scheduled
-wrapper persists the same bounded, redacted result in the terminal cycle JSON,
-status heartbeat, and operational history (including `degraded` transient
-outages), while still allowing deterministic fallback. `research.strategy_llm.model` accepts a
-provider model ID for generic endpoints. For Azure OpenAI-compatible base URLs,
-set the optional `research.strategy_llm.deployment` to the resource-local
-deployment alias; the preflight fails clearly before corpus work when that
-alias is absent, while retaining `model` as catalog/evidence metadata.
-Authentication/configuration failures and HTTP 404 `DeploymentNotFound` are
-fatal and stop the scheduled cycle. Timeouts, 429s, and 5xx responses are
-transient: the cycle records degraded provider evidence and keeps its
-deterministic fallback. If every runtime LLM call later fails, the cycle ends
-with explicit `llm_provider_failure` unless an authorizing proof already exists.
-
-## Costs and fill calibration
-
-`research.costs.CostModel` is the single expected-cost model: every lane --
-IBR replay, edge discovery, and the strategy factory -- prices its fills
-through it, and none carries its own spread/slippage/fee numbers or its own
-arithmetic. `cost_model_for_vehicle` selects optional `costs.vehicles.equity`
-or `.option` overrides and persists their provenance; absent an override, the
-shipped defaults are 4 bps spread, 6 bps adverse slippage, 0.5 bps per-side
-notional fee, and a 0.65 currency-unit option fee per contract per side. These
-are expected costs, not rejection caps.
-
-### Cost-model versions
-
-The review of 15 October 2026 (E1-01) found those constants charge 17 bps per
-round trip on bar references (13 bps on top of executable quotes), against a
-realistic 1.5 to 4 bps on this universe. Two versions now exist:
-
-- `static_v1` is the original flat model above. It remains the behaviour of
-  `CostModel` and of every lane that does not ask for another version, so
-  stored evidence, candidate identities and sealed tests recompute exactly
-  (`tests/research/test_costs_versions.py` pins its outputs to a fingerprint
-  of the original code). Its rows and reports carry no version field; absence
-  means `static_v1`. Its `as_dict` is unchanged because identity hashes use it.
-- `per_symbol_v2` is `research.costs.PerSymbolCostModel`, the arithmetic of
-  `studies/liquid_reversion/costs.py`: one full spread per round trip, the
-  larger of one tick and the symbol's measured or reference spread
-  (`docs/audit-2026-09-21/spread-reference.json`, embedded in
-  `REFERENCE_SPREADS_BPS`); explicit slippage per side (0.5 bps) on market and
-  stop legs only, plus one tick of stop-trigger slippage on stop legs; the SEC
-  Section 31 fee ($20.60 per million, SEC Fee Rate Advisory 2026-2) and the
-  FINRA TAF ($0.000195 per share, capped at $9.79; paused from 1 October to
-  31 December 2026 under SR-FINRA-2026-021, kept as a parameter) on the sell
-  leg only. Legs are priced by the runtime's order types: the entry is a
-  marketable limit at the executable quote and the take-profit a resting limit,
-  so neither slips; each says in its provenance that its non-fill risk is not
-  modelled (a `target_fill_probability` below 1 charges the unfilled share the
-  cost of the market exit that replaces it). Every leg it prices records
-  `per_symbol_v2` in its provenance, and every report it produces records
-  `cost_model_version`.
-
-At the reference prices the `per_symbol_v2` round trip (marketable entry and
-exit from a bar) is 2.18 bps for SPY, 2.50 for QQQ, 2.49 for IWM and 2.49 for
-HYG; across the 24 symbols it runs from 1.75 (VB) to 4.07 (SLV).
-
-`per_symbol_v2` is the default for new research runs: `research.cost_rerun`
-replays every variant under it (with each quoted symbol's measured median
-spread) next to the configured and measured arms, and reports its round trips.
-It is not yet the default of the factory and gate lanes, because switching
-them changes every candidate identity, stored proof and sealed fixture; a
-lane opts in by passing `PerSymbolCostModel().resolver()` as the
-`cost_resolver` of `simulate_account`. Rows priced that way are recomputed
-from their own legs by `risk_unit_report`. One limit: account simulation
-stores a bar-priced entry's `realized_risk_per_unit` from the reference
-price, so a diagnostic bar-fallback row (not a strict quote-priced one) fails
-the row-economics check under any per-leg model, measured or `per_symbol_v2`.
-
-For equity, an explicitly enabled `costs.measured_quote` block supplies a
-frozen per-symbol, per-half-hour spread/depth schedule. Configuration verifies
-and embeds the declared schedule hash and binds its feed, provider, percentile,
-depth percentile, quote-count floor, and strict coverage policy into candidate
-identity. Candidate, root control, randomized null, sealed qualification, and
-live-shadow paths all resolve entry and exit costs from that same schedule; a
-missing or under-covered cell never falls back to a broader average. In
-account simulation (the factory lanes and `cost_rerun`) it refuses that one
-opportunity with `reject_stage` `cost_coverage` and `reject_reason`
-`measured_cost_unavailable`; IBR repricing and the edge-discovery account
-still abort. Schedules fitted by `cost_rerun` require each bucket cell to
-span at least five sessions as well as `min_quotes_per_cell` quotes
-(`min_sessions_per_cell`, recorded in the schedule and enforced by the
-resolver), because recorder snapshots within one session are autocorrelated;
-`measure_quote_costs` applies the floor only when asked, so other callers
-(`deploy/trader_projection.py`) still fit without it. Pre-open and post-close
-quotes no longer enter the symbol and universe aggregates. Depth
-impact is zero for an order that fits displayed size, so a stop exit also
-pays an explicit stop-trigger slippage of one tick at its reference price
-(named in the leg provenance as `stop-trigger-<bps>`). The checked-in block
-remains disabled until an operator fits and freezes a schedule from the
-corpus actually being proved.
-The validated `broker.provider` is authoritative (default `alpaca`): the
-schedule may not self-declare a different provider, and explicit row-level
-provider/feed contradictions fail closed in the resolver and live shadow.
-Spread and executable-depth coverage are separate: only rows with both
-positive `bid_size` and `ask_size` count toward executable depth. For positive
-`order_shares`, the selected section must meet `min_quotes_per_cell` for both
-spread and depth and provide a usable selected depth percentile; otherwise
-measured pricing fails closed. Omitted or nonpositive order size remains
-spread-only.
-
-Every proof also persists the preregistered all-in stress scenarios of 9, 15,
-25, and 50 bps. The 25 bps scenario is the authorization requirement; the
-other scenarios remain diagnostics. A stress result that is missing, negative,
-or not positive at 25 bps cannot authorize a candidate.
-
-Every rung is a round trip (`COST_STRESS_RUNG_BASIS`): one all-in charge in
-bps of entry notional for both legs, never a per-side figure. A rung is a
-stress only above the model's expected round trip, and under `static_v1` the
-9 bps runtime rung is below it (17 bps on bars, 13 on quotes), so the 0.30
-cost-to-risk veto does not hold under that model's own expectation and the
-gate's 9 and 15 bps rungs add nothing for equity (E1-02). Under
-`per_symbol_v2` (1.75 to 4.07 bps) the same 9 bps rung is 2.2 to 5.1 times the
-expected round trip. `stress_coherence` makes that comparison and
-`stress_relative_to_expected` (and `PerSymbolCostModel.stressed_round_trip_bps`)
-defines a stress as `expected x multiple + add_bps` instead; `cost_rerun`
-reports the coherence of the configured rung against each model. The runtime
-veto is unchanged.
-
-Stress semantics are explicit: each scenario charges its bps against entry
-notional, then listed options add round-trip fees for both per-contract sides;
-the stress bps are not per-side bps. The shipped admission scenario is 9 bps against a `max_stressed_cost_to_risk_ratio` of `0.30`, so the implied minimum stop is exactly the 30 bps grammar floor and a floor-width trade is admitted at the 0.30 limit. A stricter scenario (15, 25 or 50 bps, or a calibrated per-symbol cell) lifts the implied stop above the floor and the veto binds again: at 25 bps a 30-bps-floor trade is about `0.833` cost-to-risk and is vetoed before option fees. 25 bps remains the proof-time stress required by `research/gates.py`.
-For equity geometry, a broker-normalized authored stop below
-`max(30 bps, scenario / max-cost-to-risk ratio)` is refused as
-`stressed_cost_risk_limit` before sizing or fill. The stop is never widened and
-a fixed-R target is never recomputed; explicitly wide authored brackets pass
-unchanged. The floor and binding decision remain in refusal/trade telemetry.
-
-The runtime's stressed-cost risk check abstains before order submission when
-the configured scenario (`risk.stressed_cost_scenario_bps`: 9 bps in the
-shipped `config.yaml` since commit 2249cc5, 25 bps when the key is absent)
-exceeds its allowed cost-to-risk ratio, and persists the scenario, cost, ratio,
-and vehicle telemetry. The shipped cost provenance label
-`shipped_conservative_v1_plus_25bps_stress` predates that change and is
-stale; it is left as is because it is part of every candidate identity, so
-read the runtime rung from `risk.stressed_cost_scenario_bps`, not from it. The runtime's `execution.max_slippage_bps` and
-`max_spread_bps` are rejection caps, not expectations. They are read into the
-same model and bound it: a model expecting a cost the runtime would refuse to
-submit fails closed rather
-than simulating fills that could never happen. The pure entry-slippage check
-applies the same quote-versus-reference cap to runtime, factory, explicit IBR,
-and randomized-null quote entries; malformed inputs use
-`entry_slippage_invalid`, while over-cap quotes use
-`entry_slippage_exceeds_limit`. Sourcing an expected slippage from the cap is
-as wrong as ignoring the cap.
-
-Quote-driven fills need the quote rows to reach a strict lane. `research.edge_lab`
-and `research.strategy_factory` are handed the complete mixed corpus by
-`deploy/research-cycle.sh`, so a scheduled cycle prices a boundary fill from a
-recorded quote where one exists and records the source on the trade. Historical
-backtests may use the research-only bar fallback described above; the
-bar-only, quote-only and option-only views the script derives alongside it are
-used to decide which vehicle lanes to run and to feed the standalone
-`backtest-ibr` invocation, which receives the quotes explicitly.
+Use `--diagnostic-only` only when the purpose is explicitly non-authorizing:
 
 ```bash
-python research.py calibrate runtime/paper/journal.db --vehicle equity
-# Use --vehicle option for the independent option calibration lane.
+.venv/bin/python research.py validate-data DATA.jsonl \
+  --provider alpaca --feed delayed_sip --diagnostic-only
 ```
 
-`research.calibration` reads the runtime journal read-only and reports adverse
-cost in basis points, model bias, runtime-cap overruns, and a verdict of
-`conservative`, `optimistic`, or `insufficient_data`. Results are stratified by
-runtime mode, vehicle, execution profile, and by both entry and exit when
-references are present; partial fills use the plan/reference fields rather than
-their realized notional, and missing references remain unreferenced. Equity and
-options are never pooled. Pass `--vehicle` (or the API's `vehicle=` argument)
-for an explicit per-vehicle report; the report records its filter and available
-journal vehicles. Scheduled shadow authorization always computes and checks the
-matching vehicle report, so a mixed journal cannot authorize the other lane.
-Calibration is an authorization gate: missing, stale,
-or insufficient evidence, an optimistic cost verdict, a terminal material
-underfill (<80% of requested quantity), or a partial-cancel rate above 20%
-returns a veto and non-zero status. The scheduled cycle still records offline
-discovery/factory diagnostics, but it does not ingest shadow authorization until
-calibration is fresh and authorized. In-flight orders are excluded; calibration
-never adjusts the model automatically.
-The scheduled calibration-only pass is per symbol/session on the fixed
-9/15/25/50-bps ladder and is disabled by default. Activation requires an
-explicit operator path and a content-addressed artifact with exact
-provider/feed identity, disjoint chronological held-out sessions, sufficient
-coverage, and one artifact-wide effective-after boundary. An unusable cell
-falls back to the configured scalar stress (`cost_rerun` passes
-`risk.stressed_cost_scenario_bps`); the artifact cannot authorize itself.
-Each cell is laddered on its round-trip cost (full spread, depth impact on
-both legs, sell-leg fee), a positive order size without a depth measurement
-fails closed, and fit and validation are compared on the rung they select, so
-a one-tick change inside one rung no longer voids the artifact. The artifact
-records `cost_basis`, `materiality_basis` and `narrowing_possible`;
-`cost_basis="one_way_v1"` reproduces earlier artifacts exactly. The module is
-kept rather than parked: its lowest rung equals the shipped 9 bps runtime
-rung, so it can keep or widen that stress but never narrow it
-(`narrowing_possible` is false) and changes no decision at the shipped
-configuration, but `deploy/trader_projection.py`, `research/live_shadow.py`
-and `research/cost_rerun.py` consume its artifacts, and an error would turn
-their diagnostic output into a failure.
+The diagnostic flag permits historical/mixed source modes for inspection; it
+does not permit malformed rows, unsupported feeds, future observations, or a
+mutable source that changes during validation.
 
-## Evidence and provenance
+## Replay and fill semantics
 
-Research artifacts require row-level provider/feed identity; command-line flags
-cannot manufacture missing IEX/OPRA provenance. They retain the normalized input
-digest, configuration, code version, cost model, risk/`ReplayPolicy`, and
-gate assumptions alongside results. The experiment identity binds dataset,
-configuration, code, cost, risk, gates, and provenance hashes. Any feature or
-label must be computed from events at or before its as-of timestamp.  A
-completed-bar fixture and a no-look-ahead test are required for every new
-replay path.  Fixed-rule rolling-origin forward-stability, paired-baseline, placebo/falsification, and
-acceptance-floor checks are mandatory gates, with fit/held-out structural
-floors, family-local, frozen-dependence-cluster, and cycle-global false-discovery
-correction, sealed
-qualification source binding, and a durable verified gate. A family-local pass
-with a cycle-global failure is a normal marginal result; only a candidate that
-also clears the frozen-cluster veto can authorize cross-family selection. The
-gates are applied per vehicle and per
-session rather than to a pooled equity/options series. Rolling-origin uses the
-same fixed rule in every fold. The cumulative online-FDR allocation is durable
-per vehicle scope and persists across cycles. The active
-`shadow-confirmation-v6` scope implements the LORD++ construction of
-[Ramdas, Yang, Wainwright, and Jordan (2017)](https://proceedings.neurips.cc/paper_files/paper/2017/hash/7f018eb7b301a66658931cb8a93fd6e8-Abstract.html): with
-`gamma_k=1/(k*(k+1))`, explicit `W0=alpha/2`, and discovery indices `tau_j`, the
-allocation at test `t` is `W0*gamma_t + (alpha-W0)*gamma_(t-tau_1) +
-alpha*sum_(j>=2, tau_j<t) gamma_(t-tau_j)`. Thus pre-discovery spending is
-`(alpha/2)*gamma_t`, the first-discovery reward is the explicitly recorded
-`alpha-W0=alpha/2`, and subsequent rewards are `alpha`. v5 rows retain their
-prior `W0=alpha` semantics and are not replayed into v6. The cited result controls
-mFDR under conditionally super-uniform null p-values; its full FDR guarantee
-additionally assumes independent null p-values and predictable test levels
-that are monotone in prior discoveries. The implementation fixes that
-predictable monotone schedule, but only the confirmatory design can justify
-the p-value and dependence assumptions. Disjoint chronological tails prevent
-selection-row reuse; they do not establish either assumption. The sealed
-qualification window is released once by
-one preselected candidate alone, while other variants remain diagnostic.
+All replay paths share the completed-bar and cost contracts. A signal uses only
+the completed prefix available at its causal decision time. Entries do not use
+the signal bar's own close as a retrospective fill. A gap through a stop or
+target fills at the gap open; an intrabar stop/target tie resolves to the stop.
+The entry bar cannot retrospectively close a new position. A hold ending at an
+internal data discontinuity is recorded as a discontinuity, not silently joined
+to the next observed minute.
 
-Serial inference is deterministic: paired deltas are grouped by chronological
-session/day clusters and the persisted lower bound uses a seeded moving-block
-cluster bootstrap (with its draw count, seed, and block length). The persisted
-effective-breadth report is a correlation/eigenvalue participation-ratio
-diagnostic over matched symbol-by-session deltas. Breadth is re-derived and
-verified with the proof, but it never counts as additional independent sample
-size; independence still comes from session clusters. Authorizing dependence is
-separate: before each factory cycle, completed prior-cycle family deltas are
-frozen into a hash-verified map. Strong clusters receive an additional
-cluster-level BY veto, and runtime allocation admits at most the strongest edge
-per verified frozen cluster; an unavailable map never grants independence.
+Strict lanes require fresh executable quotes at every boundary that needs one.
+The historical IBR backtest may opt into the validated research-only bar
+fallback; that fallback is labelled diagnostic and never authorizes a proof.
+`research.costs.CostModel` owns spread, slippage, fees, stress arithmetic, and
+leg provenance. Runtime spread/slippage limits are rejection caps, not expected
+costs. Equity bracket prices are rounded to valid broker ticks before sizing;
+invalid geometry or a stressed cost/risk violation refuses the signal without
+widening its stop or recomputing its target.
 
-Remaining extension boundaries are explicit. Universe expansion is a separate
-approved universe/feed scope, not an automatic remedy; it requires an
-operator-approved exact symbol list, recorder coverage for that list, and a new
-identity/proof epoch. Event conditioning requires a point-in-time event source
-with provider, `as_of`, and observation provenance. Prior-session, true
-multi-timeframe, and cross-sectional features require explicit replay context;
-missing or ambiguous context fails closed. Shadow quarantine is not an auto-skip:
-an unresolved session blocks watermark/FDR advancement until source correction
-and a bounded parity replay complete.
+Replay outputs preserve raw rows, refusal reasons, quote/bar fill source,
+provider/feed/age metadata, realized risk, costs, and canonical exit causes.
+The canonical causes are `stop`, `target`, `max_hold`, `thesis_deadline`,
+`session_force_flat`, `data_discontinuity`, and `unknown`.
 
-## Edge laboratory
-
-`research.edge_lab` stores pre-registered candidates, immutable
-backtest/shadow runs, trades, evidence, paper outcomes, and lifecycle events
-in SQLite. Every run carries dataset, configuration, code, and provenance
-SHA-256 hashes. The default database is `runtime/research/edge_lab.sqlite3`
-(override with `ALPACA_EDGE_DB`).
-
-The lifecycle is forward-only: an initial corpus backtest moves a candidate to
-`backtest_passed`; a later corpus must contain sessions strictly after the
-persisted boundary, and passing offline forward-shadow gates may move it to
-`shadow` only. Offline historical/forward replay never authorizes runtime.
-Only broker-free ShadowRunner output consumed by research-side
-`edge ingest-shadow` can append the parity-matched live marker and move a
-candidate to `validated`/`champion`. A shadow boundary advances only from a
-durable re-verifying passing proof; an underpowered worker persists no shadow
-result, so the same tail can be reconsidered later. Paper outcomes
-are append-only evidence scoped to the exact shadow proof that authorized the
-entry and may demote a deployed edge. A demoted candidate may re-prove on a
-newer shadow run; re-proving begins a new trial epoch instead of aggregating
-lifetime outcomes. Candidates are scored
-separately for `equity` and `option` vehicles. Gates require chronological
-held-out data, fit/held-out trade and session structural floors, matched
-controls, cluster-aware randomisation, family-local, frozen-dependence-cluster,
-and cycle-global FDR,
-sealed qualification observations/digests, and placebo/falsification.
-The v3 proof stores the complete family/global/cluster raw p-value batches and
-recomputes BY during verification; scalar q-values alone cannot authorize.
-Its second placebo seed is an integrity replication over the same held-out
-sample, not independent market evidence or another significance hurdle.
-Underpowered or inconclusive data is not failure. Retirement is allowed only
-after all bounded coordinate/interaction points and the final confirmation
-carry a powered upper-bound rejection across multiple negative windows; a
-valid bounded LLM replacement must be registered first when that lane is enabled.
-Drawdown is
-measured and used in conservative champion ranking. Normal operation needs no
-manual promotion; the `edge promote` CLI is only for explicit, audited controls
-and cannot bypass the live marker. Legacy validated/champion rows without that
-marker may be evaluated/migrated but remain ineligible until a new authorized
-live proof. Backward rollback is rejected; explicit demotion is the operator
-safety action.
-
-## Broker-free live shadow
-
-For a supported paper deployment, create two files outside Git: an Alpaca
-paper broker secret (`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`,
-`ALPACA_PAPER=true`) and a separate readable research-provider dotenv file
-containing `OPENAI_API_KEY` for the checked provider (or the matching
-configured provider key). Set the host path in
-`ALPACA_RESEARCH_LLM_SECRET_FILE`, validate, and start every lane together:
+Run the standalone IBR path with the actual CLI flags:
 
 ```bash
-docker compose config --quiet
-docker compose up -d
-docker compose ps
+.venv/bin/python research.py backtest-ibr BARS.jsonl \
+  --vehicle equity --provider alpaca --feed iex \
+  --quotes QUOTES.jsonl --strict-market-data
 ```
 
-Compose starts scheduled research and the broker-free shadow lane in the default
-startup. It refuses to render the research service when the separate provider
-secret path is missing or unreadable. The plain Compose `shadow` service reads recorder rows and EdgeLedger
-candidates through read-only connections, evaluates eligible candidates in
-isolated virtual books, and writes only its own WAL SQLite database. For each
-complete session it creates candidate, paired synthetic root-control, and
-randomized-entry-null replays; mismatch or incomplete rows are quarantined.
-It uses the deterministic runtime signal/setup/risk path and compares semantic
-shadow signatures with factory/IBR replay for parity. Tuned rule descendants
-also receive a paired synthetic root-control arm: it consumes the same events
-in its own virtual book and writes first-class shadow replay evidence, while
-remaining outside EdgeLedger lifecycle state. It has no broker
-credentials, order path, or broker/runtime state authority. The scheduled
-research cycle runs `edge ingest-shadow` by default when enabled; absent shadow
-DB is a no-op. Ingestion opens the WAL read-only and requires strictly newer,
-complete parity-matched rows, prior qualification, source/config/code/
-provenance/replay/gate hashes, family/global BY plus the frozen-dependence-cluster
-veto, and durable online FDR before
-appending the immutable `lane=shadow` proof and live marker. Semantic or
-mid-tail incompleteness fails closed but is repairable: correct the source and
-run the bounded complete parity replay before retrying ingestion. There is no
-unsafe auto-skip: unresolved quarantine blocks the watermark and FDR boundary.
-The `shadow-confirmation-v6` scope splits each tail into older
-chronological selection sessions and a newer disjoint confirmatory window; BY
-uses the selection p-values, and only the selected candidate's raw confirmatory
-p-value reaches LORD++. Same-tail v3 scopes remain audit-only and cannot
-authorize. Legacy v2/v3/v4 sequences (`lord_balanced_v2` and
-`lord_balanced_raw_p_v3`) and v5 LORD++ rows remain audit-readable and isolated
-from v6. From epoch 6 onward, the persisted live proof must match the durable FDR
-allocation (scope/test id, method/version, p-value, alpha, allocation, and
-decision), not merely repeat those fields in a caller-supplied envelope.
+For an explicit historical diagnostic, add `--diagnostic-only`. The other
+available flags are `--symbol`, `--quotes-from-mixed`, `--range-minutes`,
+`--stop-pct`, `--target-pct`, `--spread-bps`, `--slippage-bps`, `--fee-bps`,
+`--force-flat`, and `--vehicle {equity,option,both}`. `validate-data` and
+`backtest-ibr` are offline; neither downloads data nor places orders.
 
-## Autonomous strategy factory
+## Cost-model versions
 
-`research.strategy_factory` owns safe hypothesis generation. Its proposal
-language is the finite grammar in `agent.contracts.rule`: twelve signal
-primitives — opening-range breakout/fade, momentum continuation, mean
-reversion, trend pullback, volatility breakout, volume breakout, VWAP
-reversion, VWAP trend, range expansion, opening drive, and the shares-only
-`cross_sectional_residual` family against SPY with synchronized one-minute
-context — with bounded confirmations and exit parameters. It never generates
-or imports source code.
+`static_v1` is the compatibility model used by `CostModel` when no alternate
+resolver is selected: 4 bps spread, 6 bps adverse slippage, and 0.5 bps per
+side notional fee; the option fee is 0.65 currency units per contract per side.
+The all-in stress ladder is 9, 15, 25, and 50 bps of entry notional for a
+round trip. These values are code contracts, not claims about realized fills.
 
-Session-anchored families re-derive the current session from the bars' own New
-York dates, so a longer history can never contaminate a session statistic.
-`cross_sectional_residual` is a separate shares-only synchronized-context path.
-The identifier is retained for compatibility, while the implemented thesis is
-SPY-relative directional momentum rather than a beta-neutral residual or paired
-hedge. SPY self-reference and symbols outside the bounded comparable-equity ETF
-eligibility set fail closed and remain visible in per-symbol diagnostics.
-Research replays one session at a time and the runtime fetches from the session
-open, so the two see the same window either way.
+`per_symbol_v2` is the order-type-aware, per-symbol expected-cost model used by
+the cost rerun and explicit resolver callers. It requires its own measured or
+reference spread/depth context and records the model version in leg
+provenance. A measured-quote schedule is only usable when its feed/provider,
+coverage policy, percentiles, quote-count floor, and content hash verify. A
+missing or under-covered cell fails closed; it does not fall back to a broad
+average.
 
-The grammar has five versions. `rule-strategy.v1` is the original field set and
-is unchanged, so every candidate already in a ledger keeps its exact
-`variant_id`. `rule-strategy.v2` is a strict superset reached only by naming it
-explicitly, and adds four *entry-side* predicates: `confirmations` (a list of
-additional trend/volume/volatility filters, all of which must hold),
-`entry_after_minutes`/`entry_before_minutes` (the minutes-from-09:30-New-York
-window a signal may fire in), and `min_atr_bps`/`max_atr_bps` (the volatility
-regime the rule may trade). `rule-strategy.v3` keeps those entry predicates and
-adds nullable numeric `breakeven_r` for equity shares; `null` preserves the
-fixed-stop behavior. `rule-strategy.v4` adds bounded equity-only exits: a
-frozen session VWAP or rolling-mean target, a monotone trailing stop, and an
-`exit-before` deadline. `rule-strategy.v5` adds optional trend/range context
-from whole, contiguous 5- or 15-minute bars and structural pullback/value reclaim
-entries. Incomplete higher-timeframe buckets and missing minutes are excluded;
-context must be available before a context-enabled signal can pass. The exact
-source digest and feature version accompany the signal and replay trade.
-Neutral v5 behavior matches v4; old v1–v4 content identities remain unchanged.
-Options remain on executable v1/v2 schemas. Together
-the extensions let a hypothesis express a *conditional* edge or bounded
-equity exit behavior without changing the signal evaluator. V2 entry
-predicates stay outside sizing/execution; v3/v4 affect only the shared bounded
-exit-state path and cannot author arbitrary orders. A v2 spec that admits a
-signal produces exactly the v1 plan, while v3/v4 specs add only their declared
-equity exit state.
-
-Session VWAP and rolling-mean targets are frozen from the completed signal
-prefix and persisted as `target_reference`; the broker-valid rounded level is
-persisted separately as `target_price`. Missing or wrong-side references reject
-the signal instead of falling back to fixed R. Research and runtime compare the
-shared `canonical_exit_reason` values `stop`, `target`, `max_hold`,
-`thesis_deadline`, `session_force_flat`, `data_discontinuity`, and `unknown`;
-unrecognized operational reasons map to `unknown`, while historical
-research `exit_reason` and runtime operational `reason` aliases remain readable.
-Strict equity replay requires a fresh quote for a force-flat fill, while an
-explicit diagnostic bar-fallback lane remains costed and non-authorizing.
-
-### Slots are capacity, not licences
-
-The factory runs a fixed number of logical slots. A slot's hypothesis leaves
-the active set permanently once it proves an edge — the deployed variant is
-frozen and must never be re-tuned — so the slot is immediately reseeded with a
-*new* hypothesis in the same cycle. Without that reseed the factory would lose
-one worker per success and eventually have nothing left to search. Reseeding
-prefers a family the slot has not tried, at that family's own template, and
-then continues into the conditional grammar ladder (v2 entry predicates and
-v3/v4 equity exits): a slot that has run out of
-families has not run out of hypotheses. Each reseed grants one further
-`max_generations` mutation budget and never consumes the separate
-failure-recovery rotation budget.
-
-`run_factory` gives every configured slot an active hypothesis at the start of
-every cycle, which is one code path for three situations: genesis on a fresh
-ledger, a slot added by raising `--strategies`, and a slot that lost its
-hypothesis (a ledger written before reseeding existed). The cycle result
-reports `seeded`, `revived`, `reseeds`, and `active_slots` separately —
-`revived` is the one that says something had gone wrong — so idle capacity is
-visible rather than silent.
-
-Research defaults to the deployed vehicle (`equity`). `research.py vehicles`
-reports the selected set, and `ALPACA_RESEARCH_VEHICLES` may explicitly select
-`equity`, `option`, `all`, or a comma-separated subset; the shipped Compose and
-systemd paths set it to `equity`. The trader still runs one runtime execution
-profile, `shares`, so proving an option edge is useful
-research evidence but never switches the trader to options or authorizes an
-options order. Select the `options` execution profile separately, on paper,
-only after its OPRA evidence and controls have been reviewed.
-
-On a fresh corpus, each worker diagnoses its baseline only from the
-chronological fit partition, creates bounded variants based on the observed
-failure mode, and evaluates those variants on untouched held-out sessions.
-Every variant has a separate simulated cash/equity account. New equity roots
-retain neutral v4 defaults and stable content identities. The coordinate pool
-promotes one family-specific exit hypothesis early without expanding the
-Cartesian discovery cap: breakout/trend families try a completed-close trailing
-ratchet, while reversion families try a frozen fair-value target. The neutral
-root and other fixed-R candidates remain in the default first batch. Family-
-aware target and hold ladders and
-all other coordinate refinement change exactly one executable field at a time. After all such
-points are measured, at most two measured fields are combined in a bounded
-interaction phase, followed by one unchanged confirmation. A family is retired
-only when every point explicitly rejects a useful edge with adequate powered
-evidence; if LLM replacement is enabled, a valid bounded proposal is registered first. For
-v2/v3/v4 roots with measured `min_atr_bps` and `stop_atr` coordinate lessons, an
-`execution_blocked` fit diagnosis makes coordinate exhaustion schedule exactly
-one bounded measured interaction. It uses configured stress geometry when
-available, never invents missing values, changes no risk constants, and does not
-claim the pair will trade. A
-missing or invalid LLM proposal leaves the family pending replacement, not
-retired. Insufficient data is not treated as failure. Backtest winners must
-still pass strictly later forward data before runtime can select them.
-
-Before replay, the fit-only signal screen supplies the report's forward-return
-and control rows. Unavailable comparisons are represented by explicit `p=1`
-placeholders, and a terminal current-hypothesis no-edge outcome is reported
-instead of silently treating a corpus as proof; a changed corpus reseeds the
-hypothesis. `research.path_telemetry` measures target/hold reachability from
-the actual entry through the bounded hold, while lower-target and hold proposals
-are limited to preregistered ladders and remain non-authorizing.
-
-Before full variant replay, `research.fit_diagnostics` records fit-only
-eligible-prefix and first-signal rates, ATR and 30-bps-floor binding, planned
-stop/target/hold distributions, gross/net/fees/slippage and configured/stressed
-cost-to-risk, configured pre-cap versus fill-delivered risk, exit reason/tie/gap
-counts, and clustered MDE/power, provider/feed provenance for each leg,
-entry-pricing sources, configured limits,
-pass/fail/unknown row counts, behavioral alias fingerprints, and an execution-
-rejection section that passes only aggregate fit-partition counts/reasons to
-proposal generation. The exit grammar stays bounded
-(ATR-floor bracket, fixed or frozen fair-value target, optional completed-close
-breakeven/trailing amendment, thesis deadline, and bar cap); these measurements are
-operator-review diagnostics only and never authorize or expand a candidate.
-When every fit opportunity is explicitly rejected at execution, the fit is
-classified as `execution_blocked`, distinct from sparse/underpowered data. It
-may close after the bounded attempt cap only to progress and observe search
-exhaustion; it is not a powered negative edge conclusion.
-
-Each factory result also persists one `bar-coverage.v1` record for the input
-corpus, with per-symbol/session observed minutes, exact-calendar expected
-minutes when those boundaries are present, early-close caveats, internal gaps,
-and bounded gap samples. It is not repeated in every account or variant. A
-time-like trade exit records `internal_gap` or `observed_data_end` separately
-from normal `time_expiry`. These fields describe censoring only: neither a gap
-nor a coverage ratio is assigned a positive or negative R effect without a
-separate matched analysis.
-
-A worker is given a corpus descriptor — the session window it needs — rather
-than a copy of the corpus, and re-reads that window itself. The predicates are
-the orchestrator's own, so the trades, statistics and content hashes are the
-same either way; an in-memory corpus has nothing to re-read and still travels
-with the task.
-
-### What the LLM does, and what it cannot do
-
-`research.llm_strategy` serves three distinct requests, all bounded by the same
-output contract:
-
-- `llm-rule-proposal.v1` — **repair.** Asked for a replacement `rule_spec` only
-  after every intended variant of a family has failed with an adequate sample.
-- `llm-edge-discovery.v1` — **discovery.** Asked for a genuinely new hypothesis
-  whenever a slot needs one: at genesis on a fresh ledger, when a slot proves
-  an edge and is reseeded, when a generation budget runs out, and when an idle
-  slot is revived. The request carries a small aggregate brief — the families
-  this slot has tried, the families already carrying a deployed edge, the last
-  diagnosis, the slots already seeded earlier *in this same cycle*, and the
-  graded history of earlier reasons — and the reply must include a
-  one-sentence `thesis` of at most 240 characters, which is recorded as
-  evidence and displayed but never interpreted as an instruction.
-- `llm-variant-tuning.v1` — **tuning.** Asked for the parameter variants of one
-  hypothesis, given its root spec, the fit-partition diagnosis, and the graded
-  lessons. Each returned variant must carry a `reason` of at most 240
-  characters naming the parameter it changed and the diagnosed problem it
-  should fix, and a `builds_on` citing the lesson it reasoned from.
-
-### The model tunes values; it cannot invent a signal
-
-The signal primitives are fixed code. `RULE_FAMILIES` names twelve of them,
-`CONFIRMATIONS` and `SIDES` are closed enums, the permitted field set is fixed
-per grammar version, and every numeric field has hard bounds — so
-`validate_rule_spec` rejects an unknown family, an unknown filter, an invented
-indicator field, or a new data source before anything reaches an evaluator.
-How each signal is computed from the bars lives in
-`agent/contracts/rule.py::evaluate_rule_signal`, which is code the research
-process never generates, imports, or rewrites. That has always been true of
-every lane; tuning does not weaken it.
-
-Tuning is narrower still. A tuned spec must keep its root's `family` *and* its
-root's `schema`:
-
-- **family** — changing which idea is under test is discovery's job, not
-  tuning's.
-- **schema** — `rule-strategy.v2` unlocks whole categories of predicate
-  (`confirmations`, an entry-time window, an ATR regime band) that the root was
-  never expressed in, while v3 adds the nullable equity `breakeven_r` exit
-  field and v4 adds bounded target, trailing-stop, and deadline fields.
-  Reaching a wider schema is adding structure, not tuning values, so every
-  root remains on its declared schema while its existing fields are tuned
-  (including when `breakeven_r` changes from `null` to a finite value).
-  Options remain on v1/v2.
-
-What is left is exactly what "tuning the parameters" means: the values of the
-fields the root already has, inside the bounds the grammar already enforces.
-
-### Why something was tried, and how that turned out
-
-Parameter search used to be a fixed table: three hand-written responses per
-diagnosed failure mode, with an arithmetic sweep filling anything past that.
-It worked, but nothing it learned in one cycle reached the next one.
-
-All three replies use strict full-schema structured JSON (`additionalProperties:
-false`, including the complete rule specification), are size-capped,
-fence-rejecting, and validated against the rule grammar before anything is
-stored; keys that look like source, credentials, or market rows are refused
-outright. The adapter enforces a per-run total-call budget, bounded attempts,
-timeouts, and response bytes, and opens an authentication circuit after an auth
-failure. Result evidence records schema/grammar hashes, call counts, circuit
-state, and each attempt's hashes/errors. A discovered hypothesis is
-registered `queued` with no run, no gate, and no candidate — it must earn
-`backtest_passed` and then a strictly later offline forward-shadow pass through
-exactly the same gates as a deterministic one. That pass may leave the
-candidate at `shadow`; only live parity ingestion can authorize runtime. A
-tuned variant gets its own isolated
-simulated account and faces every gate a mutated variant faces. **The LLM
-chooses what to try next; it can never shorten the evidence path or authorize
-trading.** The shipped lane requires its separate readable provider secret;
-missing or unreadable credentials fail closed before discovery rather than
-downgrading the run to an unauthenticated or silently different mode.
-
-Every proposal records a **reason** before the gate that will judge it exists,
-and that reason is **graded** against fit-derived evidence afterwards. The pair
-lives in two append-only tables — `factory_lessons` for the reason,
-`factory_lesson_outcomes` for the verdict — because the two facts are known at
-different times, and writing the reason first is what makes it a prediction
-rather than a summary. Proposal verdicts and shared learning are fit-derived;
-underpowered attempts, including `execution_blocked`, do not count as family or
-parameter successes or failures. Held-out, sealed, and qualification evidence
-remains audit metadata and is unavailable to proposal generation. Deterministic
-mutations record reasons in the same shape, including an explicit "no diagnosis
-behind it" marker on the sweep fill, so a tuned reason can be compared against
-the fixed table rather than only against other tuned reasons.
-
-The graded pairs are read back into the next tuning and discovery request,
-oldest-first-trimmed to stay inside the prompt's aggregate bound.
-
-### A proposal has to build on a learning, not arrive from nowhere
-
-Handing the model its history is necessary but not sufficient — nothing in a
-prompt makes a model use what it was given. Three rules make the loop a
-property of the system instead:
-
-1. **Cite the lesson.** Each brief entry carries a short id. When any lesson is
-   supplied, every returned variant must set `builds_on` to one of those ids,
-   and its `reason` must say what that lesson showed. An uncited proposal is
-   refused; so is one citing an id that was never supplied, which would be a
-   fabricated citation.
-2. **Do not re-run a settled experiment.** A variant whose parameters a graded
-   lesson already recorded as a powered negative rejection is dropped, and the
-   deterministic table tops the slot back up. *Underpowered* is not a failure,
-   so a thin sample never closes a door.
-3. **Keep the chain.** The citation is resolved to a real lesson id and stored
-   as `parent_lesson_id`, so "B was tried because A failed this way" is a
-   durable edge in the ledger. `factory report` renders it as `built on:` and
-   counts how many proposals stood on an earlier result.
-
-The model may add at most eight novel numeric tuning values per lineage/family.
-The factory ledger records marked novel attempts across parent hypotheses and
-cycles, so the allowance survives prompt trimming and restarts; deterministic
-grid values do not consume it.
-
-That is the whole loop: propose with a reason and a citation, evaluate under
-unchanged gates, grade the reason, and hand the grade forward.
-
-Across all discovery lanes, executable variants are de-duplicated by a
-family-specific semantic signature, including v1/v2/v3/v4 no-op aliases. Continuous
-numeric axes use relative/local scaling for semantic novelty, while
-integer/topology axes use their grammar spans; exact signatures and validation
-are unchanged. Only a
-graded `adequate_negative_rejection` suppresses its exact variant id;
-underpowered and adequate-but-inconclusive results remain eligible.
-
-### Learning shared across every strategy
-
-A per-family brief can only say what happened to one idea. Some of what
-research learns is not about one idea at all — that lowering a target tends to
-help across families, that live trials keep disagreeing with replays, that one
-direction of change fails everywhere it is tried. `shared_learning` aggregates
-exactly that and attaches it to every tuning and discovery request, so a fresh
-slot with no history of its own still has evidence to reason from.
-
-It is an aggregate of *outcomes*, never of market data: each entry is a
-parameter name, a direction, how many graded attempts changed it that way, and
-how many passed. Underpowered attempts are excluded — they say something about
-the sample, not the parameter — and a direction needs at least three graded
-attempts before it is reported, because a "trend" drawn from one is worse than
-no trend. Nothing in the digest is derived from a held-out, sealed, or
-later-forward observation, so sharing it adds no information about unseen data.
-
-## The isolated paper-research epoch
-
-`research.paper_epoch` is a separate operational experiment from both the
-authorizing EdgeLedger and the existing paper-account trial below. It freezes
-exactly one primary connected to a separately fingerprinted Alpaca paper
-account/runtime and at least one broker-free shadow sibling. Every member must
-attest the same realtime-stream, data-window, config, code, cost, risk, and
-manifest digests before the epoch starts. Runtime LLM adaptation is required to
-be false both in the manifest and at start.
-
-The epoch writes only its dedicated SQLite store (default
-`runtime/research/paper_epochs.sqlite3`). A complete observation batch contains
-the primary and every sibling for the same stream event. It records paper
-fills, slippage, rejections, and paper/shadow operational parity. A mismatch or
-runtime failure may stop the epoch; a favorable paper outcome contributes zero
-alpha evidence and has no promotion authority. The database is append-only,
-uses immutable triggers, row digests, and an audit hash chain, and refuses to
-share a namespace with an EdgeLedger or runtime journal.
-
-Lifecycle operations use bounded JSON documents and never accept or persist
-broker secrets:
+Fit or publish a diagnostic calibration artifact with:
 
 ```bash
-python research.py paper-epoch create --db runtime/research/paper_epochs.sqlite3 --input create.json
-python research.py paper-epoch start --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH --input attestation.json
-python research.py paper-epoch record --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH --input paired-outcome.json
-python research.py paper-epoch complete --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH
-python research.py paper-epoch seal --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH --input lessons.json
-python research.py paper-epoch verify --db runtime/research/paper_epochs.sqlite3
+.venv/bin/python -m research.cost_rerun \
+  --calibration-only --corpus QUOTES.jsonl --config config.yaml \
+  --min-quotes-per-cell 500 --out calibration.json
 ```
 
-An immutable, public-safe operational snapshot can be emitted without opening
-the store for writes:
+`--publish-latest PATH` archives an immutable content-addressed artifact and
+refreshes a non-activating latest view. Publication never activates a runtime
+cost schedule. The full CLI also accepts `--specs`, `--percentile`,
+`--starting-cash`, and `--schedule-out`; inspect `--help` before using them.
+
+## Evidence lifecycle and gates
+
+The authorizing lifecycle is source validation → causal replay → fit/held-out
+controls → qualification → parity-matched live shadow → verified proof → an
+explicit deployment selection. The current constants are defined in
+`research/gates.py`; they include 100 trades/30 sessions/30 clusters for
+backtest and qualification, and 150 trades/30 sessions/30 clusters for the
+parity-matched shadow tail. These are minimum evidence floors, not tuning
+knobs. A corpus that cannot support a required floor is underpowered, not a
+negative edge.
+
+The current gate envelope is `verified-research-gate.v3` with gate protocol 2;
+protocol 1 remains readable under its original semantics for stored evidence.
+Protocol 2 adds the versioned cost-stress, control, qualification, and durable
+FDR checks. The current replay generation is `REPLAY_ENGINE_EPOCH = 7` in
+`research/edge_ledger_store.py`; older proofs remain audit-readable but cannot
+authorize until re-derived under the current epoch.
+
+Gate checks include absolute after-cost economics, matched controls, a seeded
+cluster-level falsification test, walk-forward stability, qualification rows,
+multiple-test correction, and the durable confirmatory online-FDR allocation.
+The active new confirmatory scope is `shadow-confirmation-v6` with its v6
+method. The v7 FDR constants are versioned and parseable, but the proof
+verifier's active scope remains v6; changing that scope is an explicit code and
+proof-verifier change, not a documentation choice.
+
+Use the ledger commands only for their named lifecycle operation:
 
 ```bash
-python research.py paper-epoch export \
-  --db runtime/research/paper_epochs.sqlite3 --epoch EPOCH \
-  --output-root research/results/paper-epochs
+.venv/bin/python research.py edge init
+.venv/bin/python research.py edge discover --data DATA.jsonl \
+  --vehicle equity --lane backtest --agent-config config.yaml
+.venv/bin/python research.py edge-ingest-shadow CANDIDATE_ID \
+  --db runtime/research/edge_lab.sqlite3 \
+  --shadow-db runtime/research/shadow.sqlite3
+.venv/bin/python research.py edge-trials --dry-run
+.venv/bin/python research.py edge-promotable --format json
 ```
 
-The writer verifies the audit chain, then produces deterministic canonical
-JSONL with an epoch manifest/cohort digest, current status and policy,
-operational summary, one record for each outcome currently stored, and the
-integrity/audit head. The filename contains the full content SHA-256 digest;
-creation is atomic and repeats are byte-identity checked. Account/runtime
-fingerprints and the local SQLite path are intentionally omitted. This is an
-operational export, not a complete observer or signal feed: it does not fill
-in session dates, signal times, symbols, sides, brackets, quote provenance,
-exits, or R values. It is descriptive instrumentation with zero alpha or
-promotion authority. An optional HTTPS metadata notification is available via
-`--webhook-url`; delivery is best effort and never changes the artifact.
+`edge discover --diagnostic-only` inspects historical/mixed inputs without
+opening an authorizing ledger. `edge-ingest-shadow` requires the prior
+qualification, current source/config/code/provenance/replay/gate identities,
+fresh complete parity-matched rows, and the durable shadow/FDR checks. A
+candidate report or a diagnostic candidate list is not a promotion.
 
-Lessons are invisible to their source epoch. A successor may consume only the
-immediately preceding sealed batch, and only after attesting a clean runtime
-restart and a different unseen data-window digest. It therefore restarts
-confirmation rather than tuning the running cohort. Broker order wiring must be
-hosted in its own paper-only process with its own credentials; the control
-plane deliberately cannot fall back to the trader's account or credentials.
-
-## The paper-account trial lane
-
-`research.trial` closes the loop between the book and the search.
-
-A proved edge that is not pinned trades the same Alpaca paper account, and its real fills
-accumulate as `paper_outcomes`, each carrying the exact passing shadow
-`proof_run_id` that authorized entry. After the trial window — the standalone
-module fallback is 30 sessions/100 trades, while the shipped validated runtime
-configuration supplies 20 sessions/20 trades — that proof epoch is judged
-against an explicit floor (total R and mean R both positive by default):
-
-- **Clears it, with a 95% session-cluster lower bound above the mean-R floor** →
-  the edge keeps trading and becomes *promotable*. Nothing is
-  promoted; `edge promotable` hands the operator the config block.
-- **Misses it** → the edge is parked, and the reason is written into the lesson
-  ledger as a `trial` lesson from `live_paper`, graded immediately. The next
-  tuning request reads it, so the parameters proposed next are answering the
-  book rather than only the replay. This is the point of the lane.
-- **Window still open, outcomes carry no usable R, or a positive estimate has
-  insufficient confidence** → nothing happens.
-  Underpowered is not failure here either.
-
-A pinned edge is still judged. The sequential drift stop and trial review run
-for pinned identities just as they do for automatic selections; an authoritative
-failure parks or demotes the edge and records the pin context for audit. The
-20-outcome rolling-R calculation remains visible as advisory telemetry but does
-not itself change lifecycle state. Pinning selects an identity and prevents
-silent substitution, but never bypasses authorization or a hard lifecycle stop.
+The factory has the same boundary and isolated accounts per variant:
 
 ```bash
-python research.py edge trials --dry-run   # verdicts, changing nothing
-python research.py edge trials             # park the failures (exit 3)
-python research.py edge promotable         # what has earned a promotion
+.venv/bin/python research.py factory-run \
+  --data DATA.jsonl --agent-config config.yaml --vehicle equity \
+  --db runtime/research/factory.sqlite3 --workers 2
 ```
 
-The scheduled cycle runs the review *before* discovery and tuning, so a trial
-that just finished below its floor is already a recorded lesson by the time
-this cycle proposes anything. `ALPACA_TRIAL_REVIEW_ENABLED=0` turns it off.
+Use `--diagnostic-only` for non-authorizing sources. `--cohort
+intraday-mechanisms.v1` is a frozen 12-arm diagnostic comparison and requires
+that flag. The exact options include `--worker-data`, `--strategies`,
+`--variants`, `--starting-cash`, `--min-trades`, `--min-sessions`, `--alpha`,
+`--max-generations`, `--max-confirmatory-attempts`, and `--config`.
+Fit diagnostics and LLM proposals can explain or bound search; they never read
+held-out/sealed evidence, mutate the runtime config, emit a proof, or promote
+an entry.
 
-If the same immutable candidate is later re-proved, the newer passing shadow
-run starts a fresh trial epoch. Earlier outcomes remain in the append-only
-ledger but are excluded from `paper_performance`, drift, and the new verdict.
-A failed or unverifiable latest shadow proof quarantines history rather than
-falling back to lifetime aggregation.
+## Diagnostic inventory and shadow
 
-Parking an edge never promotes anything in its place. The replacement still has
-to earn `backtest_passed`, a strictly later offline shadow pass, and every gate,
-then obtain a new parity-matched live proof before runtime eligibility.
+`research.diagnostic_suite` resolves existing identities; it does not invent or
+tune strategies, open a ledger, emit proofs, or turn unavailable observations
+into negative returns. The current inventory is exactly 43 unique equity arms:
+the diagnostic-shadow rule cohort, the registered mechanism cohort, and the
+equity IBR registry. Each arm has an isolated simulated account and the report
+sets `eligible: []`, `proofs: []`, and `authorizing: false`.
+
+Run it with a new output path:
 
 ```bash
-python research.py factory report --format markdown   # includes the graded reasons
+.venv/bin/python -m research.diagnostic_suite \
+  --data /absolute/path/to/frozen/market.jsonl \
+  --agent-config config.yaml \
+  --out /absolute/path/to/new/inventory.json \
+  --diagnostic-only --workers 2
 ```
 
-The unmutated root is always variant zero and is never proposed away. It is
-compared with an independent randomized-entry null that preserves the
-candidate's session/symbol/direction distribution and exit rules; it is never
-compared with itself. The root remains a real candidate in the family and
-cycle-global Benjamini–Yekutieli denominators, so it consumes multiplicity like
-any mutation.
+The command also accepts `--full-fit-diagnostics` and `--ibr-max-events`.
+The latter is a hard event budget: input over the budget becomes unavailable,
+never silently truncated. The CLI returns exit code 2 for a completed,
+non-authorizing diagnostic report.
 
-Verified gate envelopes carry explainable arm evidence for candidate, baseline,
-and randomized-null rows: raw/executed/eligible counts, fill sources, quote-age
-summaries, gross/cost/net economics, matched and dropped match keys, and
-directional/pair coverage. Quote density can legitimately change null/control
-evidence even when the candidate count is unchanged.
+The broker-free live shadow (`deploy/shadow.py`) uses the same runtime signal,
+setup, risk, exit, and cost code in virtual books. Direct CLI defaults to the
+24-rule cohort; `ALPACA_SHADOW_INCLUDE_IBR=1` or `--diagnostic-include-ibr`
+adds the seven registered IBR arms. The environment value is strict `0` or `1`.
+The shadow has no broker-secret or order path. Session acceptance requires
+stable deployment/code/cohort identities, exact calendar coverage, current
+source observations, and genuine event/cursor progress. An unchanged heartbeat
+is not a completed session.
 
-The checked config enables model-assisted discovery, replacement, and tuning
-with OpenAI `gpt-5.6-terra`. Azure-compatible endpoints also require the exact
-resource-local alias in `research.strategy_llm.deployment`; preflight rejects
-an unset alias before loading the corpus. Compose uses the host override
-`ALPACA_RESEARCH_LLM_SECRET_FILE`; the scheduler reads the mounted path through
-`ALPACA_RESEARCH_LLM_SECRETS_FILE`. Provider keys are read only from that
-separate readable file, never from the broker secret. An enabled adapter
-without its provider key fails before discovery; invalid or rejected model
-output records a pending replacement and cannot retire a family prematurely.
-Successful proof produces a content-addressed finding. `research.proof.webhook_url` may send that finding
-to an HTTPS webhook without changing the durable artifact.
+`deploy/trader_projection.py` is a bounded, diagnostic-only projection of the
+recorder corpus. It preserves non-quote events and replay-boundary quotes,
+measures costs before compaction, and writes a manifest only after source
+identity rechecks. It has no promotion or broker-facing path.
 
-`OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` are trust boundaries: a configured
-endpoint receives the provider key and the bounded aggregate prompt. Use only a
-trusted HTTPS service; there is no application host allowlist. Prompt, request,
-schema, configuration (including the effective sampling setting), and
-raw-response hashes prove what the cycle consumed, and make the evidence
-reproducible for that exact invocation, but they do not guarantee bit-for-bit
-identical model output later. The OpenAI path uses the Responses API
-structured-output request and sends `temperature: 0` when supported; when the
-configured model or deployment is exactly `gpt-5.6-terra`, the adapter omits
-that unsupported parameter and records `temperature: null` in configuration
-evidence. Anthropic requests keep `temperature` at `0`; the hashes preserve the
-actual request and response. The adapter's call budget is a per-run call-count
-guard rather than spend accounting; provider-side quotas remain an operational
-control.
+## Paper-only incumbent and isolated epoch stores
 
-The scheduled cycle reports `completed`, `completed_no_edge`, `no_data`, or
-`failed`. `completed_no_edge` means the input was valid but no candidate was
-proved; the report separates `adequate_negative_rejection`,
-`adequate_negative_inconclusive`, `adequate_inconclusive`, `underpowered`, and
-families not yet tested. `no_data` means the input was unavailable or empty. Neither status
-permits bypassing the runtime edge gate.
+`research.paper_trial` selects exactly one predeclared diagnostic catalog arm in
+the paper runtime. It freezes the rule, policy, feed/provider, cohort, code
+identity, and report root. It cannot use `auto`, arbitrary specs, runtime LLM
+selection, options, delayed feeds, or live mode. `config.yaml` keeps the block
+disabled; an operator must explicitly enable a profile and pass flat-book and
+account-bound activation checks. `research.require_validated_variant` must stay
+true as a configuration guard, but the explicit paper-trial path deliberately
+does not require an ordinary EdgeLedger proof; it runs the one frozen arm with
+separate account and identity controls. All paper-trial outcomes and verdicts
+are persisted with `authorizing: false` and `proof_authority: false`.
 
-Before validation, the scheduled cycle builds temporary normalized views and
-emits `research-cycle-quarantine.v1`. Recorder rows from the legacy observation
-timestamp bug (`as_of > observed_at`) are excluded from those views without
-modifying the append-only source. Rows proven outside an authoritative Alpaca
-session, including an authoritative closed day, are likewise excluded and
-reported as `research-cycle-calendar-filter.v1`; missing, malformed, or
-conflicting exact-calendar metadata remains a hard validation failure.
+The separate `research.paper_epoch` store is an append-only operational
+primary/shadow epoch. It must use a separate SQLite path and immutable identity
+bindings. Its operator CLI is:
 
 ```bash
-python research.py factory run --data market.jsonl --strategies 12 --variants 4 --workers 2
-python research.py factory status
-python research.py factory report [--slot N] [--format text|markdown|json] [--write]
+.venv/bin/python research.py paper-epoch status --db PATH
+.venv/bin/python research.py paper-epoch verify --db PATH
+.venv/bin/python research.py paper-epoch export \
+  --db PATH --epoch EPOCH_ID --output-root research/results/paper-epochs
 ```
 
-The standalone factory preflight requires readable normalized JSONL with
-explicit provider/feed provenance; the equity lane requires exact IEX or SIP.
-`delayed_sip` and other partial/non-exact feeds are diagnostic-only, mark the
-result diagnostic, and emit no proofs. In this mode
-the configured strategy model may still perform bounded discovery and tuning;
-its hypotheses, variants, call evidence, and aggregate refusal diagnostics are
-written to `ALPACA_FACTORY_DIAGNOSTIC_REPORT`, never to either authorizing
-ledger. Scheduled diagnostic cycles skip trial review and shadow ingestion.
+Lifecycle writes (`create`, `start`, `record`, `stop`, `complete`, `seal`)
+require their bounded JSON input schemas and are independent of the authorizing
+EdgeLedger. Paper trial details, replacement safety, and shadow session
+acceptance are in [`docs/paper-shadow-trials.md`](../docs/paper-shadow-trials.md).
 
-For a preregistered reachability check, freeze the exact diagnostic report and
-run the same specifications and data under two cost-risk limits:
+## Provider preflight
+
+`llm-preflight` makes one bounded, non-authorizing provider request. It does not
+load market data or touch trading state. Authentication/configuration failures
+and deployment-not-found responses stop the scheduled cycle; bounded timeout,
+rate-limit, and server errors are recorded as degraded provider evidence and
+the deterministic path may continue. The provider response is never a signal,
+an edge proof, or an entry authorization.
 
 ```bash
-python -m research.cost_counterfactual \
-  --data market.jsonl --specs diagnostic-report.json \
-  --agent-config config.yaml --baseline 0.30 --alternative 0.60 \
-  --output cost-counterfactual.json
+.venv/bin/python research.py llm-preflight --agent-config config.yaml
 ```
 
-Only that one risk-policy field changes. The output measures refusal rate,
-executed trades, and ordinary diagnostic replay P&L, is explicitly
-non-authorizing, and cannot select or update the production threshold from its
-own result. It does not claim a separate stressed-expectancy estimator.
+The scheduled wrapper persists a redacted bounded result in its cycle status and
+operational history. The provider model/deployment is metadata; the finite rule
+grammar and its validators remain the source of executable behavior.
 
-The v2 contract verifies that the only changed config path is exactly
-`risk.max_stressed_cost_to_risk_ratio` and persists baseline, alternative, and
-runtime config hashes. Pairing is exact on `variant_id + opportunity_id`;
-malformed terminal/numeric/identity rows and duplicate keys are excluded from
-pairing, and identity/duplicate exclusions also apply to the empirical
-summaries. Incomplete, ambiguous, or path-dependent pairs fail the top-level
-controlled-change invariant and cannot support a direct causal interpretation.
-Each arm reports empirical `r_multiple` (R) distributions,
-including mean and sample sigma, trades per session, target definition/hit
-counts, gross/fee/net economics, modeled execution-drag decomposition when the
-references permit it, stop geometry, exit reasons, stressed-cost-to-risk values,
-entry slippage, and fill sources. Compact signal-opportunity evidence is sorted,
-JSON-safe, content-addressed per row, and bound by a collection hash. This makes
-the replay reproducible without making its stateful account path a causal or
-authorizing result.
-The diagnostic Section 0.5 measurement includes a 95% moving-block
-session-cluster bootstrap interval and clustered MDE/power at alpha .05 for a
-`.05R` effect; uncertainty is data-derived and no fixed `0.38R` width is
-assumed.
+## Related contracts
 
-Provenance records the source-report, measurement-code, dataset, frozen-cohort,
-run-settings, and final result content digests (`source_report_hash`,
-`measurement_code_hash`, `dataset_hash`, `frozen_cohort_hash`,
-`run_settings_hash`, and `content_hash`). A bound source report must also carry
-its dataset hash, strict diagnostic/non-authorizing flags, and an explicit
-empty proof list; omissions fail the controlled-change invariant. The evidence
-funnel lists five
-protocol windows—`fit`, `heldout`, `qualification`, `shadow_selection`, and
-`shadow_confirmation`—with nominal floors of 100, 100, 100, 150, and 150
-trades (30 sessions/clusters each; 600 trades in total); each is marked
-`measurement_available: false` until sealed/live window assignments exist. Its
-readiness context is 150 offline sessions plus 60 shadow sessions (210 total).
-These measurements remain diagnostic-only: P&L is descriptive, and the result
-cannot select a threshold or promote an edge.
-
-`factory run` archives the Markdown narrative under `research/results/factory/`
-on every cycle, including a cycle that proved nothing, so the read-only
-dashboard lists it without anyone running a command. `--write` does the same
-on demand; `ALPACA_RESEARCH_REPORT_DIR` overrides the destination.
-
-`research.factory_report` is the reader for everything the two ledgers already
-record but nothing previously opened: per slot, the lineage of hypotheses it
-has held; per hypothesis, its origin (template, deterministic mutation,
-rotation, LLM discovery, LLM replacement) with the model and the prompt,
-request and response content hashes where one applies, plus its thesis and its
-falsification condition; per variant, trade counts split fit/held-out, net P&L,
-drawdown, held-out delta and lower bound, q-value, and the named gates it
-missed; and per outcome, why a hypothesis was retired, after how many of its
-intended variants, the dominant failure mode, and what replaced it. It opens
-both ledgers read-only, derives every number on read, and reports the gate hash
-beside anything a gate produced.
-
-```bash
-python research.py edge init
-python research.py edge discover --data market.jsonl --vehicle equity --lane auto
-python research.py edge status --vehicle equity
-python research.py edge ingest CANDIDATE_ID paper-outcome.json
-python research.py edge paper --vehicle equity --deployed
-```
-
-`edge status` reports lifecycle state; `edge paper` reports how each edge is
-actually doing on live paper outcomes — trade and session counts, total and
-mean R, win rate, net P&L, the advisory rolling-R monitor with its floor, and
-the authoritative sequential drift statistic against the held-out distribution the edge was
-validated on. The live view is limited to the latest passing shadow proof epoch,
-so “what it has done since” means since the proof currently authorizing it, not
-the candidate's lifetime. Both matter: the first is the evidence an edge was
-promoted with, the second is what it has done since. Neither can change a
-lifecycle state; they are read-only views of append-only data.
-
-## Fixed mechanism comparison (diagnostic only)
-
-```bash
-python research.py factory run --data market.jsonl \
-  --diagnostic-only --cohort intraday-mechanisms.v1
-```
-
-This freezes 12 arms in three families: opening-range breakout with trend
-context, confirmed trend pullbacks with context/trailing exits, and VWAP
-reclaims with range context/shorter holds. Roots and treatments share the same
-dataset and existing costed simulation. The cohort disables proposal generation
-and mutation, persists every arm including losses and zero-trade arms, and
-cannot write proofs or authorize entries. The manifest and its hash live in
-`research/mechanism_cohort.py`. It is a hypothesis comparison, not a new winner
-selection gate. A later confirmation needs an independently frozen protocol and
-unseen observations.
-
-Diagnostics distinguish missing data, execution refusals, and no signal. They
-report net expectancy, average net win/loss, payoff ratio and implied break-even
-win rate instead of treating an arbitrary win-rate threshold as edge. Zero
-trades mean no measured expectancy; undefined profit factors stay undefined.
-Gross P&L is already calculated at modeled fills. Reference-price P&L and
-modeled execution drag are separate, and reference quotes may already include
-bid/ask crossing. Trial `mean_r_pct` is mean R × 100, not capital return;
-`capital_return_pct` requires a recorded capital denominator.
+* [`research/protocol.md`](protocol.md) — the normative replay, evidence, and
+  version/authority contract.
+* [`docs/edge-diagnostics.md`](../docs/edge-diagnostics.md) — non-authorizing
+  inventory, quote calibration, and shadow diagnostics.
+* [`docs/preregistered-hypotheses.md`](../docs/preregistered-hypotheses.md) —
+  frozen preregistration manifests and their exact CLI.
+* [`docs/paper-shadow-trials.md`](../docs/paper-shadow-trials.md) — paper-only
+  incumbent and isolated shadow workflows.

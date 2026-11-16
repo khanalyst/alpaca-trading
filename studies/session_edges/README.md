@@ -1,137 +1,153 @@
-# Session-edge research and exact-rule qualification
+# Session-edge research
 
-The session study is an upstream research lane for the main validation system.
-It adds sixteen bounded session, swing and volatility-context mechanisms and
-long-history screening. It does not authorize paper or live entries. Main's
-existing proof, source provenance, qualification, risk and trial controls remain
-unchanged. See [the integration record](../../docs/session-edge-integration-2026-11-13/README.md).
+The session study screens bounded minute, daily and volatility-context
+hypotheses upstream of the main validation system. Historical results,
+registered-rule reports and generated books are diagnostic. They do not enable
+paper or live entries.
 
-Historical outputs under `results/` are preserved as originally recorded. Their
-v1 `confirmed` and `paper_candidate` labels are historical claims, not current
-qualification. The saved 124 alpha statistics yield zero Holm and zero BY
-survivors when corrected together. That check does not replay the corrected
-strategy or prove the effect absent.
+The [catalogue](EDGES.md) is generated from [grammar.py](grammar.py). Its runner
+support flag describes signal implementation, while trading authority remains
+subject to the main proof/runtime bridge.
 
-## Evidence and execution contracts
+## Inputs and causal contracts
 
-- `discover.py` screens on development data and applies Holm/BY to the claimed
-  alpha beyond the instrument, as well as total-return checks. All labels are
-  historical support or diagnostic; every book has `trade: false`.
-- The 2020 and 2024 dates are historical comparison windows. They overlap
-  published strategy research and carry no untouched-holdout claim.
-- Daily close/RSI/streak decisions execute at the next observed session open.
-  They are distinct from the minute 15:50 strategy. Daily evidence is never
-  translated into minute-rule qualification.
-- Minute simulations retain observed-bar masks. Unobserved signal/fill bars
-  cannot become executable prices. The noise-band default exits at 15:58,
-  matching the shadow runner's timing. Statistical screens reject incomplete
-  sessions instead of turning an unavailable future exit into a zero return.
-  Missing sessions cannot silently erase an already-owned swing position.
-- Round-trip costs are scenarios, including entry and exit sides; replace
-  defaults with measured instrument/time/size costs for executable evaluation.
-- The cumulative ledger binds experiment name, data content, simulator/code,
-  costs and protocol. Reusing a name with changed inputs fails. A new explicit
-  experiment keeps prior trials in the cumulative correction.
-- Import requests bind the exact bounded specification and execution form.
-  Main reviews actual trade-level evidence and matched controls with its
-  existing floors; session-return summaries are never relabelled as trades.
-  Unsupported runtime/lifecycle or missing newer parity-shadow proof blocks
-  authorization, regardless of the historical tier.
+- Minute input uses SIP month files from the
+  [historical fetcher](../liquid_reversion/fetch_sip.py), named
+  `<SYMBOL>_1Min_YYYY-MM.csv.gz`. Supply the fetched calendar to exclude
+  early-close sessions correctly.
+- Daily input uses adjusted chart files from [fetch_public.py](fetch_public.py).
+  Context series such as VIX and VIX3M are supplied separately by name.
+- The turn-of-month family needs an explicit ordered exchange calendar through
+  `--exchange-calendar`. Cover all loaded dates and the calendar rule's required
+  surrounding dates; do not infer future month ends from price observations.
+- Minute statistical screens require observed bars for complete sessions.
+  Missing signal/fill/exit bars cannot become executable prices. A completed
+  download does not guarantee complete session coverage; the screen refuses
+  incomplete sessions rather than assigning unavailable returns zero.
+- Completed daily close/RSI/streak signals execute at the next observed open.
+  The daily close rule and the minute 15:50 rule retain separate identities.
+- Intraday noise-band simulations flatten at the runner's configured 15:58
+  boundary. Missing sessions cannot silently erase an owned swing position.
+- Costs are scenario assumptions, charged on executed sides. Calibrate them for
+  the intended instrument, time, size and execution before interpretation.
 
-[EDGES.md](EDGES.md) is the generated signal catalogue. Options-labelled signals
-read volatility indices or an expiry calendar and trade underlying shares;
-they do not establish option-contract mispricing. Turn-of-month research
-requires an explicit exchange calendar rather than inferring future month ends
-from the supplied price dataset. Supply its full date coverage with
-`--exchange-calendar PATH` (an ordered JSON list of dates or broker calendar
-objects with `date` fields). Missing calendar context is reported as a skip.
+Historical comparison windows and correction thresholds are defined in
+[discover.py](discover.py) and [stats.py](stats.py). Their labels make no claim
+that the historical windows are untouched holdouts. Discovery tests positive
+net return and exposure-adjusted alpha, and retains unavailable evidence in the
+cumulative correction rather than treating it as success.
 
-## Historical rerun on the VM
+## Historical workflow
 
-Use a new output directory on the persistent runtime volume and one shared
-ledger outside those output directories. Preserve config, pause, frozen trial,
-active ledgers and original evidence. Research does not require stopping the
-trader/watchdog, changing the trial or enabling orders.
+Examples use `.venv/bin/python` from the repository root; inside the built
+application image, use `python` instead. Use a frozen
+input corpus, a new output directory and a shared ledger outside individual
+run directories. An isolated application image can mount inputs read-only and
+only the new research destination writable. The study does not need access to
+active paper, proof or trial stores.
 
-After deploying the tested main revision, run inside the existing application
-image with the persistent runtime volume mounted. Substitute the actual SIP
-month-file and calendar paths; no command below fetches or prints credentials.
+Inspect the retrieval CLIs before fetching data:
 
 ```bash
-python -I studies/session_edges/run.py --alpaca-dir /app/runtime/session_edges/sip --symbols QQQ,SPY --calendar /app/runtime/session_edges/sip/calendar.json --out /app/runtime/session_edges/runs/registered-causal-v2
+.venv/bin/python -m studies.liquid_reversion.fetch_sip --help
+.venv/bin/python -m studies.session_edges.fetch_public --help
 ```
 
-Initialize a new shared ledger once. If the old public discovery ledger should
-be retained in the experiment history, add `--migrate-ledger` pointing to it;
-legacy rows are retained as historical diagnostics and never upgraded to proof.
+Run the registered-rule study with minute input:
 
 ```bash
-python -I studies/session_edges/discover.py --alpaca-dir /app/runtime/session_edges/sip --symbols QQQ,SPY,XLK,IVW --calendar /app/runtime/session_edges/sip/calendar.json --ledger /app/runtime/session_edges/experiments/ledger-v2.json --initialize-ledger --experiment sip-causal-v2 --out /app/runtime/session_edges/runs/sip-causal-v2
+.venv/bin/python -m studies.session_edges.run \
+  --alpaca-dir DATA/sip --symbols QQQ,SPY \
+  --calendar DATA/sip/calendar.json --out RUNS/registered
 ```
 
-Repeat the same experiment only with identical bound inputs. A changed dataset,
-cost or simulator needs a new experiment name and explicit `--new-experiment`;
-use the same ledger so prior admitted trials remain counted. Do not use an old
-ledger's scalar result as evidence for new code.
-
-Discovery emits the research record, a shadow-only book and a main-candidate
-review. Missing real trade evidence or lifecycle support remains a reported
-blocker rather than an implied pass. A later genuinely new confirmation window
-must be selected and sealed through main's existing pipeline.
-
-The default cost assumptions are 1bp round trip on SPY/QQQ/IWM, 1.5bp on DIA/VTI
-and 3bp elsewhere, stressed at twice those levels. Use `--cost-bps` with the
-measured values appropriate to the intended execution. These defaults are not
-claims about current broker fills.
-
-## LLM experiments
+`run.py` requires minute input and can also accept daily files. For a discovery
+experiment, initialize a shared ledger explicitly once:
 
 ```bash
-python -m studies.session_edges.propose prompt --discovery OUT/discovery.json --symbols QQQ,SPY,IWM,XLK
-python -m studies.session_edges.propose ask --model MODEL --discovery OUT/discovery.json --symbols QQQ,SPY,IWM,XLK --out proposals.json
+.venv/bin/python -m studies.session_edges.discover \
+  --alpaca-dir DATA/sip --symbols QQQ,SPY \
+  --calendar DATA/sip/calendar.json \
+  --ledger HISTORY/ledger.json --initialize-ledger \
+  --experiment sip-causal --out RUNS/discovery
 ```
 
-The proposal envelope retains exact model/provider identity, prompt/request,
-response, configuration fingerprints and thesis. Discovery retains attribution
-for proposals and duplicate grid matches. Failed and rejected proposals are
-experiment attempts too. The prompt exposes development statistics only;
-modern model pretraining can still contain later historical knowledge.
+For a daily-only experiment, use `--daily-dir DATA/public/daily` and `--daily`
+instead of the minute arguments. Add `--context VIX=VIX,VIX3M=VIX3M` when those
+files are available, and `--exchange-calendar PATH` for the month-end family.
+Missing required context is reported by family; malformed supplied inputs can
+refuse the run.
 
-`research/session_model_experiment.py` provides preregistered equal-budget
-mechanical/model lanes, attempt accounting, frozen selections and diagnostic
-paired outcome comparisons. Run its `--help` for the plan/attempt/freeze/outcome
-commands. No model is considered superior without recorded future outcomes.
-The checked-in v1 promoted hypotheses are all labelled grid-generated.
+The ledger binds each experiment name to data, context, source code, simulation
+version, costs and protocol. Reusing the name requires identical bound inputs.
+Changed inputs require a new name and `--new-experiment`, retaining the same
+shared ledger. `--migrate-ledger PATH` with `--initialize-ledger` retains a
+legacy ledger as diagnostic history without upgrading its claims. Do not reset
+history to discard failed or previously admitted trials.
 
-## Forward shadow and owned-position recovery
+Outputs include `discovery.json`, `discovery.md`, `edge_book.json` and
+`main_candidate_review.json`. Preserve raw inputs, failures, manifests and all
+experiment outputs. No report label or book field grants execution authority.
+
+## Main-candidate review
 
 ```bash
-python -m studies.session_edges.live run --book OUT/edge_book.json
+.venv/bin/python -m research.session_candidate_review \
+  --discovery RUNS/discovery/discovery.json --executions executions.json \
+  --out RUNS/main-candidate-review.json
 ```
 
-Shadow sends no orders. The optional `deploy/compose.session-edges.yaml` service
-also runs shadow-only; the ordinary six-service update does not enable it.
-Normal `--paper-orders` and `--live-orders` entries are disabled until an exact
-main proof/runtime bridge exists. A book's text label or `trade` field cannot
-authorize them. There is no two-day route from historical output to live entry.
+Executions must bind the exact candidate request, specification, kernel, real
+fills and matched controls. Session-return summaries cannot substitute for
+trade records. The reviewer rejects mismatched rules and reused or overlapping
+qualification sessions. Unsupported runtime/lifecycle, incomplete main gates
+or missing strictly newer parity-shadow evidence remains a blocker. The main
+system supplies trading authority through its existing pipeline.
 
-For a runner that already owns positions from an earlier release, the explicit
-`--recover-owned` mode uses its original state directory, saved position
-ownership and pending client IDs. It can only reconcile and reduce that saved
-exposure to zero; it cannot open new positions or use a replacement book.
-Inspect `python -m studies.session_edges.live preflight --help` before recovery.
-Pending submission timeouts retain the same identity until resolved. Position
-reduction does not depend on successful market-data fetching.
-
-The main account's operator pause and frozen trial are independent of this
-study. Neither research nor deployment should resume or rebind them.
-
-## Reproducible saved-artifact check and tests
+## Proposal experiments
 
 ```bash
-python -m research.session_artifact_audit studies/session_edges/results/discovery-public-2026-11-12/discovery.json --out OUT/saved-artifact-audit.json
-python deploy/test_suite.py
+.venv/bin/python -m studies.session_edges.propose prompt \
+  --discovery RUNS/discovery/discovery.json --symbols QQQ,SPY
+.venv/bin/python -m studies.session_edges.propose ask \
+  --model MODEL --discovery RUNS/discovery/discovery.json \
+  --symbols QQQ,SPY --out RUNS/proposals.json
+.venv/bin/python -m research.session_model_experiment --help
 ```
 
-The first command only recomputes correction from saved statistics. A raw-data
-research rerun requires the actual market corpus and is reported separately.
+Configure the provider before using `ask`. Receipts retain provider/model,
+prompt, request, response, configuration identity and failed calls. Discovery
+retains attributed, rejected and duplicate proposals. Equal-budget experiments
+freeze selections before paired outcomes; they remain diagnostic comparisons.
+
+## Forward shadow and recovery
+
+```bash
+.venv/bin/python -m studies.session_edges.live run \
+  --book RUNS/discovery/edge_book.json --dir RUNS/shadow
+```
+
+Default shadow records observations and decisions without sending orders. The
+optional [Compose override](../../deploy/compose.session-edges.yaml) provides a
+shadow service; the ordinary deployment helper does not enable it.
+
+`--paper-orders` and `--live-orders` are permitted only with `--recover-owned`;
+new entries remain disabled pending the main proof/runtime bridge. For previously saved owned exposure, explicit
+`--recover-owned` mode uses the original directory, saved ownership and pending
+client IDs to reconcile and reduce exposure. It cannot open new positions or
+use a replacement book. Review the account-scoped preflight and recovery flags:
+
+```bash
+.venv/bin/python -m studies.session_edges.live preflight --help
+```
+
+The main account's operator pause, frozen trial and authorization are separate
+from this study. Research or deployment must preserve them.
+
+## Validation
+
+```bash
+.venv/bin/python deploy/test_suite.py --shard research
+```
+
+The complete test-shard commands are in the [project guide](../../README.md).
