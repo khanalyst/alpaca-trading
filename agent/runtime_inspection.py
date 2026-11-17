@@ -10,7 +10,7 @@ clock calls.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import closing
+from contextlib import closing, contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -120,7 +120,9 @@ def _runtime_paths(mode: str, runtime_base: str | Path | None) -> tuple[Path, Pa
     return runtime, runtime / "state.json", runtime / "journal.db"
 
 
-def _read_existing_state(path: Path) -> dict[str, Any]:
+def _read_existing_state(
+        path: Path, *,
+        cancellation_journal_path: str | Path | None = None) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -135,7 +137,8 @@ def _read_existing_state(path: Path) -> dict[str, Any]:
         raise StateCorruptionError(
             "runtime state is missing safety fields: " + ", ".join(missing))
     try:
-        return _validated(raw)
+        return _validated(
+            raw, cancellation_journal_path=cancellation_journal_path)
     except ValueError as exc:
         raise StateCorruptionError(f"runtime state is invalid: {exc}") from exc
 
@@ -191,60 +194,89 @@ def _copy_stable_journal_snapshot(path: Path, destination: Path) -> str | None:
     return None
 
 
-def _readonly_journal_check(path: Path, mode: str) -> tuple[bool, str | None]:
-    """Validate the existing journal through SQLite's read-only URI mode.
+@contextmanager
+def _stable_journal_snapshot(path: Path):
+    """Provide one disposable, stable journal view for an inspection.
 
-    ``immutable=1`` is deliberately not used: an active SQLite WAL is part of
-    the current journal and must not be ignored by an operator inspection.
+    State validation and schema validation must consume the same copied
+    database.  Otherwise a cancelled trial can be validated against a
+    different journal (or the process-global runtime journal) than the one
+    whose readiness was inspected.
     """
-    if not path.exists():
+    with tempfile.TemporaryDirectory(
+            prefix="runtime-journal-inspection-") as temp_dir:
+        snapshot = Path(temp_dir) / path.name
+        error = _copy_stable_journal_snapshot(path, snapshot)
+        if error is not None:
+            # Never let a validation failure fall back to the live source.
+            # Remove a partially copied database as well, so the explicit
+            # path below can only fail closed.
+            snapshot.unlink(missing_ok=True)
+        yield snapshot, error
+
+
+def _readonly_journal_check_snapshot(
+        snapshot: Path, mode: str) -> tuple[bool, str | None]:
+    del mode  # The schema is mode-independent; the caller scopes the path.
+    if not snapshot.exists():
         return False, "runtime_journal_missing"
     try:
-        with tempfile.TemporaryDirectory(
-                prefix="runtime-journal-inspection-") as temp_dir:
-            snapshot = Path(temp_dir) / path.name
-            snapshot_error = _copy_stable_journal_snapshot(path, snapshot)
-            if snapshot_error:
-                return False, snapshot_error
-            encoded = quote(str(snapshot.resolve()), safe="/")
-            uri = f"file:{encoded}?mode=ro"
-            with closing(sqlite3.connect(uri, uri=True, timeout=1)) as db:
-                db.execute("PRAGMA query_only=ON")
-                quick = db.execute("PRAGMA quick_check(1)").fetchone()
-                if not quick or str(quick[0]).lower() != "ok":
-                    return False, "runtime_journal_invalid"
-                rows = db.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-                tables = {str(row[0]) for row in rows}
-                application_tables = {
-                    table for table in tables
-                    if not table.startswith("sqlite_")
-                }
-                core_tables = set(_JOURNAL_TABLES)
-                known_tables = (
-                    core_tables | set(_JOURNAL_OPTIONAL_REQUIRED_COLUMNS)
-                )
-                if (not core_tables.issubset(application_tables) or
-                        not application_tables.issubset(known_tables)):
-                    return False, "runtime_journal_invalid"
-                required_columns = {
-                    **_JOURNAL_MINIMUM_COLUMNS,
-                    **{
-                        table: columns
-                        for table, columns in
-                        _JOURNAL_OPTIONAL_REQUIRED_COLUMNS.items()
-                        if table in application_tables
-                    },
-                }
-                if any(not set(columns).issubset(_journal_columns(db, table))
-                       for table, columns in required_columns.items()):
-                    return False, "runtime_journal_invalid"
+        encoded = quote(str(snapshot.resolve()), safe="/")
+        uri = f"file:{encoded}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=1)) as db:
+            db.execute("PRAGMA query_only=ON")
+            quick = db.execute("PRAGMA quick_check(1)").fetchone()
+            if not quick or str(quick[0]).lower() != "ok":
+                return False, "runtime_journal_invalid"
+            rows = db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+            tables = {str(row[0]) for row in rows}
+            application_tables = {
+                table for table in tables
+                if not table.startswith("sqlite_")
+            }
+            core_tables = set(_JOURNAL_TABLES)
+            known_tables = (
+                core_tables | set(_JOURNAL_OPTIONAL_REQUIRED_COLUMNS)
+            )
+            if (not core_tables.issubset(application_tables) or
+                    not application_tables.issubset(known_tables)):
+                return False, "runtime_journal_invalid"
+            required_columns = {
+                **_JOURNAL_MINIMUM_COLUMNS,
+                **{
+                    table: columns
+                    for table, columns in
+                    _JOURNAL_OPTIONAL_REQUIRED_COLUMNS.items()
+                    if table in application_tables
+                },
+            }
+            if any(not set(columns).issubset(_journal_columns(db, table))
+                   for table, columns in required_columns.items()):
+                return False, "runtime_journal_invalid"
     except sqlite3.DatabaseError:
         return False, "runtime_journal_invalid"
     except (OSError, RuntimeError):
         return False, "runtime_journal_unreadable"
     return True, None
+
+
+def _readonly_journal_check(
+        path: Path, mode: str, *,
+        snapshot_path: Path | None = None) -> tuple[bool, str | None]:
+    """Validate the existing journal through SQLite's read-only URI mode.
+
+    ``immutable=1`` is deliberately not used: an active SQLite WAL is part of
+    the current journal and must not be ignored by an operator inspection.
+    """
+    if snapshot_path is not None:
+        return _readonly_journal_check_snapshot(snapshot_path, mode)
+    with _stable_journal_snapshot(path) as (snapshot, snapshot_error):
+        if snapshot_error:
+            return False, snapshot_error
+        # ``snapshot`` cannot be None when ``snapshot_error`` is clear.
+        return _readonly_journal_check_snapshot(snapshot, mode)
 
 
 def _sanitize_error(exc: Exception, provider: Any = None) -> str:
@@ -290,18 +322,39 @@ def _local_snapshot(config: Mapping[str, Any], *,
     result["runtime_path"] = str(runtime_dir)
     result["state_file_present"] = state_path.exists()
     result["journal_file_present"] = journal_path.exists()
-    try:
-        runtime = _read_existing_state(state_path)
-    except FileNotFoundError:
-        result["state_error"] = "runtime state file does not exist"
-        blockers.append("runtime_state_missing")
-        runtime = None
-    except Exception as exc:  # noqa: BLE001 - preserve local evidence on corruption
-        result["state_error"] = _sanitize_error(exc)
-        blockers.append("runtime_state_unreadable")
-        runtime = None
+    persisted_trial_status: dict[str, Any] | None = None
+    # Use one stable disposable journal snapshot for both schema inspection
+    # and cancelled-trial audit verification.  In particular, never let the
+    # validator fall back to the process-global state.JOURNAL_FILE when the
+    # caller supplied an explicit runtime_base.
+    with _stable_journal_snapshot(journal_path) as (
+            journal_snapshot, snapshot_error):
+        cancellation_journal_path = journal_snapshot
+        try:
+            runtime = _read_existing_state(
+                state_path,
+                cancellation_journal_path=cancellation_journal_path)
+        except FileNotFoundError:
+            result["state_error"] = "runtime state file does not exist"
+            blockers.append("runtime_state_missing")
+            runtime = None
+        except Exception as exc:  # noqa: BLE001 - preserve local evidence on corruption
+            result["state_error"] = _sanitize_error(exc)
+            blockers.append("runtime_state_unreadable")
+            runtime = None
 
-    journal_ready, journal_error = _readonly_journal_check(journal_path, mode)
+        if isinstance(runtime, Mapping):
+            candidate_trial = runtime.get("paper_trial")
+            if isinstance(candidate_trial, Mapping) and candidate_trial:
+                persisted_trial_status = public_status(
+                    candidate_trial,
+                    cancellation_journal_path=cancellation_journal_path)
+
+        journal_ready = False
+        journal_error = snapshot_error
+        if journal_error is None:
+            journal_ready, journal_error = _readonly_journal_check(
+                journal_path, mode, snapshot_path=journal_snapshot)
     result["journal_ready"] = journal_ready
     if journal_error:
         blockers.append(journal_error)
@@ -420,7 +473,7 @@ def _local_snapshot(config: Mapping[str, Any], *,
             "accepted_sessions": len(frozen.get("accepted_sessions", ())),
             "closed_outcomes": len(frozen.get("outcomes", ())),
         })
-        trial_status = public_status(frozen)
+        trial_status = persisted_trial_status or public_status(frozen)
         trial_status["observed_entry_eligible"] = (
             trial_status.get("entry_eligible") is True)
         result["paper_trial"] = trial_status

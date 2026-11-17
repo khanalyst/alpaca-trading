@@ -301,9 +301,8 @@ class AlpacaMarketDataMixin:
         underlying_symbol = validate_equity_symbol(underlying_symbol)
         requested_feed = _canonical_feed(feed or self.options_feed, options=True)
         try:
-            # OptionHistoricalDataClient.get_option_chain in alpaca-py 0.43.5
-            # takes the underlying symbol and feed as a request object only
-            # via OptionChainRequest in releases that provide it.
+            # Releases providing OptionChainRequest carry the underlying
+            # symbol and feed together in that request object.
             from alpaca.data.requests import OptionChainRequest
             request_kwargs = {"underlying_symbol": underlying_symbol,
                               "feed": _sdk_feed(requested_feed, options=True)}

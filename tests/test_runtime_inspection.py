@@ -17,11 +17,13 @@ import unittest
 from unittest import mock
 
 import main
+import agent.runtime_inspection as runtime_inspection
 from agent import state
 from agent.alpaca_domain import Account, MarketClock
 from agent.config import DEFAULT_CONFIG, validate_config
 from agent.governance import record_config_version
 from agent.paper_trial import build_descriptor, new_state
+from agent.paper_trial_operator import cancel_paper_trial
 from agent.runtime_inspection import inspect_runtime
 from research.diagnostic_shadow import _logical_arms
 
@@ -201,6 +203,58 @@ class RuntimeInspectionTests(unittest.TestCase):
             result["frozen_trial_identity"]["accepted_sessions"], 0)
         self.assertEqual(
             result["frozen_trial_identity"]["closed_outcomes"], 0)
+
+    def test_cancelled_trial_validation_uses_explicit_runtime_journal_snapshot(self):
+        cancel_paper_trial(
+            self.config,
+            confirm_trial_id=self.config["research"]["paper_trial"]["trial_id"],
+            confirm_incumbent_identity=state.load_state()["paper_trial"][
+                "incumbent_identity"],
+            reason="runtime inspection test",
+            provider_factory=lambda _config: _ReadOnlyProvider(),
+        )
+        target_state = state.STATE_FILE.read_bytes()
+        target_journal = state.JOURNAL_FILE.read_bytes()
+        wrong_global_base = self.root / "different-global-runtime"
+        state.configure_runtime("paper", base=wrong_global_base)
+        try:
+            result = self._inspect(_ReadOnlyProvider())
+        finally:
+            state.configure_runtime("paper", base=self.runtime_base)
+
+        self.assertTrue(result["runtime_state_ready"])
+        self.assertTrue(result["journal_ready"])
+        self.assertNotIn("runtime_state_unreadable",
+                          result["readiness_blockers"])
+        self.assertTrue(result["paused_flat_verified"])
+        self.assertEqual(target_state, (self.runtime_base / "paper" /
+                                        "state.json").read_bytes())
+        self.assertEqual(target_journal, (self.runtime_base / "paper" /
+                                          "journal.db").read_bytes())
+
+    def test_unstable_journal_snapshot_never_falls_back_to_live_audit_journal(self):
+        cancel_paper_trial(
+            self.config,
+            confirm_trial_id=self.config["research"]["paper_trial"]["trial_id"],
+            confirm_incumbent_identity=state.load_state()[
+                "paper_trial"]["incumbent_identity"],
+            reason="snapshot failure test",
+            provider_factory=lambda _config: _ReadOnlyProvider(),
+        )
+        before = _tree_snapshot(self.runtime_base)
+        with mock.patch.object(
+                runtime_inspection, "_copy_stable_journal_snapshot",
+                return_value="runtime_journal_snapshot_unstable"), \
+                mock.patch.object(runtime_inspection.sqlite3, "connect",
+                                  wraps=sqlite3.connect) as connect:
+            result = self._inspect(_ReadOnlyProvider())
+
+        self.assertIn("runtime_journal_snapshot_unstable",
+                      result["readiness_blockers"])
+        self.assertIn("runtime_state_unreadable",
+                      result["readiness_blockers"])
+        self.assertEqual(before, _tree_snapshot(self.runtime_base))
+        self.assertEqual(connect.call_args_list, [])
 
     def test_auth_failure_preserves_local_pause_and_redacts_credentials(self):
         provider = _ReadOnlyProvider(auth_error=True)

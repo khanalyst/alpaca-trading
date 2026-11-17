@@ -357,6 +357,17 @@ class PaperTrialOperatorTests(unittest.TestCase):
         self.assertTrue(any(uri.endswith("?mode=ro") for uri in uris))
         self.assertFalse(any(uri.endswith("?mode=rw") for uri in uris))
 
+    def test_explicit_cancellation_journal_cannot_fall_back_to_global_journal(self):
+        self._cancel()
+        current = state.load_state()["paper_trial"]
+        wrong_journal = self.root / "other-runtime" / "journal.db"
+        with self.assertRaisesRegex(
+                PaperTrialOperatorError, "existing paper journal"):
+            operator.verify_operator_cancellation(
+                current, current["operator_cancellation"],
+                journal_path=wrong_journal)
+        self.assertFalse(wrong_journal.exists())
+
     def test_missing_journal_is_not_created_during_cancelled_state_validation(self):
         self._cancel()
         journal_path = Path(state.JOURNAL_FILE)

@@ -98,10 +98,12 @@ def _require_existing_runtime() -> None:
             "paper cancellation requires the existing paper journal")
 
 
-def _journal_uri(*, mode: str) -> str:
+def _journal_uri(*, mode: str,
+                 journal_path: str | Path | None = None) -> str:
     if mode not in {"ro", "rw"}:
         raise PaperTrialOperatorError("paper cancellation journal mode is invalid")
-    path = Path(state.JOURNAL_FILE)
+    path = Path(journal_path) if journal_path is not None else Path(
+        state.JOURNAL_FILE)
     if path.is_symlink():
         raise PaperTrialOperatorError(
             "paper cancellation rejects a symlinked paper journal")
@@ -137,10 +139,12 @@ def _require_journal_ready() -> None:
             ", ".join(sorted(missing)))
 
 
-def _audit_rows(audit_id: str) -> list[tuple[str, str, str]]:
+def _audit_rows(audit_id: str, *,
+                journal_path: str | Path | None = None) -> list[tuple[str, str, str]]:
     try:
         with closing(sqlite3.connect(
-                _journal_uri(mode="ro"), uri=True, timeout=5)) as db:
+                _journal_uri(mode="ro", journal_path=journal_path),
+                uri=True, timeout=5)) as db:
             return db.execute(
                 "SELECT kind, run_id, payload FROM events "
                 "WHERE kind=? AND run_id=? LIMIT 2",
@@ -422,7 +426,8 @@ def _validate_audit(payload: Mapping[str, Any], expected: Mapping[str, Any],
 
 
 def verify_operator_cancellation(trial_state: Mapping[str, Any],
-                                 record: Mapping[str, Any]) -> dict[str, Any]:
+                                 record: Mapping[str, Any], *,
+                                 journal_path: str | Path | None = None) -> dict[str, Any]:
     """Verify one canceled trial against exactly one durable operator audit.
 
     This deliberately does not call :func:`validate_state`; it is the narrow
@@ -438,7 +443,7 @@ def verify_operator_cancellation(trial_state: Mapping[str, Any],
                                   for char in audit_id):
         raise PaperTrialOperatorError(
             "operator-cancelled paper trial audit id is invalid")
-    rows = _audit_rows(audit_id)
+    rows = _audit_rows(audit_id, journal_path=journal_path)
     if len(rows) != 1:
         raise PaperTrialOperatorError(
             "operator-cancelled paper trial audit is missing or duplicated")

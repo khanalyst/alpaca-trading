@@ -45,7 +45,8 @@ class StateCorruptionError(RuntimeError):
     """The durable runtime state exists but cannot be trusted."""
 
 
-def _validated(data: Mapping[str, Any]) -> dict:
+def _validated(data: Mapping[str, Any], *,
+               cancellation_journal_path: str | Path | None = None) -> dict:
     # Drop fields from older state formats instead of propagating them into
     # the mode-scoped control file.
     value = deepcopy(DEFAULT)
@@ -79,8 +80,13 @@ def _validated(data: Mapping[str, Any]) -> dict:
     if value["paper_trial"]:
         try:
             from .paper_trial import validate_state as validate_paper_trial_state
-            value["paper_trial"] = validate_paper_trial_state(
-                value["paper_trial"])
+            if cancellation_journal_path is None:
+                value["paper_trial"] = validate_paper_trial_state(
+                    value["paper_trial"])
+            else:
+                value["paper_trial"] = validate_paper_trial_state(
+                    value["paper_trial"],
+                    cancellation_journal_path=cancellation_journal_path)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
     return value

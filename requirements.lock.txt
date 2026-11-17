@@ -2,7 +2,7 @@ annotated-types==0.7.0
 anthropic==0.117.1
 anyio==4.14.2
 attrs==26.1.0
-alpaca-py==0.43.5
+alpaca-py==0.45.0
 certifi==2026.6.17
 cffi==2.0.0
 charset-normalizer==3.4.7

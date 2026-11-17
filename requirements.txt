@@ -1,4 +1,4 @@
-alpaca-py==0.43.5
+alpaca-py==0.45.0
 anthropic==0.117.1
 openai==2.46.0
 PyYAML==6.0.3

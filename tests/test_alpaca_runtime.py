@@ -568,10 +568,10 @@ class AlpacaRuntimeTests(unittest.TestCase):
         try:
             installed = metadata.version("alpaca-py")
         except metadata.PackageNotFoundError:
-            self.skipTest("locked alpaca-py 0.43.5 is unavailable locally")
+            self.skipTest("locked alpaca-py 0.45.0 is unavailable locally")
         from alpaca.trading.models import TradeAccount
 
-        self.assertEqual(installed, "0.43.5")
+        self.assertEqual(installed, "0.45.0")
         for field in ("buying_power", "pattern_day_trader", "daytrade_count",
                       "daytrading_buying_power"):
             self.assertIsNone(TradeAccount.model_fields[field].default)

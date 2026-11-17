@@ -315,7 +315,8 @@ def new_state(descriptor: Mapping[str, Any], config: Mapping[str, Any], *,
     }
 
 
-def validate_state(value: Mapping[str, Any] | None) -> dict[str, Any]:
+def validate_state(value: Mapping[str, Any] | None, *,
+                   cancellation_journal_path: str | Path | None = None) -> dict[str, Any]:
     if value in (None, {}):
         return {}
     if not isinstance(value, Mapping) or value.get("schema") != SCHEMA:
@@ -433,7 +434,12 @@ def validate_state(value: Mapping[str, Any] | None) -> dict[str, Any]:
                 "operator-cancelled paper trial observed time is invalid")
         try:
             from .paper_trial_operator import verify_operator_cancellation
-            verify_operator_cancellation(result, cancellation)
+            if cancellation_journal_path is None:
+                verify_operator_cancellation(result, cancellation)
+            else:
+                verify_operator_cancellation(
+                    result, cancellation,
+                    journal_path=cancellation_journal_path)
         except PaperTrialError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -938,9 +944,14 @@ def merge_outcomes(state_value: Mapping[str, Any],
 
 def public_status(state_value: Mapping[str, Any] | None, *,
                   pending_replacement: bool = False,
-                  error: str | None = None) -> dict[str, Any]:
+                  error: str | None = None,
+                  cancellation_journal_path: str | Path | None = None) -> dict[str, Any]:
     try:
-        current = validate_state(state_value)
+        if cancellation_journal_path is None:
+            current = validate_state(state_value)
+        else:
+            current = validate_state(
+                state_value, cancellation_journal_path=cancellation_journal_path)
     except PaperTrialError as exc:
         return {
             "schema": SCHEMA, "enabled": True, "state": "blocked",
