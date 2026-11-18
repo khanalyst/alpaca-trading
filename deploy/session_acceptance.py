@@ -10,6 +10,7 @@ it cannot qualify, select, or authorize a strategy.
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import date, datetime, timezone
 import fcntl
 import json
@@ -19,6 +20,7 @@ from pathlib import Path
 import sys
 import time
 import uuid
+import zlib
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -33,6 +35,8 @@ from research.diagnostic_cohort_contract import validate_cohort_layout
 
 SCHEMA = "session-acceptance.v1"
 SAMPLE_SCHEMA = "session-acceptance-sample.v1"
+SAMPLE_ENVELOPE_SCHEMA = "session-acceptance-sample-envelope.v1"
+SAMPLE_ENVELOPE_ENCODING = "zlib+base64"
 REPORT_SCHEMA = "session-acceptance-report.v1"
 RECORDER_INDEX_SCHEMA = "recorder-index.v1"
 RECORDER_STATUS_SCHEMA = "recorder-status.v1"
@@ -49,6 +53,11 @@ COMPLETED_BAR_INTERVAL_SECONDS = 60.0
 MAX_SAMPLES = 200_000
 MAX_METADATA_BYTES = 16 * 1024 * 1024
 MAX_SAMPLE_BYTES = 512 * 1024
+# A compressed journal may be smaller than the on-disk file bound while its
+# decoded samples are substantially larger.  Keep the aggregate decoded JSON
+# budget below the 2 GiB process ceiling while allowing the current largest
+# real session (about 430 MiB at a five-second cadence) to finalize.
+MAX_DECODED_SAMPLE_BYTES = 512 * 1024 * 1024
 MAX_SAMPLE_FILE_BYTES = 64 * 1024 * 1024
 MAX_REPORT_BYTES = 1024 * 1024
 MAX_ACCEPTANCE_FILES = 10_000
@@ -888,7 +897,12 @@ def summarize_session(samples: Sequence[Mapping[str, object]], *, session: Mappi
             (declared_close is not None and closed is not None and
              abs(declared_close - closed) > .001)):
         reasons.append("session_calendar_bounds_mismatch")
-    samples_list = [dict(item) for item in samples if isinstance(item, Mapping)]
+    # Keep the decoded sample mappings by reference.  The previous defensive
+    # ``dict(item)`` copy doubled the live memory footprint of a realistic
+    # full-session journal (diagnostic shadows are commonly tens of KB each)
+    # before sorting and summarizing it.  The summarizer only reads samples,
+    # so retaining the mappings is both lossless and materially bounded.
+    samples_list = [item for item in samples if isinstance(item, Mapping)]
     if len(samples_list) != len(samples):
         reasons.append("sample_record_invalid")
     if len(samples_list) > MAX_SAMPLES:
@@ -1189,6 +1203,107 @@ def _latest_arm_progress(samples: Sequence[Mapping[str, object]]) -> dict:
     }
 
 
+def _decode_sample_line(
+        line: bytes, path: Path, line_number: object) -> tuple[dict, int]:
+    """Decode one legacy JSONL or compressed sample line.
+
+    The journal remains line-oriented so old plain JSONL files are readable
+    without migration.  A compressed envelope is only an alternate transport;
+    the payload is the exact UTF-8 JSON bytes that the legacy writer would
+    have persisted.  Decoding is deliberately bounded before and during
+    decompression so a small compressed line cannot bypass the sample limit.
+    """
+    try:
+        value = json.loads(line.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}")
+    if value.get("schema") != SAMPLE_ENVELOPE_SCHEMA:
+        return value, len(line.rstrip(b"\r\n"))
+
+    encoding = value.get("encoding")
+    payload_value = value.get("payload")
+    if encoding != SAMPLE_ENVELOPE_ENCODING or not isinstance(payload_value, str):
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_invalid")
+    if len(payload_value) > MAX_SAMPLE_BYTES:
+        raise SessionAcceptanceError(
+            f"session_sample_size_bound_exceeded:{path}:{line_number}")
+    declared_compressed = value.get("compressed_bytes")
+    declared_raw = value.get("raw_bytes")
+    if (isinstance(declared_compressed, bool) or
+            not isinstance(declared_compressed, int) or declared_compressed < 0 or
+            declared_compressed > MAX_SAMPLE_BYTES or
+            isinstance(declared_raw, bool) or not isinstance(declared_raw, int) or
+            declared_raw < 0 or declared_raw > MAX_SAMPLE_BYTES):
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_size_invalid")
+    try:
+        compressed = base64.b64decode(payload_value.encode("ascii"), validate=True)
+    except (UnicodeError, ValueError) as exc:
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_encoding_invalid") from exc
+    if len(compressed) != declared_compressed:
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_size_mismatch")
+    try:
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(compressed, declared_raw + 1)
+    except zlib.error as exc:
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_corrupt") from exc
+    if len(raw) > declared_raw or decompressor.unconsumed_tail:
+        raise SessionAcceptanceError(
+            f"session_sample_size_bound_exceeded:{path}:{line_number}")
+    if not decompressor.eof or decompressor.unused_data:
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_corrupt")
+    if len(raw) != declared_raw:
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_size_mismatch")
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_payload_invalid") from exc
+    if not isinstance(decoded, dict):
+        raise SessionAcceptanceError(
+            f"session_samples_corrupt:{path}:{line_number}: envelope_payload_invalid")
+    return decoded, len(raw)
+
+
+def _encoded_sample_line(sample: Mapping[str, object]) -> tuple[str, int]:
+    """Return the smallest bounded line representation for ``sample``.
+
+    Plain JSON remains the fallback for incompressible or tiny samples.  This
+    makes the new format strictly non-expanding relative to the historical
+    line, including its newline, while retaining the historical per-line and
+    whole-file limits.
+    """
+    encoded = json.dumps(dict(sample), sort_keys=True, allow_nan=False)
+    raw = encoded.encode("utf-8")
+    plain_size = len(raw) + 1
+    if plain_size > MAX_SAMPLE_BYTES:
+        raise SessionAcceptanceError("session_sample_size_bound_exceeded")
+    compressed = zlib.compress(raw)
+    envelope = {
+        "compressed_bytes": len(compressed),
+        "encoding": SAMPLE_ENVELOPE_ENCODING,
+        "payload": base64.b64encode(compressed).decode("ascii"),
+        "raw_bytes": len(raw),
+        "schema": SAMPLE_ENVELOPE_SCHEMA,
+    }
+    envelope_encoded = json.dumps(
+        envelope, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    envelope_size = len(envelope_encoded.encode("utf-8")) + 1
+    if envelope_size < plain_size and envelope_size <= MAX_SAMPLE_BYTES:
+        return envelope_encoded, envelope_size
+    return encoded, plain_size
+
+
 def read_session_samples(output_dir: str | Path, session_date: str) -> list[dict]:
     path = session_file(output_dir, session_date)
     if not path.is_file():
@@ -1202,6 +1317,7 @@ def read_session_samples(output_dir: str | Path, session_date: str) -> list[dict
         raise SessionAcceptanceError(f"session_samples_read_failed:{path}: {exc}") from exc
     result: list[dict] = []
     total_bytes = 0
+    total_decoded_bytes = 0
     try:
         with path.open("rb") as handle:
             line_number = 0
@@ -1219,13 +1335,11 @@ def read_session_samples(output_dir: str | Path, session_date: str) -> list[dict
                 if len(line) > MAX_SAMPLE_BYTES:
                     raise SessionAcceptanceError(
                         f"session_sample_size_bound_exceeded:{path}:{line_number}")
-                try:
-                    value = json.loads(line.decode("utf-8"))
-                except (UnicodeError, json.JSONDecodeError) as exc:
+                value, decoded_bytes = _decode_sample_line(line, path, line_number)
+                if total_decoded_bytes + decoded_bytes > MAX_DECODED_SAMPLE_BYTES:
                     raise SessionAcceptanceError(
-                        f"session_samples_corrupt:{path}:{line_number}: {exc}") from exc
-                if not isinstance(value, dict):
-                    raise SessionAcceptanceError(f"session_samples_corrupt:{path}:{line_number}")
+                        "session_samples_decoded_size_bound_exceeded")
+                total_decoded_bytes += decoded_bytes
                 result.append(value)
                 if len(result) > MAX_SAMPLES:
                     raise SessionAcceptanceError("session_samples_bound_exceeded")
@@ -1253,11 +1367,8 @@ def _last_sample_id(path: Path) -> str | None:
     lines = [line for line in tail.splitlines() if line.strip()]
     if not lines:
         return None
-    try:
-        value = json.loads(lines[-1].decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise SessionAcceptanceError(f"session_samples_corrupt:{path}:tail") from exc
-    return _text(value.get("sample_id")) if isinstance(value, Mapping) else None
+    value, _decoded_bytes = _decode_sample_line(lines[-1], path, "tail")
+    return _text(value.get("sample_id"))
 
 
 class SessionSampleWriter:
@@ -1273,10 +1384,7 @@ class SessionSampleWriter:
 
     def write(self, sample: Mapping[str, object]) -> bool:
         try:
-            encoded = json.dumps(dict(sample), sort_keys=True, allow_nan=False)
-            encoded_bytes = len(encoded.encode("utf-8")) + 1
-            if encoded_bytes > MAX_SAMPLE_BYTES:
-                raise SessionAcceptanceError("session_sample_size_bound_exceeded")
+            encoded, encoded_bytes = _encoded_sample_line(sample)
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
             if (_text(sample.get("sample_id")) is not None and
                     _last_sample_id(self.path) == _text(sample.get("sample_id"))):

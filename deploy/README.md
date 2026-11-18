@@ -108,6 +108,17 @@ describes inspection eligibility, not a Docker/startup failure.
 
 ## Recorder and shadow maintenance
 
+On a full-tick `forward_only` recorder, set
+`ALPACA_RECORDER_LATEST_QUOTE_PREFETCH=1` to request the latest equity quotes
+before fetching completed bars. Shadow can then evaluate a bar with a quote
+already observed by the recorder. The historical quote request still fetches
+the ticks in the original window. Quotes keep their provider timestamp and
+receipt time, and the configured freshness checks still apply.
+
+Recorder health reports the bytes available above the configured disk reserve
+under `storage_headroom`. Its session estimate uses the largest of the last
+five closed partition files. A partial recording can understate future usage.
+
 The recorder supports bounded, one-shot maintenance operations:
 
 ```bash

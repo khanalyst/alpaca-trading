@@ -163,6 +163,7 @@ def _initialize_cycle_telemetry(target: dict) -> dict:
         "calendar_preparation_seconds": 0.0,
         "fetch_projection_seconds": 0.0,
         "bars_fetch_seconds": 0.0,
+        "latest_quotes_fetch_seconds": 0.0,
         "quotes_fetch_seconds": 0.0,
         "equity_projection_seconds": 0.0,
         "options_fetch_projection_seconds": 0.0,
@@ -188,6 +189,8 @@ def _initialize_cycle_telemetry(target: dict) -> dict:
         "bars_durable_at": None,
         "bars_durable_rows": 0,
         "bars_durable_unique_rows": 0,
+        "latest_quote_prefetch_status": "disabled",
+        "latest_quote_prefetch_error": None,
         "storage_free_bytes": None,
         "storage_reserve_bytes": None,
         "recent_key_incoming_count": 0,
@@ -2285,6 +2288,32 @@ def _capture_policy() -> str:
     return value
 
 
+def _latest_quote_prefetch(config: dict | None = None) -> bool:
+    """Resolve the additive live latest-quote observation option.
+
+    This does not select a different corpus mode: the historical bounded
+    every-quote request always remains enabled.  It only adds one
+    feed-scoped latest quote before the minute-bar request in a forward-only
+    cycle, which gives paper decision diagnostics an honest pre-bar receipt.
+    """
+    raw = os.getenv("ALPACA_RECORDER_LATEST_QUOTE_PREFETCH")
+    if raw is None and isinstance(config, dict):
+        recorder_cfg = config.get("recorder")
+        if isinstance(recorder_cfg, dict) and "latest_quote_prefetch" in recorder_cfg:
+            raw = recorder_cfg.get("latest_quote_prefetch")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off", ""}:
+        return False
+    raise RuntimeError(
+        "ALPACA_RECORDER_LATEST_QUOTE_PREFETCH must be true or false")
+
+
 def _max_windows_per_cycle() -> int:
     raw = os.getenv("ALPACA_RECORDER_MAX_WINDOWS_PER_CYCLE", "0")
     try:
@@ -2450,13 +2479,18 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
 
         existing_keys = recent_store.contains_many(lookup_keys)
         for row, parsed, key in validated_rows:
+            is_prefetched = bool(row.get("_prefetched_quote"))
+            if (advance_watermark and not is_prefetched and
+                    (watermark is None or parsed > watermark)):
+                watermark = parsed
             if key in unique_keys or key in existing_keys:
                 continue
             unique_keys.add(key)
             unique_rows.append(row)
             recent_entries.append((key, parsed.isoformat()))
-            if advance_watermark and (watermark is None or parsed > watermark):
-                watermark = parsed
+            # The watermark update above intentionally runs before dedup: a
+            # historical quote can be a duplicate of a prefetch observation,
+            # but it still proves progress through the full-tick window.
             if row.get("event_type") in {"bar", "bar_1m"}:
                 symbol = str(row.get("symbol") or "")
                 if index["latest_bars"].get(symbol, "") < parsed.isoformat():
@@ -2511,7 +2545,7 @@ def _ingest_chunk(output: Path, index: dict, recent_store: RecentKeyIndex,
             _save_index(
                 output, index, recent_store=recent_store,
                 recent_entries=recent_entries, telemetry=telemetry)
-    return index, watermark, latest_bars, pins, len(unique_rows)
+    return index, watermark, latest_bars, pins, len(unique_rows), unique_rows
 
 
 def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
@@ -2544,6 +2578,10 @@ def _record_once_locked(provider: AlpacaProvider, symbols: list[str], output: Pa
     if not symbols:
         raise ValueError("at least one US equity symbol is required")
     capture_policy = _capture_policy()
+    latest_quote_prefetch = _latest_quote_prefetch(config)
+    if latest_quote_prefetch and capture_policy != "forward_only":
+        raise RuntimeError(
+            "latest quote prefetch is supported only with forward_only capture")
     if now is not None:
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("recorder time must be timezone-aware")
@@ -2576,6 +2614,7 @@ def _record_once_locked(provider: AlpacaProvider, symbols: list[str], output: Pa
             config=config, include_options=include_options,
             option_limit=option_limit, option_hold=option_hold,
             calendar=calendar, capture_policy=capture_policy,
+            latest_quote_prefetch=latest_quote_prefetch,
             refresh_quote_end=(cycle_now is None and capture_policy == "forward_only"),
             telemetry=telemetry)
     finally:
@@ -2590,6 +2629,7 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                             option_hold: timedelta,
                             calendar: CalendarCache | None,
                             capture_policy: str,
+                            latest_quote_prefetch: bool = False,
                             refresh_quote_end: bool = False,
                             telemetry: dict | None = None) -> int:
     """Run one recorder cycle with an already validated disk-backed index."""
@@ -2751,29 +2791,34 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             nonlocal index, watermark, latest_bars, pins, total_unique
             if not projected:
                 return
-            bar_rows = _recorded_session_rows(
+            source_rows = _recorded_session_rows(
                 index, projected,
                 require_exact_calendar=require_exact_calendar)
-            if not bar_rows:
+            if not source_rows:
                 return
-            index, watermark, latest_bars, pins, unique = _ingest_chunk(
+            index, watermark, latest_bars, pins, unique, durable_rows = _ingest_chunk(
                 output, index, recent_store, watermark, latest_bars, pins,
-                bar_rows, symbols, window_end, now, option_hold, horizon,
+                source_rows, symbols, window_end, now, option_hold, horizon,
                 calendar, feed=resolved_feed, bar_gap_policy=bar_gap_policy,
                 bar_gap_maximum=bar_gap_maximum,
                 forward_observation_max_lag=forward_observation_max_lag,
                 telemetry=telemetry, advance_watermark=False)
             published_bar_keys.update(
-                str(row.get("event_key") or "") for row in bar_rows)
+                str(row.get("event_key") or "") for row in source_rows
+                if row.get("event_type") in {"bar", "bar_1m"})
             total_unique += unique
             _increment_cycle_telemetry(telemetry, "unique_rows", unique)
             if telemetry is not None:
                 telemetry["bars_durable_at"] = datetime.now(
                     timezone.utc).isoformat()
                 telemetry["bars_durable_rows"] = int(
-                    telemetry.get("bars_durable_rows", 0) or 0) + len(bar_rows)
+                    telemetry.get("bars_durable_rows", 0) or 0) + sum(
+                        row.get("event_type") in {"bar", "bar_1m"}
+                        for row in source_rows)
                 telemetry["bars_durable_unique_rows"] = int(
-                    telemetry.get("bars_durable_unique_rows", 0) or 0) + unique
+                    telemetry.get("bars_durable_unique_rows", 0) or 0) + sum(
+                        row.get("event_type") in {"bar", "bar_1m"}
+                        for row in durable_rows)
 
         with _timed_cycle_phase(telemetry, "fetch_projection_seconds"):
             fetched_rows = list(_rows(
@@ -2787,10 +2832,10 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                 include_options=bool(include_options and window_end >= now),
                 option_limit=option_limit,
                 start=cursor, option_pins=frozenset(pins), observed_at=now,
+                prefetch_latest_quote=latest_quote_prefetch,
                 refresh_quote_end=refresh_current_quotes,
                 quote_end_limit=quote_end_limit, telemetry=telemetry,
                 on_bars=publish_bars))
-        total_rows += len(fetched_rows)
         _increment_cycle_telemetry(
             telemetry, "projected_rows", len(fetched_rows))
         with _timed_cycle_phase(telemetry, "validation_ingest_seconds"):
@@ -2798,12 +2843,18 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                 index, fetched_rows,
                 require_exact_calendar=require_exact_calendar)
         _increment_cycle_telemetry(telemetry, "session_rows", len(rows))
+        # Only rows surviving authoritative session bounds count toward a
+        # successful cycle. A stale latest-quote response must not make an
+        # otherwise empty/off-window request look healthy.
+        total_rows += len(rows)
         # The callback above already committed the complete bar response.  The
         # final ingest therefore contains only quotes/options, preserving the
         # existing source-specific atomic boundary without writing bars twice.
         rows = [row for row in rows
-                if str(row.get("event_key") or "") not in published_bar_keys]
-        index, watermark, latest_bars, pins, unique = _ingest_chunk(
+                if not row.get("_prefetched_quote") and
+                not (row.get("event_type") in {"bar", "bar_1m"} and
+                        str(row.get("event_key") or "") in published_bar_keys)]
+        index, watermark, latest_bars, pins, unique, _durable_rows = _ingest_chunk(
             output, index, recent_store, watermark, latest_bars, pins, rows, symbols,
             window_end, now, option_hold, horizon, calendar,
             feed=resolved_feed, bar_gap_policy=bar_gap_policy,

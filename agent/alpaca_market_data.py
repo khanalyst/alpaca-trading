@@ -254,6 +254,76 @@ class AlpacaMarketDataMixin:
         except Exception as exc:  # noqa: BLE001
             raise AlpacaError(f"stock bars request failed: {exc}") from exc
 
+    def latest_quotes(self, symbols, feed: str | None = None) -> dict[str, list[Quote]]:
+        """Return one feed-scoped latest quote per requested equity symbol.
+
+        The recorder's optional forward-observation lane deliberately uses
+        this endpoint instead of asking the historical quote endpoint for a
+        tiny time range.
+        A latest quote has no caller-supplied end boundary, so its provider
+        timestamp and the local response receipt are kept separate by the
+        recorder.  Feed metadata is checked at both the response and row
+        boundaries; an SDK/client that cannot carry the requested feed is a
+        hard capability failure rather than an implicit downgrade.
+        """
+        symbols = [validate_equity_symbol(symbol) for symbol in symbols]
+        requested_symbols = set(symbols)
+        requested_feed = _canonical_feed(feed or self.data_feed)
+        try:
+            from alpaca.data.requests import StockLatestQuoteRequest
+            request_kwargs = {
+                "symbol_or_symbols": symbols,
+                "feed": _sdk_feed(requested_feed),
+            }
+            request = StockLatestQuoteRequest(**request_kwargs)
+        except ImportError:
+            request = {"symbols": symbols, "feed": requested_feed}
+        except AlpacaError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AlpacaError(
+                f"stock latest quote request construction failed: {exc}") from exc
+        getter = getattr(self.session.stock_data, "get_stock_latest_quote", None)
+        if getter is None:
+            raise AlpacaError(
+                "alpaca-py latest quote request support is unavailable")
+        try:
+            response = getter(request)
+            data = getattr(response, "data", response)
+            response_feed = _row_feed(response, requested_feed)
+            _assert_feed_match(response_feed, requested_feed,
+                               kind="stock latest quotes")
+            result: dict[str, list[Quote]] = {}
+            if isinstance(data, Mapping):
+                items = data.items()
+            else:
+                items = ((_value(row, "symbol"), row)
+                         for row in (data or []))
+            for key, row in items:
+                key_symbol = str(key or "").upper()
+                if key_symbol not in requested_symbols:
+                    continue
+                row_symbol = str(_value(row, "symbol", key_symbol) or
+                                 key_symbol).upper()
+                if row_symbol != key_symbol:
+                    raise AlpacaError(
+                        f"stock latest quote response symbol {row_symbol!r} "
+                        f"does not match mapping key {key_symbol!r}")
+                row_feed = _row_feed(row, response_feed)
+                _assert_feed_match(row_feed, requested_feed,
+                                   kind="stock latest quote")
+                quote = normalize_quote(row, row_symbol, row_feed)
+                if quote.symbol != key_symbol:
+                    raise AlpacaError(
+                        f"stock latest quote response symbol {quote.symbol!r} "
+                        f"does not match mapping key {key_symbol!r}")
+                result.setdefault(key_symbol, []).append(quote)
+            return result
+        except AlpacaError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AlpacaError(f"stock latest quote request failed: {exc}") from exc
+
     def quotes(self, symbols, start=None, end=None, feed: str | None = None) -> dict[str, list[Quote]]:
         symbols = [validate_equity_symbol(symbol) for symbol in symbols]
         requested_symbols = set(symbols)

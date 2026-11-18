@@ -678,14 +678,16 @@ class MarketEntryRiskMixin:
             return None
         decision["daily_pnl"] = self._number(runtime.get("risk_day", {}).get("daily_pnl")) \
             if isinstance(runtime.get("risk_day"), Mapping) else None
+        rejection_evidence = {}
         plan, why = self.risk.vet_open(
             decision, equity, mapped_positions, {symbol: row}, {}, gross,
-            active_trades=active, now=now.timestamp(), cost_cfg=edge_cfg)
+            active_trades=active, now=now.timestamp(), cost_cfg=edge_cfg,
+            rejection_evidence=rejection_evidence)
         if plan is None:
             self._event(
                 "execution_reject" if why == "broker_tick_geometry_invalid"
                 else "risk_reject",
-                {"symbol": symbol, "reason": why})
+                {"symbol": symbol, "reason": why, **rejection_evidence})
             return None
         if decision["execution_profile"] == "shares":
             try:

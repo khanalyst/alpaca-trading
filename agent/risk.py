@@ -612,7 +612,8 @@ class RiskEngine:
                  entry_failures: Mapping | None = None,
                  active_trades: Mapping | None = None,
                  now: float | None = None,
-                 cost_cfg: Mapping | None = None):
+                 cost_cfg: Mapping | None = None,
+                 rejection_evidence: dict | None = None):
         try:
             now_value = _evaluation_timestamp(now)
         except ValueError as exc:
@@ -738,6 +739,10 @@ class RiskEngine:
                 # instruction to rewrite the authored stop or fixed-R target.
                 # A binding stop must be refused before risk budgeting/sizing.
                 if binding:
+                    if rejection_evidence is not None:
+                        rejection_evidence.update(geometry_telemetry)
+                        rejection_evidence["entry_price"] = entry
+                        rejection_evidence["stage"] = "risk_geometry"
                     return None, "stressed_cost_risk_limit"
             if (not math.isfinite(float(stop)) or stop <= 0 or
                     not math.isfinite(float(target)) or target <= 0 or

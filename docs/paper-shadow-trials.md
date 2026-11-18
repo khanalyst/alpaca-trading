@@ -132,6 +132,16 @@ path cannot delete outcomes or bypass the incumbent identity check. Replacing a
 terminal trial likewise requires an audited terminal snapshot and another
 confirmed flat book.
 
+Paper and shadow calculate the same code identity from the agent and research
+Python sources, recorder, recorder market-data adapter, dataset reader, and
+dependency lock. After a rollout, compare the paper descriptor and shadow
+health for both code and cohort identity. A changed identity requires a new
+trial and report directory through the normal audited transition.
+
+Large samples in the session journal use lossless per-line compression when
+that saves space. The session acceptance reader supports both encodings in
+the same journal and checks size limits before finalization.
+
 ## Persistent shadow books
 
 `deploy/shadow.py` and `research.live_shadow` maintain independent virtual

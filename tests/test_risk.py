@@ -501,12 +501,18 @@ class RiskProfileTests(unittest.TestCase):
                              "stressed_cost_scenario_bps": 25,
                              "max_stressed_cost_to_risk_ratio": limit},
                    "execution": {}, "costs": {}}
+            evidence = {}
             plan, why = RiskEngine(cfg).vet_open(
-                decision, 10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
+                decision, 10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0,
+                rejection_evidence=evidence)
             if binding:
                 self.assertIsNone(plan)
                 self.assertEqual(why, "stressed_cost_risk_limit")
+                self.assertEqual(evidence["stage"], "risk_geometry")
+                self.assertAlmostEqual(evidence["authored_stop_distance_bps"], 100)
+                self.assertAlmostEqual(evidence["effective_stop_floor_bps"], 25 / limit)
                 continue
+            self.assertEqual(evidence, {})
             self.assertIsNotNone(plan)
             self.assertIsNone(why)
             self.assertFalse(plan["stress_floor_binding"])

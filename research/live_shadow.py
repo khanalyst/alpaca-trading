@@ -68,6 +68,7 @@ from research.diagnostic_accounts import (
     new_account_state, prepare_diagnostic_quote_index,
     validate_account_state, validate_position_state,
 )
+from research.replay_identity import runtime_code_identity
 from research.quote_costs import cost_resolver_setup, reprice_ibr_result
 from research.stressed_cost_calibration import (
     load_stress_calibration_artifact, verify_stress_calibration_artifact,
@@ -142,9 +143,6 @@ DIAGNOSTIC_REPLAY_EPOCH_SCHEMA = "shadow-replay-epoch.v1"
 CANDIDATE_REPLAY_EPOCH_SCHEMA = "shadow-candidate-replay-epoch.v1"
 MAX_DIAGNOSTIC_ROLLUP_SESSIONS = 64
 DIAGNOSTIC_REASON_ROLLUP_PREFIX = "reason:"
-_REPLAY_CODE_BUNDLE_ROOTS = ("agent", "research")
-_REPLAY_CODE_BUNDLE_EXTRAS = ("deploy/recorder.py", "deploy/recorder_market.py",
-                            "deploy/research_dataset.py", "requirements.lock.txt")
 _REPLAY_CODE_HASH_CACHE: str | None = None
 
 
@@ -233,24 +231,7 @@ def _replay_code_hash() -> str:
     global _REPLAY_CODE_HASH_CACHE
     if _REPLAY_CODE_HASH_CACHE is not None:
         return _REPLAY_CODE_HASH_CACHE
-    root = Path(__file__).resolve().parents[1]
-    files = {
-        path.relative_to(root).as_posix()
-        for name in _REPLAY_CODE_BUNDLE_ROOTS
-        for path in (root / name).rglob("*.py")
-        if path.is_file()
-    }
-    files.update(name for name in _REPLAY_CODE_BUNDLE_EXTRAS
-                if (root / name).is_file())
-    digest = hashlib.sha256()
-    for name in sorted(files):
-        digest.update(name.encode("utf-8") + b"\0")
-        path = root / name
-        try:
-            digest.update(path.read_bytes())
-        except OSError:
-            digest.update(f"missing:{name}".encode("utf-8"))
-    _REPLAY_CODE_HASH_CACHE = digest.hexdigest()
+    _REPLAY_CODE_HASH_CACHE = runtime_code_identity()
     return _REPLAY_CODE_HASH_CACHE
 
 

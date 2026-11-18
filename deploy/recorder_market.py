@@ -41,6 +41,13 @@ def _value(value):
     return "" if value is None else str(value)
 
 
+def _field(value, name: str, default=None):
+    """Read a provider model or mapping without changing its shape."""
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
 def _timeframe():
     try:
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -102,6 +109,22 @@ def _call_quotes(method, symbols, *, start, end, feed):
         except TypeError:
             continue
     raise TypeError("provider quotes method does not accept an explicit data feed")
+
+
+def _call_latest_quotes(method, symbols, *, feed):
+    """Request feed-scoped latest quotes without a historical fallback.
+
+    The additive live-observation lane is intentionally bound to the
+    provider's latest-quote endpoint. Falling back to
+    ``quotes(start=..., end=...)`` would hide a client that dropped its feed
+    entitlement and would blur the observation receipt boundary.
+    """
+    try:
+        return method(symbols, feed=feed)
+    except TypeError as exc:
+        raise TypeError(
+            "provider latest_quotes method must accept an explicit data feed"
+        ) from exc
 
 
 def _call_options(method, symbol, *, now, underlying_price, feed,
@@ -400,6 +423,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
           observed_at: datetime | None = None,
           refresh_quote_end: bool = False,
           quote_end_limit: datetime | None = None,
+          prefetch_latest_quote: bool = False,
           telemetry: dict | None = None,
           on_bars=None):
     start = start or now - timedelta(minutes=3)
@@ -415,6 +439,95 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
         feed if feed is not None else
         getattr(provider, "data_feed", None) or _feed())
     symbols = [validate_equity_symbol(symbol) for symbol in symbols]
+    base_observation = observed_at or now
+    latest_rows: list[dict] = []
+    if prefetch_latest_quote:
+        # This additive observation is deliberately fetched before minute bars
+        # so its receipt is an honest upper bound for a paper decision.  The
+        # historical every-quote request below remains unchanged.
+        try:
+            with _market_phase(telemetry, "latest_quotes_fetch_seconds"):
+                latest_quotes = _call_latest_quotes(
+                    getattr(provider, "latest_quotes", None), symbols, feed=feed)
+            latest_quotes_received = datetime.now(timezone.utc)
+            latest_observation = max(base_observation, latest_quotes_received)
+            if telemetry is not None:
+                telemetry["latest_quotes_received_at"] = latest_quotes_received.isoformat()
+                telemetry["latest_quotes_latency_seconds"] = round(
+                    max(0.0, (latest_quotes_received - base_observation).total_seconds()), 6)
+                telemetry["latest_quote_prefetch_status"] = "ok"
+            for raw_symbol, values in (latest_quotes or {}).items():
+                symbol = validate_equity_symbol(raw_symbol)
+                if symbol not in symbols:
+                    continue
+                # The normalized provider returns a list for parity with quotes;
+                # accepting a single object keeps the boundary friendly to small
+                # paper fakes while still validating every returned row.
+                if isinstance(values, (list, tuple)):
+                    quote_values = values
+                elif values is None:
+                    quote_values = ()
+                else:
+                    quote_values = (values,)
+                for quote in quote_values:
+                    _assert_row_symbol(quote, symbol, kind="latest quote")
+                    quote_feed = _row_feed(quote, feed)
+                    _assert_row_feed(quote_feed, feed, kind="latest quote")
+                    timestamp = _iso(_field(quote, "timestamp"))
+                    if not _point_in_time(timestamp):
+                        raise RuntimeError(
+                            f"latest quote {symbol!r} has no point-in-time timestamp")
+                    quote_timestamp = _timestamp(timestamp)
+                    if quote_timestamp > latest_quotes_received + timedelta(seconds=5):
+                        raise RuntimeError(
+                            f"latest quote {symbol!r} timestamp is after receipt")
+                    bid_raw = _field(quote, "bid")
+                    ask_raw = _field(quote, "ask")
+                    last_raw = _field(quote, "last")
+                    bid = _number(bid_raw)
+                    ask = _number(ask_raw)
+                    last = _number(last_raw)
+                    for raw, parsed, field in (
+                            (bid_raw, bid, "bid"), (ask_raw, ask, "ask"),
+                            (last_raw, last, "last")):
+                        if raw not in (None, "") and parsed is None:
+                            raise RuntimeError(
+                                f"latest quote {symbol!r} has invalid {field} price")
+                    if (bid is None or ask is None or bid <= 0 or ask < bid or
+                            (last is not None and last <= 0)):
+                        # Do not let a malformed latest row claim the standard
+                        # quote event key and suppress a valid historical tick.
+                        continue
+                    # A latest quote is useful only inside this bounded
+                    # decision window. Session-calendar filtering remains the
+                    # recorder's authoritative after-close check.
+                    if quote_timestamp < start or (
+                            quote_end_limit is not None and
+                            quote_timestamp >= quote_end_limit):
+                        continue
+                    latest_rows.append({
+                        "event_key": _event_key("quote", symbol, timestamp),
+                        "observed_at": latest_observation.isoformat(),
+                        "provider": "alpaca", "feed": quote_feed,
+                        "event_type": "quote", "symbol": symbol, "contract": "",
+                        "timestamp": timestamp, "as_of": timestamp,
+                        "open": "", "high": "", "low": "", "close": "",
+                        "volume": "", "bid": _value(bid_raw),
+                        "ask": _value(ask_raw),
+                        "last": _value(last_raw),
+                        "bid_size": _value(_field(quote, "bid_size")),
+                        "ask_size": _value(_field(quote, "ask_size")),
+                        # Transient marker: never written to CSV; it prevents
+                        # this optional observation from moving the historical
+                        # watermark when it is seen again after publication.
+                        "_prefetched_quote": True,
+                    })
+        except Exception as exc:  # optional sample; historical capture remains authoritative
+            latest_rows = []
+            if telemetry is not None:
+                telemetry["latest_quote_prefetch_status"] = "failed"
+                telemetry["latest_quote_prefetch_error"] = str(exc)[:240]
+
     # A quote watermark can fall partway through a minute. Round only the bar
     # request back to its start so an updated previous-minute bar is observed
     # by the overlap; quote acquisition keeps its original bounded window.
@@ -437,7 +550,6 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     # a paginated quote response; assigning every row the later quote receipt
     # makes the bar's first observation appear artificially late. The caller's
     # explicit boundary still wins when it is later than the receipt.
-    base_observation = observed_at or now
     bars_observation = max(base_observation, bars_received)
     observed_bar = bars_observation.isoformat()
     projection_started = time.perf_counter()
@@ -477,7 +589,13 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     # potentially paginated quote request starts.  Existing callers still see
     # the same rows below, so this is an additive latency seam.
     if callable(on_bars):
-        on_bars(list(bar_rows))
+        # Publish the optional fresh quote and its causal bar boundary
+        # together. The recorder ingests this batch with watermark advancement
+        # disabled, then processes the unchanged historical quote window.
+        on_bars([*latest_rows, *bar_rows])
+    # Preserve source order for the additive latest quote while retaining the
+    # established bar-then-historical-quotes request sequence.
+    yield from latest_rows
     yield from bar_rows
     with _market_phase(telemetry, "quotes_fetch_seconds"):
         quotes = _call_quotes(provider.quotes, symbols, start=start, end=quote_end,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import base64
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -17,7 +18,9 @@ from deploy.session_acceptance import (
     DIAGNOSTIC_COVERAGE_SCHEMA,
     REPORT_SCHEMA,
     SAMPLE_SCHEMA,
+    SAMPLE_ENVELOPE_SCHEMA,
     SessionAcceptanceError,
+    SessionSampleWriter,
     capture_sample,
     finalize_session,
     read_session_samples,
@@ -358,6 +361,109 @@ class SessionAcceptanceTests(unittest.TestCase):
             with self.assertRaises(SessionAcceptanceError) as context:
                 read_session_samples(directory, DATE)
             self.assertIn("session_samples_corrupt", str(context.exception))
+
+    def test_compressed_sample_envelope_round_trips_without_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sample = _sample(OPEN)
+            sample["sample_id"] = "poll:compressed"
+            sample["retained_fields"] = {
+                "nested": ["lossless", {"value": 7}],
+                "unicode": "μ-market",
+            }
+            plain = json.dumps(sample, sort_keys=True, allow_nan=False).encode()
+            with SessionSampleWriter(directory, DATE) as writer:
+                self.assertTrue(writer.write(sample))
+            path = session_file(directory, DATE)
+            line = path.read_bytes().splitlines()[0]
+            envelope = json.loads(line)
+
+            self.assertEqual(envelope["schema"], SAMPLE_ENVELOPE_SCHEMA)
+            self.assertLess(len(line) + 1, len(plain) + 1)
+            self.assertEqual(read_session_samples(directory, DATE), [sample])
+
+    def test_legacy_plain_sample_lines_remain_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sample = _sample(OPEN)
+            session_file(directory, DATE).parent.mkdir(parents=True, exist_ok=True)
+            session_file(directory, DATE).write_text(
+                json.dumps(sample, sort_keys=True, allow_nan=False) + "\n",
+                encoding="utf-8")
+
+            self.assertEqual(read_session_samples(directory, DATE), [sample])
+
+    def test_compressed_tail_duplicate_is_suppressed_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sample = _sample(OPEN)
+            sample["sample_id"] = "poll:tail"
+            with SessionSampleWriter(directory, DATE) as writer:
+                self.assertTrue(writer.write(sample))
+            with SessionSampleWriter(directory, DATE) as writer:
+                self.assertFalse(writer.write(dict(sample)))
+
+            self.assertEqual(read_session_samples(directory, DATE), [sample])
+
+    def test_small_sample_keeps_legacy_plain_line_when_envelope_would_expand(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sample = {"sample_id": "tiny", "schema": SAMPLE_SCHEMA}
+            with SessionSampleWriter(directory, DATE) as writer:
+                self.assertTrue(writer.write(sample))
+
+            line = session_file(directory, DATE).read_bytes().splitlines()[0]
+            self.assertNotEqual(json.loads(line).get("schema"), SAMPLE_ENVELOPE_SCHEMA)
+            self.assertEqual(read_session_samples(directory, DATE), [sample])
+
+    def test_compressed_envelope_length_metadata_is_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sample = _sample(OPEN)
+            sample["sample_id"] = "poll:length"
+            with SessionSampleWriter(directory, DATE) as writer:
+                self.assertTrue(writer.write(sample))
+            path = session_file(directory, DATE)
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            envelope["raw_bytes"] += 1
+            path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+
+            with self.assertRaises(SessionAcceptanceError) as context:
+                read_session_samples(directory, DATE)
+            self.assertIn("envelope_size_mismatch", str(context.exception))
+
+    def test_compressed_envelope_corruption_is_visible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sample = _sample(OPEN)
+            sample["sample_id"] = "poll:corrupt"
+            with SessionSampleWriter(directory, DATE) as writer:
+                self.assertTrue(writer.write(sample))
+            path = session_file(directory, DATE)
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            envelope["payload"] = base64.b64encode(b"not-zlib").decode("ascii")
+            envelope["compressed_bytes"] = len(b"not-zlib")
+            path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+
+            with self.assertRaises(SessionAcceptanceError) as context:
+                read_session_samples(directory, DATE)
+            self.assertIn("session_samples_corrupt", str(context.exception))
+
+    def test_cumulative_decoded_sample_budget_rejects_crossline_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = _sample(OPEN)
+            first["sample_id"] = "poll:budget-1"
+            second = _sample(OPEN + 5.0)
+            second["sample_id"] = "poll:budget-2"
+            with SessionSampleWriter(directory, DATE) as writer:
+                self.assertTrue(writer.write(first))
+                self.assertTrue(writer.write(second))
+            envelopes = [
+                json.loads(line)
+                for line in session_file(directory, DATE).read_text().splitlines()
+            ]
+            self.assertTrue(all(row["schema"] == SAMPLE_ENVELOPE_SCHEMA
+                                for row in envelopes))
+            budget = sum(row["raw_bytes"] for row in envelopes) - 1
+            with patch("deploy.session_acceptance.MAX_DECODED_SAMPLE_BYTES", budget):
+                with self.assertRaises(SessionAcceptanceError) as context:
+                    read_session_samples(directory, DATE)
+            self.assertIn("session_samples_decoded_size_bound_exceeded",
+                          str(context.exception))
 
     def test_oversized_sample_journal_finalizes_as_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

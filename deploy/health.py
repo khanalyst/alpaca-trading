@@ -1035,7 +1035,8 @@ def _recorder_cycle_telemetry(attempt: dict) -> dict:
     for key in (
             "corpus_migration_seconds", "index_preparation_seconds",
             "calendar_preparation_seconds", "fetch_projection_seconds",
-            "bars_fetch_seconds", "quotes_fetch_seconds", "equity_projection_seconds",
+            "bars_fetch_seconds", "latest_quotes_fetch_seconds", "latest_quote_rows",
+            "quotes_fetch_seconds", "equity_projection_seconds",
             "options_fetch_projection_seconds", "validation_ingest_seconds",
             "revision_validation_save_seconds", "durable_save_seconds",
             "csv_partition_flush_fsync_seconds", "recent_key_transaction_seconds",
@@ -1051,8 +1052,10 @@ def _recorder_cycle_telemetry(attempt: dict) -> dict:
         value = _status_nonnegative_float(raw.get(key))
         if value is not None:
             result[key] = value
+    if raw.get("latest_quote_prefetch_status") in ("ok", "failed"):
+        result["latest_quote_prefetch_status"] = raw["latest_quote_prefetch_status"]
     for key in ("bar_request_end_at", "quote_request_end_at", "bars_received_at",
-                "quotes_received_at", "bars_durable_at", "last_bar_market_ts",
+                "quotes_received_at", "latest_quotes_received_at", "bars_durable_at", "last_bar_market_ts",
                 "last_quote_market_ts"):
         value = raw.get(key)
         if isinstance(value, str) and len(value) <= 40:
@@ -1063,6 +1066,32 @@ def _recorder_cycle_telemetry(attempt: dict) -> dict:
             if parsed.tzinfo is not None and parsed.utcoffset() is not None:
                 result[key] = parsed.isoformat()
     return result
+
+
+def _recorder_storage_headroom(index: dict, telemetry: dict, now: float) -> dict:
+    """Estimate headroom from the five most recent closed partition sizes."""
+    partitions = index.get("partitions")
+    calendar = index.get("session_calendar")
+    free = _status_nonnegative_float(telemetry.get("storage_free_bytes"))
+    reserve = _status_nonnegative_float(telemetry.get("storage_reserve_bytes"))
+    if free is None or reserve is None:
+        return {}
+    available = max(0, free - reserve)
+    closed = []
+    if isinstance(partitions, dict) and isinstance(calendar, dict):
+        for date, record in sorted(calendar.items(), reverse=True):
+            if not isinstance(record, dict) or record.get("source") != "alpaca_calendar":
+                continue
+            end = _timestamp_epoch(record.get("close"))
+            size = _status_nonnegative_float(partitions.get(f"market-{date}.csv"))
+            if size and end is not None and end <= now:
+                closed.append(size)
+                if len(closed) == 5:
+                    break
+    peak = max(closed, default=0)
+    return {"bytes_above_reserve": available, "recent_partitions": len(closed),
+            "largest_recent_partition_bytes": peak or None,
+            "estimated_sessions_at_recent_peak": available / peak if peak else None}
 
 
 def recorder(path: Path, max_age: float, *, now: float | None = None,
@@ -1192,6 +1221,7 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
         },
         "cadence": cadence,
     }
+    cycle_telemetry = _recorder_cycle_telemetry(attempt)
     result = {
         "ok": (service_liveness_ok and not blocking_attempt_failure and
                not coverage_failures),
@@ -1249,7 +1279,8 @@ def recorder(path: Path, max_age: float, *, now: float | None = None,
                                    current - watermark_epoch),
         "partition_provenance": dict(sorted(partition_sources.items())[-64:]),
         "cadence": cadence,
-        "cycle_telemetry": _recorder_cycle_telemetry(attempt),
+        "cycle_telemetry": cycle_telemetry,
+        "storage_headroom": _recorder_storage_headroom(index, cycle_telemetry, current),
         **market_readiness,
     }
     if coverage_reason:

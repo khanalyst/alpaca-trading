@@ -20,6 +20,7 @@ import stat
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from research.replay_identity import runtime_code_identity
 from research.diagnostic_shadow import (
     _logical_arms,
     build_diagnostic_cohort,
@@ -155,28 +156,6 @@ def _paper_trial_include_ibr() -> bool:
         raise PaperTrialError(
             "ALPACA_SHADOW_INCLUDE_IBR must be exactly 0 or 1")
     return value == "1"
-
-
-def runtime_code_identity(root: str | Path | None = None) -> str:
-    """Match the bounded code identity used by diagnostic live shadow."""
-    repo = Path(root) if root is not None else Path(__file__).resolve().parents[1]
-    files = {
-        path.relative_to(repo).as_posix()
-        for name in ("agent", "research")
-        for path in (repo / name).rglob("*.py")
-        if path.is_file()
-    }
-    for name in ("deploy/recorder.py", "requirements.lock.txt"):
-        if (repo / name).is_file():
-            files.add(name)
-    digest = hashlib.sha256()
-    for name in sorted(files):
-        digest.update(name.encode("utf-8") + b"\0")
-        try:
-            digest.update((repo / name).read_bytes())
-        except OSError:
-            digest.update(f"missing:{name}".encode("utf-8"))
-    return digest.hexdigest()
 
 
 def _frozen_policy(config: Mapping[str, Any], arm: Mapping[str, Any],

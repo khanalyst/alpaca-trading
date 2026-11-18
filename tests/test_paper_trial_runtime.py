@@ -28,6 +28,28 @@ SECOND_VARIANT = _logical_arms()[1]["variant_id"]
 START = "2026-08-01"
 
 
+class PaperShadowIdentityTest(unittest.TestCase):
+    def test_incumbent_and_forward_shadow_use_the_same_identity(self):
+        from agent.paper_trial import runtime_code_identity
+        from research.live_shadow import _replay_code_hash
+
+        self.assertEqual(runtime_code_identity(), _replay_code_hash())
+
+    def test_recorder_market_and_dataset_changes_start_new_evidence_epochs(self):
+        from agent.paper_trial import runtime_code_identity
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "deploy").mkdir()
+            for name in ("deploy/recorder.py", "deploy/recorder_market.py",
+                         "deploy/research_dataset.py", "requirements.lock.txt"):
+                (root / name).write_text(name)
+            for name in ("deploy/recorder_market.py", "deploy/research_dataset.py"):
+                previous = runtime_code_identity(root)
+                (root / name).write_text("new implementation")
+                self.assertNotEqual(previous, runtime_code_identity(root))
+
+
 class PaperProvider:
     paper = True
     data_feed = "iex"

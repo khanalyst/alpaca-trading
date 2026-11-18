@@ -3742,6 +3742,19 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(result["index_write_ts"], 900)
             self.assertEqual(result["latest_write_ts"], 900)
 
+    def test_recorder_headroom_uses_only_closed_calendar_partitions(self):
+        index = {
+            "partitions": {"market-2026-11-17.csv": 4_000_000_000, "market-2026-11-18.csv": 7_000_000_000},
+            "session_calendar": {
+                day: {"source": "alpaca_calendar", "close": day + "T21:00:00+00:00"}
+                for day in ("2026-11-17", "2026-11-18")},
+        }
+        report = health._recorder_storage_headroom(
+            index, {"storage_free_bytes": 11_000_000_000, "storage_reserve_bytes": 5_000_000_000},
+            datetime.fromisoformat("2026-11-18T10:00:00+00:00").timestamp())
+        self.assertEqual(report["recent_partitions"], 1)
+        self.assertEqual(report["estimated_sessions_at_recent_peak"], 1.5)
+
     def test_recorder_health_exposes_readiness_counts_watermark_and_cadence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
