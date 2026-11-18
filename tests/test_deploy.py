@@ -3171,18 +3171,29 @@ class DeployTests(unittest.TestCase):
 
     def test_recorder_service_retries_errors_without_exiting(self):
         with tempfile.TemporaryDirectory() as directory:
+            clock = [0.0]
+
+            def monotonic():
+                return clock[0]
+
+            def sleep(seconds):
+                clock[0] += float(seconds)
+
             with patch.object(recorder, "AlpacaProvider", return_value=object()), \
                     patch.object(recorder, "record_once",
                                  side_effect=[RuntimeError("continuity gap"),
                                               KeyboardInterrupt()]) as record, \
-                    patch.object(recorder.time, "sleep") as sleep:
+                    patch.object(recorder.time, "monotonic", side_effect=monotonic), \
+                    patch.object(recorder.time, "sleep", side_effect=sleep) as wait:
                 with self.assertRaises(KeyboardInterrupt):
                     recorder.main([
                         "--config", "config.yaml", "--out", directory,
                         "--interval", "2",
                     ])
             self.assertEqual(record.call_count, 2)
-            sleep.assert_called_once_with(2.0)
+            self.assertTrue(wait.call_count > 1)
+            self.assertTrue(all(0 < call.args[0] <= recorder.MAX_STOP_POLL_SECONDS
+                                for call in wait.call_args_list))
 
     def test_recorder_skips_quotes_without_point_in_time_timestamp(self):
         fake = _MissingQuoteTimestampFake()

@@ -26,6 +26,7 @@ import math
 import mmap
 import os
 import sqlite3
+import signal
 import shutil
 import sys
 import tempfile
@@ -141,6 +142,7 @@ DEFAULT_FORWARD_OBSERVATION_MAX_LAG_MINUTES = 15
 DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
 MAX_AUTHORIZING_INTERVAL_SECONDS = 30.0
+MAX_STOP_POLL_SECONDS = 0.5
 MAX_DEFERRED_CATCHUP_INTERVALS = 64
 DEFAULT_RECORDER_MIN_FREE_BYTES = 5 * 1024 ** 3
 # Calendar metadata is an audit boundary, not a deduplication cache.  Keep the
@@ -240,6 +242,59 @@ def _next_cadence_deadline(previous: float | None, now: float,
         return deadline
     missed = int((now - deadline) // interval) + 1
     return deadline + missed * interval
+
+
+class _RecorderStopState:
+    """Main-thread-only signal state; handlers must not acquire a lock."""
+
+    def __init__(self):
+        self.requested = False
+
+
+def _install_stop_handlers(stop_state: _RecorderStopState) -> dict[int, object]:
+    """Request an orderly stop without interrupting an active write.
+
+    The signal callback intentionally does no I/O, takes no lock, and raises
+    no exception.  A recorder cycle may already have appended a partition row
+    when SIGTERM arrives; allowing that cycle to return is what lets the
+    matching index and SQLite sidecars commit before the process exits.
+    """
+    def request_stop(_signum, _frame):
+        # Python may run this callback while the main thread is in a blocking
+        # syscall.  Keep it lock-free: Event.set() can deadlock if a signal
+        # interrupts Event.wait() while its condition lock is held.
+        stop_state.requested = True
+
+    previous: dict[int, object] = {}
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.signal(signum, request_stop)
+    except BaseException:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        raise
+    return previous
+
+
+def _restore_stop_handlers(previous: Mapping[int, object]) -> None:
+    """Restore process signal dispositions after the recorder loop exits."""
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+def _wait_for_stop(stop_state: _RecorderStopState, timeout: float) -> bool:
+    """Sleep until the cadence deadline, polling promptly for a stop signal."""
+    timeout = max(0.0, float(timeout))
+    deadline = time.monotonic() + timeout
+    while not stop_state.requested:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # A signal handler only flips the lock-free boolean.  Keep each sleep
+        # short enough that a signal received during a syscall cannot delay
+        # shutdown beyond the bounded polling slice.
+        time.sleep(min(remaining, MAX_STOP_POLL_SECONDS))
+    return True
 
 
 def _save_status(output: Path, payload: dict) -> dict:
@@ -3021,82 +3076,103 @@ def main(argv=None) -> int:
         return 0
     calendar = CalendarCache(provider)
     failure_count = 0
+    stop_state = _RecorderStopState()
+    previous_handlers = _install_stop_handlers(stop_state)
     # Anchor cadence before the request starts.  Scheduling from a timestamp
     # captured after ``record_once`` would make the true polling period equal
     # to request latency plus the configured interval.
     next_tick: float | None = time.monotonic()
-    while True:
-        cycle_started_ts = time.time()
-        cycle_telemetry = _initialize_cycle_telemetry({})
-        try:
-            count = record_once(provider, symbols, output, config=cfg,
-                                include_options=include_options,
-                                option_limit=option_limit,
-                                option_hold=option_hold, calendar=calendar,
-                                telemetry=cycle_telemetry)
-        except Exception as exc:
-            failure_count += 1
-            # Failures consume the same fixed cadence as successful cycles.
-            # Exponential retry backoff made repeated failed reads drift to
-            # 60--90 seconds despite the configured 30-second interval.
-            completed_monotonic = time.monotonic()
-            next_tick = _next_cadence_deadline(
-                next_tick, completed_monotonic, args.interval)
-            # Millisecond precision is sufficient for a 30-second polling
-            # boundary and avoids turning clock-read jitter into a misleading
-            # retry interval in status and tests.
-            delay = round(max(0.0, next_tick - completed_monotonic), 3)
-            failure_kind, retryable = _market_data_failure(
-                exc, data_feed=data_feed,
-                options_feed=options_feed or "opra")
-            payload = {
-                "schema": "recorder-error.v1",
-                "status": "failed",
+    try:
+        while True:
+            # A signal received while the service was idle must not start one
+            # more provider request.  A signal received during record_once is
+            # observed after that cycle's durable commit instead.
+            if stop_state.requested:
+                return 0
+            cycle_started_ts = time.time()
+            cycle_telemetry = _initialize_cycle_telemetry({})
+            try:
+                count = record_once(provider, symbols, output, config=cfg,
+                                    include_options=include_options,
+                                    option_limit=option_limit,
+                                    option_hold=option_hold, calendar=calendar,
+                                    telemetry=cycle_telemetry)
+            except Exception as exc:
+                failure_count += 1
+                # Failures consume the same fixed cadence as successful cycles.
+                # Exponential retry backoff made repeated failed reads drift to
+                # 60--90 seconds despite the configured 30-second interval.
+                completed_monotonic = time.monotonic()
+                next_tick = _next_cadence_deadline(
+                    next_tick, completed_monotonic, args.interval)
+                # Millisecond precision is sufficient for a 30-second polling
+                # boundary and avoids turning clock-read jitter into a misleading
+                # retry interval in status and tests.
+                delay = round(max(0.0, next_tick - completed_monotonic), 3)
+                failure_kind, retryable = _market_data_failure(
+                    exc, data_feed=data_feed,
+                    options_feed=options_feed or "opra")
+                payload = {
+                    "schema": "recorder-error.v1",
+                    "status": "failed",
+                    "probe": False,
+                    "data_feed": data_feed,
+                    "options_feed": options_feed,
+                    "failure_kind": failure_kind,
+                    "retryable": retryable,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "failure_count": failure_count,
+                    "retry_seconds": delay,
+                    "shutdown_requested": stop_state.requested,
+                    "cycle_telemetry": cycle_telemetry,
+                    "cadence": _cadence_telemetry(
+                        output, interval=args.interval,
+                        cycle_started_ts=cycle_started_ts,
+                        cycle_completed_ts=time.time()),
+                }
+                # Keep a failed cycle's pending quote checkpoint intact.  On a
+                # later service start it remains a bounded, non-destructive
+                # retry rather than being discarded on shutdown.
+                _save_status(output, payload)
+                print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
+                if args.once or stop_state.requested:
+                    return 1
+                if _wait_for_stop(stop_state, delay):
+                    # Preserve the failed attempt's non-zero result while
+                    # leaving its bounded retry checkpoint untouched.
+                    return 1
+                continue
+            failure_count = 0
+            stopping = stop_state.requested
+            _save_status(output, {
+                "status": "stopped" if stopping else "recording",
                 "probe": False,
                 "data_feed": data_feed,
                 "options_feed": options_feed,
-                "failure_kind": failure_kind,
-                "retryable": retryable,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-                "failure_count": failure_count,
-                "retry_seconds": delay,
+                "rows": count,
+                "failure_kind": None,
+                "retryable": None,
+                "error_type": None,
+                "error": None,
+                "shutdown_requested": stopping,
                 "cycle_telemetry": cycle_telemetry,
                 "cadence": _cadence_telemetry(
                     output, interval=args.interval,
                     cycle_started_ts=cycle_started_ts,
                     cycle_completed_ts=time.time()),
-            }
-            _save_status(output, payload)
-            print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
-            if args.once:
-                return 1
-            time.sleep(delay)
-            continue
-        failure_count = 0
-        _save_status(output, {
-            "status": "recording",
-            "probe": False,
-            "data_feed": data_feed,
-            "options_feed": options_feed,
-            "rows": count,
-            "failure_kind": None,
-            "retryable": None,
-            "error_type": None,
-            "error": None,
-            "cycle_telemetry": cycle_telemetry,
-            "cadence": _cadence_telemetry(
-                output, interval=args.interval,
-                cycle_started_ts=cycle_started_ts,
-                cycle_completed_ts=time.time()),
-        })
-        print(f"recorded {count} Alpaca rows to {output}", flush=True)
-        if args.once:
-            return 0
-        now_monotonic = time.monotonic()
-        next_tick = _next_cadence_deadline(
-            next_tick, now_monotonic, args.interval)
-        time.sleep(max(0.0, next_tick - time.monotonic()))
+            })
+            print(f"recorded {count} Alpaca rows to {output}", flush=True)
+            if args.once or stopping:
+                return 0
+            now_monotonic = time.monotonic()
+            next_tick = _next_cadence_deadline(
+                next_tick, now_monotonic, args.interval)
+            if _wait_for_stop(
+                    stop_state, max(0.0, next_tick - time.monotonic())):
+                return 0
+    finally:
+        _restore_stop_handlers(previous_handlers)
 
 
 if __name__ == "__main__":

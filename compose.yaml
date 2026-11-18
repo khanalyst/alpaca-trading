@@ -77,7 +77,9 @@ services:
     cpus: "${ALPACA_RECORDER_CPUS:-0.75}"
     mem_limit: 768m
     pids_limit: 128
-    stop_grace_period: 45s
+    # SIGTERM lets an active bounded fetch drain and commit its CSV/index
+    # checkpoint before the container exits, within a finite budget.
+    stop_grace_period: 2m
 
   trader:
     <<: *app

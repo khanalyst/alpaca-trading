@@ -119,6 +119,16 @@ Recorder health reports the bytes available above the configured disk reserve
 under `storage_headroom`. Its session estimate uses the largest of the last
 five closed partition files. A partial recording can understate future usage.
 
+The long-running recorder handles `SIGTERM` and `SIGINT` cooperatively. If a
+cycle is active, it finishes that bounded fetch and commits the CSV, index, and
+dedup sidecars before exiting; it never starts another cycle after the stop is
+requested. If it is between cycles, the interruptible wait exits within its
+bounded 0.5-second polling slice.
+Failed cycles retain their pending quote checkpoint and failure status for the
+next start, so a stop does not discard a non-destructive retry. Compose gives
+the recorder a finite two-minute grace period for this final commit. A forced
+kill after that grace may require the normal recorder audit/rebuild path.
+
 The recorder supports bounded, one-shot maintenance operations:
 
 ```bash

@@ -21,24 +21,40 @@ class RecorderCadenceFixTests(unittest.TestCase):
             self.assertEqual(second, 60.0)
 
         with self.subTest("service retry loop"), self._temporary_output() as output:
+            clock = [0.0]
+            attempts = [0]
+
+            def monotonic():
+                return clock[0]
+
+            def record(*_args, **_kwargs):
+                attempts[0] += 1
+                clock[0] = 1.0 if attempts[0] == 1 else 31.0
+                if attempts[0] < 3:
+                    raise RuntimeError(
+                        "first" if attempts[0] == 1 else "second")
+                raise KeyboardInterrupt()
+
+            sleeps = []
+
+            def sleep(seconds):
+                sleeps.append(float(seconds))
+                clock[0] += float(seconds)
+
             with patch.object(recorder, "AlpacaProvider", return_value=object()), \
-                    patch.object(
-                        recorder,
-                        "record_once",
-                        side_effect=[RuntimeError("first"),
-                                     RuntimeError("second"),
-                                     KeyboardInterrupt()],
-                    ), \
+                    patch.object(recorder, "record_once", side_effect=record), \
                     patch.object(recorder.time, "monotonic",
-                                 side_effect=[0.0, 1.0, 1.0, 31.0, 31.0]), \
-                    patch.object(recorder.time, "sleep") as sleep:
+                                 side_effect=monotonic), \
+                    patch.object(recorder.time, "sleep", side_effect=sleep):
                 with self.assertRaises(KeyboardInterrupt):
                     recorder.main([
                         "--config", "config.yaml", "--out", str(output),
                         "--interval", "30",
                     ])
-            self.assertEqual(sleep.call_args_list[0].args, (29.0,))
-            self.assertEqual(sleep.call_args_list[1].args, (29.0,))
+            self.assertEqual(attempts[0], 3)
+            self.assertEqual(sum(sleeps), 58.0)
+            self.assertTrue(all(0 < value <= recorder.MAX_STOP_POLL_SECONDS
+                                for value in sleeps))
 
     def test_rows_keep_source_specific_response_receipts(self):
         requested = datetime(2026, 10, 5, 13, 31, tzinfo=timezone.utc)
