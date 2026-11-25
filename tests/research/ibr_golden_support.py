@@ -372,6 +372,14 @@ _MISSING = "<missing>"
 # precisely; every other field is folded into the record digest.
 TRADE_CLEAR_FIELDS = ("symbol", "session_date", "exit_reason",
                       "canonical_exit_reason")
+# Additive stressed-cost geometry is intentionally excluded only from this
+# archived v1 compatibility projection.  ``compute_fingerprint`` still keeps
+# the fields in current evidence; the projection preserves old trade/refusal
+# identities while callers migrate to the richer geometry contract.
+LEGACY_ADDITIVE_TRADE_FIELDS = frozenset({
+    "stop_geometry_max_tolerable_scenario_bps",
+    "stop_geometry_stress_headroom_bps",
+})
 
 
 def _digest(value: Any) -> str:
@@ -402,7 +410,10 @@ def _iter_trades(full: dict[str, Any]):
 def record_keys(full: dict[str, Any]) -> dict[str, list[str]]:
     """The key set of each record kind, which must be uniform per kind."""
     def uniform(records, kind):
-        sets = {tuple(sorted(record)) for record in records}
+        sets = {tuple(sorted(
+            key for key in record
+            if not (kind == "trade" and key in LEGACY_ADDITIVE_TRADE_FIELDS)))
+                for record in records}
         if len(sets) != 1:
             raise AssertionError(f"{kind} records do not share one key set")
         return list(next(iter(sets)))
@@ -457,10 +468,21 @@ def _compact_runtime(records: list[dict[str, Any]], keys: list[str]
 
 
 def _compact_replay(record: dict[str, Any], keys: list[str]) -> dict[str, Any]:
+    def legacy_refusal(item: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(item)
+        detail = result.get("detail")
+        if isinstance(detail, Mapping):
+            result["detail"] = {
+                key: value for key, value in detail.items()
+                if key not in LEGACY_ADDITIVE_TRADE_FIELDS
+            }
+        return result
+
     return {
         "trades": [_compact_mapping(trade, keys, clear=TRADE_CLEAR_FIELDS)
                    for trade in record["trades"]],
-        "refusals": record["refusals"],
+        "refusals": [legacy_refusal(refusal)
+                     for refusal in record["refusals"]],
         "authorizing": record["authorizing"],
         "diagnostic_only": record["diagnostic_only"],
     }

@@ -30,7 +30,7 @@ from agent.contracts.rule import (
 )
 from agent.contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
-    quantize_equity_bracket,
+    maximum_tolerable_stress_bps, quantize_equity_bracket,
 )
 from .costs import (BAR, QUOTE, RESTING_BRACKET,
                     DIAGNOSTIC_BAR_FALLBACK,
@@ -827,6 +827,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         stop_floor_bps = MIN_STOP_DISTANCE_BPS
         stop_floor_binding = False
         stop_geometry_scenario = None
+        max_tolerable_stress = None
         stop_geometry_activation_reason = "stress_disabled"
         if vehicle == "equity":
             # Quantization is broker-facing geometry.  Anchor it to the same
@@ -884,6 +885,9 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # rebuild either authored bracket leg: widening a stop changes the
             # strategy's risk and target semantics.
             stop_floor_binding = effective_distance > broker_normalized_distance + 1e-12
+            max_tolerable_stress = maximum_tolerable_stress_bps(
+                broker_normalized_distance / entry_ref * 10_000.0,
+                resolved_policy.max_stressed_cost_to_risk_ratio)
             if stop_floor_binding:
                 plan_evidence = entry_evidence or entry_bar
                 plan_identity = getattr(plan_evidence, "identity", None)
@@ -939,6 +943,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     "stress_scenario_bps": stop_geometry_scenario,
                     "stress_max_cost_to_risk_ratio": (
                         resolved_policy.max_stressed_cost_to_risk_ratio),
+                    "stress_max_tolerable_scenario_bps": (
+                        max_tolerable_stress),
+                    "stress_headroom_bps": (
+                        max_tolerable_stress - float(stop_geometry_scenario)),
                     "required_stop_floor_bps": stop_floor_bps,
                     "required_tick_rounded_stop_distance": effective_distance,
                     "required_tick_rounded_stop_distance_bps": (
@@ -953,6 +961,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     "stop_geometry_scenario_bps": stop_geometry_scenario,
                     "stop_geometry_max_cost_to_risk_ratio": (
                         resolved_policy.max_stressed_cost_to_risk_ratio),
+                    "stop_geometry_max_tolerable_scenario_bps": (
+                        max_tolerable_stress),
+                    "stop_geometry_stress_headroom_bps": (
+                        max_tolerable_stress - float(stop_geometry_scenario)),
                     "stop_geometry_activation_reason": (
                         stop_geometry_activation_reason),
                     "pre_admission_plan": pre_admission_plan,
@@ -1312,6 +1324,18 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 else "forward_observed"
             ),
         }
+        # Compatibility rows with stressed-cost controls disabled retain the
+        # archived shape. Active geometry rows carry these additive decision
+        # boundary diagnostics.
+        if stress_geometry_requested:
+            trade_row.update({
+                "stop_geometry_max_tolerable_scenario_bps": (
+                    max_tolerable_stress),
+                "stop_geometry_stress_headroom_bps": (
+                    (None if max_tolerable_stress is None or
+                     stop_geometry_scenario is None else
+                     max_tolerable_stress - float(stop_geometry_scenario))),
+            })
         if spec["family"] == "cross_sectional_residual":
             trade_row.update({
                 key: signal.get(key) for key in (

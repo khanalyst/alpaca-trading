@@ -86,6 +86,13 @@ class SlotStateTests(unittest.TestCase):
         self.assertEqual(
             context["execution_geometry"]["grammar_stop_floor_bps"],
             MIN_STOP_DISTANCE_BPS)
+        self.assertEqual(
+            context["execution_geometry"][
+                "grammar_floor_max_tolerable_stress_bps"],
+            MIN_STOP_DISTANCE_BPS * .30)
+        # The derived boundary is a stop-floor/ratio diagnostic; it must not
+        # replace or narrow the configured 25bp stress scenario.
+        self.assertEqual(context["execution_geometry"]["scenario_bps"], 25.0)
         self.assertFalse(
             context["execution_geometry"]["grammar_stop_floor_admissible"])
         self.assertAlmostEqual(
@@ -123,6 +130,8 @@ class SlotStateTests(unittest.TestCase):
         self.assertIsNone(option_geometry["required_stop_distance_bps"])
         self.assertIsNone(option_geometry["effective_stop_floor_bps"])
         self.assertIsNone(option_geometry["grammar_stop_floor_admissible"])
+        self.assertIsNone(option_geometry[
+            "grammar_floor_max_tolerable_stress_bps"])
         self.assertTrue(option_geometry["policy_adjusted_stop_floor_admissible"])
         self.assertIn("plan-dependent", option_geometry[
             "stop_distance_formula_unavailable_reason"])

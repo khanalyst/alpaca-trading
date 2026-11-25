@@ -2749,9 +2749,8 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                         telemetry=telemetry)
         _clear_pending_quote_window(output)
     if capture_policy == "forward_only":
-        # Always observe exactly the newest configured window. Repeated cycles
-        # overlap naturally; recorder_market additionally rounds only the bar
-        # request back to the minute boundary to capture revisions.
+        # Quote capture uses the newest configured window. Completed bars can
+        # overlap a recent durable bar when a previous poll ran long.
         start = now - window
     else:
         # Catch-up resumes from durable data. The one-minute overlap makes
@@ -2840,6 +2839,17 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             else:
                 refresh_current_quotes = False
         published_bar_keys: set[str] = set()
+        # A full-tick quote request may take several minute boundaries to
+        # finish. Recover the intervening completed bars on the next poll.
+        # Keep long outages on the existing forward-only path and allow one
+        # minute of receipt headroom inside the provenance and dedup bounds.
+        bar_start = cursor
+        if capture_policy == "forward_only" and latest_bars:
+            previous_bar = max(latest_bars.values())
+            overlap_limit = min(DEDUP_HORIZON, forward_observation_max_lag)
+            if (_session_date(previous_bar) == _session_date(window_end)
+                    and now - previous_bar <= overlap_limit - timedelta(minutes=1)):
+                bar_start = min(cursor, previous_bar)
 
         def publish_bars(projected: list[dict]) -> None:
             """Commit one complete bar response before requesting quotes."""
@@ -2886,7 +2896,8 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
                 # request's lower bound.
                 include_options=bool(include_options and window_end >= now),
                 option_limit=option_limit,
-                start=cursor, option_pins=frozenset(pins), observed_at=now,
+                start=cursor, bar_start=bar_start,
+                option_pins=frozenset(pins), observed_at=now,
                 prefetch_latest_quote=latest_quote_prefetch,
                 refresh_quote_end=refresh_current_quotes,
                 quote_end_limit=quote_end_limit, telemetry=telemetry,
@@ -3089,6 +3100,7 @@ def main(argv=None) -> int:
             # observed after that cycle's durable commit instead.
             if stop_state.requested:
                 return 0
+            cycle_started_monotonic = time.monotonic()
             cycle_started_ts = time.time()
             cycle_telemetry = _initialize_cycle_telemetry({})
             try:
@@ -3166,8 +3178,14 @@ def main(argv=None) -> int:
             if args.once or stopping:
                 return 0
             now_monotonic = time.monotonic()
-            next_tick = _next_cadence_deadline(
-                next_tick, now_monotonic, args.interval)
+            if cycle_telemetry["windows_completed"] and _capture_policy() == "forward_only":
+                # Each successful live poll reads the current market. If disk
+                # or provider work consumed the interval, waiting for another
+                # grid boundary only makes the next observation older.
+                next_tick = max(cycle_started_monotonic + args.interval, now_monotonic)
+            else:
+                next_tick = _next_cadence_deadline(
+                    next_tick, now_monotonic, args.interval)
             if _wait_for_stop(
                     stop_state, max(0.0, next_tick - time.monotonic())):
                 return 0

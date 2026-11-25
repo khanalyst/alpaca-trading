@@ -81,6 +81,7 @@ class CompleteDiagnosticSuiteTests(unittest.TestCase):
         self.assertAlmostEqual(result["fixed_scenario_minimum_stop_bps"],
                                scenario / ratio)
         self.assertEqual(result["rule_grammar_stop_floor_bps"], 30.0)
+        self.assertEqual(result["grammar_floor_max_tolerable_stress_bps"], 9.0)
         self.assertEqual(result["static_bar_round_trip_cost_bps"], 17.0)
         # The mounted 9 bps scenario over a 0.30 ratio implies exactly the
         # 30 bps grammar floor, so the floor is no longer *below* the
@@ -96,6 +97,8 @@ class CompleteDiagnosticSuiteTests(unittest.TestCase):
         exposed = suite.admission_preflight(incompatible)
         self.assertAlmostEqual(exposed["fixed_scenario_minimum_stop_bps"],
                                25.0 / ratio)
+        self.assertEqual(exposed["grammar_floor_max_tolerable_stress_bps"],
+                         9.0)
         self.assertTrue(
             exposed["grammar_floor_below_fixed_scenario_requirement"])
         self.assertFalse(exposed["plan_mutation"])

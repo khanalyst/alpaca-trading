@@ -90,6 +90,12 @@ refresh a non-activating view. Canonical quote validation, source/feed checks,
 and held-out coverage remain mandatory. Missing quotes or insufficient cells
 are unavailable, not zero-cost observations.
 
+For an equity stop, the maximum tolerable stress in basis points equals the
+stop distance in basis points times the configured cost-to-risk fraction.
+Headroom subtracts the trial's stress scenario from that ceiling. A negative
+value identifies how much the scenario exceeds the stop's allowance. Estimate
+executable costs from quotes, depth, fees and separate validation sessions.
+
 ## Broker-free live shadow
 
 `deploy/shadow.py` and `research.live_shadow` run the same signal, setup, risk,

@@ -308,7 +308,7 @@ def compute_path_telemetry(
 
     tie_broken = bool(trade.get("tie_broken"))
     exit_reason = str(trade.get("exit_reason") or trade.get("hold_exit_reason") or "unknown")
-    return {
+    result = {
         "schema": PATH_TELEMETRY_SCHEMA,
         "available": bool(path and entry is not None and direction in {"long", "short"}),
         "symbol": _trade_symbol(trade),
@@ -346,6 +346,20 @@ def compute_path_telemetry(
         "mfe_at_exit_r": mfe_r,
         "mae_at_exit_r": mae_r,
     }
+    # Geometry is optional evidence. Preserve the legacy path shape for rows
+    # produced before stressed-cost geometry existed, while carrying finite
+    # bps diagnostics from current replay/runtime rows.
+    geometry_names = (
+        "stop_geometry_scenario_bps",
+        "stop_geometry_max_cost_to_risk_ratio",
+        "stop_geometry_max_tolerable_scenario_bps",
+        "stop_geometry_stress_headroom_bps",
+    )
+    if any(name in trade and trade.get(name) is not None
+           for name in geometry_names):
+        result.update({name: _number(trade.get(name))
+                       for name in geometry_names})
+    return result
 
 
 def _metric(values: Sequence[Any]) -> dict[str, Any]:
@@ -377,7 +391,7 @@ def aggregate_path_telemetry(rows: Sequence[Any]) -> dict[str, Any]:
     for (target, hold, reason), items in sorted(groups.items(), key=lambda pair: (
             float("inf") if pair[0][0] is None else pair[0][0],
             float("inf") if pair[0][1] is None else pair[0][1], pair[0][2])):
-        rendered.append({
+        group = {
             "target_r": target, "max_hold_bars": hold, "exit_reason": reason,
             "count": len(items),
             "right_censored": sum(bool(item.get("right_censored")) for item in items),
@@ -387,7 +401,19 @@ def aggregate_path_telemetry(rows: Sequence[Any]) -> dict[str, Any]:
             "mae_bps": _metric([item.get("mae_bps") for item in items]),
             "mfe_r": _metric([item.get("mfe_r") for item in items]),
             "mae_r": _metric([item.get("mae_r") for item in items]),
-        })
+        }
+        geometry_names = (
+            "stop_geometry_scenario_bps",
+            "stop_geometry_max_cost_to_risk_ratio",
+            "stop_geometry_max_tolerable_scenario_bps",
+            "stop_geometry_stress_headroom_bps",
+        )
+        if any(name in item for item in items for name in geometry_names):
+            group["geometry"] = {
+                name: _metric([item.get(name) for item in items])
+                for name in geometry_names
+            }
+        rendered.append(group)
     return {
         "schema": PATH_AGGREGATE_SCHEMA,
         "diagnostic_only": True,
@@ -421,7 +447,6 @@ def compute_pre_admission_path_telemetry(
         "authored_target_distance", "authored_target_r",
         "tick_normalized_stop_price", "tick_normalized_target_price",
         "tick_normalized_stop_distance", "tick_normalized_target_distance",
-        "stress_scenario_bps", "stress_max_cost_to_risk_ratio",
         "required_stop_floor_bps", "required_tick_rounded_stop_distance",
         "required_tick_rounded_stop_distance_bps")
     provenance = plan.get("entry_provenance")
@@ -444,6 +469,13 @@ def compute_pre_admission_path_telemetry(
         "authored_max_hold_bars": plan.get("authored_max_hold_bars"),
         **{name: _number(plan.get(name)) for name in copied_numbers},
     }
+    geometry_names = (
+        "stress_scenario_bps", "stress_max_cost_to_risk_ratio",
+        "stress_max_tolerable_scenario_bps", "stress_headroom_bps",
+    )
+    if any(name in plan for name in geometry_names):
+        result.update({name: _number(plan.get(name))
+                       for name in geometry_names})
 
     def finish(status: str, reason: str | None = None, *,
                path: Sequence[tuple[datetime, datetime, Any]] = (),
@@ -618,6 +650,7 @@ def aggregate_pre_admission_path_telemetry(
             name: _metric([item.get(name) for item in items])
             for name in (
                 "stress_scenario_bps", "stress_max_cost_to_risk_ratio",
+                "stress_max_tolerable_scenario_bps", "stress_headroom_bps",
                 "authored_stop_distance", "tick_normalized_stop_distance",
                 "required_stop_floor_bps",
                 "required_tick_rounded_stop_distance",

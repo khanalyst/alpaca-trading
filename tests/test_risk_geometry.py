@@ -5,6 +5,7 @@ from agent.contracts.risk_geometry import (
     RiskGeometryError,
     effective_stop_distance,
     effective_stop_floor_bps,
+    maximum_tolerable_stress_bps,
     required_stop_distance_bps,
 )
 
@@ -22,6 +23,12 @@ class RiskGeometryTests(unittest.TestCase):
         self.assertEqual(effective_stop_floor_bps(30.0, 9.0, .30), 30.0)
         self.assertAlmostEqual(
             effective_stop_floor_bps(30.0, 25.0, .30), 250.0 / 3.0)
+
+    def test_maximum_tolerable_stress_solves_the_same_boundary(self):
+        self.assertAlmostEqual(maximum_tolerable_stress_bps(30.0, .30), 9.0)
+        self.assertAlmostEqual(
+            maximum_tolerable_stress_bps(30.0109, .30), 9.00327)
+        self.assertEqual(maximum_tolerable_stress_bps(30.0, 0.0), 0.0)
 
     def test_effective_distance_widens_only_when_policy_requires_it(self):
         distance, floor = effective_stop_distance(
@@ -65,6 +72,10 @@ class RiskGeometryTests(unittest.TestCase):
                        (25.0, -1.0), (float("nan"), .30)):
             with self.subTest(values=values), self.assertRaises(RiskGeometryError):
                 required_stop_distance_bps(*values)
+        for values in ((True, .30), (30.0, True), (-1.0, .30),
+                       (30.0, -1.0), (float("nan"), .30)):
+            with self.subTest(values=values), self.assertRaises(RiskGeometryError):
+                maximum_tolerable_stress_bps(*values)
 
 
 if __name__ == "__main__":

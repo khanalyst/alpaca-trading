@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from agent.config import load_config
-from agent.contracts.risk_geometry import required_stop_distance_bps
+from agent.contracts.risk_geometry import (
+    maximum_tolerable_stress_bps, required_stop_distance_bps)
 from agent.contracts.rule import MIN_STOP_DISTANCE_BPS
 from agent.variants import load_registry
 from .cost_counterfactual import _code_bundle_files, _code_bundle_hash
@@ -55,6 +56,9 @@ def admission_preflight(runtime_config: Mapping[str, Any]) -> dict:
     ratio = policy.max_stressed_cost_to_risk_ratio
     required = (None if scenario is None or ratio is None else
                 required_stop_distance_bps(scenario, ratio))
+    max_tolerable = (None if ratio is None else
+                     maximum_tolerable_stress_bps(
+                         float(MIN_STOP_DISTANCE_BPS), ratio))
     fixed = CostModel.from_config(static_cost_config(runtime_config), vehicle="equity")
     return {
         "schema": "diagnostic-admission-preflight.v1",
@@ -62,6 +66,7 @@ def admission_preflight(runtime_config: Mapping[str, Any]) -> dict:
         "rule_grammar_stop_floor_bps": float(MIN_STOP_DISTANCE_BPS),
         "fixed_scenario_minimum_stop_bps": (
             required if required is not None and math.isfinite(required) else None),
+        "grammar_floor_max_tolerable_stress_bps": max_tolerable,
         "no_finite_stop_admissible": required is not None and not math.isfinite(required),
         "grammar_floor_below_fixed_scenario_requirement": (
             required is not None and float(MIN_STOP_DISTANCE_BPS) < required),

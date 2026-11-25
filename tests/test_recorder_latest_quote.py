@@ -12,6 +12,54 @@ from deploy import recorder, recorder_market
 
 
 class RecorderLatestQuoteTests(unittest.TestCase):
+    def test_overrun_recovers_completed_bars_with_actual_receipt(self):
+        import csv
+
+        first = datetime(2026, 11, 19, 15, 1, tzinfo=timezone.utc)
+        current = first
+        bar_starts, quote_starts = [], []
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return current
+
+        class Provider:
+            data_feed = "iex"
+
+            def bars(self, symbols, *, start, end, feed, **kwargs):
+                bar_starts.append(start)
+                stamps = [start + timedelta(minutes=i)
+                          for i in range(int((end-start).total_seconds() // 60))]
+                return {"SPY": [SimpleNamespace(timestamp=t.isoformat(), open=100, high=101,
+                                                low=99, close=100, volume=10)
+                                for t in stamps]}
+
+            def quotes(self, symbols, *, start, end, feed):
+                quote_starts.append(start)
+                return {}
+
+        with TemporaryDirectory() as directory, patch.dict("os.environ", {
+                "ALPACA_RECORDER_CAPTURE_POLICY": "forward_only",
+                "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "1",
+                "ALPACA_RECORDER_MIN_FREE_BYTES": "0"}), patch.object(
+                    recorder_market, "datetime", Clock):
+            output = Path(directory) / "market.csv"
+            provider = Provider()
+            recorder.record_once(provider, ["SPY"], output, now=current)
+            current += timedelta(minutes=4)
+            recorder.record_once(provider, ["SPY"], output, now=current)
+            with recorder._partition_path(output, first.date()).open() as f:
+                rows = [r for r in csv.DictReader(f) if r["event_type"] == "bar_1m"]
+            self.assertEqual(bar_starts, [first-timedelta(minutes=1)] * 2)
+            self.assertEqual(quote_starts[-1], current-timedelta(minutes=1))
+            self.assertEqual(len({row["timestamp"] for row in rows}), 5)
+            self.assertEqual([row["observed_at"] for row in rows],
+                             [first.isoformat()] + [current.isoformat()] * 4)
+            current += timedelta(hours=1)
+            recorder.record_once(provider, ["SPY"], output, now=current)
+            self.assertEqual(bar_starts[-1], quote_starts[-1])
+
     def test_prefetch_is_before_bars_and_keeps_historical_quote_window(self):
         requested = datetime(2026, 9, 8, 14, 0, tzinfo=timezone.utc)
         latest_received = requested + timedelta(seconds=2)

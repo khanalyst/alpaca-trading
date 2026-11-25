@@ -12,6 +12,34 @@ from deploy import recorder_market
 
 
 class RecorderCadenceFixTests(unittest.TestCase):
+    def test_forward_overrun_resumes_once_without_skipping_another_slot(self):
+        clock = 0.0
+        starts = []
+        durations = iter([31, 1, 94, 3])
+
+        def record(*args, telemetry, **kwargs):
+            nonlocal clock
+            starts.append(clock)
+            if len(starts) == 5:
+                raise KeyboardInterrupt
+            clock += next(durations)
+            telemetry["windows_completed"] = 1
+            return 1
+
+        def sleep(seconds):
+            nonlocal clock
+            clock += seconds
+
+        with self._temporary_output() as output, \
+                patch.dict("os.environ", {"ALPACA_RECORDER_CAPTURE_POLICY": "forward_only"}), \
+                patch.object(recorder, "AlpacaProvider", return_value=object()), \
+                patch.object(recorder, "record_once", side_effect=record), \
+                patch.object(recorder.time, "monotonic", side_effect=lambda: clock), \
+                patch.object(recorder.time, "sleep", side_effect=sleep):
+            with self.assertRaises(KeyboardInterrupt):
+                recorder.main(["--out", str(output), "--interval", "30"])
+        self.assertEqual(starts, [0, 31, 61, 155, 185])
+
     def test_failed_cycles_keep_the_original_cadence_anchor(self):
         """Repeated failed reads stay 30 seconds apart instead of backing off."""
         with self.subTest("deadline arithmetic"):

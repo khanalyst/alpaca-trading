@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import unittest
+from unittest.mock import Mock
 
 from agent.alpaca_domain import Bar
 from agent.alpaca_sdk import normalize_bar
@@ -54,6 +55,29 @@ class MarketEntryAvailabilityTests(unittest.TestCase):
         return self.collector._collect(
             ["SPY"], now,
             {"SPY": {"bars": bars, "quote": _quote(now)}})
+
+    def test_provider_query_keeps_the_inclusive_quote_freshness_boundary(self):
+        now = START + timedelta(minutes=4)
+        quotes = [_quote(now - timedelta(seconds=60)), _quote(now - timedelta(seconds=7))]
+        market = self.collector.market = Mock()
+        market.session.return_value.open = START
+        market.stock_bars.return_value = {"SPY": [_bar(START)]}
+        market.stock_quotes.side_effect = lambda symbols, start, end: {
+            "SPY": [q for q in quotes if start <= q["timestamp"] <= end]}
+        for max_age in (7, 6):
+            self.collector.cfg["execution"]["max_market_data_age_seconds"] = max_age
+            result = self.collector._collect(["SPY"], now, None)
+            reference = self.collector._collect(
+                ["SPY"], now, {"SPY": {"bars": [_bar(START)], "quotes": quotes}})
+            self.assertEqual("SPY" in result, max_age == 7)
+            self.assertEqual(result.keys(), reference.keys())
+            if "SPY" in result:
+                for key in ("quote", "bars", "spread_bps", "quote_age_seconds"):
+                    self.assertEqual(result["SPY"][key], reference["SPY"][key])
+            market.stock_quotes.assert_called_with(
+                ["SPY"], start=now - timedelta(seconds=max_age), end=now)
+            market.stock_bars.assert_called_with(
+                ["SPY"], timeframe="1m", start=START, end=now)
 
     def test_completion_boundary_and_bar_age_remain_minute_based(self):
         bar = _bar(

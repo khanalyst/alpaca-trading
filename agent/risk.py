@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from .instruments import validate_equity_symbol, validate_option_symbol
 from .contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
-    quantize_equity_bracket,
+    maximum_tolerable_stress_bps, quantize_equity_bracket,
 )
 from .contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V3,
                              RULE_SCHEMA_V4, RULE_SCHEMA_V5)
@@ -720,6 +720,8 @@ class RiskEngine:
                 except RiskGeometryError:
                     return None, "stressed_cost_invalid"
                 binding = effective_distance > broker_normalized_distance + 1e-12
+                max_tolerable_scenario = maximum_tolerable_stress_bps(
+                    broker_normalized_distance / entry * 10_000.0, limit)
                 geometry_telemetry = {
                     "authored_stop_price": signal_authored_stop,
                     "authored_target_price": signal_authored_target,
@@ -733,6 +735,10 @@ class RiskEngine:
                     "stress_floor_binding": bool(binding),
                     "stop_geometry_scenario_bps": float(scenario),
                     "stop_geometry_max_cost_to_risk_ratio": float(limit),
+                    "stop_geometry_max_tolerable_scenario_bps": float(
+                        max_tolerable_scenario),
+                    "stop_geometry_stress_headroom_bps": float(
+                        max_tolerable_scenario - float(scenario)),
                     "stop_geometry_activation_reason": activation_reason,
                 }
                 # The effective stressed-cost floor is a veto boundary, not an

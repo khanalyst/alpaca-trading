@@ -253,6 +253,21 @@ class PreAdmissionPathTelemetryTests(unittest.TestCase):
         self.assertEqual(summary["cost_geometry"]
                          ["required_tick_rounded_stop_distance_bps"]["count"], 3)
 
+    def test_geometry_headroom_is_propagated_as_diagnostic_bps(self):
+        plan = _plan(stress_scenario_bps=25.0,
+                     stress_max_cost_to_risk_ratio=.30,
+                     stress_max_tolerable_scenario_bps=9.0,
+                     stress_headroom_bps=-16.0)
+        result = compute_pre_admission_path_telemetry(plan, [
+            _bar(0, 100, 101, 99, 100), _bar(1, 100, 104, 99, 103),
+            _bar(2, 103, 104, 102, 103),
+        ])
+        self.assertEqual(result["stress_max_tolerable_scenario_bps"], 9.0)
+        self.assertEqual(result["stress_headroom_bps"], -16.0)
+        summary = aggregate_pre_admission_path_telemetry([result])
+        self.assertEqual(summary["cost_geometry"][
+            "stress_headroom_bps"]["median"], -16.0)
+
         prefix_hit = compute_pre_admission_path_telemetry(_plan(), [
             _bar(0, 100, 105, 99, 104),
         ])

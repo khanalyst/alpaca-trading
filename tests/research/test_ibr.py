@@ -309,6 +309,12 @@ class IBRReplayTests(unittest.TestCase):
         self.assertEqual(refusal.detail["stop_geometry_scenario_bps"], 25.0)
         self.assertEqual(
             refusal.detail["stop_geometry_max_cost_to_risk_ratio"], .30)
+        self.assertAlmostEqual(
+            refusal.detail["stop_geometry_max_tolerable_scenario_bps"],
+            refusal.detail["authored_stop_distance_bps"] * .30)
+        self.assertAlmostEqual(
+            refusal.detail["stop_geometry_stress_headroom_bps"],
+            refusal.detail["authored_stop_distance_bps"] * .30 - 25.0)
 
     def test_equity_stress_floor_leaves_explicit_wide_geometry_unchanged(self):
         policy = ReplayPolicy(
@@ -325,6 +331,12 @@ class IBRReplayTests(unittest.TestCase):
         self.assertEqual(trade.stop_price, 99.99)
         self.assertEqual(trade.target_price, 103.02)
         self.assertEqual(trade.stop_geometry_scenario_bps, 25.0)
+        self.assertAlmostEqual(
+            trade.stop_geometry_max_tolerable_scenario_bps,
+            trade.authored_stop_distance / trade.entry_reference * 10_000.0 * .30)
+        self.assertAlmostEqual(
+            trade.stop_geometry_stress_headroom_bps,
+            trade.stop_geometry_max_tolerable_scenario_bps - 25.0)
 
     def test_partial_stress_geometry_controls_fail_closed_before_replay(self):
         for policy in (

@@ -938,7 +938,13 @@ class PaperTrialRuntimeTests(unittest.TestCase):
         from agent.contracts.rule import generate_rule_signal as real_signal
         seen_variants: list[str] = []
         events: list[tuple[str, dict]] = []
-        engine._event = lambda kind, payload: events.append((kind, payload))
+        real_event = engine._event
+
+        def capture_event(kind, payload):
+            events.append((kind, payload))
+            real_event(kind, payload)
+
+        engine._event = capture_event
 
         def exact_signal(*args, **kwargs):
             seen_variants.append(kwargs["config"]["strategy"]["variant_id"])
@@ -962,6 +968,22 @@ class PaperTrialRuntimeTests(unittest.TestCase):
             engine._paper_trial_runtime.current["candidate_id"])
         self.assertIsNone(risk_plan["proof_run_id"])
         self.assertFalse(risk_plan["paper_trial_authorizing"])
+        # The normal runtime submission path must carry the same frozen
+        # incumbent identity into the durable operational event, not only the
+        # in-memory/state order snapshot.
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            row = db.execute(
+                "SELECT payload FROM events WHERE kind='order_submitted' "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertIsNotNone(row)
+        journal_payload = json.loads(row[0])
+        self.assertEqual(journal_payload["risk"]["paper_trial_id"],
+                         "full-cycle")
+        self.assertEqual(journal_payload["risk"]["paper_trial_variant_id"],
+                         VARIANT)
+        self.assertEqual(
+            journal_payload["risk"]["paper_trial_incumbent_identity"],
+            engine._paper_trial_runtime.current["incumbent_identity"])
 
     def test_close_outcome_is_atomic_idempotent_and_never_enters_edge_ledger(self):
         engine = self._engine(trial_id="close")

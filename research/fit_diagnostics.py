@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from agent.contracts.risk_geometry import maximum_tolerable_stress_bps
 from agent.contracts.rule import (
     CROSS_SECTIONAL_BENCHMARK, MIN_STOP_DISTANCE_BPS,
     RULE_SCHEMA_V7,
@@ -1554,6 +1555,19 @@ def measure_fit_diagnostics(
         float(stress_scenario) / float(stress_limit)
         if (resolved_vehicle == "equity" and stress_scenario is not None and
             stress_limit is not None and stress_limit > 0) else None)
+    grammar_floor_max_tolerable_stress_bps = (
+        maximum_tolerable_stress_bps(effective_floor_bps, stress_limit)
+        if (resolved_vehicle == "equity" and stress_limit is not None) else
+        None)
+    observed_geometry = {
+        name: _quantiles([row.get(name) for row in rows])
+        for name in (
+            "stop_geometry_scenario_bps",
+            "stop_geometry_max_cost_to_risk_ratio",
+            "stop_geometry_max_tolerable_scenario_bps",
+            "stop_geometry_stress_headroom_bps",
+        )
+    }
     fit_diagnostics = {
         "schema": FIT_DIAGNOSTICS_SCHEMA,
         "scope": "fit_only",
@@ -1627,9 +1641,12 @@ def measure_fit_diagnostics(
             "limit": stress_limit,
             "required_static_stop_distance_bps": required_stop_bps,
             "grammar_stop_floor_bps": effective_floor_bps,
+            "grammar_floor_max_tolerable_stress_bps": (
+                grammar_floor_max_tolerable_stress_bps),
             "grammar_stop_floor_admissible": (
                 None if required_stop_bps is None else
                 effective_floor_bps >= required_stop_bps),
+            "observed_geometry": observed_geometry,
             "configured_stress": {
                 "scenario_bps": stress_scenario,
                 "max_cost_to_risk_ratio": stress_limit,

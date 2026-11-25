@@ -59,6 +59,26 @@ class PathTelemetryTests(unittest.TestCase):
         self.assertEqual(result["risk_unit"], 2.0)
         self.assertEqual(result["mfe_r"], 2.0)
 
+    def test_geometry_diagnostics_propagate_as_bps_without_authority(self):
+        trade = {"symbol": "SPY", "direction": "long",
+                 "entry_timestamp": BASE.isoformat(),
+                 "exit_timestamp": (BASE + timedelta(minutes=1)).isoformat(),
+                 "underlying_entry": 100.0, "stop_price": 95.0,
+                 "target_r": 2.0, "max_hold_bars": 1,
+                 "exit_reason": "target",
+                 "stop_geometry_scenario_bps": 25.0,
+                 "stop_geometry_max_cost_to_risk_ratio": .30,
+                 "stop_geometry_max_tolerable_scenario_bps": 30.0,
+                 "stop_geometry_stress_headroom_bps": 5.0}
+        result = compute_path_telemetry(trade, bars([(100, 102, 99, 101)]))
+        self.assertNotEqual(result.get("authorizing"), True)
+        self.assertEqual(result["stop_geometry_scenario_bps"], 25.0)
+        self.assertEqual(result["stop_geometry_max_tolerable_scenario_bps"], 30.0)
+        self.assertEqual(result["stop_geometry_stress_headroom_bps"], 5.0)
+        aggregate = aggregate_path_telemetry([result])
+        self.assertEqual(aggregate["groups"][0]["geometry"][
+            "stop_geometry_stress_headroom_bps"]["median"], 5.0)
+
     def test_gap_is_observed_and_right_censored(self):
         trade = {"symbol": "SPY", "direction": "long",
                  "entry_timestamp": BASE.isoformat(),

@@ -54,7 +54,8 @@ def _rule_session(ts: datetime) -> str:
 
 def _rule_runtime_bars(
         bars: Any, spec: Mapping[str, Any], now: datetime, *,
-        max_age_seconds: float = 30.0) -> tuple[list, str, float] | None:
+        max_age_seconds: float = 30.0,
+        diagnostics: dict[str, Any] | None = None) -> tuple[list, str, float] | None:
     """Return the current session's completed, contiguous feature prefix.
 
     Replay evaluates one completed session and rejects a gap inside the exact
@@ -63,58 +64,121 @@ def _rule_runtime_bars(
     evaluator; otherwise a fixed lookback could silently span an outage or a
     partial latest candle could become a look-ahead signal.
     """
-    if not isinstance(bars, (list, tuple)) or not isinstance(spec, Mapping):
+    if diagnostics is not None:
+        diagnostics.clear()
+
+    def reject(reason: str, readiness_class: str = "missing", **evidence):
+        if diagnostics is not None:
+            diagnostics.update({
+                "readiness_reason": reason,
+                "readiness_class": readiness_class,
+                "readiness_evidence": evidence,
+            })
         return None
+
+    if not isinstance(bars, (list, tuple)) or not isinstance(spec, Mapping):
+        return reject("invalid_inputs")
     current = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
     parsed: list[tuple[datetime, Any]] = []
-    for row in bars:
+    for index, row in enumerate(bars):
         stamp = _rule_bar_timestamp(row)
         if stamp is None:
-            return None
+            return reject("malformed_bar", bar_index=index)
         stamp = stamp.astimezone(timezone.utc)
         # A row is visible only after its one-minute candle has closed.
         if stamp + timedelta(minutes=1) > current or stamp > current:
-            return None
+            return reject("future_or_incomplete_bar", bar_index=index,
+                          bar_timestamp=stamp.isoformat(),
+                          observed_at=current.isoformat())
         parsed.append((stamp, row))
     if not parsed:
-        return None
+        return reject("no_bars")
     # The replay stream is an ordered event log.  Provider normalization sorts
     # its own responses before this boundary; any caller that reaches here
     # with an early/reversed row is malformed and must fail closed rather than
     # silently repairing the evidence.
-    if any(right[0] <= left[0] for left, right in zip(parsed, parsed[1:])):
-        return None
-    parsed.sort(key=lambda item: item[0])
-    timestamps = [stamp for stamp, _row in parsed]
-    if len(set(timestamps)) != len(timestamps):
-        return None
-    latest_stamp = timestamps[-1]
+    for left, right in zip(parsed, parsed[1:]):
+        if right[0] <= left[0]:
+            reason = "duplicate_bar_timestamp" if right[0] == left[0] else "bar_sequence_invalid"
+            return reject(reason, bar_count=len(parsed))
+    latest_stamp = parsed[-1][0]
     # A completed bar from a prior local session is not an immediate runtime
     # observation.  This also prevents a feed outage at the next open from
     # replaying yesterday's final signal merely because its quote is fresh.
     if _rule_session(latest_stamp) != _rule_session(current):
-        return None
+        return reject("session_mismatch",
+                      latest_bar_timestamp=latest_stamp.isoformat(),
+                      current_session=_rule_session(current),
+                      latest_session=_rule_session(latest_stamp))
     try:
         freshness_limit = float(max_age_seconds)
         if not freshness_limit >= 0 or freshness_limit == float("inf"):
-            return None
+            return reject("invalid_freshness_limit")
         age = (current - (latest_stamp + timedelta(minutes=1))).total_seconds()
         if age < 0 or age > freshness_limit:
-            return None
+            return reject("latest_bar_stale",
+                          latest_bar_timestamp=latest_stamp.isoformat(),
+                          age_seconds=round(age, 3),
+                          max_age_seconds=freshness_limit)
     except (TypeError, ValueError, OverflowError):
-        return None
+        return reject("invalid_freshness_limit")
     session = _rule_session(latest_stamp)
     session_rows = [(stamp, row) for stamp, row in parsed
                     if _rule_session(stamp) == session]
     if not session_rows or session_rows[-1][0] != latest_stamp:
-        return None
+        return reject("session_empty", session=session)
     try:
         from .contracts.rule import (causal_maturity_bars,
+                                     continuity_window_bars,
                                      feature_window_bars)
         window = feature_window_bars(spec)
+        continuity = (continuity_window_bars(spec)
+                      if spec.get("session_gap_mode") == "zero_volume" else window)
         maturity = causal_maturity_bars(spec)
     except (TypeError, ValueError):
-        return None
+        return reject("rule_spec_invalid")
+    # The V7 zero-volume tolerance is deliberately narrower than a generic
+    # trailing-window rule: replay still evaluates session-anchored features
+    # against the complete session prefix and therefore requires the first
+    # observed bar to be the 09:30 New York bar.  Without this guard runtime
+    # could authorize a late-started prefix that replay rejects as missing
+    # session-open evidence.
+    if spec.get("session_gap_mode") == "zero_volume":
+        first_local = session_rows[0][0].astimezone(_NEW_YORK)
+        if (first_local.hour, first_local.minute, first_local.second,
+                first_local.microsecond) != (9, 30, 0, 0):
+            expected_open = first_local.replace(
+                hour=9, minute=30, second=0, microsecond=0).astimezone(timezone.utc)
+            return reject(
+                "session_open_bar_missing", "missing",
+                expected_bar_timestamp=expected_open.isoformat(),
+                first_bar_timestamp=session_rows[0][0].isoformat(),
+                session=session)
+    if spec.get("family") in {"opening_range_breakout", "opening_range_fade",
+                               "opening_drive"}:
+        range_minutes = int(spec.get("range_minutes", 0) or 0)
+        session_open = latest_stamp.astimezone(_NEW_YORK).replace(
+            hour=9, minute=30, second=0, microsecond=0).astimezone(timezone.utc)
+        range_end = session_open + timedelta(minutes=range_minutes)
+        if latest_stamp < range_end:
+            return reject("opening_window_incomplete", "warmup",
+                          range_end=range_end.isoformat(), session=session)
+        expected_opening = {
+            session_open + timedelta(minutes=index)
+            for index in range(max(0, range_minutes))
+        }
+        observed_opening = {stamp for stamp, _row in session_rows
+                            if session_open <= stamp < range_end}
+        missing_opening = expected_opening - observed_opening
+        if missing_opening:
+            missing_stamp = min(missing_opening)
+            return reject(
+                "opening_window_undercovered", "missing",
+                missing_bar_timestamp=missing_stamp.astimezone(
+                    timezone.utc).isoformat(),
+                missing_bar_count=len(missing_opening),
+                range_minutes=range_minutes,
+                session=session)
     feature_rows = session_rows if window is None else session_rows[-int(window):]
     # The bounded continuity window and the causal maturity prefix are
     # separate contracts for session-anchored families: their feature window
@@ -123,15 +187,35 @@ def _rule_runtime_bars(
     # rolling target).  This avoids evaluating an underpowered latest prefix
     # without forcing unrelated older bars for trailing families.
     if len(session_rows) < int(maturity):
-        return None
+        return reject(
+            "insufficient_history", "warmup",
+            available_bars=len(session_rows), required_bars=int(maturity),
+            feature_window_bars=window,
+            continuity_window_bars=continuity,
+            session=session)
     if window is not None and len(feature_rows) < int(window):
-        return None
+        return reject(
+            "insufficient_feature_window", "warmup",
+            available_bars=len(feature_rows), required_bars=int(window),
+            feature_window_bars=window,
+            continuity_window_bars=continuity,
+            session=session)
     # The current signal's feature prefix must be one-minute adjacent.  A gap
     # after a previously resolved position is not in this prefix and is not
     # considered here, matching replay's scoped continuity rule.
-    if any(right[0] - left[0] != timedelta(minutes=1)
-           for left, right in zip(feature_rows, feature_rows[1:])):
-        return None
+    continuity_rows = (session_rows if continuity is None else
+                       session_rows[-int(continuity):])
+    for left, right in zip(continuity_rows, continuity_rows[1:]):
+        if right[0] - left[0] != timedelta(minutes=1):
+            gap_minutes = int((right[0] - left[0]).total_seconds() / 60) - 1
+            return reject(
+                "feature_bar_gap", "missing",
+                gap_from=left[0].isoformat(), gap_to=right[0].isoformat(),
+                gap_minutes=max(1, gap_minutes),
+                checked_bars=len(continuity_rows),
+                feature_window_bars=window,
+                continuity_window_bars=continuity,
+                session=session)
     # Keep the complete current-session prefix for the evaluator.  Opening
     # range families need their clock-anchored opening bars even though their
     # trailing feature continuity check is bounded; dropping those bars here
@@ -158,6 +242,109 @@ def build_setup_plan(*args, **kwargs):
 
 
 class EngineCycleMixin:
+    def _paper_trial_input_identity(self) -> dict[str, Any]:
+        """Return frozen trial identifiers for data-readiness journal rows."""
+        runtime = getattr(self, "_paper_trial_runtime", None)
+        if runtime is None:
+            return {}
+        descriptor = getattr(runtime, "descriptor", {})
+        current = getattr(runtime, "current", {})
+        if not isinstance(descriptor, Mapping):
+            descriptor = {}
+        if not isinstance(current, Mapping):
+            current = {}
+        fields = (
+            ("paper_trial_id", "trial_id"),
+            ("paper_trial_candidate_id", "candidate_id"),
+            ("paper_trial_variant_id", "variant_id"),
+            ("paper_trial_incumbent_identity", "incumbent_identity"),
+        )
+        identity: dict[str, Any] = {}
+        for output, source in fields:
+            value = (descriptor.get(source) or descriptor.get(output) or
+                     current.get(source) or current.get(output))
+            if value:
+                identity[output] = value
+        return identity
+
+    def _rule_signal_rejection(
+            self, *, symbol: str, reason: str,
+            edge_record: Mapping[str, Any] | None = None,
+            strategy_cfg: Mapping[str, Any] | None = None,
+            readiness_class: str | None = None,
+            readiness_evidence: Mapping[str, Any] | None = None,
+            readiness_reason: str | None = None,
+            **detail: Any) -> None:
+        """Journal one rule-input refusal with its exact bounded evidence.
+
+        Runtime used to collapse every failed bar preparation into the same
+        ``completed_contiguous_feature_bars_required`` label.  That made a
+        stale feed indistinguishable from warmup, a gap, or a malformed row,
+        and left the frozen paper-trial identity absent from the only durable
+        record of the refusal.  Keep the event additive and bounded: the
+        evaluator's economic rule is untouched, while operators get the
+        precise readiness reason and the identity that was active for it.
+        """
+        record = edge_record if isinstance(edge_record, Mapping) else {}
+        strategy = strategy_cfg if isinstance(strategy_cfg, Mapping) else {}
+        variant_id = (record.get("variant_id") or strategy.get("variant_id"))
+        payload: dict[str, Any] = {
+            "symbol": str(symbol).upper(),
+            "reason": str(reason),
+        }
+        if variant_id:
+            payload["variant_id"] = variant_id
+        if readiness_reason:
+            payload["readiness_reason"] = str(readiness_reason)
+        if readiness_class:
+            payload["readiness_class"] = str(readiness_class)
+        if readiness_evidence is not None:
+            payload["readiness_evidence"] = dict(readiness_evidence)
+        payload.update(detail)
+        payload.update(self._paper_trial_input_identity())
+        self._event("rule_signal_reject", payload)
+
+    def _paper_trial_signal_telemetry_once(
+            self, *, symbol: str, session: str, latest_bar_ts: float,
+            reason: str, readiness_reason: str,
+            readiness_evidence: Mapping[str, Any] | None = None,
+            edge_record: Mapping[str, Any] | None = None,
+            strategy_cfg: Mapping[str, Any] | None = None) -> None:
+        """Bound generic evaluator telemetry to one row per trial bar.
+
+        Ordinary runtime predicates remain journal-free when they simply do
+        not emit a signal. The active paper-trial lane gets one bounded row so
+        a valid no-signal result is distinguishable from input refusal without
+        re-running the staged evaluator on every poll.
+        """
+        runtime = getattr(self, "_paper_trial_runtime", None)
+        current = getattr(runtime, "current", {}) if runtime is not None else {}
+        if (runtime is None or not isinstance(current, Mapping) or
+                current.get("activation_confirmed") is not True):
+            return
+        descriptor = getattr(runtime, "descriptor", {})
+        if not isinstance(descriptor, Mapping):
+            descriptor = {}
+        trial_id = str(current.get("trial_id") or
+                       descriptor.get("trial_id", ""))
+        key = (trial_id, str(symbol).upper(), str(session), round(float(latest_bar_ts), 6))
+        seen = getattr(self, "_paper_trial_signal_telemetry_keys", None)
+        if not isinstance(seen, dict):
+            seen = {}
+            self._paper_trial_signal_telemetry_keys = seen
+        if key in seen:
+            return
+        seen[key] = None
+        if len(seen) > 512:
+            seen.pop(next(iter(seen)))
+        self._rule_signal_rejection(
+            symbol=symbol, reason=reason,
+            edge_record=edge_record, strategy_cfg=strategy_cfg,
+            readiness_class=("unavailable" if reason ==
+                              "signal_evaluation_unavailable" else "predicate"),
+            readiness_reason=readiness_reason,
+            readiness_evidence=readiness_evidence)
+
     def _pause_with_residual_risk(self, reason: str) -> None:
         """Keep failed exits visible while the next cycle retries protection."""
         try:
@@ -790,6 +977,11 @@ class EngineCycleMixin:
                 # The book is flat here (positions collect their rows above),
                 # so a failed data read only blocks this cycle's entries.
                 self._event("entry_market_data_unavailable", {"error": str(exc)})
+                try:
+                    state.write_heartbeat("degraded", **self._cycle_heartbeat_detail(
+                        run_id=self.run_id, reason="market_data_unavailable", orders=0))
+                except Exception:
+                    pass
                 return {"action": "hold", "reason": "market_data_unavailable",
                         "error": str(exc)}
         try:
@@ -948,19 +1140,30 @@ class EngineCycleMixin:
                     execution_mode = str(
                         strategy_cfg.get("execution_mode") or "").lower()
                     if not rule_vehicle_executable(rule_spec, execution_mode):
-                        self._event("rule_signal_reject", {
-                            "symbol": symbol,
-                            "reason": "rule_vehicle_not_executable",
-                            "variant_id": (edge_record or {}).get("variant_id")})
+                        self._rule_signal_rejection(
+                            symbol=symbol, reason="rule_vehicle_not_executable",
+                            edge_record=edge_record, strategy_cfg=strategy_cfg,
+                            readiness_class="policy")
                         continue
+                    readiness: dict[str, Any] = {}
                     prepared = _rule_runtime_bars(
                         bars, rule_spec, now,
-                        max_age_seconds=configured_bar_age)
+                        max_age_seconds=configured_bar_age,
+                        diagnostics=readiness)
                     if prepared is None:
-                        self._event("rule_signal_reject", {
-                            "symbol": symbol,
-                            "reason": "completed_contiguous_feature_bars_required",
-                            "variant_id": (edge_record or {}).get("variant_id")})
+                        rejection_reason = (
+                            readiness.get("readiness_reason") or
+                            "completed_contiguous_feature_bars_required")
+                        self._rule_signal_rejection(
+                            symbol=symbol,
+                            # Keep the established consumer-facing reason;
+                            # exact readiness is additive below.
+                            reason="completed_contiguous_feature_bars_required",
+                            edge_record=edge_record, strategy_cfg=strategy_cfg,
+                            readiness_class=readiness.get("readiness_class"),
+                            readiness_reason=rejection_reason,
+                            readiness_evidence=readiness.get(
+                                "readiness_evidence"))
                         continue
                     rule_bars, current_session, latest_bar_ts = prepared
                     market_context = None
@@ -969,35 +1172,57 @@ class EngineCycleMixin:
                         benchmark_bars = (benchmark_row.get("bars", [])
                                           if isinstance(benchmark_row, Mapping)
                                           else [])
+                        benchmark_readiness: dict[str, Any] = {}
                         benchmark_prepared = (
                             prepared if symbol == CROSS_SECTIONAL_BENCHMARK else
                             _rule_runtime_bars(
                                 benchmark_bars, rule_spec, now,
-                                max_age_seconds=configured_bar_age))
+                                max_age_seconds=configured_bar_age,
+                                diagnostics=benchmark_readiness))
                         if benchmark_prepared is None:
                             reason = ("benchmark_context_missing"
                                       if not benchmark_bars else
                                       "benchmark_context_stale")
-                            self._event("rule_signal_reject", {
-                                "symbol": symbol, "reason": reason,
-                                "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
-                                "variant_id": (edge_record or {}).get("variant_id")})
+                            self._rule_signal_rejection(
+                                symbol=symbol, reason=reason,
+                                edge_record=edge_record, strategy_cfg=strategy_cfg,
+                                readiness_class=benchmark_readiness.get(
+                                    "readiness_class"),
+                                readiness_reason=benchmark_readiness.get(
+                                    "readiness_reason"),
+                                readiness_evidence=benchmark_readiness.get(
+                                    "readiness_evidence"),
+                                benchmark_symbol=CROSS_SECTIONAL_BENCHMARK)
                             continue
                         market_context = MappingProxyType({
                             CROSS_SECTIONAL_BENCHMARK:
                                 tuple(benchmark_prepared[0]),
                         })
                     if signal_sessions.get(signal_state_key) == current_session:
-                        self._event("rule_signal_duplicate_blocked", {
-                            "symbol": symbol, "session": current_session})
+                        duplicate_detail = {
+                            "symbol": symbol, "session": current_session,
+                            **self._paper_trial_input_identity(),
+                        }
+                        self._event("rule_signal_duplicate_blocked",
+                                    duplicate_detail)
                         continue
-                    if market_context is None:
-                        signal = generate_rule_signal(
-                            symbol, rule_bars, config=edge_cfg, now=now)
-                    else:
-                        signal = generate_rule_signal(
-                            symbol, rule_bars, config=edge_cfg, now=now,
-                            bars_by_symbol=market_context)
+                    try:
+                        if market_context is None:
+                            signal = generate_rule_signal(
+                                symbol, rule_bars, config=edge_cfg, now=now)
+                        else:
+                            signal = generate_rule_signal(
+                                symbol, rule_bars, config=edge_cfg, now=now,
+                                bars_by_symbol=market_context)
+                    except Exception as exc:  # noqa: BLE001
+                        self._paper_trial_signal_telemetry_once(
+                            symbol=symbol, session=current_session,
+                            latest_bar_ts=latest_bar_ts,
+                            reason="signal_evaluation_unavailable",
+                            readiness_reason="evaluator_unavailable",
+                            readiness_evidence={"error_type": type(exc).__name__},
+                            edge_record=edge_record, strategy_cfg=strategy_cfg)
+                        raise
                     if (signal is None and
                             rule_spec["family"] == "cross_sectional_residual"):
                         trace = evaluate_rule_signal_trace(
@@ -1008,10 +1233,22 @@ class EngineCycleMixin:
                                   if stages else "")
                         if reason.startswith(("benchmark_context_",
                                               "subject_context_")):
-                            self._event("rule_signal_reject", {
-                                "symbol": symbol, "reason": reason,
-                                "benchmark_symbol": CROSS_SECTIONAL_BENCHMARK,
-                                "variant_id": (edge_record or {}).get("variant_id")})
+                            self._rule_signal_rejection(
+                                symbol=symbol, reason=reason,
+                                edge_record=edge_record, strategy_cfg=strategy_cfg,
+                                readiness_class="missing",
+                                benchmark_symbol=CROSS_SECTIONAL_BENCHMARK)
+                            continue
+                    if signal is None:
+                        self._paper_trial_signal_telemetry_once(
+                            symbol=symbol, session=current_session,
+                            latest_bar_ts=latest_bar_ts,
+                            reason="no_signal",
+                            readiness_reason="predicate_not_met",
+                            readiness_evidence={
+                                "completed_bar_timestamp": datetime.fromtimestamp(
+                                    latest_bar_ts, timezone.utc).isoformat()},
+                            edge_record=edge_record, strategy_cfg=strategy_cfg)
                     if signal is not None:
                         signal_ts = signal.get("signal_ts")
                         try:
@@ -1024,10 +1261,11 @@ class EngineCycleMixin:
                         if (signal_ts is None or
                                 abs(signal_ts - latest_bar_ts) > 1e-6 or
                                 str(signal.get("session") or "") != current_session):
-                            self._event("rule_signal_reject", {
-                                "symbol": symbol,
-                                "reason": "signal_not_fresh_for_latest_completed_bar",
-                                "variant_id": (edge_record or {}).get("variant_id")})
+                            self._rule_signal_rejection(
+                                symbol=symbol,
+                                reason="signal_not_fresh_for_latest_completed_bar",
+                                edge_record=edge_record, strategy_cfg=strategy_cfg,
+                                readiness_class="stale")
                             signal = None
                     if signal is not None:
                         emitted_session = current_session
@@ -1104,7 +1342,10 @@ class EngineCycleMixin:
                 }
                 plan, why = build_setup_plan(signal, plan_snapshot, edge_cfg)
                 if plan is None:
-                    self._event("setup_reject", {"symbol": symbol, "reason": why})
+                    self._event("setup_reject", {
+                        "symbol": symbol, "reason": why,
+                        **self._paper_trial_input_identity(),
+                    })
                     continue
                 if (strategy_id == "rule" and
                         rule_spec["family"] == "cross_sectional_residual"):
@@ -1127,7 +1368,9 @@ class EngineCycleMixin:
                 if key in placed_keys or symbol in pending_underlyings:
                     self._event("entry_duplicate_blocked", {
                         "symbol": symbol, "direction": key[1],
-                        "variant_id": (edge_record or {}).get("variant_id")})
+                        "variant_id": (edge_record or {}).get("variant_id"),
+                        **self._paper_trial_input_identity(),
+                    })
                     continue
                 try:
                     sized = self._risk_order(
@@ -1169,7 +1412,8 @@ class EngineCycleMixin:
                 if (len(positions) + pending_position_count + len(placed) >=
                         max_positions):
                     self._event("risk_reject", {"symbol": symbol,
-                                                  "reason": "max concurrent positions reached"})
+                                                  "reason": "max concurrent positions reached",
+                                                  **self._paper_trial_input_identity()})
                     continue
                 equity = self._number(_value(account, "equity", 0)) or 0
                 risk_cap = self._number(risk_cfg.get(
@@ -1178,18 +1422,21 @@ class EngineCycleMixin:
                         candidate_risk >
                         equity * risk_cap / 100.0 + 1e-9):
                     self._event("risk_reject", {"symbol": symbol,
-                                                  "reason": "max open risk cap reached"})
+                                                  "reason": "max open risk cap reached",
+                                                  **self._paper_trial_input_identity()})
                     continue
                 gross_cap = self._number(risk_cfg.get("max_gross_exposure_pct"))
                 if (gross_cap is not None and gross + pending_notional + planned_notional +
                         candidate_notional >
                         equity * gross_cap / 100.0 + 1e-9):
                     self._event("risk_reject", {"symbol": symbol,
-                                                  "reason": "max gross exposure reached"})
+                                                  "reason": "max gross exposure reached",
+                                                  **self._paper_trial_input_identity()})
                     continue
                 if self._client_order_pending(request.client_order_id):
                     self._event("entry_pending", {"symbol": request.symbol,
-                                                    "client_order_id": request.client_order_id})
+                                                    "client_order_id": request.client_order_id,
+                                                    **self._paper_trial_input_identity()})
                     continue
                 try:
                     risk_plan = dict(risk_plan)

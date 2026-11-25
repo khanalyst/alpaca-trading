@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 
 from agent.contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
-    quantize_equity_bracket,
+    maximum_tolerable_stress_bps, quantize_equity_bracket,
 )
 from agent.contracts.rule import (
     MIN_STOP_DISTANCE_BPS, RULE_SCHEMA_V4, RULE_SCHEMA_V5, RULE_SCHEMA_V6, RULE_SCHEMA_V7, canonical_exit_reason,
@@ -1066,6 +1066,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         authored_distance = distance
         stop_floor_bps = MIN_STOP_DISTANCE_BPS
         stop_floor_binding = False
+        max_tolerable_stress = None
         stress_scenario, stress_activation_reason = (
             policy.resolve_stress_scenario(
                 symbol, entry_at, vehicle=vehicle))
@@ -1095,6 +1096,9 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             # authored stop or recompute its target, since doing so changes the
             # candidate's exit distribution instead of testing the same rule.
             stop_floor_binding = effective_distance > authored_distance + 1e-12
+            max_tolerable_stress = maximum_tolerable_stress_bps(
+                authored_distance / entry_underlying * 10_000.0,
+                policy.max_stressed_cost_to_risk_ratio)
             if stop_floor_binding:
                 geometry_telemetry = {
                     "reject_stage": "risk_geometry",
@@ -1106,6 +1110,10 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                     "stop_geometry_scenario_bps": stress_scenario,
                     "stop_geometry_max_cost_to_risk_ratio": (
                         policy.max_stressed_cost_to_risk_ratio),
+                    "stop_geometry_max_tolerable_scenario_bps": (
+                        max_tolerable_stress),
+                    "stop_geometry_stress_headroom_bps": (
+                        max_tolerable_stress - float(stress_scenario)),
                     "stop_geometry_activation_reason": (
                         stress_activation_reason),
                 }
@@ -1452,6 +1460,12 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                      "stop_geometry_scenario_bps": stress_scenario,
                      "stop_geometry_max_cost_to_risk_ratio": (
                          policy.max_stressed_cost_to_risk_ratio),
+                     "stop_geometry_max_tolerable_scenario_bps": (
+                         max_tolerable_stress),
+                     "stop_geometry_stress_headroom_bps": (
+                         (None if max_tolerable_stress is None or
+                          stress_scenario is None else
+                          max_tolerable_stress - float(stress_scenario))),
                      "stop_geometry_activation_reason": (
                          stress_activation_reason),
                      "active_stop_price": float(

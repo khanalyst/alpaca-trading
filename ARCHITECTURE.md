@@ -66,6 +66,17 @@ normalizes bars/quotes/option snapshots, partitions by New York session date,
 and writes append-only data plus bounded status/index sidecars. Catch-up and
 forward-only capture remain distinct; historical backfill is diagnostic.
 
+The recorder targets a 30-second poll interval. In `forward_only` capture,
+the next poll can recover recently completed bars from the same session.
+It records when it actually received each response. The recorder fetches
+full quote ticks on their own schedule and de-duplicates repeated ticks by
+exact event key in SQLite with `synchronous=FULL`.
+
+The trader requests completed bars from the session open and quotes within
+its configured maximum quote age. Paper trial events identify the frozen
+variant and distinguish feature warmup, missing or stale inputs, and a valid
+evaluation that produced no signal.
+
 research.py provides source validation, IBR replay, edge commands, factory
 discovery, shadow ingestion, calibration, and reports. The scheduled cycle
 checks source boundaries, runs enabled diagnostics, consumes shadow WAL, and

@@ -145,6 +145,33 @@ class ForceFlatSupervisorHeartbeatTests(unittest.TestCase):
         self.assertTrue(runtime["operator_pause"])
         self.assertEqual(provider.orders_sent, [])
 
+    def test_flat_book_data_outage_reports_progress_to_supervisor(self):
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.now
+        clock = _FakeClock(provider.now.timestamp())
+        child = _FakeChild(polls_before_exit=7)
+
+        def run_cycle(interval):
+            provider.now += timedelta(seconds=interval)
+            clock.wall += interval
+            clock.monotonic_value += interval
+            self.assertEqual(engine.run_once()["reason"], "market_data_unavailable")
+
+        with patch.object(engine, "_collect", side_effect=RuntimeError("feed offline")), \
+                patch.object(state.time, "time", side_effect=clock.wall_time):
+            verdict = supervisor.monitor(
+                child, state.HEARTBEAT_FILE, max_age=300, interval=60,
+                started_wall=clock.wall, stop_requested=lambda: False,
+                monotonic=clock.monotonic, wall_time=clock.wall_time, sleep=run_cycle)
+        self.assertEqual(verdict, "exit")
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "degraded")
+        self.assertEqual(heartbeat["reason"], "market_data_unavailable")
+        self.assertFalse(state.load_state()["operator_pause"])
+        self.assertEqual(provider.orders_sent, [])
+
 
 if __name__ == "__main__":
     unittest.main()

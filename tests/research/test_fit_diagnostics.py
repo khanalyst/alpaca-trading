@@ -371,12 +371,19 @@ class FitDiagnosticsTests(unittest.TestCase):
                 "vehicle": "option", "no_trade": False, "plan_entry": 2.0,
                 "quantity": 2, "contract_multiplier": 100, "risk_usd": 100.0,
                 "costs": 1.0,
-            }])
+            }], risk_config={"risk": {
+                "stressed_cost_scenario_bps": 25.0,
+                "max_stressed_cost_to_risk_ratio": 0.30,
+            }})
         # $400 entry notional * 9 bps + two contracts x two sides x $0.65.
         self.assertAlmostEqual(option["cost_to_risk"]["stressed"]["9"]["total_cost"],
                                2.96)
         self.assertAlmostEqual(option["cost_to_risk"]["stressed"]["9"]["cost_to_risk_ratio"],
                                .0296)
+        # Option stop geometry is plan-dependent; the grammar-floor boundary
+        # must remain null even when the shared stress policy is configured.
+        self.assertIsNone(
+            option["risk_controls"]["grammar_floor_max_tolerable_stress_bps"])
 
     def test_fit_output_exposes_provenance_pricing_and_risk_controls(self):
         bars, _snapshots, _quotes = self._fit()
@@ -389,6 +396,10 @@ class FitDiagnosticsTests(unittest.TestCase):
                 "entry_fill_source": "quote", "exit_fill_source": "quote",
                 "entry_feed": "sip", "exit_feed": "sip",
                 "entry_provider": "alpaca", "exit_provider": "alpaca",
+                "stop_geometry_scenario_bps": 25.0,
+                "stop_geometry_max_cost_to_risk_ratio": .30,
+                "stop_geometry_max_tolerable_scenario_bps": 12.0,
+                "stop_geometry_stress_headroom_bps": -13.0,
             }, {"vehicle": "equity", "no_trade": False}],
             risk_config={"risk": {
                 "stressed_cost_scenario_bps": 25.0,
@@ -410,6 +421,10 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertEqual(controls["stressed_cost_scenario_bps"], 25.0)
         self.assertEqual(controls["max_stressed_cost_to_risk_ratio"], 0.30)
         self.assertEqual(controls["basis"]["notional"], "entry_notional")
+        self.assertEqual(controls["grammar_floor_max_tolerable_stress_bps"], 9.0)
+        self.assertEqual(
+            controls["observed_geometry"][
+                "stop_geometry_stress_headroom_bps"]["median"], -13.0)
         statuses = diagnostic["cost_to_risk"]["stressed"]["25"]["row_status"]
         self.assertEqual(statuses, {"pass": 0, "fail": 1, "unknown": 1})
 

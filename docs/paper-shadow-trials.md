@@ -63,6 +63,13 @@ Outcomes are appended atomically with closes and carry
 `authorizing: false` and `proof_authority: false`; they never enter the
 authorizing EdgeLedger/FDR outbox.
 
+Inspect the frozen trial configuration for its stressed round-trip cost.
+The shipped template uses 9 bp. At a 30% cost-to-risk cap, a trial configured
+for 25 bp requires at least 83.33 bp of stop distance before broker tick
+rounding. Rejection records report the largest stress the submitted stop
+could support. The configured cost stays frozen for that trial. Quote-cost
+calibration compares separate fit and validation sessions.
+
 The retained `require_validated_variant` setting is a configuration invariant,
 not ordinary EdgeLedger proof authority for this exception. When the explicit
 paper-trial block is enabled, `Engine` sets its normal edge requirement aside

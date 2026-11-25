@@ -511,6 +511,12 @@ class RiskProfileTests(unittest.TestCase):
                 self.assertEqual(evidence["stage"], "risk_geometry")
                 self.assertAlmostEqual(evidence["authored_stop_distance_bps"], 100)
                 self.assertAlmostEqual(evidence["effective_stop_floor_bps"], 25 / limit)
+                self.assertAlmostEqual(
+                    evidence["stop_geometry_max_tolerable_scenario_bps"],
+                    100.0 * limit)
+                self.assertAlmostEqual(
+                    evidence["stop_geometry_stress_headroom_bps"],
+                    100.0 * limit - 25.0)
                 continue
             self.assertEqual(evidence, {})
             self.assertIsNotNone(plan)
@@ -518,6 +524,12 @@ class RiskProfileTests(unittest.TestCase):
             self.assertFalse(plan["stress_floor_binding"])
             self.assertEqual(plan["authored_stop_distance"], 1.0)
             self.assertAlmostEqual(plan["effective_stop_floor_bps"], 25.0 / limit)
+            self.assertAlmostEqual(
+                plan["stop_geometry_max_tolerable_scenario_bps"],
+                100.0 * limit)
+            self.assertAlmostEqual(
+                plan["stop_geometry_stress_headroom_bps"],
+                100.0 * limit - 25.0)
             self.assertEqual(plan["stressed_cost_scenario_bps"], 25.0)
             self.assertAlmostEqual(plan["stressed_cost_usd"], 12.5)
             self.assertLessEqual(plan["stressed_cost_to_risk_ratio"], limit)

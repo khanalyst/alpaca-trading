@@ -50,6 +50,28 @@ def required_stop_distance_bps(scenario_bps: object,
     return scenario / ratio
 
 
+def maximum_tolerable_stress_bps(stop_distance_bps: object,
+                                 max_cost_to_risk_ratio: object) -> float:
+    """Return the largest stress a fixed stop can admit.
+
+    The stressed-cost boundary is ``scenario / ratio <= stop_distance``.
+    Solving that inequality for the scenario gives this diagnostic decision
+    boundary.  It never changes the configured stress or an authored stop.
+    A zero risk ratio intentionally tolerates no positive stress and returns
+    zero, while malformed or negative values fail closed like the companion
+    geometry helpers.
+    """
+
+    stop = _finite_number(stop_distance_bps, "stop_distance_bps")
+    ratio = _finite_number(max_cost_to_risk_ratio,
+                           "max_cost_to_risk_ratio")
+    if stop < 0:
+        raise RiskGeometryError("stop_distance_bps cannot be negative")
+    if ratio < 0:
+        raise RiskGeometryError("max_cost_to_risk_ratio cannot be negative")
+    return stop * ratio
+
+
 def effective_stop_floor_bps(base_floor_bps: object, scenario_bps: object,
                              max_cost_to_risk_ratio: object) -> float:
     """Return the stricter of the grammar floor and stress-implied floor."""
@@ -172,6 +194,7 @@ def quantize_equity_bracket(entry_price: object, stop_price: object,
 
 __all__ = [
     "RiskGeometryError", "effective_stop_distance", "equity_price_increment",
-    "effective_stop_floor_bps", "quantize_equity_bracket",
+    "effective_stop_floor_bps", "maximum_tolerable_stress_bps",
+    "quantize_equity_bracket",
     "quantize_equity_price", "required_stop_distance_bps",
 ]

@@ -115,6 +115,20 @@ already observed by the recorder. The historical quote request still fetches
 the ticks in the original window. Quotes keep their provider timestamp and
 receipt time, and the configured freshness checks still apply.
 
+The recorder target interval is 30 seconds (the Compose and systemd defaults).
+When a full-tick request overruns a minute boundary, the next `forward_only`
+poll may overlap the recent current-session bar request anchored on the prior
+durable bar's market timestamp. This bar overlap is bounded by the
+forward-observation and de-duplication horizons. The quote cursor remains
+separate, and returned rows retain their actual receipt times. The exact recent
+tick keys are retained in the SQLite sidecar with rollback `DELETE` journaling
+and `synchronous=FULL`, so overlap recovery does not discard received ticks.
+
+Cadence is anchored to cycle start. After a successful `forward_only` cycle that
+overruns the target, the next poll starts immediately after the cycle completes.
+Shorter polls wait until the next interval measured from the previous start.
+Failed cycles keep their bounded retry checkpoint.
+
 Recorder health reports the bytes available above the configured disk reserve
 under `storage_headroom`. Its session estimate uses the largest of the last
 five closed partition files. A partial recording can understate future usage.

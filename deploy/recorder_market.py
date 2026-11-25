@@ -419,6 +419,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
           *, feed: str | None = None, config: dict | None = None,
           include_options: bool = False, option_limit: int = 5,
           start: datetime | None = None,
+          bar_start: datetime | None = None,
           option_pins: frozenset[str] = frozenset(),
           observed_at: datetime | None = None,
           refresh_quote_end: bool = False,
@@ -531,11 +532,13 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     # A quote watermark can fall partway through a minute. Round only the bar
     # request back to its start so an updated previous-minute bar is observed
     # by the overlap; quote acquisition keeps its original bounded window.
+    bar_request_start = (bar_start or start).replace(second=0, microsecond=0)
     if telemetry is not None:
+        telemetry["bar_request_start_at"] = bar_request_start.isoformat()
         telemetry["bar_request_end_at"] = now.isoformat()
     with _market_phase(telemetry, "bars_fetch_seconds"):
         bars = _call_market_data(provider.bars, symbols,
-                                 start=start.replace(second=0, microsecond=0), end=now,
+                                 start=bar_request_start, end=now,
                                  feed=feed)
     bars_received = datetime.now(timezone.utc)
     # Only real-time forward capture opts in. Explicit replay/catch-up bounds

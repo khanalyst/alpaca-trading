@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.risk_geometry import (
     RiskGeometryError, effective_stop_distance, equity_price_increment,
-    quantize_equity_bracket,
+    maximum_tolerable_stress_bps, quantize_equity_bracket,
 )
 from agent.contracts.ibr import IBRConfig as ContractIBRConfig
 from agent.contracts.ibr import (
@@ -390,6 +390,8 @@ class IBRTrade:
     stress_floor_binding: bool = False
     stop_geometry_scenario_bps: float | None = None
     stop_geometry_max_cost_to_risk_ratio: float | None = None
+    stop_geometry_max_tolerable_scenario_bps: float | None = None
+    stop_geometry_stress_headroom_bps: float | None = None
     stop_geometry_activation_reason: str | None = None
     # Canonical durable cause; ``exit_reason`` remains the compatibility
     # alias consumed by legacy research reports.
@@ -780,6 +782,8 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      stress_floor_binding: bool = False,
                      stop_geometry_scenario_bps: float | None = None,
                      stop_geometry_max_cost_to_risk_ratio: float | None = None,
+                     stop_geometry_max_tolerable_scenario_bps: float | None = None,
+                     stop_geometry_stress_headroom_bps: float | None = None,
                      stop_geometry_activation_reason: str | None = None,
                      evidence_records: Sequence[object] = (),
                      discontinuity: bool = False,
@@ -876,6 +880,9 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         stop_geometry_scenario_bps=stop_geometry_scenario_bps,
         stop_geometry_max_cost_to_risk_ratio=(
             stop_geometry_max_cost_to_risk_ratio),
+        stop_geometry_max_tolerable_scenario_bps=(
+            stop_geometry_max_tolerable_scenario_bps),
+        stop_geometry_stress_headroom_bps=stop_geometry_stress_headroom_bps,
         stop_geometry_activation_reason=stop_geometry_activation_reason,
         # ``exit_reason`` stays the compatibility alias (a hold cut short by
         # missing data still exits through the force-flat path); the durable
@@ -1311,6 +1318,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     stop_floor_bps = MIN_STOP_DISTANCE_BPS
     stop_floor_binding = False
     stop_geometry_scenario = None
+    max_tolerable_stress = None
     stop_geometry_activation_reason = "stress_disabled"
     stress_geometry_requested = (
         cfg.policy.stressed_cost_scenario_bps is not None or
@@ -1337,6 +1345,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         # target intact; widening either would change the strategy being
         # replayed and could make its bracket appear executable by fiat.
         stop_floor_binding = effective_distance > authored_distance + 1e-12
+        max_tolerable_stress = maximum_tolerable_stress_bps(
+            authored_distance / anchor * 10_000.0,
+            cfg.policy.max_stressed_cost_to_risk_ratio)
         if stop_floor_binding:
             return refuse(
                 "stressed_cost_risk_limit",
@@ -1350,6 +1361,10 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                     "stop_geometry_scenario_bps": stop_geometry_scenario,
                     "stop_geometry_max_cost_to_risk_ratio": (
                         cfg.policy.max_stressed_cost_to_risk_ratio),
+                    "stop_geometry_max_tolerable_scenario_bps": (
+                        max_tolerable_stress),
+                    "stop_geometry_stress_headroom_bps": (
+                        max_tolerable_stress - float(stop_geometry_scenario)),
                     "stop_geometry_activation_reason": (
                         stop_geometry_activation_reason),
                 })
@@ -1485,6 +1500,13 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                         stop_geometry_scenario),
                                     stop_geometry_max_cost_to_risk_ratio=(
                                         cfg.policy.max_stressed_cost_to_risk_ratio),
+                                    stop_geometry_max_tolerable_scenario_bps=(
+                                        max_tolerable_stress),
+                                    stop_geometry_stress_headroom_bps=(
+                                        None if max_tolerable_stress is None or
+                                        stop_geometry_scenario is None else
+                                        max_tolerable_stress - float(
+                                            stop_geometry_scenario)),
                                     stop_geometry_activation_reason=(
                                         stop_geometry_activation_reason),
                                     evidence_records=consumed_evidence(bar))
@@ -1532,6 +1554,13 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                         stop_geometry_scenario),
                                     stop_geometry_max_cost_to_risk_ratio=(
                                         cfg.policy.max_stressed_cost_to_risk_ratio),
+                                    stop_geometry_max_tolerable_scenario_bps=(
+                                        max_tolerable_stress),
+                                    stop_geometry_stress_headroom_bps=(
+                                        None if max_tolerable_stress is None or
+                                        stop_geometry_scenario is None else
+                                        max_tolerable_stress - float(
+                                            stop_geometry_scenario)),
                                     stop_geometry_activation_reason=(
                                         stop_geometry_activation_reason),
                                     evidence_records=consumed_evidence(bar))
@@ -1602,6 +1631,13 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                 stop_geometry_scenario),
                             stop_geometry_max_cost_to_risk_ratio=(
                                 cfg.policy.max_stressed_cost_to_risk_ratio),
+                            stop_geometry_max_tolerable_scenario_bps=(
+                                max_tolerable_stress),
+                            stop_geometry_stress_headroom_bps=(
+                                None if max_tolerable_stress is None or
+                                stop_geometry_scenario is None else
+                                max_tolerable_stress - float(
+                                    stop_geometry_scenario)),
                             stop_geometry_activation_reason=(
                                 stop_geometry_activation_reason),
                             evidence_records=consumed_evidence(last))

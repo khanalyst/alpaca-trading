@@ -30,6 +30,7 @@ from agent.contracts.rule import (MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
                                   rule_semantic_distance,
                                   rule_semantic_signature, rule_variant_id,
                                   validate_rule_spec)
+from agent.contracts.risk_geometry import maximum_tolerable_stress_bps
 from .costs import (BAR, QUOTE, STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                     CostModel, ReplayPolicy, SQLiteQuoteIndex,
                     diagnostic_backfill_policy, index_quotes, quote_fill,
@@ -500,6 +501,7 @@ _FIT_EXECUTION_GEOMETRY_KEYS = frozenset({
     "stressed_cost_scenario_bps", "scenario_bps",
     "max_stressed_cost_to_risk_ratio", "max_cost_to_risk_ratio",
     "required_stop_distance_bps", "grammar_stop_floor_bps",
+    "grammar_floor_max_tolerable_stress_bps",
     "effective_stop_floor_bps", "grammar_stop_floor_admissible",
     "policy_adjusted_stop_floor_admissible",
     "stop_distance_formula_available",
@@ -843,6 +845,10 @@ def _execution_geometry_context(*, vehicle: str, costs: CostModel,
         "max_stressed_cost_to_risk_ratio": ratio_value,
         "max_cost_to_risk_ratio": ratio_value,
         "grammar_stop_floor_bps": float(MIN_STOP_DISTANCE_BPS),
+        "grammar_floor_max_tolerable_stress_bps": (
+            None if vehicle == "option" or ratio_value is None else
+            maximum_tolerable_stress_bps(float(MIN_STOP_DISTANCE_BPS),
+                                         ratio_value)),
         "expected_cost_calibration_independent_of_stress": True,
         "expected_cost_calibration_is_independent": True,
         "expected_cost_calibration_note": (

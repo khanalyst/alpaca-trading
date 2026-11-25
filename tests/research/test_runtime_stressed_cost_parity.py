@@ -99,6 +99,15 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
                     self.assertEqual(row[key], runtime[key])
         self.assertEqual(row["stressed_cost_schema"], STRESSED_COST_SCHEMA)
         self.assertEqual(row["stressed_cost_basis"], STRESSED_COST_BASIS)
+        expected_tolerable = (
+            row["stop_distance"] / row["entry_reference"] * 10_000.0 *
+            self.policy.max_stressed_cost_to_risk_ratio)
+        self.assertAlmostEqual(
+            row["stop_geometry_max_tolerable_scenario_bps"],
+            expected_tolerable)
+        self.assertAlmostEqual(
+            row["stop_geometry_stress_headroom_bps"],
+            expected_tolerable - row["stop_geometry_scenario_bps"])
 
     def test_thirty_bp_floor_is_vetoed_by_factory_null_and_runtime(self):
         # First replay without stress to retain the authored geometry.  Every
@@ -151,6 +160,16 @@ class RuntimeStressedCostParityTests(unittest.TestCase):
         self.assertAlmostEqual(null_row["authored_stop_distance"], .31)
         self.assertAlmostEqual(null_row["effective_stop_floor_bps"],
                                candidate_row["effective_stop_floor_bps"])
+        expected_tolerable = (
+            null_row["authored_stop_distance"] /
+            reference_row["entry_reference"] * 10_000.0 *
+            self.policy.max_stressed_cost_to_risk_ratio)
+        self.assertAlmostEqual(
+            null_row["stop_geometry_max_tolerable_scenario_bps"],
+            expected_tolerable)
+        self.assertAlmostEqual(
+            null_row["stop_geometry_stress_headroom_bps"],
+            expected_tolerable - null_row["stop_geometry_scenario_bps"])
 
 
 if __name__ == "__main__":

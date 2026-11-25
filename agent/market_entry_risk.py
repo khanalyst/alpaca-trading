@@ -200,6 +200,7 @@ class MarketEntryRiskMixin:
         """Fetch only configured symbols and completed one-minute bars."""
         if self._timestamp(now) is None:
             return {}
+        max_age = float(self.cfg.get("execution", {}).get("max_market_data_age_seconds", 30))
         if supplied is not None:
             if not isinstance(supplied, Mapping):
                 return {}
@@ -216,12 +217,14 @@ class MarketEntryRiskMixin:
             session = self.market.session(now)
             start = session.open if session is not None else now - timedelta(hours=8)
             fetched_bars = self.market.stock_bars(symbols, timeframe="1m", start=start, end=end)
-            fetched_quotes = self.market.stock_quotes(symbols, start=now - timedelta(minutes=2), end=end)
+            # A quote older than this cutoff cannot affect any collected row.
+            # Keep the inclusive decision window and avoid paging older ticks.
+            fetched_quotes = self.market.stock_quotes(
+                symbols, start=now - timedelta(seconds=max_age), end=end)
             rows = {
                 symbol: {"bars": fetched_bars.get(symbol, []), "quotes": fetched_quotes.get(symbol, [])}
                 for symbol in symbols
             }
-        max_age = float(self.cfg.get("execution", {}).get("max_market_data_age_seconds", 30))
         result = {}
         for symbol in symbols:
             raw_row = rows.get(symbol, {}) if isinstance(rows, Mapping) else {}

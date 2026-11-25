@@ -12,6 +12,7 @@ import tempfile
 import types
 import unittest
 from inspect import getattr_static
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from agent.alpaca_domain import Account, Asset, CalendarDay, MarketClock, Order, Position, Quote
@@ -2264,6 +2265,99 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertIsNotNone(_rule_runtime_bars(bars(drop=3), spec, now))
         self.assertIsNone(_rule_runtime_bars(bars(drop=4), spec, now))
         self.assertIsNone(_rule_runtime_bars(bars(partial=True), spec, now))
+
+    def test_rule_runtime_diagnostics_preserve_the_actual_gap_reason(self):
+        opening = datetime(2026, 8, 18, 13, 30, tzinfo=timezone.utc)
+        now = opening + timedelta(minutes=8, seconds=30)
+        spec = validate_rule_spec({"family": "momentum_continuation",
+                                   "lookback": 3, "atr_period": 3})
+        rows = [{"timestamp": opening + timedelta(minutes=index),
+                 "open": 100 + index, "high": 101 + index,
+                 "low": 99 + index, "close": 100 + index,
+                 "volume": 1000} for index in range(8) if index != 4]
+        diagnostics = {}
+        self.assertIsNone(_rule_runtime_bars(
+            rows, spec, now, diagnostics=diagnostics))
+        self.assertEqual(diagnostics["readiness_reason"], "feature_bar_gap")
+        self.assertEqual(diagnostics["readiness_class"], "missing")
+        self.assertEqual(diagnostics["readiness_evidence"]["gap_minutes"], 1)
+
+    def test_rule_runtime_identifies_missing_strict_opening_input(self):
+        opening = datetime(2026, 8, 18, 13, 30, tzinfo=timezone.utc)
+        now = opening + timedelta(minutes=17, seconds=15)
+        spec = validate_rule_spec({"family": "opening_range_breakout",
+                                   "range_minutes": 5, "atr_period": 3})
+        warmup = {}
+        self.assertIsNone(_rule_runtime_bars(
+            [{"timestamp": opening}], spec, opening + timedelta(minutes=1),
+            diagnostics=warmup))
+        self.assertEqual(warmup["readiness_reason"], "opening_window_incomplete")
+        self.assertEqual(warmup["readiness_class"], "warmup")
+        rows = [{"timestamp": opening + timedelta(minutes=index),
+                 "open": 100, "high": 101, "low": 99,
+                 "close": 100, "volume": 1000}
+                for index in range(1, 17)]
+        diagnostics = {}
+        self.assertIsNone(_rule_runtime_bars(
+            rows, spec, now, diagnostics=diagnostics))
+        self.assertEqual(diagnostics["readiness_reason"],
+                         "opening_window_undercovered")
+
+    def test_rule_rejection_journal_binds_paper_trial_identity(self):
+        events = []
+
+        class Probe(EngineCycleMixin):
+            def _event(self, kind, payload):
+                events.append((kind, payload))
+
+        probe = Probe()
+        probe._paper_trial_runtime = SimpleNamespace(
+            descriptor={"trial_id": "trial-1", "candidate_id": "candidate-1",
+                        "variant_id": "variant-1",
+                        "incumbent_identity": "incumbent-1"},
+            current={},
+        )
+        probe._rule_signal_rejection(
+            symbol="SPY", reason="feature_bar_gap",
+            strategy_cfg={"variant_id": "variant-1"},
+            readiness_class="missing", readiness_reason="feature_bar_gap",
+            readiness_evidence={"gap_minutes": 1})
+        self.assertEqual(len(events), 1)
+        kind, payload = events[0]
+        self.assertEqual(kind, "rule_signal_reject")
+        self.assertEqual(payload["reason"], "feature_bar_gap")
+        self.assertEqual(payload["readiness_reason"], "feature_bar_gap")
+        self.assertEqual(payload["paper_trial_id"], "trial-1")
+        self.assertEqual(payload["paper_trial_candidate_id"], "candidate-1")
+        self.assertEqual(payload["paper_trial_variant_id"], "variant-1")
+        self.assertEqual(payload["paper_trial_incumbent_identity"],
+                         "incumbent-1")
+
+    def test_paper_trial_no_signal_telemetry_is_once_per_completed_bar(self):
+        events = []
+
+        class Probe(EngineCycleMixin):
+            def _event(self, kind, payload):
+                events.append((kind, payload))
+
+        probe = Probe()
+        probe._paper_trial_runtime = SimpleNamespace(
+            descriptor={"trial_id": "trial-1"},
+            current={"trial_id": "trial-1", "activation_confirmed": True},
+        )
+        kwargs = {
+            "symbol": "SPY", "session": "2026-08-18",
+            "latest_bar_ts": 1_000.0, "reason": "no_signal",
+            "readiness_reason": "predicate_not_met",
+        }
+        probe._paper_trial_signal_telemetry_once(**kwargs)
+        probe._paper_trial_signal_telemetry_once(**kwargs)
+        probe._paper_trial_signal_telemetry_once(
+            **{**kwargs, "latest_bar_ts": 1_060.0})
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0][1]["reason"], "no_signal")
+        self.assertEqual(events[0][1]["readiness_reason"],
+                         "predicate_not_met")
 
     def test_rule_runtime_uses_exact_mean_reversion_window(self):
         from agent.contracts.rule import validate_rule_spec

@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from agent.contracts.rule import (RULE_SCHEMA_V6, RULE_SCHEMA_V7, RuleSpecError,
                                   continuity_window_bars, feature_window_bars,
                                   rule_variant_id, validate_rule_spec)
+from agent.engine_cycle import _rule_runtime_bars
 from research.costs import ReplayPolicy
 from research.edge_lab import _read_discovery_rows
 from research.factory_core import _simulate_trade
@@ -141,6 +142,23 @@ class SessionGapReplayTests(unittest.TestCase):
 
     def test_a_session_first_seen_after_the_bell_is_refused(self):
         self.assertFalse(_traded(_outcome(TOLERANT, drop=(0,))))
+
+    def test_runtime_uses_the_same_session_open_contract_as_replay(self):
+        # Runtime receives a completed current-session prefix, while replay
+        # evaluates the same prefix one signal at a time.  The opt-in
+        # zero-volume mode must therefore refuse a prefix that starts after
+        # 09:30 even though its trailing causal window is contiguous.
+        complete = _rows()
+        now = datetime.fromisoformat(complete[-1]["timestamp"]) + timedelta(
+            minutes=1, seconds=15)
+        self.assertIsNotNone(_rule_runtime_bars(
+            complete, TOLERANT, now, max_age_seconds=30))
+        diagnostics = {}
+        self.assertIsNone(_rule_runtime_bars(
+            _rows(drop=(0,)), TOLERANT, now, max_age_seconds=30,
+            diagnostics=diagnostics))
+        self.assertEqual(diagnostics["readiness_reason"],
+                         "session_open_bar_missing")
 
 
 class SignalQualityParityTests(unittest.TestCase):
