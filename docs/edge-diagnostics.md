@@ -36,7 +36,7 @@ new versions of them.
 | Volume breakout | Volume multiplier | 1.5 | 1.75 |
 | VWAP reversion | Threshold (bp) | 25 | 35 |
 | VWAP trend | Threshold (bp) | 8 | 12 |
-| Range expansion | Volume multiplier | 2 | 2.5 |
+| Range expansion | Current bar's high–low range as a multiple of the prior average range | 2 | 2.5 |
 | Opening drive | Threshold (bp) | 30 | 40 |
 | Cross-sectional residual | Threshold (bp) | 12 | 16 |
 
