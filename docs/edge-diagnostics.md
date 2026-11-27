@@ -20,6 +20,36 @@ rule cohort, the registered mechanism cohort, and the equity IBR registry. The
 report is explicitly non-authorizing (`eligible: []`, `proofs: []`,
 `authorizing: false`).
 
+The fixed rule cohort evaluates the same baseline and one registered change
+for each family on every eligible replay or shadow update. These definitions
+are versioned in the catalog. The daily research schedule does not generate
+new versions of them.
+
+| Rule family | Parameter | Baseline | Comparison |
+| --- | --- | ---: | ---: |
+| Opening-range breakout | Breakout threshold (bp) | 5 | 8 |
+| Opening-range fade | Threshold (bp) | 8 | 12 |
+| Momentum continuation | Threshold (bp) | 18 | 24 |
+| Mean reversion | Z-score | 1.5 | 1.75 |
+| Trend pullback | Threshold (bp) | 3 | 5 |
+| Volatility breakout | Compression (bp) | 8 | 12 |
+| Volume breakout | Volume multiplier | 1.5 | 1.75 |
+| VWAP reversion | Threshold (bp) | 25 | 35 |
+| VWAP trend | Threshold (bp) | 8 | 12 |
+| Range expansion | Volume multiplier | 2 | 2.5 |
+| Opening drive | Threshold (bp) | 30 | 40 |
+| Cross-sectional residual | Threshold (bp) | 12 | 16 |
+
+Compose also enables seven initial-balance breakout (IBR) arms by default.
+They compare the baseline with a 30- or 45-minute range, a 1.5R or 3R profit
+target, or a 0 or 10 bp breakout buffer. This gives 31 shadow accounts. The
+43-arm replay adds four research-only comparisons for each of opening
+continuation, trend pullback and fair-value reversion. The factory's separate
+discovery and tuning cycle is described in the research guide.
+[Rule catalog](../research/diagnostic_shadow.py) · [IBR registry](../research/variants.yaml) ·
+[Research-only comparisons](../research/mechanism_cohort.py) ·
+[Factory cadence](../research/README.md#when-the-model-proposes-variants)
+
 Run it against a frozen normalized JSONL corpus, always using a new output path:
 
 ```bash
@@ -134,6 +164,24 @@ coverage, current source observations, all active arms, and genuine event/cursor
 progress. An unchanged heartbeat or cursor is not a completed session. Source
 lag and quote age remain bounded; re-fetching an old bar cannot make its
 completion timestamp current.
+
+### Latency rules and measurements
+
+| Consumer | Clock and default policy |
+| --- | --- |
+| Paper trader | The default cycle starts on a 60-second wall-clock grid. The collector filters session bars to those completed by its cutoff and requests quotes in the configured freshness window. The collector checks quote age from the market timestamp. The rule checks the latest bar's age from its close. Both use the broker clock sampled for the cycle, with a default limit of 30 seconds. |
+| Recorder | Compose targets 30 seconds between polls. A successful forward cycle with a completed fetch window can start the next poll immediately after an overrun. Full-tick capture also pays for provider pagination, durable file writes and the exact-key index commit. |
+| Shadow and session acceptance | Compose polls shadow every 30 seconds. Acceptance checks quotes, recorder/shadow freshness, source lag, progress and full-session coverage. For completed minute bars it checks when the *next* completed bar was due, with at most 30 seconds of publication tolerance. At a 30-second shadow interval the allowed gap between acceptance samples is 35 seconds. |
+
+To diagnose a slow session, compare provider publication time, request time and
+age at actual receipt. For the recorder, measure successful in-session fetch
+and commit phases separately from idle polls and failed retries. For shadow,
+compare the time spent processing a batch with the age of the source it read.
+For orders that reach submission, use the decision, send, response and broker
+timestamps. The entry snapshot freshness check alone cannot establish age
+at send or time to fill. [Trader collection](../agent/market_entry_risk.py) ·
+[Decision loop](../agent/engine_cycle.py) · [Recorder](../deploy/recorder.py) ·
+[Acceptance](../deploy/session_acceptance.py)
 
 ## Recorder projection and pre-acceptance diagnostics
 

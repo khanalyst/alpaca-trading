@@ -145,12 +145,14 @@ backward rollback that bypasses evidence.
 ## 6. Search and mutation constraints
 
 The strategy factory evaluates each variant in an isolated simulated account.
-Proposal generation sees fit diagnostics and graded completed fit lessons only;
-it does not see held-out, sealed, or later-forward observations. Every proposal
-echoes a complete normalized root spec and changes only bounded fields in the
-root's family and grammar. Unknown fields, families, filters, data sources,
-unbounded values, unsupported exit templates, and hidden multi-field changes
-are refused.
+The model receives fit-period diagnostics and eligible completed fit lessons.
+Holdout, sealed and later forward observations stay outside the prompt.
+Discovery can propose a new hypothesis in an executable family. Tuning stays
+within the current root's family and declares the bounded parameter or
+structural change being tested. After a qualifying terminal negative, the
+replacement path can propose a materially different hypothesis, including a
+different registered family. The validator enforces the grammar, parameter
+bounds, supported exits and declared changes before evaluation.
 
 Multiple-test correction applies to every evaluated variant, including tuned
 variants and dependence-cluster checks. Underpowered, execution-blocked, and

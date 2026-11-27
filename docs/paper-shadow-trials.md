@@ -18,13 +18,12 @@ requires all of the following:
 * `enabled: true`, a non-empty explicit `trial_id`, and exactly one
   `variant_id` from the fixed diagnostic catalog;
 * paper mode, `research.require_validated_variant: true` retained as a
-  configuration guard, and the configured `shares` execution path; and
+  configuration guard, the `shares` execution path, and `llm.enabled: false`;
 * an account-bound activation with a confirmed flat local and broker book.
 
-The runtime rejects `auto`, arbitrary rule specs, runtime LLM selection,
-options, delayed feeds, and live mode for this exception. This block shows the
-shipped disabled baseline, not an enabled profile. Enabling a trial requires
-the explicit IDs and activation checks above:
+The trial evaluates its frozen strategy deterministically. The configuration
+requires an exact real-time IEX or SIP feed and an explicit catalog identity.
+The shipped baseline below has the paper incumbent disabled:
 
 ```json
 {
@@ -165,10 +164,11 @@ diagnostic bar fallback is labelled and cannot become proof evidence. Broker
 shortability, buying power, pending orders, and actual fills are not modeled
 broker authority.
 
-The direct shadow CLI defaults to the 24-rule cohort. Compose may set
-`ALPACA_SHADOW_INCLUDE_IBR=1`; direct use can pass `--diagnostic-include-ibr`
-to add seven registered IBR arms. The environment value must be exactly `0` or
-`1`, and `--diagnostic-include-ibr` requires diagnostic mode.
+The direct shadow CLI defaults to 24 rule arms. Compose defaults
+`ALPACA_SHADOW_INCLUDE_IBR` to `1` and runs 31 arms, including the seven
+registered initial-balance breakout arms. A direct CLI run can enable those
+arms with the same environment setting or `--diagnostic-include-ibr`. The
+environment accepts exactly `0` or `1`, and the flag requires diagnostic mode.
 
 ```bash
 ALPACA_SHADOW_INCLUDE_IBR=1 .venv/bin/python deploy/shadow.py \
@@ -203,10 +203,12 @@ heartbeat that is unchanged, stale, or missing does not count. Quote age and
 completed-bar publication lag remain bounded; re-fetching an old bar cannot
 refresh its completion watermark.
 
-The scheduler may run a metadata-only acceptance census before expensive
-provider/research work. Insufficient accepted forward history reports
-`waiting_for_forward_sessions`; it does not create accepted sessions or turn a
-historical corpus into forward evidence.
+The normal scheduled recorder path runs a metadata-only acceptance census
+before provider preflight or preprocessing. It needs at least 30 accepted
+forward sessions by default. Insufficient history ends that cycle with
+`waiting_for_forward_sessions`. The Compose scheduler runs daily at
+03:00 UTC (07:00 Dubai). The systemd timer uses the same UTC time with up to
+ten minutes of randomized delay.
 
 ## Paper epoch store
 

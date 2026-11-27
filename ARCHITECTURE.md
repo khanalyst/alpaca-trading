@@ -10,7 +10,7 @@ historical test results.
 | --- | --- | --- |
 | deploy/recorder.py | Read-only market-data reads | Session corpus and sidecars |
 | research.py / scheduler | None | EdgeLedger SQLite, proofs, diagnostics |
-| deploy/shadow.py | No credentials/order path | Isolated shadow WAL and reports |
+| deploy/shadow.py | No credentials/order path | Isolated shadow WAL, health, and session-acceptance samples and reports |
 | main.py + agent.engine.Engine | Account reads and order mutation | Mode-scoped state, journal, heartbeat |
 | deploy/trader_supervisor.py | One child and post-exit recovery | Supervisor health |
 | deploy/watchdog.py | Cancel/flatten only; never entries | Recovery verdict/health |
@@ -47,17 +47,19 @@ endpoint.
 
 Compose uses a read-only application filesystem, unprivileged services,
 dropped capabilities, resource bounds, secrets/configs, named volumes, and a
-loopback-only dashboard. shadow-init has no credentials/network and only
-prepares shadow-volume ownership. The supplied systemd units cover recorder,
-trader, watchdog, and a research timer invoking a bounded oneshot cycle. They
+loopback-only dashboard. The short-lived `shadow-init` service runs as root
+with networking disabled to set shadow-volume ownership. The supplied systemd
+units cover recorder, trader, watchdog, and a research timer invoking a bounded
+oneshot cycle. They
 do not install shadow or dashboard services. A systemd deployment needs a
-separately managed, single shadow writer to produce fresh shadow evidence;
-the research cycle only consumes its WAL.
+separately managed, single shadow writer to produce fresh shadow evidence.
+The research cycle consumes its outputs.
 
-recorder writes the corpus. research reads corpus/shadow inputs and mounts the
-LLM provider secret separately. shadow has no broker secret and writes only its
-WAL. trader owns order mutation. watchdog shares runtime/credentials for
-cancel/flatten recovery. dashboard mounts reporting inputs read-only.
+The recorder writes the corpus. Research reads the corpus and shadow evidence
+and mounts the LLM provider secret separately. The broker-free shadow service
+writes its own WAL, health file, and acceptance samples and reports. The
+trader owns order mutation. The watchdog shares runtime and broker credentials
+for cancel/flatten recovery. The dashboard mounts reporting inputs read-only.
 
 ## Data and research flow
 
@@ -72,15 +74,17 @@ It records when it actually received each response. The recorder fetches
 full quote ticks on their own schedule and de-duplicates repeated ticks by
 exact event key in SQLite with `synchronous=FULL`.
 
-The trader requests completed bars from the session open and quotes within
-its configured maximum quote age. Paper trial events identify the frozen
+The trader requests bars from the session open through its cycle cutoff and
+filters them to completed bars. It requests quotes within its configured
+maximum quote age. Paper trial events identify the frozen
 variant and distinguish feature warmup, missing or stale inputs, and a valid
 evaluation that produced no signal.
 
 research.py provides source validation, IBR replay, edge commands, factory
-discovery, shadow ingestion, calibration, and reports. The scheduled cycle
-checks source boundaries, runs enabled diagnostics, consumes shadow WAL, and
-persists gate/proof results. Runtime selection remains the trader's job.
+discovery, shadow ingestion, calibration, and reports. The normal scheduled
+recorder research path checks accepted forward sessions before it calls the
+provider or preprocesses the source. The cycle consumes shadow evidence and
+persists gate and proof results. Runtime selection remains the trader's job.
 
 The LLM adapter proposes bounded rule data only. It cannot write executable
 code, bypass gates, or submit orders. Feed/account/configuration/code identity

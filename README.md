@@ -93,9 +93,10 @@ broker account.
 - Equity protection uses broker-side brackets. The current adapter uses a
   software stop plus a broker-side take-profit for long options; the watchdog
   is a flatten-only backstop.
-- The bounded research LLM may propose rule data inside the registered grammar.
-  It cannot write executable strategy code, bypass a gate, choose quantity,
-  or submit an order. The optional paper-runtime LLM is a veto only.
+- The research LLM proposes structured rule parameters when the factory reaches
+  discovery, tuning, or replacement. The fixed paper trial requires the runtime
+  LLM to be disabled. Its selected rule makes entry decisions deterministically.
+  An optional LLM veto is available in other eligible paper configurations.
 - A deployment identity is propagated through the Compose services. The update
   helper refuses a dirty checkout, a mismatched declared commit, an active
   systemd trader, or a failed recorder probe/check. Do not bypass those checks

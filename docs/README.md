@@ -40,8 +40,8 @@ eligibility; successful deployment inspection does not authorize entries.
 | --- | --- |
 | [Research workflow](../research/README.md) | Diagnostic research, data and qualification commands |
 | [Research protocol](../research/protocol.md) | Versioned evidence, statistics and authority contracts |
-| [Trader research](trader-research-v6.md) | Runtime-faithful diagnostic comparisons |
-| [Edge diagnostics](edge-diagnostics.md) | Ledger and candidate evidence interpretation |
+| [Trader research](trader-research-v6.md) | Bounded recorder projection for diagnostic replay |
+| [Edge diagnostics](edge-diagnostics.md) | Non-authorizing replay, quote-cost calibration, and shadow evidence |
 | [Paper/shadow trials](paper-shadow-trials.md) | Frozen trial identities and activation controls |
 | [Preregistered hypotheses](preregistered-hypotheses.md) | Frozen registrations and interpretation limits |
 | [Rule exit protocol](rule_strategy_v3_exit_protocol.md) | Versioned rule execution and exit contracts |

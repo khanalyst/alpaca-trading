@@ -31,14 +31,15 @@ these services:
 | `trader` | Runs the paper execution loop through `deploy/trader_supervisor.py`. | `runtime-data`, `research-cache` | Paper orders after gates |
 | `watchdog` | Watches trader heartbeat and performs cancel/flatten recovery only. | `runtime-data` | Flatten/cancel only |
 | `research` | Runs the scheduled factory/replay and shadow-ingestion cycle. | `runtime-data`, `research-cache`, `research-results` | None |
-| `shadow` | Runs broker-free incremental replay and writes its isolated WAL. | `shadow-data` | None |
+| `shadow` | Runs broker-free incremental replay and writes its isolated WAL, health, and acceptance records. | `shadow-data` | None |
 | `dashboard` | Exposes read-only health/report views on localhost. | None | None |
 | `shadow-init` | Repairs `shadow-data` ownership before `shadow` starts. | `shadow-data` | None; no network/credentials |
 
-All workload services run as UID/GID `10001`, drop capabilities, and use a
-read-only root filesystem. Dashboard mounts are read-only and it receives no
-broker credentials. Named volumes survive ordinary `docker compose down`;
-`docker compose down -v` removes them and is a destructive data operation.
+The long-running services use UID/GID `10001`, drop capabilities, and use a
+read-only root filesystem. The short-lived `shadow-init` service runs as root
+with networking disabled to set ownership. Dashboard mounts are read-only and
+it receives no broker credentials. Named volumes survive ordinary
+`docker compose down`. The `-v` flag also removes the named volumes.
 
 The watchdog uses a separate broker session. When the trader heartbeat is
 older than `ALPACA_WATCHDOG_MAX_HEARTBEAT_AGE` (Compose default: 300 seconds)
@@ -124,14 +125,19 @@ separate, and returned rows retain their actual receipt times. The exact recent
 tick keys are retained in the SQLite sidecar with rollback `DELETE` journaling
 and `synchronous=FULL`, so overlap recovery does not discard received ticks.
 
-Cadence is anchored to cycle start. After a successful `forward_only` cycle that
-overruns the target, the next poll starts immediately after the cycle completes.
-Shorter polls wait until the next interval measured from the previous start.
-Failed cycles keep their bounded retry checkpoint.
+After a successful `forward_only` poll completes at least one fetch window,
+the next poll is due one interval after the previous start. If the poll
+overruns that deadline, the next poll starts immediately on completion.
+Idle polls with no completed fetch window, catch-up polls, and failed polls
+follow the fixed cadence grid. Failed cycles keep their bounded retry
+checkpoint.
 
-Recorder health reports the bytes available above the configured disk reserve
-under `storage_headroom`. Its session estimate uses the largest of the last
-five closed partition files. A partial recording can understate future usage.
+The recorder checks free space on the corpus filesystem before fetches or
+writes. It reports `storage_capacity` when free space falls below
+`ALPACA_RECORDER_MIN_FREE_BYTES` (5 GiB by default). Health reports the bytes
+available above that reserve under `storage_headroom`. Its session estimate
+uses the largest of the last five closed partition files. A partial recording
+can understate future usage.
 
 The long-running recorder handles `SIGTERM` and `SIGINT` cooperatively. If a
 cycle is active, it finishes that bounded fetch and commits the CSV, index, and
@@ -161,11 +167,12 @@ rows are diagnostic and cannot satisfy forward-shadow or paper authorization.
 Add `--quotes` only when the larger historical quote corpus is deliberately
 required.
 
-The broker-free shadow service can be run once for a bounded retry or repair,
-but only after its long-running writer is stopped. Set the container paths to
-the values in `docker compose config`; the values below are only the shipped
-defaults and must be changed when `ALPACA_RECORDER_CORPUS_ROOT` or the
-deployment’s shadow command paths differ:
+The broker-free shadow service can be run once for a bounded retry or repair
+after stopping its long-running writer. Match the resolved shadow command and
+environment in `docker compose config`. This includes the paths, poll interval,
+worker count, retention, and diagnostic cohort. Prefer an isolated diagnostic
+path for experiments during an active session. The following example uses the
+shipped Compose defaults:
 
 ```bash
 SHADOW_CORPUS=/app/runtime/research/recorded/market.csv
@@ -173,15 +180,21 @@ SHADOW_EDGE_DB=/app/runtime/research/edge_lab.sqlite3
 SHADOW_DB=/app/shadow/shadow.sqlite3
 SHADOW_HEALTH=/app/shadow/health.json
 SHADOW_ACCEPTANCE=/app/shadow/session-acceptance
+SHADOW_INTERVAL=30
+SHADOW_WORKERS=4
+SHADOW_RETENTION_DAYS=180
 
 docker compose stop shadow
 shadow_status=0
 docker compose run --rm --no-deps shadow \
-  python deploy/shadow.py --config /app/config.yaml \
+  python deploy/shadow.py --config /app/config.yaml --diagnostic \
   --corpus "$SHADOW_CORPUS" \
   --edge-db "$SHADOW_EDGE_DB" \
   --shadow-db "$SHADOW_DB" \
   --health-file "$SHADOW_HEALTH" \
+  --interval "$SHADOW_INTERVAL" \
+  --max-workers "$SHADOW_WORKERS" \
+  --retention-days "$SHADOW_RETENTION_DAYS" \
   --acceptance-root "$SHADOW_ACCEPTANCE" --once || shadow_status=$?
 docker compose start shadow
 test "$shadow_status" -eq 0
@@ -225,9 +238,11 @@ runs a recorder probe, runs `python main.py check`, starts with
 `up -d --no-build --remove-orphans`, checks the running trader, and prints
 `docker compose ps`. If `alpaca-trader.service` is active, it refuses to start
 a second trader. Stop and reconcile the existing lane instead of bypassing
-this check. Unlike the data-only bootstrap, this helper remains strict: a
-missing validated edge makes its check fail and aborts the update. Do not label
-that refusal as success or bypass it.
+this check. The authenticated check requires a resolved proof when the
+ordinary validated-edge policy applies. An explicitly enabled paper incumbent
+uses its frozen catalog and account checks. If a release changes the incumbent
+identity, follow the [audited trial-replacement procedure](../docs/paper-shadow-trials.md#activation-and-replacement-safety)
+before starting the new trial.
 
 An external backup overlay may be selected explicitly:
 

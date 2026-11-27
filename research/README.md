@@ -203,6 +203,39 @@ Fit diagnostics and LLM proposals can explain or bound search; they never read
 held-out/sealed evidence, mutate the runtime config, emit a proof, or promote
 an entry.
 
+### When the model proposes variants
+
+The default Compose scheduler checks once per UTC date at 03:00 UTC (07:00
+Dubai). On the normal trusted-recorder path it counts accepted forward sessions
+first. With fewer than 30 accepted sessions it returns
+`waiting_for_forward_sessions` before the provider check or factory. The
+fixed paper rule and shadow accounts can keep evaluating market data in the
+meantime.
+
+On an eligible equity factory run the Compose defaults allow 12 active
+hypothesis slots and up to four evaluated arms per slot, including the root.
+There is no daily allotment of new variants for each strategy family. Discovery
+can fill an empty slot, tuning can compare bounded changes to its root, and
+replacement can propose a different hypothesis after a sufficiently supported
+terminal negative. The factory can retain a forward candidate, reject duplicate
+or invalid proposals, or fill comparisons deterministically. It can reuse a
+completed cycle for the same dataset, vehicle and experiment identity.
+
+The checked-in research model settings allow two attempts per request, a
+30-second timeout, a 16 KiB response and 64 provider calls per factory run.
+These are ceilings. The standalone provider check is separate. The active
+profile supplies the model and limits. The model proposes a thesis and
+structured rule data. Runtime code validates the proposal, simulates it and
+applies the evidence gates. [Factory](strategy_factory.py) ·
+[Proposal grammar](llm_strategy.py) · [Compose schedule](../compose.yaml)
+
+The regular recorder-data path also checks the selected source size and
+scratch space before preprocessing. The Compose source cap defaults to 1 GiB.
+The scratch estimate is eight times the selected source bytes plus 2 GiB.
+The recorder filesystem and the research scratch filesystem can be different
+mounts. [Source selection](../deploy/research_dataset.py) ·
+[Capacity checks](../deploy/research_budget.py)
+
 ## Diagnostic inventory and shadow
 
 `research.diagnostic_suite` resolves existing identities; it does not invent or

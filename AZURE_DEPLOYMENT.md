@@ -29,6 +29,13 @@ infer a device from size or `/dev/sdX`; if you need to identify an attached
 disk, use the stable `/dev/disk/azure/` links and follow the infrastructure
 team’s storage procedure.
 
+Repeat these checks after changing the managed-disk size. In `lsblk`, check
+both the device and its partition. In `df`, check that the mounted filesystem
+uses the new capacity. The recorder checks free space on the filesystem that
+holds its corpus before fetching data or writing a partition. Its default
+reserve is 5 GiB. See the [recorder guide](deploy/README.md#recorder-and-shadow-maintenance)
+for the reserve and health fields.
+
 Before the first Compose start, Docker’s reported data root must be on the
 managed disk (for example, under `/datadrive/docker`). If the mount is absent
 or Docker still uses an OS/temporary-disk location, stop and correct the host
