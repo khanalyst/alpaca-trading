@@ -2839,17 +2839,25 @@ def _record_once_with_index(provider: AlpacaProvider, symbols: list[str],
             else:
                 refresh_current_quotes = False
         published_bar_keys: set[str] = set()
-        # A full-tick quote request may take several minute boundaries to
-        # finish. Recover the intervening completed bars on the next poll.
-        # Keep long outages on the existing forward-only path and allow one
-        # minute of receipt headroom inside the provenance and dedup bounds.
+        # Quote pagination can span several minutes. Recover intervening bars
+        # on the next poll with one minute of receipt headroom inside the
+        # provenance and dedup bounds.
         bar_start = cursor
-        if capture_policy == "forward_only" and latest_bars:
-            previous_bar = max(latest_bars.values())
-            overlap_limit = min(DEDUP_HORIZON, forward_observation_max_lag)
-            if (_session_date(previous_bar) == _session_date(window_end)
-                    and now - previous_bar <= overlap_limit - timedelta(minutes=1)):
+        if capture_policy == "forward_only":
+            session_day = _session_date(window_end)
+            overlap = (min(DEDUP_HORIZON, forward_observation_max_lag)
+                       - timedelta(minutes=1))
+            previous_bar = max(latest_bars.values(), default=None)
+            if (previous_bar is not None and _session_date(previous_bar) == session_day
+                    and now - previous_bar <= overlap):
                 bar_start = min(cursor, previous_bar)
+            if forward_open_window is not None and calendar is not None:
+                session = calendar.session(session_day)
+                # A slow first poll may have no durable bar to overlap. Retry
+                # from the exact open while it is recent, even if the first
+                # response already recorded a later bar or another symbol.
+                if session is not None and now - session.open <= overlap:
+                    bar_start = min(bar_start, session.open.astimezone(timezone.utc))
 
         def publish_bars(projected: list[dict]) -> None:
             """Commit one complete bar response before requesting quotes."""

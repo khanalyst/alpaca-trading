@@ -117,10 +117,12 @@ the ticks in the original window. Quotes keep their provider timestamp and
 receipt time, and the configured freshness checks still apply.
 
 The recorder target interval is 30 seconds (the Compose and systemd defaults).
-When a full-tick request overruns a minute boundary, the next `forward_only`
-poll may overlap the recent current-session bar request anchored on the prior
-durable bar's market timestamp. This bar overlap is bounded by the
-forward-observation and de-duplication horizons. The quote cursor remains
+At the start of an exact calendar session, each `forward_only` poll requests
+completed bars back to the opening bell while the open is within the smaller
+of the observation and deduplication horizons, less one minute for receipt
+(14 minutes with the defaults). This also retries symbols omitted from an
+earlier response. Later polls can recover recent bars from the latest durable
+bar's market timestamp within the same bound. The quote cursor remains
 separate, and returned rows retain their actual receipt times. The exact recent
 tick keys are retained in the SQLite sidecar with rollback `DELETE` journaling
 and `synchronous=FULL`, so overlap recovery does not discard received ticks.

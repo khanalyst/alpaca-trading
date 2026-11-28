@@ -12,6 +12,82 @@ from deploy import recorder, recorder_market
 
 
 class RecorderLatestQuoteTests(unittest.TestCase):
+    def test_forward_bars_retry_from_exact_open_after_partial_first_response(self):
+        opened = datetime(2026, 11, 27, 14, 30, tzinfo=timezone.utc)
+        times = [
+            opened + timedelta(minutes=4, seconds=10),
+            opened + timedelta(minutes=5, seconds=10),
+            opened + timedelta(minutes=14),
+            opened + timedelta(minutes=14, seconds=30),
+        ]
+        current = times[0]
+        bar_starts, quote_windows = [], []
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return current + timedelta(seconds=2)
+
+        class Provider:
+            data_feed = "iex"
+
+            def calendar(self, *, start, end):
+                return [{"date": "2026-11-27", "open": "09:30", "close": "13:00"}]
+
+            def bars(self, symbols, *, start, end, feed, **kwargs):
+                bar_starts.append(start)
+                stamps = [start + timedelta(minutes=i)
+                          for i in range(int((end - start).total_seconds() // 60))]
+                if len(bar_starts) == 1:
+                    symbols, stamps = ["SPY"], stamps[-1:]
+                return {
+                    symbol: [SimpleNamespace(timestamp=stamp, open=100, high=101,
+                                             low=99, close=100, volume=10)
+                             for stamp in stamps]
+                    for symbol in symbols
+                }
+
+            def quotes(self, symbols, *, start, end, feed):
+                quote_windows.append((start, end))
+                return {"SPY": [
+                    SimpleNamespace(timestamp=end - timedelta(seconds=offset),
+                                    bid=100, ask=101, last=100.5)
+                    for offset in (20, 10)
+                ]}
+
+        with TemporaryDirectory() as directory, patch.dict("os.environ", {
+                "ALPACA_RECORDER_CAPTURE_POLICY": "forward_only",
+                "ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "1",
+                "ALPACA_RECORDER_FORWARD_OBSERVATION_MAX_LAG_MINUTES": "15",
+                "ALPACA_RECORDER_MIN_FREE_BYTES": "0",
+        }), patch.object(recorder_market, "datetime", Clock):
+            output = Path(directory) / "market.csv"
+            provider = Provider()
+            calendar = recorder.CalendarCache(provider)
+            for current in times:
+                recorder.record_once(
+                    provider, ["SPY", "QQQ"], output, now=current,
+                    config={"session": {"require_exact_calendar": True}},
+                    calendar=calendar)
+            rows = list(recorder.iter_corpus_rows(output))
+
+        self.assertEqual(bar_starts, [opened] * 3 + [opened + timedelta(minutes=13)])
+        self.assertEqual(quote_windows,
+                         [(now - timedelta(minutes=1), now) for now in times])
+        self.assertEqual(sum(row["event_type"] == "quote" for row in rows), 8)
+        opening_bars = {
+            (row["symbol"], datetime.fromisoformat(row["timestamp"])):
+                datetime.fromisoformat(row["observed_at"])
+            for row in rows if row["event_type"] == "bar_1m"
+            and datetime.fromisoformat(row["timestamp"]) < opened + timedelta(minutes=5)
+        }
+        self.assertEqual(len(opening_bars), 10)
+        for (symbol, stamp), received in opening_bars.items():
+            first_response = (symbol == "SPY" and
+                              stamp == opened + timedelta(minutes=3))
+            expected = times[0] if first_response else times[1]
+            self.assertEqual(received, expected + timedelta(seconds=2))
+
     def test_overrun_recovers_completed_bars_with_actual_receipt(self):
         import csv
 
